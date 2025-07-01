@@ -70,7 +70,7 @@ pub struct BucketTarget {
     #[serde(rename = "isOnline")]
     online: bool,
 
-    latency: LatencyStat,
+    latency: Option<LatencyStat>,
 
     deployment_id: Option<String>,
 

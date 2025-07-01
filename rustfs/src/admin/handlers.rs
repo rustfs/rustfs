@@ -796,7 +796,7 @@ impl Operation for SetRemoteTargetHandler {
     async fn call(&self, mut _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         //return Ok(S3Response::new((StatusCode::OK, Body::from("OK".to_string()))));
         // println!("handle MetricsHandler, params: {:?}", _req.input);
-        info!("handle MetricsHandler, params: {:?}", _req.credentials);
+        info!("SetRemoteTargetHandler params: {:?}", _req.credentials);
         let querys = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
@@ -834,7 +834,12 @@ impl Operation for SetRemoteTargetHandler {
                 }
             }
 
-            let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(ApiError::other)?; // 错误会被传播
+            tracing::debug!("body is: {}", std::str::from_utf8(&body).unwrap_or("Invalid UTF-8"));
+
+            let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
+                tracing::error!("Failed to parse BucketTarget from body: {}", e);
+                ApiError::other(e)
+            })?;
             remote_target.source_bucket = bucket.clone();
 
             info!("remote target {} And arn is:", remote_target.source_bucket.clone());

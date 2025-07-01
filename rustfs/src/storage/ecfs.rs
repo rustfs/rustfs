@@ -2177,13 +2177,13 @@ impl S3 for FS {
         let rcfg = match metadata_sys::get_replication_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
+                error!("get_replication_config err {:?}", err);
                 if err == StorageError::ConfigNotFound {
                     return Err(S3Error::with_message(
                         S3ErrorCode::ReplicationConfigurationNotFoundError,
                         "replication not found".to_string(),
                     ));
                 }
-                error!("get_replication_config err {:?}", err);
                 return Err(ApiError::from(err).into());
             }
         };

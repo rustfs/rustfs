@@ -465,7 +465,7 @@ impl BucketTargetSys {
         }
 
         //if tgt.target_type == BucketTargetType::ReplicationService {
-        // Check if target is a RustFS server and alive
+        // Check if target is a rustfs server and alive
         // let hc_result = tokio::time::timeout(Duration::from_secs(3), client.health_check(&tgt.endpoint)).await;
         // match hc_result {
         //     Ok(Ok(true)) => {} // Server is alive
@@ -758,7 +758,7 @@ fn generate_arn(target: BucketTarget, depl_id: String) -> String {
 //             }
 //         }
 
-//         // Check if target is a RustFS server and alive
+//         // Check if target is a rustfs server and alive
 //         let hc_result = timeout(Duration::from_secs(3), client.health_check(&tgt.endpoint)).await;
 //         match hc_result {
 //             Ok(Ok(true)) => {} // Server is alive

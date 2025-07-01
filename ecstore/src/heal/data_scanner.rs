@@ -759,7 +759,7 @@ impl ScannerItem {
         let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
             Ok((replication, _)) => replication,
             Err(_) => {
-                error!("heal_replication: failed to get replication config for bucket {} {}", oi.bucket, oi.name);
+                error!("heal_replication: failed to get replication config for bucket: {} and object name: {}", oi.bucket, oi.name);
                 return;
             }
         };

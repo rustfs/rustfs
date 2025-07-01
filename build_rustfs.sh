@@ -14,7 +14,7 @@ else
 fi
 
 # Set CARGO_TARGET_DIR and build the project
-CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --package rustfs
+CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release --package rustfs
 
 echo -e "\a"
 echo -e "\a"
