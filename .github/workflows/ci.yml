@@ -18,11 +18,47 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "scripts/probe.sh"
+      - "LICENSE*"
+      - ".gitignore"
+      - ".dockerignore"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/audit.yml"
+      - ".github/workflows/samply.yml"
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "scripts/probe.sh"
+      - "LICENSE*"
+      - ".gitignore"
+      - ".dockerignore"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/audit.yml"
+      - ".github/workflows/samply.yml"
   schedule:
-    - cron: '0 0 * * 0' # at midnight of each sunday
+    - cron: "0 0 * * 0" # at midnight of each sunday
   workflow_dispatch:
 
 jobs:
@@ -37,7 +73,7 @@ jobs:
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@v5
         with:
-          concurrent_skipping: 'same_content_newer'
+          concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md"]'
 
