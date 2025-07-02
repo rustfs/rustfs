@@ -40,7 +40,7 @@ pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
 pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
 pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct BucketMetadata {
     pub name: String,
