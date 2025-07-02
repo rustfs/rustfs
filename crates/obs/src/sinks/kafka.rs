@@ -174,6 +174,6 @@ impl Drop for KafkaSink {
             }
         });
 
-        eprintln!("Dropping KafkaSink with topic: {self.topic}");
+        eprintln!("Dropping KafkaSink with topic: {0}", self.topic);
     }
 }

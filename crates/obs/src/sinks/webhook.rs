@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::UnifiedLogEntry;
 use crate::sinks::Sink;
+use crate::UnifiedLogEntry;
 use async_trait::async_trait;
 
 /// Webhook Sink Implementation
@@ -71,7 +71,7 @@ impl Sink for WebhookSink {
             }
         }
 
-        eprintln!("Failed to send log to webhook after {self.max_retries} retries");
+        eprintln!("Failed to send log to webhook after {0} retries", self.max_retries);
     }
 }
 
@@ -79,6 +79,6 @@ impl Drop for WebhookSink {
     fn drop(&mut self) {
         // Perform any necessary cleanup here
         // For example, you might want to log that the sink is being dropped
-        eprintln!("Dropping WebhookSink with URL: {self.endpoint}");
+        eprintln!("Dropping WebhookSink with URL: {0}", self.endpoint);
     }
 }
