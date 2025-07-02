@@ -16,10 +16,10 @@ name: Build and Push Docker Images
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -28,7 +28,7 @@ on:
       push_to_registry:
         description: "Push images to registry"
         required: false
-        default: "true"
+        default: true
         type: boolean
 
 env:
@@ -55,7 +55,8 @@ jobs:
   # Build RustFS binary for different platforms
   build-binary:
     needs: skip-check
-    if: needs.skip-check.outputs.should_skip != 'true'
+    # Only execute in the following cases: 1) tag push 2) commit message contains --build 3) workflow_dispatch 4) PR
+    if: needs.skip-check.outputs.should_skip != 'true' && (startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '--build') || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
     strategy:
       matrix:
         include:

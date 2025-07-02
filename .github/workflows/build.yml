@@ -19,13 +19,19 @@ on:
   schedule:
     - cron: "0 0 * * 0" # at midnight of each sunday
   push:
+    tags: ["v*", "*"]
     branches:
       - main
-    tags: ["v*", "*"]
 
 jobs:
   build-rustfs:
     runs-on: ${{ matrix.os }}
+    # Only execute in the following cases: 1) tag push 2) scheduled run 3) commit message contains --build
+    if: |
+      startsWith(github.ref, 'refs/tags/') ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '--build')
     strategy:
       fail-fast: false
       matrix:
@@ -382,12 +388,6 @@ jobs:
           fi
           echo "ossutil2 installation completed"
 
-          # Set the OSS configuration
-          # ossutil config set Region oss-cn-beijing
-          # ossutil config set endpoint oss-cn-beijing.aliyuncs.com
-          # ossutil config set accessKeyID ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          # ossutil config set accessKeySecret ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-
       - name: Upload to Aliyun OSS
         if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
         shell: bash
@@ -402,6 +402,44 @@ jobs:
           ossutil cp "${{ steps.package.outputs.artifact_name }}.zip" "oss://rustfs-artifacts/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.zip" --force
           ossutil cp "${{ steps.package.outputs.artifact_name }}.zip" "oss://rustfs-artifacts/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.latest.zip" --force
           echo "Successfully uploaded artifacts to OSS"
+
+      # Create and upload latest version info
+      - name: Create and Upload latest.json
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'ubuntu-latest' && matrix.variant.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        run: |
+          echo "::group::Creating latest.json file"
+
+          # Extract version from tag (remove 'refs/tags/' prefix)
+          VERSION="${GITHUB_REF#refs/tags/}"
+          # Remove 'v' prefix if present
+          VERSION="${VERSION#v}"
+
+          # Get current timestamp in ISO 8601 format
+          RELEASE_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Create latest.json content
+          cat > latest.json << EOF
+          {
+            "version": "${VERSION}",
+            "release_date": "${RELEASE_DATE}",
+            "release_notes": "Release ${VERSION}",
+            "download_url": "https://github.com/rustfs/rustfs/releases/tag/${GITHUB_REF#refs/tags/}"
+          }
+          EOF
+
+          echo "Generated latest.json:"
+          cat latest.json
+
+          echo "::group::Uploading latest.json to OSS"
+          # Upload latest.json to rustfs-version bucket
+          ossutil cp latest.json "oss://rustfs-version/latest.json" --force
+          echo "Successfully uploaded latest.json to OSS"
 
       # Determine whether to perform GUI construction based on conditions
       - name: Prepare for GUI build
@@ -535,6 +573,7 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     needs: [build-rustfs]
+    # Only execute merge operation when tag is pushed
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/upload-artifact/merge@v4
