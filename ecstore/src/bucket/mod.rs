@@ -18,7 +18,7 @@ pub mod metadata;
 pub mod metadata_sys;
 pub mod object_lock;
 pub mod policy_sys;
-mod quota;
+pub mod quota;
 pub mod replication;
 pub mod tagging;
 pub mod target;
