@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sinks::Sink;
 use crate::UnifiedLogEntry;
+use crate::sinks::Sink;
 use async_trait::async_trait;
 
 /// Webhook Sink Implementation
