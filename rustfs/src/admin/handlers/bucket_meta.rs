@@ -413,7 +413,7 @@ impl Operation for ImportBucketMetadata {
             return Err(s3_error!(InvalidRequest, "object store not init"));
         };
 
-        let update_at = OffsetDateTime::now_utc();
+        let _update_at = OffsetDateTime::now_utc();
 
         // Second pass: process file contents
         for (file_path, content) in file_contents {

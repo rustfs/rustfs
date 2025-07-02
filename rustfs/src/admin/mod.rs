@@ -349,43 +349,5 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         AdminOperation(&policys::SetPolicyForUserOrGroup {}),
     )?;
 
-    // ?
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
-        AdminOperation(&tier::ListTiers {}),
-    )?;
-    // ?
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
-        AdminOperation(&tier::GetTierInfo {}),
-    )?;
-    // ?force=xxx
-    r.insert(
-        Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
-        AdminOperation(&tier::RemoveTier {}),
-    )?;
-    // ?force=xxx
-    // body: AddOrUpdateTierReq
-    r.insert(
-        Method::PUT,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
-        AdminOperation(&tier::AddTier {}),
-    )?;
-    // ?
-    // body: AddOrUpdateTierReq
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
-        AdminOperation(&tier::EditTier {}),
-    )?;
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
-        AdminOperation(&tier::ClearTier {}),
-    )?;
-
     Ok(())
 }
