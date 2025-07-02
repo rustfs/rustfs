@@ -177,6 +177,6 @@ mod test {
         let major = 7;
         let minor = 11;
         let s = get_drive_stats(major, minor).unwrap();
-        println!("{:?}", s);
+        println!("{s:?}");
     }
 }
