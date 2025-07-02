@@ -30,11 +30,11 @@ pub fn Home() -> Element {
     #[allow(clippy::redundant_closure)]
     let service = use_signal(|| ServiceManager::new());
     let conf = RustFSConfig::load().unwrap_or_else(|e| {
-        ServiceManager::show_error(&format!("加载配置失败：{e}"));
+        ServiceManager::show_error(&format!("load config failed: {e}"));
         RustFSConfig::default()
     });
 
-    debug!("loaded configurations:{:?}", conf);
+    debug!("loaded configurations: {:?}", conf);
     let config = use_signal(|| conf.clone());
 
     use dioxus_router::prelude::Link;
@@ -78,7 +78,7 @@ pub fn Home() -> Element {
                     }
                 }
                 Err(e) => {
-                    ServiceManager::show_error(&format!("服务启动失败：{e}"));
+                    ServiceManager::show_error(&format!("start service failed: {e}"));
                 }
             }
             // Only set loading to false when it's actually done
@@ -104,7 +104,7 @@ pub fn Home() -> Element {
                     }
                 }
                 Err(e) => {
-                    ServiceManager::show_error(&format!("服务停止失败：{e}"));
+                    ServiceManager::show_error(&format!("stop service failed: {e}"));
                 }
             }
             debug!("service_state: {:?}", service_state.read());
@@ -143,6 +143,7 @@ pub fn Home() -> Element {
         Title { "RustFS APP" }
         Meta {
             name: "description",
+            // TODO: translate to english
             content: "RustFS RustFS 用热门安全的 Rust 语言开发，兼容 S3 协议。适用于 AI/ML 及海量数据存储、大数据、互联网、工业和保密存储等全部场景。近乎免费使用。遵循 Apache 2 协议，支持国产保密设备和系统。",
         }
         div { class: "min-h-screen flex flex-col items-center bg-white",
@@ -166,7 +167,7 @@ pub fn Home() -> Element {
                 }
                 LoadingSpinner {
                     loading: loading.read().to_owned(),
-                    text: "服务处理中...",
+                    text: "processing...",
                 }
                 button { class: button_class, onclick: toggle_service,
                     svg {
