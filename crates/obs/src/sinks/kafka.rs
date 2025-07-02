@@ -97,7 +97,7 @@ impl KafkaSink {
             let payload = match serde_json::to_string(&entry) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("Failed to serialize log entry: {}", e);
+                    eprintln!("Failed to serialize log entry: {e}");
                     continue;
                 }
             };
@@ -174,6 +174,6 @@ impl Drop for KafkaSink {
             }
         });
 
-        eprintln!("Dropping KafkaSink with topic: {}", self.topic);
+        eprintln!("Dropping KafkaSink with topic: {self.topic}");
     }
 }

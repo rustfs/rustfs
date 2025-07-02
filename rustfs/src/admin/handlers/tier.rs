@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use http::{HeaderMap, StatusCode};
 use time::OffsetDateTime;
 //use iam::get_global_action_cred;

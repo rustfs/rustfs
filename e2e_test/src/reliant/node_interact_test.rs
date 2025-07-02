@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use ecstore::disk::{VolumeInfo, WalkDirOptions};
 
 use futures::future::join_all;

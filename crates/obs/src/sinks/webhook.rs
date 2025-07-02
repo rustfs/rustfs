@@ -71,7 +71,7 @@ impl Sink for WebhookSink {
             }
         }
 
-        eprintln!("Failed to send log to webhook after {} retries", self.max_retries);
+        eprintln!("Failed to send log to webhook after {self.max_retries} retries");
     }
 }
 
@@ -79,6 +79,6 @@ impl Drop for WebhookSink {
     fn drop(&mut self) {
         // Perform any necessary cleanup here
         // For example, you might want to log that the sink is being dropped
-        eprintln!("Dropping WebhookSink with URL: {}", self.endpoint);
+        eprintln!("Dropping WebhookSink with URL: {self.endpoint}");
     }
 }
