@@ -46,7 +46,7 @@ Stress test server parameters
 |Driver  | 40GB x 4 |   IOPS 3800 / Driver |
 
 
-https://github.com/user-attachments/assets/8cdc78f3-5ccb-413b-aa08-ff005022cf52
+https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a
 
 
 ### RustFS vs Other object storage
