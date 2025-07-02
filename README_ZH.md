@@ -12,7 +12,7 @@
 </p >
 
 <p align="center">
-  <a href=" ">快速开始</a >
+  <a href="https://docs.rustfs.com/quickstart">快速开始</a >
   · <a href="https://docs.rustfs.com">文档</a >
   · <a href="https://github.com/rustfs/rustfs/issues">问题报告</a >
   · <a href="https://github.com/rustfs/rustfs/discussions">讨论</a >
