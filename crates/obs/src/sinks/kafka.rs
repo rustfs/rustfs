@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::sinks::Sink;
 use crate::{LogRecord, UnifiedLogEntry};
 use async_trait::async_trait;
@@ -83,7 +97,7 @@ impl KafkaSink {
             let payload = match serde_json::to_string(&entry) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("Failed to serialize log entry: {}", e);
+                    eprintln!("Failed to serialize log entry: {e}");
                     continue;
                 }
             };
@@ -160,6 +174,6 @@ impl Drop for KafkaSink {
             }
         });
 
-        eprintln!("Dropping KafkaSink with topic: {}", self.topic);
+        eprintln!("Dropping KafkaSink with topic: {0}", self.topic);
     }
 }
