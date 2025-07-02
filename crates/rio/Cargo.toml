@@ -19,11 +19,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
-homepage.workspace = true
-description = "Rio is a RustFS component that provides a high-performance, asynchronous I/O framework for building scalable and efficient applications."
-keywords = ["asynchronous", "IO", "framework", "rustfs", "Minio"]
-categories = ["web-programming", "development-tools", "asynchronous"]
-documentation = "https://docs.rs/rustfs-rio/latest/rustfs_rio/"
 
 [lints]
 workspace = true
@@ -45,5 +40,4 @@ serde_json.workspace = true
 md-5 = { workspace = true }
 
 [dev-dependencies]
-#criterion = { version = "0.5.1", features = ["async", "async_tokio", "tokio"] }
-tokio-test = "0.4"
+tokio-test = { workspace = true }
