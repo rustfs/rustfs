@@ -35,7 +35,7 @@ pub fn pre_sign_v2(
     let headers = req.headers_mut().expect("headers_mut err");
     let expires_str = headers.get("Expires");
     if expires_str.is_none() {
-        headers.insert("Expires", format!("{:010}", epoch_expires).parse().unwrap());
+        headers.insert("Expires", format!("{epoch_expires:010}").parse().unwrap());
     }
 
     let string_to_sign = pre_string_to_sign_v2(&req, virtual_host);
@@ -49,7 +49,7 @@ pub fn pre_sign_v2(
         query.insert("AWSAccessKeyId".to_string(), access_key_id.to_string());
     }
 
-    query.insert("Expires".to_string(), format!("{:010}", epoch_expires));
+    query.insert("Expires".to_string(), format!("{epoch_expires:010}"));
 
     let uri = req.uri_ref().unwrap().clone();
     let mut parts = req.uri_ref().unwrap().clone().into_parts();
@@ -95,7 +95,7 @@ pub fn sign_v2(
         );
     }
 
-    let auth_header = format!("{} {}:", SIGN_V2_ALGORITHM, access_key_id);
+    let auth_header = format!("{SIGN_V2_ALGORITHM} {access_key_id}:");
     let auth_header = format!("{}{}", auth_header, base64_encode(&hmac_sha1(secret_access_key, string_to_sign)));
 
     headers.insert("Authorization", auth_header.parse().unwrap());

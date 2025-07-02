@@ -81,7 +81,7 @@ impl Operation for SetNotificationTarget {
             .await
             .map_err(|e| {
                 error!("failed to set target config: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set target config: {}", e))
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set target config: {e}"))
             })?;
 
         let mut header = HeaderMap::new();
@@ -124,7 +124,7 @@ impl Operation for ListNotificationTargets {
 
         // 4. Serialize and return the result
         let data = serde_json::to_vec(&data_target_arn_list)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {e}")))?;
         debug!("ListNotificationTargets call end, response data length: {}", data.len(),);
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -159,7 +159,7 @@ impl Operation for RemoveNotificationTarget {
             .await
             .map_err(|e| {
                 error!("failed to remove target config: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to remove target config: {}", e))
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to remove target config: {e}"))
             })?;
 
         let mut header = HeaderMap::new();
@@ -204,7 +204,7 @@ impl Operation for SetBucketNotification {
             .await
             .map_err(|e| {
                 error!("failed to load bucket notification config: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load bucket notification config: {}", e))
+                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load bucket notification config: {e}"))
             })?;
 
         let mut header = HeaderMap::new();
@@ -241,7 +241,7 @@ impl Operation for GetBucketNotification {
         };
 
         let data = serde_json::to_vec(&response)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize rules: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize rules: {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

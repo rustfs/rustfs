@@ -104,8 +104,7 @@ impl VersionChecker {
             let error_text = response.text().await.unwrap_or_default();
             error!("Version check request failed, status code: {}, response: {}", status, error_text);
             return Err(UpdateCheckError::InvalidResponse(format!(
-                "HTTP status code: {}, response: {}",
-                status, error_text
+                "HTTP status code: {status}, response: {error_text}"
             )));
         }
 
@@ -117,8 +116,7 @@ impl VersionChecker {
                 let error_text = String::from_utf8_lossy(&response_bytes);
                 error!("Version check request failed, response: {}", e);
                 return Err(UpdateCheckError::InvalidResponse(format!(
-                    "JSON parsing failed: {}, response: {}",
-                    e, error_text
+                    "JSON parsing failed: {e}, response: {error_text}"
                 )));
             }
         };
@@ -196,7 +194,7 @@ impl VersionChecker {
         let parts: Vec<&str> = version.split('.').collect();
 
         if parts.len() < 3 {
-            return Err(UpdateCheckError::VersionParseError(format!("Invalid version format: {}", version)));
+            return Err(UpdateCheckError::VersionParseError(format!("Invalid version format: {version}")));
         }
 
         let major = parts[0]
@@ -292,7 +290,7 @@ mod tests {
     async fn test_get_current_version() {
         let version = get_current_version();
         assert!(!version.is_empty());
-        println!("Current version: {}", version);
+        println!("Current version: {version}");
     }
 
     #[test]
@@ -341,7 +339,7 @@ mod tests {
         assert_eq!(cloned_result.check_time, result.check_time);
 
         // Test Debug functionality (should not panic)
-        let debug_output = format!("{:?}", result);
+        let debug_output = format!("{result:?}");
         assert!(debug_output.contains("UpdateCheckResult"));
         assert!(debug_output.contains("1.1.0"));
         assert!(debug_output.contains("1.2.0"));
@@ -403,7 +401,7 @@ mod tests {
         assert_eq!(cloned_info.download_url, version_info.download_url);
 
         // Test Debug functionality
-        let debug_output = format!("{:?}", version_info);
+        let debug_output = format!("{version_info:?}");
         assert!(debug_output.contains("VersionInfo"));
         assert!(debug_output.contains("2.0.0"));
 
@@ -422,7 +420,7 @@ mod tests {
 
         // Test JSON serialization/deserialization
         let json_string = serde_json::to_string(&version_info).unwrap();
-        println!("json_string: {}", json_string);
+        println!("json_string: {json_string}");
         assert!(json_string.contains("2.0.0"));
         assert!(json_string.contains("Major release"));
 
