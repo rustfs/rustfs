@@ -44,7 +44,8 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 |网络 | 15Gbp |      |
 |驱动器  | 40GB x 4 |   IOPS 3800 / 驱动器 |
 
-<https://github.com/user-attachments/assets/8cdc78f3-5ccb-413b-aa08-ff005022cf52>
+https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a
+
 
 ### RustFS vs 其他对象存储
 
