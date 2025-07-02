@@ -145,7 +145,7 @@ impl Operation for AddTier {
                 warn!("tier_config_mgr add failed, e: {:?}", err);
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("TierAddFailed".into()),
-                    format!("tier add failed. {}", err),
+                    format!("tier add failed. {err}"),
                 ));
             }
         }
@@ -212,7 +212,7 @@ impl Operation for EditTier {
                 warn!("tier_config_mgr edit failed, e: {:?}", err);
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("TierEditFailed".into()),
-                    format!("tier edit failed. {}", err),
+                    format!("tier edit failed. {err}"),
                 ));
             }
         }
@@ -307,7 +307,7 @@ impl Operation for RemoveTier {
                 warn!("tier_config_mgr remove failed, e: {:?}", err);
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("TierRemoveFailed".into()),
-                    format!("tier remove failed. {}", err),
+                    format!("tier remove failed. {err}"),
                 ));
             }
         }
@@ -434,7 +434,7 @@ impl Operation for ClearTier {
             warn!("tier_config_mgr clear failed, e: {:?}", err);
             return Err(S3Error::with_message(
                 S3ErrorCode::Custom("TierClearFailed".into()),
-                format!("tier clear failed. {}", err),
+                format!("tier clear failed. {err}"),
             ));
         }
         if let Err(e) = tier_config_mgr.save().await {

@@ -166,7 +166,7 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
         query_params.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build canonical query string
-        let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         canonical_query_string = sorted_params.join("&");
         canonical_query_string = canonical_query_string.replace("+", "%20");
@@ -219,7 +219,7 @@ pub fn pre_sign_v4(
     query.push(("X-Amz-Algorithm".to_string(), SIGN_V4_ALGORITHM.to_string()));
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     query.push(("X-Amz-Date".to_string(), t.format(&format).unwrap().to_string()));
-    query.push(("X-Amz-Expires".to_string(), format!("{:010}", expires)));
+    query.push(("X-Amz-Expires".to_string(), format!("{expires:010}")));
     query.push(("X-Amz-SignedHeaders".to_string(), signed_headers));
     query.push(("X-Amz-Credential".to_string(), credential));
     if !session_token.is_empty() {
@@ -300,7 +300,7 @@ fn sign_v4_inner(
         }
 
         headers.insert("Content-Encoding", "aws-chunked".parse().unwrap());
-        headers.insert("x-amz-decoded-content-length", format!("{:010}", content_len).parse().unwrap());
+        headers.insert("x-amz-decoded-content-length", format!("{content_len:010}").parse().unwrap());
     }
 
     if service_type == SERVICE_TYPE_STS {
@@ -318,10 +318,7 @@ fn sign_v4_inner(
 
     let headers = req.headers_mut().expect("err");
 
-    let auth = format!(
-        "{} Credential={}, SignedHeaders={}, Signature={}",
-        SIGN_V4_ALGORITHM, credential, signed_headers, signature
-    );
+    let auth = format!("{SIGN_V4_ALGORITHM} Credential={credential}, SignedHeaders={signed_headers}, Signature={signature}");
     headers.insert("Authorization", auth.parse().unwrap());
 
     if !trailer.is_empty() {
@@ -350,7 +347,7 @@ fn _unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: Heade
     }
 
     headers.insert("Content-Encoding", "aws-chunked".parse().unwrap());
-    headers.insert("x-amz-decoded-content-length", format!("{:010}", content_len).parse().unwrap());
+    headers.insert("x-amz-decoded-content-length", format!("{content_len:010}").parse().unwrap());
 
     if !trailer.is_empty() {
         for (_, v) in &trailer {

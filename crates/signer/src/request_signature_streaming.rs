@@ -87,7 +87,7 @@ pub fn streaming_sign_v4(
     headers.insert("X-Amz-Date", HeaderValue::from_str(&req_time.format(&format).unwrap()).expect("err"));
 
     //req.content_length = 100；
-    headers.insert("x-amz-decoded-content-length", format!("{:010}", data_len).parse().unwrap());
+    headers.insert("x-amz-decoded-content-length", format!("{data_len:010}").parse().unwrap());
 
     req
 }

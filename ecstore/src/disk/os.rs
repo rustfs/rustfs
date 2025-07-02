@@ -91,7 +91,7 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
         if file_type.is_file() {
             volumes.push(name);
         } else if file_type.is_dir() {
-            volumes.push(format!("{}{}", name, SLASH_SEPARATOR));
+            volumes.push(format!("{name}{SLASH_SEPARATOR}"));
         }
         count -= 1;
         if count == 0 {
