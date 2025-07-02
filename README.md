@@ -1,6 +1,5 @@
 [![RustFS](https://github.com/user-attachments/assets/547d72f7-d1f4-4763-b9a8-6040bad9251a)](https://rustfs.com)
 
-
 <p align="center">RustFS is a high-performance distributed object storage software built using Rust</p>
 
 <p align="center">
@@ -13,8 +12,8 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/quickstart">Getting Started</a>
-  · <a href="https://docs.rustfs.com">Docs</a>
+  <a href="https://docs.rustfs.com/en/introduction.html">Getting Started</a>
+  · <a href="https://docs.rustfs.com/en/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
 </p>
@@ -45,9 +44,7 @@ Stress test server parameters
 |Network | 15Gbp |      |
 |Driver  | 40GB x 4 |   IOPS 3800 / Driver |
 
-
-https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a
-
+<https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a>
 
 ### RustFS vs Other object storage
 
@@ -85,16 +82,15 @@ For detailed documentation, including configuration options, API references, and
 
 If you have any questions or need assistance, you can:
 
-- Check the [FAQ](https://docs.rustfs.com/faq) for common issues and solutions.
+- Check the [FAQ](https://github.com/rustfs/rustfs/discussions/categories/q-a) for common issues and solutions.
 - Join our [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) to ask questions and share your experiences.
 - Open an issue on our [GitHub Issues](https://github.com/rustfs/rustfs/issues) page for bug reports or feature requests.
 
 ## Links
 
 - [Documentation](https://docs.rustfs.com) - The manual you should read
-- [Changelog](https://docs.rustfs.com/changelog) - What we broke and fixed
+- [Changelog](https://github.com/rustfs/rustfs/releases) - What we broke and fixed
 - [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Where the community lives
-
 
 ## Contact
 
@@ -111,7 +107,6 @@ RustFS is a community-driven project, and we appreciate all contributions. Check
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=rustfs/rustfs" />
 </a>
-
 
 ## License
 

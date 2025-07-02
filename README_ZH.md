@@ -12,8 +12,8 @@
 </p >
 
 <p align="center">
-  <a href="https://docs.rustfs.com/quickstart">快速开始</a >
-  · <a href="https://docs.rustfs.com">文档</a >
+  <a href="https://docs.rustfs.com/zh/introduction.html">快速开始</a >
+  · <a href="https://docs.rustfs.com/zh/">文档</a >
   · <a href="https://github.com/rustfs/rustfs/issues">问题报告</a >
   · <a href="https://github.com/rustfs/rustfs/discussions">讨论</a >
 </p >
@@ -44,8 +44,7 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 |网络 | 15Gbp |      |
 |驱动器  | 40GB x 4 |   IOPS 3800 / 驱动器 |
 
-https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a
-
+<https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a>
 
 ### RustFS vs 其他对象存储
 
@@ -83,7 +82,7 @@ https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a
 
 如果您有任何问题或需要帮助，您可以：
 
-- 查看[常见问题解答](https://docs.rustfs.com/faq)以获取常见问题和解决方案。
+- 查看[常见问题解答](https://github.com/rustfs/rustfs/discussions/categories/q-a)以获取常见问题和解决方案。
 - 加入我们的 [GitHub 讨论](https://github.com/rustfs/rustfs/discussions)来提问和分享您的经验。
 - 在我们的 [GitHub Issues](https://github.com/rustfs/rustfs/issues) 页面上开启问题，报告错误或功能请求。
 
