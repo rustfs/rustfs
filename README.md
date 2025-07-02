@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-English | <a href="https://github.com/rustfs/rustfs/blob/main/README-CN.md">简体中文</a>
+English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简体中文</a>
 </p>
 
 RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
@@ -34,7 +34,7 @@ RustFS is a high-performance distributed object storage software built using Rus
 - **Open Source**: Licensed under Apache 2.0, encouraging community contributions and transparency.
 - **User-Friendly**: Designed with simplicity in mind, making it easy to deploy and manage.
 
-## RustFS vs MinIO 
+## RustFS vs MinIO
 
 Stress test server parameters
 
