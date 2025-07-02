@@ -1,0 +1,118 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-ecstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+rustfs-config = { workspace = true, features = ["constants", "notify"] }
+async-trait.workspace = true
+bytes.workspace = true
+byteorder = { workspace = true }
+rustfs-common.workspace = true
+rustfs-policy.workspace = true
+chrono.workspace = true
+glob = { workspace = true }
+thiserror.workspace = true
+flatbuffers.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+time.workspace = true
+bytesize.workspace = true
+serde_json.workspace = true
+serde-xml-rs.workspace = true
+s3s.workspace = true
+http.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
+reed-solomon-simd = { workspace = true }
+lazy_static.workspace = true
+rustfs-lock.workspace = true
+regex = { workspace = true }
+path-absolutize = { workspace = true }
+rustfs-protos.workspace = true
+rmp.workspace = true
+rmp-serde.workspace = true
+tokio-util = { workspace = true, features = ["io", "compat"] }
+base64 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex-simd = { workspace = true }
+path-clean = { workspace = true }
+tempfile.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
+tokio-stream = { workspace = true }
+tonic.workspace = true
+xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
+tower.workspace = true
+async-channel.workspace = true
+enumset = { workspace = true }
+num_cpus = { workspace = true }
+rand.workspace = true
+pin-project-lite.workspace = true
+md-5.workspace = true
+rustfs-madmin.workspace = true
+rustfs-workers.workspace = true
+reqwest = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+once_cell = { workspace = true }
+rustfs-rsc = { workspace = true }
+urlencoding = { workspace = true }
+smallvec = { workspace = true }
+shadow-rs.workspace = true
+rustfs-filemeta.workspace = true
+rustfs-utils = { workspace = true, features = ["full"] }
+rustfs-rio.workspace = true
+rustfs-signer.workspace = true
+futures-util.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+nix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true }
+
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+temp-env = "0.3.6"
+
+[build-dependencies]
+shadow-rs = { workspace = true, features = ["build", "metadata"] }
+
+[[bench]]
+name = "erasure_benchmark"
+harness = false
+
+[[bench]]
+name = "comparison_benchmark"
+harness = false

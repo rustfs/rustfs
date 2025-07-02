@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::global::get_global_action_cred;
 use http::HeaderMap;
 use http::Uri;
-use iam::error::Error as IamError;
-use iam::sys::SESSION_POLICY_NAME;
-use policy::auth;
-use policy::auth::get_claims_from_token_with_secret;
+use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_iam::error::Error as IamError;
+use rustfs_iam::sys::SESSION_POLICY_NAME;
+use rustfs_policy::auth;
+use rustfs_policy::auth::get_claims_from_token_with_secret;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -51,7 +51,7 @@ impl S3Auth for IAMAuth {
             return Ok(key);
         }
 
-        if let Ok(iam_store) = iam::get() {
+        if let Ok(iam_store) = rustfs_iam::get() {
             if let Some(id) = iam_store.get_user(access_key).await {
                 return Ok(SecretKey::from(id.credentials.secret_key.clone()));
             }
@@ -73,7 +73,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     let sys_cred = cred.clone();
 
     if cred.access_key != access_key {
-        let Ok(iam_store) = iam::get() else {
+        let Ok(iam_store) = rustfs_iam::get() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("check_key_valid {:?}", IamError::IamSysNotInitialized),

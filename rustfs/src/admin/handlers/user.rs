@@ -16,18 +16,18 @@ use crate::{
     admin::{router::Operation, utils::has_space_be},
     auth::{check_key_valid, get_condition_values, get_session_token},
 };
-use ecstore::global::get_global_action_cred;
 use http::{HeaderMap, StatusCode};
-use iam::{
+use matchit::Params;
+use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::NewServiceAccountOpts,
 };
-use madmin::{
+use rustfs_madmin::{
     AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity,
     user::{ImportIAMResult, SRSessionPolicy, SRSvcAccCreate},
 };
-use matchit::Params;
-use policy::policy::{
+use rustfs_policy::policy::{
     Args,
     action::{Action, AdminAction},
 };
@@ -104,7 +104,9 @@ impl Operation for AddUser {
             }
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         if let Some(user) = iam_store.get_user(ak).await {
             if (user.credentials.is_temp() || user.credentials.is_service_account()) && cred.parent_user == ak {
@@ -180,7 +182,9 @@ impl Operation for SetUserStatus {
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         iam_store
             .set_user_status(ak, status)
@@ -213,7 +217,9 @@ impl Operation for ListUsers {
             }
         };
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let users = {
             if !query.bucket.is_empty() {
@@ -266,7 +272,9 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let (is_temp, _) = iam_store
             .is_temp_user(ak)
@@ -327,7 +335,9 @@ impl Operation for GetUserInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -401,7 +411,9 @@ impl Operation for ExportIam {
         let (_cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let mut zip_writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default();
@@ -410,7 +422,7 @@ impl Operation for ExportIam {
             let file_path = path_join_buf(&[IAM_ASSETS_DIR, file]);
             match file {
                 ALL_POLICIES_FILE => {
-                    let policies: HashMap<String, policy::policy::Policy> = iam_store
+                    let policies: HashMap<String, rustfs_policy::policy::Policy> = iam_store
                         .list_polices("")
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
@@ -615,7 +627,9 @@ impl Operation for ImportIam {
         let mut zip_reader =
             ZipArchive::new(Cursor::new(body)).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let skipped = IAMEntities::default();
         let mut removed = IAMEntities::default();
@@ -637,7 +651,7 @@ impl Operation for ImportIam {
             };
 
             if let Some(file_content) = file_content {
-                let policies: HashMap<String, policy::policy::Policy> = serde_json::from_slice(&file_content)
+                let policies: HashMap<String, rustfs_policy::policy::Policy> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (name, policy) in policies {
                     if policy.id.is_empty() {
@@ -723,7 +737,7 @@ impl Operation for ImportIam {
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (group_name, group_info) in groups {
                     if let Err(e) = iam_store.get_group_description(&group_name).await {
-                        if matches!(e, iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name) {
+                        if matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name) {
                             return Err(s3_error!(InvalidArgument, "group not found or has space be"));
                         }
                     }
@@ -763,7 +777,7 @@ impl Operation for ImportIam {
                     }
 
                     let sp = if let Some(ps) = req.session_policy.as_str() {
-                        let sp = policy::policy::Policy::parse_config(ps.as_bytes())
+                        let sp = rustfs_policy::policy::Policy::parse_config(ps.as_bytes())
                             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                         Some(sp)
                     } else {
@@ -777,7 +791,7 @@ impl Operation for ImportIam {
                     let mut update = true;
 
                     if let Err(e) = iam_store.get_service_account(&req.access_key).await {
-                        if !matches!(e, iam::error::Error::NoSuchServiceAccount(_)) {
+                        if !matches!(e, rustfs_iam::error::Error::NoSuchServiceAccount(_)) {
                             return Err(s3_error!(InvalidArgument, "failed to get service account {ak} {e}"));
                         }
                         update = false;
@@ -838,7 +852,7 @@ impl Operation for ImportIam {
                     let has_temp = match iam_store.is_temp_user(&user_name).await {
                         Ok((has_temp, _)) => has_temp,
                         Err(e) => {
-                            if !matches!(e, iam::error::Error::NoSuchUser(_)) {
+                            if !matches!(e, rustfs_iam::error::Error::NoSuchUser(_)) {
                                 return Err(s3_error!(InternalError, "is temp user failed, name: {user_name}, err: {e}"));
                             }
                             false
@@ -934,7 +948,7 @@ impl Operation for ImportIam {
                     let has_temp = match iam_store.is_temp_user(&user_name).await {
                         Ok((has_temp, _)) => has_temp,
                         Err(e) => {
-                            if !matches!(e, iam::error::Error::NoSuchUser(_)) {
+                            if !matches!(e, rustfs_iam::error::Error::NoSuchUser(_)) {
                                 return Err(s3_error!(InternalError, "is temp user failed, name: {user_name}, err: {e}"));
                             }
                             false

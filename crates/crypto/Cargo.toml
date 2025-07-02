@@ -1,0 +1,53 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-crypto"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes-gcm = { workspace = true, features = ["std"], optional = true }
+argon2 = { workspace = true, features = ["std"], optional = true }
+cfg-if = { workspace = true }
+chacha20poly1305 = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true }
+pbkdf2 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+thiserror.workspace = true
+serde_json.workspace = true
+
+
+[dev-dependencies]
+test-case.workspace = true
+time.workspace = true
+
+[features]
+default = ["crypto", "fips"]
+fips = []
+crypto = [
+    "dep:aes-gcm",
+    "dep:argon2",
+    "dep:chacha20poly1305",
+    "dep:pbkdf2",
+    "dep:rand",
+    "dep:sha2",
+]

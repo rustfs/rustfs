@@ -16,11 +16,11 @@ use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
 };
-use ecstore::bucket::utils::serialize;
 use http::StatusCode;
-use iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use matchit::Params;
-use policy::{auth::get_new_credentials_with_metadata, policy::Policy};
+use rustfs_ecstore::bucket::utils::serialize;
+use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
+use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
 use rustfs_utils::crypto::base64_encode;
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
@@ -112,7 +112,9 @@ impl Operation for AssumeRoleHandle {
         // warn!("AssumeRole get cred {:?}", &user);
         // warn!("AssumeRole get body {:?}", &body);
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         if let Err(_err) = iam_store.policy_db_get(&cred.access_key, &cred.groups).await {
             return Err(s3_error!(InvalidArgument, "invalid policy arg"));

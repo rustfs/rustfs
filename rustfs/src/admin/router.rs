@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::rpc::verify_rpc_signature;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -20,6 +19,7 @@ use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
+use rustfs_ecstore::rpc::verify_rpc_signature;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;

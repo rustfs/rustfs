@@ -15,18 +15,18 @@
 use crate::admin::utils::has_space_be;
 use crate::auth::{get_condition_values, get_session_token};
 use crate::{admin::router::Operation, auth::check_key_valid};
-use ecstore::global::get_global_action_cred;
 use http::HeaderMap;
 use hyper::StatusCode;
-use iam::error::is_err_no_such_service_account;
-use iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
-use madmin::{
+use matchit::Params;
+use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_iam::error::is_err_no_such_service_account;
+use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
+use rustfs_madmin::{
     AddServiceAccountReq, AddServiceAccountResp, Credentials, InfoServiceAccountResp, ListServiceAccountsResp,
     ServiceAccountInfo, UpdateServiceAccountReq,
 };
-use matchit::Params;
-use policy::policy::action::{Action, AdminAction};
-use policy::policy::{Args, Policy};
+use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::{Args, Policy};
 use s3s::S3ErrorCode::InvalidRequest;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
@@ -102,7 +102,9 @@ impl Operation for AddServiceAccount {
             req_is_derived_cred = true;
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let deny_only = cred.access_key == target_user || cred.parent_user == target_user;
 
@@ -222,7 +224,9 @@ impl Operation for UpdateServiceAccount {
 
         let access_key = query.access_key;
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         // let svc_account = iam_store.get_service_account(&access_key).await.map_err(|e| {
         //     debug!("get service account failed, e: {:?}", e);
@@ -329,7 +333,9 @@ impl Operation for InfoServiceAccount {
 
         let access_key = query.access_key;
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let (svc_account, session_policy) = iam_store.get_service_account(&access_key).await.map_err(|e| {
             debug!("get service account failed, e: {:?}", e);
@@ -466,7 +472,9 @@ impl Operation for ListServiceAccount {
         //     cred.parent_user
         // };
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let target_account = if query.user.as_ref().is_some_and(|v| v != &cred.access_key) {
             if !iam_store
@@ -552,7 +560,9 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let svc_account = match iam_store.get_service_account(&query.access_key).await {
             Ok((res, _)) => Some(res),

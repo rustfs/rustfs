@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{Event, EventArgs, NotificationError, NotificationSystem};
-use ecstore::config::Config;
 use once_cell::sync::Lazy;
+use rustfs_ecstore::config::Config;
 use std::sync::{Arc, OnceLock};
 use tracing::instrument;
 

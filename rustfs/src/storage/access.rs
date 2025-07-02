@@ -15,11 +15,11 @@
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::license::license_check;
-use ecstore::bucket::policy_sys::PolicySys;
-use iam::error::Error as IamError;
-use policy::auth;
-use policy::policy::action::{Action, S3Action};
-use policy::policy::{Args, BucketPolicyArgs};
+use rustfs_ecstore::bucket::policy_sys::PolicySys;
+use rustfs_iam::error::Error as IamError;
+use rustfs_policy::auth;
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_policy::policy::{Args, BucketPolicyArgs};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
     if let Some(cred) = &req_info.cred {
-        let Ok(iam_store) = iam::get() else {
+        let Ok(iam_store) = rustfs_iam::get() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),

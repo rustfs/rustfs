@@ -174,43 +174,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
 
 [[package]]
-name = "api"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "common",
- "datafusion",
- "ecstore",
- "futures",
- "futures-core",
- "http 1.3.1",
- "object_store",
- "pin-project-lite",
- "s3s",
- "snafu",
- "tokio",
- "tokio-util",
- "tracing",
- "transform-stream",
- "url",
-]
-
-[[package]]
-name = "appauth"
-version = "0.0.1"
-dependencies = [
- "base64-simd",
- "common",
- "hex-simd",
- "rand 0.9.1",
- "rsa",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "arbitrary"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,20 +614,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.101",
-]
-
-[[package]]
-name = "async_zip"
-version = "0.0.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b9f7252833d5ed4b00aa9604b563529dd5e11de9c23615de2dcdf91eb87b52"
-dependencies = [
- "crc32fast",
- "futures-lite",
- "pin-project",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -1140,17 +1089,6 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.2",
  "tower-service",
-]
-
-[[package]]
-name = "backon"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "302eaff5357a264a2c42f127ecb8bac761cf99749fc3dc95677e2743991f99e7"
-dependencies = [
- "fastrand",
- "gloo-timers",
- "tokio",
 ]
 
 [[package]]
@@ -1839,18 +1777,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "common"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "lazy_static",
- "scopeguard",
- "tokio",
- "tonic",
- "tracing-error",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2207,24 +2133,6 @@ name = "crunchy"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43da5946c66ffcc7745f48db692ffbb10a83bfe0afd96235c5c2a4fb23994929"
-
-[[package]]
-name = "crypto"
-version = "0.0.1"
-dependencies = [
- "aes-gcm",
- "argon2",
- "cfg-if",
- "chacha20poly1305",
- "jsonwebtoken",
- "pbkdf2",
- "rand 0.9.1",
- "serde_json",
- "sha2 0.10.9",
- "test-case",
- "thiserror 2.0.12",
- "time",
-]
 
 [[package]]
 name = "crypto-bigint"
@@ -3566,21 +3474,18 @@ name = "e2e_test"
 version = "0.0.1"
 dependencies = [
  "bytes",
- "common",
- "ecstore",
  "flatbuffers 25.2.10",
  "futures",
- "lazy_static",
- "lock",
- "madmin",
- "protos",
  "rmp-serde",
+ "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-lock",
+ "rustfs-madmin",
+ "rustfs-protos",
  "serde",
  "serde_json",
  "tokio",
  "tonic",
- "tower",
  "url",
 ]
 
@@ -3594,81 +3499,6 @@ dependencies = [
  "elliptic-curve",
  "rfc6979",
  "signature 1.6.4",
-]
-
-[[package]]
-name = "ecstore"
-version = "0.0.1"
-dependencies = [
- "async-channel",
- "async-trait",
- "aws-sdk-s3",
- "base64 0.22.1",
- "byteorder",
- "bytes",
- "bytesize",
- "chrono",
- "common",
- "criterion",
- "enumset",
- "flatbuffers 25.2.10",
- "futures",
- "futures-util",
- "glob",
- "hex-simd",
- "hmac 0.12.1",
- "http 1.3.1",
- "hyper 1.6.0",
- "hyper-rustls 0.27.7",
- "hyper-util",
- "lazy_static",
- "lock",
- "madmin",
- "md-5",
- "nix 0.30.1",
- "num_cpus",
- "once_cell",
- "path-absolutize",
- "path-clean",
- "pin-project-lite",
- "policy",
- "protos",
- "rand 0.9.1",
- "reed-solomon-simd",
- "regex",
- "reqwest",
- "rmp",
- "rmp-serde",
- "rustfs-config",
- "rustfs-filemeta",
- "rustfs-rio",
- "rustfs-rsc",
- "rustfs-signer",
- "rustfs-utils",
- "rustls 0.23.28",
- "s3s",
- "serde",
- "serde-xml-rs 0.8.1",
- "serde_json",
- "sha2 0.10.9",
- "shadow-rs",
- "smallvec",
- "temp-env",
- "tempfile",
- "thiserror 2.0.12",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tower",
- "tracing",
- "url",
- "urlencoding",
- "uuid",
- "winapi",
- "workers",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -4447,18 +4277,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gloo-timers"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
-dependencies = [
- "futures-channel",
- "futures-core",
- "js-sys",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "gloo-utils"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4905,36 +4723,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iam"
-version = "0.0.1"
-dependencies = [
- "arc-swap",
- "async-trait",
- "base64-simd",
- "common",
- "crypto",
- "ecstore",
- "futures",
- "ipnetwork",
- "itertools 0.14.0",
- "jsonwebtoken",
- "lazy_static",
- "madmin",
- "policy",
- "rand 0.9.1",
- "regex",
- "rustfs-utils",
- "serde",
- "serde_json",
- "strum",
- "test-case",
- "thiserror 2.0.12",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "iana-time-zone"
 version = "0.1.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5085,25 +4873,6 @@ dependencies = [
  "same-file",
  "walkdir",
  "winapi-util",
-]
-
-[[package]]
-name = "include_dir"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
-dependencies = [
- "include_dir_macros",
-]
-
-[[package]]
-name = "include_dir_macros"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
-dependencies = [
- "proc-macro2",
- "quote",
 ]
 
 [[package]]
@@ -5663,26 +5432,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lock"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "backon",
- "common",
- "lazy_static",
- "protos",
- "rand 0.9.1",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "tracing-error",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5777,21 +5526,6 @@ name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
-
-[[package]]
-name = "madmin"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "common",
- "humantime",
- "hyper 1.6.0",
- "s3s",
- "serde",
- "serde_json",
- "time",
- "tracing",
-]
 
 [[package]]
 name = "malloc_buf"
@@ -7203,33 +6937,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "policy"
-version = "0.0.1"
-dependencies = [
- "arc-swap",
- "async-trait",
- "base64-simd",
- "common",
- "crypto",
- "futures",
- "ipnetwork",
- "itertools 0.14.0",
- "jsonwebtoken",
- "lazy_static",
- "madmin",
- "rand 0.9.1",
- "regex",
- "serde",
- "serde_json",
- "strum",
- "test-case",
- "thiserror 2.0.12",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "polling"
 version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7451,65 +7158,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "protobuf"
-version = "3.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
-dependencies = [
- "once_cell",
- "protobuf-support",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "protobuf-support"
-version = "3.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
-dependencies = [
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "protos"
-version = "0.0.1"
-dependencies = [
- "common",
- "flatbuffers 25.2.10",
- "prost",
- "prost-build",
- "protobuf",
- "tokio",
- "tonic",
- "tonic-build",
- "tower",
-]
-
-[[package]]
 name = "psm"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e944464ec8536cd1beb0bbfd96987eb5e3b72f2ecdafdc5c769a37f1fa2ae1f"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "query"
-version = "0.0.1"
-dependencies = [
- "api",
- "async-recursion",
- "async-trait",
- "datafusion",
- "derive_builder",
- "futures",
- "lazy_static",
- "parking_lot",
- "s3s",
- "snafu",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -8178,59 +7832,45 @@ dependencies = [
 name = "rustfs"
 version = "0.0.1"
 dependencies = [
- "api",
- "appauth",
  "async-trait",
  "atoi",
  "atomic_enum",
- "aws-sdk-s3",
  "axum",
  "axum-extra",
  "axum-server",
- "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
- "common",
  "const-str",
- "crypto",
  "datafusion",
- "ecstore",
- "flatbuffers 25.2.10",
  "futures",
- "futures-util",
- "hmac 0.12.1",
  "http 1.3.1",
  "http-body 1.0.1",
  "hyper 1.6.0",
  "hyper-util",
- "iam",
- "include_dir",
- "jsonwebtoken",
  "lazy_static",
  "libsystemd",
- "lock",
- "madmin",
  "matchit",
- "mime",
  "mime_guess",
- "netif",
  "opentelemetry",
  "percent-encoding",
  "pin-project-lite",
- "policy",
- "prost-build",
- "protos",
- "query",
- "regex",
  "reqwest",
- "rmp-serde",
  "rust-embed",
+ "rustfs-appauth",
+ "rustfs-common",
  "rustfs-config",
+ "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-iam",
+ "rustfs-madmin",
  "rustfs-notify",
  "rustfs-obs",
+ "rustfs-policy",
+ "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3select-api",
+ "rustfs-s3select-query",
  "rustfs-utils",
  "rustfs-zip",
  "rustls 0.23.28",
@@ -8238,7 +7878,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sha2 0.10.9",
  "shadow-rs",
  "socket2",
  "thiserror 2.0.12",
@@ -8250,14 +7889,31 @@ dependencies = [
  "tokio-tar",
  "tokio-util",
  "tonic",
- "tonic-build",
  "tower",
  "tower-http",
  "tracing",
- "transform-stream",
  "urlencoding",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "rustfs-appauth"
+version = "0.0.1"
+dependencies = [
+ "base64-simd",
+ "rsa",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustfs-common"
+version = "0.0.1"
+dependencies = [
+ "lazy_static",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -8267,6 +7923,99 @@ dependencies = [
  "const-str",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustfs-crypto"
+version = "0.0.1"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "cfg-if",
+ "chacha20poly1305",
+ "jsonwebtoken",
+ "pbkdf2",
+ "rand 0.9.1",
+ "serde_json",
+ "sha2 0.10.9",
+ "test-case",
+ "thiserror 2.0.12",
+ "time",
+]
+
+[[package]]
+name = "rustfs-ecstore"
+version = "0.0.1"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "aws-sdk-s3",
+ "base64 0.22.1",
+ "byteorder",
+ "bytes",
+ "bytesize",
+ "chrono",
+ "criterion",
+ "enumset",
+ "flatbuffers 25.2.10",
+ "futures",
+ "futures-util",
+ "glob",
+ "hex-simd",
+ "hmac 0.12.1",
+ "http 1.3.1",
+ "hyper 1.6.0",
+ "hyper-rustls 0.27.7",
+ "hyper-util",
+ "lazy_static",
+ "md-5",
+ "nix 0.30.1",
+ "num_cpus",
+ "once_cell",
+ "path-absolutize",
+ "path-clean",
+ "pin-project-lite",
+ "rand 0.9.1",
+ "reed-solomon-simd",
+ "regex",
+ "reqwest",
+ "rmp",
+ "rmp-serde",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-filemeta",
+ "rustfs-lock",
+ "rustfs-madmin",
+ "rustfs-policy",
+ "rustfs-protos",
+ "rustfs-rio",
+ "rustfs-rsc",
+ "rustfs-signer",
+ "rustfs-utils",
+ "rustfs-workers",
+ "rustls 0.23.28",
+ "s3s",
+ "serde",
+ "serde-xml-rs 0.8.1",
+ "serde_json",
+ "sha2 0.10.9",
+ "shadow-rs",
+ "smallvec",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.12",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+ "winapi",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -8312,6 +8061,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-iam"
+version = "0.0.1"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64-simd",
+ "futures",
+ "jsonwebtoken",
+ "lazy_static",
+ "rand 0.9.1",
+ "rustfs-crypto",
+ "rustfs-ecstore",
+ "rustfs-madmin",
+ "rustfs-policy",
+ "rustfs-utils",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rustfs-lock"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "lazy_static",
+ "rand 0.9.1",
+ "rustfs-protos",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "rustfs-madmin"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "humantime",
+ "hyper 1.6.0",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "rustfs-notify"
 version = "0.0.1"
 dependencies = [
@@ -8319,13 +8121,13 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap 6.1.0",
- "ecstore",
  "form_urlencoded",
  "once_cell",
  "quick-xml",
  "reqwest",
  "rumqttc",
  "rustfs-config",
+ "rustfs-ecstore",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -8374,18 +8176,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-policy"
+version = "0.0.1"
+dependencies = [
+ "base64-simd",
+ "ipnetwork",
+ "jsonwebtoken",
+ "rand 0.9.1",
+ "regex",
+ "rustfs-crypto",
+ "serde",
+ "serde_json",
+ "strum",
+ "test-case",
+ "thiserror 2.0.12",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "rustfs-protos"
+version = "0.0.1"
+dependencies = [
+ "flatbuffers 25.2.10",
+ "prost",
+ "rustfs-common",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "rustfs-rio"
 version = "0.0.1"
 dependencies = [
  "aes-gcm",
- "async-trait",
- "base64-simd",
- "byteorder",
  "bytes",
  "crc32fast",
  "criterion",
  "futures",
- "hex-simd",
  "http 1.3.1",
  "md-5",
  "pin-project-lite",
@@ -8427,6 +8255,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-s3select-api"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "futures",
+ "futures-core",
+ "http 1.3.1",
+ "object_store",
+ "pin-project-lite",
+ "rustfs-common",
+ "rustfs-ecstore",
+ "s3s",
+ "snafu",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "transform-stream",
+ "url",
+]
+
+[[package]]
+name = "rustfs-s3select-query"
+version = "0.0.1"
+dependencies = [
+ "async-recursion",
+ "async-trait",
+ "datafusion",
+ "derive_builder",
+ "futures",
+ "lazy_static",
+ "parking_lot",
+ "rustfs-s3select-api",
+ "s3s",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustfs-signer"
 version = "0.0.1"
 dependencies = [
@@ -8434,11 +8304,8 @@ dependencies = [
  "http 1.3.1",
  "hyper 1.6.0",
  "lazy_static",
- "rand 0.9.1",
  "rustfs-utils",
- "serde",
  "serde_urlencoded",
- "tempfile",
  "time",
  "tracing",
 ]
@@ -8451,7 +8318,6 @@ dependencies = [
  "blake3",
  "brotli 8.0.1",
  "bytes",
- "common",
  "crc32fast",
  "flate2",
  "futures",
@@ -8489,16 +8355,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-workers"
+version = "0.0.1"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustfs-zip"
 version = "0.0.1"
 dependencies = [
  "async-compression",
- "async_zip",
  "tokio",
  "tokio-stream",
  "tokio-tar",
- "xz2",
- "zip",
 ]
 
 [[package]]
@@ -11488,15 +11359,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f42320e61fe2cfd34354ecb597f86f413484a798ba44a8ca1165c58d42da6c1"
 dependencies = [
  "bitflags 2.9.1",
-]
-
-[[package]]
-name = "workers"
-version = "0.0.1"
-dependencies = [
- "common",
- "tokio",
- "tracing",
 ]
 
 [[package]]

@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::admin::{router::Operation, utils::has_space_be};
-use ecstore::global::get_global_action_cred;
 use http::{HeaderMap, StatusCode};
-use iam::error::is_err_no_such_user;
-use iam::store::MappedPolicy;
 use matchit::Params;
-use policy::policy::Policy;
+use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_iam::error::is_err_no_such_user;
+use rustfs_iam::store::MappedPolicy;
+use rustfs_policy::policy::Policy;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -46,7 +46,7 @@ impl Operation for ListCannedPolicies {
             }
         };
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let policies = iam_store.list_polices(&query.bucket).await.map_err(|e| {
             warn!("list policies failed, e: {:?}", e);
@@ -114,7 +114,7 @@ impl Operation for AddCannedPolicy {
             return Err(s3_error!(InvalidRequest, "policy version is empty"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         iam_store.set_policy(&query.name, policy).await.map_err(|e| {
             warn!("set policy failed, e: {:?}", e);
@@ -153,7 +153,7 @@ impl Operation for InfoCannedPolicy {
             return Err(s3_error!(InvalidArgument, "too many policies"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let pd = iam_store.info_policy(&query.name).await.map_err(|e| {
             warn!("info policy failed, e: {:?}", e);
@@ -189,7 +189,7 @@ impl Operation for RemoveCannedPolicy {
             return Err(s3_error!(InvalidArgument, "policy name is empty"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         iam_store.delete_policy(&query.name, true).await.map_err(|e| {
             warn!("delete policy failed, e: {:?}", e);
@@ -237,7 +237,7 @@ impl Operation for SetPolicyForUserOrGroup {
             return Err(s3_error!(InvalidArgument, "user or group is empty"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         if !query.is_group {
             match iam_store.is_temp_user(&query.user_or_group).await {
@@ -275,7 +275,7 @@ impl Operation for SetPolicyForUserOrGroup {
         }
 
         iam_store
-            .policy_db_set(&query.user_or_group, iam::store::UserType::Reg, query.is_group, &query.policy_name)
+            .policy_db_set(&query.user_or_group, rustfs_iam::store::UserType::Reg, query.is_group, &query.policy_name)
             .await
             .map_err(|e| {
                 warn!("policy db set failed, e: {:?}", e);

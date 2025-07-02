@@ -17,7 +17,6 @@ use crate::{
     target::{Target, mqtt::MQTTArgs, webhook::WebhookArgs},
 };
 use async_trait::async_trait;
-use ecstore::config::{ENABLE_KEY, ENABLE_ON, KVS};
 use rumqttc::QoS;
 use rustfs_config::notify::{
     DEFAULT_DIR, DEFAULT_LIMIT, ENV_MQTT_BROKER, ENV_MQTT_ENABLE, ENV_MQTT_KEEP_ALIVE_INTERVAL, ENV_MQTT_PASSWORD, ENV_MQTT_QOS,
@@ -28,6 +27,7 @@ use rustfs_config::notify::{
     WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENV_WORD_DELIMITER_DASH};
+use rustfs_ecstore::config::{ENABLE_KEY, ENABLE_ON, KVS};
 use std::time::Duration;
 use tracing::{debug, warn};
 use url::Url;

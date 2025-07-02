@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::global::get_global_action_cred;
 use http::{HeaderMap, StatusCode};
-use iam::error::{is_err_no_such_group, is_err_no_such_user};
-use madmin::GroupAddRemove;
 use matchit::Params;
+use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
+use rustfs_madmin::GroupAddRemove;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -36,7 +36,7 @@ impl Operation for ListGroups {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListGroups");
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let groups = iam_store.list_groups().await.map_err(|e| {
             warn!("list groups failed, e: {:?}", e);
@@ -67,7 +67,7 @@ impl Operation for GetGroup {
                 GroupQuery::default()
             }
         };
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         let g = iam_store.get_group_description(&query.group).await.map_err(|e| {
             warn!("get group failed, e: {:?}", e);
@@ -103,7 +103,7 @@ impl Operation for SetGroupStatus {
             return Err(s3_error!(InvalidArgument, "group is required"));
         }
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         if let Some(status) = query.status {
             match status.as_str() {
@@ -154,7 +154,7 @@ impl Operation for UpdateGroupMembers {
 
         warn!("UpdateGroupMembers args {:?}", args);
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         for member in args.members.iter() {
             match iam_store.is_temp_user(member).await {

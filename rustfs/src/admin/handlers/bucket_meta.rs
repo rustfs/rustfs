@@ -22,7 +22,9 @@ use crate::{
     auth::{check_key_valid, get_session_token},
 };
 
-use ecstore::{
+use http::{HeaderMap, StatusCode};
+use matchit::Params;
+use rustfs_ecstore::{
     StorageAPI,
     bucket::{
         metadata::{
@@ -38,13 +40,11 @@ use ecstore::{
     new_object_layer_fn,
     store_api::BucketOptions,
 };
-use ecstore::{
+use rustfs_ecstore::{
     bucket::utils::{deserialize, serialize},
     store_api::MakeBucketOptions,
 };
-use http::{HeaderMap, StatusCode};
-use matchit::Params;
-use policy::policy::BucketPolicy;
+use rustfs_policy::policy::BucketPolicy;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
@@ -125,15 +125,16 @@ impl Operation for ExportBucketMetadata {
                 let conf_path = path_join_buf(&[bucket.name.as_str(), conf]);
                 match conf {
                     BUCKET_POLICY_CONFIG => {
-                        let config: policy::policy::BucketPolicy = match metadata_sys::get_bucket_policy(&bucket.name).await {
-                            Ok((res, _)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
+                        let config: rustfs_policy::policy::BucketPolicy =
+                            match metadata_sys::get_bucket_policy(&bucket.name).await {
+                                Ok((res, _)) => res,
+                                Err(e) => {
+                                    if e == StorageError::ConfigNotFound {
+                                        continue;
+                                    }
+                                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
                                 }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                        };
+                            };
                         let config_json =
                             serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
                         zip_writer

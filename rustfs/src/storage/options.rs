@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::bucket::versioning_sys::BucketVersioningSys;
-use ecstore::error::Result;
-use ecstore::error::StorageError;
-use ecstore::store_api::ObjectOptions;
 use http::{HeaderMap, HeaderValue};
 use lazy_static::lazy_static;
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::error::Result;
+use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_utils::path::is_dir_object;
 use std::collections::HashMap;
 use uuid::Uuid;

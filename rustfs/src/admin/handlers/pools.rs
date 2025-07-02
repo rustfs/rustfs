@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::{GLOBAL_Endpoints, new_object_layer_fn};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_ecstore::{GLOBAL_Endpoints, new_object_layer_fn};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;

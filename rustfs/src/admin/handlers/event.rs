@@ -74,14 +74,17 @@ impl Operation for SetNotificationTarget {
         let mut kvs_map: HashMap<String, String> = serde_json::from_slice(&body)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
         // If there is an enable key, add an enable key value to "on"
-        if !kvs_map.contains_key(ecstore::config::ENABLE_KEY) {
-            kvs_map.insert(ecstore::config::ENABLE_KEY.to_string(), ecstore::config::ENABLE_ON.to_string());
+        if !kvs_map.contains_key(rustfs_ecstore::config::ENABLE_KEY) {
+            kvs_map.insert(
+                rustfs_ecstore::config::ENABLE_KEY.to_string(),
+                rustfs_ecstore::config::ENABLE_ON.to_string(),
+            );
         }
 
-        let kvs = ecstore::config::KVS(
+        let kvs = rustfs_ecstore::config::KVS(
             kvs_map
                 .into_iter()
-                .map(|(key, value)| ecstore::config::KV {
+                .map(|(key, value)| rustfs_ecstore::config::KV {
                     key,
                     value,
                     hidden_if_empty: false, // Set a default value

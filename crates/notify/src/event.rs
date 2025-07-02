@@ -547,7 +547,7 @@ pub struct EventLog {
 pub struct EventArgs {
     pub event_name: EventName,
     pub bucket_name: String,
-    pub object: ecstore::store_api::ObjectInfo,
+    pub object: rustfs_ecstore::store_api::ObjectInfo,
     pub req_params: HashMap<String, String>,
     pub resp_elements: HashMap<String, String>,
     pub version_id: String,

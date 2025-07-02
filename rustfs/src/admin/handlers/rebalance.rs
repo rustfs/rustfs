@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::{
+use http::{HeaderMap, StatusCode};
+use matchit::Params;
+use rustfs_ecstore::{
     StorageAPI,
     error::StorageError,
     new_object_layer_fn,
@@ -20,8 +22,6 @@ use ecstore::{
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOptions,
 };
-use http::{HeaderMap, StatusCode};
-use matchit::Params;
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -29,7 +29,7 @@ use time::OffsetDateTime;
 use tracing::warn;
 
 use crate::admin::router::Operation;
-use ecstore::rebalance::RebalanceMeta;
+use rustfs_ecstore::rebalance::RebalanceMeta;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RebalanceResp {

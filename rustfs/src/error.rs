@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::error::StorageError;
+use rustfs_ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode};
 
 #[derive(Debug)]
@@ -102,8 +102,8 @@ impl From<std::io::Error> for ApiError {
     }
 }
 
-impl From<iam::error::Error> for ApiError {
-    fn from(err: iam::error::Error) -> Self {
+impl From<rustfs_iam::error::Error> for ApiError {
+    fn from(err: rustfs_iam::error::Error) -> Self {
         let serr: StorageError = err.into();
         serr.into()
     }
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_api_error_from_iam_error() {
-        let iam_error = iam::error::Error::other("IAM test error");
+        let iam_error = rustfs_iam::error::Error::other("IAM test error");
         let api_error: ApiError = iam_error.into();
 
         // IAM error is first converted to StorageError, then to ApiError

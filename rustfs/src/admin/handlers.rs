@@ -18,39 +18,38 @@ use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
 use crate::error::ApiError;
 use bytes::Bytes;
-use ecstore::admin_server_info::get_server_info;
-use ecstore::bucket::metadata_sys::{self, get_replication_config};
-use ecstore::bucket::target::BucketTarget;
-use ecstore::bucket::versioning_sys::BucketVersioningSys;
-use ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
-use ecstore::error::StorageError;
-use ecstore::global::GLOBAL_ALlHealState;
-use ecstore::global::get_global_action_cred;
-use ecstore::heal::data_usage::load_data_usage_from_backend;
-use ecstore::heal::heal_commands::HealOpts;
-use ecstore::heal::heal_ops::new_heal_sequence;
-use ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
-use ecstore::new_object_layer_fn;
-use ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use ecstore::store::is_valid_object_prefix;
-use ecstore::store_api::BucketOptions;
-use ecstore::store_api::StorageAPI;
-use ecstore::store_utils::is_reserved_or_invalid_bucket;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
-use iam::store::MappedPolicy;
-use rustfs_utils::path::path_join;
-// use lazy_static::lazy_static;
-use madmin::metrics::RealtimeMetrics;
-use madmin::utils::parse_duration;
 use matchit::Params;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
-use policy::policy::Args;
-use policy::policy::BucketPolicy;
-use policy::policy::action::Action;
-use policy::policy::action::S3Action;
-use policy::policy::default::DEFAULT_POLICIES;
+use rustfs_ecstore::admin_server_info::get_server_info;
+use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
+use rustfs_ecstore::bucket::target::BucketTarget;
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
+use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::global::GLOBAL_ALlHealState;
+use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
+use rustfs_ecstore::heal::heal_commands::HealOpts;
+use rustfs_ecstore::heal::heal_ops::new_heal_sequence;
+use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::store::is_valid_object_prefix;
+use rustfs_ecstore::store_api::BucketOptions;
+use rustfs_ecstore::store_api::StorageAPI;
+use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
+use rustfs_iam::store::MappedPolicy;
+use rustfs_madmin::metrics::RealtimeMetrics;
+use rustfs_madmin::utils::parse_duration;
+use rustfs_policy::policy::Args;
+use rustfs_policy::policy::BucketPolicy;
+use rustfs_policy::policy::action::Action;
+use rustfs_policy::policy::action::S3Action;
+use rustfs_policy::policy::default::DEFAULT_POLICIES;
+use rustfs_utils::path::path_join;
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
@@ -87,7 +86,7 @@ use urlencoding::decode;
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {
     pub account_name: String,
-    pub server: madmin::BackendInfo,
+    pub server: rustfs_madmin::BackendInfo,
     pub policy: BucketPolicy,
 }
 
@@ -106,7 +105,9 @@ impl Operation for AccountInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        let Ok(iam_store) = rustfs_iam::get() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
@@ -211,7 +212,7 @@ impl Operation for AccountInfoHandler {
             ));
         };
 
-        let mut effective_policy: policy::policy::Policy = Default::default();
+        let mut effective_policy: rustfs_policy::policy::Policy = Default::default();
 
         if account_name == admin_cred.access_key {
             for (name, p) in DEFAULT_POLICIES.iter() {
@@ -240,7 +241,7 @@ impl Operation for AccountInfoHandler {
         let policy_str = serde_json::to_string(&effective_policy)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse policy failed"))?;
 
-        let mut account_info = madmin::AccountInfo {
+        let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
             server: store.backend_info().await,
             policy: serde_json::Value::String(policy_str),
@@ -261,15 +262,15 @@ impl Operation for AccountInfoHandler {
             if rd || wr {
                 // TODO: BucketQuotaSys
                 // TODO: other attributes
-                account_info.buckets.push(madmin::BucketAccessInfo {
+                account_info.buckets.push(rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
-                    details: Some(madmin::BucketDetails {
+                    details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
                         versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
                         ..Default::default()
                     }),
                     created: bucket.created,
-                    access: madmin::AccountAccess { read: rd, write: wr },
+                    access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
                 });
             }
@@ -832,9 +833,9 @@ impl Operation for SetRemoteTargetHandler {
             };
 
             // let binfo:BucketInfo = store
-            // .get_bucket_info(bucket, &ecstore::store_api::BucketOptions::default()).await;
+            // .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default()).await;
             match store
-                .get_bucket_info(bucket, &ecstore::store_api::BucketOptions::default())
+                .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
                 .await
             {
                 Ok(info) => {
@@ -949,7 +950,7 @@ impl Operation for ListRemoteTargetHandler {
             };
 
             match store
-                .get_bucket_info(bucket, &ecstore::store_api::BucketOptions::default())
+                .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
                 .await
             {
                 Ok(info) => {
@@ -1047,7 +1048,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
 #[cfg(test)]
 mod test {
-    use ecstore::heal::heal_commands::HealOpts;
+    use rustfs_ecstore::heal::heal_commands::HealOpts;
 
     #[ignore] // FIXME: failed in github actions
     #[test]
