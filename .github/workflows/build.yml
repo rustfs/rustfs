@@ -581,3 +581,86 @@ jobs:
           name: rustfs-packages
           pattern: "rustfs-*"
           delete-merged: true
+
+  # Create GitHub Release with all build artifacts
+  release:
+    runs-on: ubuntu-latest
+    needs: [merge]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Download merged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rustfs-packages
+          path: ./release-artifacts
+
+      - name: Display downloaded artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          ls -la ./release-artifacts/
+          find ./release-artifacts -name "*.zip" -exec basename {} \;
+
+      - name: Extract version and create release notes
+        id: release_info
+        run: |
+          # Extract version from tag
+          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION_CLEAN="${VERSION#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version_clean=${VERSION_CLEAN}" >> $GITHUB_OUTPUT
+
+          # Create release notes
+          cat > release_notes.md << EOF
+          ## RustFS ${VERSION_CLEAN}
+
+          ### 🚀 Binary Downloads
+
+          Choose the appropriate binary for your platform:
+
+          **Linux:**
+          - \`rustfs-release-x86_64-unknown-linux-musl.zip\` - Linux x86_64 (static binary)
+          - \`rustfs-release-x86_64-unknown-linux-gnu.zip\` - Linux x86_64 (glibc)
+          - \`rustfs-release-aarch64-unknown-linux-musl.zip\` - Linux ARM64 (static binary)
+
+          **macOS:**
+          - \`rustfs-release-aarch64-apple-darwin.zip\` - macOS Apple Silicon (M1/M2)
+
+          **GUI Applications:**
+          - \`rustfs-gui-release-*.zip\` - GUI applications for different platforms
+
+          ### 📦 Installation
+
+          1. Download the appropriate binary for your platform
+          2. Extract the archive
+          3. Make the binary executable: \`chmod +x rustfs\`
+          4. Move to your PATH: \`sudo mv rustfs /usr/local/bin/\`
+
+          ### 🔗 Alternative Downloads
+
+          - [OSS Mirror](https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/)
+
+          ---
+
+          **Full Changelog**: https://github.com/rustfs/rustfs/compare/\${GITHUB_REF#refs/tags/}...${VERSION}
+          EOF
+
+          echo "Generated release notes:"
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.version }}
+          name: "RustFS ${{ steps.release_info.outputs.version_clean }}"
+          body_path: release_notes.md
+          files: ./release-artifacts/*.zip
+          draft: false
+          prerelease: ${{ contains(steps.release_info.outputs.version, 'alpha') || contains(steps.release_info.outputs.version, 'beta') || contains(steps.release_info.outputs.version, 'rc') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
