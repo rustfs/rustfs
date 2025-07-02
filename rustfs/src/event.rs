@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ecstore::config::GLOBAL_ServerConfig;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_ecstore::config::GLOBAL_ServerConfig;
 use tracing::{error, info, instrument};
 
 #[instrument]

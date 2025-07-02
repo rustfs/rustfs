@@ -14,28 +14,28 @@
 
 [workspace]
 members = [
-    "appauth", # Application authentication and authorization
+    "rustfs", # Core file system implementation
     "cli/rustfs-gui", # Graphical user interface client
-    "common/common", # Shared utilities and data structures
-    "crates/filemeta", # File metadata management
-    "common/lock", # Distributed locking implementation
-    "common/protos", # Protocol buffer definitions
-    "common/workers", # Worker thread pools and task scheduling
+    "crates/appauth", # Application authentication and authorization
+    "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
+    "crates/crypto", # Cryptography and security features
+    "crates/ecstore", # Erasure coding storage implementation
+    "crates/e2e_test", # End-to-end test suite
+    "crates/filemeta", # File metadata management
+    "crates/iam", # Identity and Access Management
+    "crates/lock", # Distributed locking implementation
+    "crates/madmin", # Management dashboard and admin API interface
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
+    "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
-    "crates/utils", # Utility functions and helpers
-    "crates/zip", # ZIP file handling and compression
+    "crates/s3select-api", # S3 Select API interface
+    "crates/s3select-query", # S3 Select query engine
     "crates/signer", # client signer
-    "crypto", # Cryptography and security features
-    "ecstore", # Erasure coding storage implementation
-    "e2e_test", # End-to-end test suite
-    "iam", # Identity and Access Management
-    "madmin", # Management dashboard and admin API interface
-    "rustfs", # Core file system implementation
-    "s3select/api", # S3 Select API interface
-    "s3select/query", # S3 Select query engine
+    "crates/utils", # Utility functions and helpers
+    "crates/workers", # Worker thread pools and task scheduling
+    "crates/zip", # ZIP file handling and compression
 ]
 resolver = "2"
 
@@ -53,17 +53,17 @@ unsafe_code = "deny"
 all = "warn"
 
 [workspace.dependencies]
-api = { path = "./s3select/api", version = "0.0.1" }
-appauth = { path = "./appauth", version = "0.0.1" }
-common = { path = "./common/common", version = "0.0.1" }
-crypto = { path = "./crypto", version = "0.0.1" }
-ecstore = { path = "./ecstore", version = "0.0.1" }
-iam = { path = "./iam", version = "0.0.1" }
-lock = { path = "./common/lock", version = "0.0.1" }
-madmin = { path = "./madmin", version = "0.0.1" }
-policy = { path = "./policy", version = "0.0.1" }
-protos = { path = "./common/protos", version = "0.0.1" }
-query = { path = "./s3select/query", version = "0.0.1" }
+rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.1" }
+rustfs-appauth = { path = "crates/appauth", version = "0.0.1" }
+rustfs-common = { path = "crates/common", version = "0.0.1" }
+rustfs-crypto = { path = "crates/crypto", version = "0.0.1" }
+rustfs-ecstore = { path = "crates/ecstore", version = "0.0.1" }
+rustfs-iam = { path = "crates/iam", version = "0.0.1" }
+rustfs-lock = { path = "crates/lock", version = "0.0.1" }
+rustfs-madmin = { path = "crates/madmin", version = "0.0.1" }
+rustfs-policy = { path = "crates/policy", version = "0.0.1" }
+rustfs-protos = { path = "crates/protos", version = "0.0.1" }
+rustfs-s3select-query = { path = "crates/s3select-query", version = "0.0.1" }
 rustfs = { path = "./rustfs", version = "0.0.1" }
 rustfs-zip = { path = "./crates/zip", version = "0.0.1" }
 rustfs-config = { path = "./crates/config", version = "0.0.1" }
@@ -73,7 +73,7 @@ rustfs-utils = { path = "crates/utils", version = "0.0.1" }
 rustfs-rio = { path = "crates/rio", version = "0.0.1" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
 rustfs-signer = { path = "crates/signer", version = "0.0.1" }
-workers = { path = "./common/workers", version = "0.0.1" }
+rustfs-workers = { path = "crates/workers", version = "0.0.1" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
 argon2 = { version = "0.5.3", features = ["std"] }
@@ -81,15 +81,14 @@ atoi = "2.0.0"
 async-channel = "2.3.1"
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
+async-compression = { version = "0.4.0" }
 atomic_enum = "0.3.0"
 aws-sdk-s3 = "1.95.0"
 axum = "0.8.4"
 axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-backon = "1.5.1"
 base64-simd = "0.8.0"
 base64 = "0.22.1"
-blake2 = "0.10.6"
 brotli = "8.0.1"
 bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.0.1"
@@ -100,6 +99,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
+criterion = { version = "0.5", features = ["html_reports"] }
 dashmap = "6.1.0"
 datafusion = "46.0.1"
 derive_builder = "0.20.2"
@@ -128,9 +128,7 @@ hyper-rustls = "0.27.5"
 http = "1.3.1"
 http-body = "1.0.1"
 humantime = "2.2.0"
-include_dir = "0.7.4"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
-itertools = "0.14.0"
 jsonwebtoken = "9.3.1"
 keyring = { version = "3.6.2", features = [
     "apple-native",
@@ -143,7 +141,6 @@ local-ip-address = "0.6.5"
 lz4 = "1.28.1"
 matchit = "0.8.4"
 md-5 = "0.10.6"
-mime = "0.3.17"
 mime_guess = "2.0.5"
 netif = "0.1.6"
 nix = { version = "0.30.1", features = ["fs"] }
@@ -175,7 +172,6 @@ percent-encoding = "2.3.1"
 pin-project-lite = "0.2.16"
 prost = "0.13.5"
 prost-build = "0.13.5"
-protobuf = "3.7"
 quick-xml = "0.37.5"
 rand = "0.9.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
@@ -205,7 +201,6 @@ rustls = { version = "0.23.28" }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "4733cdfb27b2713e832967232cbff413bb768c10" }
-scopeguard = "1.2.0"
 shadow-rs = { version = "1.2.0", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["raw_value"] }
@@ -213,7 +208,6 @@ serde-xml-rs = "0.8.1"
 serde_urlencoded = "0.7.1"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
-std-next = "0.1.9"
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use appauth::token::Token;
+use rustfs_appauth::token::Token;
 use std::io::{Error, Result};
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -31,7 +31,7 @@ pub fn init_license(license: Option<String>) {
         return;
     }
     let license = license.unwrap();
-    let token = appauth::token::parse_license(&license).unwrap_or_default();
+    let token = rustfs_appauth::token::parse_license(&license).unwrap_or_default();
 
     LICENSE.set(token).unwrap_or_else(|_| {
         error!("Failed to set license");

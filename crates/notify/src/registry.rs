@@ -18,9 +18,9 @@ use crate::{
     factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
     target::Target,
 };
-use ecstore::config::{Config, ENABLE_KEY, ENABLE_OFF, ENABLE_ON, KVS};
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
+use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_OFF, ENABLE_ON, KVS};
 use std::collections::HashMap;
 use tracing::{debug, error, info};
 

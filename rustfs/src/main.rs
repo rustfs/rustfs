@@ -34,26 +34,6 @@ use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, Shutdow
 use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
-use common::{
-    // error::{Error, Result},
-    globals::set_global_addr,
-};
-use ecstore::StorageAPI;
-use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
-use ecstore::config as ecconfig;
-use ecstore::config::GLOBAL_ConfigSys;
-use ecstore::heal::background_heal_ops::init_auto_heal;
-use ecstore::rpc::make_server;
-use ecstore::store_api::BucketOptions;
-use ecstore::{
-    endpoints::EndpointServerPools,
-    heal::data_scanner::init_data_scanner,
-    set_global_endpoints,
-    store::{ECStore, init_local_disks},
-    update_erasure_type,
-};
-use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
 use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::{
@@ -61,11 +41,28 @@ use hyper_util::{
     server::conn::auto::Builder as ConnBuilder,
     service::TowerToHyperService,
 };
-use iam::init_iam_sys;
 use license::init_license;
-use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_common::globals::set_global_addr;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_ecstore::StorageAPI;
+use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
+use rustfs_ecstore::config as ecconfig;
+use rustfs_ecstore::config::GLOBAL_ConfigSys;
+use rustfs_ecstore::heal::background_heal_ops::init_auto_heal;
+use rustfs_ecstore::rpc::make_server;
+use rustfs_ecstore::store_api::BucketOptions;
+use rustfs_ecstore::{
+    endpoints::EndpointServerPools,
+    heal::data_scanner::init_data_scanner,
+    set_global_endpoints,
+    store::{ECStore, init_local_disks},
+    update_erasure_type,
+};
+use rustfs_ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
+use rustfs_iam::init_iam_sys;
 use rustfs_obs::{SystemObserver, init_obs, set_global_guard};
+use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -142,7 +139,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("server_address {}", &server_address);
 
     // Set up AK and SK
-    ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    rustfs_ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
 
     set_global_rustfs_port(server_port);
 

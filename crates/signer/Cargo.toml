@@ -27,13 +27,10 @@ bytes = { workspace = true }
 http.workspace = true
 time.workspace = true
 hyper.workspace = true
-serde.workspace = true
 serde_urlencoded.workspace = true
-rustfs-utils = {workspace = true, features=["full"]}
+rustfs-utils = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-rand = { workspace = true }
 
 [lints]
 workspace = true

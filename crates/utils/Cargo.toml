@@ -53,7 +53,6 @@ transform-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 sysinfo = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
-common.workspace = true
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
@@ -81,7 +80,7 @@ notify = ["dep:hyper", "dep:s3s"]  # file system notification features
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex", "dep:lazy_static", "dep:rand"]
 crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
-hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd","dep:base64-simd"]
+hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:base64-simd"]
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features

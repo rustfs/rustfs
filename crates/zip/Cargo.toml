@@ -22,7 +22,7 @@ version.workspace = true
 
 
 [dependencies]
-async-compression = { version = "0.4.0", features = [
+async-compression = { workspace = true, features = [
     "tokio",
     "bzip2",
     "gzip",
@@ -30,12 +30,9 @@ async-compression = { version = "0.4.0", features = [
     "zstd",
     "xz",
 ] }
-async_zip = { version = "0.0.17", features = ["tokio"] }
-zip = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tokio-tar = { workspace = true }
-xz2 = { version = "0.1", optional = true, features = ["static"] }
 
 
 [lints]

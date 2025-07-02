@@ -18,7 +18,7 @@ use crate::{
     Event, EventName, StoreError, Target, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry,
     rules::BucketNotificationConfig, stream,
 };
-use ecstore::config::{Config, KVS};
+use rustfs_ecstore::config::{Config, KVS};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -196,11 +196,11 @@ impl NotificationSystem {
     where
         F: FnMut(&mut Config) -> bool, // The closure returns a boolean value indicating whether the configuration has been changed
     {
-        let Some(store) = ecstore::global::new_object_layer_fn() else {
+        let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
             return Err(NotificationError::ServerNotInitialized);
         };
 
-        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
+        let mut new_config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
             .await
             .map_err(|e| NotificationError::ReadConfig(e.to_string()))?;
 
@@ -210,7 +210,7 @@ impl NotificationSystem {
             return Ok(());
         }
 
-        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
+        if let Err(e) = rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
             error!("Failed to save config: {}", e);
             return Err(NotificationError::SaveConfig(e.to_string()));
         }

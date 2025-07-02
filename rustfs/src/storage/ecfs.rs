@@ -22,71 +22,71 @@ use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;
 use crate::storage::options::{extract_metadata_from_mime, get_opts};
-use api::object_store::bytes_stream;
-use api::query::Context;
-use api::query::Query;
-use api::server::dbms::DatabaseManagerSystem;
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use rustfs_s3select_api::object_store::bytes_stream;
+use rustfs_s3select_api::query::Context;
+use rustfs_s3select_api::query::Query;
+use rustfs_s3select_api::server::dbms::DatabaseManagerSystem;
 
-// use ecstore::store_api::RESERVED_METADATA_PREFIX;
-use ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
-use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
-use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
-use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
-use ecstore::bucket::metadata::BUCKET_REPLICATION_CONFIG;
-use ecstore::bucket::metadata::BUCKET_SSECONFIG;
-use ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
-use ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
-use ecstore::bucket::metadata::OBJECT_LOCK_CONFIG;
-use ecstore::bucket::metadata_sys;
-use ecstore::bucket::policy_sys::PolicySys;
-use ecstore::bucket::tagging::decode_tags;
-use ecstore::bucket::tagging::encode_tags;
-use ecstore::bucket::utils::serialize;
-use ecstore::bucket::versioning_sys::BucketVersioningSys;
-use ecstore::cmd::bucket_replication::ReplicationStatusType;
-use ecstore::cmd::bucket_replication::ReplicationType;
-use ecstore::cmd::bucket_replication::get_must_replicate_options;
-use ecstore::cmd::bucket_replication::must_replicate;
-use ecstore::cmd::bucket_replication::schedule_replication;
-use ecstore::compress::MIN_COMPRESSIBLE_SIZE;
-use ecstore::compress::is_compressible;
-use ecstore::error::StorageError;
-use ecstore::new_object_layer_fn;
-use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-use ecstore::store_api::BucketOptions;
-use ecstore::store_api::CompletePart;
-use ecstore::store_api::DeleteBucketOptions;
-use ecstore::store_api::HTTPRangeSpec;
-use ecstore::store_api::MakeBucketOptions;
-use ecstore::store_api::MultipartUploadResult;
-use ecstore::store_api::ObjectIO;
-use ecstore::store_api::ObjectOptions;
-use ecstore::store_api::ObjectToDelete;
-use ecstore::store_api::PutObjReader;
-use ecstore::store_api::StorageAPI;
+// use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
 use futures::StreamExt;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use policy::auth;
-use policy::policy::BucketPolicy;
-use policy::policy::BucketPolicyArgs;
-use policy::policy::Validator;
-use policy::policy::action::Action;
-use policy::policy::action::S3Action;
-use query::instance::make_rustfsms;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
+use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
+use rustfs_ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+use rustfs_ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
+use rustfs_ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
+use rustfs_ecstore::bucket::metadata::BUCKET_REPLICATION_CONFIG;
+use rustfs_ecstore::bucket::metadata::BUCKET_SSECONFIG;
+use rustfs_ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
+use rustfs_ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
+use rustfs_ecstore::bucket::metadata::OBJECT_LOCK_CONFIG;
+use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::bucket::policy_sys::PolicySys;
+use rustfs_ecstore::bucket::tagging::decode_tags;
+use rustfs_ecstore::bucket::tagging::encode_tags;
+use rustfs_ecstore::bucket::utils::serialize;
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
+use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
+use rustfs_ecstore::cmd::bucket_replication::get_must_replicate_options;
+use rustfs_ecstore::cmd::bucket_replication::must_replicate;
+use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
+use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
+use rustfs_ecstore::compress::is_compressible;
+use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+use rustfs_ecstore::store_api::BucketOptions;
+use rustfs_ecstore::store_api::CompletePart;
+use rustfs_ecstore::store_api::DeleteBucketOptions;
+use rustfs_ecstore::store_api::HTTPRangeSpec;
+use rustfs_ecstore::store_api::MakeBucketOptions;
+use rustfs_ecstore::store_api::MultipartUploadResult;
+use rustfs_ecstore::store_api::ObjectIO;
+use rustfs_ecstore::store_api::ObjectOptions;
+use rustfs_ecstore::store_api::ObjectToDelete;
+use rustfs_ecstore::store_api::PutObjReader;
+use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_notify::EventName;
+use rustfs_policy::auth;
+use rustfs_policy::policy::action::Action;
+use rustfs_policy::policy::action::S3Action;
+use rustfs_policy::policy::{BucketPolicy, BucketPolicyArgs, Validator};
 use rustfs_rio::CompressReader;
 use rustfs_rio::EtagReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
+use rustfs_s3select_query::instance::make_rustfsms;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
@@ -114,9 +114,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
-
-use ecstore::bucket::lifecycle::lifecycle::Lifecycle;
-use rustfs_notify::EventName;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -329,7 +326,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::BucketCreated,
             bucket_name: bucket.clone(),
-            object: ecstore::store_api::ObjectInfo { ..Default::default() },
+            object: rustfs_ecstore::store_api::ObjectInfo { ..Default::default() },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
             version_id: String::new(),
@@ -514,7 +511,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::BucketRemoved,
             bucket_name: input.bucket,
-            object: ecstore::store_api::ObjectInfo { ..Default::default() },
+            object: rustfs_ecstore::store_api::ObjectInfo { ..Default::default() },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
             version_id: String::new(),
@@ -585,7 +582,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectRemovedDelete,
             bucket_name: bucket.clone(),
-            object: ecstore::store_api::ObjectInfo {
+            object: rustfs_ecstore::store_api::ObjectInfo {
                 name: key,
                 bucket,
                 ..Default::default()
@@ -671,7 +668,7 @@ impl S3 for FS {
                 let event_args = rustfs_notify::event::EventArgs {
                     event_name,
                     bucket_name: bucket.clone(),
-                    object: ecstore::store_api::ObjectInfo {
+                    object: rustfs_ecstore::store_api::ObjectInfo {
                         name: dobj.object_name,
                         bucket: bucket.clone(),
                         ..Default::default()
@@ -1376,7 +1373,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedCompleteMultipartUpload,
             bucket_name: bucket_name.clone(),
-            object: ecstore::store_api::ObjectInfo {
+            object: rustfs_ecstore::store_api::ObjectInfo {
                 name: object_name,
                 bucket: bucket_name,
                 ..Default::default()
@@ -1668,7 +1665,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedPutTagging,
             bucket_name: bucket.clone(),
-            object: ecstore::store_api::ObjectInfo {
+            object: rustfs_ecstore::store_api::ObjectInfo {
                 name: object.clone(),
                 bucket,
                 ..Default::default()
@@ -1735,7 +1732,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedDeleteTagging,
             bucket_name: bucket.clone(),
-            object: ecstore::store_api::ObjectInfo {
+            object: rustfs_ecstore::store_api::ObjectInfo {
                 name: object.clone(),
                 bucket,
                 ..Default::default()
@@ -2485,7 +2482,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectAccessedAttributes,
             bucket_name: bucket.clone(),
-            object: ecstore::store_api::ObjectInfo {
+            object: rustfs_ecstore::store_api::ObjectInfo {
                 name: key.clone(),
                 bucket,
                 ..Default::default()

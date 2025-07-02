@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common::error::Error;
 use ecstore::error::StorageError;
-use s3s::{S3Error, S3ErrorCode, s3_error};
+use rustfs_common::error::Error;
+use s3s::{s3_error, S3Error, S3ErrorCode};
 pub fn to_s3_error(err: Error) -> S3Error {
     if let Some(storage_err) = err.downcast_ref::<StorageError>() {
         return match storage_err {

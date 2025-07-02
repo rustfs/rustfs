@@ -1,0 +1,40 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "e2e_test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustfs-ecstore.workspace = true
+flatbuffers.workspace = true
+futures.workspace = true
+rustfs-lock.workspace = true
+rustfs-protos.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tonic = { workspace = true }
+tokio = { workspace = true }
+url.workspace = true
+rustfs-madmin.workspace = true
+rustfs-filemeta.workspace = true
+bytes.workspace = true
