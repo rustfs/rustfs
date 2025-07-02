@@ -68,7 +68,7 @@ async-channel = "2.3.1"
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
 atomic_enum = "0.3.0"
-aws-sdk-s3 = "1.94.0"
+aws-sdk-s3 = "1.95.0"
 axum = "0.8.4"
 axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
@@ -167,7 +167,7 @@ rand = "0.9.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reed-solomon-simd = { version = "3.0.1" }
 regex = { version = "1.11.1" }
-reqwest = { version = "0.12.21", default-features = false, features = [
+reqwest = { version = "0.12.22", default-features = false, features = [
     "rustls-tls",
     "charset",
     "http2",
