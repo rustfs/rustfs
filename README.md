@@ -61,12 +61,18 @@ Stress test server parameters
 
 To get started with RustFS, follow these steps:
 
-1. **Install RustFS**: Download the latest release from our [GitHub Releases](https://github.com/rustfs/rustfs/releases).
-2. **Run RustFS**: Use the provided binary to start the server.
+1.  **One-click installation script (Option 1)​​**
 
    ```bash
-   ./rustfs  /data
+   curl -O  https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
    ```
+
+2. **Docker Quick Start (Option 2)​​**
+
+  ```bash
+   podman run -d -p 9000:9000 -p 9001:9001 -v /data:/data quay.io/rustfs/rustfs
+   ```
+
 
 3. **Access the Console**: Open your web browser and navigate to `http://localhost:9001` to access the RustFS console.
 4. **Create a Bucket**: Use the console to create a new bucket for your objects.
