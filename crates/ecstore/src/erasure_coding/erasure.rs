@@ -28,7 +28,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use ecstore::erasure_coding::Erasure;
+//! use rustfs_ecstore::erasure_coding::Erasure;
 //!
 //! let erasure = Erasure::new(4, 2, 1024); // 4 data shards, 2 parity shards, 1KB block size
 //! let data = b"hello world";
@@ -263,7 +263,7 @@ impl ReedSolomonEncoder {
 ///
 /// # Example
 /// ```
-/// use ecstore::erasure_coding::Erasure;
+/// use rustfs_ecstore::erasure_coding::Erasure;
 /// let erasure = Erasure::new(4, 2, 8);
 /// let data = b"hello world";
 /// let shards = erasure.encode_data(data).unwrap();
