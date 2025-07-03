@@ -12,15 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 FROM alpine:3.18 AS builder
 
 RUN apk add -U --no-cache \
     ca-certificates \
     curl \
     bash \
-    unzip \
-    a-certificates \
+    unzip
 
 RUN curl -Lo /tmp/rustfs.zip https://dl.rustfs.com/artifacts/rustfs/rustfs-release-x86_64-unknown-linux-musl.latest.zip && \
     unzip /tmp/rustfs.zip -d /tmp && \
@@ -28,8 +26,11 @@ RUN curl -Lo /tmp/rustfs.zip https://dl.rustfs.com/artifacts/rustfs/rustfs-relea
     chmod +x /rustfs && \
     rm -rf /tmp/*
 
-
 FROM alpine:3.18
+
+RUN apk add -U --no-cache \
+    ca-certificates \
+    bash
 
 COPY --from=builder /rustfs /usr/local/bin/rustfs
 
