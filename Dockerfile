@@ -20,23 +20,24 @@ RUN apk add --no-cache \
     tzdata \
     && rm -rf /var/cache/apk/*
 
-# Create rustfs user and group
-RUN addgroup -g 1000 rustfs && \
-    adduser -D -s /bin/sh -u 1000 -G rustfs rustfs
 
 # Create data directories
-RUN mkdir -p /data/rustfs && \
-    chown -R rustfs:rustfs /data 
+RUN mkdir -p /data/rustfs 
+
 
 # Copy binary based on target architecture
-COPY --chown=rustfs:rustfs \
-  target/*/release/rustfs \
+COPY target/*/release/rustfs \
   /usr/local/bin/rustfs
 
 RUN chmod +x /usr/local/bin/rustfs
 
-# Switch to non-root user
-USER rustfs
+ENV RUSTFS_ROOT_USER=rustfsadmin \
+    RUSTFS_ROOT_PASSWORD=rustfsadmin \
+    RUSTFS_ADDRESS=":9000" \
+    RUSTFS_CONSOLE_ADDRESS=":9001" \
+    RUSTFS_CONSOLE_ENABLE=true \
+    RUST_LOG=warn
+
 
 # Expose ports
 EXPOSE 9000 9001
