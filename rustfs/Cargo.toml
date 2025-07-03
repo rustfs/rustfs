@@ -69,7 +69,6 @@ percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 reqwest = { workspace = true }
 rustls.workspace = true
-rustls-pki-types = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 serde.workspace = true
@@ -102,7 +101,6 @@ tower-http = { workspace = true, features = [
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
-x509-parser = { workspace = true, features = ["verify", "validate"] }
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
