@@ -94,6 +94,7 @@ tower-http = { workspace = true, features = [
     "compression-deflate",
     "compression-gzip",
     "cors",
+    "catch-panic",
 ] }
 urlencoding = { workspace = true }
 uuid = { workspace = true }

@@ -77,6 +77,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
@@ -336,6 +337,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
+                .layer(CatchPanicLayer::new())
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &HttpRequest<_>| {
