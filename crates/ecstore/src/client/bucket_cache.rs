@@ -31,7 +31,6 @@ use crate::client::{
     transition_api::{Document, TransitionClient},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use rustfs_utils::hasher::{Hasher, Sha256};
 use s3s::Body;
 use s3s::S3ErrorCode;
 

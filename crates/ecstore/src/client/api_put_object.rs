@@ -25,7 +25,6 @@ use std::{collections::HashMap, sync::Arc};
 use time::{Duration, OffsetDateTime, macros::format_description};
 use tracing::{error, info, warn};
 
-use rustfs_utils::hasher::Hasher;
 use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
 use s3s::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
@@ -364,18 +363,14 @@ impl TransitionClient {
             if opts.send_content_md5 {
                 let mut md5_hasher = self.md5_hasher.lock().unwrap();
                 let hash = md5_hasher.as_mut().expect("err");
-                hash.write(&buf[..length]);
-                md5_base64 = base64_encode(hash.sum().as_bytes());
+                let hash = hash.hash_encode(&buf[..length]);
+                md5_base64 = base64_encode(hash.as_ref());
             } else {
-                let csum;
-                {
-                    let mut crc = opts.auto_checksum.hasher()?;
-                    crc.reset();
-                    crc.write(&buf[..length]);
-                    csum = crc.sum();
-                }
+                let mut crc = opts.auto_checksum.hasher()?;
+                let csum = crc.hash_encode(&buf[..length]);
+
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    custom_header.insert(header_name, base64_encode(csum.as_bytes()).parse().unwrap());
+                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }

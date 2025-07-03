@@ -30,8 +30,6 @@ pub mod io;
 #[cfg(feature = "hash")]
 pub mod hash;
 
-pub mod hasher;
-
 #[cfg(feature = "os")]
 pub mod os;
 

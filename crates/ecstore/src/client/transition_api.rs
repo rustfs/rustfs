@@ -28,8 +28,12 @@ use http::{
 };
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
+use md5::Digest;
+use md5::Md5;
 use rand::Rng;
+use rustfs_utils::HashAlgorithm;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -60,7 +64,6 @@ use crate::client::{
 };
 use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
 use rustfs_rio::HashReader;
-use rustfs_utils::hasher::{MD5, Sha256};
 use rustfs_utils::{
     net::get_endpoint_url,
     retry::{MAX_RETRY, new_retry_timer},
@@ -104,8 +107,8 @@ pub struct TransitionClient {
     pub random: u64,
     pub lookup: BucketLookupType,
     //pub lookupFn: func(u url.URL, bucketName string) BucketLookupType,
-    pub md5_hasher: Arc<Mutex<Option<MD5>>>,
-    pub sha256_hasher: Option<Sha256>,
+    pub md5_hasher: Arc<Mutex<Option<HashAlgorithm>>>,
+    pub sha256_hasher: Option<HashAlgorithm>,
     pub health_status: AtomicI32,
     pub trailing_header_support: bool,
     pub max_retries: i64,
@@ -122,8 +125,8 @@ pub struct Options {
     //pub custom_region_via_url: func(u url.URL) string,
     //pub bucket_lookup_via_url: func(u url.URL, bucketName string) BucketLookupType,
     pub trailing_headers: bool,
-    pub custom_md5: Option<MD5>,
-    pub custom_sha256: Option<Sha256>,
+    pub custom_md5: Option<HashAlgorithm>,
+    pub custom_sha256: Option<HashAlgorithm>,
     pub max_retries: i64,
 }
 
@@ -190,11 +193,11 @@ impl TransitionClient {
         {
             let mut md5_hasher = clnt.md5_hasher.lock().unwrap();
             if md5_hasher.is_none() {
-                *md5_hasher = Some(MD5::new());
+                *md5_hasher = Some(HashAlgorithm::Md5);
             }
         }
         if clnt.sha256_hasher.is_none() {
-            clnt.sha256_hasher = Some(Sha256::new());
+            clnt.sha256_hasher = Some(HashAlgorithm::SHA256);
         }
 
         clnt.trailing_header_support = opts.trailing_headers && clnt.override_signer_type == SignatureType::SignatureV4;
@@ -241,8 +244,8 @@ impl TransitionClient {
         &self,
         is_md5_requested: bool,
         is_sha256_requested: bool,
-    ) -> (HashMap<String, MD5>, HashMap<String, Vec<u8>>) {
-        todo!();
+    ) -> (HashMap<String, HashAlgorithm>, HashMap<String, Vec<u8>>) {
+        todo!()
     }
 
     fn is_online(&self) -> bool {

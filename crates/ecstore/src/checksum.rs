@@ -20,12 +20,12 @@
 #![allow(clippy::all)]
 
 use lazy_static::lazy_static;
+use rustfs_utils::HashAlgorithm;
 use std::collections::HashMap;
 
 use crate::client::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
 use crate::{disk::DiskAPI, store_api::GetObjectReader};
 use rustfs_utils::crypto::{base64_decode, base64_encode};
-use rustfs_utils::hasher::{Hasher, Sha256};
 use s3s::header::{
     X_AMZ_CHECKSUM_ALGORITHM, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_CRC32C, X_AMZ_CHECKSUM_SHA1, X_AMZ_CHECKSUM_SHA256,
 };
@@ -133,7 +133,7 @@ impl ChecksumMode {
         }
     }
 
-    pub fn hasher(&self) -> Result<Box<dyn Hasher>, std::io::Error> {
+    pub fn hasher(&self) -> Result<HashAlgorithm, std::io::Error> {
         match /*C_ChecksumMask & **/self {
             /*ChecksumMode::ChecksumCRC32 => {
                 return Ok(Box::new(crc32fast::Hasher::new()));
@@ -145,7 +145,7 @@ impl ChecksumMode {
                 return Ok(Box::new(sha1::new()));
             }*/
             ChecksumMode::ChecksumSHA256 => {
-                return Ok(Box::new(Sha256::new()));
+                return Ok(HashAlgorithm::SHA256);
             }
             /*ChecksumMode::ChecksumCRC64NVME => {
                 return Ok(Box::new(crc64nvme.New());
@@ -170,8 +170,8 @@ impl ChecksumMode {
             return Ok("".to_string());
         }
         let mut h = self.hasher()?;
-        h.write(b);
-        Ok(base64_encode(h.sum().as_bytes()))
+        let hash = h.hash_encode(b);
+        Ok(base64_encode(hash.as_ref()))
     }
 
     pub fn to_string(&self) -> String {
@@ -201,15 +201,15 @@ impl ChecksumMode {
         }
     }
 
-    pub fn check_sum_reader(&self, r: GetObjectReader) -> Result<Checksum, std::io::Error> {
-        let mut h = self.hasher()?;
-        Ok(Checksum::new(self.clone(), h.sum().as_bytes()))
-    }
+    // pub fn check_sum_reader(&self, r: GetObjectReader) -> Result<Checksum, std::io::Error> {
+    //     let mut h = self.hasher()?;
+    //     Ok(Checksum::new(self.clone(), h.sum().as_bytes()))
+    // }
 
-    pub fn check_sum_bytes(&self, b: &[u8]) -> Result<Checksum, std::io::Error> {
-        let mut h = self.hasher()?;
-        Ok(Checksum::new(self.clone(), h.sum().as_bytes()))
-    }
+    // pub fn check_sum_bytes(&self, b: &[u8]) -> Result<Checksum, std::io::Error> {
+    //     let mut h = self.hasher()?;
+    //     Ok(Checksum::new(self.clone(), h.sum().as_bytes()))
+    // }
 
     pub fn composite_checksum(&self, p: &mut [ObjectPart]) -> Result<Checksum, std::io::Error> {
         if !self.can_composite() {
@@ -227,10 +227,10 @@ impl ChecksumMode {
         let c = self.base();
         let crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
         let mut h = self.hasher()?;
-        h.write(&crc_bytes);
+        let hash = h.hash_encode(crc_bytes.as_ref());
         Ok(Checksum {
             checksum_type: self.clone(),
-            r: h.sum().as_bytes().to_vec(),
+            r: hash.as_ref().to_vec(),
             computed: false,
         })
     }
