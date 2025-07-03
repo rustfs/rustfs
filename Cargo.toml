@@ -81,7 +81,7 @@ atoi = "2.0.0"
 async-channel = "2.4.0"
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
-async-compression = { version = "0.4.25" }
+async-compression = { version = "0.4.0" }
 atomic_enum = "0.3.0"
 aws-sdk-s3 = "1.96.0"
 axum = "0.8.4"
@@ -250,7 +250,6 @@ uuid = { version = "1.17.0", features = [
 ] }
 wildmatch = { version = "2.4.0", features = ["serde"] }
 winapi = { version = "0.3.9" }
-x509-parser = "0.17.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
