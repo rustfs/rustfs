@@ -12,24 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:latest
 
-# Install runtime dependencies
-RUN apk add --no-cache \
+FROM alpine:3.18 AS builder
+
+RUN apk add -U --no-cache \
     ca-certificates \
-    tzdata \
-    && rm -rf /var/cache/apk/*
+    curl \
+    bash \
+    unzip \
+    a-certificates \
+
+RUN curl -Lo /tmp/rustfs.zip https://dl.rustfs.com/artifacts/rustfs/rustfs-release-x86_64-unknown-linux-musl.latest.zip && \
+    unzip /tmp/rustfs.zip -d /tmp && \
+    mv /tmp/rustfs-release-x86_64-unknown-linux-musl/bin/rustfs /rustfs && \
+    chmod +x /rustfs && \
+    rm -rf /tmp/*
 
 
-# Create data directories
-RUN mkdir -p /data/rustfs 
+FROM alpine:3.18
 
-
-# Copy binary based on target architecture
-COPY target/*/release/rustfs \
-  /usr/local/bin/rustfs
-
-RUN chmod +x /usr/local/bin/rustfs
+COPY --from=builder /rustfs /usr/local/bin/rustfs
 
 ENV RUSTFS_ROOT_USER=rustfsadmin \
     RUSTFS_ROOT_PASSWORD=rustfsadmin \
@@ -38,11 +40,9 @@ ENV RUSTFS_ROOT_USER=rustfsadmin \
     RUSTFS_CONSOLE_ENABLE=true \
     RUST_LOG=warn
 
-
-# Expose ports
 EXPOSE 9000 9001
 
+RUN mkdir -p /data
 VOLUME /data
 
-# Set default command
 CMD ["rustfs", "/data"]
