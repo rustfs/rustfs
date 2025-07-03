@@ -1,4 +1,4 @@
-[![RustFS](https://github.com/user-attachments/assets/547d72f7-d1f4-4763-b9a8-6040bad9251a)](https://rustfs.com)
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
 <p align="center">RustFS is a high-performance distributed object storage software built using Rust</p>
 
