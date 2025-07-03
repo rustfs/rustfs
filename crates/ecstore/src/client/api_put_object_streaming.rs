@@ -40,7 +40,7 @@ use crate::client::{
     constants::ISO8601_DATEFORMAT,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
-use rustfs_utils::hasher::Hasher;
+
 use rustfs_utils::{crypto::base64_encode, path::trim_etag};
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 
@@ -153,21 +153,16 @@ impl TransitionClient {
             if opts.send_content_md5 {
                 let mut md5_hasher = self.md5_hasher.lock().unwrap();
                 let md5_hash = md5_hasher.as_mut().expect("err");
-                md5_hash.reset();
-                md5_hash.write(&buf[..length]);
-                md5_base64 = base64_encode(md5_hash.sum().as_bytes());
+                let hash = md5_hash.hash_encode(&buf[..length]);
+                md5_base64 = base64_encode(hash.as_ref());
             } else {
-                let csum;
-                {
-                    let mut crc = opts.auto_checksum.hasher()?;
-                    crc.reset();
-                    crc.write(&buf[..length]);
-                    csum = crc.sum();
-                }
-                if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key_capitalized().as_bytes()) {
-                    custom_header.insert(header_name, HeaderValue::from_str(&base64_encode(csum.as_bytes())).expect("err"));
+                let mut crc = opts.auto_checksum.hasher()?;
+                let csum = crc.hash_encode(&buf[..length]);
+
+                if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
+                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
                 } else {
-                    warn!("Invalid header name: {}", opts.auto_checksum.key_capitalized());
+                    warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
             }
 
@@ -308,17 +303,11 @@ impl TransitionClient {
 
             let mut custom_header = HeaderMap::new();
             if !opts.send_content_md5 {
-                let csum;
-                {
-                    let mut crc = opts.auto_checksum.hasher()?;
-                    crc.reset();
-                    crc.write(&buf[..length]);
-                    csum = crc.sum();
-                }
+                let mut crc = opts.auto_checksum.hasher()?;
+                let csum = crc.hash_encode(&buf[..length]);
+
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    if let Ok(header_value) = HeaderValue::from_str(&base64_encode(csum.as_bytes())) {
-                        custom_header.insert(header_name, header_value);
-                    }
+                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
@@ -334,8 +323,8 @@ impl TransitionClient {
                 if opts.send_content_md5 {
                     let mut md5_hasher = clone_self.md5_hasher.lock().unwrap();
                     let md5_hash = md5_hasher.as_mut().expect("err");
-                    md5_hash.write(&buf[..length]);
-                    md5_base64 = base64_encode(md5_hash.sum().as_bytes());
+                    let hash = md5_hash.hash_encode(&buf[..length]);
+                    md5_base64 = base64_encode(hash.as_ref());
                 }
 
                 //defer wg.Done()

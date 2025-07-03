@@ -21,6 +21,7 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use rustfs_utils::{HashAlgorithm, crypto::base64_encode};
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
 use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
@@ -38,7 +39,6 @@ use crate::{
     store_api::{GetObjectReader, ObjectInfo, StorageAPI},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use rustfs_utils::hasher::{sum_md5_base64, sum_sha256_hex};
 
 pub struct RemoveBucketOptions {
     _forced_elete: bool,
@@ -330,8 +330,8 @@ impl TransitionClient {
                         query_values: url_values.clone(),
                         content_body: ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
                         content_length: remove_bytes.len() as i64,
-                        content_md5_base64: sum_md5_base64(&remove_bytes),
-                        content_sha256_hex: sum_sha256_hex(&remove_bytes),
+                        content_md5_base64: base64_encode(&HashAlgorithm::Md5.hash_encode(&remove_bytes).as_ref()),
+                        content_sha256_hex: base64_encode(&HashAlgorithm::SHA256.hash_encode(&remove_bytes).as_ref()),
                         custom_header: headers,
                         object_name: "".to_string(),
                         stream_sha256: false,

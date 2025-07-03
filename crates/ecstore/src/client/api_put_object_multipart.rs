@@ -31,7 +31,6 @@ use tracing::{error, info};
 use url::form_urlencoded::Serializer;
 use uuid::Uuid;
 
-use rustfs_utils::hasher::Hasher;
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 use s3s::{Body, dto::StreamingBlob};
 //use crate::disk::{Reader, BufferReader};
@@ -117,8 +116,8 @@ impl TransitionClient {
             let length = buf.len();
 
             for (k, v) in hash_algos.iter_mut() {
-                v.write(&buf[..length]);
-                hash_sums.insert(k.to_string(), Vec::try_from(v.sum().as_bytes()).unwrap());
+                let hash = v.hash_encode(&buf[..length]);
+                hash_sums.insert(k.to_string(), hash.as_ref().to_vec());
             }
 
             //let rd = newHook(bytes.NewReader(buf[..length]), opts.progress);
@@ -134,15 +133,11 @@ impl TransitionClient {
             sha256_hex = hex_simd::encode_to_string(hash_sums["sha256"].clone(), hex_simd::AsciiCase::Lower);
             //}
             if hash_sums.len() == 0 {
-                let csum;
-                {
-                    let mut crc = opts.auto_checksum.hasher()?;
-                    crc.reset();
-                    crc.write(&buf[..length]);
-                    csum = crc.sum();
-                }
+                let mut crc = opts.auto_checksum.hasher()?;
+                let csum = crc.hash_encode(&buf[..length]);
+
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    custom_header.insert(header_name, base64_encode(csum.as_bytes()).parse().expect("err"));
+                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
