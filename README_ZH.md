@@ -7,8 +7,6 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="Build and Push Docker Images" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
   <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
   <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
-  <img alt="Github Contributors" src="https://img.shields.io/github/contributors/rustfs/rustfs"/>
-  <img alt="GitHub closed issues" src="https://img.shields.io/github/issues-closed/rustfs/rustfs"/>
 </p >
 
 <p align="center">
