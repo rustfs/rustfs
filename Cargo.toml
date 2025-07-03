@@ -225,7 +225,7 @@ time = { version = "0.3.41", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.45.1", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.46.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
@@ -250,6 +250,7 @@ uuid = { version = "1.17.0", features = [
 ] }
 wildmatch = { version = "2.4.0", features = ["serde"] }
 winapi = { version = "0.3.9" }
+x509-parser = "0.17.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.2.0"
 zstd = "0.13.3"
