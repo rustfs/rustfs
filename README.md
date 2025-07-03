@@ -3,12 +3,12 @@
 <p align="center">RustFS is a high-performance distributed object storage software built using Rust</p>
 
 <p align="center">
-  <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="Build and Push Docker Images" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
   <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
   <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
   <img alt="Github Contributors" src="https://img.shields.io/github/contributors/rustfs/rustfs"/>
   <img alt="GitHub closed issues" src="https://img.shields.io/github/issues-closed/rustfs/rustfs"/>
-  <img alt="Discord" src="https://img.shields.io/discord/1107178041848909847?label=discord"/>
 </p>
 
 <p align="center">
