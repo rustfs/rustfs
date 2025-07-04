@@ -45,6 +45,10 @@ license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.85"
 version = "0.0.3"
+homepage = "https://rustfs.com"
+description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
+keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
+categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -19,6 +19,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Configuration management for RustFS, providing a centralized way to manage application settings and features."
+keywords = ["configuration", "settings", "management", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "config"]
 
 [dependencies]
 const-str = { workspace = true, optional = true }

@@ -14,23 +14,23 @@
 
 use rsa::Pkcs1v15Encrypt;
 use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs8::{DecodePrivateKey, DecodePublicKey},
-    rand_core::OsRng,
+    pkcs8::{DecodePrivateKey, DecodePublicKey}, rand_core::OsRng,
+    RsaPrivateKey,
+    RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Error, Result};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Token {
-    pub name: String, // 应用 ID
-    pub expired: u64, // 到期时间 (UNIX 时间戳)
+    pub name: String, // Application ID
+    pub expired: u64, // Expiry time (UNIX timestamp)
 }
 
-// 公钥生成 Token
-// [token] Token 对象
-// [key] 公钥字符串
-// 返回 base64 处理的加密字符串
+/// Public key generation Token
+/// [token] Token object
+/// [key] Public key string
+/// Returns the encrypted string processed by base64
 pub fn gencode(token: &Token, key: &str) -> Result<String> {
     let data = serde_json::to_vec(token)?;
     let public_key = RsaPublicKey::from_public_key_pem(key).map_err(Error::other)?;
@@ -38,10 +38,10 @@ pub fn gencode(token: &Token, key: &str) -> Result<String> {
     Ok(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encrypted_data))
 }
 
-// 私钥解析 Token
-// [token] base64 处理的加密字符串
-// [key] 私钥字符串
-// 返回 Token 对象
+/// Private key resolution Token
+/// [token] Encrypted string processed by base64
+/// [key] Private key string
+/// Return to the Token object
 pub fn parse(token: &str, key: &str) -> Result<Token> {
     let encrypted_data = base64_simd::URL_SAFE_NO_PAD
         .decode_to_vec(token.as_bytes())
@@ -72,8 +72,8 @@ static TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhk
 mod tests {
     use super::*;
     use rsa::{
-        RsaPrivateKey,
         pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+        RsaPrivateKey,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
     #[test]

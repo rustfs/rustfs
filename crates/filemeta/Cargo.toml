@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "File metadata management for RustFS, providing efficient storage and retrieval of file metadata in a distributed system."
+keywords = ["file-metadata", "storage", "retrieval", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "filesystem"]
+documentation = "https://docs.rs/rustfs-filemeta/latest/rustfs_filemeta/"
 
 [dependencies]
 crc32fast = { workspace = true }

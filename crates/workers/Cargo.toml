@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Workers for RustFS, providing background processing capabilities for tasks such as data synchronization, indexing, and more."
+keywords = ["workers", "tasks", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools"]
+documentation = "https://docs.rs/rustfs-workers/latest/rustfs_workers/"
 
 [lints]
 workspace = true
