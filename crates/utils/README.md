@@ -17,9 +17,13 @@
 
 ## 📖 Overview
 
-**RustFS Utils** is the utility library for the [RustFS](https://rustfs.com) distributed object storage system. It provides a comprehensive collection of utility functions, helper tools, and common functionality used across all RustFS modules, including system operations, cryptographic utilities, compression, and cross-platform compatibility tools.
+**RustFS Utils** is the utility library for the [RustFS](https://rustfs.com) distributed object storage system. It
+provides a comprehensive collection of utility functions, helper tools, and common functionality used across all RustFS
+modules, including system operations, cryptographic utilities, compression, and cross-platform compatibility tools.
 
-> **Note:** This is a foundational submodule of RustFS that provides essential utility functions for the distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
+> **Note:** This is a foundational submodule of RustFS that provides essential utility functions for the distributed
+> object storage system. For the complete RustFS experience, please visit
+> the [main RustFS repository](https://github.com/rustfs/rustfs).
 
 ## ✨ Features
 
@@ -64,17 +68,17 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustfs-utils = "0.1.0"
+rustfs-utils = "0.0.3"
 
 # Or with specific features
-rustfs-utils = { version = "0.1.0", features = ["compression", "crypto", "network"] }
+rustfs-utils = { version = "0.0.3", features = ["compression", "crypto", "network"] }
 ```
 
 ### Feature Flags
 
 ```toml
 [dependencies]
-rustfs-utils = { version = "0.1.0", features = ["full"] }
+rustfs-utils = { version = "0.0.3", features = ["full"] }
 ```
 
 Available features:
@@ -299,13 +303,13 @@ Utils Architecture:
 
 ### Feature Overview
 
-| Category | Features | Platform Support |
-|----------|----------|------------------|
-| File System | Atomic operations, path manipulation | All platforms |
-| Compression | Gzip, Zstd, LZ4, Brotli | All platforms |
-| Cryptography | Hashing, random generation, keys | All platforms |
-| System | Resource monitoring, process management | Linux, macOS, Windows |
-| Network | DNS, connectivity, interface detection | All platforms |
+| Category     | Features                                | Platform Support      |
+|--------------|-----------------------------------------|-----------------------|
+| File System  | Atomic operations, path manipulation    | All platforms         |
+| Compression  | Gzip, Zstd, LZ4, Brotli                 | All platforms         |
+| Cryptography | Hashing, random generation, keys        | All platforms         |
+| System       | Resource monitoring, process management | Linux, macOS, Windows |
+| Network      | DNS, connectivity, interface detection  | All platforms         |
 
 ## 🧪 Testing
 
@@ -338,12 +342,12 @@ The utils library is optimized for performance:
 
 ### Benchmarks
 
-| Operation | Performance | Notes |
-|-----------|-------------|-------|
-| Path Normalization | ~50 ns | Uses efficient string operations |
-| Base64 Encoding | ~1.2 GB/s | SIMD-optimized implementation |
-| XXHash64 | ~15 GB/s | Hardware-accelerated when available |
-| File Copy | ~2 GB/s | Platform-optimized copy operations |
+| Operation          | Performance | Notes                               |
+|--------------------|-------------|-------------------------------------|
+| Path Normalization | ~50 ns      | Uses efficient string operations    |
+| Base64 Encoding    | ~1.2 GB/s   | SIMD-optimized implementation       |
+| XXHash64           | ~15 GB/s    | Hardware-accelerated when available |
+| File Copy          | ~2 GB/s     | Platform-optimized copy operations  |
 
 ## 📋 Requirements
 
@@ -376,11 +380,13 @@ For comprehensive documentation, visit:
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guide](https://github.com/rustfs/rustfs/blob/main/CONTRIBUTING.md) for details.
+We welcome contributions! Please see
+our [Contributing Guide](https://github.com/rustfs/rustfs/blob/main/CONTRIBUTING.md) for details.
 
 ## 📄 License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/rustfs/rustfs/blob/main/LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/rustfs/rustfs/blob/main/LICENSE) for
+details.
 
 ---
 

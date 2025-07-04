@@ -17,25 +17,32 @@
 
 ## 📖 Overview
 
-**RustFS FileMeta** is the metadata management module for the [RustFS](https://rustfs.com) distributed object storage system. It provides efficient storage, retrieval, and management of file metadata, supporting features like versioning, tagging, and extended attributes with high performance and reliability.
+**RustFS FileMeta** is the metadata management module for the [RustFS](https://rustfs.com) distributed object storage
+system. It provides efficient storage, retrieval, and management of file metadata, supporting features like versioning,
+tagging, and extended attributes with high performance and reliability.
 
-> **Note:** This is a core submodule of RustFS that provides essential metadata management capabilities for the distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
+> **Note:** This is a core submodule of RustFS that provides essential metadata management capabilities for the
+> distributed object storage system. For the complete RustFS experience, please visit
+> the [main RustFS repository](https://github.com/rustfs/rustfs).
 
 ## ✨ Features
 
 ### 📝 Metadata Management
+
 - **File Information**: Complete file metadata including size, timestamps, and checksums
 - **Object Versioning**: Version-aware metadata management
 - **Extended Attributes**: Custom metadata and tagging support
 - **Inline Metadata**: Optimized storage for small metadata
 
 ### 🚀 Performance Features
+
 - **FlatBuffers Serialization**: Zero-copy metadata serialization
 - **Efficient Storage**: Optimized metadata storage layout
 - **Fast Lookups**: High-performance metadata queries
 - **Batch Operations**: Bulk metadata operations
 
 ### 🔧 Advanced Capabilities
+
 - **Schema Evolution**: Forward and backward compatible metadata schemas
 - **Compression**: Metadata compression for space efficiency
 - **Validation**: Metadata integrity verification
@@ -47,7 +54,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustfs-filemeta = "0.1.0"
+rustfs-filemeta = "0.0.3"
 ```
 
 ## 🔧 Usage
@@ -182,11 +189,11 @@ FileMeta Architecture:
 
 ### Metadata Types
 
-| Type | Use Case | Storage | Performance |
-|------|----------|---------|-------------|
-| XLMeta | Large objects with rich metadata | Separate file | High durability |
-| InlineMeta | Small objects with minimal metadata | Embedded | Fastest access |
-| VersionMeta | Object versioning information | Version-specific | Version-aware |
+| Type        | Use Case                            | Storage          | Performance     |
+|-------------|-------------------------------------|------------------|-----------------|
+| XLMeta      | Large objects with rich metadata    | Separate file    | High durability |
+| InlineMeta  | Small objects with minimal metadata | Embedded         | Fastest access  |
+| VersionMeta | Object versioning information       | Version-specific | Version-aware   |
 
 ## 🧪 Testing
 
@@ -225,6 +232,7 @@ FileMeta is optimized for high-performance metadata operations:
 ## 🌍 Related Projects
 
 This module is part of the RustFS ecosystem:
+
 - [RustFS Main](https://github.com/rustfs/rustfs) - Core distributed storage system
 - [RustFS ECStore](../ecstore) - Erasure coding storage engine
 - [RustFS Utils](../utils) - Utility functions
@@ -233,6 +241,7 @@ This module is part of the RustFS ecosystem:
 ## 📚 Documentation
 
 For comprehensive documentation, visit:
+
 - [RustFS Documentation](https://docs.rustfs.com)
 - [FileMeta API Reference](https://docs.rustfs.com/filemeta/)
 
@@ -244,11 +253,13 @@ For comprehensive documentation, visit:
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guide](https://github.com/rustfs/rustfs/blob/main/CONTRIBUTING.md) for details.
+We welcome contributions! Please see
+our [Contributing Guide](https://github.com/rustfs/rustfs/blob/main/CONTRIBUTING.md) for details.
 
 ## 📄 License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/rustfs/rustfs/blob/main/LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/rustfs/rustfs/blob/main/LICENSE) for
+details.
 
 ---
 
