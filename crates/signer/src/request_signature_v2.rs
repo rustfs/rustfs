@@ -28,7 +28,7 @@ const SIGN_V2_ALGORITHM: &str = "AWS";
 
 fn encode_url2path(req: &request::Request<Body>, _virtual_host: bool) -> String {
 
-    req.uri_ref().unwrap().path().to_string()
+    req.uri().path().to_string()
 }
 
 pub fn pre_sign_v2(
@@ -73,7 +73,9 @@ pub fn pre_sign_v2(
             .unwrap(),
     );
 
-    req.uri(Uri::from_parts(parts).unwrap())
+    *req.uri_mut() = Uri::from_parts(parts).unwrap();
+
+    req
 }
 
 fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {

@@ -1,4 +1,3 @@
-#![allow(clippy::map_entry)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -102,8 +101,8 @@ pub struct TransitionClient {
     pub region: String,
     pub random: u64,
     pub lookup: BucketLookupType,
-    pub md5_hasher: Arc<Mutex<Option<MD5>>>,
-    pub sha256_hasher: Option<Sha256>,
+    pub md5_hasher: Arc<Mutex<Option<HashAlgorithm>>>,
+    pub sha256_hasher: Option<HashAlgorithm>,
     pub health_status: AtomicI32,
     pub trailing_header_support: bool,
     pub max_retries: i64,
