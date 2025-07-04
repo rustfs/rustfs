@@ -292,8 +292,6 @@ impl TransitionClient {
         };
 
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
-        //defer closeResponse(resp)
-        //if resp.is_none() {
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
                 resp,
@@ -361,13 +359,13 @@ impl TransitionClient {
             bucket_name: bucket_name.to_string(),
             object_name: object_name.to_string(),
             query_values: url_values,
+            custom_header: headers,
             content_body: ReaderImpl::Body(complete_multipart_upload_buffer),
             content_length: 100,                //complete_multipart_upload_bytes.len(),
             content_sha256_hex: "".to_string(), //hex_simd::encode_to_string(complete_multipart_upload_bytes, hex_simd::AsciiCase::Lower),
-            custom_header: headers,
+            content_md5_base64: "".to_string(),
             stream_sha256: Default::default(),
             trailer: Default::default(),
-            content_md5_base64: "".to_string(),
             pre_sign_url: Default::default(),
             add_crc: Default::default(),
             extra_pre_sign_header: Default::default(),

@@ -14,9 +14,11 @@
 
 use http::request;
 
-pub fn get_host_addr(req: &request::Builder) -> String {
-    let host = req.headers_ref().expect("err").get("host");
-    let uri = req.uri_ref().unwrap();
+use s3s::Body;
+
+pub fn get_host_addr(req: &request::Request<Body>) -> String {
+    let host = req.headers().get("host");
+    let uri = req.uri();
     let req_host;
     if let Some(port) = uri.port() {
         req_host = format!("{}:{}", uri.host().unwrap(), port);

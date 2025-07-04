@@ -15,13 +15,15 @@
 use http::{HeaderValue, request};
 use time::{OffsetDateTime, macros::format_description};
 
+use s3s::Body;
+
 pub fn streaming_unsigned_v4(
-    mut req: request::Builder,
+    mut req: request::Request<Body>,
     session_token: &str,
     _data_len: i64,
     req_time: OffsetDateTime,
-) -> request::Builder {
-    let headers = req.headers_mut().expect("err");
+) -> request::Request<Body> {
+    let headers = req.headers_mut();
 
     let chunked_value = HeaderValue::from_str(&["aws-chunked"].join(",")).expect("err");
     headers.insert(http::header::TRANSFER_ENCODING, chunked_value);

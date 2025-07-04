@@ -1,238 +1,262 @@
-# RustFS FileMeta
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-A high-performance Rust implementation of xl-storage-format-v2, providing complete compatibility with S3-compatible metadata format while offering enhanced performance and safety.
+# RustFS FileMeta - File Metadata Management
 
-## Overview
+<p align="center">
+  <strong>High-performance file metadata management for RustFS distributed object storage</strong>
+</p>
 
-This crate implements the XL (Erasure Coded) metadata format used for distributed object storage. It provides:
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Full S3 Compatibility**: 100% compatible with xl.meta file format
-- **High Performance**: Optimized for speed with sub-microsecond parsing times
-- **Memory Safety**: Written in safe Rust with comprehensive error handling
-- **Comprehensive Testing**: Extensive test suite with real metadata validation
-- **Cross-Platform**: Supports multiple CPU architectures (x86_64, aarch64)
+---
 
-## Features
+## 📖 Overview
 
-### Core Functionality
-- ✅ XL v2 file format parsing and serialization
-- ✅ MessagePack-based metadata encoding/decoding
-- ✅ Version management with modification time sorting
-- ✅ Erasure coding information storage
-- ✅ Inline data support for small objects
-- ✅ CRC32 integrity verification using xxHash64
-- ✅ Delete marker handling
-- ✅ Legacy version support
+**RustFS FileMeta** is the metadata management module for the [RustFS](https://rustfs.com) distributed object storage system. It provides efficient storage, retrieval, and management of file metadata, supporting features like versioning, tagging, and extended attributes with high performance and reliability.
 
-### Advanced Features
-- ✅ Signature calculation for version integrity
-- ✅ Metadata validation and compatibility checking
-- ✅ Version statistics and analytics
-- ✅ Async I/O support with tokio
-- ✅ Comprehensive error handling
-- ✅ Performance benchmarking
+> **Note:** This is a core submodule of RustFS that provides essential metadata management capabilities for the distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## Performance
+## ✨ Features
 
-Based on our benchmarks:
+### 📝 Metadata Management
+- **File Information**: Complete file metadata including size, timestamps, and checksums
+- **Object Versioning**: Version-aware metadata management
+- **Extended Attributes**: Custom metadata and tagging support
+- **Inline Metadata**: Optimized storage for small metadata
 
-| Operation | Time | Description |
-|-----------|------|-------------|
-| Parse Real xl.meta | ~255 ns | Parse authentic xl metadata |
-| Parse Complex xl.meta | ~1.1 µs | Parse multi-version metadata |
-| Serialize Real xl.meta | ~659 ns | Serialize to xl format |
-| Round-trip Real xl.meta | ~1.3 µs | Parse + serialize cycle |
-| Version Statistics | ~5.2 ns | Calculate version stats |
-| Integrity Validation | ~7.8 ns | Validate metadata integrity |
+### 🚀 Performance Features
+- **FlatBuffers Serialization**: Zero-copy metadata serialization
+- **Efficient Storage**: Optimized metadata storage layout
+- **Fast Lookups**: High-performance metadata queries
+- **Batch Operations**: Bulk metadata operations
 
-## Usage
+### 🔧 Advanced Capabilities
+- **Schema Evolution**: Forward and backward compatible metadata schemas
+- **Compression**: Metadata compression for space efficiency
+- **Validation**: Metadata integrity verification
+- **Migration**: Seamless metadata format migration
 
-### Basic Usage
+## 📦 Installation
 
-```rust
-use rustfs_filemeta::file_meta::FileMeta;
+Add this to your `Cargo.toml`:
 
-// Load metadata from bytes
-let metadata = FileMeta::load(&xl_meta_bytes)?;
-
-// Access version information
-for version in &metadata.versions {
-    println!("Version ID: {:?}", version.header.version_id);
-    println!("Mod Time: {:?}", version.header.mod_time);
-}
-
-// Serialize back to bytes
-let serialized = metadata.marshal_msg()?;
+```toml
+[dependencies]
+rustfs-filemeta = "0.1.0"
 ```
 
-### Advanced Usage
+## 🔧 Usage
+
+### Basic Metadata Operations
 
 ```rust
-use rustfs_filemeta::file_meta::FileMeta;
+use rustfs_filemeta::{FileInfo, XLMeta};
+use std::collections::HashMap;
 
-// Load with validation
-let mut metadata = FileMeta::load(&xl_meta_bytes)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create file metadata
+    let mut file_info = FileInfo::new();
+    file_info.name = "example.txt".to_string();
+    file_info.size = 1024;
+    file_info.mod_time = chrono::Utc::now();
 
-// Validate integrity
-metadata.validate_integrity()?;
+    // Add custom metadata
+    let mut user_defined = HashMap::new();
+    user_defined.insert("author".to_string(), "john@example.com".to_string());
+    user_defined.insert("department".to_string(), "engineering".to_string());
+    file_info.user_defined = user_defined;
 
-// Check xl format compatibility
-if metadata.is_compatible_with_meta() {
-    println!("Compatible with xl format");
-}
+    // Create XL metadata
+    let xl_meta = XLMeta::new(file_info);
 
-// Get version statistics
-let stats = metadata.get_version_stats();
-println!("Total versions: {}", stats.total_versions);
-println!("Object versions: {}", stats.object_versions);
-println!("Delete markers: {}", stats.delete_markers);
-```
+    // Serialize metadata
+    let serialized = xl_meta.serialize()?;
 
-### Working with FileInfo
+    // Deserialize metadata
+    let deserialized = XLMeta::deserialize(&serialized)?;
 
-```rust
-use rustfs_filemeta::fileinfo::FileInfo;
-use rustfs_filemeta::file_meta::FileMetaVersion;
+    println!("File: {}, Size: {}", deserialized.file_info.name, deserialized.file_info.size);
 
-// Convert FileInfo to metadata version
-let file_info = FileInfo::new("bucket", "object.txt");
-let meta_version = FileMetaVersion::from(file_info);
-
-// Add version to metadata
-metadata.add_version(file_info)?;
-```
-
-## Data Structures
-
-### FileMeta
-The main metadata container that holds all versions and inline data:
-
-```rust
-pub struct FileMeta {
-    pub versions: Vec<FileMetaShallowVersion>,
-    pub data: InlineData,
-    pub meta_ver: u8,
+    Ok(())
 }
 ```
 
-### FileMetaVersion
-Represents a single object version:
+### Advanced Metadata Management
 
 ```rust
-pub struct FileMetaVersion {
-    pub version_type: VersionType,
-    pub object: Option<MetaObject>,
-    pub delete_marker: Option<MetaDeleteMarker>,
-    pub write_version: u64,
+use rustfs_filemeta::{XLMeta, FileInfo, VersionInfo};
+
+async fn advanced_metadata_example() -> Result<(), Box<dyn std::error::Error>> {
+    // Create versioned metadata
+    let mut xl_meta = XLMeta::new(FileInfo::default());
+
+    // Set version information
+    xl_meta.set_version_info(VersionInfo {
+        version_id: "v1.0.0".to_string(),
+        is_latest: true,
+        delete_marker: false,
+        restore_ongoing: false,
+    });
+
+    // Add checksums
+    xl_meta.add_checksum("md5", "d41d8cd98f00b204e9800998ecf8427e");
+    xl_meta.add_checksum("sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    // Set object tags
+    xl_meta.set_tags(vec![
+        ("Environment".to_string(), "Production".to_string()),
+        ("Owner".to_string(), "DataTeam".to_string()),
+    ]);
+
+    // Set retention information
+    xl_meta.set_retention_info(
+        chrono::Utc::now() + chrono::Duration::days(365),
+        "GOVERNANCE".to_string(),
+    );
+
+    // Validate metadata
+    xl_meta.validate()?;
+
+    Ok(())
 }
 ```
 
-### MetaObject
-Contains object-specific metadata including erasure coding information:
+### Inline Metadata Operations
 
 ```rust
-pub struct MetaObject {
-    pub version_id: Option<Uuid>,
-    pub data_dir: Option<Uuid>,
-    pub erasure_algorithm: ErasureAlgo,
-    pub erasure_m: usize,
-    pub erasure_n: usize,
-    // ... additional fields
+use rustfs_filemeta::{InlineMetadata, MetadataSize};
+
+fn inline_metadata_example() -> Result<(), Box<dyn std::error::Error>> {
+    // Create inline metadata for small files
+    let mut inline_meta = InlineMetadata::new();
+
+    // Set basic properties
+    inline_meta.set_content_type("text/plain");
+    inline_meta.set_content_encoding("gzip");
+    inline_meta.set_cache_control("max-age=3600");
+
+    // Add custom headers
+    inline_meta.add_header("x-custom-field", "custom-value");
+    inline_meta.add_header("x-app-version", "1.2.3");
+
+    // Check if metadata fits inline storage
+    if inline_meta.size() <= MetadataSize::INLINE_THRESHOLD {
+        println!("Metadata can be stored inline");
+    } else {
+        println!("Metadata requires separate storage");
+    }
+
+    // Serialize for storage
+    let bytes = inline_meta.to_bytes()?;
+
+    // Deserialize from storage
+    let restored = InlineMetadata::from_bytes(&bytes)?;
+
+    Ok(())
 }
 ```
 
-## File Format Compatibility
+## 🏗️ Architecture
 
-This implementation is fully compatible with xl-storage-format-v2:
+### Metadata Storage Layout
 
-- **Header Format**: XL2 v1 format with proper version checking
-- **Serialization**: MessagePack encoding identical to standard format
-- **Checksums**: xxHash64-based CRC validation
-- **Version Types**: Support for Object, Delete, and Legacy versions
-- **Inline Data**: Compatible inline data storage for small objects
+```
+FileMeta Architecture:
+┌─────────────────────────────────────────────────────────────┐
+│                    Metadata API Layer                       │
+├─────────────────────────────────────────────────────────────┤
+│    XL Metadata    │   Inline Metadata   │   Version Info    │
+├─────────────────────────────────────────────────────────────┤
+│              FlatBuffers Serialization                      │
+├─────────────────────────────────────────────────────────────┤
+│    Compression    │    Validation       │    Migration      │
+├─────────────────────────────────────────────────────────────┤
+│              Storage Backend Integration                     │
+└─────────────────────────────────────────────────────────────┘
+```
 
-## Testing
+### Metadata Types
 
-The crate includes comprehensive tests with real xl metadata:
+| Type | Use Case | Storage | Performance |
+|------|----------|---------|-------------|
+| XLMeta | Large objects with rich metadata | Separate file | High durability |
+| InlineMeta | Small objects with minimal metadata | Embedded | Fastest access |
+| VersionMeta | Object versioning information | Version-specific | Version-aware |
+
+## 🧪 Testing
+
+Run the test suite:
 
 ```bash
 # Run all tests
 cargo test
 
-# Run benchmarks
+# Run serialization benchmarks
 cargo bench
 
-# Run with coverage
-cargo test --features coverage
+# Test metadata validation
+cargo test validation
+
+# Test schema migration
+cargo test migration
 ```
 
-### Test Coverage
-- ✅ Real xl.meta file compatibility
-- ✅ Complex multi-version scenarios
-- ✅ Error handling and recovery
-- ✅ Inline data processing
-- ✅ Signature calculation
-- ✅ Round-trip serialization
-- ✅ Performance benchmarks
-- ✅ Edge cases and boundary conditions
+## 🚀 Performance
 
-## Architecture
+FileMeta is optimized for high-performance metadata operations:
 
-The crate follows a modular design:
+- **Serialization**: Zero-copy FlatBuffers serialization
+- **Storage**: Compact binary format reduces I/O
+- **Caching**: Intelligent metadata caching
+- **Batch Operations**: Efficient bulk metadata processing
 
-```
-src/
-├── file_meta.rs      # Core metadata structures and logic
-├── file_meta_inline.rs # Inline data handling
-├── fileinfo.rs       # File information structures
-├── test_data.rs      # Test data generation
-└── lib.rs           # Public API exports
-```
+## 📋 Requirements
 
-## Error Handling
+- **Rust**: 1.70.0 or later
+- **Platforms**: Linux, macOS, Windows
+- **Memory**: Minimal memory footprint
+- **Storage**: Compatible with RustFS storage backend
 
-Comprehensive error handling with detailed error messages:
+## 🌍 Related Projects
 
-```rust
-use rustfs_filemeta::error::Error;
+This module is part of the RustFS ecosystem:
+- [RustFS Main](https://github.com/rustfs/rustfs) - Core distributed storage system
+- [RustFS ECStore](../ecstore) - Erasure coding storage engine
+- [RustFS Utils](../utils) - Utility functions
+- [RustFS Proto](../protos) - Protocol definitions
 
-match FileMeta::load(&invalid_data) {
-    Ok(metadata) => { /* process metadata */ },
-    Err(Error::InvalidFormat(msg)) => {
-        eprintln!("Invalid format: {}", msg);
-    },
-    Err(Error::CorruptedData(msg)) => {
-        eprintln!("Corrupted data: {}", msg);
-    },
-    Err(e) => {
-        eprintln!("Other error: {}", e);
-    }
-}
-```
+## 📚 Documentation
 
-## Dependencies
+For comprehensive documentation, visit:
+- [RustFS Documentation](https://docs.rustfs.com)
+- [FileMeta API Reference](https://docs.rustfs.com/filemeta/)
 
-- `rmp` - MessagePack serialization
-- `uuid` - UUID handling
-- `time` - Date/time operations
-- `xxhash-rust` - Fast hashing
-- `tokio` - Async runtime (optional)
-- `criterion` - Benchmarking (dev dependency)
+## 🔗 Links
 
-## Contributing
+- [Documentation](https://docs.rustfs.com) - Complete RustFS manual
+- [Changelog](https://github.com/rustfs/rustfs/releases) - Release notes and updates
+- [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Community support
 
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
+## 🤝 Contributing
 
-## License
+We welcome contributions! Please see our [Contributing Guide](https://github.com/rustfs/rustfs/blob/main/CONTRIBUTING.md) for details.
 
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
+## 📄 License
 
-## Acknowledgments
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/rustfs/rustfs/blob/main/LICENSE) for details.
 
-- Original xl-storage-format-v2 implementation contributors
-- Rust community for excellent crates and tooling
-- Contributors and testers who helped improve this implementation 
+---
+
+<p align="center">
+  <strong>RustFS</strong> is a trademark of RustFS, Inc.<br>
+  All other trademarks are the property of their respective owners.
+</p>
+
+<p align="center">
+  Made with ❤️ by the RustFS Team
+</p>
