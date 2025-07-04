@@ -13,12 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_lock::{
-    drwmutex::Options,
-    lock_args::LockArgs,
-    namespace_lock::{NsLockMap, new_nslock},
-    new_lock_api,
-};
+use rustfs_lock::{lock_args::LockArgs, namespace::NsLockMap};
 use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
 use std::{error::Error, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
@@ -62,27 +57,13 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
     let url = url::Url::parse("http://127.0.0.1:9000/data")?;
-    let locker = new_lock_api(false, Some(url));
-    let ns_mutex = Arc::new(RwLock::new(NsLockMap::new(true)));
-    let ns = new_nslock(
-        Arc::clone(&ns_mutex),
-        "local".to_string(),
-        "dandan".to_string(),
-        vec!["foo".to_string()],
-        vec![locker],
-    )
-    .await;
-    assert!(
-        ns.0.write()
-            .await
-            .get_lock(&Options {
-                timeout: Duration::from_secs(5),
-                retry_interval: Duration::from_secs(1),
-            })
-            .await
-            .unwrap()
-    );
+    let ns_mutex = Arc::new(RwLock::new(NsLockMap::new(true, None)));
+    let ns_lock = ns_mutex.read().await.new_nslock(Some(url)).await?;
 
-    ns.0.write().await.un_lock().await.unwrap();
+    let resources = vec!["foo".to_string()];
+    let result = ns_lock.lock_batch(&resources, "dandan", Duration::from_secs(5)).await?;
+    assert!(result);
+
+    ns_lock.unlock_batch(&resources, "dandan").await?;
     Ok(())
 }

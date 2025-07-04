@@ -43,7 +43,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::globals::GLOBAL_Local_Node_Name;
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
+use rustfs_lock::{LockApi, NsLockMap, new_lock_api};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
@@ -170,7 +170,7 @@ impl Sets {
             let set_disks = SetDisks::new(
                 locker.clone(),
                 GLOBAL_Local_Node_Name.read().await.to_string(),
-                Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
+                Arc::new(NsLockMap::new(is_dist_erasure().await, None)),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,

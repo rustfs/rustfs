@@ -18,7 +18,7 @@ use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::store::ECStore;
 use crate::store_api::{ObjectOptions, ObjectToDelete};
-use rustfs_lock::local_locker::MAX_DELETE_LIST;
+use rustfs_lock::MAX_DELETE_LIST;
 
 pub async fn delete_object_versions(api: ECStore, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
     let mut remaining = to_del;

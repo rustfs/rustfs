@@ -34,7 +34,7 @@ use crate::{
 };
 use futures::{Stream, StreamExt};
 use futures_util::future::join_all;
-use rustfs_lock::{GLOBAL_LOCAL_SERVER, Locker, lock_args::LockArgs};
+use rustfs_lock::{GLOBAL_LOCAL_SERVER, core::local::LocalLockManager, lock_args::LockArgs};
 
 use rustfs_common::globals::GLOBAL_Local_Node_Name;
 
@@ -1527,16 +1527,28 @@ impl Node for NodeService {
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.lock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not lock, args: {args}, err: {err}")),
-                })),
-            },
+            Ok(args) => {
+                let resource = match args.resources.first() {
+                    Some(r) => r,
+                    None => {
+                        return Ok(tonic::Response::new(GenerallyLockResponse {
+                            success: false,
+                            error_info: Some("No resource specified".to_string()),
+                        }));
+                    }
+                };
+                let timeout = std::time::Duration::from_secs(30);
+                match GLOBAL_LOCAL_SERVER.write().await.lock(resource, &args.owner, timeout).await {
+                    Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: result,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: false,
+                        error_info: Some(format!("can not lock, args: {args}, err: {err}")),
+                    })),
+                }
+            }
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not decode args, err: {err}")),
@@ -1547,16 +1559,27 @@ impl Node for NodeService {
     async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.unlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not unlock, args: {args}, err: {err}")),
-                })),
-            },
+            Ok(args) => {
+                let resource = match args.resources.first() {
+                    Some(r) => r,
+                    None => {
+                        return Ok(tonic::Response::new(GenerallyLockResponse {
+                            success: false,
+                            error_info: Some("No resource specified".to_string()),
+                        }));
+                    }
+                };
+                match GLOBAL_LOCAL_SERVER.write().await.unlock(resource, &args.owner).await {
+                    Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: true,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: false,
+                        error_info: Some(format!("can not unlock, args: {args}, err: {err}")),
+                    })),
+                }
+            }
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not decode args, err: {err}")),
@@ -1567,16 +1590,28 @@ impl Node for NodeService {
     async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.rlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not rlock, args: {args}, err: {err}")),
-                })),
-            },
+            Ok(args) => {
+                let resource = match args.resources.first() {
+                    Some(r) => r,
+                    None => {
+                        return Ok(tonic::Response::new(GenerallyLockResponse {
+                            success: false,
+                            error_info: Some("No resource specified".to_string()),
+                        }));
+                    }
+                };
+                let timeout = std::time::Duration::from_secs(30);
+                match GLOBAL_LOCAL_SERVER.write().await.rlock(resource, &args.owner, timeout).await {
+                    Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: result,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: false,
+                        error_info: Some(format!("can not rlock, args: {args}, err: {err}")),
+                    })),
+                }
+            }
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not decode args, err: {err}")),
@@ -1587,16 +1622,27 @@ impl Node for NodeService {
     async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.runlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not runlock, args: {args}, err: {err}")),
-                })),
-            },
+            Ok(args) => {
+                let resource = match args.resources.first() {
+                    Some(r) => r,
+                    None => {
+                        return Ok(tonic::Response::new(GenerallyLockResponse {
+                            success: false,
+                            error_info: Some("No resource specified".to_string()),
+                        }));
+                    }
+                };
+                match GLOBAL_LOCAL_SERVER.write().await.runlock(resource, &args.owner).await {
+                    Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: true,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: false,
+                        error_info: Some(format!("can not runlock, args: {args}, err: {err}")),
+                    })),
+                }
+            }
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not decode args, err: {err}")),
@@ -1607,16 +1653,27 @@ impl Node for NodeService {
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.force_unlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not force_unlock, args: {args}, err: {err}")),
-                })),
-            },
+            Ok(args) => {
+                let resource = match args.resources.first() {
+                    Some(r) => r,
+                    None => {
+                        return Ok(tonic::Response::new(GenerallyLockResponse {
+                            success: false,
+                            error_info: Some("No resource specified".to_string()),
+                        }));
+                    }
+                };
+                match GLOBAL_LOCAL_SERVER.write().await.unlock(resource, &args.owner).await {
+                    Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: true,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                        success: false,
+                        error_info: Some(format!("can not force_unlock, args: {args}, err: {err}")),
+                    })),
+                }
+            }
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not decode args, err: {err}")),
@@ -1627,16 +1684,13 @@ impl Node for NodeService {
     async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.refresh(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
+            Ok(_args) => {
+                // 本地锁不需要刷新
+                Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: true,
                     error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not refresh, args: {args}, err: {err}")),
-                })),
-            },
+                }))
+            }
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not decode args, err: {err}")),
