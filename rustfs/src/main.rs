@@ -44,7 +44,6 @@ use hyper_util::{
 use license::init_license;
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
@@ -53,18 +52,16 @@ use rustfs_ecstore::heal::background_heal_ops::init_auto_heal;
 use rustfs_ecstore::rpc::make_server;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
-    endpoints::EndpointServerPools,
-    heal::data_scanner::init_data_scanner,
-    set_global_endpoints,
-    store::{ECStore, init_local_disks},
+    StorageAPI, endpoints::EndpointServerPools, global::set_global_rustfs_port, heal::data_scanner::init_data_scanner,
+    notification_sys::new_global_notification_sys, set_global_endpoints, store::ECStore, store::init_local_disks,
     update_erasure_type,
 };
-use rustfs_ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{SystemObserver, init_obs, set_global_guard};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
+use s3s::service::S3Service;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
 use socket2::SockRef;
@@ -72,11 +69,12 @@ use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
+use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -129,6 +127,49 @@ async fn main() -> Result<()> {
     run(opt).await
 }
 
+/// Sets up the TLS acceptor if certificates are available.
+#[instrument(skip(tls_path))]
+async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
+    if tls_path.is_empty() || tokio::fs::metadata(tls_path).await.is_err() {
+        debug!("TLS path is not provided or does not exist, starting with HTTP");
+        return Ok(None);
+    }
+
+    debug!("Found TLS directory, checking for certificates");
+
+    // 1. Try to load all certificates from the directory (multi-cert support)
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
+        if !cert_key_pairs.is_empty() {
+            debug!("Found {} certificates, creating multi-cert resolver", cert_key_pairs.len());
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let mut server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?));
+            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+            return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
+        }
+    }
+
+    // 2. Fallback to legacy single certificate mode
+    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
+    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
+    if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
+        debug!("Found legacy single TLS certificate, starting with HTTPS");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
+    }
+
+    debug!("No valid TLS certificates found in the directory, starting with HTTP");
+    Ok(None)
+}
+
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
@@ -148,7 +189,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     let listener = TcpListener::bind(server_address.clone()).await?;
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
-    // let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
     let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
     // For RPC
@@ -204,38 +244,20 @@ async fn run(opt: config::Opt) -> Result<()> {
     // This project uses the S3S library to implement S3 services
     let s3_service = {
         let store = storage::ecfs::FS::new();
-        // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
         let mut b = S3ServiceBuilder::new(store.clone());
 
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
-        // Displays info information
         debug!("authentication is enabled {}, {}", &access_key, &secret_key);
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
-
         b.set_access(store.clone());
-
         b.set_route(admin::make_admin_route()?);
 
         if !opt.server_domains.is_empty() {
             info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
             b.set_host(MultiDomain::new(&opt.server_domains).map_err(Error::other)?);
         }
-
-        // // Enable parsing virtual-hosted-style requests
-        // if let Some(dm) = opt.domain_name {
-        //     info!("virtual-hosted-style requests are enabled use domain_name {}", &dm);
-        //     b.set_base_domain(dm);
-        // }
-
-        // if domain_name.is_some() {
-        //     info!(
-        //         "virtual-hosted-style requests are enabled use domain_name {}",
-        //         domain_name.as_ref().unwrap()
-        //     );
-        //     b.set_base_domain(domain_name.unwrap());
-        // }
 
         b.build()
     };
@@ -254,57 +276,8 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
     });
 
-    let tls_path = opt.tls_path.clone().unwrap_or_default();
-    let has_tls_certs = tokio::fs::metadata(&tls_path).await.is_ok();
-    let tls_acceptor = if has_tls_certs {
-        debug!("Found TLS directory, checking for certificates");
+    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
 
-        // 1. Try to load all certificates directly (including root and subdirectories)
-        match rustfs_utils::load_all_certs_from_directory(&tls_path) {
-            Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => {
-                debug!("Found {} certificates, starting with HTTPS", cert_key_pairs.len());
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-                // create a multi certificate configuration
-                let mut server_config = ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?));
-
-                server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-                Some(TlsAcceptor::from(Arc::new(server_config)))
-            }
-            _ => {
-                // 2. If the synthesis fails, fall back to the traditional document certificate mode (backward compatible)
-                let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-                let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-                let has_single_cert =
-                    tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
-
-                if has_single_cert {
-                    debug!("Found legacy single TLS certificate, starting with HTTPS");
-                    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-                    let certs =
-                        rustfs_utils::load_certs(cert_path.as_str()).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
-                    let key = rustfs_utils::load_private_key(key_path.as_str())
-                        .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
-                    let mut server_config = ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(certs, key)
-                        .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
-                    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-                    Some(TlsAcceptor::from(Arc::new(server_config)))
-                } else {
-                    debug!("No valid TLS certificates found, starting with HTTP");
-                    None
-                }
-            }
-        }
-    } else {
-        debug!("TLS certificates not found, starting with HTTP");
-        None
-    };
-
-    let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
     let state_manager = ServiceStateManager::new();
     let worker_state_manager = state_manager.clone();
     // Update service status to Starting
@@ -318,72 +291,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
             // Unix platform specific code
-            let sigterm_inner = match signal(SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(e) => {
-                    error!("Failed to create SIGTERM signal handler: {}", e);
-                    return;
-                }
-            };
-            let sigint_inner = match signal(SignalKind::interrupt()) {
-                Ok(signal) => signal,
-                Err(e) => {
-                    error!("Failed to create SIGINT signal handler: {}", e);
-                    return;
-                }
-            };
+            let sigterm_inner = signal(SignalKind::terminate()).expect("Failed to create SIGTERM signal handler");
+            let sigint_inner = signal(SignalKind::interrupt()).expect("Failed to create SIGINT signal handler");
             (sigterm_inner, sigint_inner)
         };
-
-        let hybrid_service = TowerToHyperService::new(
-            tower::ServiceBuilder::new()
-                .layer(CatchPanicLayer::new())
-                .layer(
-                    TraceLayer::new_for_http()
-                        .make_span_with(|request: &HttpRequest<_>| {
-                            let span = tracing::info_span!("http-request",
-                                status_code = tracing::field::Empty,
-                                method = %request.method(),
-                                uri = %request.uri(),
-                                version = ?request.version(),
-                            );
-                            for (header_name, header_value) in request.headers() {
-                                if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length"
-                                {
-                                    span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
-                                }
-                            }
-
-                            span
-                        })
-                        .on_request(|request: &HttpRequest<_>, _span: &Span| {
-                            info!(
-                                counter.rustfs_api_requests_total = 1_u64,
-                                key_request_method = %request.method().to_string(),
-                                key_request_uri_path = %request.uri().path().to_owned(),
-                                "handle request api total",
-                            );
-                            debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
-                        })
-                        .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
-                            _span.record("http response status_code", tracing::field::display(response.status()));
-                            debug!("http response generated in {:?}", latency)
-                        })
-                        .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                            info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
-                            debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
-                        })
-                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
-                            debug!("http stream closed after {:?}", stream_duration)
-                        })
-                        .on_failure(|_error, latency: Duration, _span: &Span| {
-                            info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
-                            debug!("http request failure error: {:?} in {:?}", _error, latency)
-                        }),
-                )
-                .layer(CorsLayer::permissive())
-                .service(hybrid(s3_service, rpc_service)),
-        );
 
         let http_server = Arc::new(ConnBuilder::new(TokioExecutor::new()));
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -392,42 +303,36 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         // service ready
         worker_state_manager.update(ServiceState::Ready);
-        let value = hybrid_service.clone();
+        let tls_acceptor = tls_acceptor.map(Arc::new);
+
         loop {
-            debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
-            // Wait for a connection
+            debug!("Waiting for new connection...");
             let (socket, _) = {
                 #[cfg(unix)]
                 {
                     tokio::select! {
-                        res = listener.accept() => {
-                            match res {
-                                Ok(conn) => conn,
-                                Err(err) => {
-                                    error!("error accepting connection: {err}");
-                                    continue;
-                                }
+                        res = listener.accept() => match res {
+                            Ok(conn) => conn,
+                            Err(err) => {
+                                error!("error accepting connection: {err}");
+                                continue;
                             }
-                        }
-
+                        },
                         _ = ctrl_c.as_mut() => {
                             info!("Ctrl-C received in worker thread");
                             let _ = shutdown_tx_clone.send(());
                             break;
-                        }
-
+                        },
                        Some(_) = sigint_inner.recv() => {
                            info!("SIGINT received in worker thread");
                            let _ = shutdown_tx_clone.send(());
                            break;
-                       }
-
+                       },
                        Some(_) = sigterm_inner.recv() => {
                            info!("SIGTERM received in worker thread");
                            let _ = shutdown_tx_clone.send(());
                            break;
-                       }
-
+                       },
                         _ = shutdown_rx.recv() => {
                             info!("Shutdown signal received in worker thread");
                             break;
@@ -437,22 +342,18 @@ async fn run(opt: config::Opt) -> Result<()> {
                 #[cfg(not(unix))]
                 {
                     tokio::select! {
-                        res = listener.accept() => {
-                            match res {
-                                Ok(conn) => conn,
-                                Err(err) => {
-                                    error!("error accepting connection: {err}");
-                                    continue;
-                                }
+                        res = listener.accept() => match res {
+                            Ok(conn) => conn,
+                            Err(err) => {
+                                error!("error accepting connection: {err}");
+                                continue;
                             }
-                        }
-
+                        },
                         _ = ctrl_c.as_mut() => {
                             info!("Ctrl-C received in worker thread");
                             let _ = shutdown_tx_clone.send(());
                             break;
-                        }
-
+                        },
                         _ = shutdown_rx.recv() => {
                             info!("Shutdown signal received in worker thread");
                             break;
@@ -472,70 +373,12 @@ async fn run(opt: config::Opt) -> Result<()> {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            if has_tls_certs {
-                debug!("TLS certificates found, starting with SIGINT");
-                let peer_addr_str = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|e| {
-                    warn!("Could not get peer address: {}", e);
-                    "unknown".to_string()
-                });
-                let tls_socket = match tls_acceptor.as_ref() {
-                    Some(acceptor) => match acceptor.accept(socket).await {
-                        Ok(tls_socket) => {
-                            info!("TLS handshake successful with peer: {}", peer_addr_str);
-                            tls_socket
-                        }
-                        Err(err) => {
-                            error!("TLS handshake with peer {} failed: {}", peer_addr_str, err);
-                            continue;
-                        }
-                    },
-                    None => {
-                        error!(
-                            "TLS acceptor is not available, but TLS is enabled. This is a bug. Dropping connection from {}",
-                            peer_addr_str
-                        );
-                        continue;
-                    }
-                };
-
-                let http_server_clone = http_server.clone();
-                let value_clone = value.clone();
-                let graceful_clone = graceful.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    tokio::runtime::Runtime::new()
-                        .expect("Failed to create runtime")
-                        .block_on(async move {
-                            let conn = http_server_clone.serve_connection(TokioIo::new(tls_socket), value_clone);
-                            let conn = graceful_clone.watch(conn);
-                            if let Err(err) = conn.await {
-                                // Handle hyper::Error and low-level IO errors at a more granular level
-                                handle_connection_error(&*err);
-                            }
-                        });
-                });
-                debug!("TLS handshake success");
-            } else {
-                debug!("Http handshake start");
-
-                let http_server_clone = http_server.clone();
-                let value_clone = value.clone();
-                let graceful_clone = graceful.clone();
-                tokio::spawn(async move {
-                    let conn = http_server_clone.serve_connection(TokioIo::new(socket), value_clone);
-                    let conn = graceful_clone.watch(conn);
-                    if let Err(err) = conn.await {
-                        // Handle hyper::Error and low-level IO errors at a more granular level
-                        handle_connection_error(&*err);
-                    }
-                });
-                debug!("Http handshake success");
-            }
+            process_connection(socket, tls_acceptor.clone(), http_server.clone(), s3_service.clone(), graceful.clone());
         }
+
         worker_state_manager.update(ServiceState::Stopping);
         match Arc::try_unwrap(graceful) {
             Ok(g) => {
-                // Successfully obtaining unique ownership, you can call shutdown
                 tokio::select! {
                     () = g.shutdown() => {
                         debug!("Gracefully shutdown!");
@@ -546,9 +389,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 }
             }
             Err(arc_graceful) => {
-                // There are other references that cannot be obtained for unique ownership
                 error!("Cannot perform graceful shutdown, other references exist err: {:?}", arc_graceful);
-                // In this case, we can only wait for the timeout
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 debug!("Timeout reached, forcing shutdown");
             }
@@ -591,13 +432,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_data_scanner().await;
     // init auto heal
     init_auto_heal().await;
-
+    // init console configuration
     init_console_cfg(local_ip, server_port);
 
     print_server_info();
     init_bucket_replication_pool().await;
-
-    print_server_info();
 
     // Async update check (optional)
     tokio::spawn(async {
@@ -664,6 +503,103 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     info!("server is stopped state: {:?}", state_manager.current_state());
     Ok(())
+}
+
+/// Process a single incoming TCP connection.
+///
+/// This function is executed in a new Tokio task and it will:
+/// 1. If TLS is configured, perform TLS handshake.
+/// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
+/// 3. Use Hyper to handle HTTP requests on this connection.
+/// 4. Incorporate connections into the management of elegant closures.
+#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())))]
+fn process_connection(
+    socket: TcpStream,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    http_server: Arc<ConnBuilder<TokioExecutor>>,
+    s3_service: S3Service,
+    graceful: Arc<GracefulShutdown>,
+) {
+    tokio::spawn(async move {
+        // Build services inside each connected task to avoid passing complex service types across tasks,
+        // It also ensures that each connection has an independent service instance.
+        let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
+        let hybrid_service = ServiceBuilder::new()
+            .layer(CatchPanicLayer::new())
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(|request: &HttpRequest<_>| {
+                        let span = tracing::info_span!("http-request",
+                            status_code = tracing::field::Empty,
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            version = ?request.version(),
+                        );
+                        for (header_name, header_value) in request.headers() {
+                            if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
+                                span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
+                            }
+                        }
+
+                        span
+                    })
+                    .on_request(|request: &HttpRequest<_>, _span: &Span| {
+                        info!(
+                            counter.rustfs_api_requests_total = 1_u64,
+                            key_request_method = %request.method().to_string(),
+                            key_request_uri_path = %request.uri().path().to_owned(),
+                            "handle request api total",
+                        );
+                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
+                    })
+                    .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
+                        _span.record("http response status_code", tracing::field::display(response.status()));
+                        debug!("http response generated in {:?}", latency)
+                    })
+                    .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                        info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
+                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
+                    })
+                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                        debug!("http stream closed after {:?}", stream_duration)
+                    })
+                    .on_failure(|_error, latency: Duration, _span: &Span| {
+                        info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
+                        debug!("http request failure error: {:?} in {:?}", _error, latency)
+                    }),
+            )
+            .layer(CorsLayer::permissive())
+            .service(hybrid(s3_service, rpc_service));
+        let hybrid_service = TowerToHyperService::new(hybrid_service);
+
+        // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
+        if let Some(acceptor) = tls_acceptor {
+            debug!("TLS handshake start");
+            match acceptor.accept(socket).await {
+                Ok(tls_socket) => {
+                    debug!("TLS handshake successful");
+                    let stream = TokioIo::new(tls_socket);
+                    let conn = http_server.serve_connection(stream, hybrid_service);
+                    if let Err(err) = graceful.watch(conn).await {
+                        handle_connection_error(&*err);
+                    }
+                }
+                Err(err) => {
+                    error!(?err, "TLS handshake failed");
+                    return; // Failed to end the task directly
+                }
+            }
+            debug!("TLS handshake success");
+        } else {
+            debug!("Http handshake start");
+            let stream = TokioIo::new(socket);
+            let conn = http_server.serve_connection(stream, hybrid_service);
+            if let Err(err) = graceful.watch(conn).await {
+                handle_connection_error(&*err);
+            }
+            debug!("Http handshake success");
+        };
+    });
 }
 
 /// Handles the shutdown process of the server

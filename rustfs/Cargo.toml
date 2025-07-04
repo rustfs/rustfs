@@ -30,13 +30,21 @@ workspace = true
 
 [dependencies]
 rustfs-zip = { workspace = true }
-tokio-tar = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-appauth = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-common = { workspace = true }
+rustfs-iam = { workspace = true }
+rustfs-filemeta.workspace = true
+rustfs-rio.workspace = true
+rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-notify = { workspace = true }
+rustfs-obs = { workspace = true }
+rustfs-utils = { workspace = true, features = ["full"] }
+rustfs-protos.workspace = true
+rustfs-s3select-query = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
@@ -53,19 +61,13 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
-rustfs-iam = { workspace = true }
+lazy_static.workspace = true
 matchit = { workspace = true }
 mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
-rustfs-protos.workspace = true
-rustfs-s3select-query = { workspace = true }
 reqwest = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "notify"] }
-rustfs-notify = { workspace = true }
-rustfs-obs = { workspace = true }
-rustfs-utils = { workspace = true, features = ["full"] }
 rustls.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
@@ -84,9 +86,9 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
-tokio-rustls.workspace = true
-lazy_static.workspace = true
 tokio-stream.workspace = true
+tokio-rustls = { workspace = true, features = ["default"] }
+tokio-tar = { workspace = true }
 tonic = { workspace = true }
 tower.workspace = true
 tower-http = { workspace = true, features = [
@@ -98,9 +100,8 @@ tower-http = { workspace = true, features = [
 ] }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
-rustfs-filemeta.workspace = true
-rustfs-rio.workspace = true
 zip = { workspace = true }
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
