@@ -95,7 +95,6 @@ impl WarmBackendS3 {
             ..Default::default()
         };
         let client = TransitionClient::new(&u.host().expect("err").to_string(), opts).await?;
-        //client.set_appinfo(format!("s3-tier-{}", tier), ReleaseTag);
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

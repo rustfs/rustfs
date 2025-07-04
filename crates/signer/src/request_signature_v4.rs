@@ -22,10 +22,11 @@ use std::fmt::Write;
 use time::{OffsetDateTime, macros::format_description};
 use tracing::debug;
 
+use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
+use s3s::Body;
 use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
 use super::utils::{get_host_addr, sign_v4_trim_all};
-use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
@@ -76,8 +77,8 @@ fn get_credential(access_key_id: &str, location: &str, t: OffsetDateTime, servic
     s
 }
 
-fn get_hashed_payload(req: &request::Builder) -> String {
-    let headers = req.headers_ref().unwrap();
+fn get_hashed_payload(req: &request::Request<Body>) -> String {
+    let headers = req.headers();
     let mut hashed_payload = "";
     if let Some(payload) = headers.get("X-Amz-Content-Sha256") {
         hashed_payload = payload.to_str().unwrap();
@@ -88,17 +89,16 @@ fn get_hashed_payload(req: &request::Builder) -> String {
     hashed_payload.to_string()
 }
 
-fn get_canonical_headers(req: &request::Builder, ignored_headers: &HashMap<String, bool>) -> String {
+fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
-    for k in req.headers_ref().expect("err").keys() {
+    for k in req.headers().keys() {
         if ignored_headers.get(&k.to_string()).is_some() {
             continue;
         }
         headers.push(k.as_str().to_lowercase());
         let vv = req
-            .headers_ref()
-            .expect("err")
+            .headers()
             .get_all(k)
             .iter()
             .map(|e| e.to_str().unwrap().to_string())
@@ -146,9 +146,9 @@ fn header_exists(key: &str, headers: &[String]) -> bool {
     false
 }
 
-fn get_signed_headers(req: &request::Builder, ignored_headers: &HashMap<String, bool>) -> String {
+fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
     let mut headers = Vec::<String>::new();
-    let headers_ref = req.headers_ref().expect("err");
+    let headers_ref = req.headers();
     debug!("get_signed_headers headers: {:?}", headers_ref);
     for (k, _) in headers_ref {
         if ignored_headers.get(&k.to_string()).is_some() {
@@ -163,9 +163,9 @@ fn get_signed_headers(req: &request::Builder, ignored_headers: &HashMap<String, 
     headers.join(";")
 }
 
-fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<String, bool>, hashed_payload: &str) -> String {
+fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>, hashed_payload: &str) -> String {
     let mut canonical_query_string = "".to_string();
-    if let Some(q) = req.uri_ref().unwrap().query() {
+    if let Some(q) = req.uri().query() {
         // Parse query string into key-value pairs
         let mut query_params: Vec<(String, String)> = Vec::new();
         for param in q.split('&') {
@@ -187,8 +187,8 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
     }
 
     let canonical_request = [
-        req.method_ref().unwrap().to_string(),
-        req.uri_ref().unwrap().path().to_string(),
+        req.method().to_string(),
+        req.uri().path().to_string(),
         canonical_query_string,
         get_canonical_headers(req, ignored_headers),
         get_signed_headers(req, ignored_headers),
@@ -210,14 +210,14 @@ fn get_string_to_sign_v4(t: OffsetDateTime, location: &str, canonical_request: &
 }
 
 pub fn pre_sign_v4(
-    req: request::Builder,
+    req: request::Request<Body>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     expires: i64,
     t: OffsetDateTime,
-) -> request::Builder {
+) -> request::Request<Body> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return req;
     }
@@ -226,7 +226,7 @@ pub fn pre_sign_v4(
     let signed_headers = get_signed_headers(&req, &v4_ignored_headers);
 
     let mut query = <Vec<(String, String)>>::new();
-    if let Some(q) = req.uri_ref().unwrap().query() {
+    if let Some(q) = req.uri().query() {
         let result = serde_urlencoded::from_str::<Vec<(String, String)>>(q);
         query = result.unwrap_or_default();
     }
@@ -240,14 +240,15 @@ pub fn pre_sign_v4(
         query.push(("X-Amz-Security-Token".to_string(), session_token.to_string()));
     }
 
-    let uri = req.uri_ref().unwrap().clone();
-    let mut parts = req.uri_ref().unwrap().clone().into_parts();
+    let uri = req.uri().clone();
+    let mut parts = req.uri().clone().into_parts();
     parts.path_and_query = Some(
         format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
             .parse()
             .unwrap(),
     );
-    let req = req.uri(Uri::from_parts(parts).unwrap());
+    let mut req = req;
+    *req.uri_mut() = Uri::from_parts(parts).unwrap();
 
     let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
     let string_to_sign = get_string_to_sign_v4(t, location, &canonical_request, SERVICE_TYPE_S3);
@@ -256,8 +257,8 @@ pub fn pre_sign_v4(
     let signing_key = get_signing_key(secret_access_key, location, t, SERVICE_TYPE_S3);
     let signature = get_signature(signing_key, &string_to_sign);
 
-    let uri = req.uri_ref().unwrap().clone();
-    let mut parts = req.uri_ref().unwrap().clone().into_parts();
+    let uri = req.uri().clone();
+    let mut parts = req.uri().clone().into_parts();
     parts.path_and_query = Some(
         format!(
             "{}?{}&X-Amz-Signature={}",
@@ -269,7 +270,10 @@ pub fn pre_sign_v4(
         .unwrap(),
     );
 
-    req.uri(Uri::from_parts(parts).unwrap())
+
+    *req.uri_mut() = Uri::from_parts(parts).unwrap();
+
+    req
 }
 
 fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_access_key: &str, location: &str) -> String {
@@ -278,13 +282,12 @@ fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_ac
     get_signature(signing_key, policy_base64)
 }
 
-fn _sign_v4_sts(req: request::Builder, access_key_id: &str, secret_access_key: &str, location: &str) -> request::Builder {
+fn _sign_v4_sts(req: request::Request<Body>, access_key_id: &str, secret_access_key: &str, location: &str) -> request::Request<Body> {
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn sign_v4_inner(
-    mut req: request::Builder,
+    mut req: request::Request<Body>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
@@ -292,7 +295,7 @@ fn sign_v4_inner(
     location: &str,
     service_type: &str,
     trailer: HeaderMap,
-) -> request::Builder {
+) -> request::Request<Body> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return req;
     }
@@ -300,7 +303,7 @@ fn sign_v4_inner(
     let t = OffsetDateTime::now_utc();
     let t2 = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
-    let headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut();
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     headers.insert("X-Amz-Date", t.format(&format).unwrap().to_string().parse().unwrap());
 
@@ -330,9 +333,12 @@ fn sign_v4_inner(
     let signature = get_signature(signing_key, &string_to_sign);
     //debug!("\n\ncanonical_request: \n{}\nstring_to_sign: \n{}\nsignature: \n{}\n\n", &canonical_request, &string_to_sign, &signature);
 
-    let headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut();
 
-    let auth = format!("{SIGN_V4_ALGORITHM} Credential={credential}, SignedHeaders={signed_headers}, Signature={signature}");
+    let auth = format!(
+        "{} Credential={}, SignedHeaders={}, Signature={}",
+        SIGN_V4_ALGORITHM, credential, signed_headers, signature
+    );
     headers.insert("Authorization", auth.parse().unwrap());
 
     if !trailer.is_empty() {
@@ -345,14 +351,14 @@ fn sign_v4_inner(
     req
 }
 
-fn _unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: HeaderMap) {
+fn _unsigned_trailer(mut req: request::Request<Body>, content_len: i64, trailer: HeaderMap) {
     if !trailer.is_empty() {
         return;
     }
     let t = OffsetDateTime::now_utc();
     let t = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
-    let headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut();
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     headers.insert("X-Amz-Date", t.format(&format).unwrap().to_string().parse().unwrap());
 
@@ -372,13 +378,13 @@ fn _unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: Heade
 }
 
 pub fn sign_v4(
-    req: request::Builder,
+    req: request::Request<Body>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
-) -> request::Builder {
+) -> request::Request<Body> {
     sign_v4_inner(
         req,
         content_len,
@@ -392,13 +398,13 @@ pub fn sign_v4(
 }
 
 pub fn sign_v4_trailer(
-    req: request::Builder,
+    req: request::Request<Body>,
     access_key_id: &str,
     secret_access_key: &str,
     session_token: &str,
     location: &str,
     trailer: HeaderMap,
-) -> request::Builder {
+) -> request::Request<Body> {
     sign_v4_inner(
         req,
         0,
