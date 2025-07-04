@@ -1,4 +1,3 @@
-#![allow(clippy::map_entry)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -124,9 +123,11 @@ impl TransitionClient {
             url_str = target_url.to_string();
         }
 
-        let mut req_builder = Request::builder().method(http::Method::GET).uri(url_str);
+        let Ok(mut req) = Request::builder().method(http::Method::GET).uri(url_str).body(Body::empty()) else {
+            return Err(std::io::Error::other("create request error"));
+        };
 
-        self.set_user_agent(&mut req_builder);
+        self.set_user_agent(&mut req);
 
         let value;
         {
@@ -153,22 +154,12 @@ impl TransitionClient {
         }
 
         if signer_type == SignatureType::SignatureAnonymous {
-            let req = match req_builder.body(Body::empty()) {
-                Ok(req) => return Ok(req),
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            };
+            return Ok(req);
         }
 
         if signer_type == SignatureType::SignatureV2 {
-            let req_builder = rustfs_signer::sign_v2(req_builder, 0, &access_key_id, &secret_access_key, is_virtual_style);
-            let req = match req_builder.body(Body::empty()) {
-                Ok(req) => return Ok(req),
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            };
+            let req = rustfs_signer::sign_v2(req, 0, &access_key_id, &secret_access_key, is_virtual_style);
+            return Ok(req);
         }
 
         let mut content_sha256 = EMPTY_STRING_SHA256_HASH.to_string();
@@ -176,17 +167,11 @@ impl TransitionClient {
             content_sha256 = UNSIGNED_PAYLOAD.to_string();
         }
 
-        req_builder
+        req
             .headers_mut()
-            .expect("err")
             .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
-        let req_builder = rustfs_signer::sign_v4(req_builder, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
-        let req = match req_builder.body(Body::empty()) {
-            Ok(req) => return Ok(req),
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
+        let req = rustfs_signer::sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
+        Ok(req)
     }
 }
 

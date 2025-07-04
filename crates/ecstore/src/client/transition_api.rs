@@ -1,4 +1,3 @@
-#![allow(clippy::map_entry)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,7 +71,6 @@ use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
 use s3s::{Body, dto::Owner};
 
-const _C_USER_AGENT_PREFIX: &str = "RustFS (linux; x86)";
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
 const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT];
@@ -93,20 +91,16 @@ pub struct TransitionClient {
     pub endpoint_url: Url,
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
-    /*app_info: TODO*/
     pub secure: bool,
     pub http_client: Client<HttpsConnector<HttpConnector>, Body>,
-    //pub http_trace:      Httptrace.ClientTrace,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
-    //pub trace_output: io.Writer,
     pub s3_accelerate_endpoint: Arc<Mutex<String>>,
     pub s3_dual_stack_enabled: Arc<Mutex<bool>>,
     pub region: String,
     pub random: u64,
     pub lookup: BucketLookupType,
-    //pub lookupFn: func(u url.URL, bucketName string) BucketLookupType,
     pub md5_hasher: Arc<Mutex<Option<HashAlgorithm>>>,
     pub sha256_hasher: Option<HashAlgorithm>,
     pub health_status: AtomicI32,
@@ -118,12 +112,8 @@ pub struct TransitionClient {
 pub struct Options {
     pub creds: Credentials<Static>,
     pub secure: bool,
-    //pub transport:    http.RoundTripper,
-    //pub trace:        *httptrace.ClientTrace,
     pub region: String,
     pub bucket_lookup: BucketLookupType,
-    //pub custom_region_via_url: func(u url.URL) string,
-    //pub bucket_lookup_via_url: func(u url.URL, bucketName string) BucketLookupType,
     pub trailing_headers: bool,
     pub custom_md5: Option<HashAlgorithm>,
     pub custom_sha256: Option<HashAlgorithm>,
@@ -148,8 +138,6 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        //let jar = cookiejar.New(cookiejar.Options{PublicSuffixList: publicsuffix.List})?;
-
         //#[cfg(feature = "ring")]
         //let _ = rustls::crypto::ring::default_provider().install_default();
         //#[cfg(feature = "aws-lc-rs")]
@@ -157,9 +145,6 @@ impl TransitionClient {
 
         let scheme = endpoint_url.scheme();
         let client;
-        //if scheme == "https" {
-        //    client = Client::builder(TokioExecutor::new()).build_http();
-        //} else {
         let tls = rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
@@ -167,7 +152,6 @@ impl TransitionClient {
             .enable_http1()
             .build();
         client = Client::builder(TokioExecutor::new()).build(https);
-        //}
 
         let mut clnt = TransitionClient {
             endpoint_url,
@@ -211,13 +195,6 @@ impl TransitionClient {
 
     fn endpoint_url(&self) -> Url {
         self.endpoint_url.clone()
-    }
-
-    fn set_appinfo(&self, app_name: &str, app_version: &str) {
-        /*if app_name != "" && app_version != "" {
-            self.appInfo.app_name = app_name
-            self.appInfo.app_version = app_version
-        }*/
     }
 
     fn trace_errors_only_off(&self) {
@@ -268,6 +245,7 @@ impl TransitionClient {
     fn dump_http(&self, req: &http::Request<Body>, resp: &http::Response<Body>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
+        //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
         //info!("{}{}", self.trace_output, "---------END-HTTP---------");
 
         Ok(())
@@ -338,7 +316,7 @@ impl TransitionClient {
         //let mut retry_timer = RetryTimer::new();
         //while let Some(v) = retry_timer.next().await {
         for _ in [1; 1]
-        /*new_retry_timer(req_retry, DefaultRetryUnit, DefaultRetryCap, MaxJitter)*/
+        /*new_retry_timer(req_retry, default_retry_unit, default_retry_cap, max_jitter)*/
         {
             let req = self.new_request(method, metadata).await?;
 
@@ -409,7 +387,9 @@ impl TransitionClient {
             &metadata.query_values,
         )?;
 
-        let mut req_builder = Request::builder().method(method).uri(target_url.to_string());
+        let Ok(mut req) = Request::builder().method(method).uri(target_url.to_string()).body(Body::empty()) else {
+            return Err(std::io::Error::other("create request error"));
+        };
 
         let value;
         {
@@ -433,30 +413,31 @@ impl TransitionClient {
         if metadata.expires != 0 && metadata.pre_sign_url {
             if signer_type == SignatureType::SignatureAnonymous {
                 return Err(std::io::Error::other(err_invalid_argument(
-                    "Presigned URLs cannot be generated with anonymous credentials.",
+                    "presigned urls cannot be generated with anonymous credentials.",
                 )));
             }
             if metadata.extra_pre_sign_header.is_some() {
                 if signer_type == SignatureType::SignatureV2 {
                     return Err(std::io::Error::other(err_invalid_argument(
-                        "Extra signed headers for Presign with Signature V2 is not supported.",
+                        "extra signed headers for presign with signature v2 is not supported.",
                     )));
                 }
+                let headers = req.headers_mut();
                 for (k, v) in metadata.extra_pre_sign_header.as_ref().unwrap() {
-                    req_builder = req_builder.header(k, v);
+                    headers.insert(k, v.clone());
                 }
             }
             if signer_type == SignatureType::SignatureV2 {
-                req_builder = rustfs_signer::pre_sign_v2(
-                    req_builder,
+                req = rustfs_signer::pre_sign_v2(
+                    req,
                     &access_key_id,
                     &secret_access_key,
                     metadata.expires,
                     is_virtual_host,
                 );
             } else if signer_type == SignatureType::SignatureV4 {
-                req_builder = rustfs_signer::pre_sign_v4(
-                    req_builder,
+                req = rustfs_signer::pre_sign_v4(
+                    req,
                     &access_key_id,
                     &secret_access_key,
                     &session_token,
@@ -465,57 +446,41 @@ impl TransitionClient {
                     OffsetDateTime::now_utc(),
                 );
             }
-            let req = match req_builder.body(Body::empty()) {
-                Ok(req) => req,
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            };
             return Ok(req);
         }
 
-        self.set_user_agent(&mut req_builder);
+        self.set_user_agent(&mut req);
 
         for (k, v) in metadata.custom_header.clone() {
-            req_builder.headers_mut().expect("err").insert(k.expect("err"), v);
+            req.headers_mut().insert(k.expect("err"), v);
         }
 
         //req.content_length = metadata.content_length;
         if metadata.content_length <= -1 {
             let chunked_value = HeaderValue::from_str(&vec!["chunked"].join(",")).expect("err");
-            req_builder
+            req
                 .headers_mut()
-                .expect("err")
                 .insert(http::header::TRANSFER_ENCODING, chunked_value);
         }
 
         if metadata.content_md5_base64.len() > 0 {
             let md5_value = HeaderValue::from_str(&metadata.content_md5_base64).expect("err");
-            req_builder.headers_mut().expect("err").insert("Content-Md5", md5_value);
+            req.headers_mut().insert("Content-Md5", md5_value);
         }
 
         if signer_type == SignatureType::SignatureAnonymous {
-            let req = match req_builder.body(Body::empty()) {
-                Ok(req) => req,
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            };
             return Ok(req);
         }
 
         if signer_type == SignatureType::SignatureV2 {
-            req_builder =
-                rustfs_signer::sign_v2(req_builder, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
+            req =
+                rustfs_signer::sign_v2(req, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
         } else if metadata.stream_sha256 && !self.secure {
             if metadata.trailer.len() > 0 {
-                //req.Trailer = metadata.trailer;
                 for (_, v) in &metadata.trailer {
-                    req_builder = req_builder.header(http::header::TRAILER, v.clone());
+                    req.headers_mut().insert(http::header::TRAILER, v.clone());
                 }
             }
-            //req_builder = rustfs_signer::streaming_sign_v4(req_builder, &access_key_id,
-            //  &secret_access_key, &session_token, &location, metadata.content_length, OffsetDateTime::now_utc(), self.sha256_hasher());
         } else {
             let mut sha_header = UNSIGNED_PAYLOAD.to_string();
             if metadata.content_sha256_hex != "" {
@@ -526,11 +491,11 @@ impl TransitionClient {
             } else if metadata.trailer.len() > 0 {
                 sha_header = UNSIGNED_PAYLOAD_TRAILER.to_string();
             }
-            req_builder = req_builder
-                .header::<HeaderName, HeaderValue>("X-Amz-Content-Sha256".parse().unwrap(), sha_header.parse().expect("err"));
+            req
+                .headers_mut().insert("X-Amz-Content-Sha256".parse::<HeaderName>().unwrap(), sha_header.parse().expect("err"));
 
-            req_builder = rustfs_signer::sign_v4_trailer(
-                req_builder,
+            req = rustfs_signer::sign_v4_trailer(
+                req,
                 &access_key_id,
                 &secret_access_key,
                 &session_token,
@@ -539,33 +504,23 @@ impl TransitionClient {
             );
         }
 
-        let req;
-        if metadata.content_length == 0 {
-            req = req_builder.body(Body::empty());
-        } else {
+        if metadata.content_length > 0 {
             match &mut metadata.content_body {
                 ReaderImpl::Body(content_body) => {
-                    req = req_builder.body(Body::from(content_body.clone()));
+                    *req.body_mut() = Body::from(content_body.clone());
                 }
                 ReaderImpl::ObjectBody(content_body) => {
-                    req = req_builder.body(Body::from(content_body.read_all().await?));
+                    *req.body_mut() = Body::from(content_body.read_all().await?);
                 }
             }
-            //req = req_builder.body(s3s::Body::from(metadata.content_body.read_all().await?));
         }
 
-        match req {
-            Ok(req) => Ok(req),
-            Err(err) => Err(std::io::Error::other(err)),
+        Ok(req)
         }
-    }
 
-    pub fn set_user_agent(&self, req: &mut Builder) {
-        let headers = req.headers_mut().expect("err");
+    pub fn set_user_agent(&self, req: &mut Request<Body>) {
+        let headers = req.headers_mut();
         headers.insert("User-Agent", C_USER_AGENT.parse().expect("err"));
-        /*if self.app_info.app_name != "" && self.app_info.app_version != "" {
-            headers.insert("User-Agent", C_USER_AGENT+" "+self.app_info.app_name+"/"+self.app_info.app_version);
-        }*/
     }
 
     fn make_target_url(
@@ -948,7 +903,7 @@ pub struct ObjectMultipartInfo {
     pub key: String,
     pub size: i64,
     pub upload_id: String,
-    //pub err error,
+    //pub err: Error,
 }
 
 pub struct UploadInfo {

@@ -17,6 +17,7 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use time::{OffsetDateTime, macros::format_description};
 
+use s3s::Body;
 use super::request_signature_v4::{SERVICE_TYPE_S3, get_scope, get_signature, get_signing_key};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
@@ -68,7 +69,7 @@ fn _build_chunk_signature(
 
 #[allow(clippy::too_many_arguments)]
 pub fn streaming_sign_v4(
-    mut req: request::Builder,
+    mut req: request::Request<Body>,
     _access_key_id: &str,
     _secret_access_key: &str,
     session_token: &str,
@@ -76,8 +77,8 @@ pub fn streaming_sign_v4(
     data_len: i64,
     req_time: OffsetDateTime, /*, sh256: md5simd::Hasher*/
     trailer: HeaderMap,
-) -> request::Builder {
-    let headers = req.headers_mut().expect("err");
+) -> request::Request<Body> {
+    let headers = req.headers_mut();
 
     if trailer.is_empty() {
         headers.append("X-Amz-Content-Sha256", HeaderValue::from_str(STREAMING_SIGN_ALGORITHM).expect("err"));
