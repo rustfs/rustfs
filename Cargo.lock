@@ -3469,7 +3469,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "e2e_test"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "flatbuffers 25.2.10",
@@ -7839,7 +7839,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-trait",
  "atoi",
@@ -7908,7 +7908,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-appauth"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "base64-simd",
  "rsa",
@@ -7918,7 +7918,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-common"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "lazy_static",
  "tokio",
@@ -7927,7 +7927,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-config"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "const-str",
  "serde",
@@ -7936,7 +7936,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-crypto"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -7954,7 +7954,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-ecstore"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -8029,7 +8029,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-filemeta"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "byteorder",
  "bytes",
@@ -8050,7 +8050,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gui"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "chrono",
  "dioxus",
@@ -8071,7 +8071,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-iam"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -8095,7 +8095,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lock"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-trait",
  "lazy_static",
@@ -8112,7 +8112,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-madmin"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "chrono",
  "humantime",
@@ -8124,7 +8124,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-notify"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -8153,7 +8153,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-obs"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -8186,7 +8186,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-policy"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "base64-simd",
  "ipnetwork",
@@ -8205,7 +8205,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protos"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "flatbuffers 25.2.10",
  "prost",
@@ -8216,7 +8216,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -8264,7 +8264,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-api"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8288,7 +8288,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-query"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -8306,7 +8306,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-signer"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "http 1.3.1",
@@ -8320,7 +8320,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-utils"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "base64-simd",
  "blake3",
@@ -8364,7 +8364,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-workers"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "tokio",
  "tracing",
@@ -8372,7 +8372,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-zip"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "async-compression",
  "tokio",
