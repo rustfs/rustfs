@@ -1977,8 +1977,8 @@ impl S3 for FS {
         } = req.input;
 
         let mut lr_retention = false;
-        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        /*if let Ok(rcfg) = rcfg {
+        /*let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
+        if let Ok(rcfg) = rcfg {
             if let Some(rule) = rcfg.0.rule {
                 if let Some(retention) = rule.default_retention {
                     if let Some(mode) = retention.mode {
