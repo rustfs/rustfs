@@ -1982,9 +1982,9 @@ impl S3 for FS {
             if let Some(rule) = rcfg.0.rule {
                 if let Some(retention) = rule.default_retention {
                     if let Some(mode) = retention.mode {
-                        if mode == ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE) {
+                        //if mode == ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE) {
                             lr_retention = true;
-                        }
+                        //}
                     }
                 }
             }
