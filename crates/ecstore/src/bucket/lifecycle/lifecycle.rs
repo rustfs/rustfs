@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
@@ -41,7 +41,7 @@ const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID 
 const _ERR_XML_NOT_WELL_FORMED: &str =
     "The XML you provided was not well-formed or did not validate against our published schema";
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
-    "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket";
+    "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an retention bucket";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IlmAction {
@@ -102,30 +102,30 @@ impl RuleValidate for LifecycleRule {
     }
 
     fn validate_status(&self) -> Result<()> {
-        if self.Status.len() == 0 {
-            return errEmptyRuleStatus;
+        if self.status.len() == 0 {
+            return ErrEmptyRuleStatus;
         }
 
-        if self.Status != Enabled && self.Status != Disabled {
-            return errInvalidRuleStatus;
+        if self.status != Enabled && self.status != Disabled {
+            return ErrInvalidRuleStatus;
         }
         Ok(())
     }
 
     fn validate_expiration(&self) -> Result<()> {
-        self.Expiration.Validate();
+        self.expiration.validate();
     }
 
     fn validate_noncurrent_expiration(&self) -> Result<()> {
-        self.NoncurrentVersionExpiration.Validate()
+        self.noncurrent_version_expiration.validate()
     }
 
     fn validate_prefix_and_filter(&self) -> Result<()> {
-        if !self.Prefix.set && self.Filter.IsEmpty() || self.Prefix.set && !self.Filter.IsEmpty() {
-            return errXMLNotWellFormed;
+        if !self.prefix.set && self.Filter.isempty() || self.prefix.set && !self.filter.isempty() {
+            return ErrXMLNotWellFormed;
         }
-        if !self.Prefix.set {
-            return self.Filter.Validate();
+        if !self.prefix.set {
+            return self.filter.validate();
         }
         Ok(())
     }
@@ -267,7 +267,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
             r.validate()?;
             if let Some(expiration) = r.expiration.as_ref() {
                 if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
-                    if lr_retention && (!expired_object_delete_marker) {
+                    if lr_retention && (expired_object_delete_marker) {
                         return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
                     }
                 }
