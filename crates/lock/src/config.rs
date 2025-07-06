@@ -15,259 +15,147 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Lock manager configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Lock system configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LockConfig {
-    /// Lock acquisition timeout
-    #[serde(default = "default_timeout")]
-    pub timeout: Duration,
-
-    /// Retry interval
-    #[serde(default = "default_retry_interval")]
-    pub retry_interval: Duration,
-
-    /// Maximum retry attempts
-    #[serde(default = "default_max_retries")]
-    pub max_retries: usize,
-
-    /// Lock refresh interval
-    #[serde(default = "default_refresh_interval")]
-    pub refresh_interval: Duration,
-
-    /// Connection pool size
-    #[serde(default = "default_connection_pool_size")]
-    pub connection_pool_size: usize,
-
-    /// Enable metrics collection
-    #[serde(default = "default_enable_metrics")]
-    pub enable_metrics: bool,
-
-    /// Enable tracing
-    #[serde(default = "default_enable_tracing")]
-    pub enable_tracing: bool,
-
-    /// Distributed lock configuration
-    #[serde(default)]
-    pub distributed: DistributedConfig,
-
+    /// Whether distributed locking is enabled
+    pub distributed_enabled: bool,
     /// Local lock configuration
-    #[serde(default)]
-    pub local: LocalConfig,
-}
-
-/// Distributed lock configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DistributedConfig {
-    /// Quorum ratio (0.0-1.0)
-    #[serde(default = "default_quorum_ratio")]
-    pub quorum_ratio: f64,
-
-    /// Minimum quorum size
-    #[serde(default = "default_min_quorum")]
-    pub min_quorum: usize,
-
-    /// Enable auto refresh
-    #[serde(default = "default_auto_refresh")]
-    pub auto_refresh: bool,
-
-    /// Heartbeat interval
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval: Duration,
+    pub local: LocalLockConfig,
+    /// Distributed lock configuration
+    pub distributed: DistributedLockConfig,
+    /// Network configuration
+    pub network: NetworkConfig,
 }
 
 /// Local lock configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalConfig {
-    /// Maximum number of locks
-    #[serde(default = "default_max_locks")]
-    pub max_locks: usize,
-
-    /// Lock cleanup interval
-    #[serde(default = "default_cleanup_interval")]
-    pub cleanup_interval: Duration,
-
-    /// Lock expiry time
-    #[serde(default = "default_lock_expiry")]
-    pub lock_expiry: Duration,
+pub struct LocalLockConfig {
+    /// Default lock timeout
+    pub default_timeout: Duration,
+    /// Default lock expiration time
+    pub default_expiration: Duration,
+    /// Maximum number of locks per resource
+    pub max_locks_per_resource: usize,
 }
 
-impl Default for LockConfig {
+/// Distributed lock configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributedLockConfig {
+    /// Total number of nodes in the cluster
+    pub total_nodes: usize,
+    /// Number of nodes that can fail (tolerance)
+    pub tolerance: usize,
+    /// Lock acquisition timeout
+    pub acquisition_timeout: Duration,
+    /// Lock refresh interval
+    pub refresh_interval: Duration,
+    /// Lock expiration time
+    pub expiration_time: Duration,
+    /// Retry interval for failed operations
+    pub retry_interval: Duration,
+    /// Maximum number of retry attempts
+    pub max_retries: usize,
+}
+
+/// Network configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Connection timeout
+    pub connection_timeout: Duration,
+    /// Request timeout
+    pub request_timeout: Duration,
+    /// Keep-alive interval
+    pub keep_alive_interval: Duration,
+    /// Maximum connection pool size
+    pub max_connections: usize,
+}
+
+impl Default for LocalLockConfig {
     fn default() -> Self {
         Self {
-            timeout: default_timeout(),
-            retry_interval: default_retry_interval(),
-            max_retries: default_max_retries(),
-            refresh_interval: default_refresh_interval(),
-            connection_pool_size: default_connection_pool_size(),
-            enable_metrics: default_enable_metrics(),
-            enable_tracing: default_enable_tracing(),
-            distributed: DistributedConfig::default(),
-            local: LocalConfig::default(),
+            default_timeout: Duration::from_secs(30),
+            default_expiration: Duration::from_secs(60),
+            max_locks_per_resource: 1000,
         }
     }
 }
 
-impl Default for DistributedConfig {
+impl Default for DistributedLockConfig {
     fn default() -> Self {
         Self {
-            quorum_ratio: default_quorum_ratio(),
-            min_quorum: default_min_quorum(),
-            auto_refresh: default_auto_refresh(),
-            heartbeat_interval: default_heartbeat_interval(),
+            total_nodes: 3,
+            tolerance: 1,
+            acquisition_timeout: Duration::from_secs(30),
+            refresh_interval: Duration::from_secs(10),
+            expiration_time: Duration::from_secs(60),
+            retry_interval: Duration::from_millis(250),
+            max_retries: 10,
         }
     }
 }
 
-impl Default for LocalConfig {
+impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            max_locks: default_max_locks(),
-            cleanup_interval: default_cleanup_interval(),
-            lock_expiry: default_lock_expiry(),
+            connection_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            keep_alive_interval: Duration::from_secs(30),
+            max_connections: 100,
         }
     }
-}
-
-// Default value functions
-fn default_timeout() -> Duration {
-    Duration::from_secs(30)
-}
-
-fn default_retry_interval() -> Duration {
-    Duration::from_millis(100)
-}
-
-fn default_max_retries() -> usize {
-    3
-}
-
-fn default_refresh_interval() -> Duration {
-    Duration::from_secs(10)
-}
-
-fn default_connection_pool_size() -> usize {
-    10
-}
-
-fn default_enable_metrics() -> bool {
-    true
-}
-
-fn default_enable_tracing() -> bool {
-    true
-}
-
-fn default_quorum_ratio() -> f64 {
-    0.5
-}
-
-fn default_min_quorum() -> usize {
-    1
-}
-
-fn default_auto_refresh() -> bool {
-    true
-}
-
-fn default_heartbeat_interval() -> Duration {
-    Duration::from_secs(5)
-}
-
-fn default_max_locks() -> usize {
-    10000
-}
-
-fn default_cleanup_interval() -> Duration {
-    Duration::from_secs(60)
-}
-
-fn default_lock_expiry() -> Duration {
-    Duration::from_secs(300)
 }
 
 impl LockConfig {
-    /// Create minimal configuration
-    pub fn minimal() -> Self {
+    /// Create new lock configuration
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create distributed lock configuration
+    pub fn distributed(total_nodes: usize, tolerance: usize) -> Self {
         Self {
-            timeout: Duration::from_secs(10),
-            retry_interval: Duration::from_millis(50),
-            max_retries: 1,
-            refresh_interval: Duration::from_secs(5),
-            connection_pool_size: 5,
-            enable_metrics: false,
-            enable_tracing: false,
-            distributed: DistributedConfig {
-                quorum_ratio: 0.5,
-                min_quorum: 1,
-                auto_refresh: false,
-                heartbeat_interval: Duration::from_secs(10),
+            distributed_enabled: true,
+            distributed: DistributedLockConfig {
+                total_nodes,
+                tolerance,
+                ..Default::default()
             },
-            local: LocalConfig {
-                max_locks: 1000,
-                cleanup_interval: Duration::from_secs(30),
-                lock_expiry: Duration::from_secs(60),
-            },
+            ..Default::default()
         }
     }
 
-    /// Create high performance configuration
-    pub fn high_performance() -> Self {
+    /// Create local-only lock configuration
+    pub fn local() -> Self {
         Self {
-            timeout: Duration::from_secs(60),
-            retry_interval: Duration::from_millis(10),
-            max_retries: 5,
-            refresh_interval: Duration::from_secs(30),
-            connection_pool_size: 50,
-            enable_metrics: true,
-            enable_tracing: true,
-            distributed: DistributedConfig {
-                quorum_ratio: 0.7,
-                min_quorum: 3,
-                auto_refresh: true,
-                heartbeat_interval: Duration::from_secs(2),
-            },
-            local: LocalConfig {
-                max_locks: 100000,
-                cleanup_interval: Duration::from_secs(300),
-                lock_expiry: Duration::from_secs(1800),
-            },
+            distributed_enabled: false,
+            ..Default::default()
         }
     }
 
-    /// Validate configuration
-    pub fn validate(&self) -> crate::error::Result<()> {
-        if self.timeout.is_zero() {
-            return Err(crate::error::LockError::configuration("Timeout must be greater than zero"));
-        }
-
-        if self.retry_interval.is_zero() {
-            return Err(crate::error::LockError::configuration("Retry interval must be greater than zero"));
-        }
-
-        if self.max_retries == 0 {
-            return Err(crate::error::LockError::configuration("Max retries must be greater than zero"));
-        }
-
-        if self.distributed.quorum_ratio < 0.0 || self.distributed.quorum_ratio > 1.0 {
-            return Err(crate::error::LockError::configuration("Quorum ratio must be between 0.0 and 1.0"));
-        }
-
-        if self.distributed.min_quorum == 0 {
-            return Err(crate::error::LockError::configuration("Minimum quorum must be greater than zero"));
-        }
-
-        Ok(())
+    /// Check if distributed locking is enabled
+    pub fn is_distributed(&self) -> bool {
+        self.distributed_enabled
     }
 
-    /// Calculate quorum size for distributed locks
-    pub fn calculate_quorum(&self, total_nodes: usize) -> usize {
-        let quorum = (total_nodes as f64 * self.distributed.quorum_ratio).ceil() as usize;
-        std::cmp::max(quorum, self.distributed.min_quorum)
+    /// Get quorum size for distributed locks
+    pub fn get_quorum_size(&self) -> usize {
+        self.distributed.total_nodes - self.distributed.tolerance
     }
 
-    /// Calculate fault tolerance
-    pub fn calculate_tolerance(&self, total_nodes: usize) -> usize {
-        total_nodes - self.calculate_quorum(total_nodes)
+    /// Check if quorum configuration is valid
+    pub fn is_quorum_valid(&self) -> bool {
+        self.distributed.tolerance < self.distributed.total_nodes
+    }
+
+    /// Get effective timeout
+    pub fn get_effective_timeout(&self, timeout: Option<Duration>) -> Duration {
+        timeout.unwrap_or(self.local.default_timeout)
+    }
+
+    /// Get effective expiration
+    pub fn get_effective_expiration(&self, expiration: Option<Duration>) -> Duration {
+        expiration.unwrap_or(self.local.default_expiration)
     }
 }
 
@@ -276,57 +164,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
+    fn test_lock_config_default() {
         let config = LockConfig::default();
-        assert!(!config.timeout.is_zero());
-        assert!(!config.retry_interval.is_zero());
-        assert!(config.max_retries > 0);
+        assert!(!config.distributed_enabled);
+        assert_eq!(config.local.default_timeout, Duration::from_secs(30));
     }
 
     #[test]
-    fn test_minimal_config() {
-        let config = LockConfig::minimal();
-        assert_eq!(config.timeout, Duration::from_secs(10));
-        assert_eq!(config.max_retries, 1);
-        assert!(!config.enable_metrics);
+    fn test_lock_config_distributed() {
+        let config = LockConfig::distributed(5, 2);
+        assert!(config.distributed_enabled);
+        assert_eq!(config.distributed.total_nodes, 5);
+        assert_eq!(config.distributed.tolerance, 2);
+        assert_eq!(config.get_quorum_size(), 3);
     }
 
     #[test]
-    fn test_high_performance_config() {
-        let config = LockConfig::high_performance();
-        assert_eq!(config.timeout, Duration::from_secs(60));
-        assert_eq!(config.max_retries, 5);
-        assert!(config.enable_metrics);
+    fn test_lock_config_local() {
+        let config = LockConfig::local();
+        assert!(!config.distributed_enabled);
     }
 
     #[test]
-    fn test_config_validation() {
-        let mut config = LockConfig::default();
-        assert!(config.validate().is_ok());
-
-        config.timeout = Duration::ZERO;
-        assert!(config.validate().is_err());
-
-        config = LockConfig::default();
-        config.distributed.quorum_ratio = 1.5;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_quorum_calculation() {
+    fn test_effective_timeout() {
         let config = LockConfig::default();
-        assert_eq!(config.calculate_quorum(10), 5);
-        assert_eq!(config.calculate_quorum(3), 2);
-        assert_eq!(config.calculate_tolerance(10), 5);
+        assert_eq!(config.get_effective_timeout(None), Duration::from_secs(30));
+        assert_eq!(config.get_effective_timeout(Some(Duration::from_secs(10))), Duration::from_secs(10));
     }
 
     #[test]
-    fn test_serialization() {
+    fn test_effective_expiration() {
         let config = LockConfig::default();
-        let serialized = serde_json::to_string(&config).unwrap();
-        let deserialized: LockConfig = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(config.timeout, deserialized.timeout);
-        assert_eq!(config.max_retries, deserialized.max_retries);
+        assert_eq!(config.get_effective_expiration(None), Duration::from_secs(60));
+        assert_eq!(config.get_effective_expiration(Some(Duration::from_secs(30))), Duration::from_secs(30));
     }
 }

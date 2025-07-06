@@ -50,8 +50,6 @@ pub enum LockPriority {
     Critical = 4,
 }
 
-
-
 /// Lock information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockInfo {
@@ -79,36 +77,99 @@ pub struct LockInfo {
     pub wait_start_time: Option<SystemTime>,
 }
 
+impl LockInfo {
+    /// Check if the lock has expired
+    pub fn has_expired(&self) -> bool {
+        self.expires_at <= SystemTime::now()
+    }
+
+    /// Get remaining time until expiration
+    pub fn remaining_time(&self) -> Duration {
+        let now = SystemTime::now();
+        if self.expires_at > now {
+            self.expires_at.duration_since(now).unwrap_or(Duration::ZERO)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Check if the lock is still valid
+    pub fn is_valid(&self) -> bool {
+        !self.has_expired() && self.status == LockStatus::Acquired
+    }
+}
+
 /// Lock ID type
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LockId(pub String);
+pub struct LockId {
+    pub resource: String,
+    pub uuid: String,
+}
 
 impl LockId {
-    /// Generate new lock ID
-    pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
+    /// Generate new lock ID for a resource
+    pub fn new(resource: &str) -> Self {
+        Self {
+            resource: resource.to_string(),
+            uuid: Uuid::new_v4().to_string(),
+        }
     }
 
-    /// Create lock ID from string
+    /// Generate deterministic lock ID for a resource (same resource = same ID)
+    pub fn new_deterministic(resource: &str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        resource.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        Self {
+            resource: resource.to_string(),
+            uuid: format!("{hash:016x}"),
+        }
+    }
+
+    /// Create lock ID from resource and uuid
+    pub fn from_parts(resource: impl Into<String>, uuid: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            uuid: uuid.into(),
+        }
+    }
+
+    /// Create lock ID from string (for compatibility, expects "resource:uuid")
     pub fn from_string(id: impl Into<String>) -> Self {
-        Self(id.into())
+        let s = id.into();
+        if let Some((resource, uuid)) = s.split_once(":") {
+            Self {
+                resource: resource.to_string(),
+                uuid: uuid.to_string(),
+            }
+        } else {
+            // fallback: treat as uuid only
+            Self {
+                resource: "unknown".to_string(),
+                uuid: s,
+            }
+        }
     }
 
-    /// Get string representation of lock ID
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Get string representation of lock ID ("resource:uuid")
+    pub fn as_str(&self) -> String {
+        format!("{}:{}", self.resource, self.uuid)
     }
 }
 
 impl Default for LockId {
     fn default() -> Self {
-        Self::new()
+        Self::new("default")
     }
 }
 
 impl std::fmt::Display for LockId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}:{}", self.resource, self.uuid)
     }
 }
 
@@ -173,6 +234,8 @@ impl LockMetadata {
 /// Lock request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockRequest {
+    /// Lock ID
+    pub lock_id: LockId,
     /// Resource path
     pub resource: String,
     /// Lock type
@@ -194,8 +257,10 @@ pub struct LockRequest {
 impl LockRequest {
     /// Create new lock request
     pub fn new(resource: impl Into<String>, lock_type: LockType, owner: impl Into<String>) -> Self {
+        let resource_str = resource.into();
         Self {
-            resource: resource.into(),
+            lock_id: LockId::new_deterministic(&resource_str),
+            resource: resource_str,
             lock_type,
             owner: owner.into(),
             timeout: Duration::from_secs(30),
@@ -332,6 +397,14 @@ pub struct LockStats {
     pub average_hold_time: Duration,
     /// Total wait queues
     pub total_wait_queues: usize,
+    /// Queue entries
+    pub queue_entries: usize,
+    /// Average wait time
+    pub avg_wait_time: Duration,
+    /// Successful acquires
+    pub successful_acquires: usize,
+    /// Failed acquires
+    pub failed_acquires: usize,
 }
 
 impl Default for LockStats {
@@ -348,6 +421,10 @@ impl Default for LockStats {
             total_hold_time: Duration::ZERO,
             average_hold_time: Duration::ZERO,
             total_wait_queues: 0,
+            queue_entries: 0,
+            avg_wait_time: Duration::ZERO,
+            successful_acquires: 0,
+            failed_acquires: 0,
         }
     }
 }
@@ -379,8 +456,6 @@ pub enum NodeStatus {
     Degraded,
 }
 
-
-
 /// Cluster information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterInfo {
@@ -408,7 +483,49 @@ pub enum ClusterStatus {
     Unhealthy,
 }
 
+/// Health check status
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthStatus {
+    /// Healthy
+    Healthy,
+    /// Degraded
+    Degraded,
+    /// Unhealthy
+    Unhealthy,
+}
 
+/// Health check information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthInfo {
+    /// Overall status
+    pub status: HealthStatus,
+    /// Node ID
+    pub node_id: String,
+    /// Last heartbeat time
+    pub last_heartbeat: SystemTime,
+    /// Connected nodes count
+    pub connected_nodes: usize,
+    /// Total nodes count
+    pub total_nodes: usize,
+    /// Lock statistics
+    pub lock_stats: LockStats,
+    /// Error message (if any)
+    pub error_message: Option<String>,
+}
+
+impl Default for HealthInfo {
+    fn default() -> Self {
+        Self {
+            status: HealthStatus::Healthy,
+            node_id: "unknown".to_string(),
+            last_heartbeat: SystemTime::now(),
+            connected_nodes: 1,
+            total_nodes: 1,
+            lock_stats: LockStats::default(),
+            error_message: None,
+        }
+    }
+}
 
 /// Timestamp type alias
 pub type Timestamp = u64;
@@ -498,12 +615,12 @@ mod tests {
 
     #[test]
     fn test_lock_id() {
-        let id1 = LockId::new();
-        let id2 = LockId::new();
+        let id1 = LockId::new("test-resource");
+        let id2 = LockId::new("test-resource");
         assert_ne!(id1, id2);
 
-        let id3 = LockId::from_string("test-id");
-        assert_eq!(id3.as_str(), "test-id");
+        let id3 = LockId::from_string("test-resource:test-uuid");
+        assert_eq!(id3.as_str(), "test-resource:test-uuid");
     }
 
     #[test]
@@ -538,7 +655,7 @@ mod tests {
     #[test]
     fn test_lock_response() {
         let lock_info = LockInfo {
-            id: LockId::new(),
+            id: LockId::new("test-resource"),
             resource: "test".to_string(),
             lock_type: LockType::Exclusive,
             status: LockStatus::Acquired,

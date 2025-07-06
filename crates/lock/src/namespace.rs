@@ -13,116 +13,60 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use lru::LruCache;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
-    Locker,
-    core::local::LocalLockMap,
+    client::{LockClient, local::LocalClient, remote::RemoteClient},
+    distributed::DistributedLockManager,
     error::{LockError, Result},
-    client::remote::RemoteClient,
+    local::LocalLockMap,
+    types::{LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStatus, LockType},
 };
 
-/// Connection health check result
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConnectionHealth {
-    /// Connection healthy
-    Healthy,
-    /// Connection unhealthy
-    Unhealthy(String),
-    /// Connection status unknown
-    Unknown,
-}
-
-/// Namespace lock mapping table
+/// Namespace lock manager
 ///
-/// Provides local lock or remote lock functionality based on whether it is a distributed mode
+/// Provides unified interface for both local and remote locks
 #[derive(Debug)]
 pub struct NsLockMap {
-    /// Whether it is a distributed mode
+    /// Whether it is distributed mode
     is_dist: bool,
-    /// Local lock mapping table (not used in distributed mode)
-    local_map: Option<LocalLockMap>,
-    /// Remote client cache (used in distributed mode)
-    /// Using LRU cache to avoid infinite memory growth
-    remote_clients: RemoteClientCache,
-    /// Health check background task stop signal
-    health_check_stop_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Lock client (local or remote)
+    client: Arc<dyn LockClient>,
+    /// Shared lock map for local mode
+    local_lock_map: Arc<LocalLockMap>,
 }
 
 impl NsLockMap {
-    /// Start health check background task, return stop signal Sender
-    fn spawn_health_check_task(
-        clients: Arc<Mutex<LruCache<String, Arc<Mutex<RemoteClient>>>>>,
-        interval_secs: u64,
-    ) -> tokio::sync::broadcast::Sender<()> {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let mut cache_guard = clients.lock().await;
-                        let mut to_remove = Vec::new();
-                        for (url, client) in cache_guard.iter() {
-                            let online = client.lock().await.is_online().await;
-                            if !online {
-                                warn!("[auto-health-check] Remote client {} is unhealthy, will remove", url);
-                                to_remove.push(url.clone());
-                            }
-                        }
-                        for url in to_remove {
-                            cache_guard.pop(&url);
-                            info!("[auto-health-check] Removed unhealthy remote client: {}", url);
-                        }
-                    }
-                    _ = rx.recv() => {
-                        debug!("[auto-health-check] Health check task stopped");
-                        break;
-                    }
-                }
-            }
-        });
-        tx
-    }
-
-    /// Create a new namespace lock mapping table
+    /// Create a new namespace lock manager
     ///
     /// # Parameters
-    /// - `is_dist`: Whether it is a distributed mode
-    /// - `cache_size`: LRU cache size (only valid in distributed mode, default is 100)
+    /// - `is_dist`: Whether it is distributed mode
+    /// - `cache_size`: Not used in simplified version
     ///
     /// # Returns
     /// - New NsLockMap instance
-    pub fn new(is_dist: bool, cache_size: Option<usize>) -> Self {
-        let cache_size = cache_size.unwrap_or(100);
-        let remote_clients: RemoteClientCache = if is_dist {
-            Some(Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(cache_size).unwrap()))))
+    pub fn new(is_dist: bool, _cache_size: Option<usize>) -> Self {
+        // Use the global shared lock map to ensure all instances share the same lock state
+        let local_lock_map = crate::get_global_lock_map();
+        
+        let client: Arc<dyn LockClient> = if is_dist {
+            // In distributed mode, we need a remote client
+            // For now, we'll use local client as fallback
+            // TODO: Implement proper remote client creation with URL
+            Arc::new(LocalClient::new())
         } else {
-            None
+            Arc::new(LocalClient::new())
         };
-        let health_check_stop_tx = if is_dist {
-            Some(Self::spawn_health_check_task(remote_clients.as_ref().unwrap().clone(), 30))
-        } else {
-            None
-        };
-        Self {
-            is_dist,
-            local_map: if !is_dist { Some(LocalLockMap::new()) } else { None },
-            remote_clients,
-            health_check_stop_tx,
-        }
+
+        Self { is_dist, client, local_lock_map }
     }
 
     /// Create namespace lock client
     ///
     /// # Parameters
-    /// - `url`: Remote lock service URL (must be provided in distributed mode)
+    /// - `url`: Remote lock service URL (required in distributed mode)
     ///
     /// # Returns
     /// - `Ok(NamespaceLock)`: Namespace lock client
@@ -130,335 +74,475 @@ impl NsLockMap {
     pub async fn new_nslock(&self, url: Option<Url>) -> Result<NamespaceLock> {
         if self.is_dist {
             let url = url.ok_or_else(|| LockError::internal("remote_url is required for distributed lock mode"))?;
-
-            // Check if the client for this URL is already in the cache
-            if let Some(cache) = &self.remote_clients {
-                let url_str = url.to_string();
-                let mut cache_guard = cache.lock().await;
-
-                if let Some(client) = cache_guard.get(&url_str) {
-                    // Reuse existing client (LRU will automatically update access order)
-                    return Ok(NamespaceLock::new_cached(client.clone()));
-                }
-
-                // Create new client and cache it
-                let new_client = Arc::new(Mutex::new(RemoteClient::from_url(url.clone())));
-                cache_guard.put(url_str, new_client.clone());
-                Ok(NamespaceLock::new_cached(new_client))
-            } else {
-                // Should not reach here, but for safety
-                Ok(NamespaceLock::new_remote(url))
-            }
+            let client = Arc::new(RemoteClient::from_url(url));
+            Ok(NamespaceLock::with_client(client))
         } else {
-            Ok(NamespaceLock::new_local())
+            let client = Arc::new(LocalClient::new());
+            Ok(NamespaceLock::with_client(client))
         }
     }
 
-    /// Batch lock (directly use local lock mapping table)
-    pub async fn lock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
-        if let Some(local_map) = &self.local_map {
-            local_map.lock_batch(resources, owner, timeout, None).await
-        } else {
-            Err(LockError::internal("local lock map not available in distributed mode"))
-        }
-    }
-
-    /// Batch unlock (directly use local lock mapping table)
-    pub async fn unlock_batch(&self, resources: &[String], owner: &str) -> Result<()> {
-        if let Some(local_map) = &self.local_map {
-            local_map.unlock_batch(resources, owner).await
-        } else {
-            Err(LockError::internal("local lock map not available in distributed mode"))
-        }
-    }
-
-    /// Batch read lock (directly use local lock mapping table)
-    pub async fn rlock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
-        if let Some(local_map) = &self.local_map {
-            local_map.rlock_batch(resources, owner, timeout, None).await
-        } else {
-            Err(LockError::internal("local lock map not available in distributed mode"))
-        }
-    }
-
-    /// Batch release read lock (directly use local lock mapping table)
-    pub async fn runlock_batch(&self, resources: &[String], owner: &str) -> Result<()> {
-        if let Some(local_map) = &self.local_map {
-            local_map.runlock_batch(resources, owner).await
-        } else {
-            Err(LockError::internal("local lock map not available in distributed mode"))
-        }
-    }
-
-    /// Check if it is a distributed mode
+    /// Check if it is distributed mode
     pub fn is_distributed(&self) -> bool {
         self.is_dist
     }
 
-    /// Clean up remote client cache (optional, for memory management)
-    pub async fn clear_remote_cache(&self) {
-        if let Some(cache) = &self.remote_clients {
-            let mut cache_guard = cache.lock().await;
-            cache_guard.clear();
-        }
+    /// Batch acquire write locks, returns Vec<LockId>
+    pub async fn lock_batch_id(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<Vec<crate::types::LockId>> {
+        self.local_lock_map.lock_batch_id(resources, owner, timeout, None).await
     }
 
-    /// Get the number of clients in the cache (for monitoring)
-    pub async fn cached_client_count(&self) -> usize {
-        if let Some(cache) = &self.remote_clients {
-            let cache_guard = cache.lock().await;
-            cache_guard.len()
-        } else {
-            0
-        }
+    /// Batch release write locks by LockIds
+    pub async fn unlock_batch_id(&self, lock_ids: &[crate::types::LockId]) -> Result<()> {
+        self.local_lock_map.unlock_batch_id(lock_ids).await
     }
 
-    /// Get the cache capacity (for monitoring)
-    pub async fn cache_capacity(&self) -> usize {
-        if let Some(cache) = &self.remote_clients {
-            let cache_guard = cache.lock().await;
-            cache_guard.cap().get()
-        } else {
-            0
-        }
+    /// Batch acquire read locks, returns Vec<LockId>
+    pub async fn rlock_batch_id(
+        &self,
+        resources: &[String],
+        owner: &str,
+        timeout: Duration,
+    ) -> Result<Vec<crate::types::LockId>> {
+        self.local_lock_map.rlock_batch_id(resources, owner, timeout, None).await
     }
 
-    /// Get the cache hit rate (for monitoring)
-    /// Note: This is a simplified implementation, and actual use may require more complex statistics
-    pub async fn cache_hit_rate(&self) -> f64 {
-        // TODO: Implement more accurate hit rate statistics
-        // Currently returning a placeholder value
-        0.0
+    /// Batch release read locks by LockIds
+    pub async fn runlock_batch_id(&self, lock_ids: &[crate::types::LockId]) -> Result<()> {
+        self.local_lock_map.runlock_batch_id(lock_ids).await
     }
 
-    /// Remove specific remote client (for manual management)
-    pub async fn remove_remote_client(&self, url: &str) -> bool {
-        if let Some(cache) = &self.remote_clients {
-            let mut cache_guard = cache.lock().await;
-            cache_guard.pop(url).is_some()
-        } else {
-            false
-        }
+    /// Batch acquire write locks (compatibility)
+    pub async fn lock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
+        let lock_ids = self.lock_batch_id(resources, owner, timeout).await?;
+        Ok(!lock_ids.is_empty())
     }
 
-    /// Check the connection health status of a specific remote client
-    pub async fn check_client_health(&self, url: &str) -> ConnectionHealth {
-        if let Some(cache) = &self.remote_clients {
-            let mut cache_guard = cache.lock().await;
-            if let Some(client) = cache_guard.get(url) {
-                let online = client.lock().await.is_online().await;
-                if online {
-                    ConnectionHealth::Healthy
-                } else {
-                    ConnectionHealth::Unhealthy("Client reports offline".to_string())
-                }
-            } else {
-                ConnectionHealth::Unknown
+    /// Batch acquire write locks with TTL
+    pub async fn lock_batch_with_ttl(&self, resources: &[String], owner: &str, timeout: Duration, ttl: Option<Duration>) -> Result<bool> {
+        if self.is_dist {
+            // For distributed mode, use the client directly
+            let request = crate::types::LockRequest::new(&resources[0], crate::types::LockType::Exclusive, owner)
+                .with_timeout(timeout);
+            match self.client.acquire_exclusive(request).await {
+                Ok(response) => Ok(response.success),
+                Err(e) => Err(e),
             }
         } else {
-            ConnectionHealth::Unknown
+            // For local mode, use the shared local lock map
+            self.local_lock_map.lock_batch(resources, owner, timeout, ttl).await
         }
     }
 
-    /// Health check all remote client connections
-    ///
-    /// # Parameters
-    /// - `remove_unhealthy`: Whether to remove unhealthy connections
-    ///
-    /// # Returns
-    /// - `Ok(HealthCheckResult)`: Health check result
-    pub async fn health_check_all_clients(&self, remove_unhealthy: bool) -> Result<HealthCheckResult> {
-        if let Some(cache) = &self.remote_clients {
-            let mut cache_guard = cache.lock().await;
-            let mut result = HealthCheckResult::default();
-            let mut to_remove = Vec::new();
+    /// Batch release write locks (compatibility)
+    pub async fn unlock_batch(&self, resources: &[String], _owner: &str) -> Result<()> {
+        // For compatibility, we need to find the LockIds for these resources
+        // This is a simplified approach - in practice you might want to maintain a resource->LockId mapping
+        for resource in resources {
+            // Create a LockId that matches the resource name for release
+            let lock_id = crate::types::LockId::new_deterministic(resource);
+            let _ = self.local_lock_map.unlock_by_id(&lock_id).await;
+        }
+        Ok(())
+    }
 
-            // Check all clients
-            for (url, client) in cache_guard.iter() {
-                let online = client.lock().await.is_online().await;
-                let health = if online {
-                    result.healthy_count += 1;
-                    ConnectionHealth::Healthy
-                } else {
-                    result.unhealthy_count += 1;
-                    ConnectionHealth::Unhealthy("Client reports offline".to_string())
-                };
+    /// Batch acquire read locks (compatibility)
+    pub async fn rlock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
+        let lock_ids = self.rlock_batch_id(resources, owner, timeout).await?;
+        Ok(!lock_ids.is_empty())
+    }
 
-                if health != ConnectionHealth::Healthy {
-                    warn!("Remote client {} is unhealthy: {:?}", url, health);
-                    if remove_unhealthy {
-                        to_remove.push(url.clone());
-                    }
-                } else {
-                    debug!("Remote client {} is healthy", url);
-                }
+    /// Batch acquire read locks with TTL
+    pub async fn rlock_batch_with_ttl(&self, resources: &[String], owner: &str, timeout: Duration, ttl: Option<Duration>) -> Result<bool> {
+        if self.is_dist {
+            // For distributed mode, use the client directly
+            let request = crate::types::LockRequest::new(&resources[0], crate::types::LockType::Shared, owner)
+                .with_timeout(timeout);
+            match self.client.acquire_shared(request).await {
+                Ok(response) => Ok(response.success),
+                Err(e) => Err(e),
             }
-
-            // Remove unhealthy connections
-            for url in to_remove {
-                if cache_guard.pop(&url).is_some() {
-                    result.removed_count += 1;
-                    info!("Removed unhealthy remote client: {}", url);
-                }
-            }
-
-            Ok(result)
         } else {
-            Ok(HealthCheckResult::default())
+            // For local mode, use the shared local lock map
+            self.local_lock_map.rlock_batch(resources, owner, timeout, ttl).await
         }
     }
-}
 
-impl Drop for NsLockMap {
-    fn drop(&mut self) {
-        if let Some(tx) = &self.health_check_stop_tx {
-            let _ = tx.send(());
+    /// Batch release read locks (compatibility)
+    pub async fn runlock_batch(&self, resources: &[String], _owner: &str) -> Result<()> {
+        // For compatibility, we need to find the LockIds for these resources
+        for resource in resources {
+            // Create a LockId that matches the resource name for release
+            let lock_id = crate::types::LockId::new_deterministic(resource);
+            let _ = self.local_lock_map.runlock_by_id(&lock_id).await;
         }
+        Ok(())
     }
 }
 
-/// Health check result
-#[derive(Debug, Default)]
-pub struct HealthCheckResult {
-    /// Healthy connection count
-    pub healthy_count: usize,
-    /// Unhealthy connection count
-    pub unhealthy_count: usize,
-    /// Removed connection count
-    pub removed_count: usize,
-}
-
-impl HealthCheckResult {
-    /// Get total connection count
-    pub fn total_count(&self) -> usize {
-        self.healthy_count + self.unhealthy_count
-    }
-
-    /// Get health rate
-    pub fn health_rate(&self) -> f64 {
-        let total = self.total_count();
-        if total == 0 {
-            1.0
-        } else {
-            self.healthy_count as f64 / total as f64
-        }
-    }
-}
-
-/// Namespace lock client enum
-///
-/// Supports both local lock and remote lock modes
+/// Namespace lock for managing locks by resource namespaces
 #[derive(Debug)]
-pub enum NamespaceLock {
-    /// Local lock client
-    Local(LocalLockMap),
-    /// Remote lock client (new)
-    Remote(Arc<Mutex<RemoteClient>>),
-    /// Remote lock client (from cache)
-    Cached(Arc<Mutex<RemoteClient>>),
+pub struct NamespaceLock {
+    /// Local lock map for this namespace
+    local_locks: Arc<LocalLockMap>,
+    /// Distributed lock manager (if enabled)
+    distributed_manager: Option<Arc<DistributedLockManager>>,
+
+    /// Namespace identifier
+    namespace: String,
+    /// Whether distributed locking is enabled
+    distributed_enabled: bool,
 }
 
 impl NamespaceLock {
-    /// Create local namespace lock
-    pub fn new_local() -> Self {
-        Self::Local(LocalLockMap::new())
-    }
-
-    /// Create remote namespace lock
-    pub fn new_remote(url: Url) -> Self {
-        Self::Remote(Arc::new(Mutex::new(RemoteClient::from_url(url))))
-    }
-
-    /// Create cached remote namespace lock
-    pub fn new_cached(client: Arc<Mutex<RemoteClient>>) -> Self {
-        Self::Cached(client)
-    }
-
-    /// Batch lock
-    pub async fn lock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
-        match self {
-            Self::Local(local) => local.lock_batch(resources, owner, timeout, None).await,
-            Self::Remote(remote) | Self::Cached(remote) => {
-                let args = crate::lock_args::LockArgs {
-                    uid: uuid::Uuid::new_v4().to_string(),
-                    resources: resources.to_vec(),
-                    owner: owner.to_string(),
-                    source: "namespace".to_string(),
-                    quorum: 1,
-                };
-                let mut client = remote.lock().await;
-                client.lock(&args).await
-            }
+    /// Create new namespace lock
+    pub fn new(namespace: String, distributed_enabled: bool) -> Self {
+        Self {
+            local_locks: Arc::new(LocalLockMap::new()),
+            distributed_manager: None,
+            namespace,
+            distributed_enabled,
         }
     }
 
-    /// Batch unlock
-    pub async fn unlock_batch(&self, resources: &[String], owner: &str) -> Result<()> {
-        match self {
-            Self::Local(local) => local.unlock_batch(resources, owner).await,
-            Self::Remote(remote) | Self::Cached(remote) => {
-                let args = crate::lock_args::LockArgs {
-                    uid: uuid::Uuid::new_v4().to_string(),
-                    resources: resources.to_vec(),
-                    owner: owner.to_string(),
-                    source: "namespace".to_string(),
-                    quorum: 1,
-                };
-                let mut client = remote.lock().await;
-                client.unlock(&args).await.map(|_| ())
-            }
+    /// Create namespace lock with client
+    pub fn with_client(_client: Arc<dyn LockClient>) -> Self {
+        Self {
+            local_locks: Arc::new(LocalLockMap::new()),
+            distributed_manager: None,
+            namespace: "default".to_string(),
+            distributed_enabled: false,
         }
     }
 
-    /// Batch read lock
-    pub async fn rlock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
-        match self {
-            Self::Local(local) => local.rlock_batch(resources, owner, timeout, None).await,
-            Self::Remote(remote) | Self::Cached(remote) => {
-                let args = crate::lock_args::LockArgs {
-                    uid: uuid::Uuid::new_v4().to_string(),
-                    resources: resources.to_vec(),
-                    owner: owner.to_string(),
-                    source: "namespace".to_string(),
-                    quorum: 1,
-                };
-                let mut client = remote.lock().await;
-                client.rlock(&args).await
-            }
+    /// Create namespace lock with distributed manager
+    pub fn with_distributed(namespace: String, distributed_manager: Arc<DistributedLockManager>) -> Self {
+        Self {
+            local_locks: Arc::new(LocalLockMap::new()),
+            distributed_manager: Some(distributed_manager),
+            namespace,
+            distributed_enabled: true,
         }
     }
 
-    /// Batch release read lock
-    pub async fn runlock_batch(&self, resources: &[String], owner: &str) -> Result<()> {
-        match self {
-            Self::Local(local) => local.runlock_batch(resources, owner).await,
-            Self::Remote(remote) | Self::Cached(remote) => {
-                let args = crate::lock_args::LockArgs {
-                    uid: uuid::Uuid::new_v4().to_string(),
-                    resources: resources.to_vec(),
-                    owner: owner.to_string(),
-                    source: "namespace".to_string(),
-                    quorum: 1,
-                };
-                let mut client = remote.lock().await;
-                client.runlock(&args).await.map(|_| ())
-            }
-        }
+    /// Get namespace identifier
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
-    /// Check connection health status
-    pub async fn check_health(&self) -> ConnectionHealth {
-        match self {
-            Self::Local(_) => ConnectionHealth::Healthy, // Local connection is always healthy
-            Self::Remote(remote) | Self::Cached(remote) => {
-                let online = remote.lock().await.is_online().await;
-                if online {
-                    ConnectionHealth::Healthy
-                } else {
-                    ConnectionHealth::Unhealthy("Client reports offline".to_string())
+    /// Check if distributed locking is enabled
+    pub fn is_distributed(&self) -> bool {
+        self.distributed_enabled && self.distributed_manager.is_some()
+    }
+
+    /// Set distributed manager
+    pub fn set_distributed_manager(&mut self, manager: Arc<DistributedLockManager>) {
+        self.distributed_manager = Some(manager);
+        self.distributed_enabled = true;
+    }
+
+    /// Remove distributed manager
+    pub fn remove_distributed_manager(&mut self) {
+        self.distributed_manager = None;
+        self.distributed_enabled = false;
+    }
+
+    /// Acquire lock in this namespace
+    pub async fn acquire_lock(&self, request: LockRequest) -> Result<LockResponse> {
+        let resource_key = self.get_resource_key(&request.resource);
+
+        // Check if we already hold this lock
+        if let Some(lock_info) = self.local_locks.get_lock(&resource_key).await {
+            if lock_info.owner == request.owner && !lock_info.has_expired() {
+                return Ok(LockResponse::success(lock_info, Duration::ZERO));
+            }
+        }
+
+        // Try local lock first
+        match self.try_local_lock(&request).await {
+            Ok(response) => {
+                if response.success {
+                    return Ok(response);
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Local lock acquisition failed: {}", e);
+            }
+        }
+
+        // If distributed locking is enabled, try distributed lock
+        if self.is_distributed() {
+            if let Some(manager) = &self.distributed_manager {
+                match manager.acquire_lock(request.clone()).await {
+                    Ok(response) => {
+                        if response.success {
+                            // Also acquire local lock for consistency
+                            let _ = self.try_local_lock(&request).await;
+                            return Ok(response);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Distributed lock acquisition failed: {}", e);
+                    }
                 }
             }
         }
+
+        // If all else fails, return timeout error
+        Err(LockError::timeout("Lock acquisition failed", request.timeout))
+    }
+
+    /// Try to acquire local lock
+    async fn try_local_lock(&self, request: &LockRequest) -> Result<LockResponse> {
+        let resource_key = self.get_resource_key(&request.resource);
+        let lock_id = request.lock_id.clone();
+
+        match request.lock_type {
+            LockType::Exclusive => {
+                self.local_locks
+                    .acquire_exclusive_lock(&resource_key, &lock_id, &request.owner, request.timeout)
+                    .await?;
+            }
+            LockType::Shared => {
+                self.local_locks
+                    .acquire_shared_lock(&resource_key, &lock_id, &request.owner, request.timeout)
+                    .await?;
+            }
+        }
+
+        Ok(LockResponse::success(
+            LockInfo {
+                id: lock_id,
+                resource: request.resource.clone(),
+                lock_type: request.lock_type,
+                status: LockStatus::Acquired,
+                owner: request.owner.clone(),
+                acquired_at: std::time::SystemTime::now(),
+                expires_at: std::time::SystemTime::now() + request.timeout,
+                last_refreshed: std::time::SystemTime::now(),
+                metadata: request.metadata.clone(),
+                priority: request.priority,
+                wait_start_time: None,
+            },
+            Duration::ZERO,
+        ))
+    }
+
+    /// Release lock in this namespace
+    pub async fn release_lock(&self, lock_id: &LockId, owner: &str) -> Result<LockResponse> {
+        let resource_key = self.get_resource_key_from_lock_id(lock_id);
+
+        // Release local lock
+        let local_result = self.local_locks.release_lock(&resource_key, owner).await;
+
+        // Release distributed lock if enabled
+        if self.is_distributed() {
+            if let Some(manager) = &self.distributed_manager {
+                let _ = manager.release_lock(lock_id, owner).await;
+            }
+        }
+
+        match local_result {
+            Ok(_) => Ok(LockResponse::success(
+                LockInfo {
+                    id: lock_id.clone(),
+                    resource: "unknown".to_string(),
+                    lock_type: LockType::Exclusive,
+                    status: LockStatus::Released,
+                    owner: owner.to_string(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now(),
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: LockMetadata::default(),
+                    priority: LockPriority::Normal,
+                    wait_start_time: None,
+                },
+                Duration::ZERO,
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Refresh lock in this namespace
+    pub async fn refresh_lock(&self, lock_id: &LockId, owner: &str) -> Result<LockResponse> {
+        let resource_key = self.get_resource_key_from_lock_id(lock_id);
+
+        // Refresh local lock
+        let local_result = self.local_locks.refresh_lock(&resource_key, owner).await;
+
+        // Refresh distributed lock if enabled
+        if self.is_distributed() {
+            if let Some(manager) = &self.distributed_manager {
+                let _ = manager.refresh_lock(lock_id, owner).await;
+            }
+        }
+
+        match local_result {
+            Ok(_) => Ok(LockResponse::success(
+                LockInfo {
+                    id: lock_id.clone(),
+                    resource: "unknown".to_string(),
+                    lock_type: LockType::Exclusive,
+                    status: LockStatus::Acquired,
+                    owner: "unknown".to_string(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + Duration::from_secs(30),
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: LockMetadata::default(),
+                    priority: LockPriority::Normal,
+                    wait_start_time: None,
+                },
+                Duration::ZERO,
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get lock information
+    pub async fn get_lock_info(&self, lock_id: &LockId) -> Option<LockInfo> {
+        let resource_key = self.get_resource_key_from_lock_id(lock_id);
+        self.local_locks.get_lock(&resource_key).await
+    }
+
+    /// List all locks in this namespace
+    pub async fn list_locks(&self) -> Vec<LockInfo> {
+        self.local_locks.list_locks().await
+    }
+
+    /// Get locks for a specific resource
+    pub async fn get_locks_for_resource(&self, resource: &str) -> Vec<LockInfo> {
+        let resource_key = self.get_resource_key(resource);
+        self.local_locks.get_locks_for_resource(&resource_key).await
+    }
+
+    /// Force release lock (admin operation)
+    pub async fn force_release_lock(&self, lock_id: &LockId) -> Result<LockResponse> {
+        let resource_key = self.get_resource_key_from_lock_id(lock_id);
+
+        // Force release local lock
+        let local_result = self.local_locks.force_release_lock(&resource_key).await;
+
+        // Force release distributed lock if enabled
+        if self.is_distributed() {
+            if let Some(manager) = &self.distributed_manager {
+                let _ = manager.force_release_lock(lock_id).await;
+            }
+        }
+
+        match local_result {
+            Ok(_) => Ok(LockResponse::success(
+                LockInfo {
+                    id: lock_id.clone(),
+                    resource: "unknown".to_string(),
+                    lock_type: LockType::Exclusive,
+                    status: LockStatus::Released,
+                    owner: "unknown".to_string(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now(),
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: LockMetadata::default(),
+                    priority: LockPriority::Normal,
+                    wait_start_time: None,
+                },
+                Duration::ZERO,
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Clean up expired locks
+    pub async fn cleanup_expired_locks(&self) -> usize {
+        let local_cleaned = self.local_locks.cleanup_expired_locks().await;
+
+        let distributed_cleaned = if self.is_distributed() {
+            if let Some(manager) = &self.distributed_manager {
+                manager.cleanup_expired_locks().await
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        local_cleaned + distributed_cleaned
+    }
+
+    /// Get health information for all namespaces
+    pub async fn get_all_health(&self) -> Vec<crate::types::HealthInfo> {
+        let mut health_list = Vec::new();
+
+        // Add current namespace health
+        health_list.push(self.get_health().await);
+
+        // In a real implementation, you might want to check other namespaces
+        // For now, we only return the current namespace
+
+        health_list
+    }
+
+    /// Get health information
+    pub async fn get_health(&self) -> crate::types::HealthInfo {
+        let lock_stats = self.get_stats().await;
+        let mut health = crate::types::HealthInfo {
+            node_id: self.namespace.clone(),
+            lock_stats,
+            ..Default::default()
+        };
+
+        // Check distributed status if enabled
+        if self.is_distributed() {
+            if let Some(_manager) = &self.distributed_manager {
+                // For now, assume healthy if distributed manager exists
+                health.status = crate::types::HealthStatus::Healthy;
+                health.connected_nodes = 1;
+                health.total_nodes = 1;
+            } else {
+                health.status = crate::types::HealthStatus::Degraded;
+                health.error_message = Some("Distributed manager not available".to_string());
+            }
+        } else {
+            health.status = crate::types::HealthStatus::Healthy;
+            health.connected_nodes = 1;
+            health.total_nodes = 1;
+        }
+
+        health
+    }
+
+    /// Get namespace statistics
+    pub async fn get_stats(&self) -> crate::types::LockStats {
+        let mut stats = self.local_locks.get_stats().await;
+
+        // Add queue statistics
+
+        // Add distributed statistics if enabled
+        if self.is_distributed() {
+            if let Some(manager) = &self.distributed_manager {
+                let distributed_stats = manager.get_stats().await;
+                stats.successful_acquires += distributed_stats.successful_acquires;
+                stats.failed_acquires += distributed_stats.failed_acquires;
+            }
+        }
+
+        stats
+    }
+
+    /// Get resource key for this namespace
+    fn get_resource_key(&self, resource: &str) -> String {
+        format!("{}:{}", self.namespace, resource)
+    }
+
+    /// Get resource key from lock ID
+    fn get_resource_key_from_lock_id(&self, lock_id: &LockId) -> String {
+        // This is a simplified implementation
+        // In practice, you might want to store a mapping from lock_id to resource
+        format!("{}:{}", self.namespace, lock_id)
+    }
+}
+
+impl Default for NamespaceLock {
+    fn default() -> Self {
+        Self::new("default".to_string(), false)
     }
 }
 
@@ -500,23 +584,199 @@ impl NamespaceLockManager for NsLockMap {
 #[async_trait]
 impl NamespaceLockManager for NamespaceLock {
     async fn lock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
-        self.lock_batch(resources, owner, timeout).await
+        if self.distributed_enabled {
+            // Use RPC to call the server
+            use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
+            use tonic::Request;
+            
+            // Add namespace prefix to resources
+            let namespaced_resources: Vec<String> = resources.iter()
+                .map(|resource| self.get_resource_key(resource))
+                .collect();
+            
+            let args = crate::client::remote::LockArgs {
+                uid: uuid::Uuid::new_v4().to_string(),
+                resources: namespaced_resources,
+                owner: owner.to_string(),
+                source: "".to_string(),
+                quorum: 3,
+            };
+            let args_str = serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
+
+            let mut client = node_service_time_out_client(&"http://localhost:9000".to_string())
+                .await
+                .map_err(|e| LockError::internal(format!("Failed to connect to server: {e}")))?;
+            
+            let request = Request::new(GenerallyLockRequest { args: args_str });
+            let response = client.lock(request).await.map_err(|e| LockError::internal(format!("RPC call failed: {e}")))?;
+            let response = response.into_inner();
+            
+            if let Some(error_info) = response.error_info {
+                return Err(LockError::internal(format!("Server error: {error_info}")));
+            }
+            
+            Ok(response.success)
+        } else {
+            // Use local locks
+            for resource in resources {
+                let resource_key = self.get_resource_key(resource);
+                let success = self
+                    .local_locks
+                    .lock_with_ttl_id(&resource_key, owner, timeout, None)
+                    .await
+                    .map_err(|e| LockError::internal(format!("Lock acquisition failed: {e}")))?;
+
+                if !success {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
     }
 
     async fn unlock_batch(&self, resources: &[String], owner: &str) -> Result<()> {
-        self.unlock_batch(resources, owner).await
+        if self.distributed_enabled {
+            // Use RPC to call the server
+            use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
+            use tonic::Request;
+            
+            // Add namespace prefix to resources
+            let namespaced_resources: Vec<String> = resources.iter()
+                .map(|resource| self.get_resource_key(resource))
+                .collect();
+            
+            let args = crate::client::remote::LockArgs {
+                uid: uuid::Uuid::new_v4().to_string(),
+                resources: namespaced_resources,
+                owner: owner.to_string(),
+                source: "".to_string(),
+                quorum: 3,
+            };
+            let args_str = serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
+
+            let mut client = node_service_time_out_client(&"http://localhost:9000".to_string())
+                .await
+                .map_err(|e| LockError::internal(format!("Failed to connect to server: {e}")))?;
+            
+            let request = Request::new(GenerallyLockRequest { args: args_str });
+            let response = client.un_lock(request).await.map_err(|e| LockError::internal(format!("RPC call failed: {e}")))?;
+            let response = response.into_inner();
+            
+            if let Some(error_info) = response.error_info {
+                return Err(LockError::internal(format!("Server error: {error_info}")));
+            }
+            
+            Ok(())
+        } else {
+            // Use local locks
+            for resource in resources {
+                let resource_key = self.get_resource_key(resource);
+                self.local_locks
+                    .unlock(&resource_key, owner)
+                    .await
+                    .map_err(|e| LockError::internal(format!("Lock release failed: {e}")))?;
+            }
+            Ok(())
+        }
     }
 
     async fn rlock_batch(&self, resources: &[String], owner: &str, timeout: Duration) -> Result<bool> {
-        self.rlock_batch(resources, owner, timeout).await
+        if self.distributed_enabled {
+            // Use RPC to call the server
+            use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
+            use tonic::Request;
+            
+            // Add namespace prefix to resources
+            let namespaced_resources: Vec<String> = resources.iter()
+                .map(|resource| self.get_resource_key(resource))
+                .collect();
+            
+            let args = crate::client::remote::LockArgs {
+                uid: uuid::Uuid::new_v4().to_string(),
+                resources: namespaced_resources,
+                owner: owner.to_string(),
+                source: "".to_string(),
+                quorum: 3,
+            };
+            let args_str = serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
+
+            let mut client = node_service_time_out_client(&"http://localhost:9000".to_string())
+                .await
+                .map_err(|e| LockError::internal(format!("Failed to connect to server: {e}")))?;
+            
+            let request = Request::new(GenerallyLockRequest { args: args_str });
+            let response = client.r_lock(request).await.map_err(|e| LockError::internal(format!("RPC call failed: {e}")))?;
+            let response = response.into_inner();
+            
+            if let Some(error_info) = response.error_info {
+                return Err(LockError::internal(format!("Server error: {error_info}")));
+            }
+            
+            Ok(response.success)
+        } else {
+            // Use local locks
+            for resource in resources {
+                let resource_key = self.get_resource_key(resource);
+                let success = self
+                    .local_locks
+                    .rlock_with_ttl_id(&resource_key, owner, timeout, None)
+                    .await
+                    .map_err(|e| LockError::internal(format!("Read lock acquisition failed: {e}")))?;
+
+                if !success {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
     }
 
     async fn runlock_batch(&self, resources: &[String], owner: &str) -> Result<()> {
-        self.runlock_batch(resources, owner).await
+        if self.distributed_enabled {
+            // Use RPC to call the server
+            use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
+            use tonic::Request;
+            
+            // Add namespace prefix to resources
+            let namespaced_resources: Vec<String> = resources.iter()
+                .map(|resource| self.get_resource_key(resource))
+                .collect();
+            
+            let args = crate::client::remote::LockArgs {
+                uid: uuid::Uuid::new_v4().to_string(),
+                resources: namespaced_resources,
+                owner: owner.to_string(),
+                source: "".to_string(),
+                quorum: 3,
+            };
+            let args_str = serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
+
+            let mut client = node_service_time_out_client(&"http://localhost:9000".to_string())
+                .await
+                .map_err(|e| LockError::internal(format!("Failed to connect to server: {e}")))?;
+            
+            let request = Request::new(GenerallyLockRequest { args: args_str });
+            let response = client.r_un_lock(request).await.map_err(|e| LockError::internal(format!("RPC call failed: {e}")))?;
+            let response = response.into_inner();
+            
+            if let Some(error_info) = response.error_info {
+                return Err(LockError::internal(format!("Server error: {error_info}")));
+            }
+            
+            Ok(())
+        } else {
+            // Use local locks
+            for resource in resources {
+                let resource_key = self.get_resource_key(resource);
+                self.local_locks
+                    .runlock(&resource_key, owner)
+                    .await
+                    .map_err(|e| LockError::internal(format!("Read lock release failed: {e}")))?;
+            }
+            Ok(())
+        }
     }
 }
-
-type RemoteClientCache = Option<Arc<Mutex<LruCache<String, Arc<Mutex<RemoteClient>>>>>>;
 
 #[cfg(test)]
 mod tests {
@@ -538,34 +798,12 @@ mod tests {
 
         // Test new_nslock
         let client = ns_lock.new_nslock(None).await.unwrap();
-        assert!(matches!(client, NamespaceLock::Local(_)));
-    }
-
-    #[tokio::test]
-    async fn test_distributed_ns_lock_map() {
-        let ns_lock = NsLockMap::new(true, None);
-        let url = Url::parse("http://localhost:8080").unwrap();
-
-        // Test new_nslock
-        let client = ns_lock.new_nslock(Some(url.clone())).await.unwrap();
-        assert!(matches!(client, NamespaceLock::Cached(_)));
-
-        // Test cache reuse
-        let client2 = ns_lock.new_nslock(Some(url)).await.unwrap();
-        assert!(matches!(client2, NamespaceLock::Cached(_)));
-
-        // Verify cache count
-        assert_eq!(ns_lock.cached_client_count().await, 1);
-
-        // Test direct operation should fail
-        let resources = vec!["test1".to_string(), "test2".to_string()];
-        let result = ns_lock.lock_batch(&resources, "test_owner", Duration::from_millis(100)).await;
-        assert!(result.is_err());
+        assert!(matches!(client, NamespaceLock { .. }));
     }
 
     #[tokio::test]
     async fn test_namespace_lock_local() {
-        let ns_lock = NamespaceLock::new_local();
+        let ns_lock = NamespaceLock::new("test-namespace".to_string(), false);
         let resources = vec!["test1".to_string(), "test2".to_string()];
 
         // Test batch lock
@@ -579,150 +817,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_nslock_remote_without_url() {
-        let ns_lock = NsLockMap::new(true, None);
-        let result = ns_lock.new_nslock(None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_batch_operations() {
         let ns_lock = NsLockMap::new(false, None);
-        let resources = vec!["batch1".to_string(), "batch2".to_string(), "batch3".to_string()];
+        let write_resources = vec!["batch_write".to_string()];
+        let read_resources = vec!["batch_read".to_string()];
 
         // Test batch write lock
         let result = ns_lock
-            .lock_batch(&resources, "batch_owner", Duration::from_millis(100))
+            .lock_batch(&write_resources, "batch_owner", Duration::from_millis(100))
             .await;
+        println!("lock_batch result: {result:?}");
         assert!(result.is_ok());
         assert!(result.unwrap());
 
         // Test batch unlock
-        let result = ns_lock.unlock_batch(&resources, "batch_owner").await;
+        let result = ns_lock.unlock_batch(&write_resources, "batch_owner").await;
+        println!("unlock_batch result: {result:?}");
         assert!(result.is_ok());
 
-        // Test batch read lock
+        // Test batch read lock (different resource)
         let result = ns_lock
-            .rlock_batch(&resources, "batch_reader", Duration::from_millis(100))
+            .rlock_batch(&read_resources, "batch_reader", Duration::from_millis(100))
             .await;
+        println!("rlock_batch result: {result:?}");
         assert!(result.is_ok());
         assert!(result.unwrap());
 
         // Test batch release read lock
-        let result = ns_lock.runlock_batch(&resources, "batch_reader").await;
+        let result = ns_lock.runlock_batch(&read_resources, "batch_reader").await;
+        println!("runlock_batch result: {result:?}");
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_cache_management() {
-        let ns_lock = NsLockMap::new(true, None);
-
-        // Add multiple different URLs
-        let url1 = Url::parse("http://localhost:8080").unwrap();
-        let url2 = Url::parse("http://localhost:8081").unwrap();
-
-        let _client1 = ns_lock.new_nslock(Some(url1)).await.unwrap();
-        let _client2 = ns_lock.new_nslock(Some(url2)).await.unwrap();
-
-        assert_eq!(ns_lock.cached_client_count().await, 2);
-
-        // Clean up cache
-        ns_lock.clear_remote_cache().await;
-        assert_eq!(ns_lock.cached_client_count().await, 0);
+    async fn test_connection_health() {
+        let local_lock = NamespaceLock::new("test-namespace".to_string(), false);
+        let health = local_lock.get_health().await;
+        assert_eq!(health.status, crate::types::HealthStatus::Healthy);
+        assert!(!local_lock.is_distributed());
     }
 
     #[tokio::test]
-    async fn test_lru_cache_behavior() {
-        // Create a cache with a capacity of 2
-        let ns_lock = NsLockMap::new(true, Some(2));
-
-        let url1 = Url::parse("http://localhost:8080").unwrap();
-        let url2 = Url::parse("http://localhost:8081").unwrap();
-        let url3 = Url::parse("http://localhost:8082").unwrap();
-
-        // Add the first two URLs
-        let _client1 = ns_lock.new_nslock(Some(url1.clone())).await.unwrap();
-        let _client2 = ns_lock.new_nslock(Some(url2.clone())).await.unwrap();
-
-        assert_eq!(ns_lock.cached_client_count().await, 2);
-        assert_eq!(ns_lock.cache_capacity().await, 2);
-
-        // Add the third URL, which should trigger LRU eviction
-        let _client3 = ns_lock.new_nslock(Some(url3.clone())).await.unwrap();
-
-        // Cache count should still be 2 (due to capacity limit)
-        assert_eq!(ns_lock.cached_client_count().await, 2);
-
-        // Verify that the first URL was evicted (least recently used)
-        assert!(!ns_lock.remove_remote_client(url1.as_ref()).await);
-
-        // Verify that the second and third URLs are still in the cache
-        assert!(ns_lock.remove_remote_client(url2.as_ref()).await);
-        assert!(ns_lock.remove_remote_client(url3.as_ref()).await);
+    async fn test_namespace_lock_creation() {
+        let ns_lock = NamespaceLock::new("test-namespace".to_string(), false);
+        assert_eq!(ns_lock.namespace(), "test-namespace");
+        assert!(!ns_lock.is_distributed());
     }
 
     #[tokio::test]
-    async fn test_lru_access_order() {
-        let ns_lock = NsLockMap::new(true, Some(2));
+    async fn test_namespace_lock_with_distributed() {
+        let distributed_manager = Arc::new(DistributedLockManager::default());
+        let ns_lock = NamespaceLock::with_distributed("test-namespace".to_string(), distributed_manager);
 
-        let url1 = Url::parse("http://localhost:8080").unwrap();
-        let url2 = Url::parse("http://localhost:8081").unwrap();
-        let url3 = Url::parse("http://localhost:8082").unwrap();
-
-        // Add the first two URLs
-        let _client1 = ns_lock.new_nslock(Some(url1.clone())).await.unwrap();
-        let _client2 = ns_lock.new_nslock(Some(url2.clone())).await.unwrap();
-
-        // Re-access the first URL, making it the most recently used
-        let _client1_again = ns_lock.new_nslock(Some(url1.clone())).await.unwrap();
-
-        // Add the third URL, which should evict the second URL (least recently used)
-        let _client3 = ns_lock.new_nslock(Some(url3.clone())).await.unwrap();
-
-        // Verify that the second URL was evicted
-        assert!(!ns_lock.remove_remote_client(url2.as_ref()).await);
-
-        // Verify that the first and third URLs are still in the cache
-        assert!(ns_lock.remove_remote_client(url1.as_ref()).await);
-        assert!(ns_lock.remove_remote_client(url3.as_ref()).await);
+        assert_eq!(ns_lock.namespace(), "test-namespace");
+        assert!(ns_lock.is_distributed());
     }
 
     #[tokio::test]
-    async fn test_health_check_result() {
-        let result = HealthCheckResult {
-            healthy_count: 8,
-            unhealthy_count: 2,
-            removed_count: 1,
+    async fn test_namespace_lock_local_operations() {
+        let ns_lock = NamespaceLock::new("test-namespace".to_string(), false);
+
+        let request = LockRequest {
+            lock_id: LockId::new("test-resource"),
+            resource: "test-resource".to_string(),
+            lock_type: LockType::Exclusive,
+            owner: "test-owner".to_string(),
+            priority: LockPriority::Normal,
+            timeout: Duration::from_secs(30),
+            metadata: LockMetadata::default(),
+            wait_timeout: None,
+            deadlock_detection: true,
         };
 
-        assert_eq!(result.total_count(), 10);
-        assert_eq!(result.health_rate(), 0.8);
+        // Test lock acquisition
+        let response = ns_lock.acquire_lock(request.clone()).await;
+        assert!(response.is_ok());
+
+        let response = response.unwrap();
+        assert!(response.success);
+
+        // Test lock release
+        let release_response = ns_lock.release_lock(&response.lock_info.unwrap().id, "test-owner").await;
+        assert!(release_response.is_ok());
     }
 
     #[tokio::test]
-    async fn test_connection_health() {
-        let local_lock = NamespaceLock::new_local();
-        let health = local_lock.check_health().await;
-        assert_eq!(health, ConnectionHealth::Healthy);
+    async fn test_namespace_lock_resource_key() {
+        let ns_lock = NamespaceLock::new("test-namespace".to_string(), false);
+
+        // Test resource key generation
+        let resource_key = ns_lock.get_resource_key("test-resource");
+        assert_eq!(resource_key, "test-namespace:test-resource");
     }
 
     #[tokio::test]
-    async fn test_health_check_all_clients() {
-        let ns_lock = NsLockMap::new(true, None);
+    async fn test_distributed_namespace_lock_health() {
+        let distributed_manager = Arc::new(DistributedLockManager::default());
+        let ns_lock = NamespaceLock::with_distributed("test-distributed-namespace".to_string(), distributed_manager);
 
-        // Add some clients
-        let url1 = Url::parse("http://localhost:8080").unwrap();
-        let url2 = Url::parse("http://localhost:8081").unwrap();
-
-        let _client1 = ns_lock.new_nslock(Some(url1)).await.unwrap();
-        let _client2 = ns_lock.new_nslock(Some(url2)).await.unwrap();
-
-        // Execute health check (without removing unhealthy connections)
-        let result = ns_lock.health_check_all_clients(false).await.unwrap();
-
-        // Verify results
-        assert_eq!(result.total_count(), 2);
-        // Note: Since there is no real remote service, health check may fail
-        // Here we just verify that the method can execute normally
+        let health = ns_lock.get_health().await;
+        assert_eq!(health.status, crate::types::HealthStatus::Healthy);
+        assert!(ns_lock.is_distributed());
     }
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::types::LockId;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -69,6 +70,22 @@ pub enum LockError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// Insufficient nodes for quorum
+    #[error("Insufficient nodes for quorum: required {required}, available {available}")]
+    InsufficientNodes { required: usize, available: usize },
+
+    /// Quorum not reached
+    #[error("Quorum not reached: required {required}, achieved {achieved}")]
+    QuorumNotReached { required: usize, achieved: usize },
+
+    /// Queue is full
+    #[error("Queue is full: {message}")]
+    QueueFull { message: String },
+
+    /// Not the lock owner
+    #[error("Not the lock owner: lock_id {lock_id}, owner {owner}")]
+    NotOwner { lock_id: LockId, owner: String },
 }
 
 impl LockError {

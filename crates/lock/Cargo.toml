@@ -43,3 +43,9 @@ thiserror.workspace = true
 once_cell.workspace = true
 lru.workspace = true
 dashmap.workspace = true
+
+[features]
+default = []
+distributed = []
+metrics = []
+tracing = []

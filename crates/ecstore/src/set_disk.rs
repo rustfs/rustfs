@@ -83,7 +83,7 @@ use rustfs_filemeta::{
     headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     merge_file_meta_versions,
 };
-use rustfs_lock::{LockApi, NsLockMap};
+use rustfs_lock::{NamespaceLockManager, NsLockMap};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
@@ -123,7 +123,7 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
-    pub lockers: Vec<LockApi>,
+    pub lockers: Vec<Arc<rustfs_lock::NamespaceLock>>,
     pub locker_owner: String,
     pub ns_mutex: Arc<NsLockMap>,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
@@ -138,7 +138,7 @@ pub struct SetDisks {
 impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        lockers: Vec<LockApi>,
+        lockers: Vec<Arc<rustfs_lock::NamespaceLock>>,
         locker_owner: String,
         ns_mutex: Arc<NsLockMap>,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
@@ -4066,7 +4066,6 @@ impl ObjectIO for SetDisks {
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.disks.read().await;
 
-        // 获取对象锁
         let mut _ns = None;
         if !opts.no_lock {
             let paths = vec![object.to_string()];
@@ -4076,7 +4075,6 @@ impl ObjectIO for SetDisks {
                 .await
                 .map_err(|err| Error::other(err.to_string()))?;
 
-            // 尝试获取锁
             let lock_acquired = ns_lock
                 .lock_batch(&paths, &self.locker_owner, std::time::Duration::from_secs(5))
                 .await
@@ -4293,7 +4291,6 @@ impl ObjectIO for SetDisks {
 
         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
-        // 释放对象锁
         if let Some(ns_lock) = _ns {
             let paths = vec![object.to_string()];
             if let Err(err) = ns_lock.unlock_batch(&paths, &self.locker_owner).await {

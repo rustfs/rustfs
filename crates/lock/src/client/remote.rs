@@ -14,284 +14,210 @@
 
 use async_trait::async_trait;
 use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
+use serde::{Deserialize, Serialize};
 use tonic::Request;
 use tracing::info;
 
 use crate::{
     error::{LockError, Result},
-    lock_args::LockArgs,
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStats},
 };
 
-/// Remote lock client
+use super::LockClient;
+
+/// RPC lock arguments for gRPC communication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockArgs {
+    pub uid: String,
+    pub resources: Vec<String>,
+    pub owner: String,
+    pub source: String,
+    pub quorum: u32,
+}
+
+impl LockArgs {
+    fn from_request(request: &LockRequest, _is_shared: bool) -> Self {
+        Self {
+            uid: request.metadata.operation_id.clone().unwrap_or_default(),
+            resources: vec![request.resource.clone()],
+            owner: request.owner.clone(),
+            source: "remote".to_string(),
+            quorum: 1,
+        }
+    }
+
+    fn from_lock_id(lock_id: &LockId) -> Self {
+        Self {
+            uid: lock_id.as_str().to_string(),
+            resources: vec![lock_id.as_str().to_string()],
+            owner: "remote".to_string(),
+            source: "remote".to_string(),
+            quorum: 1,
+        }
+    }
+}
+
+/// Remote lock client implementation
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
     addr: String,
 }
 
 impl RemoteClient {
-    /// Create new remote client from endpoint string (for trait兼容)
     pub fn new(endpoint: String) -> Self {
         Self { addr: endpoint }
     }
-    /// Create new remote client from url::Url（兼容 namespace/distributed 场景）
-    pub fn from_url(url: url::Url) -> Self {
-        let addr = format!("{}://{}:{}", url.scheme(), url.host_str().unwrap(), url.port().unwrap());
-        Self { addr }
-    }
-}
 
-// 辅助方法：从 LockRequest 创建 LockArgs
-impl LockArgs {
-    fn from_request(request: &LockRequest, _is_shared: bool) -> Self {
-        Self {
-            uid: uuid::Uuid::new_v4().to_string(),
-            resources: vec![request.resource.clone()],
-            owner: request.owner.clone(),
-            source: "remote_client".to_string(),
-            quorum: 1,
-        }
-    }
-    
-    fn from_lock_id(lock_id: &LockId) -> Self {
-        Self {
-            uid: lock_id.to_string(),
-            resources: vec![],
-            owner: "remote_client".to_string(),
-            source: "remote_client".to_string(),
-            quorum: 1,
-        }
+    pub fn from_url(url: url::Url) -> Self {
+        Self { addr: url.to_string() }
     }
 }
 
 #[async_trait]
-impl super::LockClient for RemoteClient {
+impl LockClient for RemoteClient {
     async fn acquire_exclusive(&self, request: LockRequest) -> Result<LockResponse> {
-        info!("remote acquire_exclusive");
+        info!("remote acquire_exclusive for {}", request.resource);
         let args = LockArgs::from_request(&request, false);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let req = Request::new(GenerallyLockRequest { args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))? });
-        let resp = client.lock(req).await.map_err(|e| LockError::internal(e.to_string()))?.into_inner();
+        let req = Request::new(GenerallyLockRequest {
+            args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?,
+        });
+        let resp = client
+            .lock(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
-        Ok(LockResponse {
-            success: resp.success,
-            lock_info: None, // 可扩展: 解析resp内容
-            error: None,
-            wait_time: std::time::Duration::ZERO,
-            position_in_queue: None,
-        })
+        Ok(LockResponse::success(
+            LockInfo {
+                id: LockId::new_deterministic(&request.resource),
+                resource: request.resource,
+                lock_type: request.lock_type,
+                status: crate::types::LockStatus::Acquired,
+                owner: request.owner,
+                acquired_at: std::time::SystemTime::now(),
+                expires_at: std::time::SystemTime::now() + request.timeout,
+                last_refreshed: std::time::SystemTime::now(),
+                metadata: request.metadata,
+                priority: request.priority,
+                wait_start_time: None,
+            },
+            std::time::Duration::ZERO,
+        ))
     }
+
     async fn acquire_shared(&self, request: LockRequest) -> Result<LockResponse> {
-        info!("remote acquire_shared");
+        info!("remote acquire_shared for {}", request.resource);
         let args = LockArgs::from_request(&request, true);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let req = Request::new(GenerallyLockRequest { args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))? });
-        let resp = client.r_lock(req).await.map_err(|e| LockError::internal(e.to_string()))?.into_inner();
+        let req = Request::new(GenerallyLockRequest {
+            args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?,
+        });
+        let resp = client
+            .r_lock(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
-        Ok(LockResponse {
-            success: resp.success,
-            lock_info: None,
-            error: None,
-            wait_time: std::time::Duration::ZERO,
-            position_in_queue: None,
-        })
+        Ok(LockResponse::success(
+            LockInfo {
+                id: LockId::new_deterministic(&request.resource),
+                resource: request.resource,
+                lock_type: request.lock_type,
+                status: crate::types::LockStatus::Acquired,
+                owner: request.owner,
+                acquired_at: std::time::SystemTime::now(),
+                expires_at: std::time::SystemTime::now() + request.timeout,
+                last_refreshed: std::time::SystemTime::now(),
+                metadata: request.metadata,
+                priority: request.priority,
+                wait_start_time: None,
+            },
+            std::time::Duration::ZERO,
+        ))
     }
+
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote release");
+        info!("remote release for {}", lock_id);
         let args = LockArgs::from_lock_id(lock_id);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let req = Request::new(GenerallyLockRequest { args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))? });
-        let resp = client.un_lock(req).await.map_err(|e| LockError::internal(e.to_string()))?.into_inner();
+        let req = Request::new(GenerallyLockRequest {
+            args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?,
+        });
+        let resp = client
+            .un_lock(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
         Ok(resp.success)
     }
+
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote refresh");
+        info!("remote refresh for {}", lock_id);
         let args = LockArgs::from_lock_id(lock_id);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let req = Request::new(GenerallyLockRequest { args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))? });
-        let resp = client.refresh(req).await.map_err(|e| LockError::internal(e.to_string()))?.into_inner();
+        let req = Request::new(GenerallyLockRequest {
+            args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?,
+        });
+        let resp = client
+            .refresh(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
         Ok(resp.success)
     }
+
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote force_release");
+        info!("remote force_release for {}", lock_id);
         let args = LockArgs::from_lock_id(lock_id);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let req = Request::new(GenerallyLockRequest { args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))? });
-        let resp = client.force_un_lock(req).await.map_err(|e| LockError::internal(e.to_string()))?.into_inner();
+        let req = Request::new(GenerallyLockRequest {
+            args: serde_json::to_string(&args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?,
+        });
+        let resp = client
+            .force_un_lock(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
         Ok(resp.success)
     }
+
     async fn check_status(&self, _lock_id: &LockId) -> Result<Option<LockInfo>> {
-        // 可扩展: 实现远程状态查询
+        // TODO: Implement remote status query
         Ok(None)
     }
+
     async fn get_stats(&self) -> Result<LockStats> {
-        // 可扩展: 实现远程统计
+        // TODO: Implement remote statistics
         Ok(LockStats::default())
     }
+
     async fn close(&self) -> Result<()> {
         Ok(())
     }
-    async fn is_online(&self) -> bool {
-        true
-    }
-    async fn is_local(&self) -> bool {
-        false
-    }
-}
-
-// 同时实现 Locker trait 以兼容现有调用
-#[async_trait]
-impl crate::Locker for RemoteClient {
-    async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote lock");
-        let args = serde_json::to_string(args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client
-            .lock(request)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        Ok(response.success)
-    }
-
-    async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote unlock");
-        let args = serde_json::to_string(args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client
-            .un_lock(request)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        Ok(response.success)
-    }
-
-    async fn rlock(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote rlock");
-        let args = serde_json::to_string(args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client
-            .r_lock(request)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        Ok(response.success)
-    }
-
-    async fn runlock(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote runlock");
-        let args = serde_json::to_string(args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client
-            .r_un_lock(request)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        Ok(response.success)
-    }
-
-    async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote refresh");
-        let args = serde_json::to_string(args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client
-            .refresh(request)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        Ok(response.success)
-    }
-
-    async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote force_unlock");
-        let args = serde_json::to_string(args).map_err(|e| LockError::internal(format!("Failed to serialize args: {e}")))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client
-            .force_un_lock(request)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        Ok(response.success)
-    }
-
-    async fn close(&self) {}
 
     async fn is_online(&self) -> bool {
         true
