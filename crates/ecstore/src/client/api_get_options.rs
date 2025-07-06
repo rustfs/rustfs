@@ -29,9 +29,9 @@ use crate::client::api_error_response::err_invalid_argument;
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct AdvancedGetOptions {
-    replication_deletemarker: bool,
-    is_replication_ready_for_deletemarker: bool,
-    replication_proxy_request: String,
+    pub replication_delete_marker: bool,
+    pub is_replication_ready_for_delete_marker: bool,
+    pub replication_proxy_request: String,
 }
 
 pub struct GetObjectOptions {
