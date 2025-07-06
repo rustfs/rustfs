@@ -103,7 +103,7 @@ use tokio::{
     },
     time::sleep,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16; // Visit all folders every n cycles.
@@ -741,13 +741,18 @@ impl ScannerItem {
 
         // Create a mutable clone if you need to modify fields
         let mut oi = oi.clone();
-        oi.replication_status = ReplicationStatusType::from(
-            oi.user_defined
-                .get("x-amz-bucket-replication-status")
-                .unwrap_or(&"PENDING".to_string()),
-        );
-        info!("apply status is: {:?}", oi.replication_status);
-        self.heal_replication(&oi, _size_s).await;
+
+        let versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
+        if versioned {
+            oi.replication_status = ReplicationStatusType::from(
+                oi.user_defined
+                    .get("x-amz-bucket-replication-status")
+                    .unwrap_or(&"PENDING".to_string()),
+            );
+            debug!("apply status is: {:?}", oi.replication_status);
+            self.heal_replication(&oi, _size_s).await;
+        }
+
         done();
 
         if action.delete_all() {
