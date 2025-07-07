@@ -174,10 +174,13 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
             .bucket_sizes
             .iter()
             .map(|(bucket, &size)| {
-                (bucket.clone(), BucketUsageInfo {
-                    size,
-                    ..Default::default()
-                })
+                (
+                    bucket.clone(),
+                    BucketUsageInfo {
+                        size,
+                        ..Default::default()
+                    },
+                )
             })
             .collect();
     }
@@ -198,16 +201,17 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
         {
             if let Ok((cfg, _)) = get_replication_config(bucket).await {
                 if !cfg.role.is_empty() {
-                    data_usage_info
-                        .replication_info
-                        .insert(cfg.role.clone(), BucketTargetUsageInfo {
+                    data_usage_info.replication_info.insert(
+                        cfg.role.clone(),
+                        BucketTargetUsageInfo {
                             replication_failed_size: bui.replication_failed_size_v1,
                             replication_failed_count: bui.replication_failed_count_v1,
                             replicated_size: bui.replicated_size_v1,
                             replication_pending_count: bui.replication_pending_count_v1,
                             replication_pending_size: bui.replication_pending_size_v1,
                             ..Default::default()
-                        });
+                        },
+                    );
                 }
             }
         }

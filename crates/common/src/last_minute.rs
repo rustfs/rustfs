@@ -568,11 +568,14 @@ mod tests {
         let mut latency = LastMinuteLatency::default();
 
         // Add data at time 1000
-        latency.add_all(1000, &AccElem {
-            total: 10,
-            size: 0,
-            n: 1,
-        });
+        latency.add_all(
+            1000,
+            &AccElem {
+                total: 10,
+                size: 0,
+                n: 1,
+            },
+        );
 
         // Forward to time 1030 (30 seconds later)
         latency.forward_to(1030);

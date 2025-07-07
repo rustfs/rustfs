@@ -154,10 +154,13 @@ impl ECStore {
 
             // validate_parity(partiy_count, pool_eps.drives_per_set)?;
 
-            let (disks, errs) = store_init::init_disks(&pool_eps.endpoints, &DiskOption {
-                cleanup: true,
-                health_check: true,
-            })
+            let (disks, errs) = store_init::init_disks(
+                &pool_eps.endpoints,
+                &DiskOption {
+                    cleanup: true,
+                    health_check: true,
+                },
+            )
             .await;
 
             check_disk_fatal_errs(&errs)?;
@@ -501,10 +504,14 @@ impl ECStore {
     }
     async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
         for pool in self.pools.iter() {
-            pool.delete_object(bucket, object, ObjectOptions {
-                delete_prefix: true,
-                ..Default::default()
-            })
+            pool.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
             .await?;
         }
 
@@ -614,11 +621,15 @@ impl ECStore {
 
     async fn get_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
         let idx = match self
-            .get_pool_idx_existing_with_opts(bucket, object, &ObjectOptions {
-                skip_decommissioned: true,
-                skip_rebalancing: true,
-                ..Default::default()
-            })
+            .get_pool_idx_existing_with_opts(
+                bucket,
+                object,
+                &ObjectOptions {
+                    skip_decommissioned: true,
+                    skip_rebalancing: true,
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(res) => res,
@@ -659,12 +670,16 @@ impl ECStore {
     }
 
     async fn get_pool_idx_existing_no_lock(&self, bucket: &str, object: &str) -> Result<usize> {
-        self.get_pool_idx_existing_with_opts(bucket, object, &ObjectOptions {
-            no_lock: true,
-            skip_decommissioned: true,
-            skip_rebalancing: true,
-            ..Default::default()
-        })
+        self.get_pool_idx_existing_with_opts(
+            bucket,
+            object,
+            &ObjectOptions {
+                no_lock: true,
+                skip_decommissioned: true,
+                skip_rebalancing: true,
+                ..Default::default()
+            },
+        )
         .await
     }
 
@@ -1359,11 +1374,14 @@ impl StorageAPI for ECStore {
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
             if !is_err_bucket_exists(&err.into()) {
                 let _ = self
-                    .delete_bucket(bucket, &DeleteBucketOptions {
-                        no_lock: true,
-                        no_recreate: true,
-                        ..Default::default()
-                    })
+                    .delete_bucket(
+                        bucket,
+                        &DeleteBucketOptions {
+                            no_lock: true,
+                            no_recreate: true,
+                            ..Default::default()
+                        },
+                    )
                     .await;
             }
         };
@@ -1666,10 +1684,14 @@ impl StorageAPI for ECStore {
 
         for obj in objects.iter() {
             futures.push(async move {
-                self.internal_get_pool_info_existing_with_opts(bucket, &obj.object_name, &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                })
+                self.internal_get_pool_info_existing_with_opts(
+                    bucket,
+                    &obj.object_name,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
                 .await
             });
         }

@@ -140,17 +140,20 @@ impl Locker for LocalLocker {
         }
 
         args.resources.iter().enumerate().for_each(|(idx, resource)| {
-            self.lock_map.insert(resource.to_string(), vec![LockRequesterInfo {
-                name: resource.to_string(),
-                writer: true,
-                source: args.source.to_string(),
-                owner: args.owner.to_string(),
-                uid: args.uid.to_string(),
-                group: args.resources.len() > 1,
-                quorum: args.quorum,
-                idx,
-                ..Default::default()
-            }]);
+            self.lock_map.insert(
+                resource.to_string(),
+                vec![LockRequesterInfo {
+                    name: resource.to_string(),
+                    writer: true,
+                    source: args.source.to_string(),
+                    owner: args.owner.to_string(),
+                    uid: args.uid.to_string(),
+                    group: args.resources.len() > 1,
+                    quorum: args.quorum,
+                    idx,
+                    ..Default::default()
+                }],
+            );
 
             let mut uuid = args.uid.to_string();
             format_uuid(&mut uuid, &idx);
@@ -227,15 +230,18 @@ impl Locker for LocalLocker {
                 }
             }
             None => {
-                self.lock_map.insert(resource.to_string(), vec![LockRequesterInfo {
-                    name: resource.to_string(),
-                    writer: false,
-                    source: args.source.to_string(),
-                    owner: args.owner.to_string(),
-                    uid: args.uid.to_string(),
-                    quorum: args.quorum,
-                    ..Default::default()
-                }]);
+                self.lock_map.insert(
+                    resource.to_string(),
+                    vec![LockRequesterInfo {
+                        name: resource.to_string(),
+                        writer: false,
+                        source: args.source.to_string(),
+                        owner: args.owner.to_string(),
+                        uid: args.uid.to_string(),
+                        quorum: args.quorum,
+                        ..Default::default()
+                    }],
+                );
             }
         }
         let mut uuid = args.uid.to_string();
