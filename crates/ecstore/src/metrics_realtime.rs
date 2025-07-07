@@ -148,14 +148,11 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
         }
 
         if d.state != *DRIVE_STATE_OK && d.state != *DRIVE_STATE_UNFORMATTED {
-            metrics.insert(
-                d.endpoint.clone(),
-                DiskMetric {
-                    n_disks: 1,
-                    offline: 1,
-                    ..Default::default()
-                },
-            );
+            metrics.insert(d.endpoint.clone(), DiskMetric {
+                n_disks: 1,
+                offline: 1,
+                ..Default::default()
+            });
             continue;
         }
 

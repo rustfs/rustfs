@@ -557,14 +557,11 @@ impl StorageAPI for Sets {
             let idx = self.get_hashed_set_index(obj.object_name.as_str());
 
             if !set_obj_map.contains_key(&idx) {
-                set_obj_map.insert(
-                    idx,
-                    vec![DelObj {
-                        // set_idx: idx,
-                        orig_idx: i,
-                        obj: obj.clone(),
-                    }],
-                );
+                set_obj_map.insert(idx, vec![DelObj {
+                    // set_idx: idx,
+                    orig_idx: i,
+                    obj: obj.clone(),
+                }]);
             } else if let Some(val) = set_obj_map.get_mut(&idx) {
                 val.push(DelObj {
                     // set_idx: idx,
@@ -756,13 +753,10 @@ impl StorageAPI for Sets {
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        let (disks, _) = init_storage_disks_with_errors(
-            &self.endpoints.endpoints,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
+        let (disks, _) = init_storage_disks_with_errors(&self.endpoints.endpoints, &DiskOption {
+            cleanup: false,
+            health_check: false,
+        })
         .await;
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
         if let Err(err) = check_format_erasure_values(&formats, self.set_drive_count) {

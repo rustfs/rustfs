@@ -78,26 +78,23 @@ impl TransitionClient {
         let headers = HeaderMap::new();
 
         let resp = self
-            .execute_method(
-                Method::DELETE,
-                &mut RequestMetadata {
-                    bucket_name: bucket_name.to_string(),
-                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                    custom_header: headers,
-                    object_name: "".to_string(),
-                    query_values: Default::default(),
-                    content_body: ReaderImpl::Body(Bytes::new()),
-                    content_length: 0,
-                    content_md5_base64: "".to_string(),
-                    stream_sha256: false,
-                    trailer: HeaderMap::new(),
-                    pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
-                    extra_pre_sign_header: Default::default(),
-                    bucket_location: Default::default(),
-                    expires: Default::default(),
-                },
-            )
+            .execute_method(Method::DELETE, &mut RequestMetadata {
+                bucket_name: bucket_name.to_string(),
+                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                custom_header: headers,
+                object_name: "".to_string(),
+                query_values: Default::default(),
+                content_body: ReaderImpl::Body(Bytes::new()),
+                content_length: 0,
+                content_md5_base64: "".to_string(),
+                stream_sha256: false,
+                trailer: HeaderMap::new(),
+                pre_sign_url: Default::default(),
+                add_crc: Default::default(),
+                extra_pre_sign_header: Default::default(),
+                bucket_location: Default::default(),
+                expires: Default::default(),
+            })
             .await?;
 
         {
@@ -109,26 +106,23 @@ impl TransitionClient {
 
     pub async fn remove_bucket(&self, bucket_name: &str) -> Result<(), std::io::Error> {
         let resp = self
-            .execute_method(
-                http::Method::DELETE,
-                &mut RequestMetadata {
-                    bucket_name: bucket_name.to_string(),
-                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                    custom_header: Default::default(),
-                    object_name: "".to_string(),
-                    query_values: Default::default(),
-                    content_body: ReaderImpl::Body(Bytes::new()),
-                    content_length: 0,
-                    content_md5_base64: "".to_string(),
-                    stream_sha256: false,
-                    trailer: HeaderMap::new(),
-                    pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
-                    extra_pre_sign_header: Default::default(),
-                    bucket_location: Default::default(),
-                    expires: Default::default(),
-                },
-            )
+            .execute_method(http::Method::DELETE, &mut RequestMetadata {
+                bucket_name: bucket_name.to_string(),
+                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                custom_header: Default::default(),
+                object_name: "".to_string(),
+                query_values: Default::default(),
+                content_body: ReaderImpl::Body(Bytes::new()),
+                content_length: 0,
+                content_md5_base64: "".to_string(),
+                stream_sha256: false,
+                trailer: HeaderMap::new(),
+                pre_sign_url: Default::default(),
+                add_crc: Default::default(),
+                extra_pre_sign_header: Default::default(),
+                bucket_location: Default::default(),
+                expires: Default::default(),
+            })
             .await?;
 
         {
@@ -163,26 +157,23 @@ impl TransitionClient {
         }
 
         let resp = self
-            .execute_method(
-                http::Method::DELETE,
-                &mut RequestMetadata {
-                    bucket_name: bucket_name.to_string(),
-                    object_name: object_name.to_string(),
-                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                    query_values: url_values,
-                    custom_header: headers,
-                    content_body: ReaderImpl::Body(Bytes::new()),
-                    content_length: 0,
-                    content_md5_base64: "".to_string(),
-                    stream_sha256: false,
-                    trailer: HeaderMap::new(),
-                    pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
-                    extra_pre_sign_header: Default::default(),
-                    bucket_location: Default::default(),
-                    expires: Default::default(),
-                },
-            )
+            .execute_method(http::Method::DELETE, &mut RequestMetadata {
+                bucket_name: bucket_name.to_string(),
+                object_name: object_name.to_string(),
+                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                query_values: url_values,
+                custom_header: headers,
+                content_body: ReaderImpl::Body(Bytes::new()),
+                content_length: 0,
+                content_md5_base64: "".to_string(),
+                stream_sha256: false,
+                trailer: HeaderMap::new(),
+                pre_sign_url: Default::default(),
+                add_crc: Default::default(),
+                extra_pre_sign_header: Default::default(),
+                bucket_location: Default::default(),
+                expires: Default::default(),
+            })
             .await?;
 
         Ok(RemoveObjectResult {
@@ -277,15 +268,11 @@ impl TransitionClient {
             while let Some(object) = objects_rx.recv().await {
                 if has_invalid_xml_char(&object.name) {
                     let remove_result = self
-                        .remove_object_inner(
-                            bucket_name,
-                            &object.name,
-                            RemoveObjectOptions {
-                                version_id: object.version_id.expect("err").to_string(),
-                                governance_bypass: opts.governance_bypass,
-                                ..Default::default()
-                            },
-                        )
+                        .remove_object_inner(bucket_name, &object.name, RemoveObjectOptions {
+                            version_id: object.version_id.expect("err").to_string(),
+                            governance_bypass: opts.governance_bypass,
+                            ..Default::default()
+                        })
                         .await?;
                     let remove_result_clone = remove_result.clone();
                     if !remove_result.err.is_none() {
@@ -322,26 +309,23 @@ impl TransitionClient {
 
             let remove_bytes = generate_remove_multi_objects_request(&batch);
             let resp = self
-                .execute_method(
-                    http::Method::POST,
-                    &mut RequestMetadata {
-                        bucket_name: bucket_name.to_string(),
-                        query_values: url_values.clone(),
-                        content_body: ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
-                        content_length: remove_bytes.len() as i64,
-                        content_md5_base64: base64_encode(&HashAlgorithm::Md5.hash_encode(&remove_bytes).as_ref()),
-                        content_sha256_hex: base64_encode(&HashAlgorithm::SHA256.hash_encode(&remove_bytes).as_ref()),
-                        custom_header: headers,
-                        object_name: "".to_string(),
-                        stream_sha256: false,
-                        trailer: HeaderMap::new(),
-                        pre_sign_url: Default::default(),
-                        add_crc: Default::default(),
-                        extra_pre_sign_header: Default::default(),
-                        bucket_location: Default::default(),
-                        expires: Default::default(),
-                    },
-                )
+                .execute_method(http::Method::POST, &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    query_values: url_values.clone(),
+                    content_body: ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
+                    content_length: remove_bytes.len() as i64,
+                    content_md5_base64: base64_encode(&HashAlgorithm::Md5.hash_encode(&remove_bytes).as_ref()),
+                    content_sha256_hex: base64_encode(&HashAlgorithm::SHA256.hash_encode(&remove_bytes).as_ref()),
+                    custom_header: headers,
+                    object_name: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                })
                 .await?;
 
             let body_bytes: Vec<u8> = resp.body().bytes().expect("err").to_vec();
@@ -369,26 +353,23 @@ impl TransitionClient {
         url_values.insert("uploadId".to_string(), upload_id.to_string());
 
         let resp = self
-            .execute_method(
-                http::Method::DELETE,
-                &mut RequestMetadata {
-                    bucket_name: bucket_name.to_string(),
-                    object_name: object_name.to_string(),
-                    query_values: url_values,
-                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                    custom_header: HeaderMap::new(),
-                    content_body: ReaderImpl::Body(Bytes::new()),
-                    content_length: 0,
-                    content_md5_base64: "".to_string(),
-                    stream_sha256: false,
-                    trailer: HeaderMap::new(),
-                    pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
-                    extra_pre_sign_header: Default::default(),
-                    bucket_location: Default::default(),
-                    expires: Default::default(),
-                },
-            )
+            .execute_method(http::Method::DELETE, &mut RequestMetadata {
+                bucket_name: bucket_name.to_string(),
+                object_name: object_name.to_string(),
+                query_values: url_values,
+                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                custom_header: HeaderMap::new(),
+                content_body: ReaderImpl::Body(Bytes::new()),
+                content_length: 0,
+                content_md5_base64: "".to_string(),
+                stream_sha256: false,
+                trailer: HeaderMap::new(),
+                pre_sign_url: Default::default(),
+                add_crc: Default::default(),
+                extra_pre_sign_header: Default::default(),
+                bucket_location: Default::default(),
+                expires: Default::default(),
+            })
             .await?;
         //if resp.is_some() {
         if resp.status() != StatusCode::NO_CONTENT {

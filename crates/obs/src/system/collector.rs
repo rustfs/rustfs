@@ -115,24 +115,18 @@ impl Collector {
             let transmitted = data.transmitted() as i64;
             self.metrics.network_io_per_interface.record(
                 received,
-                &[
-                    &self.attributes.attributes[..],
-                    &[
-                        KeyValue::new(INTERFACE, interface_name.to_string()),
-                        KeyValue::new(DIRECTION, "received"),
-                    ],
-                ]
+                &[&self.attributes.attributes[..], &[
+                    KeyValue::new(INTERFACE, interface_name.to_string()),
+                    KeyValue::new(DIRECTION, "received"),
+                ]]
                 .concat(),
             );
             self.metrics.network_io_per_interface.record(
                 transmitted,
-                &[
-                    &self.attributes.attributes[..],
-                    &[
-                        KeyValue::new(INTERFACE, interface_name.to_string()),
-                        KeyValue::new(DIRECTION, "transmitted"),
-                    ],
-                ]
+                &[&self.attributes.attributes[..], &[
+                    KeyValue::new(INTERFACE, interface_name.to_string()),
+                    KeyValue::new(DIRECTION, "transmitted"),
+                ]]
                 .concat(),
             );
         }
@@ -155,10 +149,10 @@ impl Collector {
         };
         self.metrics.process_status.record(
             status_value,
-            &[
-                &self.attributes.attributes[..],
-                &[KeyValue::new(STATUS, format!("{:?}", process.status()))],
-            ]
+            &[&self.attributes.attributes[..], &[KeyValue::new(
+                STATUS,
+                format!("{:?}", process.status()),
+            )]]
             .concat(),
         );
 

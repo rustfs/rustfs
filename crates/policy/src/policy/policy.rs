@@ -276,12 +276,150 @@ pub mod default {
     #[allow(clippy::incompatible_msrv)]
     pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 6]> = LazyLock::new(|| {
         [
-            (
-                "readwrite",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
+            ("readwrite", Policy {
+                id: "".into(),
+                version: DEFAULT_VERSION.into(),
+                statements: vec![Statement {
+                    sid: "".into(),
+                    effect: Effect::Allow,
+                    actions: ActionSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Action::S3Action(S3Action::AllActions));
+                        hash_set
+                    }),
+                    not_actions: ActionSet(Default::default()),
+                    resources: ResourceSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Resource::S3("*".into()));
+                        hash_set
+                    }),
+                    conditions: Functions::default(),
+                    ..Default::default()
+                }],
+            }),
+            ("readonly", Policy {
+                id: "".into(),
+                version: DEFAULT_VERSION.into(),
+                statements: vec![Statement {
+                    sid: "".into(),
+                    effect: Effect::Allow,
+                    actions: ActionSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
+                        hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
+                        hash_set
+                    }),
+                    not_actions: ActionSet(Default::default()),
+                    resources: ResourceSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Resource::S3("*".into()));
+                        hash_set
+                    }),
+                    conditions: Functions::default(),
+                    ..Default::default()
+                }],
+            }),
+            ("writeonly", Policy {
+                id: "".into(),
+                version: DEFAULT_VERSION.into(),
+                statements: vec![Statement {
+                    sid: "".into(),
+                    effect: Effect::Allow,
+                    actions: ActionSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
+                        hash_set
+                    }),
+                    not_actions: ActionSet(Default::default()),
+                    resources: ResourceSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Resource::S3("*".into()));
+                        hash_set
+                    }),
+                    conditions: Functions::default(),
+                    ..Default::default()
+                }],
+            }),
+            ("writeonly", Policy {
+                id: "".into(),
+                version: DEFAULT_VERSION.into(),
+                statements: vec![Statement {
+                    sid: "".into(),
+                    effect: Effect::Allow,
+                    actions: ActionSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
+                        hash_set
+                    }),
+                    not_actions: ActionSet(Default::default()),
+                    resources: ResourceSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Resource::S3("*".into()));
+                        hash_set
+                    }),
+                    conditions: Functions::default(),
+                    ..Default::default()
+                }],
+            }),
+            ("diagnostics", Policy {
+                id: "".into(),
+                version: DEFAULT_VERSION.into(),
+                statements: vec![Statement {
+                    sid: "".into(),
+                    effect: Effect::Allow,
+                    actions: ActionSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
+                        hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
+                        hash_set
+                    }),
+                    not_actions: ActionSet(Default::default()),
+                    resources: ResourceSet({
+                        let mut hash_set = HashSet::new();
+                        hash_set.insert(Resource::S3("*".into()));
+                        hash_set
+                    }),
+                    conditions: Functions::default(),
+                    ..Default::default()
+                }],
+            }),
+            ("consoleAdmin", Policy {
+                id: "".into(),
+                version: DEFAULT_VERSION.into(),
+                statements: vec![
+                    Statement {
+                        sid: "".into(),
+                        effect: Effect::Allow,
+                        actions: ActionSet({
+                            let mut hash_set = HashSet::new();
+                            hash_set.insert(Action::AdminAction(AdminAction::AllAdminActions));
+                            hash_set
+                        }),
+                        not_actions: ActionSet(Default::default()),
+                        resources: ResourceSet(HashSet::new()),
+                        conditions: Functions::default(),
+                        ..Default::default()
+                    },
+                    Statement {
+                        sid: "".into(),
+                        effect: Effect::Allow,
+                        actions: ActionSet({
+                            let mut hash_set = HashSet::new();
+                            hash_set.insert(Action::KmsAction(KmsAction::AllActions));
+                            hash_set
+                        }),
+                        not_actions: ActionSet(Default::default()),
+                        resources: ResourceSet(HashSet::new()),
+                        conditions: Functions::default(),
+                        ..Default::default()
+                    },
+                    Statement {
                         sid: "".into(),
                         effect: Effect::Allow,
                         actions: ActionSet({
@@ -297,165 +435,9 @@ pub mod default {
                         }),
                         conditions: Functions::default(),
                         ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "readonly",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "writeonly",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "writeonly",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "diagnostics",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "consoleAdmin",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![
-                        Statement {
-                            sid: "".into(),
-                            effect: Effect::Allow,
-                            actions: ActionSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::AdminAction(AdminAction::AllAdminActions));
-                                hash_set
-                            }),
-                            not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(HashSet::new()),
-                            conditions: Functions::default(),
-                            ..Default::default()
-                        },
-                        Statement {
-                            sid: "".into(),
-                            effect: Effect::Allow,
-                            actions: ActionSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::KmsAction(KmsAction::AllActions));
-                                hash_set
-                            }),
-                            not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(HashSet::new()),
-                            conditions: Functions::default(),
-                            ..Default::default()
-                        },
-                        Statement {
-                            sid: "".into(),
-                            effect: Effect::Allow,
-                            actions: ActionSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::S3Action(S3Action::AllActions));
-                                hash_set
-                            }),
-                            not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet({
-                                let mut hash_set = HashSet::new();
-                                hash_set.insert(Resource::S3("*".into()));
-                                hash_set
-                            }),
-                            conditions: Functions::default(),
-                            ..Default::default()
-                        },
-                    ],
-                },
-            ),
+                    },
+                ],
+            }),
         ]
     });
 }
