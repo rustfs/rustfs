@@ -11,21 +11,25 @@
 Before every commit, you **MUST**:
 
 1. **Format your code**:
+
    ```bash
    cargo fmt --all
    ```
 
 2. **Verify formatting**:
+
    ```bash
    cargo fmt --all --check
    ```
 
 3. **Pass clippy checks**:
+
    ```bash
    cargo clippy --all-targets --all-features -- -D warnings
    ```
 
 4. **Ensure compilation**:
+
    ```bash
    cargo check --all-targets
    ```
@@ -136,6 +140,7 @@ Install the `rust-analyzer` extension and add to your `settings.json`:
 #### Other IDEs
 
 Configure your IDE to:
+
 - Use the project's `rustfmt.toml` configuration
 - Format on save
 - Run clippy checks

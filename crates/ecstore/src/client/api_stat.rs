@@ -35,23 +35,26 @@ use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 impl TransitionClient {
     pub async fn bucket_exists(&self, bucket_name: &str) -> Result<bool, std::io::Error> {
         let resp = self
-            .execute_method(http::Method::HEAD, &mut RequestMetadata {
-                bucket_name: bucket_name.to_string(),
-                object_name: "".to_string(),
-                query_values: HashMap::new(),
-                custom_header: HeaderMap::new(),
-                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                content_md5_base64: "".to_string(),
-                content_body: ReaderImpl::Body(Bytes::new()),
-                content_length: 0,
-                stream_sha256: false,
-                trailer: HeaderMap::new(),
-                pre_sign_url: Default::default(),
-                add_crc: Default::default(),
-                extra_pre_sign_header: Default::default(),
-                bucket_location: Default::default(),
-                expires: Default::default(),
-            })
+            .execute_method(
+                http::Method::HEAD,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: "".to_string(),
+                    query_values: HashMap::new(),
+                    custom_header: HeaderMap::new(),
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    content_md5_base64: "".to_string(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
             .await;
 
         if let Ok(resp) = resp {
@@ -82,23 +85,26 @@ impl TransitionClient {
         }
 
         let resp = self
-            .execute_method(http::Method::HEAD, &mut RequestMetadata {
-                bucket_name: bucket_name.to_string(),
-                object_name: object_name.to_string(),
-                query_values: opts.to_query_values(),
-                custom_header: headers,
-                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                content_md5_base64: "".to_string(),
-                content_body: ReaderImpl::Body(Bytes::new()),
-                content_length: 0,
-                stream_sha256: false,
-                trailer: HeaderMap::new(),
-                pre_sign_url: Default::default(),
-                add_crc: Default::default(),
-                extra_pre_sign_header: Default::default(),
-                bucket_location: Default::default(),
-                expires: Default::default(),
-            })
+            .execute_method(
+                http::Method::HEAD,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
+                    query_values: opts.to_query_values(),
+                    custom_header: headers,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    content_md5_base64: "".to_string(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
             .await;
 
         match resp {

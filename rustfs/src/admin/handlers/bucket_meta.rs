@@ -453,10 +453,13 @@ impl Operation for ImportBucketMetadata {
             // create bucket if not exists
             if !bucket_metadatas.contains_key(bucket_name) {
                 if let Err(e) = store
-                    .make_bucket(bucket_name, &MakeBucketOptions {
-                        force_create: true,
-                        ..Default::default()
-                    })
+                    .make_bucket(
+                        bucket_name,
+                        &MakeBucketOptions {
+                            force_create: true,
+                            ..Default::default()
+                        },
+                    )
                     .await
                 {
                     warn!("create bucket failed: {e}");

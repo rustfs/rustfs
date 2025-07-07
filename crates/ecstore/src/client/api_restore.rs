@@ -141,23 +141,26 @@ impl TransitionClient {
 
         let restore_request_buffer = Bytes::from(restore_request_bytes.clone());
         let resp = self
-            .execute_method(http::Method::HEAD, &mut RequestMetadata {
-                bucket_name: bucket_name.to_string(),
-                object_name: object_name.to_string(),
-                query_values: url_values,
-                custom_header: HeaderMap::new(),
-                content_sha256_hex: "".to_string(), //sum_sha256_hex(&restore_request_bytes),
-                content_md5_base64: "".to_string(), //sum_md5_base64(&restore_request_bytes),
-                content_body: ReaderImpl::Body(restore_request_buffer),
-                content_length: restore_request_bytes.len() as i64,
-                stream_sha256: false,
-                trailer: HeaderMap::new(),
-                pre_sign_url: Default::default(),
-                add_crc: Default::default(),
-                extra_pre_sign_header: Default::default(),
-                bucket_location: Default::default(),
-                expires: Default::default(),
-            })
+            .execute_method(
+                http::Method::HEAD,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
+                    query_values: url_values,
+                    custom_header: HeaderMap::new(),
+                    content_sha256_hex: "".to_string(), //sum_sha256_hex(&restore_request_bytes),
+                    content_md5_base64: "".to_string(), //sum_md5_base64(&restore_request_bytes),
+                    content_body: ReaderImpl::Body(restore_request_buffer),
+                    content_length: restore_request_bytes.len() as i64,
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
             .await?;
 
         let b = resp.body().bytes().expect("err").to_vec();

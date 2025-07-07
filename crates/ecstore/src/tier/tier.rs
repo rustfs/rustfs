@@ -365,10 +365,15 @@ impl TierConfigMgr {
         file: &str,
         data: Bytes,
     ) -> std::result::Result<(), std::io::Error> {
-        self.save_config_with_opts(api, file, data, &ObjectOptions {
-            max_parity: true,
-            ..Default::default()
-        })
+        self.save_config_with_opts(
+            api,
+            file,
+            data,
+            &ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            },
+        )
         .await
     }
 

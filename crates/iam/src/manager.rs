@@ -1575,11 +1575,14 @@ pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
     default_policies
         .iter()
         .map(|(n, p)| {
-            (n.to_string(), PolicyDoc {
-                version: 1,
-                policy: p.clone(),
-                ..Default::default()
-            })
+            (
+                n.to_string(),
+                PolicyDoc {
+                    version: 1,
+                    policy: p.clone(),
+                    ..Default::default()
+                },
+            )
         })
         .collect()
 }

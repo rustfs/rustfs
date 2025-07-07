@@ -340,10 +340,7 @@ fn sign_v4_inner(
 
     let headers = req.headers_mut();
 
-    let auth = format!(
-        "{} Credential={}, SignedHeaders={}, Signature={}",
-        SIGN_V4_ALGORITHM, credential, signed_headers, signature
-    );
+    let auth = format!("{SIGN_V4_ALGORITHM} Credential={credential}, SignedHeaders={signed_headers}, Signature={signature}");
     headers.insert("Authorization", auth.parse().unwrap());
 
     if !trailer.is_empty() {

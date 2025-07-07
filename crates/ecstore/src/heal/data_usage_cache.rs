@@ -183,11 +183,14 @@ impl AllTierStats {
 
     fn populate_stats(&self, stats: &mut HashMap<String, TierStats>) {
         for (tier, st) in &self.tiers {
-            stats.insert(tier.clone(), TierStats {
-                total_size: st.total_size,
-                num_versions: st.num_versions,
-                num_objects: st.num_objects,
-            });
+            stats.insert(
+                tier.clone(),
+                TierStats {
+                    total_size: st.total_size,
+                    num_versions: st.num_versions,
+                    num_objects: st.num_objects,
+                },
+            );
         }
     }
 }
@@ -443,10 +446,16 @@ impl DataUsageCache {
             let path = Path::new(BUCKET_META_PREFIX).join(name);
             // warn!("Loading data usage cache from backend: {}", path.display());
             match store
-                .get_object_reader(RUSTFS_META_BUCKET, path.to_str().unwrap(), None, HeaderMap::new(), &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                })
+                .get_object_reader(
+                    RUSTFS_META_BUCKET,
+                    path.to_str().unwrap(),
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 Ok(mut reader) => {
@@ -460,10 +469,16 @@ impl DataUsageCache {
                     match err {
                         Error::FileNotFound | Error::VolumeNotFound => {
                             match store
-                                .get_object_reader(RUSTFS_META_BUCKET, name, None, HeaderMap::new(), &ObjectOptions {
-                                    no_lock: true,
-                                    ..Default::default()
-                                })
+                                .get_object_reader(
+                                    RUSTFS_META_BUCKET,
+                                    name,
+                                    None,
+                                    HeaderMap::new(),
+                                    &ObjectOptions {
+                                        no_lock: true,
+                                        ..Default::default()
+                                    },
+                                )
                                 .await
                             {
                                 Ok(mut reader) => {
@@ -804,15 +819,18 @@ impl DataUsageCache {
                 bui.replica_count = rs.replica_count;
 
                 for (arn, stat) in rs.targets.iter() {
-                    bui.replication_info.insert(arn.clone(), BucketTargetUsageInfo {
-                        replication_pending_size: stat.pending_size,
-                        replicated_size: stat.replicated_size,
-                        replication_failed_size: stat.failed_size,
-                        replication_pending_count: stat.pending_count,
-                        replication_failed_count: stat.failed_count,
-                        replicated_count: stat.replicated_count,
-                        ..Default::default()
-                    });
+                    bui.replication_info.insert(
+                        arn.clone(),
+                        BucketTargetUsageInfo {
+                            replication_pending_size: stat.pending_size,
+                            replicated_size: stat.replicated_size,
+                            replication_failed_size: stat.failed_size,
+                            replication_pending_count: stat.pending_count,
+                            replication_failed_count: stat.failed_count,
+                            replicated_count: stat.replicated_count,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
             dst.insert(bucket.name.clone(), bui);
