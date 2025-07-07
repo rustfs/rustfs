@@ -31,10 +31,14 @@ pub async fn delete_object_versions(api: ECStore, bucket: &str, to_del: &[Object
             remaining = &[];
         }
         let vc = BucketVersioningSys::get(bucket).await.expect("err!");
-        let _deleted_objs = api.delete_objects(bucket, to_del.to_vec(), ObjectOptions {
-            //prefix_enabled_fn:  vc.prefix_enabled(""),
-            version_suspended: vc.suspended(),
-            ..Default::default()
-        });
+        let _deleted_objs = api.delete_objects(
+            bucket,
+            to_del.to_vec(),
+            ObjectOptions {
+                //prefix_enabled_fn:  vc.prefix_enabled(""),
+                version_suspended: vc.suspended(),
+                ..Default::default()
+            },
+        );
     }
 }

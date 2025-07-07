@@ -2026,11 +2026,15 @@ impl DiskAPI for LocalDisk {
     ) -> Result<()> {
         if path.starts_with(SLASH_SEPARATOR) {
             return self
-                .delete(volume, path, DeleteOptions {
-                    recursive: false,
-                    immediate: false,
-                    ..Default::default()
-                })
+                .delete(
+                    volume,
+                    path,
+                    DeleteOptions {
+                        recursive: false,
+                        immediate: false,
+                        ..Default::default()
+                    },
+                )
                 .await;
         }
 

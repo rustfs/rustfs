@@ -85,9 +85,13 @@ fn main() -> Result<(), AnyError> {
         Err(_) => "flatc".to_string(),
     };
 
-    compile_flatbuffers_models(&mut generated_mod_rs, &flatc_path, proto_dir.clone(), flatbuffer_out_dir.clone(), vec![
-        "models",
-    ])?;
+    compile_flatbuffers_models(
+        &mut generated_mod_rs,
+        &flatc_path,
+        proto_dir.clone(),
+        flatbuffer_out_dir.clone(),
+        vec!["models"],
+    )?;
 
     fmt();
     Ok(())

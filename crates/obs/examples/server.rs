@@ -46,10 +46,10 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
     // Record Metrics
     let meter = global::meter("rustfs");
     let request_duration = meter.f64_histogram("s3_request_duration_seconds").build();
-    request_duration.record(start_time.elapsed().unwrap().as_secs_f64(), &[opentelemetry::KeyValue::new(
-        "operation",
-        "run",
-    )]);
+    request_duration.record(
+        start_time.elapsed().unwrap().as_secs_f64(),
+        &[opentelemetry::KeyValue::new("operation", "run")],
+    );
 
     match SystemObserver::init_process_observer(meter).await {
         Ok(_) => info!("Process observer initialized successfully"),
@@ -84,10 +84,10 @@ async fn put_object(bucket: String, object: String, user: String) {
 
     let meter = global::meter("rustfs");
     let request_duration = meter.f64_histogram("s3_request_duration_seconds").build();
-    request_duration.record(start_time.elapsed().unwrap().as_secs_f64(), &[opentelemetry::KeyValue::new(
-        "operation",
-        "put_object",
-    )]);
+    request_duration.record(
+        start_time.elapsed().unwrap().as_secs_f64(),
+        &[opentelemetry::KeyValue::new("operation", "put_object")],
+    );
 
     info!(
         "Starting PUT operation content: bucket = {}, object = {}, user = {},start_time = {}",

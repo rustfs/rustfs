@@ -255,11 +255,15 @@ impl HealingTracker {
     pub async fn delete(&self) -> Result<()> {
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
-            disk.delete(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), DeleteOptions {
-                recursive: false,
-                immediate: false,
-                ..Default::default()
-            })
+            disk.delete(
+                RUSTFS_META_BUCKET,
+                file_path.to_str().unwrap(),
+                DeleteOptions {
+                    recursive: false,
+                    immediate: false,
+                    ..Default::default()
+                },
+            )
             .await?;
         }
 

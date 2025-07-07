@@ -193,23 +193,26 @@ impl TransitionClient {
         }*/
 
         let mut resp = self
-            .execute_method(http::Method::HEAD, &mut RequestMetadata {
-                bucket_name: bucket_name.to_string(),
-                object_name: object_name.to_string(),
-                query_values: url_values,
-                custom_header: headers,
-                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                content_md5_base64: "".to_string(),
-                content_body: ReaderImpl::Body(Bytes::new()),
-                content_length: 0,
-                stream_sha256: false,
-                trailer: HeaderMap::new(),
-                pre_sign_url: Default::default(),
-                add_crc: Default::default(),
-                extra_pre_sign_header: Default::default(),
-                bucket_location: Default::default(),
-                expires: Default::default(),
-            })
+            .execute_method(
+                http::Method::HEAD,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
+                    query_values: url_values,
+                    custom_header: headers,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    content_md5_base64: "".to_string(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
             .await?;
 
         let h = resp.headers();

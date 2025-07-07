@@ -406,11 +406,17 @@ impl SetDisks {
                     let src_object = src_object.clone();
                     futures.push(tokio::spawn(async move {
                         let _ = disk
-                            .delete_version(&src_bucket, &src_object, fi, false, DeleteOptions {
-                                undo_write: true,
-                                old_data_dir,
-                                ..Default::default()
-                            })
+                            .delete_version(
+                                &src_bucket,
+                                &src_object,
+                                fi,
+                                false,
+                                DeleteOptions {
+                                    undo_write: true,
+                                    old_data_dir,
+                                    ..Default::default()
+                                },
+                            )
                             .await
                             .map_err(|e| {
                                 debug!("rename_data delete_version err {:?}", e);
@@ -483,10 +489,14 @@ impl SetDisks {
             tokio::spawn(async move {
                 if let Some(disk) = disk {
                     (disk
-                        .delete(&bucket, &file_path, DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        })
+                        .delete(
+                            &bucket,
+                            &file_path,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
                         .await)
                         .err()
                 } else {
@@ -685,10 +695,14 @@ impl SetDisks {
 
                 if let Some(disk) = disks[i].as_ref() {
                     let _ = disk
-                        .delete(bucket, &path_join_buf(&[prefix, STORAGE_FORMAT_FILE]), DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        })
+                        .delete(
+                            bucket,
+                            &path_join_buf(&[prefix, STORAGE_FORMAT_FILE]),
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
                         .await
                         .map_err(|e| {
                             warn!("write meta revert err {:?}", e);
@@ -1667,10 +1681,14 @@ impl SetDisks {
         for disk in disks.iter() {
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.delete(bucket, prefix, DeleteOptions {
-                        recursive: true,
-                        ..Default::default()
-                    })
+                    disk.delete(
+                        bucket,
+                        prefix,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
                     .await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2391,10 +2409,17 @@ impl SetDisks {
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
                             return match self
-                                .delete_if_dang_ling(bucket, object, &parts_metadata, &errs, &data_errs_by_part, ObjectOptions {
-                                    version_id: version_id_op.clone(),
-                                    ..Default::default()
-                                })
+                                .delete_if_dang_ling(
+                                    bucket,
+                                    object,
+                                    &parts_metadata,
+                                    &errs,
+                                    &data_errs_by_part,
+                                    ObjectOptions {
+                                        version_id: version_id_op.clone(),
+                                        ..Default::default()
+                                    },
+                                )
                                 .await
                             {
                                 Ok(m) => {
@@ -2700,11 +2725,15 @@ impl SetDisks {
                                 if parts_metadata[index].is_remote() {
                                     let rm_data_dir = parts_metadata[index].data_dir.unwrap().to_string();
                                     let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
-                                    disk.delete(bucket, d_path.to_str().unwrap(), DeleteOptions {
-                                        immediate: true,
-                                        recursive: true,
-                                        ..Default::default()
-                                    })
+                                    disk.delete(
+                                        bucket,
+                                        d_path.to_str().unwrap(),
+                                        DeleteOptions {
+                                            immediate: true,
+                                            recursive: true,
+                                            ..Default::default()
+                                        },
+                                    )
                                     .await?;
                                 }
 
@@ -2727,10 +2756,17 @@ impl SetDisks {
             Err(err) => {
                 let data_errs_by_part = HashMap::new();
                 match self
-                    .delete_if_dang_ling(bucket, object, &parts_metadata, &errs, &data_errs_by_part, ObjectOptions {
-                        version_id: version_id_op.clone(),
-                        ..Default::default()
-                    })
+                    .delete_if_dang_ling(
+                        bucket,
+                        object,
+                        &parts_metadata,
+                        &errs,
+                        &data_errs_by_part,
+                        ObjectOptions {
+                            version_id: version_id_op.clone(),
+                            ..Default::default()
+                        },
+                    )
                     .await
                 {
                     Ok(m) => {
@@ -2786,11 +2822,15 @@ impl SetDisks {
                 let object = object.to_string();
                 futures.push(tokio::spawn(async move {
                     let _ = disk
-                        .delete(&bucket, &object, DeleteOptions {
-                            recursive: false,
-                            immediate: false,
-                            ..Default::default()
-                        })
+                        .delete(
+                            &bucket,
+                            &object,
+                            DeleteOptions {
+                                recursive: false,
+                                immediate: false,
+                                ..Default::default()
+                            },
+                        )
                         .await;
                 }));
             }
@@ -3485,11 +3525,16 @@ impl SetDisks {
                         Ok(fivs) => fivs,
                         Err(err) => {
                             match self_clone
-                                .heal_object(&bucket, &encoded_entry_name, "", &HealOpts {
-                                    scan_mode,
-                                    remove: HEAL_DELETE_DANGLING,
-                                    ..Default::default()
-                                })
+                                .heal_object(
+                                    &bucket,
+                                    &encoded_entry_name,
+                                    "",
+                                    &HealOpts {
+                                        scan_mode,
+                                        remove: HEAL_DELETE_DANGLING,
+                                        ..Default::default()
+                                    },
+                                )
                                 .await
                             {
                                 Ok((res, None)) => {
@@ -3606,53 +3651,56 @@ impl SetDisks {
             let bucket_partial = bucket.clone();
             let heal_entry_agree = heal_entry.clone();
             let heal_entry_partial = heal_entry.clone();
-            if let Err(err) = list_path_raw(rx, ListPathRawOptions {
-                disks,
-                fallback_disks,
-                bucket: bucket.clone(),
-                recursice: true,
-                forward_to,
-                min_disks: 1,
-                report_not_found: false,
-                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                    let jt = jt_agree.clone();
-                    let bucket = bucket_agree.clone();
-                    let heal_entry = heal_entry_agree.clone();
-                    Box::pin(async move {
-                        jt.take().await;
-                        let bucket = bucket.clone();
-                        tokio::spawn(async move {
-                            heal_entry(bucket, entry).await;
-                        });
-                    })
-                })),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                    let jt = jt_partial.clone();
-                    let bucket = bucket_partial.clone();
-                    let heal_entry = heal_entry_partial.clone();
-                    Box::pin({
-                        let heal_entry = heal_entry.clone();
-                        let resolver = resolver.clone();
-                        async move {
-                            let entry = if let Some(entry) = entries.resolve(resolver) {
-                                entry
-                            } else if let (Some(entry), _) = entries.first_found() {
-                                entry
-                            } else {
-                                return;
-                            };
+            if let Err(err) = list_path_raw(
+                rx,
+                ListPathRawOptions {
+                    disks,
+                    fallback_disks,
+                    bucket: bucket.clone(),
+                    recursice: true,
+                    forward_to,
+                    min_disks: 1,
+                    report_not_found: false,
+                    agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                        let jt = jt_agree.clone();
+                        let bucket = bucket_agree.clone();
+                        let heal_entry = heal_entry_agree.clone();
+                        Box::pin(async move {
                             jt.take().await;
                             let bucket = bucket.clone();
-                            let heal_entry = heal_entry.clone();
                             tokio::spawn(async move {
                                 heal_entry(bucket, entry).await;
                             });
-                        }
-                    })
-                })),
-                finished: None,
-                ..Default::default()
-            })
+                        })
+                    })),
+                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                        let jt = jt_partial.clone();
+                        let bucket = bucket_partial.clone();
+                        let heal_entry = heal_entry_partial.clone();
+                        Box::pin({
+                            let heal_entry = heal_entry.clone();
+                            let resolver = resolver.clone();
+                            async move {
+                                let entry = if let Some(entry) = entries.resolve(resolver) {
+                                    entry
+                                } else if let (Some(entry), _) = entries.first_found() {
+                                    entry
+                                } else {
+                                    return;
+                                };
+                                jt.take().await;
+                                let bucket = bucket.clone();
+                                let heal_entry = heal_entry.clone();
+                                tokio::spawn(async move {
+                                    heal_entry(bucket, entry).await;
+                                });
+                            }
+                        })
+                    })),
+                    finished: None,
+                    ..Default::default()
+                },
+            )
             .await
             {
                 ret_err = Some(err.into());
@@ -3695,11 +3743,15 @@ impl SetDisks {
             let prefix = prefix.to_string();
             futures.push(async move {
                 if let Some(disk) = disk_op {
-                    disk.delete(&bucket, &prefix, DeleteOptions {
-                        recursive: true,
-                        immediate: true,
-                        ..Default::default()
-                    })
+                    disk.delete(
+                        &bucket,
+                        &prefix,
+                        DeleteOptions {
+                            recursive: true,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
                     .await
                 } else {
                     Ok(())
