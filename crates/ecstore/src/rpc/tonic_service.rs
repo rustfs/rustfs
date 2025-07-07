@@ -262,13 +262,10 @@ impl Node for NodeService {
         let request = request.into_inner();
         match self
             .local_peer
-            .delete_bucket(
-                &request.bucket,
-                &DeleteBucketOptions {
-                    force: false,
-                    ..Default::default()
-                },
-            )
+            .delete_bucket(&request.bucket, &DeleteBucketOptions {
+                force: false,
+                ..Default::default()
+            })
             .await
         {
             Ok(_) => Ok(tonic::Response::new(DeleteBucketResponse {

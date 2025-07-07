@@ -290,6 +290,7 @@ fn _sign_v4_sts(
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_v4_inner(
     mut req: request::Request<Body>,
     content_len: i64,

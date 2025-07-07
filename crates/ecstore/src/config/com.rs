@@ -70,29 +70,20 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
 }
 
 pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
-    save_config_with_opts(
-        api,
-        file,
-        data,
-        &ObjectOptions {
-            max_parity: true,
-            ..Default::default()
-        },
-    )
+    save_config_with_opts(api, file, data, &ObjectOptions {
+        max_parity: true,
+        ..Default::default()
+    })
     .await
 }
 
 pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
     match api
-        .delete_object(
-            RUSTFS_META_BUCKET,
-            file,
-            ObjectOptions {
-                delete_prefix: true,
-                delete_prefix_object: true,
-                ..Default::default()
-            },
-        )
+        .delete_object(RUSTFS_META_BUCKET, file, ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            ..Default::default()
+        })
         .await
     {
         Ok(_) => Ok(()),

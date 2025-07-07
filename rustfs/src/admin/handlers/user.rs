@@ -445,20 +445,17 @@ impl Operation for ExportIam {
                     let users: HashMap<String, AddOrUpdateUserReq> = users
                         .into_iter()
                         .map(|(k, v)| {
-                            (
-                                k,
-                                AddOrUpdateUserReq {
-                                    secret_key: v.credentials.secret_key,
-                                    status: {
-                                        if v.credentials.status == "off" {
-                                            AccountStatus::Disabled
-                                        } else {
-                                            AccountStatus::Enabled
-                                        }
-                                    },
-                                    policy: None,
+                            (k, AddOrUpdateUserReq {
+                                secret_key: v.credentials.secret_key,
+                                status: {
+                                    if v.credentials.status == "off" {
+                                        AccountStatus::Disabled
+                                    } else {
+                                        AccountStatus::Enabled
+                                    }
                                 },
-                            )
+                                policy: None,
+                            })
                         })
                         .collect::<HashMap<String, AddOrUpdateUserReq>>();
 

@@ -310,14 +310,11 @@ impl S3 for FS {
         };
 
         store
-            .make_bucket(
-                &bucket,
-                &MakeBucketOptions {
-                    force_create: true,
-                    lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
-                    ..Default::default()
-                },
-            )
+            .make_bucket(&bucket, &MakeBucketOptions {
+                force_create: true,
+                lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
+                ..Default::default()
+            })
             .await
             .map_err(ApiError::from)?;
 
@@ -498,13 +495,10 @@ impl S3 for FS {
         };
 
         store
-            .delete_bucket(
-                &input.bucket,
-                &DeleteBucketOptions {
-                    force: false,
-                    ..Default::default()
-                },
-            )
+            .delete_bucket(&input.bucket, &DeleteBucketOptions {
+                force: false,
+                ..Default::default()
+            })
             .await
             .map_err(ApiError::from)?;
 
@@ -1976,7 +1970,7 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let mut lr_retention = false;
+        let lr_retention = false;
         /*let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
         if let Ok(rcfg) = rcfg {
             if let Some(rule) = rcfg.0.rule {
