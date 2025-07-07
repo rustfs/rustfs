@@ -12,154 +12,99 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Build and Push Docker Images
+name: Docker Images
 
 on:
   push:
-    tags:
-      - "v*"
-    branches:
-      - main
+    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "rustfs/**"
+      - "crates/**"
+      - "Dockerfile*"
+      - ".docker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/docker.yml"
   pull_request:
-    branches:
-      - main
+    branches: [main]
+    paths:
+      - "rustfs/**"
+      - "crates/**"
+      - "Dockerfile*"
+      - ".docker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/docker.yml"
   workflow_dispatch:
     inputs:
-      push_to_registry:
-        description: "Push images to registry"
+      push_images:
+        description: "Push images to registries"
         required: false
         default: true
         type: boolean
 
 env:
-  REGISTRY_IMAGE_DOCKERHUB: rustfs/rustfs
-  REGISTRY_IMAGE_GHCR: ghcr.io/${{ github.repository }}
+  CARGO_TERM_COLOR: always
+  REGISTRY_DOCKERHUB: rustfs/rustfs
+  REGISTRY_GHCR: ghcr.io/${{ github.repository }}
 
 jobs:
-  # Skip duplicate job runs
-  skip-check:
-    permissions:
-      actions: write
-      contents: read
+  # Check if we should build
+  build-check:
+    name: Build Check
     runs-on: ubuntu-latest
     outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      should_push: ${{ steps.check.outputs.should_push }}
     steps:
-      - id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          concurrent_skipping: "same_content_newer"
-          cancel_others: true
-          paths_ignore: '["*.md", "docs/**"]'
-
-  # Build RustFS binary for different platforms
-  build-binary:
-    needs: skip-check
-    # Only execute in the following cases: 1) tag push 2) commit message contains --build 3) workflow_dispatch 4) PR
-    if: needs.skip-check.outputs.should_skip != 'true' && (startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '--build') || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            arch: amd64
-            use_cross: false
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            arch: arm64
-            use_cross: true
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: ${{ matrix.target }}
-          components: rustfmt, clippy
-
-      - name: Install cross-compilation dependencies (native build)
-        if: matrix.use_cross == false
+      - name: Check build conditions
+        id: check
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          should_build=false
+          should_push=false
 
-      - name: Install cross tool (cross compilation)
-        if: matrix.use_cross == true
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+          # Always build on workflow_dispatch or when changes detected
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+             [[ "${{ github.event_name }}" == "push" ]] || \
+             [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            should_build=true
+          fi
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "31.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          # Push only on main branch, tags, or manual trigger
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]] || \
+             [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]] || \
+             [[ "${{ github.event.inputs.push_images }}" == "true" ]]; then
+            should_push=true
+          fi
 
-      - name: Install flatc
-        uses: Nugine/setup-flatc@v1
-        with:
-          version: "25.2.10"
+          echo "should_build=$should_build" >> $GITHUB_OUTPUT
+          echo "should_push=$should_push" >> $GITHUB_OUTPUT
+          echo "Build: $should_build, Push: $should_push"
 
-      - name: Cache cargo dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
-            ${{ runner.os }}-cargo-
-
-      - name: Generate protobuf code
-        run: cargo run --bin gproto
-
-      - name: Build RustFS binary (native)
-        if: matrix.use_cross == false
-        run: |
-          cargo build --release --target ${{ matrix.target }} --bin rustfs
-
-      - name: Build RustFS binary (cross)
-        if: matrix.use_cross == true
-        run: |
-          cross build --release --target ${{ matrix.target }} --bin rustfs
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfs-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/rustfs
-          retention-days: 1
-
-  # Build and push multi-arch Docker images
-  build-images:
-    needs: [skip-check, build-binary]
-    if: needs.skip-check.outputs.should_skip != 'true'
+  # Build multi-arch Docker images
+  build-docker:
+    name: Build Docker Images
+    needs: build-check
+    if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
-        image-type: [production, ubuntu, rockylinux, devenv]
+        variant:
+          - name: production
+            dockerfile: Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: ubuntu
+            dockerfile: .docker/Dockerfile.ubuntu22.04
+            platforms: linux/amd64,linux/arm64
+          - name: alpine
+            dockerfile: .docker/Dockerfile.alpine
+            platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Download binary artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
-
-      - name: Setup binary files
-        run: |
-          mkdir -p target/x86_64-unknown-linux-musl/release
-          mkdir -p target/aarch64-unknown-linux-gnu/release
-          cp artifacts/rustfs-amd64/rustfs target/x86_64-unknown-linux-musl/release/
-          cp artifacts/rustfs-arm64/rustfs target/aarch64-unknown-linux-gnu/release/
-          chmod +x target/*/release/rustfs
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -168,75 +113,86 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        if: needs.build-check.outputs.should_push == 'true' && secrets.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        if: needs.build-check.outputs.should_push == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set Dockerfile and context
-        id: dockerfile
-        run: |
-          case "${{ matrix.image-type }}" in
-            production)
-              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
-              echo "context=." >> $GITHUB_OUTPUT
-              echo "suffix=" >> $GITHUB_OUTPUT
-              ;;
-            ubuntu)
-              echo "dockerfile=.docker/Dockerfile.ubuntu22.04" >> $GITHUB_OUTPUT
-              echo "context=." >> $GITHUB_OUTPUT
-              echo "suffix=-ubuntu22.04" >> $GITHUB_OUTPUT
-              ;;
-            rockylinux)
-              echo "dockerfile=.docker/Dockerfile.rockylinux9.3" >> $GITHUB_OUTPUT
-              echo "context=." >> $GITHUB_OUTPUT
-              echo "suffix=-rockylinux9.3" >> $GITHUB_OUTPUT
-              ;;
-            devenv)
-              echo "dockerfile=.docker/Dockerfile.devenv" >> $GITHUB_OUTPUT
-              echo "context=." >> $GITHUB_OUTPUT
-              echo "suffix=-devenv" >> $GITHUB_OUTPUT
-              ;;
-          esac
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY_IMAGE_DOCKERHUB }}
-            ${{ env.REGISTRY_IMAGE_GHCR }}
+            ${{ env.REGISTRY_DOCKERHUB }}
+            ${{ env.REGISTRY_GHCR }}
           tags: |
-            type=ref,event=branch,suffix=${{ steps.dockerfile.outputs.suffix }}
-            type=ref,event=pr,suffix=${{ steps.dockerfile.outputs.suffix }}
-            type=semver,pattern={{version}},suffix=${{ steps.dockerfile.outputs.suffix }}
-            type=semver,pattern={{major}}.{{minor}},suffix=${{ steps.dockerfile.outputs.suffix }}
-            type=semver,pattern={{major}},suffix=${{ steps.dockerfile.outputs.suffix }}
-            type=raw,value=latest,suffix=${{ steps.dockerfile.outputs.suffix }},enable={{is_default_branch}}
+            type=ref,event=branch,suffix=-${{ matrix.variant.name }}
+            type=ref,event=pr,suffix=-${{ matrix.variant.name }}
+            type=semver,pattern={{version}},suffix=-${{ matrix.variant.name }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.variant.name }}
+            type=raw,value=latest,suffix=-${{ matrix.variant.name }},enable={{is_default_branch}}
           flavor: |
             latest=false
 
-      - name: Build and push multi-arch Docker image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ${{ steps.dockerfile.outputs.context }}
-          file: ${{ steps.dockerfile.outputs.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: ${{ (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))) || github.event.inputs.push_to_registry == 'true' }}
+          context: .
+          file: ${{ matrix.variant.dockerfile }}
+          platforms: ${{ matrix.variant.platforms }}
+          push: ${{ needs.build-check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image-type }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image-type }}
+          cache-from: type=gha,scope=docker-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.variant.name }}
           build-args: |
             BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+
+  # Create manifest for main production image
+  create-manifest:
+    name: Create Manifest
+    needs: [build-check, build-docker]
+    if: needs.build-check.outputs.should_push == 'true' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to Docker Hub
+        if: secrets.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+
+          # Create main image tag (without variant suffix)
+          if [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]]; then
+            docker buildx imagetools create \
+              -t ${{ env.REGISTRY_DOCKERHUB }}:${VERSION} \
+              -t ${{ env.REGISTRY_DOCKERHUB }}:latest \
+              ${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-production
+          fi
+
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY_GHCR }}:${VERSION} \
+            -t ${{ env.REGISTRY_GHCR }}:latest \
+            ${{ env.REGISTRY_GHCR }}:${VERSION}-production
