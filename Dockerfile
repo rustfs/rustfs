@@ -34,8 +34,8 @@ RUN apk add -U --no-cache \
 
 COPY --from=builder /rustfs /usr/local/bin/rustfs
 
-ENV RUSTFS_ROOT_USER=rustfsadmin \
-    RUSTFS_ROOT_PASSWORD=rustfsadmin \
+ENV RUSTFS_ACCESS_KEY=rustfsadmin \
+    RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ADDRESS=":9001" \
     RUSTFS_CONSOLE_ENABLE=true \
