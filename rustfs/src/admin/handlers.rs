@@ -1016,7 +1016,6 @@ impl Operation for RemoveRemoteTargetHandler {
             )));
         };
 
-
         let mut need_delete = true;
 
         if let Some(arnstr) = querys.get("arn") {
@@ -1047,7 +1046,6 @@ impl Operation for RemoveRemoteTargetHandler {
                 error!("need delete target is {}", decoded_str);
                 bucket_targets::remove_bucket_target(bucket, arnstr).await;
             }
-            
         }
         // List bucket targets and return as JSON to client
         // match bucket_targets::list_bucket_targets(bucket).await {

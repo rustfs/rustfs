@@ -317,13 +317,10 @@ enum WriterType {
 impl std::fmt::Debug for BitrotWriterWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BitrotWriterWrapper")
-            .field(
-                "writer_type",
-                &match self.writer_type {
-                    WriterType::InlineBuffer => "InlineBuffer",
-                    WriterType::Other => "Other",
-                },
-            )
+            .field("writer_type", &match self.writer_type {
+                WriterType::InlineBuffer => "InlineBuffer",
+                WriterType::Other => "Other",
+            })
             .finish()
     }
 }

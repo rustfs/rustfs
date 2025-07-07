@@ -17,9 +17,9 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use time::{OffsetDateTime, macros::format_description};
 
-use s3s::Body;
 use super::request_signature_v4::{SERVICE_TYPE_S3, get_scope, get_signature, get_signing_key};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use s3s::Body;
 
 const STREAMING_SIGN_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_SIGN_TRAILER_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";

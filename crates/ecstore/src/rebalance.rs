@@ -774,20 +774,16 @@ impl ECStore {
             let mut error = None;
             if version.deleted {
                 if let Err(err) = set
-                    .delete_object(
-                        &bucket,
-                        &version.name,
-                        ObjectOptions {
-                            versioned: true,
-                            version_id: version_id.clone(),
-                            mod_time: version.mod_time,
-                            src_pool_idx: pool_index,
-                            data_movement: true,
-                            delete_marker: true,
-                            skip_decommissioned: true,
-                            ..Default::default()
-                        },
-                    )
+                    .delete_object(&bucket, &version.name, ObjectOptions {
+                        versioned: true,
+                        version_id: version_id.clone(),
+                        mod_time: version.mod_time,
+                        src_pool_idx: pool_index,
+                        data_movement: true,
+                        delete_marker: true,
+                        skip_decommissioned: true,
+                        ..Default::default()
+                    })
                     .await
                 {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
@@ -883,16 +879,12 @@ impl ECStore {
 
         if rebalanced == fivs.versions.len() {
             if let Err(err) = set
-                .delete_object(
-                    bucket.as_str(),
-                    &encode_dir_object(&entry.name),
-                    ObjectOptions {
-                        delete_prefix: true,
-                        delete_prefix_object: true,
+                .delete_object(bucket.as_str(), &encode_dir_object(&entry.name), ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
 
-                        ..Default::default()
-                    },
-                )
+                    ..Default::default()
+                })
                 .await
             {
                 error!("rebalance_entry: delete_object err {:?}", &err);
@@ -911,17 +903,13 @@ impl ECStore {
 
         if object_info.is_multipart() {
             let res = match self
-                .new_multipart_upload(
-                    &bucket,
-                    &object_info.name,
-                    &ObjectOptions {
-                        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                        user_defined: object_info.user_defined.clone(),
-                        src_pool_idx: pool_idx,
-                        data_movement: true,
-                        ..Default::default()
-                    },
-                )
+                .new_multipart_upload(&bucket, &object_info.name, &ObjectOptions {
+                    version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+                    user_defined: object_info.user_defined.clone(),
+                    src_pool_idx: pool_idx,
+                    data_movement: true,
+                    ..Default::default()
+                })
                 .await
             {
                 Ok(res) => res,
@@ -955,17 +943,10 @@ impl ECStore {
                 let mut data = PutObjReader::from_vec(chunk);
 
                 let pi = match self
-                    .put_object_part(
-                        &bucket,
-                        &object_info.name,
-                        &res.upload_id,
-                        part.number,
-                        &mut data,
-                        &ObjectOptions {
-                            preserve_etag: Some(part.etag.clone()),
-                            ..Default::default()
-                        },
-                    )
+                    .put_object_part(&bucket, &object_info.name, &res.upload_id, part.number, &mut data, &ObjectOptions {
+                        preserve_etag: Some(part.etag.clone()),
+                        ..Default::default()
+                    })
                     .await
                 {
                     Ok(pi) => pi,
@@ -983,17 +964,11 @@ impl ECStore {
 
             if let Err(err) = self
                 .clone()
-                .complete_multipart_upload(
-                    &bucket,
-                    &object_info.name,
-                    &res.upload_id,
-                    parts,
-                    &ObjectOptions {
-                        data_movement: true,
-                        mod_time: object_info.mod_time,
-                        ..Default::default()
-                    },
-                )
+                .complete_multipart_upload(&bucket, &object_info.name, &res.upload_id, parts, &ObjectOptions {
+                    data_movement: true,
+                    mod_time: object_info.mod_time,
+                    ..Default::default()
+                })
                 .await
             {
                 error!("rebalance_object: complete_multipart_upload err {:?}", &err);
@@ -1008,21 +983,16 @@ impl ECStore {
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
-            .put_object(
-                &bucket,
-                &object_info.name,
-                &mut data,
-                &ObjectOptions {
-                    src_pool_idx: pool_idx,
-                    data_movement: true,
-                    version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                    mod_time: object_info.mod_time,
-                    user_defined: object_info.user_defined.clone(),
-                    preserve_etag: object_info.etag.clone(),
+            .put_object(&bucket, &object_info.name, &mut data, &ObjectOptions {
+                src_pool_idx: pool_idx,
+                data_movement: true,
+                version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+                mod_time: object_info.mod_time,
+                user_defined: object_info.user_defined.clone(),
+                preserve_etag: object_info.etag.clone(),
 
-                    ..Default::default()
-                },
-            )
+                ..Default::default()
+            })
             .await
         {
             error!("rebalance_object: put_object err {:?}", &err);
@@ -1167,36 +1137,33 @@ impl SetDisks {
         };
 
         let cb1 = cb.clone();
-        list_path_raw(
-            rx,
-            ListPathRawOptions {
-                disks: disks.iter().cloned().map(Some).collect(),
-                bucket: bucket.clone(),
-                recursice: true,
-                min_disks: listing_quorum,
-                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                    info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
-                    Box::pin(cb1(entry))
-                })),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
-                    // let cb = cb.clone();
-                    let resolver = resolver.clone();
-                    let cb = cb.clone();
+        list_path_raw(rx, ListPathRawOptions {
+            disks: disks.iter().cloned().map(Some).collect(),
+            bucket: bucket.clone(),
+            recursice: true,
+            min_disks: listing_quorum,
+            agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
+                Box::pin(cb1(entry))
+            })),
+            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                // let cb = cb.clone();
+                let resolver = resolver.clone();
+                let cb = cb.clone();
 
-                    match entries.resolve(resolver) {
-                        Some(entry) => {
-                            info!("list_objects_to_rebalance: list_objects_to_decommission get {}", &entry.name);
-                            Box::pin(async move { cb(entry).await })
-                        }
-                        None => {
-                            info!("list_objects_to_rebalance: list_objects_to_decommission get none");
-                            Box::pin(async {})
-                        }
+                match entries.resolve(resolver) {
+                    Some(entry) => {
+                        info!("list_objects_to_rebalance: list_objects_to_decommission get {}", &entry.name);
+                        Box::pin(async move { cb(entry).await })
                     }
-                })),
-                ..Default::default()
-            },
-        )
+                    None => {
+                        info!("list_objects_to_rebalance: list_objects_to_decommission get none");
+                        Box::pin(async {})
+                    }
+                }
+            })),
+            ..Default::default()
+        })
         .await?;
 
         info!("list_objects_to_rebalance: list_objects_to_rebalance done");

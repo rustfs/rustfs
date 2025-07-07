@@ -74,26 +74,23 @@ impl TransitionClient {
         url_values.insert("policy".to_string(), "".to_string());
 
         let resp = self
-            .execute_method(
-                http::Method::DELETE,
-                &mut RequestMetadata {
-                    bucket_name: bucket_name.to_string(),
-                    query_values: url_values,
-                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                    object_name: "".to_string(),
-                    custom_header: HeaderMap::new(),
-                    content_body: ReaderImpl::Body(Bytes::new()),
-                    content_length: 0,
-                    content_md5_base64: "".to_string(),
-                    stream_sha256: false,
-                    trailer: HeaderMap::new(),
-                    pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
-                    extra_pre_sign_header: Default::default(),
-                    bucket_location: Default::default(),
-                    expires: Default::default(),
-                },
-            )
+            .execute_method(http::Method::DELETE, &mut RequestMetadata {
+                bucket_name: bucket_name.to_string(),
+                query_values: url_values,
+                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                object_name: "".to_string(),
+                custom_header: HeaderMap::new(),
+                content_body: ReaderImpl::Body(Bytes::new()),
+                content_length: 0,
+                content_md5_base64: "".to_string(),
+                stream_sha256: false,
+                trailer: HeaderMap::new(),
+                pre_sign_url: Default::default(),
+                add_crc: Default::default(),
+                extra_pre_sign_header: Default::default(),
+                bucket_location: Default::default(),
+                expires: Default::default(),
+            })
             .await?;
         //defer closeResponse(resp)
 
@@ -114,26 +111,23 @@ impl TransitionClient {
         url_values.insert("policy".to_string(), "".to_string());
 
         let resp = self
-            .execute_method(
-                http::Method::GET,
-                &mut RequestMetadata {
-                    bucket_name: bucket_name.to_string(),
-                    query_values: url_values,
-                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-                    object_name: "".to_string(),
-                    custom_header: HeaderMap::new(),
-                    content_body: ReaderImpl::Body(Bytes::new()),
-                    content_length: 0,
-                    content_md5_base64: "".to_string(),
-                    stream_sha256: false,
-                    trailer: HeaderMap::new(),
-                    pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
-                    extra_pre_sign_header: Default::default(),
-                    bucket_location: Default::default(),
-                    expires: Default::default(),
-                },
-            )
+            .execute_method(http::Method::GET, &mut RequestMetadata {
+                bucket_name: bucket_name.to_string(),
+                query_values: url_values,
+                content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                object_name: "".to_string(),
+                custom_header: HeaderMap::new(),
+                content_body: ReaderImpl::Body(Bytes::new()),
+                content_length: 0,
+                content_md5_base64: "".to_string(),
+                stream_sha256: false,
+                trailer: HeaderMap::new(),
+                pre_sign_url: Default::default(),
+                add_crc: Default::default(),
+                extra_pre_sign_header: Default::default(),
+                bucket_location: Default::default(),
+                expires: Default::default(),
+            })
             .await?;
 
         let policy = String::from_utf8_lossy(&resp.body().bytes().expect("err").to_vec()).to_string();

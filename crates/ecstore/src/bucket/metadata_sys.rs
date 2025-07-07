@@ -236,13 +236,10 @@ impl BucketMetadataSys {
             futures.push(async move {
                 sleep(Duration::from_millis(30)).await;
                 let _ = api
-                    .heal_bucket(
-                        &bucket,
-                        &HealOpts {
-                            recreate: true,
-                            ..Default::default()
-                        },
-                    )
+                    .heal_bucket(&bucket, &HealOpts {
+                        recreate: true,
+                        ..Default::default()
+                    })
                     .await;
                 load_bucket_metadata(self.api.clone(), bucket.as_str()).await
             });
