@@ -336,6 +336,9 @@ jobs:
     needs: [skip-duplicate, build-check, build-rustfs]
     if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release' && needs.build-rustfs.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -343,10 +346,7 @@ jobs:
           path: ./artifacts
 
       - name: Upload to Aliyun OSS
-        if: ${{ secrets.ALICLOUDOSS_KEY_ID != '' }}
-        env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+        if: ${{ env.OSS_ACCESS_KEY_ID != '' }}
         run: |
           # Install ossutil
           curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
