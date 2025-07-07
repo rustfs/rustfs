@@ -96,6 +96,7 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests
@@ -123,6 +124,7 @@ jobs:
           rust-version: stable
           cache-shared-key: ci-e2e-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2

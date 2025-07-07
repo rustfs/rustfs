@@ -49,6 +49,7 @@ jobs:
           rust-version: nightly
           cache-shared-key: perf-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install additional nightly components
         run: rustup component add llvm-tools-preview
@@ -123,6 +124,7 @@ jobs:
         with:
           rust-version: stable
           cache-shared-key: bench-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run benchmarks

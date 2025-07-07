@@ -36,6 +36,10 @@ inputs:
     description: "Target architecture to add"
     required: false
     default: ""
+  github-token:
+    description: "GitHub token for API access"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -68,6 +72,7 @@ runs:
       uses: arduino/setup-protoc@v3
       with:
         version: "31.1"
+        github-token: ${{ inputs.github-token }}
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1

@@ -133,6 +133,7 @@ jobs:
           rust-version: stable
           target: ${{ matrix.target }}
           cache-shared-key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           install-cross-tools: ${{ matrix.cross }}
 
@@ -212,6 +213,7 @@ jobs:
           rust-version: stable
           target: ${{ matrix.target }}
           cache-shared-key: gui-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download RustFS binary
         uses: actions/download-artifact@v4
