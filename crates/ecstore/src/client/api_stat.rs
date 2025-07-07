@@ -21,16 +21,16 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
-use uuid::Uuid;
 use std::{collections::HashMap, str::FromStr};
 use tokio::io::BufReader;
+use uuid::Uuid;
 
-use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::client::{
-    api_error_response::{err_invalid_argument, http_resp_to_error_response, ErrorResponse},
+    api_error_response::{ErrorResponse, err_invalid_argument, http_resp_to_error_response},
     api_get_options::GetObjectOptions,
-    transition_api::{to_object_info, ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient},
+    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
+use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 
 impl TransitionClient {
     pub async fn bucket_exists(&self, bucket_name: &str) -> Result<bool, std::io::Error> {
@@ -59,7 +59,7 @@ impl TransitionClient {
 
         if let Ok(resp) = resp {
             let b = resp.body().bytes().expect("err").to_vec();
-            let resperr = http_resp_to_error_response(resp, b, bucket_name, "");
+            let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
             /*if to_error_response(resperr).code == "NoSuchBucket" {
                 return Ok(false);
             }
@@ -70,7 +70,12 @@ impl TransitionClient {
         Ok(true)
     }
 
-    pub async fn stat_object(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<ObjectInfo, std::io::Error> {
+    pub async fn stat_object(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        opts: &GetObjectOptions,
+    ) -> Result<ObjectInfo, std::io::Error> {
         let mut headers = opts.header();
         if opts.internal.replication_delete_marker {
             headers.insert("X-Source-DeleteMarker", HeaderValue::from_str("true").unwrap());
@@ -107,24 +112,30 @@ impl TransitionClient {
                 let h = resp.headers();
                 let delete_marker = if let Some(x_amz_delete_marker) = h.get(X_AMZ_DELETE_MARKER.as_str()) {
                     x_amz_delete_marker.to_str().unwrap() == "true"
-                } else { false };
+                } else {
+                    false
+                };
                 let replication_ready = if let Some(x_amz_delete_marker) = h.get("X-Replication-Ready") {
                     x_amz_delete_marker.to_str().unwrap() == "true"
-                } else { false };
+                } else {
+                    false
+                };
                 if resp.status() != http::StatusCode::OK && resp.status() != http::StatusCode::PARTIAL_CONTENT {
                     if resp.status() == http::StatusCode::METHOD_NOT_ALLOWED && opts.version_id != "" && delete_marker {
                         let err_resp = ErrorResponse {
                             status_code: resp.status(),
-                            code:       s3s::S3ErrorCode::MethodNotAllowed,
-                            message:    "the specified method is not allowed against this resource.".to_string(),
+                            code: s3s::S3ErrorCode::MethodNotAllowed,
+                            message: "the specified method is not allowed against this resource.".to_string(),
                             bucket_name: bucket_name.to_string(),
-                            key:         object_name.to_string(),
+                            key: object_name.to_string(),
                             ..Default::default()
                         };
                         return Ok(ObjectInfo {
-                            version_id:       match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
+                            version_id: match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
                                 Ok(v) => v,
-                                Err(e) => { return Err(std::io::Error::other(e)); }
+                                Err(e) => {
+                                    return Err(std::io::Error::other(e));
+                                }
                             },
                             is_delete_marker: delete_marker,
                             ..Default::default()
@@ -132,12 +143,14 @@ impl TransitionClient {
                         //err_resp
                     }
                     return Ok(ObjectInfo {
-                        version_id:          match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
+                        version_id: match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
                             Ok(v) => v,
-                            Err(e) => { return Err(std::io::Error::other(e)); }
+                            Err(e) => {
+                                return Err(std::io::Error::other(e));
+                            }
                         },
-                        is_delete_marker:    delete_marker,
-                        replication_ready:   replication_ready,
+                        is_delete_marker: delete_marker,
+                        replication_ready: replication_ready,
                         ..Default::default()
                     });
                     //http_resp_to_error_response(resp, bucket_name, object_name)

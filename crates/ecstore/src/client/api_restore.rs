@@ -20,12 +20,15 @@
 
 use bytes::Bytes;
 use http::HeaderMap;
+use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::BufReader;
-use std::collections::HashMap;
 
 use crate::client::{
-    api_error_response::{err_invalid_argument, http_resp_to_error_response}, api_get_object_acl::AccessControlList, api_get_options::GetObjectOptions, transition_api::{to_object_info, ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient}
+    api_error_response::{err_invalid_argument, http_resp_to_error_response},
+    api_get_object_acl::AccessControlList,
+    api_get_options::GetObjectOptions,
+    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
 
 const TIER_STANDARD: &str = "Standard";
@@ -40,32 +43,32 @@ struct GlacierJobParameters {
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Encryption {
     encryption_type: String,
-    kms_context:     String,
-    kms_key_id:      String,
+    kms_context: String,
+    kms_key_id: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct MetadataEntry {
-    name:  String,
+    name: String,
     value: String,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
 struct S3 {
     access_control_list: AccessControlList,
-    bucket_name:        String,
-    prefix:             String,
-    canned_acl:         String,
-    encryption:         Encryption,
-    storage_class:      String,
+    bucket_name: String,
+    prefix: String,
+    canned_acl: String,
+    encryption: Encryption,
+    storage_class: String,
     //tagging:            Tags,
-    user_metadata:      MetadataEntry,
+    user_metadata: MetadataEntry,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
 struct SelectParameters {
-    expression_type:      String,
-    expression:           String,
+    expression_type: String,
+    expression: String,
     //input_serialization:  SelectObjectInputSerialization,
     //output_serialization: SelectObjectOutputSerialization,
 }
@@ -75,13 +78,13 @@ struct OutputLocation(S3);
 
 #[derive(Debug, Default, serde::Serialize)]
 struct RestoreRequest {
-    restore_type:           String,
-    tier:                   String,
-    days:                   i64,
+    restore_type: String,
+    tier: String,
+    days: i64,
     glacier_job_parameters: GlacierJobParameters,
-    description:            String,
-    select_parameters:      SelectParameters,
-    output_location:        OutputLocation,
+    description: String,
+    select_parameters: SelectParameters,
+    output_location: OutputLocation,
 }
 
 impl RestoreRequest {
@@ -115,7 +118,13 @@ impl RestoreRequest {
 }
 
 impl TransitionClient {
-    pub async fn restore_object(&self, bucket_name: &str, object_name: &str, version_id: &str, restore_req: &RestoreRequest) -> Result<(), std::io::Error> {
+    pub async fn restore_object(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        version_id: &str,
+        restore_req: &RestoreRequest,
+    ) -> Result<(), std::io::Error> {
         let restore_request = match serde_xml_rs::to_string(restore_req) {
             Ok(buf) => buf,
             Err(e) => {
@@ -139,8 +148,8 @@ impl TransitionClient {
                     object_name: object_name.to_string(),
                     query_values: url_values,
                     custom_header: HeaderMap::new(),
-                    content_sha256_hex: "".to_string(),  //sum_sha256_hex(&restore_request_bytes),
-                    content_md5_base64: "".to_string(),  //sum_md5_base64(&restore_request_bytes),
+                    content_sha256_hex: "".to_string(), //sum_sha256_hex(&restore_request_bytes),
+                    content_md5_base64: "".to_string(), //sum_md5_base64(&restore_request_bytes),
                     content_body: ReaderImpl::Body(restore_request_buffer),
                     content_length: restore_request_bytes.len() as i64,
                     stream_sha256: false,
@@ -156,7 +165,7 @@ impl TransitionClient {
 
         let b = resp.body().bytes().expect("err").to_vec();
         if resp.status() != http::StatusCode::ACCEPTED && resp.status() != http::StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, b, bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, b, bucket_name, "")));
         }
         Ok(())
     }

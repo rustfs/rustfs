@@ -19,7 +19,7 @@
 #![allow(clippy::all)]
 
 use bytes::Bytes;
-use futures::Future;
+use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
 use http::{
     HeaderValue, Response, StatusCode,
@@ -65,7 +65,9 @@ use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
 use rustfs_rio::HashReader;
 use rustfs_utils::{
     net::get_endpoint_url,
-    retry::{MAX_RETRY, new_retry_timer},
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
 };
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
@@ -186,6 +188,7 @@ impl TransitionClient {
 
         clnt.trailing_header_support = opts.trailing_headers && clnt.override_signer_type == SignatureType::SignatureV4;
 
+        clnt.max_retries = MAX_RETRY;
         if opts.max_retries > 0 {
             clnt.max_retries = opts.max_retries;
         }
@@ -313,12 +316,9 @@ impl TransitionClient {
         }
         //}
 
-        //let mut retry_timer = RetryTimer::new();
-        //while let Some(v) = retry_timer.next().await {
-        for _ in [1; 1]
-        /*new_retry_timer(req_retry, default_retry_unit, default_retry_cap, max_jitter)*/
-        {
-            let req = self.new_request(method, metadata).await?;
+        let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, self.random);
+        while let Some(v) = retry_timer.next().await {
+            let req = self.new_request(&method, metadata).await?;
 
             resp = self.doit(req).await?;
 
@@ -329,7 +329,7 @@ impl TransitionClient {
             }
 
             let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-            let err_response = http_resp_to_error_response(resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
+            let err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
 
             if self.region == "" {
                 match err_response.code {
@@ -360,6 +360,14 @@ impl TransitionClient {
                 }
             }
 
+            if is_s3code_retryable(err_response.code.as_str()) {
+                continue;
+            }
+
+            if is_http_status_retryable(&resp.status()) {
+                continue;
+            }
+
             break;
         }
 
@@ -368,7 +376,7 @@ impl TransitionClient {
 
     async fn new_request(
         &self,
-        method: http::Method,
+        method: &http::Method,
         metadata: &mut RequestMetadata,
     ) -> Result<http::Request<Body>, std::io::Error> {
         let location = metadata.bucket_location.clone();
@@ -387,7 +395,11 @@ impl TransitionClient {
             &metadata.query_values,
         )?;
 
-        let Ok(mut req) = Request::builder().method(method).uri(target_url.to_string()).body(Body::empty()) else {
+        let Ok(mut req) = Request::builder()
+            .method(method)
+            .uri(target_url.to_string())
+            .body(Body::empty())
+        else {
             return Err(std::io::Error::other("create request error"));
         };
 
@@ -428,13 +440,7 @@ impl TransitionClient {
                 }
             }
             if signer_type == SignatureType::SignatureV2 {
-                req = rustfs_signer::pre_sign_v2(
-                    req,
-                    &access_key_id,
-                    &secret_access_key,
-                    metadata.expires,
-                    is_virtual_host,
-                );
+                req = rustfs_signer::pre_sign_v2(req, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
             } else if signer_type == SignatureType::SignatureV4 {
                 req = rustfs_signer::pre_sign_v4(
                     req,
@@ -458,9 +464,7 @@ impl TransitionClient {
         //req.content_length = metadata.content_length;
         if metadata.content_length <= -1 {
             let chunked_value = HeaderValue::from_str(&vec!["chunked"].join(",")).expect("err");
-            req
-                .headers_mut()
-                .insert(http::header::TRANSFER_ENCODING, chunked_value);
+            req.headers_mut().insert(http::header::TRANSFER_ENCODING, chunked_value);
         }
 
         if metadata.content_md5_base64.len() > 0 {
@@ -473,8 +477,7 @@ impl TransitionClient {
         }
 
         if signer_type == SignatureType::SignatureV2 {
-            req =
-                rustfs_signer::sign_v2(req, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
+            req = rustfs_signer::sign_v2(req, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
         } else if metadata.stream_sha256 && !self.secure {
             if metadata.trailer.len() > 0 {
                 for (_, v) in &metadata.trailer {
@@ -491,8 +494,8 @@ impl TransitionClient {
             } else if metadata.trailer.len() > 0 {
                 sha_header = UNSIGNED_PAYLOAD_TRAILER.to_string();
             }
-            req
-                .headers_mut().insert("X-Amz-Content-Sha256".parse::<HeaderName>().unwrap(), sha_header.parse().expect("err"));
+            req.headers_mut()
+                .insert("X-Amz-Content-Sha256".parse::<HeaderName>().unwrap(), sha_header.parse().expect("err"));
 
             req = rustfs_signer::sign_v4_trailer(
                 req,
@@ -516,7 +519,7 @@ impl TransitionClient {
         }
 
         Ok(req)
-        }
+    }
 
     pub fn set_user_agent(&self, req: &mut Request<Body>) {
         let headers = req.headers_mut();

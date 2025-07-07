@@ -477,7 +477,12 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
 
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                &resp,
+                vec![],
+                bucket_name,
+                object_name,
+            )));
         }
 
         let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {

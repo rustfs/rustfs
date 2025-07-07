@@ -98,7 +98,7 @@ impl TransitionClient {
             )
             .await?;
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, vec![], bucket_name, "")));
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();

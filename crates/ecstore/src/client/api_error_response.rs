@@ -95,7 +95,7 @@ pub fn to_error_response(err: &std::io::Error) -> ErrorResponse {
 }
 
 pub fn http_resp_to_error_response(
-    resp: http::Response<Body>,
+    resp: &http::Response<Body>,
     b: Vec<u8>,
     bucket_name: &str,
     object_name: &str,

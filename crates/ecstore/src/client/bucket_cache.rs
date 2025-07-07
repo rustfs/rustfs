@@ -167,8 +167,7 @@ impl TransitionClient {
             content_sha256 = UNSIGNED_PAYLOAD.to_string();
         }
 
-        req
-            .headers_mut()
+        req.headers_mut()
             .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
         let req = rustfs_signer::sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
         Ok(req)
@@ -178,7 +177,7 @@ impl TransitionClient {
 async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str) -> Result<String, std::io::Error> {
     //if resp != nil {
     if resp.status() != StatusCode::OK {
-        let err_resp = http_resp_to_error_response(resp, vec![], bucket_name, "");
+        let err_resp = http_resp_to_error_response(&resp, vec![], bucket_name, "");
         match err_resp.code {
                 S3ErrorCode::NotImplemented => {
                     match err_resp.server.as_str() {

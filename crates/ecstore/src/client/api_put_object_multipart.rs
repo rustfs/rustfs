@@ -236,7 +236,12 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
         //if resp.is_none() {
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                &resp,
+                vec![],
+                bucket_name,
+                object_name,
+            )));
         }
         //}
         let initiate_multipart_upload_result = InitiateMultipartUploadResult::default();
@@ -293,7 +298,7 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                resp,
+                &resp,
                 vec![],
                 &p.bucket_name.clone(),
                 &p.object_name,
