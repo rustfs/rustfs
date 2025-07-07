@@ -86,15 +86,17 @@ runs:
         targets: ${{ inputs.target }}
         components: rustfmt, clippy
 
-    - name: Install cross-compilation tools
+    - name: Install Zig
       if: inputs.install-cross-tools == 'true'
-      shell: bash
-      run: |
-        # Install Zig for cross-compilation
-        curl -L https://github.com/ziglang/zig/releases/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz | tar -xJ
-        sudo mv zig-linux-x86_64-0.11.0/zig /usr/local/bin/
-        # Install cargo-zigbuild
-        cargo install cargo-zigbuild
+      uses: mlugg/setup-zig@v2
+      with:
+        version: "0.11.0"
+
+    - name: Install cargo-zigbuild
+      if: inputs.install-cross-tools == 'true'
+      uses: taiki-e/cache-cargo-install-action@v2
+      with:
+        tool: cargo-zigbuild
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
