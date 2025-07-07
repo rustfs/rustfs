@@ -12,56 +12,93 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: "setup"
-
-description: "setup environment for rustfs"
+name: "Setup Rust Environment"
+description: "Setup Rust development environment with caching for RustFS"
 
 inputs:
   rust-version:
-    required: true
+    description: "Rust version to install"
+    required: false
     default: "stable"
-    description: "Rust version to use"
   cache-shared-key:
-    required: true
-    default: ""
-    description: "Cache key for shared cache"
+    description: "Shared cache key for Rust dependencies"
+    required: false
+    default: "rustfs-deps"
   cache-save-if:
-    required: true
-    default: ${{ github.ref == 'refs/heads/main' }}
-    description: "Cache save condition"
-  runs-on:
-    required: true
-    default: "ubuntu-latest"
-    description: "Running system"
+    description: "Condition for saving cache"
+    required: false
+    default: "true"
+  install-cross-tools:
+    description: "Install cross-compilation tools"
+    required: false
+    default: "false"
+  target:
+    description: "Target architecture to add"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
   steps:
-    - name: Install system dependencies
-      if: inputs.runs-on == 'ubuntu-latest'
+    - name: Install system dependencies (Ubuntu)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo apt update
-        sudo apt install -y musl-tools build-essential lld libdbus-1-dev libwayland-dev libwebkit2gtk-4.1-dev libxdo-dev
+        sudo apt-get update
+        sudo apt-get install -y \
+          musl-tools \
+          build-essential \
+          lld \
+          libdbus-1-dev \
+          libwayland-dev \
+          libwebkit2gtk-4.1-dev \
+          libxdo-dev \
+          pkg-config \
+          libssl-dev
 
-    - uses: arduino/setup-protoc@v3
+    - name: Cache protoc binary
+      id: cache-protoc
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/bin/protoc
+        key: protoc-31.1-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install protoc
+      if: steps.cache-protoc.outputs.cache-hit != 'true'
+      uses: arduino/setup-protoc@v3
       with:
         version: "31.1"
 
-    - uses: Nugine/setup-flatc@v1
+    - name: Install flatc
+      uses: Nugine/setup-flatc@v1
       with:
         version: "25.2.10"
 
-    - uses: dtolnay/rust-toolchain@master
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: ${{ inputs.rust-version }}
+        targets: ${{ inputs.target }}
         components: rustfmt, clippy
 
-    - uses: Swatinem/rust-cache@v2
+    - name: Install cross-compilation tools
+      if: inputs.install-cross-tools == 'true'
+      shell: bash
+      run: |
+        # Install Zig for cross-compilation
+        curl -L https://github.com/ziglang/zig/releases/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz | tar -xJ
+        sudo mv zig-linux-x86_64-0.11.0/zig /usr/local/bin/
+        # Install cargo-zigbuild
+        cargo install cargo-zigbuild
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
       with:
         cache-all-crates: true
+        cache-on-failure: true
         shared-key: ${{ inputs.cache-shared-key }}
         save-if: ${{ inputs.cache-save-if }}
-
-    - uses: mlugg/setup-zig@v2
-    - uses: taiki-e/install-action@cargo-zigbuild
+        # Cache workspace dependencies
+        workspaces: |
+          . -> target
+          cli/rustfs-gui -> cli/rustfs-gui/target

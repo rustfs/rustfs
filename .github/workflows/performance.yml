@@ -1,0 +1,138 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Performance Testing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rustfs/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      profile_duration:
+        description: "Profiling duration in seconds"
+        required: false
+        default: "120"
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  performance-profile:
+    name: Performance Profiling
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: nightly
+          cache-shared-key: perf-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install additional nightly components
+        run: rustup component add llvm-tools-preview
+
+      - name: Install samply profiler
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: samply
+
+      - name: Configure kernel for profiling
+        run: echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+      - name: Prepare test environment
+        run: |
+          # Create test volumes
+          for i in {0..4}; do
+            mkdir -p ./target/volume/test$i
+          done
+
+          # Set environment variables
+          echo "RUSTFS_VOLUMES=./target/volume/test{0...4}" >> $GITHUB_ENV
+          echo "RUST_LOG=rustfs=info,ecstore=info,s3s=info,iam=info,rustfs-obs=info" >> $GITHUB_ENV
+
+      - name: Download static files
+        run: |
+          curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+            -o tempfile.zip --retry 3 --retry-delay 5
+          unzip -o tempfile.zip -d ./rustfs/static
+          rm tempfile.zip
+
+      - name: Build with profiling optimizations
+        run: |
+          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off" \
+          cargo +nightly build --profile profiling -p rustfs --bins
+
+      - name: Run performance profiling
+        id: profiling
+        run: |
+          DURATION="${{ github.event.inputs.profile_duration || '120' }}"
+          echo "Running profiling for ${DURATION} seconds..."
+
+          timeout "${DURATION}s" samply record \
+            --output samply-profile.json \
+            ./target/profiling/rustfs ${RUSTFS_VOLUMES} || true
+
+          if [ -f "samply-profile.json" ]; then
+            echo "profile_generated=true" >> $GITHUB_OUTPUT
+            echo "Profile generated successfully"
+          else
+            echo "profile_generated=false" >> $GITHUB_OUTPUT
+            echo "::warning::Profile data not generated"
+          fi
+
+      - name: Upload profile data
+        if: steps.profiling.outputs.profile_generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-profile-${{ github.run_number }}
+          path: samply-profile.json
+          retention-days: 30
+
+  benchmark:
+    name: Benchmark Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: bench-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run benchmarks
+        run: |
+          cargo bench --package ecstore --bench comparison_benchmark -- --output-format json | \
+          tee benchmark-results.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_number }}
+          path: benchmark-results.json
+          retention-days: 7
