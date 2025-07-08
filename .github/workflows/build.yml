@@ -49,7 +49,6 @@ env:
   RUST_BACKTRACE: 1
   # Optimize build performance
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: "-C target-cpu=native"
 
 jobs:
   # First layer: GitHub Actions level optimization (handling duplicates and concurrency)
@@ -108,6 +107,8 @@ jobs:
     if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.cross == 'false' && '-C target-cpu=native' || '' }}
     strategy:
       fail-fast: false
       matrix:
