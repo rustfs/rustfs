@@ -21,6 +21,7 @@ on:
     paths-ignore:
       - "**.md"
       - "**.txt"
+      - ".github/**"
       - "docs/**"
       - "deploy/**"
       - "scripts/dev_*.sh"
@@ -36,6 +37,7 @@ on:
     paths-ignore:
       - "**.md"
       - "**.txt"
+      - ".github/**"
       - "docs/**"
       - "deploy/**"
       - "scripts/dev_*.sh"
@@ -76,7 +78,7 @@ jobs:
         with:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
-          paths_ignore: '["*.md", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
+          paths_ignore: '["*.md", ".github/**", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
 
   # Second layer: Business logic level checks (handling build strategy)
   build-check:
