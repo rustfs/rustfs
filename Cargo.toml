@@ -36,6 +36,7 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
+    "crates/ahm",
 ]
 resolver = "2"
 
@@ -261,6 +262,9 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
+anyhow = "1.0.86"
+figment = "0.10.19"
+prometheus = "0.13.4"
 
 [profile.wasm-dev]
 inherits = "dev"

@@ -449,14 +449,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
 
     // init scanner and auto heal with unified cancellation token
-    let _background_services_cancel_token = create_background_services_cancel_token();
-    init_data_scanner().await;
-    init_auto_heal().await;
-    // init console configuration
-    init_console_cfg(local_ip, server_port);
+    // let _background_services_cancel_token = create_background_services_cancel_token();
+    // init_data_scanner().await;
+    // init_auto_heal().await;
+    // // init console configuration
+    // init_console_cfg(local_ip, server_port);
 
-    print_server_info();
-    init_bucket_replication_pool().await;
+    // print_server_info();
+    // init_bucket_replication_pool().await;
 
     // Async update check (optional)
     tokio::spawn(async {
