@@ -21,6 +21,7 @@ on:
     paths-ignore:
       - "**.md"
       - "**.txt"
+      - ".github/**"
       - "docs/**"
       - "deploy/**"
       - "scripts/dev_*.sh"
@@ -36,6 +37,7 @@ on:
     paths-ignore:
       - "**.md"
       - "**.txt"
+      - ".github/**"
       - "docs/**"
       - "deploy/**"
       - "scripts/dev_*.sh"
