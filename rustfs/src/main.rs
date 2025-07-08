@@ -429,7 +429,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
 
     // init scanner
-    init_data_scanner().await;
+    let scanner_cancel_token = init_data_scanner().await;
     // init auto heal
     init_auto_heal().await;
     // init console configuration
@@ -493,11 +493,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, &scanner_cancel_token).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, &scanner_cancel_token).await;
         }
     }
 
@@ -603,10 +603,18 @@ fn process_connection(
 }
 
 /// Handles the shutdown process of the server
-async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
+async fn handle_shutdown(
+    state_manager: &ServiceStateManager,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    scanner_cancel_token: &tokio_util::sync::CancellationToken,
+) {
     info!("Shutdown signal received in main thread");
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);
+
+    // Stop data scanner gracefully
+    info!("Stopping data scanner...");
+    scanner_cancel_token.cancel();
 
     // Stop the notification system
     shutdown_event_notifier().await;
