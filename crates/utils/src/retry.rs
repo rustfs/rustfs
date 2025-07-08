@@ -29,31 +29,12 @@ pub const NO_JITTER: f64 = 0.0;
 pub const DEFAULT_RETRY_UNIT: Duration = Duration::from_millis(200);
 pub const DEFAULT_RETRY_CAP: Duration = Duration::from_secs(1);
 
-struct Delay {
-    when: Instant,
-}
-
-impl Future for Delay {
-    type Output = &'static str;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
-        if Instant::now() >= self.when {
-            println!("Hello world");
-            Poll::Ready("done")
-        } else {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
 pub struct RetryTimer {
     base_sleep: Duration,
     max_sleep: Duration,
     jitter: f64,
     random: u64,
     rem: i64,
-    delay: Duration,
 }
 
 impl RetryTimer {
@@ -64,7 +45,6 @@ impl RetryTimer {
             jitter,
             random,
             rem: max_retry,
-            delay: Duration::from_millis(0),
         }
     }
 }
@@ -88,10 +68,8 @@ impl Stream for RetryTimer {
             return Poll::Ready(None);
         }
 
-        let when = self.delay + sleep;
-        self.delay = when;
         self.rem -= 1;
-        let mut t = interval(when);
+        let mut t = interval(sleep);
         match t.poll_tick(cx) {
             Poll::Ready(_) => Poll::Ready(Some(())),
             Poll::Pending => Poll::Pending,

@@ -85,7 +85,7 @@ pub struct PutObjectOptions {
     pub expires: OffsetDateTime,
     pub mode: ObjectLockRetentionMode,
     pub retain_until_date: OffsetDateTime,
-    //pub server_side_encryption: encrypt.ServerSide,
+    //pub server_side_encryption: encrypt::ServerSide,
     pub num_threads: u64,
     pub storage_class: String,
     pub website_redirect_location: String,

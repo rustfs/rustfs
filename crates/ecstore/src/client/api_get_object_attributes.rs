@@ -20,33 +20,35 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
-use time::OffsetDateTime;
-use std::io::Cursor;
 use std::collections::HashMap;
+use std::io::Cursor;
+use time::OffsetDateTime;
 use tokio::io::BufReader;
 
-use s3s::{Body, dto::Owner};
-use s3s::header::{X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_DELETE_MARKER, X_AMZ_METADATA_DIRECTIVE, X_AMZ_VERSION_ID,
-    X_AMZ_REQUEST_CHARGED, X_AMZ_RESTORE, X_AMZ_PART_NUMBER_MARKER, X_AMZ_MAX_PARTS,};
-use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use crate::client::constants::{GET_OBJECT_ATTRIBUTES_MAX_PARTS, GET_OBJECT_ATTRIBUTES_TAGS, ISO8601_DATEFORMAT};
+use rustfs_utils::EMPTY_STRING_SHA256_HASH;
+use s3s::header::{
+    X_AMZ_DELETE_MARKER, X_AMZ_MAX_PARTS, X_AMZ_METADATA_DIRECTIVE, X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_PART_NUMBER_MARKER,
+    X_AMZ_REQUEST_CHARGED, X_AMZ_RESTORE, X_AMZ_VERSION_ID,
+};
+use s3s::{Body, dto::Owner};
 
 use crate::client::{
     api_error_response::err_invalid_argument,
+    api_get_object_acl::AccessControlPolicy,
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
-    api_get_object_acl::AccessControlPolicy,
 };
 
 struct ObjectAttributesOptions {
-    max_parts:             i64,
-    version_id:            String,
-    part_number_marker:    i64,
+    max_parts: i64,
+    version_id: String,
+    part_number_marker: i64,
     //server_side_encryption: encrypt::ServerSide,
 }
 
 struct ObjectAttributes {
-    version_id:    String,
+    version_id: String,
     last_modified: OffsetDateTime,
     object_attributes_response: ObjectAttributesResponse,
 }
@@ -54,7 +56,7 @@ struct ObjectAttributes {
 impl ObjectAttributes {
     fn new() -> Self {
         Self {
-            version_id:    "".to_string(),
+            version_id: "".to_string(),
             last_modified: OffsetDateTime::now_utc(),
             object_attributes_response: ObjectAttributesResponse::new(),
         }
@@ -63,18 +65,18 @@ impl ObjectAttributes {
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Checksum {
-    checksum_crc32:  String,
+    checksum_crc32: String,
     checksum_crc32c: String,
-    checksum_sha1:   String,
+    checksum_sha1: String,
     checksum_sha256: String,
 }
 
 impl Checksum {
     fn new() -> Self {
         Self {
-            checksum_crc32:  "".to_string(),
+            checksum_crc32: "".to_string(),
             checksum_crc32c: "".to_string(),
-            checksum_sha1:   "".to_string(),
+            checksum_sha1: "".to_string(),
             checksum_sha256: "".to_string(),
         }
     }
@@ -82,62 +84,62 @@ impl Checksum {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct ObjectParts {
-    parts_count:             i64,
-    part_number_marker:      i64,
+    parts_count: i64,
+    part_number_marker: i64,
     next_part_number_marker: i64,
-    max_parts:               i64,
-    is_truncated:            bool,
-    parts:                   Vec<ObjectAttributePart>,
+    max_parts: i64,
+    is_truncated: bool,
+    parts: Vec<ObjectAttributePart>,
 }
 
 impl ObjectParts {
     fn new() -> Self {
         Self {
-            parts_count:             0,
-            part_number_marker:      0,
+            parts_count: 0,
+            part_number_marker: 0,
             next_part_number_marker: 0,
-            max_parts:               0,
-            is_truncated:            false,
-            parts:                   Vec::new(),
+            max_parts: 0,
+            is_truncated: false,
+            parts: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct ObjectAttributesResponse {
-    etag:          String,
+    etag: String,
     storage_class: String,
-    object_size:   i64,
-    checksum:      Checksum,
-    object_parts:  ObjectParts,
+    object_size: i64,
+    checksum: Checksum,
+    object_parts: ObjectParts,
 }
 
 impl ObjectAttributesResponse {
     fn new() -> Self {
         Self {
-            etag:          "".to_string(),
+            etag: "".to_string(),
             storage_class: "".to_string(),
-            object_size:   0,
-            checksum:      Checksum::new(),
-            object_parts:  ObjectParts::new(),
+            object_size: 0,
+            checksum: Checksum::new(),
+            object_parts: ObjectParts::new(),
         }
     }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct ObjectAttributePart {
-    checksum_crc32:  String,
+    checksum_crc32: String,
     checksum_crc32c: String,
-    checksum_sha1:   String,
+    checksum_sha1: String,
     checksum_sha256: String,
-    part_number:     i64,
-    size:            i64,
+    part_number: i64,
+    size: i64,
 }
 
 impl ObjectAttributes {
     pub async fn parse_response(&mut self, resp: &mut http::Response<Body>) -> Result<(), std::io::Error> {
         let h = resp.headers();
-        let mod_time = OffsetDateTime::parse(h.get("Last-Modified").unwrap().to_str().unwrap(), ISO8601_DATEFORMAT).unwrap();  //RFC7231Time
+        let mod_time = OffsetDateTime::parse(h.get("Last-Modified").unwrap().to_str().unwrap(), ISO8601_DATEFORMAT).unwrap(); //RFC7231Time
         self.last_modified = mod_time;
         self.version_id = h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap().to_string();
 
@@ -155,7 +157,12 @@ impl ObjectAttributes {
 }
 
 impl TransitionClient {
-    pub async fn get_object_attributes(&self, bucket_name: &str, object_name: &str, opts: ObjectAttributesOptions) -> Result<ObjectAttributes, std::io::Error> {
+    pub async fn get_object_attributes(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        opts: ObjectAttributesOptions,
+    ) -> Result<ObjectAttributes, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("attributes".to_string(), "".to_string());
         if opts.version_id != "" {
@@ -166,13 +173,19 @@ impl TransitionClient {
         headers.insert(X_AMZ_OBJECT_ATTRIBUTES, HeaderValue::from_str(GET_OBJECT_ATTRIBUTES_TAGS).unwrap());
 
         if opts.part_number_marker > 0 {
-            headers.insert(X_AMZ_PART_NUMBER_MARKER, HeaderValue::from_str(&opts.part_number_marker.to_string()).unwrap());
+            headers.insert(
+                X_AMZ_PART_NUMBER_MARKER,
+                HeaderValue::from_str(&opts.part_number_marker.to_string()).unwrap(),
+            );
         }
 
         if opts.max_parts > 0 {
             headers.insert(X_AMZ_MAX_PARTS, HeaderValue::from_str(&opts.max_parts.to_string()).unwrap());
         } else {
-            headers.insert(X_AMZ_MAX_PARTS, HeaderValue::from_str(&GET_OBJECT_ATTRIBUTES_MAX_PARTS.to_string()).unwrap());
+            headers.insert(
+                X_AMZ_MAX_PARTS,
+                HeaderValue::from_str(&GET_OBJECT_ATTRIBUTES_MAX_PARTS.to_string()).unwrap(),
+            );
         }
 
         /*if opts.server_side_encryption.is_some() {
@@ -205,7 +218,9 @@ impl TransitionClient {
         let h = resp.headers();
         let has_etag = h.get("ETag").unwrap().to_str().unwrap();
         if !has_etag.is_empty() {
-            return Err(std::io::Error::other("get_object_attributes is not supported by the current endpoint version"));
+            return Err(std::io::Error::other(
+                "get_object_attributes is not supported by the current endpoint version",
+            ));
         }
 
         if resp.status() != http::StatusCode::OK {

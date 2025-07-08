@@ -22,11 +22,11 @@ use std::fmt::Write;
 use time::{OffsetDateTime, macros::format_description};
 use tracing::debug;
 
-use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
-use s3s::Body;
 use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
 use super::utils::{get_host_addr, sign_v4_trim_all};
+use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
+use s3s::Body;
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
@@ -270,7 +270,6 @@ pub fn pre_sign_v4(
         .unwrap(),
     );
 
-
     *req.uri_mut() = Uri::from_parts(parts).unwrap();
 
     req
@@ -282,7 +281,12 @@ fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_ac
     get_signature(signing_key, policy_base64)
 }
 
-fn _sign_v4_sts(req: request::Request<Body>, access_key_id: &str, secret_access_key: &str, location: &str) -> request::Request<Body> {
+fn _sign_v4_sts(
+    req: request::Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    location: &str,
+) -> request::Request<Body> {
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 

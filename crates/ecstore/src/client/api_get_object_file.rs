@@ -21,15 +21,15 @@
 use bytes::Bytes;
 use http::HeaderMap;
 use std::io::Cursor;
-use tokio::io::BufReader;
 #[cfg(not(windows))]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 #[cfg(not(windows))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(not(windows))]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+use tokio::io::BufReader;
 
 use crate::client::{
     api_error_response::err_invalid_argument,
@@ -38,14 +38,20 @@ use crate::client::{
 };
 
 impl TransitionClient {
-    pub async fn fget_object(&self, bucket_name: &str, object_name: &str, file_path: &str, opts: GetObjectOptions) -> Result<(), std::io::Error> {
+    pub async fn fget_object(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        file_path: &str,
+        opts: GetObjectOptions,
+    ) -> Result<(), std::io::Error> {
         match std::fs::metadata(file_path) {
             Ok(file_path_stat) => {
                 let ft = file_path_stat.file_type();
                 if ft.is_dir() {
                     return Err(std::io::Error::other(err_invalid_argument("filename is a directory.")));
                 }
-            },
+            }
             Err(err) => {
                 return Err(std::io::Error::other(err));
             }
@@ -77,7 +83,7 @@ impl TransitionClient {
         };
 
         let mut file_part_path = file_path.to_string();
-        file_part_path.push_str(""/*sum_sha256_hex(object_stat.etag.as_bytes())*/);
+        file_part_path.push_str("" /*sum_sha256_hex(object_stat.etag.as_bytes())*/);
         file_part_path.push_str(".part.rustfs");
 
         #[cfg(not(windows))]

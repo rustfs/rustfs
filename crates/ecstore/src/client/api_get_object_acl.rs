@@ -21,40 +21,40 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use s3s::dto::Owner;
-use std::io::Cursor;
 use std::collections::HashMap;
+use std::io::Cursor;
 use tokio::io::BufReader;
 
-use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use crate::client::{
     api_error_response::{err_invalid_argument, http_resp_to_error_response},
     api_get_options::GetObjectOptions,
-    transition_api::{to_object_info, ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient},
+    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
+use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Grantee {
-    id:           String,
+    id: String,
     display_name: String,
-    uri:          String,
+    uri: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Grant {
-    grantee:    Grantee,
+    grantee: Grantee,
     permission: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AccessControlList {
-    pub grant:      Vec<Grant>,
+    pub grant: Vec<Grant>,
     pub permission: String,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct AccessControlPolicy {
     #[serde(skip)]
-    owner:               Owner,
+    owner: Owner,
     pub access_control_list: AccessControlList,
 }
 
@@ -98,7 +98,9 @@ impl TransitionClient {
             }
         };
 
-        let mut obj_info = self.stat_object(bucket_name, object_name, &GetObjectOptions::default()).await?;
+        let mut obj_info = self
+            .stat_object(bucket_name, object_name, &GetObjectOptions::default())
+            .await?;
 
         obj_info.owner.display_name = res.owner.display_name.clone();
         obj_info.owner.id = res.owner.id.clone();
@@ -107,7 +109,9 @@ impl TransitionClient {
 
         let canned_acl = get_canned_acl(&res);
         if canned_acl != "" {
-            obj_info.metadata.insert("X-Amz-Acl", HeaderValue::from_str(&canned_acl).unwrap());
+            obj_info
+                .metadata
+                .insert("X-Amz-Acl", HeaderValue::from_str(&canned_acl).unwrap());
             return Ok(obj_info);
         }
 
