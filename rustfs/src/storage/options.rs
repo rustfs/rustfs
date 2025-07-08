@@ -273,7 +273,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
     }
 
     #[tokio::test]
@@ -346,7 +346,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
     }
 
     #[tokio::test]
@@ -390,7 +390,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
     }
 
     #[tokio::test]
