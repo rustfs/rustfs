@@ -847,6 +847,22 @@ These rules should serve as guiding principles when developing the RustFS projec
 
 #### Development Workflow
 
+## 🎯 **Core Development Principles**
+
+- **🔴 Every change must be precise - don't modify unless you're confident**
+  - Carefully analyze code logic and ensure complete understanding before making changes
+  - When uncertain, prefer asking users or consulting documentation over blind modifications
+  - Use small iterative steps, modify only necessary parts at a time
+  - Evaluate impact scope before changes to ensure no new issues are introduced
+
+- **🚀 GitHub PR creation prioritizes gh command usage**
+  - Prefer using `gh pr create` command to create Pull Requests
+  - Avoid having users manually create PRs through web interface
+  - Provide clear and professional PR titles and descriptions
+  - Using `gh` commands ensures better integration and automation
+
+## 📝 **Code Quality Requirements**
+
 - Use English for all code comments, documentation, and variable names
 - Write meaningful and descriptive names for variables, functions, and methods
 - Avoid meaningless test content like "debug 111" or placeholder values
