@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS Protos - Protocol Buffer Definitions
 
-**RustFS Protos** provides protocol buffer definitions and gRPC service interfaces for the [RustFS](https://rustfs.com) distributed object storage system. It defines the communication protocols, message formats, and service contracts used across all RustFS components.
+<p align="center">
+  <strong>Protocol buffer definitions and gRPC services for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **gRPC Services**: Core storage, admin, metadata, and lock services
-- **Message Types**: Storage, administrative, metadata, and error messages
-- **Versioning**: Protocol version compatibility management
-- **Streaming**: Support for streaming large data transfers
-- **Type Safety**: Strong typing for all protocol messages
-- **Code Generation**: Automatic Rust code generation
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS Protos** provides protocol buffer definitions and gRPC services for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- Comprehensive gRPC service definitions
+- Cross-language compatibility with Protocol Buffers
+- Efficient binary serialization for network communication
+- Versioned API schemas with backward compatibility
+- Type-safe message definitions
+- Code generation for multiple programming languages
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

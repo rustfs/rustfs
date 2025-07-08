@@ -1,8 +1,25 @@
-# RustFS Utils
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-Essential utility functions and common tools module for RustFS distributed object storage.
+# RustFS Utils - Utility Functions
 
-## Features
+<p align="center">
+  <strong>Essential utility functions and common tools for RustFS distributed object storage</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
+
+---
+
+## 📖 Overview
+
+**RustFS Utils** provides essential utility functions and common tools for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
+
+## ✨ Features
 
 - Cross-platform system operations and monitoring
 - File system utilities with atomic operations
@@ -11,10 +28,10 @@ Essential utility functions and common tools module for RustFS distributed objec
 - Network utilities and protocol helpers
 - Certificate handling and validation tools
 
-## Documentation
+## 📚 Documentation
 
 For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

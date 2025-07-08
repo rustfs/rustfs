@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS Config - Configuration Management
 
-**RustFS Config** is the configuration management module for the [RustFS](https://rustfs.com) distributed object storage system. It provides centralized configuration handling, environment-based configuration loading, validation, and runtime configuration updates for all RustFS components.
+<p align="center">
+  <strong>Configuration management and validation module for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Multi-Format Support**: JSON, YAML, TOML configuration formats
-- **Environment Variables**: Automatic environment variable override
-- **Hot Reload**: Runtime configuration updates without restart
-- **Profile Support**: Environment-specific configuration profiles
-- **Secret Management**: Secure handling of sensitive configuration
-- **Type Safety**: Strongly typed configuration structures
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS Config** provides configuration management and validation capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- Multi-format configuration support (TOML, YAML, JSON, ENV)
+- Environment variable integration and override
+- Configuration validation and type safety
+- Hot-reload capabilities for dynamic updates
+- Default value management and fallbacks
+- Secure credential handling and encryption
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

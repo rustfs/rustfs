@@ -1,20 +1,37 @@
-# RustFS Crypto Module
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-**RustFS Crypto Module** is a core cryptographic component of the [RustFS](https://rustfs.com) distributed object storage system. This module provides secure, high-performance encryption and decryption capabilities, JWT token management, and cross-platform cryptographic operations designed specifically for enterprise-grade storage systems.
+# RustFS Crypto - Cryptographic Operations
 
-## Features
+<p align="center">
+  <strong>High-performance cryptographic operations module for RustFS distributed object storage</strong>
+</p>
 
-- **Multiple Algorithms**: Support for AES-GCM, ChaCha20Poly1305, and PBKDF2
-- **JWT Management**: Secure JWT token creation and validation
-- **Memory Safety**: Built with Rust's memory safety guarantees
-- **Cross-Platform**: Optimized for x86_64, aarch64, s390x, and other architectures
-- **Hardware Acceleration**: Automatic detection and utilization of CPU crypto extensions
-- **Zero-Copy Operations**: Efficient memory usage with `Bytes` support
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-## Documentation
+---
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+## 📖 Overview
 
-## License
+**RustFS Crypto** provides high-performance cryptographic operations for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-This project is licensed under the Apache License, Version 2.0.
+## ✨ Features
+
+- AES-GCM encryption with hardware acceleration
+- RSA and ECDSA digital signature support
+- Secure hash functions (SHA-256, BLAKE3)
+- Key derivation and management utilities
+- Stream ciphers for large data encryption
+- Hardware security module integration
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

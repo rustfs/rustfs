@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS AppAuth - Application Authentication
 
-**RustFS AppAuth** provides secure application authentication and authorization mechanisms for the [RustFS](https://rustfs.com) distributed object storage system. It implements modern cryptographic standards including RSA-based authentication, JWT tokens, and secure session management for application-level access control.
+<p align="center">
+  <strong>Application-level authentication and authorization module for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **RSA Authentication**: Public-key cryptography for secure authentication
-- **JWT Tokens**: JSON Web Token support for stateless authentication
-- **API Keys**: Simple API key-based authentication
-- **Session Management**: Secure session handling and lifecycle management
-- **Cryptographic Signing**: RSA digital signatures for request validation
-- **Token Encryption**: Encrypted token storage and transmission
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS AppAuth** provides application-level authentication and authorization capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- JWT-based authentication with secure token management
+- RBAC (Role-Based Access Control) for fine-grained permissions
+- Multi-tenant application isolation and management
+- OAuth 2.0 and OpenID Connect integration
+- API key management and rotation
+- Session management with configurable expiration
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

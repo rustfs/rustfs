@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS Notify - Event Notification System
 
-**RustFS Notify** is the event notification system for the [RustFS](https://rustfs.com) distributed object storage platform. It provides real-time event publishing and delivery to various targets including webhooks, MQTT brokers, and message queues, enabling seamless integration with external systems and workflows.
+<p align="center">
+  <strong>Real-time event notification and messaging system for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Real-time Events**: Instant notification of storage events
-- **Event Filtering**: Advanced filtering based on object patterns and event types
-- **Multiple Targets**: HTTP/HTTPS webhook notifications, MQTT broker integration
-- **Reliable Delivery**: Guaranteed delivery with retry mechanisms
-- **Event Transformation**: Custom event payload transformation
-- **Dead Letter Queue**: Failed event handling and recovery
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS Notify** provides real-time event notification and messaging capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- Real-time event streaming and notifications
+- Multiple notification targets (HTTP, Kafka, Redis, Email)
+- Event filtering and routing based on criteria
+- Message queuing with guaranteed delivery
+- Event replay and auditing capabilities
+- High-throughput messaging with batching support
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

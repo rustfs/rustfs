@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS Obs - Observability & Monitoring
 
-**RustFS Obs** provides comprehensive observability and monitoring capabilities for the [RustFS](https://rustfs.com) distributed object storage system. It includes metrics collection, distributed tracing, logging, alerting, and performance monitoring to ensure optimal system operation and troubleshooting.
+<p align="center">
+  <strong>Comprehensive observability and monitoring system for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Prometheus Integration**: Native Prometheus metrics export
-- **OpenTelemetry Support**: Standard distributed tracing
-- **Structured Logging**: JSON logging with context propagation
-- **Rule-Based Alerts**: Configurable alerting rules
-- **Custom Metrics**: Application-specific performance metrics
-- **Performance Analysis**: Latency and bottleneck identification
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS Obs** provides comprehensive observability and monitoring capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- OpenTelemetry integration for distributed tracing
+- Prometheus metrics collection and exposition
+- Structured logging with configurable levels
+- Performance profiling and analytics
+- Real-time health checks and status monitoring
+- Custom dashboards and alerting integration
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

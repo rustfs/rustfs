@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS FileMeta - File Metadata Management
 
-**RustFS FileMeta** is the metadata management module for the [RustFS](https://rustfs.com) distributed object storage system. It provides efficient storage, retrieval, and management of file metadata, supporting features like versioning, tagging, and extended attributes with high performance and reliability.
+<p align="center">
+  <strong>Advanced file metadata management and indexing module for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **File Information**: Complete file metadata including size, timestamps, and checksums
-- **Object Versioning**: Version-aware metadata management
-- **Extended Attributes**: Custom metadata and tagging support
-- **FlatBuffers Serialization**: Zero-copy metadata serialization
-- **Schema Evolution**: Forward and backward compatible metadata schemas
-- **Inline Metadata**: Optimized storage for small metadata
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS FileMeta** provides advanced file metadata management and indexing capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- High-performance metadata storage and retrieval
+- Advanced indexing with full-text search capabilities
+- File attribute management and custom metadata
+- Version tracking and history management
+- Distributed metadata replication
+- Real-time metadata synchronization
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

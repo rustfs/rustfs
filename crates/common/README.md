@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS Common - Shared Components
 
-**RustFS Common** provides shared components, types, and utilities used across all RustFS modules. This foundational library ensures consistency, reduces code duplication, and provides essential building blocks for the [RustFS](https://rustfs.com) distributed object storage system.
+<p align="center">
+  <strong>Shared components and common utilities module for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Common Data Structures**: Shared types and enums
-- **Error Handling**: Unified error types and utilities
-- **Async Helpers**: Common async patterns and utilities
-- **Network Components**: Shared gRPC types and utilities
-- **Serialization**: Shared serialization utilities
-- **Metrics**: Shared metrics and observability
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS Common** provides shared components and common utilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- Shared data structures and type definitions
+- Common error handling and result types
+- Utility functions used across modules
+- Configuration structures and validation
+- Logging and tracing infrastructure
+- Cross-platform compatibility helpers
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

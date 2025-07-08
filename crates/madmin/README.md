@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS MadAdmin - Administrative Interface
 
-**RustFS MadAdmin** provides comprehensive administrative interfaces and management APIs for the [RustFS](https://rustfs.com) distributed object storage system. It enables cluster management, monitoring, configuration, and administrative operations through both programmatic APIs and interactive interfaces.
+<p align="center">
+  <strong>Advanced administrative interface and management tools for RustFS distributed object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Node Management**: Add, remove, and monitor cluster nodes
-- **Performance Metrics**: CPU, memory, disk, and network metrics
-- **Dynamic Configuration**: Runtime configuration updates
-- **Data Migration**: Cross-cluster data migration
-- **Healing Operations**: Data integrity repair and healing
-- **User Management**: User and group administration
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS MadAdmin** provides advanced administrative interface and management tools for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- Comprehensive cluster management and monitoring
+- Real-time performance metrics and analytics
+- Automated backup and disaster recovery tools
+- User and permission management interface
+- System health monitoring and alerting
+- Configuration management and deployment tools
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

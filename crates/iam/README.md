@@ -1,20 +1,37 @@
-# RustFS IAM - Identity and Access Management
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-**RustFS IAM** is the identity and access management module for the [RustFS](https://rustfs.com) distributed object storage system. It provides comprehensive authentication, authorization, and access control capabilities, ensuring secure and compliant access to storage resources.
+# RustFS IAM - Identity & Access Management
 
-## Features
+<p align="center">
+  <strong>Identity and access management system for RustFS distributed object storage</strong>
+</p>
 
-- **Multi-Factor Authentication**: Support for various authentication methods
-- **Access Key Management**: Secure generation and management of access keys
-- **Role-Based Access Control (RBAC)**: Flexible role and permission system
-- **Policy-Based Access Control**: Fine-grained access policies
-- **User Management**: Complete user lifecycle management
-- **LDAP Integration**: Enterprise directory service integration
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-## Documentation
+---
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+## 📖 Overview
 
-## License
+**RustFS IAM** provides identity and access management capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-This project is licensed under the Apache License, Version 2.0.
+## ✨ Features
+
+- User and group management with RBAC
+- Service account and API key authentication
+- Policy engine with fine-grained permissions
+- LDAP/Active Directory integration
+- Multi-factor authentication support
+- Session management and token validation
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

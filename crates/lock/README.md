@@ -1,20 +1,37 @@
+[![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
+
 # RustFS Lock - Distributed Locking
 
-**RustFS Lock** provides distributed locking and synchronization primitives for the [RustFS](https://rustfs.com) distributed object storage system. It ensures data consistency and prevents race conditions in multi-node environments through various locking mechanisms and coordination protocols.
+<p align="center">
+  <strong>High-performance distributed locking system for RustFS object storage</strong>
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
+</p>
 
-- **Distributed Mutex**: Cross-node mutual exclusion
-- **Shared Locks**: Reader-writer lock semantics
-- **Timeout Support**: Configurable lock timeouts and expiration
-- **Deadlock Prevention**: Automatic deadlock detection and resolution
-- **Fault Tolerance**: Automatic recovery from node failures
-- **Lock Coalescing**: Efficient batching of lock operations
+---
 
-## Documentation
+## 📖 Overview
 
-For complete documentation, examples, and usage information, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+**RustFS Lock** provides distributed locking capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
-## License
+## ✨ Features
 
-This project is licensed under the Apache License, Version 2.0.
+- Distributed lock management across cluster nodes
+- Read-write lock support with concurrent readers
+- Lock timeout and automatic lease renewal
+- Deadlock detection and prevention
+- High-availability with leader election
+- Performance-optimized locking algorithms
+
+## 📚 Documentation
+
+For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.
