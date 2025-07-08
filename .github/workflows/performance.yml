@@ -17,11 +17,19 @@ name: Performance Testing
 on:
   push:
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   workflow_dispatch:
     inputs:
       profile_duration:

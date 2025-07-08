@@ -18,22 +18,34 @@ on:
   push:
     tags: ["*"]
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "cli/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/build.yml"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   pull_request:
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "cli/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/build.yml"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
