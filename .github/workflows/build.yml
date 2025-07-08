@@ -428,23 +428,28 @@ jobs:
           VERSION="${{ steps.release_prep.outputs.version }}"
           VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
 
-          # Get release notes from tag message
-          RELEASE_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
-          if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
-            RELEASE_NOTES="Release ${VERSION_CLEAN}"
-          fi
+          # Check if release already exists
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, skipping creation"
+          else
+            # Get release notes from tag message
+            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
+            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
+              RELEASE_NOTES="Release ${VERSION_CLEAN}"
+            fi
 
-          # Determine if this is a prerelease
-          PRERELEASE_FLAG=""
-          if [[ "$VERSION" == *"alpha"* ]] || [[ "$VERSION" == *"beta"* ]] || [[ "$VERSION" == *"rc"* ]]; then
-            PRERELEASE_FLAG="--prerelease"
-          fi
+            # Determine if this is a prerelease
+            PRERELEASE_FLAG=""
+            if [[ "$VERSION" == *"alpha"* ]] || [[ "$VERSION" == *"beta"* ]] || [[ "$VERSION" == *"rc"* ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
 
-          # Create the release
-          gh release create "$VERSION" \
-            --title "RustFS $VERSION_CLEAN" \
-            --notes "$RELEASE_NOTES" \
-            $PRERELEASE_FLAG
+            # Create the release only if it doesn't exist
+            gh release create "$VERSION" \
+              --title "RustFS $VERSION_CLEAN" \
+              --notes "$RELEASE_NOTES" \
+              $PRERELEASE_FLAG
+          fi
 
       - name: Upload release assets
         env:
@@ -480,104 +485,114 @@ jobs:
           VERSION="${{ steps.release_prep.outputs.version }}"
           VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
 
-          # Get original release notes
-          ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
-          if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
-            ORIGINAL_NOTES="Release ${VERSION_CLEAN}"
+          # Check if release already has custom notes (not auto-generated)
+          EXISTING_NOTES=$(gh release view "$VERSION" --json body --jq '.body' 2>/dev/null || echo "")
+
+          # Only update if release notes are empty or auto-generated
+          if [[ -z "$EXISTING_NOTES" ]] || [[ "$EXISTING_NOTES" == *"Release ${VERSION_CLEAN}"* ]]; then
+            echo "Updating release notes for $VERSION"
+
+            # Get original release notes from tag
+            ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
+            if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
+              ORIGINAL_NOTES="Release ${VERSION_CLEAN}"
+            fi
+
+            # Create comprehensive release notes
+            cat > enhanced_notes.md << EOF
+            ## RustFS ${VERSION_CLEAN}
+
+            ${ORIGINAL_NOTES}
+
+            ---
+
+            ### 🚀 Quick Download
+
+            **Linux (Recommended - Static Binaries):**
+            \`\`\`bash
+            # x86_64 (Intel/AMD)
+            curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-unknown-linux-musl.tar.gz
+            tar -xzf rustfs-x86_64-unknown-linux-musl.tar.gz
+            sudo cp rustfs-x86_64-unknown-linux-musl/bin/rustfs /usr/local/bin/
+
+            # ARM64 (Graviton, Apple Silicon VMs)
+            curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-aarch64-unknown-linux-musl.tar.gz
+            tar -xzf rustfs-aarch64-unknown-linux-musl.tar.gz
+            sudo cp rustfs-aarch64-unknown-linux-musl/bin/rustfs /usr/local/bin/
+            \`\`\`
+
+            **macOS:**
+            \`\`\`bash
+            # Apple Silicon (M1/M2/M3)
+            curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-aarch64-apple-darwin.tar.gz
+            tar -xzf rustfs-aarch64-apple-darwin.tar.gz
+            sudo cp rustfs-aarch64-apple-darwin/bin/rustfs /usr/local/bin/
+
+            # Intel
+            curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-apple-darwin.tar.gz
+            tar -xzf rustfs-x86_64-apple-darwin.tar.gz
+            sudo cp rustfs-x86_64-apple-darwin/bin/rustfs /usr/local/bin/
+            \`\`\`
+
+            **Windows:**
+            \`\`\`powershell
+            # Download and extract
+            Invoke-WebRequest https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-pc-windows-msvc.zip -OutFile rustfs.zip
+            Expand-Archive rustfs.zip
+            \`\`\`
+
+            ### 📁 Available Downloads
+
+            | Platform | Architecture | File | Size |
+            |----------|-------------|------|------|
+            | Linux | x86_64 | \`rustfs-x86_64-unknown-linux-musl.tar.gz\` | Static binary |
+            | Linux | ARM64 | \`rustfs-aarch64-unknown-linux-musl.tar.gz\` | Static binary |
+            | macOS | Apple Silicon | \`rustfs-aarch64-apple-darwin.tar.gz\` | Native binary |
+            | macOS | Intel | \`rustfs-x86_64-apple-darwin.tar.gz\` | Native binary |
+            | Windows | x86_64 | \`rustfs-x86_64-pc-windows-msvc.zip\` | MSVC binary |
+            | Windows | ARM64 | \`rustfs-aarch64-pc-windows-msvc.zip\` | Experimental |
+
+            ### 🔐 Verification
+
+            Download checksums and verify your download:
+            \`\`\`bash
+            # Download checksums
+            curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/SHA256SUMS
+
+            # Verify (Linux/macOS)
+            sha256sum -c SHA256SUMS --ignore-missing
+
+            # Verify (Windows PowerShell)
+            \$expectedHash = (Get-Content SHA256SUMS | Select-String "rustfs-x86_64-pc-windows-msvc.zip").Line.Split()[0]
+            \$actualHash = (Get-FileHash rustfs-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+            if (\$expectedHash -eq \$actualHash) { "✅ Checksum verified" } else { "❌ Checksum mismatch" }
+            \`\`\`
+
+            ### 🛠️ System Requirements
+
+            - **Linux**: Any distribution with glibc 2.17+ (CentOS 7+, Ubuntu 16.04+)
+            - **macOS**: 10.15+ (Catalina or later)
+            - **Windows**: Windows 10 version 1809 or later
+
+            ### 📚 Documentation
+
+            - [Installation Guide](https://github.com/rustfs/rustfs#installation)
+            - [Quick Start](https://github.com/rustfs/rustfs#quick-start)
+            - [Configuration](https://github.com/rustfs/rustfs/blob/main/docs/)
+            - [API Documentation](https://docs.rs/rustfs)
+
+            ### 🆘 Support
+
+            - 🐛 [Report Issues](https://github.com/rustfs/rustfs/issues)
+            - 💬 [Community Discussions](https://github.com/rustfs/rustfs/discussions)
+            - 📖 [Documentation](https://github.com/rustfs/rustfs/tree/main/docs)
+            EOF
+
+            # Update the release with enhanced notes
+            gh release edit "$VERSION" --notes-file enhanced_notes.md
+          else
+            echo "Release $VERSION already has custom notes, skipping update to preserve manual edits"
           fi
-
-          # Create comprehensive release notes
-          cat > enhanced_notes.md << EOF
-          ## RustFS ${VERSION_CLEAN}
-
-          ${ORIGINAL_NOTES}
-
-          ---
-
-          ### 🚀 Quick Download
-
-          **Linux (Recommended - Static Binaries):**
-          \`\`\`bash
-          # x86_64 (Intel/AMD)
-          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-unknown-linux-musl.tar.gz
-          tar -xzf rustfs-x86_64-unknown-linux-musl.tar.gz
-          sudo cp rustfs-x86_64-unknown-linux-musl/bin/rustfs /usr/local/bin/
-
-          # ARM64 (Graviton, Apple Silicon VMs)
-          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-aarch64-unknown-linux-musl.tar.gz
-          tar -xzf rustfs-aarch64-unknown-linux-musl.tar.gz
-          sudo cp rustfs-aarch64-unknown-linux-musl/bin/rustfs /usr/local/bin/
-          \`\`\`
-
-          **macOS:**
-          \`\`\`bash
-          # Apple Silicon (M1/M2/M3)
-          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-aarch64-apple-darwin.tar.gz
-          tar -xzf rustfs-aarch64-apple-darwin.tar.gz
-          sudo cp rustfs-aarch64-apple-darwin/bin/rustfs /usr/local/bin/
-
-          # Intel
-          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-apple-darwin.tar.gz
-          tar -xzf rustfs-x86_64-apple-darwin.tar.gz
-          sudo cp rustfs-x86_64-apple-darwin/bin/rustfs /usr/local/bin/
-          \`\`\`
-
-          **Windows:**
-          \`\`\`powershell
-          # Download and extract
-          Invoke-WebRequest https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-pc-windows-msvc.zip -OutFile rustfs.zip
-          Expand-Archive rustfs.zip
-          \`\`\`
-
-          ### 📁 Available Downloads
-
-          | Platform | Architecture | File | Size |
-          |----------|-------------|------|------|
-          | Linux | x86_64 | \`rustfs-x86_64-unknown-linux-musl.tar.gz\` | Static binary |
-          | Linux | ARM64 | \`rustfs-aarch64-unknown-linux-musl.tar.gz\` | Static binary |
-          | macOS | Apple Silicon | \`rustfs-aarch64-apple-darwin.tar.gz\` | Native binary |
-          | macOS | Intel | \`rustfs-x86_64-apple-darwin.tar.gz\` | Native binary |
-          | Windows | x86_64 | \`rustfs-x86_64-pc-windows-msvc.zip\` | MSVC binary |
-          | Windows | ARM64 | \`rustfs-aarch64-pc-windows-msvc.zip\` | Experimental |
-
-          ### 🔐 Verification
-
-          Download checksums and verify your download:
-          \`\`\`bash
-          # Download checksums
-          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/SHA256SUMS
-
-          # Verify (Linux/macOS)
-          sha256sum -c SHA256SUMS --ignore-missing
-
-          # Verify (Windows PowerShell)
-          \$expectedHash = (Get-Content SHA256SUMS | Select-String "rustfs-x86_64-pc-windows-msvc.zip").Line.Split()[0]
-          \$actualHash = (Get-FileHash rustfs-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
-          if (\$expectedHash -eq \$actualHash) { "✅ Checksum verified" } else { "❌ Checksum mismatch" }
-          \`\`\`
-
-          ### 🛠️ System Requirements
-
-          - **Linux**: Any distribution with glibc 2.17+ (CentOS 7+, Ubuntu 16.04+)
-          - **macOS**: 10.15+ (Catalina or later)
-          - **Windows**: Windows 10 version 1809 or later
-
-          ### 📚 Documentation
-
-          - [Installation Guide](https://github.com/rustfs/rustfs#installation)
-          - [Quick Start](https://github.com/rustfs/rustfs#quick-start)
-          - [Configuration](https://github.com/rustfs/rustfs/blob/main/docs/)
-          - [API Documentation](https://docs.rs/rustfs)
-
-          ### 🆘 Support
-
-          - 🐛 [Report Issues](https://github.com/rustfs/rustfs/issues)
-          - 💬 [Community Discussions](https://github.com/rustfs/rustfs/discussions)
-          - 📖 [Documentation](https://github.com/rustfs/rustfs/tree/main/docs)
-          EOF
-
-          # Update the release with enhanced notes
-          gh release edit "$VERSION" --notes-file enhanced_notes.md
 
   # Upload to OSS (optional)
   upload-oss:
