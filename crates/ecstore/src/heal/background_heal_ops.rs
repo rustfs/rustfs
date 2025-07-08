@@ -24,6 +24,7 @@ use tokio::{
     },
     time::interval,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -32,7 +33,7 @@ use super::{
     heal_ops::{HealSequence, new_bg_heal_sequence},
 };
 use crate::error::{Error, Result};
-use crate::global::GLOBAL_MRFState;
+use crate::global::{GLOBAL_MRFState, get_background_services_cancel_token};
 use crate::heal::error::ERR_RETRY_HEALING;
 use crate::heal::heal_commands::{HEAL_ITEM_BUCKET, HealScanMode};
 use crate::heal::heal_ops::{BG_HEALING_UUID, HealSource};
@@ -54,6 +55,13 @@ use crate::{
 pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10);
 
 pub async fn init_auto_heal() {
+    info!("Initializing auto heal background task");
+    
+    let Some(cancel_token) = get_background_services_cancel_token() else {
+        error!("Background services cancel token not initialized");
+        return;
+    };
+    
     init_background_healing().await;
     let v = env::var("_RUSTFS_AUTO_DRIVE_HEALING").unwrap_or("on".to_string());
     if v == "on" {
@@ -61,12 +69,16 @@ pub async fn init_auto_heal() {
         GLOBAL_BackgroundHealState
             .push_heal_local_disks(&get_local_disks_to_heal().await)
             .await;
-        spawn(async {
-            monitor_local_disks_and_heal().await;
+        
+        let cancel_clone = cancel_token.clone();
+        spawn(async move {
+            monitor_local_disks_and_heal(cancel_clone).await;
         });
     }
-    spawn(async {
-        GLOBAL_MRFState.heal_routine().await;
+    
+    let cancel_clone = cancel_token.clone();
+    spawn(async move {
+        GLOBAL_MRFState.heal_routine_with_cancel(cancel_clone).await;
     });
 }
 
@@ -108,50 +120,66 @@ pub async fn get_local_disks_to_heal() -> Vec<Endpoint> {
     disks_to_heal
 }
 
-async fn monitor_local_disks_and_heal() {
+async fn monitor_local_disks_and_heal(cancel_token: CancellationToken) {
+    info!("Auto heal monitor started");
     let mut interval = interval(DEFAULT_MONITOR_NEW_DISK_INTERVAL);
 
     loop {
-        interval.tick().await;
-        let heal_disks = GLOBAL_BackgroundHealState.get_heal_local_disk_endpoints().await;
-        if heal_disks.is_empty() {
-            info!("heal local disks is empty");
-            interval.reset();
-            continue;
-        }
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                info!("Auto heal monitor received shutdown signal, exiting gracefully");
+                break;
+            }
+            _ = interval.tick() => {
+                let heal_disks = GLOBAL_BackgroundHealState.get_heal_local_disk_endpoints().await;
+                if heal_disks.is_empty() {
+                    info!("heal local disks is empty");
+                    interval.reset();
+                    continue;
+                }
 
-        info!("heal local disks: {:?}", heal_disks);
+                info!("heal local disks: {:?}", heal_disks);
 
-        let store = new_object_layer_fn().expect("errServerNotInitialized");
-        if let (_result, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
-            error!("heal local disk format error: {}", err);
-            if err == Error::NoHealRequired {
-            } else {
-                info!("heal format err: {}", err.to_string());
+                let store = new_object_layer_fn().expect("errServerNotInitialized");
+                if let (_result, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
+                    error!("heal local disk format error: {}", err);
+                    if err == Error::NoHealRequired {
+                    } else {
+                        info!("heal format err: {}", err.to_string());
+                        interval.reset();
+                        continue;
+                    }
+                }
+
+                let mut futures = Vec::new();
+                for disk in heal_disks.into_ref().iter() {
+                    let disk_clone = disk.clone();
+                    let cancel_clone = cancel_token.clone();
+                    futures.push(async move {
+                        let disk_for_cancel = disk_clone.clone();
+                        tokio::select! {
+                            _ = cancel_clone.cancelled() => {
+                                info!("Disk healing task cancelled for disk: {}", disk_for_cancel);
+                            }
+                            _ = async {
+                                GLOBAL_BackgroundHealState
+                                    .set_disk_healing_status(disk_clone.clone(), true)
+                                    .await;
+                                if heal_fresh_disk(&disk_clone).await.is_err() {
+                                    info!("heal_fresh_disk is err");
+                                    GLOBAL_BackgroundHealState
+                                        .set_disk_healing_status(disk_clone.clone(), false)
+                                        .await;
+                                }
+                                GLOBAL_BackgroundHealState.pop_heal_local_disks(&[disk_clone]).await;
+                            } => {}
+                        }
+                    });
+                }
+                let _ = join_all(futures).await;
                 interval.reset();
-                continue;
             }
         }
-
-        let mut futures = Vec::new();
-        for disk in heal_disks.into_ref().iter() {
-            let disk_clone = disk.clone();
-            futures.push(async move {
-                GLOBAL_BackgroundHealState
-                    .set_disk_healing_status(disk_clone.clone(), true)
-                    .await;
-                if heal_fresh_disk(&disk_clone).await.is_err() {
-                    info!("heal_fresh_disk is err");
-                    GLOBAL_BackgroundHealState
-                        .set_disk_healing_status(disk_clone.clone(), false)
-                        .await;
-                    return;
-                }
-                GLOBAL_BackgroundHealState.pop_heal_local_disks(&[disk_clone]).await;
-            });
-        }
-        let _ = join_all(futures).await;
-        interval.reset();
     }
 }
 

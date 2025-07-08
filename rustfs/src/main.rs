@@ -52,8 +52,14 @@ use rustfs_ecstore::heal::background_heal_ops::init_auto_heal;
 use rustfs_ecstore::rpc::make_server;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
-    StorageAPI, endpoints::EndpointServerPools, global::set_global_rustfs_port, heal::data_scanner::init_data_scanner,
-    notification_sys::new_global_notification_sys, set_global_endpoints, store::ECStore, store::init_local_disks,
+    StorageAPI,
+    endpoints::EndpointServerPools,
+    global::{create_background_services_cancel_token, set_global_rustfs_port, shutdown_background_services},
+    heal::data_scanner::init_data_scanner,
+    notification_sys::new_global_notification_sys,
+    set_global_endpoints,
+    store::ECStore,
+    store::init_local_disks,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -442,9 +448,9 @@ async fn run(opt: config::Opt) -> Result<()> {
         Error::other(err)
     })?;
 
-    // init scanner
-    let scanner_cancel_token = init_data_scanner().await;
-    // init auto heal
+    // init scanner and auto heal with unified cancellation token
+    let _background_services_cancel_token = create_background_services_cancel_token();
+    init_data_scanner().await;
     init_auto_heal().await;
     // init console configuration
     init_console_cfg(local_ip, server_port);
@@ -507,11 +513,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx, &scanner_cancel_token).await;
+            handle_shutdown(&state_manager, &shutdown_tx).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx, &scanner_cancel_token).await;
+            handle_shutdown(&state_manager, &shutdown_tx).await;
         }
     }
 
@@ -617,18 +623,14 @@ fn process_connection(
 }
 
 /// Handles the shutdown process of the server
-async fn handle_shutdown(
-    state_manager: &ServiceStateManager,
-    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
-    scanner_cancel_token: &tokio_util::sync::CancellationToken,
-) {
+async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
     info!("Shutdown signal received in main thread");
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);
 
-    // Stop data scanner gracefully
-    info!("Stopping data scanner...");
-    scanner_cancel_token.cancel();
+    // Stop background services (data scanner and auto heal) gracefully
+    info!("Stopping background services (data scanner and auto heal)...");
+    shutdown_background_services();
 
     // Stop the notification system
     shutdown_event_notifier().await;
