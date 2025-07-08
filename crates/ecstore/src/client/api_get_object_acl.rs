@@ -87,7 +87,7 @@ impl TransitionClient {
 
         if resp.status() != http::StatusCode::OK {
             let b = resp.body().bytes().expect("err").to_vec();
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, b, bucket_name, object_name)));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, b, bucket_name, object_name)));
         }
 
         let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
