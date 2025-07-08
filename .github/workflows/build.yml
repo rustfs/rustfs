@@ -79,15 +79,14 @@ jobs:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", ".github/**", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
-          # Never skip when pushing tags (version releases)
-          skip_after_successful_duplicate: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Never skip release events and tag pushes
+          do_not_skip: '["release", "push"]'
 
   # Second layer: Business logic level checks (handling build strategy)
   build-check:
     name: Build Strategy Check
     needs: skip-duplicate
-    # Force execution for tag pushes (version releases), otherwise respect skip check
-    if: startsWith(github.ref, 'refs/tags/') || needs.skip-duplicate.outputs.should_skip != 'true'
+    if: needs.skip-duplicate.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -123,8 +122,7 @@ jobs:
   build-rustfs:
     name: Build RustFS
     needs: [skip-duplicate, build-check]
-    # Force execution for tag pushes, otherwise respect both skip check and build check
-    if: startsWith(github.ref, 'refs/tags/') || (needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_build == 'true')
+    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -272,8 +270,7 @@ jobs:
   build-gui:
     name: Build GUI
     needs: [skip-duplicate, build-check, build-rustfs]
-    # Force execution for tag pushes (releases), otherwise respect skip check
-    if: (startsWith(github.ref, 'refs/tags/') || needs.skip-duplicate.outputs.should_skip != 'true') && needs.build-check.outputs.build_type == 'release'
+    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -377,8 +374,7 @@ jobs:
   release:
     name: GitHub Release
     needs: [skip-duplicate, build-check, build-rustfs, build-gui]
-    # Force execution for tag pushes (releases), otherwise respect skip check
-    if: always() && (startsWith(github.ref, 'refs/tags/') || needs.skip-duplicate.outputs.should_skip != 'true') && needs.build-check.outputs.build_type == 'release'
+    if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -587,8 +583,7 @@ jobs:
   upload-oss:
     name: Upload to OSS
     needs: [skip-duplicate, build-check, build-rustfs]
-    # Force execution for tag pushes (releases), otherwise respect skip check
-    if: always() && (startsWith(github.ref, 'refs/tags/') || needs.skip-duplicate.outputs.should_skip != 'true') && needs.build-check.outputs.build_type == 'release' && needs.build-rustfs.result == 'success'
+    if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release' && needs.build-rustfs.result == 'success'
     runs-on: ubuntu-latest
     env:
       OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
