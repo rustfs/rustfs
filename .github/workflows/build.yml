@@ -125,15 +125,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux builds
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: false
+            platform: linux
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
+            platform: linux
+          # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
             cross: false
+            platform: macos
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+            platform: macos
+          # Windows builds
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            platform: windows
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross: true
+            platform: windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -153,30 +171,57 @@ jobs:
       - name: Download static console assets
         run: |
           mkdir -p ./rustfs/static
-          curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-            -o console.zip --retry 3 --retry-delay 5 --max-time 300
-          unzip -o console.zip -d ./rustfs/static
-          rm console.zip
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          else
+            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+              -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          fi
 
       - name: Build RustFS
         run: |
+          # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
           if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Use cross for Windows ARM64
+              cargo install cross --git https://github.com/cross-rs/cross
+              cross build --release --target ${{ matrix.target }} -p rustfs --bins
+            else
+              # Use zigbuild for Linux ARM64
+              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            fi
           else
             cargo build --release --target ${{ matrix.target }} -p rustfs --bins
           fi
 
       - name: Create release package
         id: package
+        shell: bash
         run: |
           PACKAGE_NAME="rustfs-${{ matrix.target }}"
           mkdir -p "${PACKAGE_NAME}"/{bin,docs}
 
-          # Copy binary
+          # Copy binary with platform-specific handling
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             cp target/${{ matrix.target }}/release/rustfs.exe "${PACKAGE_NAME}/bin/"
+            # Add Windows-specific files
+            echo "RustFS for Windows" > "${PACKAGE_NAME}/README.txt"
           else
             cp target/${{ matrix.target }}/release/rustfs "${PACKAGE_NAME}/bin/"
             chmod +x "${PACKAGE_NAME}/bin/rustfs"
@@ -186,17 +231,33 @@ jobs:
           [ -f "LICENSE" ] && cp LICENSE "${PACKAGE_NAME}/docs/"
           [ -f "README.md" ] && cp README.md "${PACKAGE_NAME}/docs/"
 
-          # Create archive
-          tar -czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+          # Add platform-specific information
+          cat > "${PACKAGE_NAME}/docs/PLATFORM_INFO.txt" << EOF
+          Platform: ${{ matrix.platform }}
+          Target: ${{ matrix.target }}
+          Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Git Commit: ${GITHUB_SHA::8}
+          EOF
 
-          echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
-          echo "Package created: ${PACKAGE_NAME}.tar.gz"
+          # Create appropriate archive format for platform
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            # Use PowerShell to create zip on Windows
+            powershell -Command "Compress-Archive -Path '${PACKAGE_NAME}' -DestinationPath '${PACKAGE_NAME}.zip'"
+            echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+            echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
+            echo "Package created: ${PACKAGE_NAME}.zip"
+          else
+            tar -czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+            echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+            echo "package_file=${PACKAGE_NAME}.tar.gz" >> $GITHUB_OUTPUT
+            echo "Package created: ${PACKAGE_NAME}.tar.gz"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.package_name }}
-          path: ${{ steps.package.outputs.package_name }}.tar.gz
+          path: ${{ steps.package.outputs.package_file }}
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
   # Build GUI (only for releases)
@@ -216,6 +277,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: macos
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -235,10 +299,19 @@ jobs:
           path: ./artifacts
 
       - name: Prepare embedded binary
+        shell: bash
         run: |
           mkdir -p ./cli/rustfs-gui/embedded-rustfs/
-          tar -xzf ./artifacts/rustfs-${{ matrix.target }}.tar.gz -C ./artifacts/
-          cp ./artifacts/rustfs-${{ matrix.target }}/bin/rustfs ./cli/rustfs-gui/embedded-rustfs/
+
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            # Extract from zip file
+            unzip ./artifacts/rustfs-${{ matrix.target }}.zip -d ./artifacts/
+            cp ./artifacts/rustfs-${{ matrix.target }}/bin/rustfs.exe ./cli/rustfs-gui/embedded-rustfs/
+          else
+            # Extract from tar.gz file
+            tar -xzf ./artifacts/rustfs-${{ matrix.target }}.tar.gz -C ./artifacts/
+            cp ./artifacts/rustfs-${{ matrix.target }}/bin/rustfs ./cli/rustfs-gui/embedded-rustfs/
+          fi
 
       - name: Install Dioxus CLI
         uses: taiki-e/cache-cargo-install-action@v2
@@ -247,6 +320,7 @@ jobs:
 
       - name: Build GUI
         working-directory: ./cli/rustfs-gui
+        shell: bash
         run: |
           case "${{ matrix.platform }}" in
             "linux")
@@ -255,10 +329,14 @@ jobs:
             "macos")
               dx bundle --platform macos --package-types dmg --release
               ;;
+            "windows")
+              dx bundle --platform windows --package-types msi --release
+              ;;
           esac
 
       - name: Package GUI
         id: gui_package
+        shell: bash
         run: |
           GUI_PACKAGE="rustfs-gui-${{ matrix.target }}"
           mkdir -p "${GUI_PACKAGE}"
@@ -268,14 +346,22 @@ jobs:
             cp -r cli/rustfs-gui/dist/bundle/* "${GUI_PACKAGE}/"
           fi
 
-          tar -czf "${GUI_PACKAGE}.tar.gz" "${GUI_PACKAGE}"
-          echo "gui_package=${GUI_PACKAGE}" >> $GITHUB_OUTPUT
+          # Create appropriate archive format
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            powershell -Command "Compress-Archive -Path '${GUI_PACKAGE}' -DestinationPath '${GUI_PACKAGE}.zip'"
+            echo "gui_package=${GUI_PACKAGE}" >> $GITHUB_OUTPUT
+            echo "gui_file=${GUI_PACKAGE}.zip" >> $GITHUB_OUTPUT
+          else
+            tar -czf "${GUI_PACKAGE}.tar.gz" "${GUI_PACKAGE}"
+            echo "gui_package=${GUI_PACKAGE}" >> $GITHUB_OUTPUT
+            echo "gui_file=${GUI_PACKAGE}.tar.gz" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload GUI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.gui_package.outputs.gui_package }}
-          path: ${{ steps.gui_package.outputs.gui_package }}.tar.gz
+          path: ${{ steps.gui_package.outputs.gui_file }}
           retention-days: 30
 
   # Release management
@@ -289,13 +375,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: ./release-artifacts
 
-      - name: Prepare release
+      - name: Prepare release assets
         id: release_prep
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
@@ -306,44 +394,184 @@ jobs:
 
           # Organize artifacts
           mkdir -p ./release-files
+
+          # Copy all artifacts (both .tar.gz and .zip files)
           find ./release-artifacts -name "*.tar.gz" -exec cp {} ./release-files/ \;
+          find ./release-artifacts -name "*.zip" -exec cp {} ./release-files/ \;
 
-          # Create release notes
-          cat > release_notes.md << EOF
-          ## RustFS ${VERSION_CLEAN}
+          # Generate checksums for all files
+          cd ./release-files
+          if ls *.tar.gz >/dev/null 2>&1; then
+            sha256sum *.tar.gz >> SHA256SUMS
+            sha512sum *.tar.gz >> SHA512SUMS
+          fi
+          if ls *.zip >/dev/null 2>&1; then
+            sha256sum *.zip >> SHA256SUMS
+            sha512sum *.zip >> SHA512SUMS
+          fi
+          cd ..
 
-          ### 🚀 Downloads
-
-          **Linux:**
-          - \`rustfs-x86_64-unknown-linux-musl.tar.gz\` - Linux x86_64 (static)
-          - \`rustfs-aarch64-unknown-linux-musl.tar.gz\` - Linux ARM64 (static)
-
-          **macOS:**
-          - \`rustfs-aarch64-apple-darwin.tar.gz\` - macOS Apple Silicon
-
-          **GUI Applications:**
-          - \`rustfs-gui-*.tar.gz\` - GUI applications
-
-          ### 📦 Installation
-
-          1. Download the appropriate binary for your platform
-          2. Extract: \`tar -xzf rustfs-*.tar.gz\`
-          3. Install: \`sudo cp rustfs-*/bin/rustfs /usr/local/bin/\`
-
-          ### 🔗 Mirror Downloads
-
-          - [OSS Mirror](https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/)
-          EOF
+          # Display what we're releasing
+          echo "=== Release Files ==="
+          ls -la ./release-files/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release_prep.outputs.version }}
-          name: "RustFS ${{ steps.release_prep.outputs.version_clean }}"
-          body_path: release_notes.md
-          files: ./release-files/*.tar.gz
-          draft: false
-          prerelease: ${{ contains(steps.release_prep.outputs.version, 'alpha') || contains(steps.release_prep.outputs.version, 'beta') || contains(steps.release_prep.outputs.version, 'rc') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.release_prep.outputs.version }}"
+          VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
+
+          # Get release notes from tag message
+          RELEASE_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
+          if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
+            RELEASE_NOTES="Release ${VERSION_CLEAN}"
+          fi
+
+          # Determine if this is a prerelease
+          PRERELEASE_FLAG=""
+          if [[ "$VERSION" == *"alpha"* ]] || [[ "$VERSION" == *"beta"* ]] || [[ "$VERSION" == *"rc"* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          # Create the release
+          gh release create "$VERSION" \
+            --title "RustFS $VERSION_CLEAN" \
+            --notes "$RELEASE_NOTES" \
+            $PRERELEASE_FLAG
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.release_prep.outputs.version }}"
+
+          cd ./release-files
+
+          # Upload all binary archives
+          for file in *.tar.gz *.zip; do
+            if [[ -f "$file" ]]; then
+              echo "Uploading $file..."
+              gh release upload "$VERSION" "$file" --clobber
+            fi
+          done
+
+          # Upload checksum files
+          if [[ -f "SHA256SUMS" ]]; then
+            echo "Uploading SHA256SUMS..."
+            gh release upload "$VERSION" "SHA256SUMS" --clobber
+          fi
+
+          if [[ -f "SHA512SUMS" ]]; then
+            echo "Uploading SHA512SUMS..."
+            gh release upload "$VERSION" "SHA512SUMS" --clobber
+          fi
+
+      - name: Update release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.release_prep.outputs.version }}"
+          VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
+
+          # Get original release notes
+          ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
+          if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
+            ORIGINAL_NOTES="Release ${VERSION_CLEAN}"
+          fi
+
+          # Create comprehensive release notes
+          cat > enhanced_notes.md << EOF
+          ## RustFS ${VERSION_CLEAN}
+
+          ${ORIGINAL_NOTES}
+
+          ---
+
+          ### 🚀 Quick Download
+
+          **Linux (Recommended - Static Binaries):**
+          \`\`\`bash
+          # x86_64 (Intel/AMD)
+          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf rustfs-x86_64-unknown-linux-musl.tar.gz
+          sudo cp rustfs-x86_64-unknown-linux-musl/bin/rustfs /usr/local/bin/
+
+          # ARM64 (Graviton, Apple Silicon VMs)
+          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-aarch64-unknown-linux-musl.tar.gz
+          tar -xzf rustfs-aarch64-unknown-linux-musl.tar.gz
+          sudo cp rustfs-aarch64-unknown-linux-musl/bin/rustfs /usr/local/bin/
+          \`\`\`
+
+          **macOS:**
+          \`\`\`bash
+          # Apple Silicon (M1/M2/M3)
+          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-aarch64-apple-darwin.tar.gz
+          tar -xzf rustfs-aarch64-apple-darwin.tar.gz
+          sudo cp rustfs-aarch64-apple-darwin/bin/rustfs /usr/local/bin/
+
+          # Intel
+          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-apple-darwin.tar.gz
+          tar -xzf rustfs-x86_64-apple-darwin.tar.gz
+          sudo cp rustfs-x86_64-apple-darwin/bin/rustfs /usr/local/bin/
+          \`\`\`
+
+          **Windows:**
+          \`\`\`powershell
+          # Download and extract
+          Invoke-WebRequest https://github.com/rustfs/rustfs/releases/download/${VERSION}/rustfs-x86_64-pc-windows-msvc.zip -OutFile rustfs.zip
+          Expand-Archive rustfs.zip
+          \`\`\`
+
+          ### 📁 Available Downloads
+
+          | Platform | Architecture | File | Size |
+          |----------|-------------|------|------|
+          | Linux | x86_64 | \`rustfs-x86_64-unknown-linux-musl.tar.gz\` | Static binary |
+          | Linux | ARM64 | \`rustfs-aarch64-unknown-linux-musl.tar.gz\` | Static binary |
+          | macOS | Apple Silicon | \`rustfs-aarch64-apple-darwin.tar.gz\` | Native binary |
+          | macOS | Intel | \`rustfs-x86_64-apple-darwin.tar.gz\` | Native binary |
+          | Windows | x86_64 | \`rustfs-x86_64-pc-windows-msvc.zip\` | MSVC binary |
+          | Windows | ARM64 | \`rustfs-aarch64-pc-windows-msvc.zip\` | Experimental |
+
+          ### 🔐 Verification
+
+          Download checksums and verify your download:
+          \`\`\`bash
+          # Download checksums
+          curl -LO https://github.com/rustfs/rustfs/releases/download/${VERSION}/SHA256SUMS
+
+          # Verify (Linux/macOS)
+          sha256sum -c SHA256SUMS --ignore-missing
+
+          # Verify (Windows PowerShell)
+          \$expectedHash = (Get-Content SHA256SUMS | Select-String "rustfs-x86_64-pc-windows-msvc.zip").Line.Split()[0]
+          \$actualHash = (Get-FileHash rustfs-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+          if (\$expectedHash -eq \$actualHash) { "✅ Checksum verified" } else { "❌ Checksum mismatch" }
+          \`\`\`
+
+          ### 🛠️ System Requirements
+
+          - **Linux**: Any distribution with glibc 2.17+ (CentOS 7+, Ubuntu 16.04+)
+          - **macOS**: 10.15+ (Catalina or later)
+          - **Windows**: Windows 10 version 1809 or later
+
+          ### 📚 Documentation
+
+          - [Installation Guide](https://github.com/rustfs/rustfs#installation)
+          - [Quick Start](https://github.com/rustfs/rustfs#quick-start)
+          - [Configuration](https://github.com/rustfs/rustfs/blob/main/docs/)
+          - [API Documentation](https://docs.rs/rustfs)
+
+          ### 🆘 Support
+
+          - 🐛 [Report Issues](https://github.com/rustfs/rustfs/issues)
+          - 💬 [Community Discussions](https://github.com/rustfs/rustfs/discussions)
+          - 📖 [Documentation](https://github.com/rustfs/rustfs/tree/main/docs)
+          EOF
+
+          # Update the release with enhanced notes
+          gh release edit "$VERSION" --notes-file enhanced_notes.md
 
   # Upload to OSS (optional)
   upload-oss:
@@ -368,8 +596,9 @@ jobs:
           unzip ossutil.zip
           sudo mv ossutil-*/ossutil /usr/local/bin/
 
-          # Upload files
+          # Upload files (both .tar.gz and .zip)
           find ./artifacts -name "*.tar.gz" -exec ossutil cp {} oss://rustfs-artifacts/artifacts/rustfs/ --force \;
+          find ./artifacts -name "*.zip" -exec ossutil cp {} oss://rustfs-artifacts/artifacts/rustfs/ --force \;
 
           # Create latest.json
           VERSION="${GITHUB_REF#refs/tags/v}"
