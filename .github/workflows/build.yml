@@ -65,28 +65,9 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # First layer: GitHub Actions level optimization (handling duplicates and concurrency)
-  skip-duplicate:
-    name: Skip Duplicate Actions
-    runs-on: ubuntu-latest
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
-    steps:
-      - name: Skip duplicate actions
-        id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          concurrent_skipping: "same_content_newer"
-          cancel_others: true
-          paths_ignore: '["*.md", ".github/**", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
-          # Never skip release events and tag pushes
-          do_not_skip: '["release", "push"]'
-
   # Second layer: Business logic level checks (handling build strategy)
   build-check:
     name: Build Strategy Check
-    needs: skip-duplicate
-    if: needs.skip-duplicate.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -121,8 +102,8 @@ jobs:
   # Build RustFS binaries
   build-rustfs:
     name: Build RustFS
-    needs: [skip-duplicate, build-check]
-    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_build == 'true'
+    needs: [build-check]
+    if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -269,8 +250,8 @@ jobs:
   # Build GUI (only for releases)
   build-gui:
     name: Build GUI
-    needs: [skip-duplicate, build-check, build-rustfs]
-    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release'
+    needs: [build-check, build-rustfs]
+    if: needs.build-check.outputs.build_type == 'release'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -373,8 +354,8 @@ jobs:
   # Release management
   release:
     name: GitHub Release
-    needs: [skip-duplicate, build-check, build-rustfs, build-gui]
-    if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release'
+    needs: [build-check, build-rustfs, build-gui]
+    if: always() && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -597,8 +578,8 @@ jobs:
   # Upload to OSS (optional)
   upload-oss:
     name: Upload to OSS
-    needs: [skip-duplicate, build-check, build-rustfs]
-    if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release' && needs.build-rustfs.result == 'success'
+    needs: [build-check, build-rustfs]
+    if: always() && needs.build-check.outputs.build_type == 'release' && needs.build-rustfs.result == 'success'
     runs-on: ubuntu-latest
     env:
       OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
