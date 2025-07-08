@@ -62,9 +62,28 @@ env:
   REGISTRY_GHCR: ghcr.io/${{ github.repository }}
 
 jobs:
+  # First layer: GitHub Actions level optimization (handling duplicates and concurrency)
+  skip-duplicate:
+    name: Skip Duplicate Actions
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - name: Skip duplicate actions
+        id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: "same_content_newer"
+          cancel_others: true
+          paths_ignore: '["*.md", ".github/**", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
+          # Never skip release events and tag pushes
+          do_not_skip: '["release", "push"]'
+
   # Check if we should build
   build-check:
     name: Build Check
+    needs: skip-duplicate
+    if: needs.skip-duplicate.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -97,8 +116,8 @@ jobs:
   # Build multi-arch Docker images
   build-docker:
     name: Build Docker Images
-    needs: build-check
-    if: needs.build-check.outputs.should_build == 'true'
+    needs: [skip-duplicate, build-check]
+    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -174,8 +193,8 @@ jobs:
   # Create manifest for main production image
   create-manifest:
     name: Create Manifest
-    needs: [build-check, build-docker]
-    if: needs.build-check.outputs.should_push == 'true' && startsWith(github.ref, 'refs/tags/')
+    needs: [skip-duplicate, build-check, build-docker]
+    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_push == 'true' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Login to Docker Hub

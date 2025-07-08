@@ -79,6 +79,8 @@ jobs:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", ".github/**", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
+          # Never skip release events and tag pushes
+          do_not_skip: '["release", "push"]'
 
   # Second layer: Business logic level checks (handling build strategy)
   build-check:
@@ -105,9 +107,11 @@ jobs:
             build_type="development"
           fi
 
+          # Always build for tag pushes (version releases)
           if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
             should_build=true
             build_type="release"
+            echo "🏷️  Tag detected: forcing release build"
           fi
 
           echo "should_build=$should_build" >> $GITHUB_OUTPUT

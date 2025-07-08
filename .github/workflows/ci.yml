@@ -80,6 +80,8 @@ jobs:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", "docs/**", "deploy/**"]'
+          # Never skip release events and tag pushes
+          do_not_skip: '["release", "push"]'
 
   test-and-lint:
     name: Test and Lint
