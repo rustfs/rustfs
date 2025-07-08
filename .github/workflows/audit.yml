@@ -12,28 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Audit
+name: Security Audit
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
   schedule:
-    - cron: '0 0 * * 0' # at midnight of each sunday
+    - cron: '0 0 * * 0' # Weekly on Sunday at midnight UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  audit:
+  security-audit:
+    name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: taiki-e/install-action@cargo-audit
-      - run: cargo audit -D warnings
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run security audit
+        run: |
+          cargo audit -D warnings --json | tee audit-results.json
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-results-${{ github.run_number }}
+          path: audit-results.json
+          retention-days: 30
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: true

@@ -40,17 +40,17 @@ use crate::client::{
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
 
-struct ObjectAttributesOptions {
-    max_parts: i64,
-    version_id: String,
-    part_number_marker: i64,
+pub struct ObjectAttributesOptions {
+    pub max_parts: i64,
+    pub version_id: String,
+    pub part_number_marker: i64,
     //server_side_encryption: encrypt::ServerSide,
 }
 
-struct ObjectAttributes {
-    version_id: String,
-    last_modified: OffsetDateTime,
-    object_attributes_response: ObjectAttributesResponse,
+pub struct ObjectAttributes {
+    pub version_id: String,
+    pub last_modified: OffsetDateTime,
+    pub object_attributes_response: ObjectAttributesResponse,
 }
 
 impl ObjectAttributes {
@@ -83,11 +83,11 @@ impl Checksum {
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
-struct ObjectParts {
-    parts_count: i64,
-    part_number_marker: i64,
-    next_part_number_marker: i64,
-    max_parts: i64,
+pub struct ObjectParts {
+    pub parts_count: i64,
+    pub part_number_marker: i64,
+    pub next_part_number_marker: i64,
+    pub max_parts: i64,
     is_truncated: bool,
     parts: Vec<ObjectAttributePart>,
 }
@@ -106,12 +106,12 @@ impl ObjectParts {
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
-struct ObjectAttributesResponse {
-    etag: String,
-    storage_class: String,
-    object_size: i64,
-    checksum: Checksum,
-    object_parts: ObjectParts,
+pub struct ObjectAttributesResponse {
+    pub etag: String,
+    pub storage_class: String,
+    pub object_size: i64,
+    pub checksum: Checksum,
+    pub object_parts: ObjectParts,
 }
 
 impl ObjectAttributesResponse {

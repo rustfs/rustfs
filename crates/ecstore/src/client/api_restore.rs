@@ -36,55 +36,55 @@ const TIER_BULK: &str = "Bulk";
 const TIER_EXPEDITED: &str = "Expedited";
 
 #[derive(Debug, Default, serde::Serialize)]
-struct GlacierJobParameters {
-    tier: String,
+pub struct GlacierJobParameters {
+    pub tier: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct Encryption {
-    encryption_type: String,
-    kms_context: String,
-    kms_key_id: String,
+pub struct Encryption {
+    pub encryption_type: String,
+    pub kms_context: String,
+    pub kms_key_id: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct MetadataEntry {
-    name: String,
-    value: String,
+pub struct MetadataEntry {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-struct S3 {
-    access_control_list: AccessControlList,
-    bucket_name: String,
-    prefix: String,
-    canned_acl: String,
-    encryption: Encryption,
-    storage_class: String,
+pub struct S3 {
+    pub access_control_list: AccessControlList,
+    pub bucket_name: String,
+    pub prefix: String,
+    pub canned_acl: String,
+    pub encryption: Encryption,
+    pub storage_class: String,
     //tagging:            Tags,
-    user_metadata: MetadataEntry,
+    pub user_metadata: MetadataEntry,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-struct SelectParameters {
-    expression_type: String,
-    expression: String,
+pub struct SelectParameters {
+    pub expression_type: String,
+    pub expression: String,
     //input_serialization:  SelectObjectInputSerialization,
     //output_serialization: SelectObjectOutputSerialization,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-struct OutputLocation(S3);
+pub struct OutputLocation(pub S3);
 
 #[derive(Debug, Default, serde::Serialize)]
-struct RestoreRequest {
-    restore_type: String,
-    tier: String,
-    days: i64,
-    glacier_job_parameters: GlacierJobParameters,
-    description: String,
-    select_parameters: SelectParameters,
-    output_location: OutputLocation,
+pub struct RestoreRequest {
+    pub restore_type: String,
+    pub tier: String,
+    pub days: i64,
+    pub glacier_job_parameters: GlacierJobParameters,
+    pub description: String,
+    pub select_parameters: SelectParameters,
+    pub output_location: OutputLocation,
 }
 
 impl RestoreRequest {

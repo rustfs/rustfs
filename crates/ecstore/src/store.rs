@@ -1372,7 +1372,8 @@ impl StorageAPI for ECStore {
         }
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
-            if !is_err_bucket_exists(&err.into()) {
+            let err = err.into();
+            if !is_err_bucket_exists(&err) {
                 let _ = self
                     .delete_bucket(
                         bucket,
@@ -1384,6 +1385,8 @@ impl StorageAPI for ECStore {
                     )
                     .await;
             }
+
+            return Err(err);
         };
 
         let mut meta = BucketMetadata::new(bucket);

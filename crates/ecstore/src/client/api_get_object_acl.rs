@@ -33,16 +33,16 @@ use crate::client::{
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-struct Grantee {
-    id: String,
-    display_name: String,
-    uri: String,
+pub struct Grantee {
+    pub id: String,
+    pub display_name: String,
+    pub uri: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-struct Grant {
-    grantee: Grantee,
-    permission: String,
+pub struct Grant {
+    pub grantee: Grantee,
+    pub permission: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]

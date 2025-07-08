@@ -17,6 +17,8 @@ version: '3.8'
 services:
   # RustFS main service
   rustfs:
+    security_opt:
+      - "no-new-privileges:true"
     image: rustfs/rustfs:latest
     container_name: rustfs-server
     build:

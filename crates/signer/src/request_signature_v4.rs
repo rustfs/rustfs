@@ -290,6 +290,7 @@ fn _sign_v4_sts(
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_v4_inner(
     mut req: request::Request<Body>,
     content_len: i64,
@@ -339,10 +340,7 @@ fn sign_v4_inner(
 
     let headers = req.headers_mut();
 
-    let auth = format!(
-        "{} Credential={}, SignedHeaders={}, Signature={}",
-        SIGN_V4_ALGORITHM, credential, signed_headers, signature
-    );
+    let auth = format!("{SIGN_V4_ALGORITHM} Credential={credential}, SignedHeaders={signed_headers}, Signature={signature}");
     headers.insert("Authorization", auth.parse().unwrap());
 
     if !trailer.is_empty() {

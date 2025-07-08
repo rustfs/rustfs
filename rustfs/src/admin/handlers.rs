@@ -55,6 +55,7 @@ use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 // use serde_json::to_vec;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -970,7 +971,7 @@ impl Operation for ListRemoteTargetHandler {
 
             if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
                 let targets = sys.list_targets(Some(bucket), None).await;
-                error!("target sys len {}", targets.len());
+                info!("target sys len {}", targets.len());
                 if targets.is_empty() {
                     return Ok(S3Response::new((
                         StatusCode::NOT_FOUND,
@@ -1006,43 +1007,65 @@ pub struct RemoveRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        error!("remove remote target called");
+        debug!("remove remote target called");
         let querys = extract_query_params(&_req.uri);
+        let Some(bucket) = querys.get("bucket") else {
+            return Ok(S3Response::new((
+                StatusCode::BAD_REQUEST,
+                Body::from("Bucket parameter is required".to_string()),
+            )));
+        };
+
+        let mut need_delete = true;
 
         if let Some(arnstr) = querys.get("arn") {
-            if let Some(bucket) = querys.get("bucket") {
-                if bucket.is_empty() {
-                    error!("bucket parameter is empty");
-                    return Ok(S3Response::new((StatusCode::NOT_FOUND, Body::from("bucket not found".to_string()))));
-                }
-                let _arn = bucket_targets::ARN::parse(arnstr);
+            let _arn = bucket_targets::ARN::parse(arnstr);
 
-                match get_replication_config(bucket).await {
-                    Ok((conf, _ts)) => {
-                        for ru in conf.rules {
-                            let encoded = percent_encode(ru.destination.bucket.as_bytes(), &COLON);
-                            let encoded_str = encoded.to_string();
-                            if *arnstr == encoded_str {
-                                error!("target in use");
-                                return Ok(S3Response::new((StatusCode::FORBIDDEN, Body::from("Ok".to_string()))));
-                            }
-                            info!("bucket: {} and arn str is {} ", encoded_str, arnstr);
+            match get_replication_config(bucket).await {
+                Ok((conf, _ts)) => {
+                    for ru in conf.rules {
+                        let encoded = percent_encode(ru.destination.bucket.as_bytes(), &COLON);
+                        let encoded_str = encoded.to_string();
+                        if *arnstr == encoded_str {
+                            //error!("target in use");
+                            //return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
+                            need_delete = false;
+                            break;
                         }
-                    }
-                    Err(err) => {
-                        error!("get replication config err: {}", err);
-                        return Ok(S3Response::new((StatusCode::NOT_FOUND, Body::from(err.to_string()))));
+                        //info!("bucket: {} and arn str is {} ", encoded_str, arnstr);
                     }
                 }
-                //percent_decode_str(&arnstr);
+                Err(err) => {
+                    error!("get replication config err: {}", err);
+                    return Ok(S3Response::new((StatusCode::NOT_FOUND, Body::from(err.to_string()))));
+                }
+            }
+            if need_delete {
+                info!("arn {} is in use, cannot delete", arnstr);
                 let decoded_str = decode(arnstr).unwrap();
                 error!("need delete target is {}", decoded_str);
                 bucket_targets::remove_bucket_target(bucket, arnstr).await;
             }
         }
-        //return Err(s3_error!(InvalidArgument, "Invalid bucket name"));
-        //Ok(S3Response::with_headers((StatusCode::OK, Body::from()), header))
-        return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
+        // List bucket targets and return as JSON to client
+        // match bucket_targets::list_bucket_targets(bucket).await {
+        //     Ok(targets) => {
+        //         let json_targets = serde_json::to_string(&targets).map_err(|e| {
+        //             error!("Serialization error: {}", e);
+        //             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+        //         })?;
+        //         return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
+        //     }
+        //     Err(e) => {
+        //         error!("list bucket targets failed: {:?}", e);
+        //         return Err(S3Error::with_message(
+        //             S3ErrorCode::InternalError,
+        //             "list bucket targets failed".to_string(),
+        //         ));
+        //     }
+        // }
+
+        return Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))));
     }
 }
 

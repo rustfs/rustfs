@@ -178,6 +178,16 @@ pub async fn remove_bucket_target(bucket: &str, arn_str: &str) {
     }
 }
 
+pub async fn list_bucket_targets(bucket: &str) -> Result<BucketTargets, BucketRemoteTargetNotFound> {
+    if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
+        sys.list_bucket_targets(bucket).await
+    } else {
+        Err(BucketRemoteTargetNotFound {
+            bucket: bucket.to_string(),
+        })
+    }
+}
+
 impl Default for BucketTargetSys {
     fn default() -> Self {
         Self::new()
