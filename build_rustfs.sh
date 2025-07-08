@@ -23,6 +23,8 @@ if [ "$ARCH" == "x86_64" ]; then
     TARGET_DIR="target/x86_64"
 elif [ "$ARCH" == "aarch64" ]; then
     TARGET_DIR="target/arm64"
+elif [ "$ARCH" == "loongarch64" ]; then
+    TARGET_DIR="target/loongarch64"
 else
     TARGET_DIR="target/unknown"
 fi
