@@ -52,7 +52,7 @@ pub async fn del_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(Uuid::max().to_string())
         } else {
             vid
         }
@@ -91,7 +91,7 @@ pub async fn get_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(Uuid::max().to_string())
         } else {
             vid
         }
@@ -133,7 +133,7 @@ pub async fn put_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(Uuid::max().to_string())
         } else {
             vid
         }
