@@ -29,5 +29,5 @@ documentation = "https://docs.rs/rustfs-workers/latest/rustfs_workers/"
 workspace = true
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
