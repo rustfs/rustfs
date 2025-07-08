@@ -29,6 +29,9 @@ detect_platform() {
                 "armv7l")
                     echo "armv7-unknown-linux-musleabihf"
                     ;;
+                "loongarch64")
+                    echo "loongarch64-unknown-linux-musl"
+                    ;;
                 *)
                     echo "unknown-platform"
                     ;;
@@ -385,7 +388,7 @@ build_binary() {
         fi
     else
         # Native compilation
-        build_cmd="cargo build"
+        build_cmd="RUSTFLAGS=-Clink-arg=-lm cargo build"
     fi
 
     if [ "$BUILD_TYPE" = "release" ]; then
