@@ -17,19 +17,11 @@ name: Performance Testing
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/performance.yml'
   workflow_dispatch:
     inputs:
       profile_duration:
