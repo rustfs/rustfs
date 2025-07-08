@@ -16,7 +16,7 @@ name: Docker Images
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["*"]
     branches: [main]
     paths:
       - "rustfs/**"

@@ -16,7 +16,7 @@ name: Build and Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["*"]
     branches: [main]
     paths:
       - "rustfs/**"
