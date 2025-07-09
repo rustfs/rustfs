@@ -584,6 +584,8 @@ jobs:
     env:
       OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
       OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+      OSS_REGION: cn-beijing
+      OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
