@@ -30,7 +30,7 @@ use crate::global::GLOBAL_MRFState;
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::heal::data_usage_cache::DataUsageCache;
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
-use crate::store_api::ObjectToDelete;
+use crate::store_api::{ObjectInfoOrErr, ObjectToDelete, WalkOptions};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
@@ -76,16 +76,16 @@ use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, file_info_from_raw,
-    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
-    merge_file_meta_versions,
+    RawFileInfo, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_lock::{LockApi, namespace_lock::NsLockMap};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
+use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
+use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::{
     HashAlgorithm,
     crypto::{base64_decode, base64_encode, hex},
@@ -114,6 +114,7 @@ use tokio::{
     sync::mpsc::{self, Sender},
     time::interval,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -2106,9 +2107,9 @@ impl SetDisks {
         let opts_clone = *opts;
         let bucket_agreed = bucket.clone();
         let bucket_partial = bucket.to_string();
-        let (tx, rx) = broadcast::channel(1);
-        let tx_agreed = tx.clone();
-        let tx_partial = tx.clone();
+        let rx = CancellationToken::new();
+        let tx_agreed = rx.clone();
+        let tx_partial = rx.clone();
         let func_agreed = heal_entry.clone();
         let func_partial = heal_entry.clone();
         let lopts = ListPathRawOptions {
@@ -2139,7 +2140,7 @@ impl SetDisks {
                             .await
                             .is_err()
                         {
-                            let _ = tx_agreed.send(true);
+                            let _ = tx_agreed.cancel();
                         }
                     }
                 })
@@ -2164,7 +2165,7 @@ impl SetDisks {
                             .await
                             .is_err()
                         {
-                            let _ = tx_partial.send(true);
+                            tx_partial.cancel();
                         }
                     }
                 })
@@ -3644,7 +3645,7 @@ impl SetDisks {
                 bucket: bucket.clone(),
                 ..Default::default()
             };
-            let (_, rx) = broadcast::channel(1);
+            let rx = CancellationToken::new();
             let jt_agree = jt.clone();
             let jt_partial = jt.clone();
             let bucket_agree = bucket.clone();
@@ -4479,6 +4480,17 @@ impl StorageAPI for SetDisks {
         _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
         unimplemented!()
     }
 

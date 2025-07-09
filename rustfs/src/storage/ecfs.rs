@@ -28,6 +28,11 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use rustfs_ecstore::bucket::replication::ReplicationType;
+use rustfs_ecstore::bucket::replication::StatusType;
+use rustfs_ecstore::bucket::replication::get_must_replicate_options;
+use rustfs_ecstore::bucket::replication::must_replicate;
+use rustfs_ecstore::bucket::replication::schedule_replication;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
 use rustfs_s3select_api::query::Query;
@@ -52,11 +57,6 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
-use rustfs_ecstore::cmd::bucket_replication::get_must_replicate_options;
-use rustfs_ecstore::cmd::bucket_replication::must_replicate;
-use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
 use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
@@ -73,8 +73,6 @@ use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_notify::EventName;
 use rustfs_policy::auth;
 use rustfs_policy::policy::action::Action;
@@ -87,6 +85,8 @@ use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
 use rustfs_s3select_query::instance::make_rustfsms;
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
 use s3s::S3;
@@ -1265,9 +1265,9 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+            get_must_replicate_options(&mt2, "".to_string(), StatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
         // warn!("dsc {}", &dsc.replicate_any().clone());
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
@@ -1285,14 +1285,12 @@ impl S3 for FS {
         let event_info = obj_info.clone();
         let e_tag = obj_info.etag.clone();
 
-        let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+        let repoptions = get_must_replicate_options(&mt2, "".to_string(), StatusType::Empty, ReplicationType::Object, opts);
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
-            let objectlayer = new_object_layer_fn();
-            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
 
         let output = PutObjectOutput {
@@ -1532,6 +1530,7 @@ impl S3 for FS {
         };
 
         let obj_info = store
+            .clone()
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(ApiError::from)?;
@@ -1546,14 +1545,13 @@ impl S3 for FS {
 
         let mt2 = HashMap::new();
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, opts);
+            get_must_replicate_options(&mt2, "".to_string(), StatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            let objectlayer = new_object_layer_fn();
-            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
         Ok(S3Response::new(output))
     }

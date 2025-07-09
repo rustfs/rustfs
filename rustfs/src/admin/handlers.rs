@@ -24,13 +24,15 @@ use hyper::StatusCode;
 use matchit::Params;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use rustfs_ecstore::admin_server_info::get_server_info;
+use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
+use rustfs_ecstore::bucket::target::ARN;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::GLOBAL_ALlHealState;
 use rustfs_ecstore::global::get_global_action_cred;
+use std::str::FromStr;
 // use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::heal::heal_commands::HealOpts;
@@ -862,63 +864,54 @@ impl Operation for SetRemoteTargetHandler {
 
             info!("remote target {} And arn is:", remote_target.source_bucket.clone());
 
-            if let Some(val) = remote_target.arn.clone() {
-                info!("arn is {}", val);
-            }
+            info!("arn is {}", remote_target.arn);
 
-            if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-                let (arn, exist) = sys.get_remote_arn(bucket, Some(&remote_target), "").await;
-                info!("exist: {} {}", exist, arn.clone().unwrap_or_default());
-                if exist && arn.is_some() {
-                    let jsonarn = serde_json::to_string(&arn).expect("failed to serialize");
-                    //Ok(S3Response::new)
-                    return Ok(S3Response::new((StatusCode::OK, Body::from(jsonarn))));
-                } else {
-                    remote_target.arn = arn;
-                    match sys.set_target(bucket, &remote_target, false, false).await {
-                        Ok(_) => {
-                            {
-                                //todo 各种持久化的工作
-                                let targets = sys.list_targets(Some(bucket), None).await;
-                                info!("targets is {}", targets.len());
-                                match serde_json::to_vec(&targets) {
-                                    Ok(json) => {
-                                        //println!("json is:{:?}", json.clone().to_ascii_lowercase());
-                                        //metadata_sys::GLOBAL_BucketMetadataSys::
-                                        //BUCKET_TARGETS_FILE: &str = "bucket-targets.json"
-                                        let _ = metadata_sys::update(bucket, "bucket-targets.json", json).await;
-                                        // if let Err(err) = metadata_sys::GLOBAL_BucketMetadataSys.get().
-                                        //     .update(ctx, bucket, "bucketTargetsFile", tgt_bytes)
-                                        //     .await
-                                        // {
-                                        //     write_error_response(ctx, &err)?;
-                                        //     return Err(err);
-                                        // }
-                                    }
-                                    Err(e) => {
-                                        error!("序列化失败{}", e);
-                                    }
+            let sys = BucketTargetSys::get();
+            let (arn, exist) = sys.get_remote_arn(bucket, Some(&remote_target), "").await;
+
+            if exist {
+                let jsonarn = serde_json::to_string(&arn).expect("failed to serialize");
+                //Ok(S3Response::new)
+                return Ok(S3Response::new((StatusCode::OK, Body::from(jsonarn))));
+            } else {
+                remote_target.arn = arn;
+                match sys.set_target(bucket, &remote_target, false).await {
+                    Ok(_) => {
+                        {
+                            //todo 各种持久化的工作
+                            let targets = sys.list_targets(bucket, "").await;
+                            info!("targets is {}", targets.len());
+                            match serde_json::to_vec(&targets) {
+                                Ok(json) => {
+                                    //println!("json is:{:?}", json.clone().to_ascii_lowercase());
+                                    //metadata_sys::GLOBAL_BucketMetadataSys::
+                                    //BUCKET_TARGETS_FILE: &str = "bucket-targets.json"
+                                    let _ = metadata_sys::update(bucket, "bucket-targets.json", json).await;
+                                    // if let Err(err) = metadata_sys::GLOBAL_BucketMetadataSys.get().
+                                    //     .update(ctx, bucket, "bucketTargetsFile", tgt_bytes)
+                                    //     .await
+                                    // {
+                                    //     write_error_response(ctx, &err)?;
+                                    //     return Err(err);
+                                    // }
+                                }
+                                Err(e) => {
+                                    error!("序列化失败{}", e);
                                 }
                             }
+                        }
 
-                            let jsonarn = serde_json::to_string(&remote_target.arn.clone()).expect("failed to serialize");
-                            return Ok(S3Response::new((StatusCode::OK, Body::from(jsonarn))));
-                        }
-                        Err(e) => {
-                            error!("set target error {}", e);
-                            return Ok(S3Response::new((
-                                StatusCode::BAD_REQUEST,
-                                Body::from("remote target not ready".to_string()),
-                            )));
-                        }
+                        let jsonarn = serde_json::to_string(&remote_target.arn.clone()).expect("failed to serialize");
+                        return Ok(S3Response::new((StatusCode::OK, Body::from(jsonarn))));
+                    }
+                    Err(e) => {
+                        error!("set target error {}", e);
+                        return Ok(S3Response::new((
+                            StatusCode::BAD_REQUEST,
+                            Body::from("remote target not ready".to_string()),
+                        )));
                     }
                 }
-            } else {
-                error!("GLOBAL_BUCKET _TARGET_SYS is not initialized");
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "GLOBAL_BUCKET_TARGET_SYS is not initialized".to_string(),
-                ));
             }
         }
         // return Err(s3_error!(InvalidArgument));
@@ -970,29 +963,22 @@ impl Operation for ListRemoteTargetHandler {
                 }
             }
 
-            if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-                let targets = sys.list_targets(Some(bucket), None).await;
-                info!("target sys len {}", targets.len());
-                if targets.is_empty() {
-                    return Ok(S3Response::new((
-                        StatusCode::NOT_FOUND,
-                        Body::from("No remote targets found".to_string()),
-                    )));
-                }
-
-                let json_targets = serde_json::to_string(&targets).map_err(|e| {
-                    error!("Serialization error: {}", e);
-                    S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
-                })?;
-
-                return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
-            } else {
-                println!("GLOBAL_BUCKET_TARGET_SYS is not initialized");
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "GLOBAL_BUCKET_TARGET_SYS is not initialized".to_string(),
-                ));
+            let sys = BucketTargetSys::get();
+            let targets = sys.list_targets(bucket, "").await;
+            info!("target sys len {}", targets.len());
+            if targets.is_empty() {
+                return Ok(S3Response::new((
+                    StatusCode::NOT_FOUND,
+                    Body::from("No remote targets found".to_string()),
+                )));
             }
+
+            let json_targets = serde_json::to_string(&targets).map_err(|e| {
+                error!("Serialization error: {}", e);
+                S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+            })?;
+
+            return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
         }
 
         println!("Bucket parameter missing in request");
@@ -1020,7 +1006,7 @@ impl Operation for RemoveRemoteTargetHandler {
         let mut need_delete = true;
 
         if let Some(arnstr) = querys.get("arn") {
-            let _arn = bucket_targets::ARN::parse(arnstr);
+            let _arn = ARN::from_str(arnstr);
 
             match get_replication_config(bucket).await {
                 Ok((conf, _ts)) => {
@@ -1045,7 +1031,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 info!("arn {} is in use, cannot delete", arnstr);
                 let decoded_str = decode(arnstr).unwrap();
                 error!("need delete target is {}", decoded_str);
-                bucket_targets::remove_bucket_target(bucket, arnstr).await;
+                // bucket_targets::remove_bucket_target(bucket, arnstr).await; TODO:
             }
         }
         // List bucket targets and return as JSON to client

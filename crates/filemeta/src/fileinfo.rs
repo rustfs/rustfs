@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::headers::RESERVED_METADATA_PREFIX_LOWER;
-use crate::headers::RUSTFS_HEALING;
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;

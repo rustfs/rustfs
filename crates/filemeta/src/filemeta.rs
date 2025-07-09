@@ -15,12 +15,12 @@
 use crate::error::{Error, Result};
 use crate::fileinfo::{ErasureAlgo, ErasureInfo, FileInfo, FileInfoVersions, ObjectPartInfo, RawFileInfo};
 use crate::filemeta_inline::InlineData;
-use crate::headers::{
+use byteorder::ByteOrder;
+use bytes::Bytes;
+use rustfs_utils::http::headers::{
     self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX,
     RESERVED_METADATA_PREFIX_LOWER, VERSION_PURGE_STATUS_KEY,
 };
-use byteorder::ByteOrder;
-use bytes::Bytes;
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;

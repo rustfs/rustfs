@@ -61,6 +61,7 @@ sha2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 s3s = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
+convert_case = "0.8.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -87,4 +88,5 @@ hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:s
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features
-full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify"]  # all features
+http = []
+full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify","http"]  # all features

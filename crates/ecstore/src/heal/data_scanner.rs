@@ -27,6 +27,7 @@ use std::{
 };
 
 use time::{self, OffsetDateTime};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     data_scanner_metric::{ScannerMetric, ScannerMetrics, globalScannerMetrics},
@@ -38,7 +39,7 @@ use crate::bucket::{
     object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion},
     utils::is_meta_bucketname,
 };
-use crate::cmd::bucket_replication::queue_replication_heal;
+
 use crate::event::name::EventName;
 use crate::{
     bucket::{
@@ -55,7 +56,6 @@ use crate::{
 };
 use crate::{
     bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
-    cmd::bucket_replication::ReplicationStatusType,
     disk,
     heal::data_usage::DATA_USAGE_ROOT,
 };
@@ -98,7 +98,7 @@ use s3s::dto::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{
-        RwLock, broadcast,
+        RwLock,
         mpsc::{self, Sender},
     },
     time::sleep,
@@ -794,17 +794,18 @@ impl ScannerItem {
         );
 
         // Create a mutable clone if you need to modify fields
-        let mut oi = oi.clone();
+        let oi = oi.clone();
 
         let versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
         if versioned {
-            oi.replication_status = ReplicationStatusType::from(
-                oi.user_defined
-                    .get("x-amz-bucket-replication-status")
-                    .unwrap_or(&"PENDING".to_string()),
-            );
-            debug!("apply status is: {:?}", oi.replication_status);
-            self.heal_replication(&oi, _size_s).await;
+            // TODO:ReplicationStatusType
+            // oi.replication_status = ReplicationStatusType::from(
+            //     oi.user_defined
+            //         .get("x-amz-bucket-replication-status")
+            //         .unwrap_or(&"PENDING".to_string()),
+            // );
+            // debug!("apply status is: {:?}", oi.replication_status);
+            // self.heal_replication(&oi, _size_s).await;
         }
 
         done();
@@ -816,7 +817,7 @@ impl ScannerItem {
         (false, oi.size)
     }
 
-    pub async fn heal_replication(&mut self, oi: &ObjectInfo, size_s: &mut SizeSummary) {
+    pub async fn heal_replication(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) {
         if oi.version_id.is_none() {
             error!(
                 "heal_replication: no version_id or replication config {} {} {}",
@@ -857,49 +858,51 @@ impl ScannerItem {
             return;
         }
 
-        if oi.replication_status == ReplicationStatusType::Completed {
-            return;
-        }
+        // if oi.replication_status == ReplicationStatusType::Completed {
+        //     return;
+        // }
 
         info!("replication status is: {:?} and user define {:?}", oi.replication_status, oi.user_defined);
 
-        let roi = queue_replication_heal(&oi.bucket, oi, &replication, 3).await;
+        // TODO:queue_replication_heal
 
-        if roi.is_none() {
-            info!("not need heal {} {} {:?}", oi.bucket, oi.name, oi.version_id);
-            return;
-        }
+        // let roi = queue_replication_heal(&oi.bucket, oi, &replication, 3).await;
 
-        for (arn, tgt_status) in &roi.unwrap().target_statuses {
-            let tgt_size_s = size_s.repl_target_stats.entry(arn.clone()).or_default();
+        // if roi.is_none() {
+        //     info!("not need heal {} {} {:?}", oi.bucket, oi.name, oi.version_id);
+        //     return;
+        // }
 
-            match tgt_status {
-                ReplicationStatusType::Pending => {
-                    tgt_size_s.pending_count += 1;
-                    tgt_size_s.pending_size += oi.size as usize;
-                    size_s.pending_count += 1;
-                    size_s.pending_size += oi.size as usize;
-                }
-                ReplicationStatusType::Failed => {
-                    tgt_size_s.failed_count += 1;
-                    tgt_size_s.failed_size += oi.size as usize;
-                    size_s.failed_count += 1;
-                    size_s.failed_size += oi.size as usize;
-                }
-                ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
-                    tgt_size_s.replicated_count += 1;
-                    tgt_size_s.replicated_size += oi.size as usize;
-                    size_s.replicated_count += 1;
-                    size_s.replicated_size += oi.size as usize;
-                }
-                _ => {}
-            }
-        }
+        // for (arn, tgt_status) in &roi.unwrap().target_statuses {
+        //     let tgt_size_s = size_s.repl_target_stats.entry(arn.clone()).or_default();
 
-        if matches!(oi.replication_status, ReplicationStatusType::Replica) {
-            size_s.replica_count += 1;
-            size_s.replica_size += oi.size as usize;
-        }
+        //     match tgt_status {
+        //         ReplicationStatusType::Pending => {
+        //             tgt_size_s.pending_count += 1;
+        //             tgt_size_s.pending_size += oi.size as usize;
+        //             size_s.pending_count += 1;
+        //             size_s.pending_size += oi.size as usize;
+        //         }
+        //         ReplicationStatusType::Failed => {
+        //             tgt_size_s.failed_count += 1;
+        //             tgt_size_s.failed_size += oi.size as usize;
+        //             size_s.failed_count += 1;
+        //             size_s.failed_size += oi.size as usize;
+        //         }
+        //         ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
+        //             tgt_size_s.replicated_count += 1;
+        //             tgt_size_s.replicated_size += oi.size as usize;
+        //             size_s.replicated_count += 1;
+        //             size_s.replicated_size += oi.size as usize;
+        //         }
+        //         _ => {}
+        //     }
+        // }
+
+        // if matches!(oi.replication_status, ReplicationStatusType::Replica) {
+        //     size_s.replica_count += 1;
+        //     size_s.replica_size += oi.size as usize;
+        // }
     }
 }
 
@@ -1251,9 +1254,8 @@ impl FolderScanner {
                 resolver.bucket = bucket.clone();
                 let found_objs = Arc::new(RwLock::new(false));
                 let found_objs_clone = found_objs.clone();
-                let (tx, rx) = broadcast::channel(1);
-                // let tx_partial = tx.clone();
-                let tx_finished = tx.clone();
+                let cancel_rx = CancellationToken::new();
+                let tx_finished = cancel_rx.clone();
                 let update_current_path_agreed = self.update_current_path.clone();
                 let update_current_path_partial = self.update_current_path.clone();
                 let resolver_clone = resolver.clone();
@@ -1366,13 +1368,13 @@ impl FolderScanner {
                         Box::pin({
                             let tx_finished = tx_finished.clone();
                             async move {
-                                let _ = tx_finished.send(true);
+                                tx_finished.cancel();
                             }
                         })
                     })),
                     ..Default::default()
                 };
-                let _ = list_path_raw(rx, lopts).await;
+                let _ = list_path_raw(cancel_rx, lopts).await;
 
                 if *found_objs.read().await {
                     let this: CachedFolder = CachedFolder {

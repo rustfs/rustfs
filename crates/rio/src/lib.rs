@@ -79,5 +79,6 @@ pub trait HashReaderDetector {
 impl Reader for crate::HashReader {}
 impl Reader for crate::HardLimitReader {}
 impl Reader for crate::EtagReader {}
+impl<R> Reader for crate::LimitReader<R> where R: Reader {}
 impl<R> Reader for crate::CompressReader<R> where R: Reader {}
 impl<R> Reader for crate::EncryptReader<R> where R: Reader {}

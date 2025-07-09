@@ -33,7 +33,7 @@ use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_service
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
+use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_ConfigSys;
 use rustfs_ecstore::config::GLOBAL_ServerConfig;
@@ -52,6 +52,7 @@ use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_utils::net::parse_and_resolve_address;
 use std::io::{Error, Result};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -149,14 +150,21 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
+    let ctx = CancellationToken::new();
+
     // init store
-    let store = ECStore::new(server_addr, endpoint_pools.clone()).await.inspect_err(|err| {
-        error!("ECStore::new {:?}", err);
-    })?;
+    let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
+        .await
+        .inspect_err(|err| {
+            error!("ECStore::new {:?}", err);
+        })?;
 
     ecconfig::init();
     // config system configuration
     GLOBAL_ConfigSys.init(store.clone()).await?;
+
+    // init  replication_pool
+    init_background_replication(store.clone()).await;
 
     // Initialize event notifier
     init_event_notifier().await;
@@ -169,9 +177,13 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(Error::other)?;
 
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    init_bucket_metadata_sys(store.clone(), buckets).await;
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
+
+    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        pool.clone().init_resync(ctx.clone(), buckets).await?;
+    }
 
     init_iam_sys(store.clone()).await?;
 
@@ -188,7 +200,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let scanner = Scanner::new(Some(ScannerConfig::default()));
     scanner.start().await?;
     print_server_info();
-    init_bucket_replication_pool().await;
+    // init_bucket_replication_pool().await;
 
     // Async update check (optional)
     tokio::spawn(async {
@@ -228,11 +240,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -241,7 +253,13 @@ async fn run(opt: config::Opt) -> Result<()> {
 }
 
 /// Handles the shutdown process of the server
-async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
+async fn handle_shutdown(
+    state_manager: &ServiceStateManager,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    ctx: CancellationToken,
+) {
+    ctx.cancel();
+
     info!("Shutdown signal received in main thread");
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);

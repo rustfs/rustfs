@@ -1071,7 +1071,9 @@ mod tests {
         // create ECStore with dynamic port
         let port = port.unwrap_or(9000);
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
+        let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+            .await
+            .unwrap();
 
         // init bucket metadata system
         let buckets_list = ecstore

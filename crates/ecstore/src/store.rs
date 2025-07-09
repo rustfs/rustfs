@@ -38,7 +38,7 @@ use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
-use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
+use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
@@ -76,6 +76,7 @@ use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::{interval, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -115,7 +116,7 @@ pub struct ECStore {
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     #[tracing::instrument(level = "debug", skip(endpoint_pools))]
-    pub async fn new(address: SocketAddr, endpoint_pools: EndpointServerPools) -> Result<Arc<Self>> {
+    pub async fn new(address: SocketAddr, endpoint_pools: EndpointServerPools, ctx: CancellationToken) -> Result<Arc<Self>> {
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -254,7 +255,7 @@ impl ECStore {
         let wait_sec = 5;
         let mut exit_count = 0;
         loop {
-            if let Err(err) = ec.init().await {
+            if let Err(err) = ec.init(ctx.clone()).await {
                 error!("init err: {}", err);
                 error!("retry after  {} second", wait_sec);
                 sleep(Duration::from_secs(wait_sec)).await;
@@ -276,7 +277,7 @@ impl ECStore {
         Ok(ec)
     }
 
-    pub async fn init(self: &Arc<Self>) -> Result<()> {
+    pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
         if self.load_rebalance_meta().await.is_ok() {
@@ -320,18 +321,16 @@ impl ECStore {
         if !pool_indeces.is_empty() {
             let idx = pool_indeces[0];
             if endpoints.as_ref()[idx].endpoints.as_ref()[0].is_local {
-                let (_tx, rx) = broadcast::channel(1);
-
                 let store = self.clone();
 
                 tokio::spawn(async move {
                     // wait  3 minutes for cluster init
                     tokio::time::sleep(Duration::from_secs(60 * 3)).await;
 
-                    if let Err(err) = store.decommission(rx.resubscribe(), pool_indeces.clone()).await {
+                    if let Err(err) = store.decommission(rx.clone(), pool_indeces.clone()).await {
                         if err == StorageError::DecommissionAlreadyRunning {
                             for i in pool_indeces.iter() {
-                                store.do_decommission_in_routine(rx.resubscribe(), *i).await;
+                                store.do_decommission_in_routine(rx.clone(), *i).await;
                             }
                             return;
                         }
@@ -1498,6 +1497,17 @@ impl StorageAPI for ECStore {
     ) -> Result<ListObjectVersionsInfo> {
         self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 
     #[tracing::instrument(skip(self))]

@@ -48,7 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::broadcast::Receiver as B_Receiver;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 pub const POOL_META_NAME: &str = "pool.bin";
@@ -651,7 +651,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    pub async fn decommission(&self, rx: B_Receiver<bool>, indices: Vec<usize>) -> Result<()> {
+    pub async fn decommission(&self, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
         warn!("decommission: {:?}", indices);
         if indices.is_empty() {
             return Err(Error::other("InvalidArgument"));
@@ -663,13 +663,14 @@ impl ECStore {
 
         self.start_decommission(indices.clone()).await?;
 
+        let rx_clone = rx.clone();
         tokio::spawn(async move {
             let Some(store) = new_object_layer_fn() else {
                 error!("store not init");
                 return;
             };
             for idx in indices.iter() {
-                store.do_decommission_in_routine(rx.resubscribe(), *idx).await;
+                store.do_decommission_in_routine(rx_clone.clone(), *idx).await;
             }
         });
 
@@ -891,7 +892,7 @@ impl ECStore {
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_pool(
         self: &Arc<Self>,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         idx: usize,
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
@@ -936,20 +937,20 @@ impl ECStore {
             });
 
             let set = set.clone();
-            let mut rx = rx.resubscribe();
+            let rx_clone = rx.clone();
             let bi = bi.clone();
             let set_id = set_idx;
             let wk_clone = wk.clone();
             tokio::spawn(async move {
                 loop {
-                    if rx.try_recv().is_ok() {
+                    if rx_clone.is_cancelled() {
                         warn!("decommission_pool: cancel {}", set_id);
                         break;
                     }
                     warn!("decommission_pool: list_objects_to_decommission {} {}", set_id, &bi.name);
 
                     match set
-                        .list_objects_to_decommission(rx.resubscribe(), bi.clone(), decommission_entry.clone())
+                        .list_objects_to_decommission(rx_clone.clone(), bi.clone(), decommission_entry.clone())
                         .await
                     {
                         Ok(_) => {
@@ -982,7 +983,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: B_Receiver<bool>, idx: usize) {
+    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
         if let Err(err) = self.decommission_in_background(rx, idx).await {
             error!("decom err {:?}", &err);
             if let Err(er) = self.decommission_failed(idx).await {
@@ -1060,7 +1061,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    async fn decommission_in_background(self: &Arc<Self>, rx: B_Receiver<bool>, idx: usize) -> Result<()> {
+    async fn decommission_in_background(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
         let pool = self.pools[idx].clone();
 
         let pending = {
@@ -1090,10 +1091,7 @@ impl ECStore {
 
             warn!("decommission: currently on bucket {}", &bucket.name);
 
-            if let Err(err) = self
-                .decommission_pool(rx.resubscribe(), idx, pool.clone(), bucket.clone())
-                .await
-            {
+            if let Err(err) = self.decommission_pool(rx.clone(), idx, pool.clone(), bucket.clone()).await {
                 error!("decommission: decommission_pool err {:?}", &err);
                 return Err(err);
             } else {
@@ -1329,7 +1327,7 @@ impl SetDisks {
     #[tracing::instrument(skip(self, rx, cb_func))]
     async fn list_objects_to_decommission(
         self: &Arc<Self>,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         bucket_info: DecomBucketInfo,
         cb_func: ListCallback,
     ) -> Result<()> {

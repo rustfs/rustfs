@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::replication::{self, ReplicationState};
 use crate::bucket::versioning::VersioningApi as _;
-use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::error::{Error, Result};
 use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
@@ -25,11 +25,11 @@ use crate::{
 };
 use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
+use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,6 +39,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -306,7 +307,7 @@ pub struct ObjectOptions {
 
     pub replication_request: bool,
     pub delete_marker: bool,
-
+    pub delete_replication: Option<ReplicationState>,
     pub transition: TransitionOptions,
     pub expiration: ExpirationOptions,
     pub lifecycle_audit_event: LcAuditEvent,
@@ -389,6 +390,7 @@ pub struct ObjectInfo {
     pub is_latest: bool,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
+    pub expires: Option<OffsetDateTime>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
     pub put_object_reader: Option<PutObjReader>,
@@ -397,9 +399,10 @@ pub struct ObjectInfo {
     pub metadata_only: bool,
     pub version_only: bool,
     pub replication_status_internal: String,
-    pub replication_status: ReplicationStatusType,
+    pub replication_status: replication::StatusType,
     pub version_purge_status_internal: String,
-    pub version_purge_status: VersionPurgeStatusType,
+    pub version_purge_status: replication::VersionPurgeStatusType,
+    pub replication_decision: String,
     pub checksum: Vec<u8>,
 }
 
@@ -434,7 +437,9 @@ impl Clone for ObjectInfo {
             replication_status: self.replication_status.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
+            replication_decision: self.replication_decision.clone(),
             checksum: Default::default(),
+            expires: self.expires,
         }
     }
 }
@@ -858,7 +863,7 @@ pub struct DeletedObject {
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication
-    // pub replication_state: ReplicationState,
+    pub replication_state: ReplicationState,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -870,8 +875,33 @@ pub struct ListObjectVersionsInfo {
     pub prefixes: Vec<String>,
 }
 
+type WalkFilter = fn(&FileInfo) -> bool;
+
+#[derive(Clone, Default)]
+pub struct WalkOptions {
+    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
+    pub marker: Option<String>,               // set to skip until this object
+    pub latest_only: bool,                    // returns only latest versions for all matching objects
+    pub ask_disks: String,                    // dictates how many disks are being listed
+    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
+    pub limit: usize,                         // maximum number of items, 0 means no limit
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum WalkVersionsSortOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug)]
+pub struct ObjectInfoOrErr {
+    pub item: Option<ObjectInfo>,
+    pub err: Option<Error>,
+}
+
 #[async_trait::async_trait]
-pub trait ObjectIO: Send + Sync + 'static {
+pub trait ObjectIO: Send + Sync + Debug + 'static {
     // GetObjectNInfo FIXME:
     async fn get_object_reader(
         &self,
@@ -887,7 +917,7 @@ pub trait ObjectIO: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
-pub trait StorageAPI: ObjectIO {
+pub trait StorageAPI: ObjectIO + Debug {
     // NewNSLock TODO:
     // Shutdown TODO:
     // NSScanner TODO:
@@ -921,7 +951,15 @@ pub trait StorageAPI: ObjectIO {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo>;
-    // Walk TODO:
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()>;
 
     // GetObjectNInfo ObjectIO
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;

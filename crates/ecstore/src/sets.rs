@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
+use crate::store_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -46,6 +47,7 @@ use rustfs_lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::heal::heal_ops::HealSequence;
@@ -454,6 +456,17 @@ impl StorageAPI for Sets {
         _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
         unimplemented!()
     }
 

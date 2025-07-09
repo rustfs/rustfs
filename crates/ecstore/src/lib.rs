@@ -20,7 +20,6 @@ pub mod bitrot;
 pub mod bucket;
 pub mod cache_value;
 mod chunk_stream;
-pub mod cmd;
 pub mod compress;
 pub mod config;
 pub mod disk;
