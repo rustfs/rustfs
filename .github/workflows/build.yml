@@ -236,21 +236,36 @@ jobs:
           # Install ossutil (platform-specific)
           case "${{ matrix.platform }}" in
             linux)
-              curl -o ossutil-2.1.1-linux-amd64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
-              unzip ossutil-2.1.1-linux-amd64.zip
-              mv ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                curl -o ossutil-2.1.1-linux-arm64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-arm64.zip
+                unzip ossutil-2.1.1-linux-arm64.zip
+                mv ossutil-2.1.1-linux-arm64/ossutil /usr/local/bin/
+                rm ossutil-2.1.1-linux-arm64
+                rm ossutil-2.1.1-linux-arm64.zip
+              else
+                curl -o ossutil-2.1.1-linux-amd64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
+                unzip ossutil-2.1.1-linux-amd64.zip
+                mv ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/
+                rm ossutil-2.1.1-linux-amd64
+                rm ossutil-2.1.1-linux-amd64.zip
+              fi
               chmod +x /usr/local/bin/ossutil
-              rm ossutil-2.1.1-linux-amd64
-              rm ossutil-2.1.1-linux-amd64.zip
-              OSSUTIL_BIN=ossutil
               ;;
             macos)
-              curl -o ossutil-2.1.1-mac-arm64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-mac-arm64.zip
-              unzip ossutil-2.1.1-mac-arm64.zip
-              mv ossutil-2.1.1-mac-arm64/ossutil /usr/local/bin/
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                curl -o ossutil-2.1.1-mac-arm64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-mac-arm64.zip
+                unzip ossutil-2.1.1-mac-arm64.zip
+                mv ossutil-2.1.1-mac-arm64/ossutil /usr/local/bin/
+                rm ossutil-2.1.1-mac-arm64
+                rm ossutil-2.1.1-mac-arm64.zip
+              else
+                curl -o ossutil-2.1.1-mac-amd64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-mac-amd64.zip
+                unzip ossutil-2.1.1-mac-amd64.zip
+                mv ossutil-2.1.1-mac-amd64/ossutil /usr/local/bin/
+                rm ossutil-2.1.1-mac-amd64
+                rm ossutil-2.1.1-mac-amd64.zip
+              fi
               chmod +x /usr/local/bin/ossutil
-              rm ossutil-2.1.1-mac-arm64
-              rm ossutil-2.1.1-mac-arm64.zip
               OSSUTIL_BIN=ossutil
               ;;
             # windows)
