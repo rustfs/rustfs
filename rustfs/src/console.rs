@@ -212,10 +212,20 @@ fn _is_private_ip(ip: IpAddr) -> bool {
 #[allow(clippy::const_is_empty)]
 #[instrument(fields(host))]
 async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+    // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
+
+    // Get the X-Real-IP request header
+    let real_ip = headers
+        .get(HeaderName::from_static("x-real-ip"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+
+    // Print logs for debugging
+    info!("Scheme: {}, Real IP: {}", scheme, real_ip);
 
     // Get the host from the uri and use the value of the host extractor if it doesn't have one
     let host = uri.host().unwrap_or(host.as_str());
