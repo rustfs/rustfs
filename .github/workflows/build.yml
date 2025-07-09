@@ -203,7 +203,7 @@ jobs:
         run: |
           PACKAGE_NAME="rustfs-${{ matrix.target }}"
 
-                              # Create zip packages for all platforms
+          # Create zip packages for all platforms
           # Ensure zip is available
           if ! command -v zip &> /dev/null; then
             if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
@@ -234,14 +234,40 @@ jobs:
           OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
           # Install ossutil (platform-specific)
+          OSSUTIL_VERSION="2.1.1"
           case "${{ matrix.platform }}" in
-            linux|macos)
-              sudo -v ; curl https://gosspublic.alicdn.com/ossutil/install.sh | sudo bash
+            linux)
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                ARCH="arm64"
+              else
+                ARCH="amd64"
+              fi
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              chmod +x /usr/local/bin/ossutil
               OSSUTIL_BIN=ossutil
               ;;
-            # windows)
-            #   暂不支持 Windows ossutil
-            #   ;;
+            macos)
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                ARCH="arm64"
+              else
+                ARCH="amd64"
+              fi
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              chmod +x /usr/local/bin/ossutil
+              OSSUTIL_BIN=ossutil
+              ;;
           esac
 
           # Upload the package file directly to OSS
@@ -254,7 +280,6 @@ jobs:
             echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
             $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi
-
 
   # Release management
   release:
@@ -463,5 +488,3 @@ jobs:
           else
             echo "Release $VERSION already has custom notes, skipping update to preserve manual edits"
           fi
-
-
