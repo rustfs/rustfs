@@ -16,26 +16,38 @@ name: Docker Images
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["*"]
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "crates/**"
-      - "Dockerfile*"
-      - ".docker/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/docker.yml"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - ".github/**"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   pull_request:
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "crates/**"
-      - "Dockerfile*"
-      - ".docker/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/docker.yml"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - ".github/**"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   workflow_dispatch:
     inputs:
       push_images:
