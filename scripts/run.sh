@@ -100,6 +100,8 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
 
 export RUSTFS_COMPRESSION_ENABLED=true # 是否启用压缩
 
+#export RUSTFS_REGION="us-east-1"
+
 # 事件消息配置
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
 
