@@ -189,7 +189,17 @@ async fn run(opt: config::Opt) -> Result<()> {
     let listener = TcpListener::bind(server_address.clone()).await?;
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
-    let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
+    debug!("Listening on: {}", local_addr);
+    let local_ip = match rustfs_utils::get_local_ip() {
+        Some(ip) => {
+            debug!("Obtained local IP address: {}", ip);
+            ip
+        }
+        None => {
+            warn!("Unable to obtain local IP address, using");
+            local_addr.ip()
+        }
+    };
 
     // For RPC
     let (endpoint_pools, setup_type) =
