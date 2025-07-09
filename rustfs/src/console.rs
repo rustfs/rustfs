@@ -234,7 +234,8 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
-        if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() }
+        let port = socket_addr.port();
+        if ip.is_ipv6() { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") }
     } else {
         // Failed to parse, it might be a domain name or a bare IP, use it as is.
         host.to_string()
