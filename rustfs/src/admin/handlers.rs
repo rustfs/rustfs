@@ -862,9 +862,7 @@ impl Operation for SetRemoteTargetHandler {
 
             info!("remote target {} And arn is:", remote_target.source_bucket.clone());
 
-            if let Some(val) = remote_target.arn.clone() {
-                info!("arn is {}", val);
-            }
+            info!("arn is {}", remote_target.arn);
 
             if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
                 let (arn, exist) = sys.get_remote_arn(bucket, Some(&remote_target), "").await;

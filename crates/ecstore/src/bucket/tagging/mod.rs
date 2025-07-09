@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 use s3s::dto::Tag;
 use url::form_urlencoded;
 
@@ -29,6 +31,20 @@ pub fn decode_tags(tags: &str) -> Vec<Tag> {
             key: Some(k.to_string()),
             value: Some(v.to_string()),
         });
+    }
+
+    list
+}
+
+pub fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
+    let mut list = HashMap::new();
+
+    for (k, v) in form_urlencoded::parse(tags.as_bytes()) {
+        if k.is_empty() || v.is_empty() {
+            continue;
+        }
+
+        list.insert(k.to_string(), v.to_string());
     }
 
     list

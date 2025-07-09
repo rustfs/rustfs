@@ -33,7 +33,7 @@ use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_service
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
+// use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_ConfigSys;
 use rustfs_ecstore::config::GLOBAL_ServerConfig;
@@ -188,7 +188,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let scanner = Scanner::new(Some(ScannerConfig::default()));
     scanner.start().await?;
     print_server_info();
-    init_bucket_replication_pool().await;
+    // init_bucket_replication_pool().await;
 
     // Async update check (optional)
     tokio::spawn(async {

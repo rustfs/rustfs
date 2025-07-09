@@ -12,4 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod config;
 pub mod datatypes;
+mod replication_pool;
+mod replication_resyncer;
+mod replication_type;
+mod rule;
+
+pub use config::*;
+pub use datatypes::*;
+pub use replication_type::*;
+pub use rule::*;

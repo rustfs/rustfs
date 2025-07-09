@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::replication;
 use crate::bucket::versioning::VersioningApi as _;
-use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::error::{Error, Result};
 use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
@@ -25,11 +25,11 @@ use crate::{
 };
 use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
+use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -397,9 +397,9 @@ pub struct ObjectInfo {
     pub metadata_only: bool,
     pub version_only: bool,
     pub replication_status_internal: String,
-    pub replication_status: ReplicationStatusType,
+    pub replication_status: replication::StatusType,
     pub version_purge_status_internal: String,
-    pub version_purge_status: VersionPurgeStatusType,
+    pub version_purge_status: replication::VersionPurgeStatusType,
     pub checksum: Vec<u8>,
 }
 

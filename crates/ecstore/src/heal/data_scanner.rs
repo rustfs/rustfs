@@ -38,7 +38,7 @@ use crate::bucket::{
     object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion},
     utils::is_meta_bucketname,
 };
-use crate::cmd::bucket_replication::queue_replication_heal;
+
 use crate::event::name::EventName;
 use crate::{
     bucket::{
@@ -55,7 +55,6 @@ use crate::{
 };
 use crate::{
     bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
-    cmd::bucket_replication::ReplicationStatusType,
     disk,
     heal::data_usage::DATA_USAGE_ROOT,
 };
@@ -798,13 +797,14 @@ impl ScannerItem {
 
         let versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
         if versioned {
-            oi.replication_status = ReplicationStatusType::from(
-                oi.user_defined
-                    .get("x-amz-bucket-replication-status")
-                    .unwrap_or(&"PENDING".to_string()),
-            );
-            debug!("apply status is: {:?}", oi.replication_status);
-            self.heal_replication(&oi, _size_s).await;
+            // TODO:ReplicationStatusType
+            // oi.replication_status = ReplicationStatusType::from(
+            //     oi.user_defined
+            //         .get("x-amz-bucket-replication-status")
+            //         .unwrap_or(&"PENDING".to_string()),
+            // );
+            // debug!("apply status is: {:?}", oi.replication_status);
+            // self.heal_replication(&oi, _size_s).await;
         }
 
         done();
@@ -857,49 +857,51 @@ impl ScannerItem {
             return;
         }
 
-        if oi.replication_status == ReplicationStatusType::Completed {
-            return;
-        }
+        // if oi.replication_status == ReplicationStatusType::Completed {
+        //     return;
+        // }
 
         info!("replication status is: {:?} and user define {:?}", oi.replication_status, oi.user_defined);
 
-        let roi = queue_replication_heal(&oi.bucket, oi, &replication, 3).await;
+        // TODO:queue_replication_heal
 
-        if roi.is_none() {
-            info!("not need heal {} {} {:?}", oi.bucket, oi.name, oi.version_id);
-            return;
-        }
+        // let roi = queue_replication_heal(&oi.bucket, oi, &replication, 3).await;
 
-        for (arn, tgt_status) in &roi.unwrap().target_statuses {
-            let tgt_size_s = size_s.repl_target_stats.entry(arn.clone()).or_default();
+        // if roi.is_none() {
+        //     info!("not need heal {} {} {:?}", oi.bucket, oi.name, oi.version_id);
+        //     return;
+        // }
 
-            match tgt_status {
-                ReplicationStatusType::Pending => {
-                    tgt_size_s.pending_count += 1;
-                    tgt_size_s.pending_size += oi.size as usize;
-                    size_s.pending_count += 1;
-                    size_s.pending_size += oi.size as usize;
-                }
-                ReplicationStatusType::Failed => {
-                    tgt_size_s.failed_count += 1;
-                    tgt_size_s.failed_size += oi.size as usize;
-                    size_s.failed_count += 1;
-                    size_s.failed_size += oi.size as usize;
-                }
-                ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
-                    tgt_size_s.replicated_count += 1;
-                    tgt_size_s.replicated_size += oi.size as usize;
-                    size_s.replicated_count += 1;
-                    size_s.replicated_size += oi.size as usize;
-                }
-                _ => {}
-            }
-        }
+        // for (arn, tgt_status) in &roi.unwrap().target_statuses {
+        //     let tgt_size_s = size_s.repl_target_stats.entry(arn.clone()).or_default();
 
-        if matches!(oi.replication_status, ReplicationStatusType::Replica) {
-            size_s.replica_count += 1;
-            size_s.replica_size += oi.size as usize;
-        }
+        //     match tgt_status {
+        //         ReplicationStatusType::Pending => {
+        //             tgt_size_s.pending_count += 1;
+        //             tgt_size_s.pending_size += oi.size as usize;
+        //             size_s.pending_count += 1;
+        //             size_s.pending_size += oi.size as usize;
+        //         }
+        //         ReplicationStatusType::Failed => {
+        //             tgt_size_s.failed_count += 1;
+        //             tgt_size_s.failed_size += oi.size as usize;
+        //             size_s.failed_count += 1;
+        //             size_s.failed_size += oi.size as usize;
+        //         }
+        //         ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
+        //             tgt_size_s.replicated_count += 1;
+        //             tgt_size_s.replicated_size += oi.size as usize;
+        //             size_s.replicated_count += 1;
+        //             size_s.replicated_size += oi.size as usize;
+        //         }
+        //         _ => {}
+        //     }
+        // }
+
+        // if matches!(oi.replication_status, ReplicationStatusType::Replica) {
+        //     size_s.replica_count += 1;
+        //     size_s.replica_size += oi.size as usize;
+        // }
     }
 }
 
