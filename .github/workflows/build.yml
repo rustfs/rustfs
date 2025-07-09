@@ -249,11 +249,11 @@ jobs:
             ossutil cp latest.json oss://rustfs-version/latest.json --force
           fi
 
-  # Build GUI (only for releases)
+  # Build GUI
   build-gui:
     name: Build GUI
     needs: [build-check, build-rustfs]
-    if: needs.build-check.outputs.build_type == 'release'
+    if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -351,7 +351,7 @@ jobs:
         with:
           name: ${{ steps.gui_package.outputs.gui_package }}
           path: ${{ steps.gui_package.outputs.gui_file }}
-          retention-days: 30
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
   # Release management
   release:
