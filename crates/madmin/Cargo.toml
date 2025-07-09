@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Management and administration tools for RustFS, providing a web interface and API for system management."
+keywords = ["management", "administration", "web-interface", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "config"]
+documentation = "https://docs.rs/rustfs-madmin/latest/rustfs_madmin/"
 
 [lints]
 workspace = true

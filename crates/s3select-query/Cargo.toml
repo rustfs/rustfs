@@ -19,6 +19,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+description = "S3 Select query engine for RustFS, enabling efficient data retrieval from S3-compatible storage using SQL-like queries."
+keywords = ["s3-select", "query-engine", "rustfs", "Minio", "data-retrieval"]
+categories = ["web-programming", "development-tools", "data-structures"]
+documentation = "https://docs.rs/rustfs-s3select-query/latest/rustfs_s3select_query/"
 
 [dependencies]
 rustfs-s3select-api = { workspace = true }

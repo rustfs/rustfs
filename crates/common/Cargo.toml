@@ -19,6 +19,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+description = "Common utilities and data structures for RustFS, providing shared functionality across the project."
+keywords = ["common", "utilities", "data-structures", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "data-structures"]
 
 [lints]
 workspace = true

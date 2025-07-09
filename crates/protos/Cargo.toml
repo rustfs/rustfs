@@ -16,6 +16,14 @@
 name = "rustfs-protos"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Protocol definitions for RustFS, providing gRPC and FlatBuffers interfaces for communication between components."
+keywords = ["protocols", "gRPC", "FlatBuffers", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "data-structures", "asynchronous"]
+documentation = "https://docs.rs/rustfs-protos/latest/rustfs_protos/"
 
 [lints]
 workspace = true

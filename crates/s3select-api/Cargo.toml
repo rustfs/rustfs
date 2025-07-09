@@ -19,6 +19,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+description = "S3 Select API implementation for RustFS, enabling efficient data retrieval from S3-compatible object stores."
+keywords = ["s3-select", "api", "rustfs", "Minio", "object-store"]
+categories = ["web-programming", "development-tools", "asynchronous"]
+documentation = "https://docs.rs/rustfs-s3select-api/latest/rustfs_s3select_api/"
 
 [dependencies]
 async-trait.workspace = true

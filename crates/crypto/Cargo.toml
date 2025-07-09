@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Cryptography and security features for RustFS, providing encryption, hashing, and secure authentication mechanisms."
+keywords = ["cryptography", "encryption", "hashing", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "cryptography"]
+documentation = "https://docs.rs/rustfs-crypto/latest/rustfs_crypto/"
 
 [lints]
 workspace = true

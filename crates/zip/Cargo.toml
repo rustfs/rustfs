@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "ZIP file handling for RustFS, providing support for reading and writing ZIP archives."
+keywords = ["zip", "compression", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "compression"]
+documentation = "https://docs.rs/rustfs-zip/latest/rustfs_zip/"
 
 
 [dependencies]
