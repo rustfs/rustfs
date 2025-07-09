@@ -56,12 +56,12 @@ pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10)
 
 pub async fn init_auto_heal() {
     info!("Initializing auto heal background task");
-    
+
     let Some(cancel_token) = get_background_services_cancel_token() else {
         error!("Background services cancel token not initialized");
         return;
     };
-    
+
     init_background_healing().await;
     let v = env::var("_RUSTFS_AUTO_DRIVE_HEALING").unwrap_or("on".to_string());
     if v == "on" {
@@ -69,13 +69,13 @@ pub async fn init_auto_heal() {
         GLOBAL_BackgroundHealState
             .push_heal_local_disks(&get_local_disks_to_heal().await)
             .await;
-        
+
         let cancel_clone = cancel_token.clone();
         spawn(async move {
             monitor_local_disks_and_heal(cancel_clone).await;
         });
     }
-    
+
     let cancel_clone = cancel_token.clone();
     spawn(async move {
         GLOBAL_MRFState.heal_routine_with_cancel(cancel_clone).await;

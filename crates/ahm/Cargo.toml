@@ -1,41 +1,32 @@
 [package]
-name = "ahm"
+name = "rustfs-ahm"
 version = "0.1.0"
 edition = "2021"
 authors = ["RustFS Team"]
 license = "Apache-2.0"
-description = "Advanced Health & Metrics (AHM) system for RustFS"
+description = "RustFS AHM (Automatic Health Management) Scanner"
 
 [dependencies]
-# Workspace dependencies
-rustfs-common = { workspace = true, path = "../common" }
-rustfs-config = { workspace = true, path = "../config" }
-rustfs-ecstore = { workspace = true, path = "../ecstore" }
-rustfs-filemeta = { workspace = true, path = "../filemeta" }
-rustfs-iam = { workspace = true, path = "../iam" }
-rustfs-protos = { workspace = true, path = "../protos" }
-
-# External dependencies
-anyhow = "1.0"
-async-trait = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
-derive_builder = "0.12"
-figment = { workspace = true }
-futures = { workspace = true }
-lazy_static = { workspace = true }
-prometheus = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
+rustfs-ecstore = { workspace = true }
+rustfs-common = { workspace = true }
+rustfs-filemeta = { workspace = true }
+rustfs-madmin = { workspace = true }
+rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+time = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4", "serde"] }
-tempfile = "3.8"
-nix = { version = "0.27", features = ["mount"] }
-serde_json = "1.0"
+anyhow = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+url = "2.4"
+rustfs-lock = { workspace = true }
 
 [dev-dependencies]
-test-case = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing-subscriber = { workspace = true }
-tempfile = "3.8"
+rmp-serde = { workspace = true }
+tokio-test = "0.4"
+serde_json = "1.0"
