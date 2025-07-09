@@ -62,7 +62,9 @@ static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
 pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
 pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
 pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
-pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();}
+pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
+pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
+}
 
 static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 
@@ -182,3 +184,11 @@ pub async fn update_erasure_type(setup_type: SetupType) {
 // }
 
 type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
+
+pub fn set_global_region(region: String) {
+    GLOBAL_REGION.set(region).unwrap();
+}
+
+pub fn get_global_region() -> Option<String> {
+    GLOBAL_REGION.get().cloned()
+}

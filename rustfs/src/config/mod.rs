@@ -86,6 +86,9 @@ pub struct Opt {
 
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
+
+    #[arg(long, env = "RUSTFS_REGION")]
+    pub region: Option<String>,
 }
 
 // lazy_static::lazy_static! {
