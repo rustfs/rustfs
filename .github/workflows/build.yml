@@ -235,8 +235,22 @@ jobs:
         run: |
           # Install ossutil (platform-specific)
           case "${{ matrix.platform }}" in
-            linux|macos)
-              sudo -v ; curl https://gosspublic.alicdn.com/ossutil/install.sh | sudo bash
+            linux)
+              curl -o ossutil-2.1.1-linux-amd64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
+              unzip ossutil-2.1.1-linux-amd64.zip
+              mv ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/
+              chmod +x /usr/local/bin/ossutil
+              rm ossutil-2.1.1-linux-amd64
+              rm ossutil-2.1.1-linux-amd64.zip
+              OSSUTIL_BIN=ossutil
+              ;;
+            macos)
+              curl -o ossutil-2.1.1-mac-arm64.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-mac-arm64.zip
+              unzip ossutil-2.1.1-mac-arm64.zip
+              mv ossutil-2.1.1-mac-arm64/ossutil /usr/local/bin/
+              chmod +x /usr/local/bin/ossutil
+              rm ossutil-2.1.1-mac-arm64
+              rm ossutil-2.1.1-mac-arm64.zip
               OSSUTIL_BIN=ossutil
               ;;
             # windows)
@@ -254,7 +268,6 @@ jobs:
             echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
             $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi
-
 
   # Release management
   release:
@@ -463,5 +476,3 @@ jobs:
           else
             echo "Release $VERSION already has custom notes, skipping update to preserve manual edits"
           fi
-
-
