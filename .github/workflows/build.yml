@@ -255,114 +255,11 @@ jobs:
             $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi
 
-  # Build GUI
-  build-gui:
-    name: Build GUI
-    needs: [build-check, build-rustfs]
-    if: needs.build-check.outputs.should_build == 'true'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      #matrix:
-        #include:
-          #- os: ubuntu-latest
-          #  target: x86_64-unknown-linux-musl
-          #  platform: linux
-          #- os: macos-latest
-          #  target: aarch64-apple-darwin
-          #  platform: macos
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   platform: windows
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          target: ${{ matrix.target }}
-          cache-shared-key: gui-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download RustFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: rustfs-${{ matrix.target }}
-          path: ./artifacts
-
-      - name: Prepare embedded binary
-        shell: bash
-        run: |
-          mkdir -p ./cli/rustfs-gui/embedded-rustfs/
-
-          # Extract binary from ZIP file (universal for all platforms)
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            # Windows (if enabled)
-            powershell -Command "Expand-Archive -Path './artifacts/rustfs-${{ matrix.target }}.zip' -DestinationPath './cli/rustfs-gui/embedded-rustfs/'"
-          else
-            # Linux and macOS
-            unzip -j ./artifacts/rustfs-${{ matrix.target }}.zip -d ./cli/rustfs-gui/embedded-rustfs/
-          fi
-
-          chmod +x ./cli/rustfs-gui/embedded-rustfs/rustfs
-
-      - name: Install Dioxus CLI
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: dioxus-cli
-
-      - name: Build GUI
-        working-directory: ./cli/rustfs-gui
-        shell: bash
-        run: |
-          case "${{ matrix.platform }}" in
-            "linux")
-              dx bundle --platform linux --package-types deb --package-types appimage --release
-              ;;
-            "macos")
-              dx bundle --platform macos --package-types dmg --release
-              ;;
-            "windows")
-              dx bundle --platform windows --package-types msi --release
-              ;;
-          esac
-
-      - name: Package GUI
-        id: gui_package
-        shell: bash
-        run: |
-          GUI_PACKAGE="rustfs-gui-${{ matrix.target }}"
-          mkdir -p "${GUI_PACKAGE}"
-
-          # Copy GUI bundles
-          if [[ -d "cli/rustfs-gui/dist/bundle" ]]; then
-            cp -r cli/rustfs-gui/dist/bundle/* "${GUI_PACKAGE}/"
-          fi
-
-          # Create zip archive for all platforms
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            powershell -Command "Compress-Archive -Path '${GUI_PACKAGE}' -DestinationPath '${GUI_PACKAGE}.zip'"
-          else
-            zip -r "${GUI_PACKAGE}.zip" "${GUI_PACKAGE}"
-          fi
-
-          echo "gui_package=${GUI_PACKAGE}" >> $GITHUB_OUTPUT
-          echo "gui_file=${GUI_PACKAGE}.zip" >> $GITHUB_OUTPUT
-
-      - name: Upload GUI artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.gui_package.outputs.gui_package }}
-          path: ${{ steps.gui_package.outputs.gui_file }}
-          retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
   # Release management
   release:
     name: GitHub Release
-    needs: [build-check, build-rustfs, build-gui]
+    needs: [build-check, build-rustfs]
     if: always() && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     permissions:
