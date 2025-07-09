@@ -351,7 +351,7 @@ jobs:
         with:
           name: ${{ steps.gui_package.outputs.gui_package }}
           path: ${{ steps.gui_package.outputs.gui_file }}
-          retention-days: 30
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
   # Release management
   release:
