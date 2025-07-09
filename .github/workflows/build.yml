@@ -130,15 +130,15 @@ jobs:
             target: x86_64-apple-darwin
             cross: false
             platform: macos
-          # Windows builds
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-            platform: windows
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            cross: true
-            platform: windows
+          # # Windows builds
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   cross: false
+          #   platform: windows
+          # - os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   cross: true
+          #   platform: windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -584,6 +584,8 @@ jobs:
     env:
       OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
       OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+      OSS_REGION: cn-beijing
+      OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
