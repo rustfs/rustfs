@@ -196,7 +196,7 @@ async fn run(opt: config::Opt) -> Result<()> {
             ip
         }
         None => {
-            warn!("Unable to obtain local IP address, using");
+            warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
             local_addr.ip()
         }
     };

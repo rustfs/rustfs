@@ -27,7 +27,7 @@ use std::io;
 
 use axum::response::Redirect;
 use axum_server::tls_rustls::RustlsConfig;
-use http::{HeaderMap, Uri, header};
+use http::{HeaderMap, HeaderName, Uri, header};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
@@ -213,7 +213,7 @@ fn _is_private_ip(ip: IpAddr) -> bool {
 #[instrument(fields(host))]
 async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
     let scheme = headers
-        .get("X-Forwarded-Proto")
+        .get(HeaderName::from_static("x-forwarded-proto"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
@@ -224,7 +224,7 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
-        if ip.is_ipv6() { format!("[{}]", ip) } else { ip.to_string() }
+        if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() }
     } else {
         // Failed to parse, it might be a domain name or a bare IP, use it as is.
         host.to_string()
