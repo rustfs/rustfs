@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Identity and Access Management (IAM) for RustFS, providing user management, roles, and permissions."
+keywords = ["iam", "identity", "access-management", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "authentication"]
+documentation = "https://docs.rs/rustfs-iam/latest/rustfs_iam/"
 
 [lints]
 workspace = true

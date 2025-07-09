@@ -703,6 +703,12 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        if let Some(region) = rustfs_ecstore::global::get_global_region() {
+            return Ok(S3Response::new(GetBucketLocationOutput {
+                location_constraint: Some(BucketLocationConstraint::from(region)),
+            }));
+        }
+
         let output = GetBucketLocationOutput::default();
         Ok(S3Response::new(output))
     }

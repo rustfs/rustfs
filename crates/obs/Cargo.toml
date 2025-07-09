@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Observability and monitoring tools for RustFS, providing metrics, logging, and tracing capabilities."
+keywords = ["observability", "metrics", "logging", "tracing", "RustFS"]
+categories = ["web-programming", "development-tools::profiling", "asynchronous", "api-bindings", "development-tools::debugging"]
+documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 
 [lints]
 workspace = true

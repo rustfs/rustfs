@@ -19,6 +19,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Application authentication and authorization for RustFS, providing secure access control and user management."
+keywords = ["authentication", "authorization", "security", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "authentication"]
 
 [dependencies]
 base64-simd = { workspace = true }

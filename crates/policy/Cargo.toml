@@ -19,6 +19,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+homepage.workspace = true
+description = "Policy management for RustFS, providing a framework for defining and enforcing policies across the system."
+keywords = ["policy", "management", "enforcement", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "accessibility"]
+documentation = "https://docs.rs/rustfs-policy/latest/rustfs_policy/"
 
 [lints]
 workspace = true

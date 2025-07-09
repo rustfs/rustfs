@@ -4099,6 +4099,8 @@ impl ObjectIO for SetDisks {
             }
         }
 
+        drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
+
         let (online_disks, _, op_old_dir) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_TMP_BUCKET,
@@ -5038,6 +5040,8 @@ impl StorageAPI for SetDisks {
         fi.parts = vec![part_info];
 
         let fi_buff = fi.marshal_msg()?;
+
+        drop(writers); // drop writers to close all files
 
         let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
         let _ = Self::rename_part(
