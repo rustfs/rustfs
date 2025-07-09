@@ -13,21 +13,21 @@
 // limitations under the License.
 
 use crate::OtelConfig;
-use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode, style};
+use flexi_logger::{style, Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode};
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::{KeyValue, global};
+use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::{
-    Resource,
     metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
+    Resource,
 };
 use opentelemetry_semantic_conventions::{
-    SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
+    SCHEMA_URL,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
@@ -42,7 +42,7 @@ use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::LocalTime;
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// A guard object that manages the lifecycle of OpenTelemetry components.
 ///
@@ -419,7 +419,7 @@ fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: 
 
     writeln!(
         w,
-        "{} {} [{}] [{}:{}] [{}:{}] {}",
+        "[{}] {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
         level_style.paint(level.to_string()),
         Color::Magenta.paint(record.target()),
@@ -443,7 +443,7 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
 
     writeln!(
         w,
-        "{} {} [{}] [{}:{}] [{}:{}] {}",
+        "[{}] {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
         level,
         record.target(),
