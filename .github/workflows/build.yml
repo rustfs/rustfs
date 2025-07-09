@@ -203,7 +203,7 @@ jobs:
         run: |
           PACKAGE_NAME="rustfs-${{ matrix.target }}"
 
-                              # Create zip packages for all platforms
+          # Create zip packages for all platforms
           # Ensure zip is available
           if ! command -v zip &> /dev/null; then
             if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
@@ -250,6 +250,7 @@ jobs:
               mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
               rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
               chmod +x /usr/local/bin/ossutil
+              OSSUTIL_BIN=ossutil
               ;;
             macos)
               if [[ "$(uname -m)" == "arm64" ]]; then
@@ -267,9 +268,6 @@ jobs:
               chmod +x /usr/local/bin/ossutil
               OSSUTIL_BIN=ossutil
               ;;
-            # windows)
-            #   暂不支持 Windows ossutil
-            #   ;;
           esac
 
           # Upload the package file directly to OSS
