@@ -236,8 +236,8 @@ jobs:
           # Install ossutil
           curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
           unzip -o ossutil.zip
-          chmod 755 ossutil-2.1.1-linux-amd64/ossutil
           sudo mv ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/
+          chmod +x /usr/local/bin/ossutil
           rm -rf ossutil.zip ossutil-2.1.1-linux-amd64
 
           # Upload the package file directly to OSS
