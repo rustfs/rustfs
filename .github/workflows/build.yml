@@ -233,22 +233,26 @@ jobs:
           OSS_REGION: cn-beijing
           OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
-          # Install ossutil
-          curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
-          unzip -o ossutil.zip
-          sudo mv ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/
-          chmod +x /usr/local/bin/ossutil
-          rm -rf ossutil.zip ossutil-2.1.1-linux-amd64
+          # Install ossutil (platform-specific)
+          case "${{ matrix.platform }}" in
+            linux|macos)
+              sudo -v ; curl https://gosspublic.alicdn.com/ossutil/install.sh | sudo bash
+              OSSUTIL_BIN=ossutil
+              ;;
+            # windows)
+            #   暂不支持 Windows ossutil
+            #   ;;
+          esac
 
           # Upload the package file directly to OSS
           echo "Uploading ${{ steps.package.outputs.package_file }} to OSS..."
-          ossutil cp "${{ steps.package.outputs.package_file }}" oss://rustfs-artifacts/artifacts/rustfs/ --force
+          $OSSUTIL_BIN cp "${{ steps.package.outputs.package_file }}" oss://rustfs-artifacts/artifacts/rustfs/ --force
 
           # Create latest.json (only for the first Linux build to avoid duplication)
           if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
-            ossutil cp latest.json oss://rustfs-version/latest.json --force
+            $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi
 
   # Build GUI
