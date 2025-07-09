@@ -218,14 +218,8 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
-    // Get the X-Real-IP request header
-    let real_ip = headers
-        .get(HeaderName::from_static("x-real-ip"))
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown");
-
     // Print logs for debugging
-    info!("Scheme: {}, Real IP: {}", scheme, real_ip);
+    info!("Scheme: {}, ", scheme);
 
     // Get the host from the uri and use the value of the host extractor if it doesn't have one
     let host = uri.host().unwrap_or(host.as_str());
@@ -234,15 +228,23 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
-        let port = socket_addr.port();
-        if ip.is_ipv6() { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") }
+        if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
     } else {
         // Failed to parse, it might be a domain name or a bare IP, use it as is.
         host.to_string()
     };
 
     // Make a copy of the current configuration
-    let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
+    let mut cfg = match CONSOLE_CONFIG.get() {
+        Some(cfg) => cfg.clone(),
+        None => {
+            error!("Console configuration not initialized");
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Console configuration not initialized"))
+                .unwrap();
+        }
+    };
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
     cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
