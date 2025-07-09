@@ -245,8 +245,11 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
                 .unwrap();
         }
     };
+
+    // port handling
     let port = uri.port().map(|p| p.as_u16()).unwrap_or(cfg.port);
-    // 避免重复添加标准端口
+
+    // avoid adding default ports (80/443)
     let url = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
         format!("{scheme}://{host}")
     } else {
