@@ -2014,6 +2014,8 @@ impl ReplicateObjectInfo {
             version_id: Uuid::try_parse(&self.version_id).ok(),
             delete_marker: self.delete_marker,
             transitioned_object: TransitionedObject::default(),
+            restore_ongoing: false,
+            restore_expires: Some(OffsetDateTime::now_utc()),
             user_tags: self.user_tags.clone(),
             parts: Vec::new(),
             is_latest: true,

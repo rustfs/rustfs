@@ -174,7 +174,7 @@ pub trait Lifecycle {
     async fn has_transition(&self) -> bool;
     fn has_expiry(&self) -> bool;
     async fn has_active_rules(&self, prefix: &str) -> bool;
-    async fn validate(&self, lr_retention: bool) -> Result<(), std::io::Error>;
+    async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error>;
     async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<LifecycleRule>>;
     async fn eval(&self, obj: &ObjectOpts) -> Event;
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event;
@@ -255,7 +255,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         false
     }
 
-    async fn validate(&self, lr_retention: bool) -> Result<(), std::io::Error> {
+    async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error> {
         if self.rules.len() > 1000 {
             return Err(std::io::Error::other(ERR_LIFECYCLE_TOO_MANY_RULES));
         }
@@ -265,13 +265,15 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         for r in &self.rules {
             r.validate()?;
-            if let Some(expiration) = r.expiration.as_ref() {
-                if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
-                    if lr_retention && (expired_object_delete_marker) {
-                        return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
+            /*if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref() {
+                if let Some(expiration) = r.expiration.as_ref() {
+                    if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                        if object_lock_enabled.as_str() == ObjectLockEnabled::ENABLED && (expired_object_delete_marker) {
+                            return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
+                        }
                     }
-                }
-            }
+    				    }
+            }*/
         }
         for (i, _) in self.rules.iter().enumerate() {
             if i == self.rules.len() - 1 {
@@ -642,7 +644,7 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
     }
     let t = mod_time
         .to_offset(offset!(-0:00:00))
-        .saturating_add(Duration::days(days as i64)); //debug
+        .saturating_add(Duration::days(days as i64));
     let mut hour = 3600;
     if let Ok(env_ilm_hour) = env::var("_RUSTFS_ILM_HOUR") {
         if let Ok(num_hour) = env_ilm_hour.parse::<usize>() {

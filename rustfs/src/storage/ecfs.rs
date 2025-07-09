@@ -488,6 +488,169 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    async fn restore_object(&self, _req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        Err(s3_error!(NotImplemented, "RestoreObject is not implemented yet"))
+        /*
+        let bucket = params.bucket;
+        if let Err(e) = un_escape_path(params.object) {
+            warn!("post restore object failed, e: {:?}", e);
+            return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
+        }
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let get_object_info = store.get_object_info();
+
+        if Err(err) = check_request_auth_type(req, policy::RestoreObjectAction, bucket, object) {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
+        }
+
+        if req.content_length <= 0 {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        }
+        let Some(opts) = post_restore_opts(req, bucket, object) else {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        };
+
+        let Some(obj_info) = get_object_info(bucket, object, opts) else {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        };
+
+        if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        }
+
+        let mut api_err;
+        let Some(rreq) = parse_restore_request(req.body(), req.content_length) else {
+            let api_err = errorCodes.ToAPIErr(ErrMalformedXML);
+            api_err.description = err.Error()
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        };
+        let mut status_code = http::StatusCode::OK;
+        let mut already_restored = false;
+        if Err(err) = rreq.validate(store) {
+            api_err = errorCodes.ToAPIErr(ErrMalformedXML)
+            api_err.description = err.Error()
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        } else {
+            if obj_info.restore_ongoing && rreq.Type != "SELECT" {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()), "post restore object failed"));
+            }
+            if !obj_info.restore_ongoing && !obj_info.restore_expires.unix_timestamp() == 0 {
+                status_code = http::StatusCode::Accepted;
+                already_restored = true;
+            }
+        }
+        let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days);
+        let mut metadata = clone_mss(obj_info.user_defined);
+
+        if rreq.type != "SELECT" {
+            obj_info.metadataOnly = true;
+            metadata[xhttp.AmzRestoreExpiryDays] = rreq.days;
+            metadata[xhttp.AmzRestoreRequestDate] = OffsetDateTime::now_utc().format(http::TimeFormat);
+            if already_restored {
+                metadata[AmzRestore] = completed_restore_obj(restore_expiry).String()
+            } else {
+                metadata[AmzRestore] = ongoing_restore_obj().to_string()
+            }
+            obj_info.user_defined = metadata;
+            if let Err(err) = store.copy_object(bucket, object, bucket, object, obj_info, ObjectOptions {
+                version_id: obj_info.version_id,
+            }, ObjectOptions {
+                version_id: obj_info.version_id,
+                m_time:     obj_info.mod_time,
+            }) {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
+            }
+            if already_restored {
+                return Ok(());
+            }
+        }
+
+        let restore_object = must_get_uuid();
+        if rreq.output_location.s3.bucket_name != "" {
+            w.Header()[AmzRestoreOutputPath] = []string{pathJoin(rreq.OutputLocation.S3.BucketName, rreq.OutputLocation.S3.Prefix, restoreObject)}
+        }
+        w.WriteHeader(status_code)
+        send_event(EventArgs {
+            event_name:  event::ObjectRestorePost,
+            bucket_name: bucket,
+            object:      obj_info,
+            req_params:  extract_req_params(r),
+            user_agent:  req.user_agent(),
+            host:        handlers::get_source_ip(r),
+        });
+        tokio::spawn(async move {
+            if !rreq.SelectParameters.IsEmpty() {
+                let actual_size = obj_info.get_actual_size();
+                if actual_size.is_err() {
+                    return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
+                }
+
+                let object_rsc = s3select.NewObjectReadSeekCloser(
+                    |offset int64| -> (io.ReadCloser, error) {
+                        rs := &HTTPRangeSpec{
+                          IsSuffixLength: false,
+                          Start:          offset,
+                          End:            -1,
+                        }
+                        return getTransitionedObjectReader(bucket, object, rs, r.Header,
+                          obj_info, ObjectOptions {version_id: obj_info.version_id});
+                    },
+                    actual_size.unwrap(),
+                );
+                if err = rreq.SelectParameters.Open(objectRSC); err != nil {
+                    if serr, ok := err.(s3select.SelectError); ok {
+                        let encoded_error_response = encodeResponse(APIErrorResponse {
+                            code:       serr.ErrorCode(),
+                            message:    serr.ErrorMessage(),
+                            bucket_name: bucket,
+                            key:        object,
+                            resource:   r.URL.Path,
+                            request_id:  w.Header().Get(xhttp.AmzRequestID),
+                            host_id:     globalDeploymentID(),
+                        });
+                        //writeResponse(w, serr.HTTPStatusCode(), encodedErrorResponse, mimeXML)
+                        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
+                    } else {
+                        return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
+                    }
+                    return Ok(());
+                }
+                let nr = httptest.NewRecorder();
+                let rw = xhttp.NewResponseRecorder(nr);
+                rw.log_err_body = true;
+                rw.log_all_body = true;
+                rreq.select_parameters.evaluate(rw);
+                rreq.select_parameters.Close();
+                return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
+            }
+            let opts = ObjectOptions {
+                transition: TransitionOptions {
+                    restore_request: rreq,
+                    restore_expiry:  restore_expiry,
+                },
+                version_id: objInfo.version_id,
+            }
+            if Err(err) = store.restore_transitioned_object(bucket, object, opts) {
+                format!(format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string()));
+                return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
+            }
+
+            send_event(EventArgs {
+                EventName:  event.ObjectRestoreCompleted,
+                BucketName: bucket,
+                Object:     objInfo,
+                ReqParams:  extractReqParams(r),
+                UserAgent:  r.UserAgent(),
+                Host:       handlers.GetSourceIP(r),
+            });
+        });
+        */
+    }
+
     /// Delete a bucket
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
@@ -1976,27 +2139,14 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let mut lr_retention = false;
-        /*let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg {
-            if let Some(rule) = rcfg.0.rule {
-                if let Some(retention) = rule.default_retention {
-                    if let Some(mode) = retention.mode {
-                        //if mode == ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE) {
-                            lr_retention = true;
-                        //}
-                    }
-                }
-            }
-        }*/
-
-        //info!("lifecycle_configuration: {:?}", &lifecycle_configuration);
-
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        if let Err(err) = input_cfg.validate(lr_retention).await {
-            //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), "bucket lock validate failed."));
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
+        if let Ok(rcfg) = rcfg {
+            if let Err(err) = input_cfg.validate(&rcfg.0).await {
+                //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), err.to_string()));
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+            }
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
