@@ -91,7 +91,7 @@ argon2 = { version = "0.5.3", features = ["std"] }
 atoi = "2.0.0"
 async-channel = "2.5.0"
 async-recursion = "1.1.1"
-async-trait = "0.1.88"
+async-trait = "0.1"
 async-compression = { version = "0.4.0" }
 atomic_enum = "0.3.0"
 aws-sdk-s3 = "1.96.0"
