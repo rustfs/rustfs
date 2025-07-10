@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use http::{HeaderMap, HeaderValue, request};
-use lazy_static::lazy_static;
-use std::collections::HashMap;
 use time::{OffsetDateTime, macros::format_description};
 
 use super::request_signature_v4::{SERVICE_TYPE_S3, get_scope, get_signature, get_signing_key};
@@ -32,15 +30,13 @@ const _CRLF_LEN: i64 = 2;
 const _TRAILER_KV_SEPARATOR: &str = ":";
 const _TRAILER_SIGNATURE: &str = "x-amz-trailer-signature";
 
-lazy_static! {
-    static ref ignored_streaming_headers: HashMap<String, bool> = {
-        let mut m = <HashMap<String, bool>>::new();
-        m.insert("authorization".to_string(), true);
-        m.insert("user-agent".to_string(), true);
-        m.insert("content-type".to_string(), true);
-        m
-    };
-}
+// static ignored_streaming_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+//     let mut m = <HashMap<String, bool>>::new();
+//     m.insert("authorization".to_string(), true);
+//     m.insert("user-agent".to_string(), true);
+//     m.insert("content-type".to_string(), true);
+//     m
+// });
 
 #[allow(dead_code)]
 fn build_chunk_string_to_sign(t: OffsetDateTime, region: &str, previous_sig: &str, chunk_check_sum: &str) -> String {

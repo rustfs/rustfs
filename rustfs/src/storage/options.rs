@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use http::{HeaderMap, HeaderValue};
-use lazy_static::lazy_static;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_utils::path::is_dir_object;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 /// Creates options for deleting an object in a bucket.
@@ -214,9 +214,9 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
     }
 }
 
-lazy_static! {
-    /// List of supported headers.
-    static ref SUPPORTED_HEADERS: Vec<&'static str> = vec![
+/// List of supported headers.
+static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    vec![
         "content-type",
         "cache-control",
         "content-language",
@@ -225,9 +225,9 @@ lazy_static! {
         "x-amz-storage-class",
         "x-amz-tagging",
         "expires",
-        "x-amz-replication-status"
-    ];
-}
+        "x-amz-replication-status",
+    ]
+});
 
 #[cfg(test)]
 mod tests {

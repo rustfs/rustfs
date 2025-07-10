@@ -67,7 +67,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
-lazy_static.workspace = true
 matchit = { workspace = true }
 mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
