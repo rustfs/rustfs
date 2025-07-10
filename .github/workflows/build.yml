@@ -158,6 +158,7 @@ jobs:
       - name: Download static console assets
         run: |
           mkdir -p ./rustfs/static
+          rm -rf ./rustfs/static/*
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
             curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
             if [[ $? -eq 0 ]]; then
