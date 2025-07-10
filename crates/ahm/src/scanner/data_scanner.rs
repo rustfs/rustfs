@@ -34,8 +34,9 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    get_ahm_services_cancel_token,
+    get_ahm_services_cancel_token, HealRequest,
 };
+use crate::heal::HealManager;
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 
@@ -126,15 +127,15 @@ pub struct Scanner {
     data_usage_stats: Arc<Mutex<HashMap<String, DataUsageInfo>>>,
     /// Last data usage statistics collection time
     last_data_usage_collection: Arc<RwLock<Option<SystemTime>>>,
+    /// Heal manager for auto-heal integration
+    heal_manager: Option<Arc<HealManager>>,
 }
 
 impl Scanner {
     /// Create a new scanner
-    pub fn new(config: Option<ScannerConfig>) -> Self {
+    pub fn new(config: Option<ScannerConfig>, heal_manager: Option<Arc<HealManager>>) -> Self {
         let config = config.unwrap_or_default();
-
         info!("Creating AHM scanner for all EC sets");
-
         Self {
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(ScannerState::default())),
@@ -143,7 +144,13 @@ impl Scanner {
             disk_metrics: Arc::new(Mutex::new(HashMap::new())),
             data_usage_stats: Arc::new(Mutex::new(HashMap::new())),
             last_data_usage_collection: Arc::new(RwLock::new(None)),
+            heal_manager,
         }
+    }
+
+    /// Set the heal manager after construction
+    pub fn set_heal_manager(&mut self, heal_manager: Arc<HealManager>) {
+        self.heal_manager = Some(heal_manager);
     }
 
     /// Start the scanner
@@ -495,6 +502,24 @@ impl Scanner {
                 metrics.free_space = disk_info.free;
                 metrics.is_online = disk.is_online().await;
 
+                // 检查磁盘状态，如果离线则提交heal任务
+                if !metrics.is_online {
+                    let enable_healing = self.config.read().await.enable_healing;
+                    if enable_healing {
+                        if let Some(heal_manager) = &self.heal_manager {
+                            let req = HealRequest::disk(disk.endpoint().clone());
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    warn!("磁盘离线，已自动提交heal任务: {} 磁盘: {}", task_id, disk_path);
+                                }
+                                Err(e) => {
+                                    error!("磁盘离线，heal任务提交失败: {}，错误: {}", disk_path, e);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Additional disk info for debugging
                 debug!(
                     "Disk {}: total={}, used={}, free={}, online={}",
@@ -514,6 +539,30 @@ impl Scanner {
             Ok(volumes) => volumes,
             Err(e) => {
                 error!("Failed to list volumes on disk {}: {}", disk_path, e);
+                
+                // 磁盘访问失败，提交磁盘heal任务
+                let enable_healing = self.config.read().await.enable_healing;
+                if enable_healing {
+                    if let Some(heal_manager) = &self.heal_manager {
+                        use crate::heal::{HealRequest, HealPriority};
+                        let req = HealRequest::new(
+                            crate::heal::HealType::Disk {
+                                endpoint: disk.endpoint().clone(),
+                            },
+                            crate::heal::HealOptions::default(),
+                            HealPriority::Urgent,
+                        );
+                        match heal_manager.submit_heal_request(req).await {
+                            Ok(task_id) => {
+                                warn!("磁盘访问失败，已自动提交heal任务: {} 磁盘: {} 错误: {}", task_id, disk_path, e);
+                            }
+                            Err(heal_err) => {
+                                error!("磁盘访问失败，heal任务提交失败: {}，错误: {}", disk_path, heal_err);
+                            }
+                        }
+                    }
+                }
+                
                 return Err(Error::Storage(e.into()));
             }
         };
@@ -625,6 +674,22 @@ impl Scanner {
                     if file_meta.versions.is_empty() {
                         objects_with_issues += 1;
                         warn!("Object {} has no versions", entry.name);
+                        
+                        // 对象元数据损坏，提交元数据heal任务
+                        let enable_healing = self.config.read().await.enable_healing;
+                        if enable_healing {
+                            if let Some(heal_manager) = &self.heal_manager {
+                                let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
+                                match heal_manager.submit_heal_request(req).await {
+                                    Ok(task_id) => {
+                                        warn!("对象元数据损坏，已自动提交heal任务: {} {} / {}", task_id, bucket, entry.name);
+                                    }
+                                    Err(e) => {
+                                        error!("对象元数据损坏，heal任务提交失败: {} / {}，错误: {}", bucket, entry.name, e);
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         // Store object metadata for later analysis
                         object_metadata.insert(entry.name.clone(), file_meta.clone());
@@ -632,6 +697,22 @@ impl Scanner {
                 } else {
                     objects_with_issues += 1;
                     warn!("Failed to parse metadata for object {}", entry.name);
+                    
+                    // 对象元数据解析失败，提交元数据heal任务
+                    let enable_healing = self.config.read().await.enable_healing;
+                    if enable_healing {
+                        if let Some(heal_manager) = &self.heal_manager {
+                            let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    warn!("对象元数据解析失败，已自动提交heal任务: {} {} / {}", task_id, bucket, entry.name);
+                                }
+                                Err(e) => {
+                                    error!("对象元数据解析失败，heal任务提交失败: {} / {}，错误: {}", bucket, entry.name, e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -735,7 +816,32 @@ impl Scanner {
                     let missing_disks: Vec<usize> = (0..disks.len()).filter(|&i| !locations.contains(&i)).collect();
                     warn!("Object {}/{} missing from disks: {:?}", bucket, object_name, missing_disks);
                     println!("Object {bucket}/{object_name} missing from disks: {missing_disks:?}");
-                    // TODO: Trigger heal for this object
+                    
+                    // 自动提交heal任务
+                    let enable_healing = self.config.read().await.enable_healing;
+                    if enable_healing {
+                        if let Some(heal_manager) = &self.heal_manager {
+                            use crate::heal::{HealRequest, HealPriority};
+                            let req = HealRequest::new(
+                                crate::heal::HealType::Object {
+                                    bucket: bucket.clone(),
+                                    object: object_name.clone(),
+                                    version_id: None,
+                                },
+                                crate::heal::HealOptions::default(),
+                                HealPriority::High,
+                            );
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    warn!("对象缺失，已自动提交heal任务: {} {} / {} (缺失磁盘: {:?})", 
+                                          task_id, bucket, object_name, missing_disks);
+                                }
+                                Err(e) => {
+                                    error!("对象缺失，heal任务提交失败: {} / {}，错误: {}", bucket, object_name, e);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Step 3: Deep scan EC verification
@@ -863,6 +969,22 @@ impl Scanner {
             );
             Ok(())
         } else {
+            // 自动提交heal任务
+            let enable_healing = self.config.read().await.enable_healing;
+            if enable_healing {
+                if let Some(heal_manager) = &self.heal_manager {
+                    use crate::heal::HealRequest;
+                    let req = HealRequest::ec_decode(bucket.to_string(), object.to_string(), None);
+                    match heal_manager.submit_heal_request(req).await {
+                        Ok(task_id) => {
+                            warn!("EC decode失败，已自动提交heal任务: {} {} / {}", task_id, bucket, object);
+                        }
+                        Err(e) => {
+                            error!("EC decode失败，heal任务提交失败: {} / {}，错误: {}", bucket, object, e);
+                        }
+                    }
+                }
+            }
             Err(Error::Scanner(format!(
                 "EC decode verification failed for object {bucket}/{object}: need {read_quorum} reads, got {successful_reads} (errors: {errors:?})"
             )))
@@ -1005,6 +1127,7 @@ impl Scanner {
             disk_metrics: Arc::clone(&self.disk_metrics),
             data_usage_stats: Arc::clone(&self.data_usage_stats),
             last_data_usage_collection: Arc::clone(&self.last_data_usage_collection),
+            heal_manager: self.heal_manager.clone(),
         }
     }
 }
@@ -1121,7 +1244,7 @@ mod tests {
             .expect("put_object failed");
 
         // create Scanner and test basic functionality
-        let scanner = Scanner::new(None);
+        let scanner = Scanner::new(None, None);
 
         // Test 1: Normal scan - verify object is found
         println!("=== Test 1: Normal scan ===");
@@ -1200,7 +1323,7 @@ mod tests {
             .await
             .unwrap();
 
-        let scanner = Scanner::new(None);
+        let scanner = Scanner::new(None, None);
 
         // enable statistics
         {
