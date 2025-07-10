@@ -17,6 +17,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+use crate::version;
+
 /// Update check related errors
 #[derive(Error, Debug)]
 pub enum UpdateCheckError {
@@ -231,25 +233,7 @@ impl VersionChecker {
 
 /// Get current version number
 pub fn get_current_version() -> String {
-    use crate::admin::console::CONSOLE_CONFIG;
-
-    if let Some(config) = CONSOLE_CONFIG.get() {
-        // Extract version from configuration
-        let version_str = config.version();
-        // Extract version part, removing extra information
-        if let Some(release_part) = version_str.split_whitespace().next() {
-            if release_part.starts_with("RELEASE.") {
-                release_part.trim_start_matches("RELEASE.").to_string()
-            } else {
-                release_part.to_string()
-            }
-        } else {
-            rustfs_config::VERSION.to_string()
-        }
-    } else {
-        // If configuration is not initialized, use constant version
-        rustfs_config::VERSION.to_string()
-    }
+    version::get_version()
 }
 
 /// Convenience function for async update checking

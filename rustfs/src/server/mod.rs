@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod http;
+mod hybrid;
 mod service_state;
+pub(crate) use http::start_http_server;
 pub(crate) use service_state::SHUTDOWN_TIMEOUT;
 pub(crate) use service_state::ServiceState;
 pub(crate) use service_state::ServiceStateManager;
