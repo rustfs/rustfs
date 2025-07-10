@@ -21,7 +21,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-/// Scanner metrics similar to MinIO's scanner metrics
+/// Scanner metrics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScannerMetrics {
     /// Total objects scanned since server start

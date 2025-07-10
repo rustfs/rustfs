@@ -107,7 +107,7 @@ pub struct ScannerState {
 ///
 /// This scanner monitors the health of objects in the RustFS storage system.
 /// It integrates with ECStore to perform real data scanning across all EC sets
-/// and collects metrics similar to MinIO's scanner.
+/// and collects metrics.
 ///
 /// The scanner operates on the entire ECStore, scanning all EC (Erasure Coding) sets,
 /// where each set contains multiple disks that store the same objects with different shards.

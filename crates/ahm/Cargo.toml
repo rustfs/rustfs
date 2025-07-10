@@ -22,12 +22,12 @@ bytes = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4", "serde"] }
 anyhow = { workspace = true }
-async-trait = "0.1"
-futures = "0.3"
-url = "2.4"
+async-trait = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }
 rustfs-lock = { workspace = true }
 
-lazy_static = "1.4"
+lazy_static = { workspace = true }
 
 [dev-dependencies]
 rmp-serde = { workspace = true }
