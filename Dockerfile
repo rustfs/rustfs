@@ -38,11 +38,10 @@ COPY --from=builder /rustfs /usr/local/bin/rustfs
 ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
-    RUSTFS_CONSOLE_ADDRESS=":9001" \
     RUSTFS_CONSOLE_ENABLE=true \
     RUST_LOG=warn
 
-EXPOSE 9000 9001
+EXPOSE 9000
 
 RUN mkdir -p /data
 VOLUME /data
