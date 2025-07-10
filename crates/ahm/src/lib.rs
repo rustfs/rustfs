@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 
 pub mod error;
 pub mod scanner;
-pub mod metrics;
 
 pub use error::{Error, Result};
 pub use scanner::{
