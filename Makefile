@@ -32,6 +32,7 @@ check:
 test:
 	@echo "🧪 Running tests..."
 	cargo nextest run --all --exclude e2e_test
+	cargo test --all --doc
 
 .PHONY: pre-commit
 pre-commit: fmt clippy check test

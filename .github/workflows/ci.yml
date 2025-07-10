@@ -102,7 +102,9 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests
-        run: cargo nextest run --all --exclude e2e_test
+        run: |
+          cargo nextest run --all --exclude e2e_test
+          cargo test --all --doc
 
       - name: Check code formatting
         run: cargo fmt --all --check
