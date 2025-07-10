@@ -49,7 +49,7 @@ const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 struct StaticFiles;
 
 /// Static file handler
-async fn static_handler(uri: Uri) -> impl IntoResponse {
+pub(crate) async fn static_handler(uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html"
@@ -184,6 +184,7 @@ pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
 //     host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
 // }
 
+#[allow(dead_code)]
 async fn license_handler() -> impl IntoResponse {
     let license = get_license().unwrap_or_default();
 
@@ -210,6 +211,7 @@ fn _is_private_ip(ip: IpAddr) -> bool {
 }
 
 #[allow(clippy::const_is_empty)]
+#[allow(dead_code)]
 #[instrument(fields(host))]
 async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
@@ -257,6 +259,14 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         .unwrap()
 }
 
+pub fn register_router() -> Router {
+    Router::new()
+        // .route("/license", get(license_handler))
+        // .route("/config.json", get(config_handler))
+        .fallback_service(get(static_handler))
+}
+
+#[allow(dead_code)]
 pub async fn start_static_file_server(
     addrs: &str,
     local_ip: IpAddr,
@@ -269,11 +279,9 @@ pub async fn start_static_file_server(
         .allow_origin(Any) // In the production environment, we recommend that you specify a specific domain name
         .allow_methods([http::Method::GET, http::Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
+
     // Create a route
-    let app = Router::new()
-        .route("/license", get(license_handler))
-        .route("/config.json", get(config_handler))
-        .fallback_service(get(static_handler))
+    let app = register_router()
         .layer(cors)
         .layer(tower_http::compression::CompressionLayer::new().gzip(true).deflate(true))
         .layer(TraceLayer::new_for_http());
@@ -295,6 +303,7 @@ pub async fn start_static_file_server(
         Err(e) => error!("Server error: {}", e),
     }
 }
+
 async fn start_server(server_addr: SocketAddr, tls_path: Option<String>, app: Router) -> io::Result<()> {
     let tls_path = tls_path.unwrap_or_default();
     let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");

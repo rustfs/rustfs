@@ -15,7 +15,6 @@
 mod admin;
 mod auth;
 mod config;
-mod console;
 mod error;
 mod event;
 // mod grpc;
@@ -26,8 +25,8 @@ mod service;
 mod storage;
 mod update_checker;
 
+use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
 use crate::auth::IAMAuth;
-use crate::console::{CONSOLE_CONFIG, init_console_cfg};
 // Ensure the correct path for parse_license is imported
 use crate::event::shutdown_event_notifier;
 use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, wait_for_shutdown};
@@ -226,6 +225,12 @@ async fn run(opt: config::Opt) -> Result<()> {
     let api_endpoints = format!("http://{local_ip}:{server_port}");
     let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
     info!("   API: {}  {}", api_endpoints, localhost_endpoint);
+    if opt.console_enable {
+        info!(
+            "   WebUI: http://{}:{}/rustfs/console/index.html http://127.0.0.1:{}/rustfs/console/index.html http://{}/rustfs/console/index.html",
+            local_ip, server_port, server_port, server_address
+        );
+    }
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
@@ -266,7 +271,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route()?);
+        b.set_route(admin::make_admin_route(opt.console_enable)?);
 
         if !opt.server_domains.is_empty() {
             info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
@@ -484,22 +489,22 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
     });
 
-    if opt.console_enable {
-        debug!("console is enabled");
-        let access_key = opt.access_key.clone();
-        let secret_key = opt.secret_key.clone();
-        let console_address = opt.console_address.clone();
-        let tls_path = opt.tls_path.clone();
+    // if opt.console_enable {
+    //     debug!("console is enabled");
+    //     let access_key = opt.access_key.clone();
+    //     let secret_key = opt.secret_key.clone();
+    //     let console_address = opt.console_address.clone();
+    //     let tls_path = opt.tls_path.clone();
 
-        if console_address.is_empty() {
-            error!("console_address is empty");
-            return Err(Error::other("console_address is empty".to_string()));
-        }
+    //     if console_address.is_empty() {
+    //         error!("console_address is empty");
+    //         return Err(Error::other("console_address is empty".to_string()));
+    //     }
 
-        tokio::spawn(async move {
-            console::start_static_file_server(&console_address, local_ip, &access_key, &secret_key, tls_path).await;
-        });
-    }
+    //     tokio::spawn(async move {
+    //         admin::console::start_static_file_server(&console_address, local_ip, &access_key, &secret_key, tls_path).await;
+    //     });
+    // }
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

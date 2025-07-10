@@ -231,7 +231,7 @@ impl VersionChecker {
 
 /// Get current version number
 pub fn get_current_version() -> String {
-    use crate::console::CONSOLE_CONFIG;
+    use crate::admin::console::CONSOLE_CONFIG;
 
     if let Some(config) = CONSOLE_CONFIG.get() {
         // Extract version from configuration

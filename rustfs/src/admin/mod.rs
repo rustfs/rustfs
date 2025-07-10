@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod console;
 pub mod handlers;
 pub mod router;
 mod rpc;
@@ -32,8 +33,8 @@ use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 
-pub fn make_admin_route() -> std::io::Result<impl S3Route> {
-    let mut r: S3Router<AdminOperation> = S3Router::new();
+pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
+    let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
