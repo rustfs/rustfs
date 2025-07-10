@@ -30,6 +30,7 @@ use std::{
     time::SystemTime,
 };
 use tokio::sync::{OnceCell, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
@@ -65,6 +66,9 @@ pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBA
 pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
 pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
 }
+
+// Global cancellation token for background services (data scanner and auto heal)
+static GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
 static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 
@@ -191,4 +195,28 @@ pub fn set_global_region(region: String) {
 
 pub fn get_global_region() -> Option<String> {
     GLOBAL_REGION.get().cloned()
+}
+
+/// Initialize the global background services cancellation token
+pub fn init_background_services_cancel_token(cancel_token: CancellationToken) -> Result<(), CancellationToken> {
+    GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.set(cancel_token)
+}
+
+/// Get the global background services cancellation token
+pub fn get_background_services_cancel_token() -> Option<&'static CancellationToken> {
+    GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get()
+}
+
+/// Create and initialize the global background services cancellation token
+pub fn create_background_services_cancel_token() -> CancellationToken {
+    let cancel_token = CancellationToken::new();
+    init_background_services_cancel_token(cancel_token.clone()).expect("Background services cancel token already initialized");
+    cancel_token
+}
+
+/// Shutdown all background services gracefully
+pub fn shutdown_background_services() {
+    if let Some(cancel_token) = GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get() {
+        cancel_token.cancel();
+    }
 }

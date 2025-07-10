@@ -7857,6 +7857,7 @@ dependencies = [
  "pin-project-lite",
  "reqwest",
  "rust-embed",
+ "rustfs-ahm",
  "rustfs-appauth",
  "rustfs-common",
  "rustfs-config",
@@ -7895,6 +7896,34 @@ dependencies = [
  "urlencoding",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "rustfs-ahm"
+version = "0.0.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "lazy_static",
+ "rmp-serde",
+ "rustfs-common",
+ "rustfs-ecstore",
+ "rustfs-filemeta",
+ "rustfs-lock",
+ "rustfs-madmin",
+ "rustfs-utils",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "time",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
