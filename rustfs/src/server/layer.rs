@@ -44,7 +44,7 @@ where
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
         // Check if this is a GET request without Authorization header and User-Agent contains Mozilla
         // and the path is either "/" or "/index.html"
-        let path = req.uri().path();
+        let path = req.uri().path().trim_end_matches('/');
         let should_redirect = req.method() == http::Method::GET
             && !req.headers().contains_key(http::header::AUTHORIZATION)
             && req
@@ -53,7 +53,7 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|ua| ua.contains("Mozilla"))
                 .unwrap_or(false)
-            && (path == "/" || path == "/index.html");
+            && (path.is_empty() || path == "/rustfs" || path == "/index.html");
 
         if should_redirect {
             debug!("Redirecting browser request from {} to console", path);
