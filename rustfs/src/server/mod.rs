@@ -14,6 +14,7 @@
 
 mod http;
 mod hybrid;
+mod layer;
 mod service_state;
 pub(crate) use http::start_http_server;
 pub(crate) use service_state::SHUTDOWN_TIMEOUT;

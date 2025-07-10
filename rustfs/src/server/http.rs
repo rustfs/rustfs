@@ -4,6 +4,7 @@ use crate::auth::IAMAuth;
 use crate::admin;
 use crate::config;
 use crate::server::hybrid::hybrid;
+use crate::server::layer::RedirectLayer;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::storage;
 use bytes::Bytes;
@@ -346,6 +347,7 @@ fn process_connection(
                     }),
             )
             .layer(CorsLayer::permissive())
+            .layer(RedirectLayer)
             .service(service);
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
