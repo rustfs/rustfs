@@ -27,7 +27,7 @@ use std::io;
 
 use axum::response::Redirect;
 use axum_server::tls_rustls::RustlsConfig;
-use http::{Uri, header};
+use http::{HeaderMap, HeaderName, Uri, header};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
@@ -211,21 +211,40 @@ fn _is_private_ip(ip: IpAddr) -> bool {
 
 #[allow(clippy::const_is_empty)]
 #[instrument(fields(host))]
-async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
-    let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("http");
+async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+    // Get the scheme from the headers or use the URI scheme
+    let scheme = headers
+        .get(HeaderName::from_static("x-forwarded-proto"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
+
+    // Print logs for debugging
+    info!("Scheme: {}, ", scheme);
 
     // Get the host from the uri and use the value of the host extractor if it doesn't have one
     let host = uri.host().unwrap_or(host.as_str());
 
-    let host = if host.contains(':') {
-        let (host, _) = host.split_once(':').unwrap_or((host, "80"));
-        host
+    let host = if let Ok(socket_addr) = host.parse::<SocketAddr>() {
+        // Successfully parsed, it's in IP:Port format.
+        // For IPv6, we need to enclose it in brackets to form a valid URL.
+        let ip = socket_addr.ip();
+        if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
     } else {
-        host
+        // Failed to parse, it might be a domain name or a bare IP, use it as is.
+        host.to_string()
     };
 
     // Make a copy of the current configuration
-    let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
+    let mut cfg = match CONSOLE_CONFIG.get() {
+        Some(cfg) => cfg.clone(),
+        None => {
+            error!("Console configuration not initialized");
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Console configuration not initialized"))
+                .unwrap();
+        }
+    };
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
     cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");

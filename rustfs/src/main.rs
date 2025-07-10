@@ -174,6 +174,10 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
+    if let Some(region) = opt.region {
+        rustfs_ecstore::global::set_global_region(region);
+    }
+
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
@@ -189,7 +193,17 @@ async fn run(opt: config::Opt) -> Result<()> {
     let listener = TcpListener::bind(server_address.clone()).await?;
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
-    let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
+    debug!("Listening on: {}", local_addr);
+    let local_ip = match rustfs_utils::get_local_ip() {
+        Some(ip) => {
+            debug!("Obtained local IP address: {}", ip);
+            ip
+        }
+        None => {
+            warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
+            local_addr.ip()
+        }
+    };
 
     // For RPC
     let (endpoint_pools, setup_type) =

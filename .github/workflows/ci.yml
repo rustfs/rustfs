@@ -80,6 +80,8 @@ jobs:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", "docs/**", "deploy/**"]'
+          # Never skip release events and tag pushes
+          do_not_skip: '["release", "push"]'
 
   test-and-lint:
     name: Test and Lint
@@ -100,7 +102,9 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests
-        run: cargo test --all --exclude e2e_test
+        run: |
+          cargo nextest run --all --exclude e2e_test
+          cargo test --all --doc
 
       - name: Check code formatting
         run: cargo fmt --all --check

@@ -18,10 +18,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "rustfs/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/performance.yml'
   workflow_dispatch:
     inputs:
       profile_duration:

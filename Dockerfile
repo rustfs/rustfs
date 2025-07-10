@@ -20,9 +20,10 @@ RUN apk add -U --no-cache \
     bash \
     unzip
 
-RUN curl -Lo /tmp/rustfs.zip https://dl.rustfs.com/artifacts/rustfs/rustfs-release-x86_64-unknown-linux-musl.latest.zip && \
-    unzip /tmp/rustfs.zip -d /tmp && \
-    mv /tmp/rustfs-release-x86_64-unknown-linux-musl/bin/rustfs /rustfs && \
+
+RUN curl -Lo /tmp/rustfs.zip https://dl.rustfs.com/artifacts/rustfs/rustfs-x86_64-unknown-linux-musl.zip && \
+    unzip -o /tmp/rustfs.zip -d /tmp && \
+    mv /tmp/rustfs /rustfs && \
     chmod +x /rustfs && \
     rm -rf /tmp/*
 

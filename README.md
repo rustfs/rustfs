@@ -1,6 +1,8 @@
 [![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
+
 <p align="center">RustFS is a high-performance distributed object storage software built using Rust</p>
+
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
@@ -17,10 +19,21 @@
 </p>
 
 <p align="center">
-English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简体中文</a>
+English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简体中文</a> | 
+  <!-- Keep these links. Translations will automatically update with the README. -->
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=de">Deutsch</a> | 
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=es">Español</a> | 
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=fr">français</a> | 
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=ja">日本語</a> | 
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=ko">한국어</a> | 
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=pt">Português</a> | 
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
 RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
+
+
+> ⚠️ **RustFS is under rapid development. Do NOT use in production environments!**
 
 ## Features
 

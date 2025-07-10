@@ -72,7 +72,7 @@ runs:
       uses: arduino/setup-protoc@v3
       with:
         version: "31.1"
-        github-token: ${{ inputs.github-token }}
+        repo-token: ${{ inputs.github-token }}
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
@@ -93,6 +93,9 @@ runs:
     - name: Install cargo-zigbuild
       if: inputs.install-cross-tools == 'true'
       uses: taiki-e/install-action@cargo-zigbuild
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@cargo-nextest
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2

@@ -145,8 +145,8 @@ impl Debug for LocalDisk {
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!("Creating local disk");
-        let root = match fs::canonicalize(ep.get_file_path()).await {
-            Ok(path) => path,
+        let root = match PathBuf::from(ep.get_file_path()).absolutize() {
+            Ok(path) => path.into_owned(),
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     return Err(DiskError::VolumeNotFound);

@@ -16,24 +16,38 @@ name: Build and Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["*"]
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "cli/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/build.yml"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - ".github/**"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   pull_request:
     branches: [main]
-    paths:
-      - "rustfs/**"
-      - "cli/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/build.yml"
+    paths-ignore:
+      - "**.md"
+      - "**.txt"
+      - ".github/**"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "LICENSE*"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".gitignore"
+      - ".dockerignore"
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
@@ -49,29 +63,11 @@ env:
   RUST_BACKTRACE: 1
   # Optimize build performance
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: "-C target-cpu=native"
 
 jobs:
-  # First layer: GitHub Actions level optimization (handling duplicates and concurrency)
-  skip-duplicate:
-    name: Skip Duplicate Actions
-    runs-on: ubuntu-latest
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
-    steps:
-      - name: Skip duplicate actions
-        id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          concurrent_skipping: "same_content_newer"
-          cancel_others: true
-          paths_ignore: '["*.md", "docs/**", "deploy/**", "scripts/dev_*.sh"]'
-
   # Second layer: Business logic level checks (handling build strategy)
   build-check:
     name: Build Strategy Check
-    needs: skip-duplicate
-    if: needs.skip-duplicate.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -92,9 +88,11 @@ jobs:
             build_type="development"
           fi
 
+          # Always build for tag pushes (version releases)
           if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
             should_build=true
             build_type="release"
+            echo "🏷️  Tag detected: forcing release build"
           fi
 
           echo "should_build=$should_build" >> $GITHUB_OUTPUT
@@ -104,23 +102,43 @@ jobs:
   # Build RustFS binaries
   build-rustfs:
     name: Build RustFS
-    needs: [skip-duplicate, build-check]
-    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.should_build == 'true'
+    needs: [build-check]
+    if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.cross == 'false' && '-C target-cpu=native' || '' }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux builds
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: false
+            platform: linux
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
+            platform: linux
+          # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
             cross: false
+            platform: macos
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+            platform: macos
+          # # Windows builds (temporarily disabled)
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   cross: false
+          #   platform: windows
+          # - os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   cross: true
+          #   platform: windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -140,149 +158,149 @@ jobs:
       - name: Download static console assets
         run: |
           mkdir -p ./rustfs/static
-          curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-            -o console.zip --retry 3 --retry-delay 5 --max-time 300
-          unzip -o console.zip -d ./rustfs/static
-          rm console.zip
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          else
+            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+              -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          fi
 
       - name: Build RustFS
         run: |
+          # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
           if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Use cross for Windows ARM64
+              cargo install cross --git https://github.com/cross-rs/cross
+              cross build --release --target ${{ matrix.target }} -p rustfs --bins
+            else
+              # Use zigbuild for Linux ARM64
+              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            fi
           else
             cargo build --release --target ${{ matrix.target }} -p rustfs --bins
           fi
 
       - name: Create release package
         id: package
+        shell: bash
         run: |
           PACKAGE_NAME="rustfs-${{ matrix.target }}"
-          mkdir -p "${PACKAGE_NAME}"/{bin,docs}
 
-          # Copy binary
-          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
-            cp target/${{ matrix.target }}/release/rustfs.exe "${PACKAGE_NAME}/bin/"
-          else
-            cp target/${{ matrix.target }}/release/rustfs "${PACKAGE_NAME}/bin/"
-            chmod +x "${PACKAGE_NAME}/bin/rustfs"
+          # Create zip packages for all platforms
+          # Ensure zip is available
+          if ! command -v zip &> /dev/null; then
+            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+              sudo apt-get update && sudo apt-get install -y zip
+            fi
           fi
 
-          # Copy documentation
-          [ -f "LICENSE" ] && cp LICENSE "${PACKAGE_NAME}/docs/"
-          [ -f "README.md" ] && cp README.md "${PACKAGE_NAME}/docs/"
-
-          # Create archive
-          tar -czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
-
+          cd target/${{ matrix.target }}/release
+          zip "../../../${PACKAGE_NAME}.zip" rustfs
+          cd ../../..
           echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
-          echo "Package created: ${PACKAGE_NAME}.tar.gz"
+          echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
+          echo "Package created: ${PACKAGE_NAME}.zip"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.package_name }}
-          path: ${{ steps.package.outputs.package_name }}.tar.gz
+          path: ${{ steps.package.outputs.package_file }}
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
-  # Build GUI (only for releases)
-  build-gui:
-    name: Build GUI
-    needs: [skip-duplicate, build-check, build-rustfs]
-    if: needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            platform: linux
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            platform: macos
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          target: ${{ matrix.target }}
-          cache-shared-key: gui-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download RustFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: rustfs-${{ matrix.target }}
-          path: ./artifacts
-
-      - name: Prepare embedded binary
+      - name: Upload to Aliyun OSS
+        if: needs.build-check.outputs.build_type == 'release' && env.OSS_ACCESS_KEY_ID != ''
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
-          mkdir -p ./cli/rustfs-gui/embedded-rustfs/
-          tar -xzf ./artifacts/rustfs-${{ matrix.target }}.tar.gz -C ./artifacts/
-          cp ./artifacts/rustfs-${{ matrix.target }}/bin/rustfs ./cli/rustfs-gui/embedded-rustfs/
-
-      - name: Install Dioxus CLI
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: dioxus-cli
-
-      - name: Build GUI
-        working-directory: ./cli/rustfs-gui
-        run: |
+          # Install ossutil (platform-specific)
+          OSSUTIL_VERSION="2.1.1"
           case "${{ matrix.platform }}" in
-            "linux")
-              dx bundle --platform linux --package-types deb --package-types appimage --release
+            linux)
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                ARCH="arm64"
+              else
+                ARCH="amd64"
+              fi
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              chmod +x /usr/local/bin/ossutil
+              OSSUTIL_BIN=ossutil
               ;;
-            "macos")
-              dx bundle --platform macos --package-types dmg --release
+            macos)
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                ARCH="arm64"
+              else
+                ARCH="amd64"
+              fi
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              chmod +x /usr/local/bin/ossutil
+              OSSUTIL_BIN=ossutil
               ;;
           esac
 
-      - name: Package GUI
-        id: gui_package
-        run: |
-          GUI_PACKAGE="rustfs-gui-${{ matrix.target }}"
-          mkdir -p "${GUI_PACKAGE}"
+          # Upload the package file directly to OSS
+          echo "Uploading ${{ steps.package.outputs.package_file }} to OSS..."
+          $OSSUTIL_BIN cp "${{ steps.package.outputs.package_file }}" oss://rustfs-artifacts/artifacts/rustfs/ --force
 
-          # Copy GUI bundles
-          if [[ -d "cli/rustfs-gui/dist/bundle" ]]; then
-            cp -r cli/rustfs-gui/dist/bundle/* "${GUI_PACKAGE}/"
+          # Create latest.json (only for the first Linux build to avoid duplication)
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
+            $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi
-
-          tar -czf "${GUI_PACKAGE}.tar.gz" "${GUI_PACKAGE}"
-          echo "gui_package=${GUI_PACKAGE}" >> $GITHUB_OUTPUT
-
-      - name: Upload GUI artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.gui_package.outputs.gui_package }}
-          path: ${{ steps.gui_package.outputs.gui_package }}.tar.gz
-          retention-days: 30
 
   # Release management
   release:
     name: GitHub Release
-    needs: [skip-duplicate, build-check, build-rustfs, build-gui]
-    if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release'
+    needs: [build-check, build-rustfs]
+    if: always() && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: ./release-artifacts
 
-      - name: Prepare release
+      - name: Prepare release assets
         id: release_prep
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
@@ -293,72 +311,107 @@ jobs:
 
           # Organize artifacts
           mkdir -p ./release-files
-          find ./release-artifacts -name "*.tar.gz" -exec cp {} ./release-files/ \;
 
-          # Create release notes
-          cat > release_notes.md << EOF
-          ## RustFS ${VERSION_CLEAN}
+          # Copy all artifacts (.zip files)
+          find ./release-artifacts -name "*.zip" -exec cp {} ./release-files/ \;
 
-          ### 🚀 Downloads
+          # Generate checksums for all files
+          cd ./release-files
+          if ls *.zip >/dev/null 2>&1; then
+            sha256sum *.zip >> SHA256SUMS
+            sha512sum *.zip >> SHA512SUMS
+          fi
+          cd ..
 
-          **Linux:**
-          - \`rustfs-x86_64-unknown-linux-musl.tar.gz\` - Linux x86_64 (static)
-          - \`rustfs-aarch64-unknown-linux-musl.tar.gz\` - Linux ARM64 (static)
-
-          **macOS:**
-          - \`rustfs-aarch64-apple-darwin.tar.gz\` - macOS Apple Silicon
-
-          **GUI Applications:**
-          - \`rustfs-gui-*.tar.gz\` - GUI applications
-
-          ### 📦 Installation
-
-          1. Download the appropriate binary for your platform
-          2. Extract: \`tar -xzf rustfs-*.tar.gz\`
-          3. Install: \`sudo cp rustfs-*/bin/rustfs /usr/local/bin/\`
-
-          ### 🔗 Mirror Downloads
-
-          - [OSS Mirror](https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/)
-          EOF
+          # Display what we're releasing
+          echo "=== Release Files ==="
+          ls -la ./release-files/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release_prep.outputs.version }}
-          name: "RustFS ${{ steps.release_prep.outputs.version_clean }}"
-          body_path: release_notes.md
-          files: ./release-files/*.tar.gz
-          draft: false
-          prerelease: ${{ contains(steps.release_prep.outputs.version, 'alpha') || contains(steps.release_prep.outputs.version, 'beta') || contains(steps.release_prep.outputs.version, 'rc') }}
-
-  # Upload to OSS (optional)
-  upload-oss:
-    name: Upload to OSS
-    needs: [skip-duplicate, build-check, build-rustfs]
-    if: always() && needs.skip-duplicate.outputs.should_skip != 'true' && needs.build-check.outputs.build_type == 'release' && needs.build-rustfs.result == 'success'
-    runs-on: ubuntu-latest
-    env:
-      OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-      OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
-
-      - name: Upload to Aliyun OSS
-        if: ${{ env.OSS_ACCESS_KEY_ID != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Install ossutil
-          curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
-          unzip ossutil.zip
-          sudo mv ossutil-*/ossutil /usr/local/bin/
+          VERSION="${{ steps.release_prep.outputs.version }}"
+          VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
 
-          # Upload files
-          find ./artifacts -name "*.tar.gz" -exec ossutil cp {} oss://rustfs-artifacts/artifacts/rustfs/ --force \;
+          # Check if release already exists
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, skipping creation"
+          else
+            # Get release notes from tag message
+            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
+            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
+              RELEASE_NOTES="Release ${VERSION_CLEAN}"
+            fi
 
-          # Create latest.json
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
-          ossutil cp latest.json oss://rustfs-version/latest.json --force
+            # Determine if this is a prerelease
+            PRERELEASE_FLAG=""
+            if [[ "$VERSION" == *"alpha"* ]] || [[ "$VERSION" == *"beta"* ]] || [[ "$VERSION" == *"rc"* ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+
+            # Create the release only if it doesn't exist
+            gh release create "$VERSION" \
+              --title "RustFS $VERSION_CLEAN" \
+              --notes "$RELEASE_NOTES" \
+              $PRERELEASE_FLAG
+          fi
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.release_prep.outputs.version }}"
+
+          cd ./release-files
+
+          # Upload all binary files
+          for file in *.zip; do
+            if [[ -f "$file" ]]; then
+              echo "Uploading $file..."
+              gh release upload "$VERSION" "$file" --clobber
+            fi
+          done
+
+          # Upload checksum files
+          if [[ -f "SHA256SUMS" ]]; then
+            echo "Uploading SHA256SUMS..."
+            gh release upload "$VERSION" "SHA256SUMS" --clobber
+          fi
+
+          if [[ -f "SHA512SUMS" ]]; then
+            echo "Uploading SHA512SUMS..."
+            gh release upload "$VERSION" "SHA512SUMS" --clobber
+          fi
+
+      - name: Update release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.release_prep.outputs.version }}"
+          VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
+
+          # Check if release already has custom notes (not auto-generated)
+          EXISTING_NOTES=$(gh release view "$VERSION" --json body --jq '.body' 2>/dev/null || echo "")
+
+          # Only update if release notes are empty or auto-generated
+          if [[ -z "$EXISTING_NOTES" ]] || [[ "$EXISTING_NOTES" == *"Release ${VERSION_CLEAN}"* ]]; then
+            echo "Updating release notes for $VERSION"
+
+            # Get original release notes from tag
+            ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
+            if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
+              ORIGINAL_NOTES="Release ${VERSION_CLEAN}"
+            fi
+
+            # Use external template file and substitute variables
+            sed -e "s/\${VERSION}/$VERSION/g" \
+                -e "s/\${VERSION_CLEAN}/$VERSION_CLEAN/g" \
+                -e "s/\${ORIGINAL_NOTES}/$(echo "$ORIGINAL_NOTES" | sed 's/[[\.*^$()+?{|]/\\&/g')/g" \
+                .github/workflows/release-notes-template.md > enhanced_notes.md
+
+            # Update the release with enhanced notes
+            gh release edit "$VERSION" --notes-file enhanced_notes.md
+          else
+            echo "Release $VERSION already has custom notes, skipping update to preserve manual edits"
+          fi

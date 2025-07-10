@@ -52,7 +52,7 @@ pub async fn del_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(Uuid::max().to_string())
         } else {
             vid
         }
@@ -91,7 +91,7 @@ pub async fn get_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(Uuid::max().to_string())
         } else {
             vid
         }
@@ -133,7 +133,7 @@ pub async fn put_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(Uuid::max().to_string())
         } else {
             vid
         }
@@ -273,7 +273,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
     }
 
     #[tokio::test]
@@ -346,7 +346,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
     }
 
     #[tokio::test]
@@ -390,7 +390,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
     }
 
     #[tokio::test]

@@ -419,7 +419,7 @@ fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: 
 
     writeln!(
         w,
-        "{} {} [{}] [{}:{}] [{}:{}] {}",
+        "[{}] {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
         level_style.paint(level.to_string()),
         Color::Magenta.paint(record.target()),
@@ -443,7 +443,7 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
 
     writeln!(
         w,
-        "{} {} [{}] [{}:{}] [{}:{}] {}",
+        "[{}] {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
         level,
         record.target(),

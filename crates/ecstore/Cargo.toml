@@ -19,6 +19,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+description = "Erasure coding storage backend for RustFS, providing efficient data storage and retrieval with redundancy."
+keywords = ["erasure-coding", "storage", "rustfs", "Minio", "solomon"]
+categories = ["web-programming", "development-tools", "filesystem"]
+documentation = "https://docs.rs/rustfs-ecstore/latest/rustfs_ecstore/"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lints]
