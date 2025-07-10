@@ -7857,6 +7857,7 @@ dependencies = [
  "pin-project-lite",
  "reqwest",
  "rust-embed",
+ "rustfs-ahm",
  "rustfs-appauth",
  "rustfs-common",
  "rustfs-config",
@@ -7899,12 +7900,13 @@ dependencies = [
 
 [[package]]
 name = "rustfs-ahm"
-version = "0.1.0"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
  "futures",
+ "lazy_static",
  "rmp-serde",
  "rustfs-common",
  "rustfs-ecstore",

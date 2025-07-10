@@ -31,6 +31,7 @@ use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::GLOBAL_ALlHealState;
 use rustfs_ecstore::global::get_global_action_cred;
+// use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::heal::heal_commands::HealOpts;
 use rustfs_ecstore::heal::heal_ops::new_heal_sequence;

@@ -35,4 +35,11 @@ pub enum Error {
     Other(#[from] anyhow::Error),
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>; 
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+// Implement conversion from ahm::Error to std::io::Error for use in main.rs
+impl From<Error> for std::io::Error {
+    fn from(err: Error) -> Self {
+        std::io::Error::other(err)
+    }
+}

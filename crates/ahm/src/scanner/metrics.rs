@@ -212,12 +212,12 @@ impl MetricsCollector {
             last_activity: Some(SystemTime::now()),
             current_cycle: self.current_cycle.load(Ordering::Relaxed),
             total_cycles: self.total_cycles.load(Ordering::Relaxed),
-            current_scan_duration: None, // Will be set by scanner
+            current_scan_duration: None,       // Will be set by scanner
             avg_scan_duration: Duration::ZERO, // Will be calculated
-            objects_per_second: 0.0, // Will be calculated
-            buckets_per_second: 0.0, // Will be calculated
-            bucket_metrics: HashMap::new(), // Will be populated by scanner
-            disk_metrics: HashMap::new(), // Will be populated by scanner
+            objects_per_second: 0.0,           // Will be calculated
+            buckets_per_second: 0.0,           // Will be calculated
+            bucket_metrics: HashMap::new(),    // Will be populated by scanner
+            disk_metrics: HashMap::new(),      // Will be populated by scanner
         }
     }
 
@@ -234,7 +234,7 @@ impl MetricsCollector {
         self.heal_tasks_failed.store(0, Ordering::Relaxed);
         self.current_cycle.store(0, Ordering::Relaxed);
         self.total_cycles.store(0, Ordering::Relaxed);
-        
+
         info!("Scanner metrics reset");
     }
 }
@@ -260,11 +260,11 @@ mod tests {
     #[test]
     fn test_metrics_increment() {
         let collector = MetricsCollector::new();
-        
+
         collector.increment_objects_scanned(10);
         collector.increment_versions_scanned(5);
         collector.increment_objects_with_issues(2);
-        
+
         let metrics = collector.get_metrics();
         assert_eq!(metrics.objects_scanned, 10);
         assert_eq!(metrics.versions_scanned, 5);
@@ -274,11 +274,11 @@ mod tests {
     #[test]
     fn test_metrics_reset() {
         let collector = MetricsCollector::new();
-        
+
         collector.increment_objects_scanned(10);
         collector.reset();
-        
+
         let metrics = collector.get_metrics();
         assert_eq!(metrics.objects_scanned, 0);
     }
-} 
+}

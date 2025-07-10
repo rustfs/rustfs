@@ -1,6 +1,6 @@
 [package]
 name = "rustfs-ahm"
-version = "0.1.0"
+version = "0.0.3"
 edition = "2021"
 authors = ["RustFS Team"]
 license = "Apache-2.0"
@@ -16,6 +16,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 time = { workspace = true, features = ["serde"] }
@@ -25,6 +26,8 @@ async-trait = "0.1"
 futures = "0.3"
 url = "2.4"
 rustfs-lock = { workspace = true }
+
+lazy_static = "1.4"
 
 [dev-dependencies]
 rmp-serde = { workspace = true }

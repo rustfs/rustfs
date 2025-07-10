@@ -42,20 +42,20 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use license::init_license;
+use rustfs_ahm::scanner::data_scanner::ScannerConfig;
+use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_services};
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_ConfigSys;
-use rustfs_ecstore::heal::background_heal_ops::init_auto_heal;
 use rustfs_ecstore::rpc::make_server;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
     endpoints::EndpointServerPools,
-    global::{create_background_services_cancel_token, set_global_rustfs_port, shutdown_background_services},
-    heal::data_scanner::init_data_scanner,
+    global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
@@ -452,11 +452,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     // let _background_services_cancel_token = create_background_services_cancel_token();
     // init_data_scanner().await;
     // init_auto_heal().await;
-    // // init console configuration
-    // init_console_cfg(local_ip, server_port);
+    let _ = create_ahm_services_cancel_token();
+    let scanner = Scanner::new(Some(ScannerConfig::default()));
+    scanner.start().await?;
 
-    // print_server_info();
-    // init_bucket_replication_pool().await;
+    // init console configuration
+    init_console_cfg(local_ip, server_port);
+    print_server_info();
+    init_bucket_replication_pool().await;
 
     // Async update check (optional)
     tokio::spawn(async {
@@ -631,6 +634,10 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
     // Stop background services (data scanner and auto heal) gracefully
     info!("Stopping background services (data scanner and auto heal)...");
     shutdown_background_services();
+
+    // Stop AHM services gracefully
+    info!("Stopping AHM services...");
+    shutdown_ahm_services();
 
     // Stop the notification system
     shutdown_event_notifier().await;

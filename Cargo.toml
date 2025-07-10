@@ -63,6 +63,7 @@ rustfs-filemeta = { path = "crates/filemeta" }
 rustfs-rio = { path = "crates/rio" }
 
 [workspace.dependencies]
+rustfs-ahm = { path = "crates/ahm", version = "0.0.3" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }

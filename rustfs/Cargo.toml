@@ -34,6 +34,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+rustfs-ahm = { workspace = true }
 rustfs-zip = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-s3select-api = { workspace = true }
