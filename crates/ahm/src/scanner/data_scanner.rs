@@ -734,7 +734,7 @@ impl Scanner {
                     objects_needing_heal += 1;
                     let missing_disks: Vec<usize> = (0..disks.len()).filter(|&i| !locations.contains(&i)).collect();
                     warn!("Object {}/{} missing from disks: {:?}", bucket, object_name, missing_disks);
-                    println!("Object {}/{} missing from disks: {:?}", bucket, object_name, missing_disks);
+                    println!("Object {bucket}/{object_name} missing from disks: {missing_disks:?}");
                     // TODO: Trigger heal for this object
                 }
 
@@ -839,7 +839,7 @@ impl Scanner {
                     );
                 }
                 Err(e) => {
-                    let error_msg = format!("{}", e);
+                    let error_msg = format!("{e}");
                     errors.push(error_msg);
                     debug!(
                         "Failed to read object {}/{} from disk {} (index: {}): {}",
@@ -864,8 +864,7 @@ impl Scanner {
             Ok(())
         } else {
             Err(Error::Scanner(format!(
-                "EC decode verification failed for object {}/{}: need {} reads, got {} (errors: {:?})",
-                bucket, object, read_quorum, successful_reads, errors
+                "EC decode verification failed for object {bucket}/{object}: need {read_quorum} reads, got {successful_reads} (errors: {errors:?})"
             )))
         }
     }
@@ -942,7 +941,7 @@ impl Scanner {
                     continue; // skip internal bucket from data usage stats
                 }
                 for object_name in objects.keys() {
-                    let object_key = format!("{}/{}", bucket_name, object_name);
+                    let object_key = format!("{bucket_name}/{object_name}");
 
                     // Skip if already processed (avoid duplicates across disks)
                     if !processed_objects.insert(object_key.clone()) {
@@ -1071,7 +1070,7 @@ mod tests {
 
         // create ECStore with dynamic port
         let port = port.unwrap_or(9000);
-        let server_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
 
         // init bucket metadata system
@@ -1141,24 +1140,24 @@ mod tests {
         // Note: This might fail if ECStore is actively using the file
         match fs::remove_dir_all(&disk1_object_path) {
             Ok(_) => {
-                println!("Successfully deleted object from disk1: {:?}", disk1_object_path);
+                println!("Successfully deleted object from disk1: {disk1_object_path:?}");
 
                 // Verify deletion by checking if the directory still exists
                 if disk1_object_path.exists() {
-                    println!("WARNING: Directory still exists after deletion: {:?}", disk1_object_path);
+                    println!("WARNING: Directory still exists after deletion: {disk1_object_path:?}");
                 } else {
                     println!("Confirmed: Directory was successfully deleted");
                 }
             }
             Err(e) => {
-                println!("Could not delete object from disk1 (file may be in use): {:?} - {}", disk1_object_path, e);
+                println!("Could not delete object from disk1 (file may be in use): {disk1_object_path:?} - {e}");
                 // This is expected behavior - ECStore might be holding file handles
             }
         }
 
         // Scan again - should still complete (even with missing data)
         let scan_result_after_corruption = scanner.scan_cycle().await;
-        println!("Scan after corruption result: {:?}", scan_result_after_corruption);
+        println!("Scan after corruption result: {scan_result_after_corruption:?}");
 
         // Scanner should handle missing data gracefully
         assert!(scan_result_after_corruption.is_ok(), "Scanner should handle missing data gracefully");
@@ -1172,7 +1171,7 @@ mod tests {
         // Test 4: Test metrics collection
         println!("=== Test 4: Metrics collection ===");
         let final_metrics = scanner.get_metrics().await;
-        println!("Final metrics: {:?}", final_metrics);
+        println!("Final metrics: {final_metrics:?}");
 
         // Verify metrics are reasonable
         assert!(final_metrics.total_cycles > 0, "Should have completed scan cycles");
@@ -1181,7 +1180,7 @@ mod tests {
         // clean up temp dir
         let temp_dir = std::path::PathBuf::from(TEST_DIR_BASIC);
         if let Err(e) = fs::remove_dir_all(&temp_dir) {
-            eprintln!("Warning: Failed to clean up temp directory {:?}: {}", temp_dir, e);
+            eprintln!("Warning: Failed to clean up temp directory {temp_dir:?}: {e}");
         }
     }
 
@@ -1216,7 +1215,7 @@ mod tests {
 
         // write 3 more objects and get statistics again
         for size in [1024, 2048, 4096] {
-            let name = format!("obj_{}", size);
+            let name = format!("obj_{size}");
             let mut pr = PutObjReader::from_vec(vec![b'x'; size]);
             ecstore.put_object(bucket, &name, &mut pr, &Default::default()).await.unwrap();
         }

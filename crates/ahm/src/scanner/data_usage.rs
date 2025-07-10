@@ -516,7 +516,7 @@ impl SizeSummary {
 /// Store data usage info to backend storage
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<()> {
     let data =
-        serde_json::to_vec(&data_usage_info).map_err(|e| Error::Config(format!("Failed to serialize data usage info: {}", e)))?;
+        serde_json::to_vec(&data_usage_info).map_err(|e| Error::Config(format!("Failed to serialize data usage info: {e}")))?;
 
     // Save to backend using the same mechanism as original code
     rustfs_ecstore::config::com::save_config(store, &DATA_USAGE_OBJ_NAME_PATH, data)
@@ -540,7 +540,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     };
 
     let mut data_usage_info: DataUsageInfo =
-        serde_json::from_slice(&buf).map_err(|e| Error::Config(format!("Failed to deserialize data usage info: {}", e)))?;
+        serde_json::from_slice(&buf).map_err(|e| Error::Config(format!("Failed to deserialize data usage info: {e}")))?;
 
     warn!("Loaded data usage info from backend {:?}", &data_usage_info);
 
