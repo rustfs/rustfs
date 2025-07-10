@@ -81,7 +81,7 @@ jobs:
           cancel_others: true
           paths_ignore: '["*.md", "docs/**", "deploy/**"]'
           # Never skip release events and tag pushes
-          do_not_skip: '["release", "push"]'
+          do_not_skip: '["workflow_dispatch", "schedule", "merge_group", "release", "push"]'
 
   test-and-lint:
     name: Test and Lint
