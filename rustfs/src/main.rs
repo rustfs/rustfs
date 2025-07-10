@@ -31,16 +31,22 @@ use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, Shutdow
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
+use rustfs_ahm::scanner::data_scanner::ScannerConfig;
+use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_services};
 use rustfs_common::globals::set_global_addr;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_ConfigSys;
-use rustfs_ecstore::heal::background_heal_ops::init_auto_heal;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
-    StorageAPI, endpoints::EndpointServerPools, global::set_global_rustfs_port, heal::data_scanner::init_data_scanner,
-    notification_sys::new_global_notification_sys, set_global_endpoints, store::ECStore, store::init_local_disks,
+    StorageAPI,
+    endpoints::EndpointServerPools,
+    global::{set_global_rustfs_port, shutdown_background_services},
+    notification_sys::new_global_notification_sys,
+    set_global_endpoints,
+    store::ECStore,
+    store::init_local_disks,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -175,10 +181,13 @@ async fn run(opt: config::Opt) -> Result<()> {
         Error::other(err)
     })?;
 
-    // init scanner
-    let scanner_cancel_token = init_data_scanner().await;
-    // init auto heal
-    init_auto_heal().await;
+    // init scanner and auto heal with unified cancellation token
+    // let _background_services_cancel_token = create_background_services_cancel_token();
+    // init_data_scanner().await;
+    // init_auto_heal().await;
+    let _ = create_ahm_services_cancel_token();
+    let scanner = Scanner::new(Some(ScannerConfig::default()));
+    scanner.start().await?;
 
     print_server_info();
     init_bucket_replication_pool().await;
@@ -221,11 +230,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx, &scanner_cancel_token).await;
+            handle_shutdown(&state_manager, &shutdown_tx).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx, &scanner_cancel_token).await;
+            handle_shutdown(&state_manager, &shutdown_tx).await;
         }
     }
 
@@ -234,18 +243,18 @@ async fn run(opt: config::Opt) -> Result<()> {
 }
 
 /// Handles the shutdown process of the server
-async fn handle_shutdown(
-    state_manager: &ServiceStateManager,
-    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
-    scanner_cancel_token: &tokio_util::sync::CancellationToken,
-) {
+async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
     info!("Shutdown signal received in main thread");
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);
 
-    // Stop data scanner gracefully
-    info!("Stopping data scanner...");
-    scanner_cancel_token.cancel();
+    // Stop background services (data scanner and auto heal) gracefully
+    info!("Stopping background services (data scanner and auto heal)...");
+    shutdown_background_services();
+
+    // Stop AHM services gracefully
+    info!("Stopping AHM services...");
+    shutdown_ahm_services();
 
     // Stop the notification system
     shutdown_event_notifier().await;
