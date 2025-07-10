@@ -20,14 +20,13 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
 
 use time::{self, OffsetDateTime};
-use tokio_util::sync::CancellationToken;
 
 use super::{
     data_scanner_metric::{ScannerMetric, ScannerMetrics, globalScannerMetrics},
@@ -51,7 +50,7 @@ use crate::{
         metadata_sys,
     },
     event_notification::{EventArgs, send_event},
-    global::GLOBAL_LocalNodeName,
+    global::{GLOBAL_LocalNodeName, get_background_services_cancel_token},
     store_api::{ObjectOptions, ObjectToDelete, StorageAPI},
 };
 use crate::{
@@ -128,8 +127,6 @@ lazy_static! {
     pub static ref globalHealConfig: Arc<RwLock<Config>> = Arc::new(RwLock::new(Config::default()));
 }
 
-static GLOBAL_SCANNER_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
-
 struct DynamicSleeper {
     factor: f64,
     max_sleep: Duration,
@@ -198,21 +195,18 @@ fn new_dynamic_sleeper(factor: f64, max_wait: Duration, is_scanner: bool) -> Dyn
 /// - Minimum sleep duration to avoid excessive CPU usage
 /// - Proper error handling and logging
 ///
-/// # Returns
-/// A CancellationToken that can be used to gracefully shutdown the scanner
-///
 /// # Architecture
 /// 1. Initialize with random seed for sleep intervals
 /// 2. Run scanner cycles in a loop
 /// 3. Use randomized sleep between cycles to avoid thundering herd
 /// 4. Ensure minimum sleep duration to prevent CPU thrashing
-pub async fn init_data_scanner() -> CancellationToken {
+pub async fn init_data_scanner() {
     info!("Initializing data scanner background task");
 
-    let cancel_token = CancellationToken::new();
-    GLOBAL_SCANNER_CANCEL_TOKEN
-        .set(cancel_token.clone())
-        .expect("Scanner already initialized");
+    let Some(cancel_token) = get_background_services_cancel_token() else {
+        error!("Background services cancel token not initialized");
+        return;
+    };
 
     let cancel_clone = cancel_token.clone();
     tokio::spawn(async move {
@@ -256,8 +250,6 @@ pub async fn init_data_scanner() -> CancellationToken {
 
         info!("Data scanner background task stopped gracefully");
     });
-
-    cancel_token
 }
 
 /// Run a single data scanner cycle
@@ -282,7 +274,7 @@ async fn run_data_scanner_cycle() {
     };
 
     // Check for cancellation before starting expensive operations
-    if let Some(token) = GLOBAL_SCANNER_CANCEL_TOKEN.get() {
+    if let Some(token) = get_background_services_cancel_token() {
         if token.is_cancelled() {
             debug!("Scanner cancelled before starting cycle");
             return;
@@ -397,9 +389,8 @@ async fn execute_namespace_scan(
     cycle: u64,
     scan_mode: HealScanMode,
 ) -> Result<()> {
-    let cancel_token = GLOBAL_SCANNER_CANCEL_TOKEN
-        .get()
-        .ok_or_else(|| Error::other("Scanner not initialized"))?;
+    let cancel_token =
+        get_background_services_cancel_token().ok_or_else(|| Error::other("Background services not initialized"))?;
 
     tokio::select! {
         result = store.ns_scanner(tx, cycle as usize, scan_mode) => {

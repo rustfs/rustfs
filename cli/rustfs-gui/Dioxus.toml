@@ -37,7 +37,9 @@ copyright = "Copyright 2025 rustfs.com"
 
 icon = [
     "assets/icons/icon.icns",
-    "assets/icons/icon.ico"
+    "assets/icons/icon.ico",
+    "assets/icons/icon.png",
+    "assets/icons/rustfs-icon.png",
 ]
 #[bundle.macos]
 #provider_short_name = "RustFs"

@@ -36,6 +36,7 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
+    "crates/ahm",
 ]
 resolver = "2"
 
@@ -62,6 +63,7 @@ rustfs-filemeta = { path = "crates/filemeta" }
 rustfs-rio = { path = "crates/rio" }
 
 [workspace.dependencies]
+rustfs-ahm = { path = "crates/ahm", version = "0.0.3" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
@@ -261,6 +263,7 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
+anyhow = "1.0.86"
 
 [profile.wasm-dev]
 inherits = "dev"
