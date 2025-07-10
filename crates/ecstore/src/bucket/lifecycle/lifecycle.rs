@@ -272,7 +272,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
                         }
                     }
-    				    }
+                        }
             }*/
         }
         for (i, _) in self.rules.iter().enumerate() {

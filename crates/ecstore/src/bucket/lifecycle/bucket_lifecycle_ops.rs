@@ -810,8 +810,8 @@ impl LifecycleOps for ObjectInfo {
             num_versions: self.num_versions,
             delete_marker: self.delete_marker,
             successor_mod_time: self.successor_mod_time,
-            restore_ongoing:    self.restore_ongoing,
-            restore_expires:    self.restore_expires,
+            restore_ongoing: self.restore_ongoing,
+            restore_expires: self.restore_expires,
             transition_status: self.transitioned_object.status.clone(),
             ..Default::default()
         }
