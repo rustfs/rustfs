@@ -32,7 +32,6 @@ async-trait.workspace = true
 datafusion = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
-lazy_static = { workspace = true }
 parking_lot = { workspace = true }
 s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }

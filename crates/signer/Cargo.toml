@@ -27,7 +27,6 @@ documentation = "https://docs.rs/rustfs-signer/latest/rustfs_signer/"
 
 [dependencies]
 tracing.workspace = true
-lazy_static.workspace = true
 bytes = { workspace = true }
 http.workspace = true
 time.workspace = true
