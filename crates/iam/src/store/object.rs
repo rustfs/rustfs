@@ -37,7 +37,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Sender};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 lazy_static! {
     pub static ref IAM_CONFIG_PREFIX: String = format!("{}/iam", RUSTFS_CONFIG_PREFIX);
@@ -370,7 +370,15 @@ impl Store for ObjectStore {
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         let mut data = read_config(self.object_api.clone(), path.as_ref()).await?;
 
-        data = Self::decrypt_data(&data)?;
+        data = match Self::decrypt_data(&data) {
+            Ok(v) => v,
+            Err(err) => {
+                debug!("decrypt_data failed: {}", err);
+                // delete the config file when decrypt failed
+                let _ = self.delete_iam_config(path.as_ref()).await;
+                return Err(Error::ConfigNotFound);
+            }
+        };
 
         Ok(serde_json::from_slice(&data)?)
     }
