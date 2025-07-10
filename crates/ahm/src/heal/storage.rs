@@ -16,82 +16,96 @@ use crate::error::{Error, Result};
 use async_trait::async_trait;
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
+    heal::heal_commands::{HealOpts, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
     store_api::{BucketInfo, StorageAPI, ObjectIO},
     store::ECStore,
 };
+use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-/// 磁盘状态
+/// Disk status for heal operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskStatus {
-    /// 正常
+    /// Ok
     Ok,
-    /// 离线
+    /// Offline
     Offline,
-    /// 损坏
+    /// Corrupt
     Corrupt,
-    /// 缺失
+    /// Missing
     Missing,
-    /// 权限错误
+    /// Permission denied
     PermissionDenied,
-    /// 故障
+    /// Faulty
     Faulty,
-    /// 根挂载
+    /// Root mount
     RootMount,
-    /// 未知
+    /// Unknown
     Unknown,
-    /// 未格式化
+    /// Unformatted
     Unformatted,
 }
 
-/// Heal 存储层接口
+/// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
-    /// 获取对象元数据
+    /// Get object meta
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>>;
     
-    /// 获取对象数据
+    /// Get object data
     async fn get_object_data(&self, bucket: &str, object: &str) -> Result<Option<Vec<u8>>>;
     
-    /// 写入对象数据
+    /// Put object data
     async fn put_object_data(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()>;
     
-    /// 删除对象
+    /// Delete object
     async fn delete_object(&self, bucket: &str, object: &str) -> Result<()>;
     
-    /// 检查对象完整性
+    /// Check object integrity
     async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<bool>;
     
-    /// EC 解码重建
+    /// EC decode rebuild
     async fn ec_decode_rebuild(&self, bucket: &str, object: &str) -> Result<Vec<u8>>;
     
-    /// 获取磁盘状态
+    /// Get disk status
     async fn get_disk_status(&self, endpoint: &Endpoint) -> Result<DiskStatus>;
     
-    /// 格式化磁盘
+    /// Format disk
     async fn format_disk(&self, endpoint: &Endpoint) -> Result<()>;
     
-    /// 获取桶信息
+    /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
     
-    /// 修复桶元数据
+    /// Fix bucket metadata
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()>;
     
-    /// 获取所有桶列表
+    /// Get all buckets
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>>;
     
-    /// 检查对象是否存在
+    /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
     
-    /// 获取对象大小
+    /// Get object size
     async fn get_object_size(&self, bucket: &str, object: &str) -> Result<Option<u64>>;
     
-    /// 获取对象校验和
+    /// Get object checksum
     async fn get_object_checksum(&self, bucket: &str, object: &str) -> Result<Option<String>>;
+
+    /// Heal object using ecstore
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>, opts: &HealOpts) -> Result<(HealResultItem, Option<Error>)>;
+    
+    /// Heal bucket using ecstore
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
+    
+    /// Heal format using ecstore
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
+    
+    /// List objects for healing
+    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>>;
 }
 
-/// ECStore Heal 存储层实现
+/// ECStore Heal storage layer implementation
 pub struct ECStoreHealStorage {
     ecstore: Arc<ECStore>,
 }
@@ -119,7 +133,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn get_object_data(&self, bucket: &str, object: &str) -> Result<Option<Vec<u8>>> {
         debug!("Getting object data: {}/{}", bucket, object);
         
-        match self.ecstore.get_object_reader(bucket, object, None, Default::default(), &Default::default()).await {
+        match (&*self.ecstore).get_object_reader(bucket, object, None, Default::default(), &Default::default()).await {
             Ok(mut reader) => {
                 match reader.read_all().await {
                     Ok(data) => Ok(Some(data)),
@@ -140,7 +154,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         debug!("Putting object data: {}/{} ({} bytes)", bucket, object, data.len());
         
         let mut reader = rustfs_ecstore::store_api::PutObjReader::from_vec(data.to_vec());
-        match self.ecstore.put_object(bucket, object, &mut reader, &Default::default()).await {
+        match (&*self.ecstore).put_object(bucket, object, &mut reader, &Default::default()).await {
             Ok(_) => {
                 info!("Successfully put object: {}/{}", bucket, object);
                 Ok(())
@@ -170,37 +184,79 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<bool> {
         debug!("Verifying object integrity: {}/{}", bucket, object);
         
-        // TODO: 实现对象完整性检查
-        // 1. 获取对象元数据
-        // 2. 检查数据块完整性
-        // 3. 验证校验和
-        // 4. 检查 EC 编码正确性
-        
-        // 临时实现：总是返回 true
-        info!("Object integrity check passed: {}/{}", bucket, object);
-        Ok(true)
+        // Try to get object info and data to verify integrity
+        match self.get_object_meta(bucket, object).await? {
+            Some(obj_info) => {
+                // Check if object has valid metadata
+                if obj_info.size < 0 {
+                    warn!("Object has invalid size: {}/{}", bucket, object);
+                    return Ok(false);
+                }
+                
+                // Try to read object data to verify it's accessible
+                match self.get_object_data(bucket, object).await {
+                    Ok(Some(_)) => {
+                        info!("Object integrity check passed: {}/{}", bucket, object);
+                        Ok(true)
+                    }
+                    Ok(None) => {
+                        warn!("Object data not found: {}/{}", bucket, object);
+                        Ok(false)
+                    }
+                    Err(_) => {
+                        warn!("Object data read failed: {}/{}", bucket, object);
+                        Ok(false)
+                    }
+                }
+            }
+            None => {
+                warn!("Object metadata not found: {}/{}", bucket, object);
+                Ok(false)
+            }
+        }
     }
     
     async fn ec_decode_rebuild(&self, bucket: &str, object: &str) -> Result<Vec<u8>> {
         debug!("EC decode rebuild: {}/{}", bucket, object);
         
-        // TODO: 实现 EC 解码重建
-        // 1. 获取对象元数据
-        // 2. 读取可用的数据块
-        // 3. 使用 EC 算法重建缺失数据
-        // 4. 返回完整数据
+        // Use ecstore's heal_object to rebuild the object
+        let heal_opts = HealOpts {
+            recursive: false,
+            dry_run: false,
+            remove: false,
+            recreate: true,
+            scan_mode: HEAL_DEEP_SCAN,
+            update_parity: true,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
         
-        // 临时实现：尝试获取对象数据
-        match self.get_object_data(bucket, object).await? {
-            Some(data) => {
-                info!("EC decode rebuild successful: {}/{}", bucket, object);
-                Ok(data)
+        match self.heal_object(bucket, object, None, &heal_opts).await {
+            Ok((_result, error)) => {
+                if error.is_some() {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Heal failed: {:?}", error),
+                    });
+                }
+                
+                // After healing, try to read the object data
+                match self.get_object_data(bucket, object).await? {
+                    Some(data) => {
+                        info!("EC decode rebuild successful: {}/{} ({} bytes)", bucket, object, data.len());
+                        Ok(data)
+                    }
+                    None => {
+                        error!("Object not found after heal: {}/{}", bucket, object);
+                        Err(Error::TaskExecutionFailed {
+                            message: format!("Object not found after heal: {}/{}", bucket, object),
+                        })
+                    }
+                }
             }
-            None => {
-                error!("Object not found for EC decode: {}/{}", bucket, object);
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Object not found: {}/{}", bucket, object),
-                })
+            Err(e) => {
+                error!("Heal operation failed: {}/{} - {}", bucket, object, e);
+                Err(e)
             }
         }
     }
@@ -208,13 +264,8 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn get_disk_status(&self, endpoint: &Endpoint) -> Result<DiskStatus> {
         debug!("Getting disk status: {:?}", endpoint);
         
-        // TODO: 实现磁盘状态检查
-        // 1. 检查磁盘是否可访问
-        // 2. 检查磁盘格式
-        // 3. 检查权限
-        // 4. 返回状态
-        
-        // 临时实现：总是返回 Ok
+        // TODO: implement disk status check using ecstore
+        // For now, return Ok status
         info!("Disk status check: {:?} - OK", endpoint);
         Ok(DiskStatus::Ok)
     }
@@ -222,14 +273,20 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn format_disk(&self, endpoint: &Endpoint) -> Result<()> {
         debug!("Formatting disk: {:?}", endpoint);
         
-        // TODO: 实现磁盘格式化
-        // 1. 检查磁盘权限
-        // 2. 执行格式化操作
-        // 3. 验证格式化结果
-        
-        // 临时实现：总是成功
-        info!("Disk formatted successfully: {:?}", endpoint);
-        Ok(())
+        // Use ecstore's heal_format
+        match self.heal_format(false).await {
+            Ok((_, error)) => {
+                if error.is_some() {
+                    return Err(Error::other(format!("Format failed: {:?}", error)));
+                }
+                info!("Successfully formatted disk: {:?}", endpoint);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to format disk: {:?} - {}", endpoint, e);
+                Err(e)
+            }
+        }
     }
     
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {
@@ -247,14 +304,28 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()> {
         debug!("Healing bucket metadata: {}", bucket);
         
-        // TODO: 实现桶元数据修复
-        // 1. 检查桶元数据完整性
-        // 2. 修复损坏的元数据
-        // 3. 更新桶配置
+        let heal_opts = HealOpts {
+            recursive: true,
+            dry_run: false,
+            remove: false,
+            recreate: false,
+            scan_mode: HEAL_NORMAL_SCAN,
+            update_parity: false,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
         
-        // 临时实现：总是成功
-        info!("Bucket metadata healed successfully: {}", bucket);
-        Ok(())
+        match self.heal_bucket(bucket, &heal_opts).await {
+            Ok(_) => {
+                info!("Successfully healed bucket metadata: {}", bucket);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to heal bucket metadata: {} - {}", bucket, e);
+                Err(e)
+            }
+        }
     }
     
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -270,36 +341,106 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
     
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool> {
-        debug!("Checking if object exists: {}/{}", bucket, object);
+        debug!("Checking object exists: {}/{}", bucket, object);
         
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                error!("Failed to check object existence: {}/{} - {}", bucket, object, e);
-                Err(Error::other(e))
-            }
+        match self.get_object_meta(bucket, object).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(_) => Ok(false),
         }
     }
     
     async fn get_object_size(&self, bucket: &str, object: &str) -> Result<Option<u64>> {
         debug!("Getting object size: {}/{}", bucket, object);
         
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
-            Ok(info) => Ok(Some(info.size as u64)),
-            Err(e) => {
-                error!("Failed to get object size: {}/{} - {}", bucket, object, e);
-                Err(Error::other(e))
-            }
+        match self.get_object_meta(bucket, object).await {
+            Ok(Some(obj_info)) => Ok(Some(obj_info.size as u64)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
     }
     
     async fn get_object_checksum(&self, bucket: &str, object: &str) -> Result<Option<String>> {
         debug!("Getting object checksum: {}/{}", bucket, object);
         
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
-            Ok(info) => Ok(info.etag),
+        match self.get_object_meta(bucket, object).await {
+            Ok(Some(obj_info)) => {
+                // Convert checksum bytes to hex string
+                let checksum = obj_info.checksum.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
+                Ok(Some(checksum))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>, opts: &HealOpts) -> Result<(HealResultItem, Option<Error>)> {
+        debug!("Healing object: {}/{}", bucket, object);
+        
+        let version_id_str = version_id.unwrap_or("");
+        
+        match self.ecstore.heal_object(bucket, object, version_id_str, opts).await {
+            Ok((result, ecstore_error)) => {
+                let error = ecstore_error.map(|e| Error::other(e));
+                info!("Heal object completed: {}/{} - result: {:?}, error: {:?}", bucket, object, result, error);
+                Ok((result, error))
+            }
             Err(e) => {
-                error!("Failed to get object checksum: {}/{} - {}", bucket, object, e);
+                error!("Heal object failed: {}/{} - {}", bucket, object, e);
+                Err(Error::other(e))
+            }
+        }
+    }
+    
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        debug!("Healing bucket: {}", bucket);
+        
+        match self.ecstore.heal_bucket(bucket, opts).await {
+            Ok(result) => {
+                info!("Heal bucket completed: {} - result: {:?}", bucket, result);
+                Ok(result)
+            }
+            Err(e) => {
+                error!("Heal bucket failed: {} - {}", bucket, e);
+                Err(Error::other(e))
+            }
+        }
+    }
+    
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        debug!("Healing format (dry_run: {})", dry_run);
+        
+        match self.ecstore.heal_format(dry_run).await {
+            Ok((result, ecstore_error)) => {
+                let error = ecstore_error.map(|e| Error::other(e));
+                info!("Heal format completed - result: {:?}, error: {:?}", result, error);
+                Ok((result, error))
+            }
+            Err(e) => {
+                error!("Heal format failed: {}", e);
+                Err(Error::other(e))
+            }
+        }
+    }
+    
+    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+        debug!("Listing objects for heal: {}/{}", bucket, prefix);
+        
+        // Use list_objects_v2 to get objects
+        match self.ecstore.clone().list_objects_v2(
+            bucket, prefix, None, None, 1000, false, None
+        ).await {
+            Ok(list_info) => {
+                let objects: Vec<String> = list_info.objects.into_iter()
+                    .map(|obj| obj.name)
+                    .collect();
+                info!("Found {} objects for heal in {}/{}", objects.len(), bucket, prefix);
+                Ok(objects)
+            }
+            Err(e) => {
+                error!("Failed to list objects for heal: {}/{} - {}", bucket, prefix, e);
                 Err(Error::other(e))
             }
         }

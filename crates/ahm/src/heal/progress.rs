@@ -17,23 +17,23 @@ use std::time::SystemTime;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct HealProgress {
-    /// 已扫描对象数
+    /// Objects scanned
     pub objects_scanned: u64,
-    /// 已修复对象数
+    /// Objects healed
     pub objects_healed: u64,
-    /// 修复失败对象数
+    /// Objects failed
     pub objects_failed: u64,
-    /// 已处理字节数
+    /// Bytes processed
     pub bytes_processed: u64,
-    /// 当前处理的对象
+    /// Current object
     pub current_object: Option<String>,
-    /// 进度百分比
+    /// Progress percentage
     pub progress_percentage: f64,
-    /// 开始时间
+    /// Start time
     pub start_time: Option<SystemTime>,
-    /// 最后更新时间
+    /// Last update time
     pub last_update_time: Option<SystemTime>,
-    /// 预计完成时间
+    /// Estimated completion time
     pub estimated_completion_time: Option<SystemTime>,
 }
 
@@ -53,7 +53,7 @@ impl HealProgress {
         self.bytes_processed = bytes;
         self.last_update_time = Some(SystemTime::now());
 
-        // 计算进度百分比
+        // calculate progress percentage
         let total = scanned + healed + failed;
         if total > 0 {
             self.progress_percentage = (healed as f64 / total as f64) * 100.0;
@@ -81,19 +81,19 @@ impl HealProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealStatistics {
-    /// 总 heal 任务数
+    /// Total heal tasks
     pub total_tasks: u64,
-    /// 成功完成的任务数
+    /// Successful tasks
     pub successful_tasks: u64,
-    /// 失败的任务数
+    /// Failed tasks
     pub failed_tasks: u64,
-    /// 正在运行的任务数
+    /// Running tasks
     pub running_tasks: u64,
-    /// 总修复对象数
+    /// Total healed objects
     pub total_objects_healed: u64,
-    /// 总修复字节数
+    /// Total healed bytes
     pub total_bytes_healed: u64,
-    /// 最后更新时间
+    /// Last update time
     pub last_update_time: SystemTime,
 }
 

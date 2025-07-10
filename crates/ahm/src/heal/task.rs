@@ -12,43 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::heal::{progress::HealProgress, storage::HealStorageAPI};
 use rustfs_ecstore::disk::endpoint::Endpoint;
+use crate::heal::storage::DiskStatus;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// Heal 扫描模式
+/// Heal scan mode
 pub type HealScanMode = usize;
 
 pub const HEAL_UNKNOWN_SCAN: HealScanMode = 0;
 pub const HEAL_NORMAL_SCAN: HealScanMode = 1;
 pub const HEAL_DEEP_SCAN: HealScanMode = 2;
 
-/// Heal 类型
+/// Heal type
 #[derive(Debug, Clone)]
 pub enum HealType {
-    /// 对象 heal
+    /// Object heal
     Object {
         bucket: String,
         object: String,
         version_id: Option<String>,
     },
-    /// 桶 heal
+    /// Bucket heal
     Bucket {
         bucket: String,
     },
-    /// 磁盘 heal
+    /// Disk heal
     Disk {
         endpoint: Endpoint,
     },
-    /// 元数据 heal
+    /// Metadata heal
     Metadata {
         bucket: String,
         object: String,
@@ -57,7 +58,7 @@ pub enum HealType {
     MRF {
         meta_path: String,
     },
-    /// EC 解码 heal
+    /// EC decode heal
     ECDecode {
         bucket: String,
         object: String,
@@ -65,16 +66,16 @@ pub enum HealType {
     },
 }
 
-/// Heal 优先级
+/// Heal priority
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HealPriority {
-    /// 低优先级
+    /// Low priority
     Low = 0,
-    /// 普通优先级
+    /// Normal priority
     Normal = 1,
-    /// 高优先级
+    /// High priority
     High = 2,
-    /// 紧急优先级
+    /// Urgent priority
     Urgent = 3,
 }
 
@@ -84,22 +85,22 @@ impl Default for HealPriority {
     }
 }
 
-/// Heal 选项
+/// Heal options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealOptions {
-    /// 扫描模式
+    /// Scan mode
     pub scan_mode: HealScanMode,
-    /// 是否删除损坏数据
+    /// Whether to remove corrupted data
     pub remove_corrupted: bool,
-    /// 是否重新创建
+    /// Whether to recreate
     pub recreate_missing: bool,
-    /// 是否更新奇偶校验
+    /// Whether to update parity
     pub update_parity: bool,
-    /// 是否递归处理
+    /// Whether to recursively process
     pub recursive: bool,
-    /// 是否试运行
+    /// Whether to dry run
     pub dry_run: bool,
-    /// 超时时间
+    /// Timeout
     pub timeout: Option<Duration>,
 }
 
@@ -112,40 +113,40 @@ impl Default for HealOptions {
             update_parity: true,
             recursive: false,
             dry_run: false,
-            timeout: Some(Duration::from_secs(300)), // 5分钟默认超时
+            timeout: Some(Duration::from_secs(300)), // 5 minutes default timeout
         }
     }
 }
 
-/// Heal 任务状态
+/// Heal task status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HealTaskStatus {
-    /// 等待中
+    /// Pending
     Pending,
-    /// 运行中
+    /// Running
     Running,
-    /// 完成
+    /// Completed
     Completed,
-    /// 失败
+    /// Failed
     Failed { error: String },
-    /// 取消
+    /// Cancelled
     Cancelled,
-    /// 超时
+    /// Timeout
     Timeout,
 }
 
-/// Heal 请求
+/// Heal request
 #[derive(Debug, Clone)]
 pub struct HealRequest {
-    /// 请求 ID
+    /// Request ID
     pub id: String,
-    /// Heal 类型
+    /// Heal type
     pub heal_type: HealType,
-    /// Heal 选项
+    /// Heal options
     pub options: HealOptions,
-    /// 优先级
+    /// Priority
     pub priority: HealPriority,
-    /// 创建时间
+    /// Created time
     pub created_at: SystemTime,
 }
 
@@ -209,27 +210,27 @@ impl HealRequest {
     }
 }
 
-/// Heal 任务
+/// Heal task
 pub struct HealTask {
-    /// 任务 ID
+    /// Task ID
     pub id: String,
-    /// Heal 类型
+    /// Heal type
     pub heal_type: HealType,
-    /// Heal 选项
+    /// Heal options
     pub options: HealOptions,
-    /// 任务状态
+    /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
-    /// 进度跟踪
+    /// Progress tracking
     pub progress: Arc<RwLock<HealProgress>>,
-    /// 创建时间
+    /// Created time
     pub created_at: SystemTime,
-    /// 开始时间
+    /// Started time
     pub started_at: Arc<RwLock<Option<SystemTime>>>,
-    /// 完成时间
+    /// Completed time
     pub completed_at: Arc<RwLock<Option<SystemTime>>>,
-    /// 取消令牌
+    /// Cancel token
     pub cancel_token: tokio_util::sync::CancellationToken,
-    /// 存储层接口
+    /// Storage layer interface
     pub storage: Arc<dyn HealStorageAPI>,
 }
 
@@ -250,7 +251,7 @@ impl HealTask {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // 更新状态为运行中
+        // update status to running
         {
             let mut status = self.status.write().await;
             *status = HealTaskStatus::Running;
@@ -283,7 +284,7 @@ impl HealTask {
             }
         };
 
-        // 更新完成时间和状态
+        // update completed time and status
         {
             let mut completed_at = self.completed_at.write().await;
             *completed_at = Some(SystemTime::now());
@@ -323,83 +324,527 @@ impl HealTask {
         self.progress.read().await.clone()
     }
 
-    // 具体的 heal 实现方法
-    async fn heal_object(&self, bucket: &str, object: &str, _version_id: Option<&str>) -> Result<()> {
-        debug!("Healing object: {}/{}", bucket, object);
+    // specific heal implementation method
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+        info!("Healing object: {}/{}", bucket, object);
         
-        // 更新进度
+        // update progress
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("{}/{}", bucket, object)));
+            progress.update_progress(0, 4, 0, 0); // 开始heal，总共4个步骤
         }
 
-        // TODO: 实现具体的对象 heal 逻辑
-        // 1. 检查对象完整性
-        // 2. 如果损坏，尝试 EC 重建
-        // 3. 更新对象数据
-        // 4. 更新进度
+        // Step 1: Check if object exists and get metadata
+        info!("Step 1: Checking object existence and metadata");
+        let object_exists = self.storage.object_exists(bucket, object).await?;
+        if !object_exists {
+            warn!("Object does not exist: {}/{}", bucket, object);
+            if self.options.recreate_missing {
+                info!("Attempting to recreate missing object: {}/{}", bucket, object);
+                return self.recreate_missing_object(bucket, object, version_id).await;
+            } else {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Object not found: {}/{}", bucket, object),
+                });
+            }
+        }
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(1, 1, 0, 1024); // 示例数据
+            progress.update_progress(1, 4, 0, 0);
         }
 
-        Ok(())
+        // Step 2: Verify object integrity
+        info!("Step 2: Verifying object integrity");
+        let integrity_ok = self.storage.verify_object_integrity(bucket, object).await?;
+        if integrity_ok {
+            info!("Object integrity check passed: {}/{}", bucket, object);
+            {
+                let mut progress = self.progress.write().await;
+                progress.update_progress(4, 4, 0, 0);
+            }
+            return Ok(());
+        }
+
+        warn!("Object integrity check failed: {}/{}", bucket, object);
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(2, 4, 0, 0);
+        }
+
+        // Step 3: Perform actual heal using ecstore
+        info!("Step 3: Performing heal using ecstore");
+        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+            recursive: self.options.recursive,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: match self.options.scan_mode {
+                crate::heal::task::HEAL_UNKNOWN_SCAN => rustfs_ecstore::heal::heal_commands::HEAL_UNKNOWN_SCAN,
+                crate::heal::task::HEAL_NORMAL_SCAN => rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
+                crate::heal::task::HEAL_DEEP_SCAN => rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+                _ => rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
+            },
+            update_parity: self.options.update_parity,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
+
+        match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("Heal operation failed: {}/{} - {}", bucket, object, e);
+                    
+                    // If heal failed and remove_corrupted is enabled, delete the corrupted object
+                    if self.options.remove_corrupted {
+                        warn!("Removing corrupted object: {}/{}", bucket, object);
+                        if !self.options.dry_run {
+                            self.storage.delete_object(bucket, object).await?;
+                            info!("Successfully deleted corrupted object: {}/{}", bucket, object);
+                        } else {
+                            info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
+                        }
+                    }
+
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(4, 4, 0, 0);
+                    }
+                    
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal object {}/{}: {}", bucket, object, e),
+                    });
+                }
+
+                // Step 4: Verify heal result
+                info!("Step 4: Verifying heal result");
+                let object_size = result.object_size as u64;
+                info!("Heal completed successfully: {}/{} ({} bytes, {} drives healed)", 
+                      bucket, object, object_size, result.after.drives.len());
+
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(4, 4, object_size, object_size);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("Heal operation failed: {}/{} - {}", bucket, object, e);
+                
+                // If heal failed and remove_corrupted is enabled, delete the corrupted object
+                if self.options.remove_corrupted {
+                    warn!("Removing corrupted object: {}/{}", bucket, object);
+                    if !self.options.dry_run {
+                        self.storage.delete_object(bucket, object).await?;
+                        info!("Successfully deleted corrupted object: {}/{}", bucket, object);
+                    } else {
+                        info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
+                    }
+                }
+
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(4, 4, 0, 0);
+                }
+                
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal object {}/{}: {}", bucket, object, e),
+                })
+            }
+        }
+    }
+
+    /// Recreate missing object (for EC decode scenarios)
+    async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+        info!("Attempting to recreate missing object: {}/{}", bucket, object);
+        
+        // Use ecstore's heal_object with recreate option
+        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: false,
+            recreate: true,
+            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            update_parity: true,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
+
+        match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to recreate missing object {}/{}: {}", bucket, object, e),
+                    });
+                }
+
+                let object_size = result.object_size as u64;
+                info!("Successfully recreated missing object: {}/{} ({} bytes)", bucket, object, object_size);
+
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(4, 4, object_size, object_size);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to recreate missing object {}/{}: {}", bucket, object, e),
+                })
+            }
+        }
     }
 
     async fn heal_bucket(&self, bucket: &str) -> Result<()> {
-        debug!("Healing bucket: {}", bucket);
+        info!("Healing bucket: {}", bucket);
         
-        // TODO: 实现桶 heal 逻辑
-        // 1. 检查桶元数据
-        // 2. 修复桶配置
-        // 3. 更新进度
+        // update progress
+        {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(format!("bucket: {}", bucket)));
+            progress.update_progress(0, 3, 0, 0);
+        }
 
-        Ok(())
+        // Step 1: Check if bucket exists
+        info!("Step 1: Checking bucket existence");
+        let bucket_exists = self.storage.get_bucket_info(bucket).await?.is_some();
+        if !bucket_exists {
+            warn!("Bucket does not exist: {}", bucket);
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Bucket not found: {}", bucket),
+            });
+        }
+
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(1, 3, 0, 0);
+        }
+
+        // Step 2: Perform bucket heal using ecstore
+        info!("Step 2: Performing bucket heal using ecstore");
+        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+            recursive: self.options.recursive,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: match self.options.scan_mode {
+                crate::heal::task::HEAL_UNKNOWN_SCAN => rustfs_ecstore::heal::heal_commands::HEAL_UNKNOWN_SCAN,
+                crate::heal::task::HEAL_NORMAL_SCAN => rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
+                crate::heal::task::HEAL_DEEP_SCAN => rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+                _ => rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
+            },
+            update_parity: self.options.update_parity,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
+
+        match self.storage.heal_bucket(bucket, &heal_opts).await {
+            Ok(result) => {
+                info!("Bucket heal completed successfully: {} ({} drives)", bucket, result.after.drives.len());
+                
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("Bucket heal failed: {} - {}", bucket, e);
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal bucket {}: {}", bucket, e),
+                })
+            }
+        }
     }
 
     async fn heal_disk(&self, endpoint: &Endpoint) -> Result<()> {
-        debug!("Healing disk: {:?}", endpoint);
+        info!("Healing disk: {:?}", endpoint);
         
-        // TODO: 实现磁盘 heal 逻辑
-        // 1. 检查磁盘状态
-        // 2. 格式化磁盘（如果需要）
-        // 3. 更新进度
+        // update progress
+        {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(format!("disk: {:?}", endpoint)));
+            progress.update_progress(0, 3, 0, 0);
+        }
 
-        Ok(())
+        // Step 1: Check disk status
+        info!("Step 1: Checking disk status");
+        let disk_status = self.storage.get_disk_status(endpoint).await?;
+        if disk_status == DiskStatus::Ok {
+            info!("Disk is already healthy: {:?}", endpoint);
+            {
+                let mut progress = self.progress.write().await;
+                progress.update_progress(3, 3, 0, 0);
+            }
+            return Ok(());
+        }
+
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(1, 3, 0, 0);
+        }
+
+        // Step 2: Perform disk heal using ecstore
+        info!("Step 2: Performing disk heal using ecstore");
+        match self.storage.heal_format(self.options.dry_run).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("Disk heal failed: {:?} - {}", endpoint, e);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(3, 3, 0, 0);
+                    }
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal disk {:?}: {}", endpoint, e),
+                    });
+                }
+
+                info!("Disk heal completed successfully: {:?} ({} drives)", endpoint, result.after.drives.len());
+                
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("Disk heal failed: {:?} - {}", endpoint, e);
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal disk {:?}: {}", endpoint, e),
+                })
+            }
+        }
     }
 
     async fn heal_metadata(&self, bucket: &str, object: &str) -> Result<()> {
-        debug!("Healing metadata: {}/{}", bucket, object);
+        info!("Healing metadata: {}/{}", bucket, object);
         
-        // TODO: 实现元数据 heal 逻辑
-        // 1. 检查元数据完整性
-        // 2. 重建元数据
-        // 3. 更新进度
+        // update progress
+        {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(format!("metadata: {}/{}", bucket, object)));
+            progress.update_progress(0, 3, 0, 0);
+        }
 
-        Ok(())
+        // Step 1: Check if object exists
+        info!("Step 1: Checking object existence");
+        let object_exists = self.storage.object_exists(bucket, object).await?;
+        if !object_exists {
+            warn!("Object does not exist: {}/{}", bucket, object);
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Object not found: {}/{}", bucket, object),
+            });
+        }
+
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(1, 3, 0, 0);
+        }
+
+        // Step 2: Perform metadata heal using ecstore
+        info!("Step 2: Performing metadata heal using ecstore");
+        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: false,
+            recreate: false,
+            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            update_parity: false,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
+
+        match self.storage.heal_object(bucket, object, None, &heal_opts).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(3, 3, 0, 0);
+                    }
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal metadata {}/{}: {}", bucket, object, e),
+                    });
+                }
+
+                info!("Metadata heal completed successfully: {}/{} ({} drives)", bucket, object, result.after.drives.len());
+                
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal metadata {}/{}: {}", bucket, object, e),
+                })
+            }
+        }
     }
 
     async fn heal_mrf(&self, meta_path: &str) -> Result<()> {
-        debug!("Healing MRF: {}", meta_path);
+        info!("Healing MRF: {}", meta_path);
         
-        // TODO: 实现 MRF heal 逻辑
-        // 1. 检查元数据复制因子
-        // 2. 修复元数据
-        // 3. 更新进度
+        // update progress
+        {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(format!("mrf: {}", meta_path)));
+            progress.update_progress(0, 2, 0, 0);
+        }
 
-        Ok(())
+        // Parse meta_path to extract bucket and object
+        let parts: Vec<&str> = meta_path.split('/').collect();
+        if parts.len() < 2 {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Invalid meta path format: {}", meta_path),
+            });
+        }
+
+        let bucket = parts[0];
+        let object = parts[1..].join("/");
+
+        // Step 1: Perform MRF heal using ecstore
+        info!("Step 1: Performing MRF heal using ecstore");
+        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+            recursive: true,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            update_parity: true,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
+
+        match self.storage.heal_object(bucket, &object, None, &heal_opts).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("MRF heal failed: {} - {}", meta_path, e);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(2, 2, 0, 0);
+                    }
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal MRF {}: {}", meta_path, e),
+                    });
+                }
+
+                info!("MRF heal completed successfully: {} ({} drives)", meta_path, result.after.drives.len());
+                
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(2, 2, 0, 0);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("MRF heal failed: {} - {}", meta_path, e);
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(2, 2, 0, 0);
+                }
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal MRF {}: {}", meta_path, e),
+                })
+            }
+        }
     }
 
-    async fn heal_ec_decode(&self, bucket: &str, object: &str, _version_id: Option<&str>) -> Result<()> {
-        debug!("Healing EC decode: {}/{}", bucket, object);
+    async fn heal_ec_decode(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+        info!("Healing EC decode: {}/{}", bucket, object);
         
-        // TODO: 实现 EC 解码 heal 逻辑
-        // 1. 检查 EC 分片
-        // 2. 使用 EC 算法重建数据
-        // 3. 更新进度
+        // update progress
+        {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(format!("ec_decode: {}/{}", bucket, object)));
+            progress.update_progress(0, 3, 0, 0);
+        }
 
-        Ok(())
+        // Step 1: Check if object exists
+        info!("Step 1: Checking object existence");
+        let object_exists = self.storage.object_exists(bucket, object).await?;
+        if !object_exists {
+            warn!("Object does not exist: {}/{}", bucket, object);
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Object not found: {}/{}", bucket, object),
+            });
+        }
+
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(1, 3, 0, 0);
+        }
+
+        // Step 2: Perform EC decode heal using ecstore
+        info!("Step 2: Performing EC decode heal using ecstore");
+        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: false,
+            recreate: true,
+            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            update_parity: true,
+            no_lock: false,
+            pool: None,
+            set: None,
+        };
+
+        match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(3, 3, 0, 0);
+                    }
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal EC decode {}/{}: {}", bucket, object, e),
+                    });
+                }
+
+                let object_size = result.object_size as u64;
+                info!("EC decode heal completed successfully: {}/{} ({} bytes, {} drives)", 
+                      bucket, object, object_size, result.after.drives.len());
+                
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, object_size, object_size);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(3, 3, 0, 0);
+                }
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal EC decode {}/{}: {}", bucket, object, e),
+                })
+            }
+        }
     }
 }
 

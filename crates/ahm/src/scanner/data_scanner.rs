@@ -510,10 +510,10 @@ impl Scanner {
                             let req = HealRequest::disk(disk.endpoint().clone());
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
-                                    warn!("磁盘离线，已自动提交heal任务: {} 磁盘: {}", task_id, disk_path);
+                                    warn!("disk offline, submit heal task: {} {}", task_id, disk_path);
                                 }
                                 Err(e) => {
-                                    error!("磁盘离线，heal任务提交失败: {}，错误: {}", disk_path, e);
+                                    error!("disk offline, submit heal task failed: {} {}", disk_path, e);
                                 }
                             }
                         }
@@ -554,10 +554,10 @@ impl Scanner {
                         );
                         match heal_manager.submit_heal_request(req).await {
                             Ok(task_id) => {
-                                warn!("磁盘访问失败，已自动提交heal任务: {} 磁盘: {} 错误: {}", task_id, disk_path, e);
+                                warn!("disk access failed, submit heal task: {} {}", task_id, disk_path);
                             }
                             Err(heal_err) => {
-                                error!("磁盘访问失败，heal任务提交失败: {}，错误: {}", disk_path, heal_err);
+                                error!("disk access failed, submit heal task failed: {} {}", disk_path, heal_err);
                             }
                         }
                     }
@@ -682,10 +682,10 @@ impl Scanner {
                                 let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
                                 match heal_manager.submit_heal_request(req).await {
                                     Ok(task_id) => {
-                                        warn!("对象元数据损坏，已自动提交heal任务: {} {} / {}", task_id, bucket, entry.name);
+                                        warn!("object metadata damaged, submit heal task: {} {} / {}", task_id, bucket, entry.name);
                                     }
                                     Err(e) => {
-                                        error!("对象元数据损坏，heal任务提交失败: {} / {}，错误: {}", bucket, entry.name, e);
+                                        error!("object metadata damaged, submit heal task failed: {} / {} {}", bucket, entry.name, e);
                                     }
                                 }
                             }
@@ -705,10 +705,10 @@ impl Scanner {
                             let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
-                                    warn!("对象元数据解析失败，已自动提交heal任务: {} {} / {}", task_id, bucket, entry.name);
+                                    warn!("object metadata parse failed, submit heal task: {} {} / {}", task_id, bucket, entry.name);
                                 }
                                 Err(e) => {
-                                    error!("对象元数据解析失败，heal任务提交失败: {} / {}，错误: {}", bucket, entry.name, e);
+                                    error!("object metadata parse failed, submit heal task failed: {} / {} {}", bucket, entry.name, e);
                                 }
                             }
                         }
@@ -817,7 +817,7 @@ impl Scanner {
                     warn!("Object {}/{} missing from disks: {:?}", bucket, object_name, missing_disks);
                     println!("Object {bucket}/{object_name} missing from disks: {missing_disks:?}");
                     
-                    // 自动提交heal任务
+                    // submit heal task
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
                         if let Some(heal_manager) = &self.heal_manager {
@@ -833,11 +833,11 @@ impl Scanner {
                             );
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
-                                    warn!("对象缺失，已自动提交heal任务: {} {} / {} (缺失磁盘: {:?})", 
+                                    warn!("object missing, submit heal task: {} {} / {} (missing disks: {:?})", 
                                           task_id, bucket, object_name, missing_disks);
                                 }
                                 Err(e) => {
-                                    error!("对象缺失，heal任务提交失败: {} / {}，错误: {}", bucket, object_name, e);
+                                    error!("object missing, submit heal task failed: {} / {} {}", bucket, object_name, e);
                                 }
                             }
                         }
@@ -969,7 +969,7 @@ impl Scanner {
             );
             Ok(())
         } else {
-            // 自动提交heal任务
+            // submit heal task
             let enable_healing = self.config.read().await.enable_healing;
             if enable_healing {
                 if let Some(heal_manager) = &self.heal_manager {
@@ -977,10 +977,10 @@ impl Scanner {
                     let req = HealRequest::ec_decode(bucket.to_string(), object.to_string(), None);
                     match heal_manager.submit_heal_request(req).await {
                         Ok(task_id) => {
-                            warn!("EC decode失败，已自动提交heal任务: {} {} / {}", task_id, bucket, object);
+                            warn!("EC decode failed, submit heal task: {} {} / {}", task_id, bucket, object);
                         }
                         Err(e) => {
-                            error!("EC decode失败，heal任务提交失败: {} / {}，错误: {}", bucket, object, e);
+                            error!("EC decode failed, submit heal task failed: {} / {} {}", bucket, object, e);
                         }
                     }
                 }

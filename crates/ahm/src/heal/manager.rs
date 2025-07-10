@@ -57,43 +57,43 @@ impl Default for HealConfig {
     }
 }
 
-/// Heal 状态
+/// Heal state
 #[derive(Debug, Default)]
 pub struct HealState {
-    /// 是否正在运行
+    /// Whether running
     pub is_running: bool,
-    /// 当前 heal 周期
+    /// Current heal cycle
     pub current_cycle: u64,
-    /// 最后 heal 时间
+    /// Last heal time
     pub last_heal_time: Option<SystemTime>,
-    /// 总 heal 对象数
+    /// Total healed objects
     pub total_healed_objects: u64,
-    /// 总 heal 失败数
+    /// Total heal failures
     pub total_heal_failures: u64,
-    /// 当前活跃 heal 任务数
+    /// Current active heal tasks
     pub active_heal_count: usize,
 }
 
-/// Heal 管理器
+/// Heal manager
 pub struct HealManager {
-    /// Heal 配置
+    /// Heal config
     config: Arc<RwLock<HealConfig>>,
-    /// Heal 状态
+    /// Heal state
     state: Arc<RwLock<HealState>>,
-    /// 活跃的 heal 任务
+    /// Active heal tasks
     active_heals: Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
-    /// Heal 队列
+    /// Heal queue
     heal_queue: Arc<Mutex<VecDeque<HealRequest>>>,
-    /// 存储层接口
+    /// Storage layer interface
     storage: Arc<dyn HealStorageAPI>,
-    /// 取消令牌
+    /// Cancel token
     cancel_token: CancellationToken,
-    /// 统计信息
+    /// Statistics
     statistics: Arc<RwLock<HealStatistics>>,
 }
 
 impl HealManager {
-    /// 创建新的 HealManager
+    /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         let config = config.unwrap_or_default();
         Self {
@@ -107,7 +107,7 @@ impl HealManager {
         }
     }
 
-    /// 启动 HealManager
+    /// Start HealManager
     pub async fn start(&self) -> Result<()> {
         let mut state = self.state.write().await;
         if state.is_running {
@@ -119,24 +119,21 @@ impl HealManager {
 
         info!("Starting HealManager");
 
-        // 启动调度器
+        // start scheduler
         self.start_scheduler().await?;
-
-        // 启动工作器
-        self.start_workers().await?;
 
         info!("HealManager started successfully");
         Ok(())
     }
 
-    /// 停止 HealManager
+    /// Stop HealManager
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping HealManager");
 
-        // 取消所有任务
+        // cancel all tasks
         self.cancel_token.cancel();
 
-        // 等待所有任务完成
+        // wait for all tasks to complete
         let mut active_heals = self.active_heals.lock().await;
         for task in active_heals.values() {
             if let Err(e) = task.cancel().await {
@@ -145,7 +142,7 @@ impl HealManager {
         }
         active_heals.clear();
 
-        // 更新状态
+        // update state
         let mut state = self.state.write().await;
         state.is_running = false;
 
@@ -153,7 +150,7 @@ impl HealManager {
         Ok(())
     }
 
-    /// 提交 heal 请求
+    /// Submit heal request
     pub async fn submit_heal_request(&self, request: HealRequest) -> Result<String> {
         let config = self.config.read().await;
         let mut queue = self.heal_queue.lock().await;
@@ -172,7 +169,7 @@ impl HealManager {
         Ok(request_id)
     }
 
-    /// 获取任务状态
+    /// Get task status
     pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
         let active_heals = self.active_heals.lock().await;
         if let Some(task) = active_heals.get(task_id) {
@@ -184,7 +181,7 @@ impl HealManager {
         }
     }
 
-    /// 获取任务进度
+    /// Get task progress
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
         let active_heals = self.active_heals.lock().await;
         if let Some(task) = active_heals.get(task_id) {
@@ -196,7 +193,7 @@ impl HealManager {
         }
     }
 
-    /// 取消任务
+    /// Cancel task
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
         let mut active_heals = self.active_heals.lock().await;
         if let Some(task) = active_heals.get(task_id) {
@@ -211,24 +208,24 @@ impl HealManager {
         }
     }
 
-    /// 获取统计信息
+    /// Get statistics
     pub async fn get_statistics(&self) -> HealStatistics {
         self.statistics.read().await.clone()
     }
 
-    /// 获取活跃任务数量
+    /// Get active task count
     pub async fn get_active_task_count(&self) -> usize {
         let active_heals = self.active_heals.lock().await;
         active_heals.len()
     }
 
-    /// 获取队列长度
+    /// Get queue length
     pub async fn get_queue_length(&self) -> usize {
         let queue = self.heal_queue.lock().await;
         queue.len()
     }
 
-    /// 启动调度器
+    /// Start scheduler
     async fn start_scheduler(&self) -> Result<()> {
         let config = self.config.clone();
         let heal_queue = self.heal_queue.clone();
@@ -256,78 +253,7 @@ impl HealManager {
         Ok(())
     }
 
-    /// 启动工作器
-    async fn start_workers(&self) -> Result<()> {
-        let config = self.config.clone();
-        let active_heals = self.active_heals.clone();
-        let storage = self.storage.clone();
-        let cancel_token = self.cancel_token.clone();
-        let statistics = self.statistics.clone();
-
-        let worker_count = config.read().await.max_concurrent_heals;
-
-        for worker_id in 0..worker_count {
-            let active_heals = active_heals.clone();
-            let _storage = storage.clone();
-            let cancel_token = cancel_token.clone();
-            let statistics = statistics.clone();
-
-            tokio::spawn(async move {
-                info!("Starting heal worker {}", worker_id);
-
-                loop {
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {
-                            info!("Heal worker {} received shutdown signal", worker_id);
-                            break;
-                        }
-                        _ = async {
-                            // 等待任务
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        } => {
-                            // 检查是否有可执行的任务
-                            let mut active_heals_guard = active_heals.lock().await;
-                            let mut completed_tasks = Vec::new();
-                            
-                            for (id, task) in active_heals_guard.iter() {
-                                let status = task.get_status().await;
-                                if matches!(status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. } | HealTaskStatus::Cancelled) {
-                                    completed_tasks.push(id.clone());
-                                }
-                            }
-
-                            // 移除已完成的任务
-                            for task_id in completed_tasks {
-                                if let Some(task) = active_heals_guard.remove(&task_id) {
-                                    // 更新统计信息
-                                    let mut stats = statistics.write().await;
-                                    match task.get_status().await {
-                                        HealTaskStatus::Completed => {
-                                            stats.update_task_completion(true);
-                                        }
-                                        HealTaskStatus::Failed { .. } => {
-                                            stats.update_task_completion(false);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-
-                            // 更新活跃任务数量
-                            let mut stats = statistics.write().await;
-                            stats.update_running_tasks(active_heals_guard.len() as u64);
-                        }
-                    }
-                }
-
-                info!("Heal worker {} stopped", worker_id);
-            });
-        }
-
-        Ok(())
-    }
-
-    /// 处理 heal 队列
+    /// Process heal queue
     async fn process_heal_queue(
         heal_queue: &Arc<Mutex<VecDeque<HealRequest>>>,
         active_heals: &Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
@@ -336,10 +262,10 @@ impl HealManager {
         storage: &Arc<dyn HealStorageAPI>,
     ) {
         let config = config.read().await;
-        let mut active_heals = active_heals.lock().await;
+        let mut active_heals_guard = active_heals.lock().await;
 
-        // 检查是否可以启动新的 heal 任务
-        if active_heals.len() >= config.max_concurrent_heals {
+        // check if new heal tasks can be started
+        if active_heals_guard.len() >= config.max_concurrent_heals {
             return;
         }
 
@@ -347,9 +273,12 @@ impl HealManager {
         if let Some(request) = queue.pop_front() {
             let task = Arc::new(HealTask::from_request(request, storage.clone()));
             let task_id = task.id.clone();
-            active_heals.insert(task_id.clone(), task.clone());
+            active_heals_guard.insert(task_id.clone(), task.clone());
+            drop(active_heals_guard);
+            let active_heals_clone = active_heals.clone();
+            let statistics_clone = statistics.clone();
 
-            // 启动 heal 任务
+            // start heal task
             tokio::spawn(async move {
                 info!("Starting heal task: {}", task_id);
                 match task.execute().await {
@@ -360,9 +289,23 @@ impl HealManager {
                         error!("Heal task failed: {} - {}", task_id, e);
                     }
                 }
+                let mut active_heals_guard = active_heals_clone.lock().await;
+                if let Some(completed_task) = active_heals_guard.remove(&task_id) {
+                    // update statistics
+                    let mut stats = statistics_clone.write().await;
+                    match completed_task.get_status().await {
+                        HealTaskStatus::Completed => {
+                            stats.update_task_completion(true);
+                        }
+                        _ => {
+                            stats.update_task_completion(false);
+                        }
+                    }
+                    stats.update_running_tasks(active_heals_guard.len() as u64);
+                }
             });
 
-            // 更新统计信息
+            // update statistics
             let mut stats = statistics.write().await;
             stats.total_tasks += 1;
         }
