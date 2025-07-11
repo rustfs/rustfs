@@ -16,7 +16,11 @@
 use http::{HeaderMap, StatusCode};
 //use iam::get_global_action_cred;
 use matchit::Params;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    s3_error,
+};
 use serde_urlencoded::from_bytes;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
@@ -169,7 +173,7 @@ impl Operation for AddTier {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -236,7 +240,7 @@ impl Operation for EditTier {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -332,7 +336,7 @@ impl Operation for RemoveTier {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -366,7 +370,7 @@ impl Operation for VerifyTier {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -457,7 +461,7 @@ impl Operation for ClearTier {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -636,7 +640,7 @@ impl Operation for PostRestoreObject {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }*/

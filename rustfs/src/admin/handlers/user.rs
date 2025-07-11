@@ -146,7 +146,7 @@ impl Operation for AddUser {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -193,7 +193,7 @@ impl Operation for SetUserStatus {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -310,7 +310,7 @@ impl Operation for RemoveUser {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
