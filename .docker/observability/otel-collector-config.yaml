@@ -66,6 +66,12 @@ service:
     logs:
       level: "info"  # Collector 日志级别
     metrics:
-      address: "0.0.0.0:8888"  # Collector 自身指标暴露
+      level: "detailed" # 可以是 basic, normal, detailed
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://otel-collector:4318
 
 
