@@ -18,7 +18,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+      - ../../.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
     ports:
       - 1888:1888
       - 8888:8888
@@ -44,7 +44,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../../.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
     networks:
@@ -54,7 +54,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml
+      - ../../.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
@@ -63,7 +63,7 @@ services:
   grafana:
     image: grafana/grafana:12.0.2
     ports:
-      - "3000:3000"  # Web UI
+      - "3000:3000" # Web UI
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - TZ=Asia/Shanghai
@@ -72,7 +72,7 @@ services:
 
   node1:
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile.obs
     container_name: node1
     environment:
@@ -83,13 +83,13 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9001:9000"  # Map port 9001 of the host to port 9000 of the container
+      - "9001:9000" # Map port 9001 of the host to port 9000 of the container
     networks:
       - rustfs-network
 
   node2:
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile.obs
     container_name: node2
     environment:
@@ -100,13 +100,13 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9002:9000"  # Map port 9002 of the host to port 9000 of the container
+      - "9002:9000" # Map port 9002 of the host to port 9000 of the container
     networks:
       - rustfs-network
 
   node3:
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile.obs
     container_name: node3
     environment:
@@ -117,13 +117,13 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9003:9000"  # Map port 9003 of the host to port 9000 of the container
+      - "9003:9000" # Map port 9003 of the host to port 9000 of the container
     networks:
       - rustfs-network
 
   node4:
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile.obs
     container_name: node4
     environment:
@@ -134,7 +134,7 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9004:9000"  # Map port 9004 of the host to port 9000 of the container
+      - "9004:9000" # Map port 9004 of the host to port 9000 of the container
     networks:
       - rustfs-network
 

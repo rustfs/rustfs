@@ -44,17 +44,23 @@ docker-compose --profile observability up -d
 ### Cluster Testing
 
 ```bash
-# Build and start 4-node cluster
+# Build and start 4-node cluster (run from project root)
 cd .docker/compose
 docker-compose -f docker-compose.cluster.yaml up -d
+
+# Or run directly from project root
+docker-compose -f .docker/compose/docker-compose.cluster.yaml up -d
 ```
 
 ### Observability Testing
 
 ```bash
-# Start observability-focused environment
+# Start observability-focused environment (run from project root)
 cd .docker/compose
 docker-compose -f docker-compose.observability.yaml up -d
+
+# Or run directly from project root
+docker-compose -f .docker/compose/docker-compose.observability.yaml up -d
 ```
 
 ## 🔧 Configuration Overview
