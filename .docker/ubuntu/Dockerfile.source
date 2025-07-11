@@ -4,7 +4,7 @@ ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 
 # Build stage
-FROM --platform=$BUILDPLATFORM rust:1.85-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 
 # Install required build dependencies
 RUN apt-get update && apt-get install -y \

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Multi-stage Alpine build from source
-FROM rust:1.85-alpine AS builder
+FROM rust:1.88-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
