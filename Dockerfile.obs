@@ -1,1 +1,61 @@
- 
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dockerfile for RustFS with observability features
+FROM ubuntu:22.04
+
+# Avoid interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Create rustfs user for security
+RUN groupadd -g 1000 rustfs && \
+    useradd -d /app -g rustfs -u 1000 -s /bin/bash rustfs
+
+# Create data directories matching RUSTFS_VOLUMES pattern
+RUN mkdir -p /data/rustfs{0,1,2,3} && \
+    chown -R rustfs:rustfs /data /app
+
+# Copy RustFS binary (expects it to be built with observability features)
+# Note: This assumes the binary is built locally with observability features enabled
+COPY ./target/x86_64-unknown-linux-gnu/release/rustfs /app/rustfs
+RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
+
+# Switch to non-root user
+USER rustfs
+
+# Environment variables for observability
+ENV RUSTFS_ACCESS_KEY=rustfsadmin \
+    RUSTFS_SECRET_KEY=rustfsadmin \
+    RUSTFS_ADDRESS=":9000" \
+    RUSTFS_CONSOLE_ENABLE=true \
+    RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3 \
+    RUSTFS_OBS_ENDPOINT=http://otel-collector:4317 \
+    RUST_LOG=info
+
+EXPOSE 9000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+
+CMD ["/app/rustfs"]
