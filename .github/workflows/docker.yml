@@ -16,7 +16,7 @@ name: Docker Images
 
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["*.*.*"]
     branches: [main]
     paths-ignore:
       - "**.md"
@@ -102,10 +102,10 @@ jobs:
           fi
 
           # Determine build type and version
-          if [[ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
             # Tag push - release or prerelease
             tag_name="${GITHUB_REF#refs/tags/}"
-            version="${tag_name#v}"
+            version="${tag_name}"
 
             # Check if this is a prerelease
             if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then

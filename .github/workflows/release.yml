@@ -16,7 +16,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["*.*.*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -47,7 +47,7 @@ jobs:
             TAG="${GITHUB_REF#refs/tags/}"
           fi
 
-          VERSION="${TAG#v}"
+          VERSION="${TAG}"
 
           # Check if this is a prerelease
           IS_PRERELEASE=false
