@@ -73,7 +73,7 @@ services:
   node1:
     build:
       context: ../..
-      dockerfile: .docker/compose/Dockerfile.obs
+      dockerfile: Dockerfile.obs
     container_name: node1
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
@@ -90,7 +90,7 @@ services:
   node2:
     build:
       context: ../..
-      dockerfile: .docker/compose/Dockerfile.obs
+      dockerfile: Dockerfile.obs
     container_name: node2
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
@@ -107,7 +107,7 @@ services:
   node3:
     build:
       context: ../..
-      dockerfile: .docker/compose/Dockerfile.obs
+      dockerfile: Dockerfile.obs
     container_name: node3
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
@@ -124,7 +124,7 @@ services:
   node4:
     build:
       context: ../..
-      dockerfile: .docker/compose/Dockerfile.obs
+      dockerfile: Dockerfile.obs
     container_name: node4
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
