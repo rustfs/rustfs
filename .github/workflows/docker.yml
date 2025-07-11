@@ -167,6 +167,9 @@ jobs:
           - name: production
             dockerfile: Dockerfile
             platforms: linux/amd64,linux/arm64
+          - name: alpine
+            dockerfile: .docker/alpine/Dockerfile.prebuild
+            platforms: linux/amd64,linux/arm64
           - name: alpine-source
             dockerfile: .docker/alpine/Dockerfile.source
             platforms: linux/amd64,linux/arm64
