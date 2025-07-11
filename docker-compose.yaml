@@ -14,16 +14,18 @@
 
 services:
   node0:
-    image: rustfs/rustfs:latest  # Replace with your image name and label
+    image: rustfs/rustfs:latest # Replace with your image name and label
     container_name: node0
     hostname: node0
     environment:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9000:9000"  # Map port 9001 of the host to port 9000 of the container
+      - "9000:9000" # Map port 9001 of the host to port 9000 of the container
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
@@ -36,9 +38,11 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9001:9000"  # Map port 9002 of the host to port 9000 of the container
+      - "9001:9000" # Map port 9002 of the host to port 9000 of the container
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
@@ -51,9 +55,11 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9002:9000"  # Map port 9003 of the host to port 9000 of the container
+      - "9002:9000" # Map port 9003 of the host to port 9000 of the container
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
@@ -66,9 +72,11 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9003:9000"  # Map port 9004 of the host to port 9000 of the container
+      - "9003:9000" # Map port 9004 of the host to port 9000 of the container
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
