@@ -87,7 +87,7 @@ To get started with RustFS, follow these steps:
    ```
 
 
-3. **Access the Console**: Open your web browser and navigate to `http://localhost:9001` to access the RustFS console, default username and password is `rustfsadmin` .
+3. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
 4. **Create a Bucket**: Use the console to create a new bucket for your objects.
 5. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
 
