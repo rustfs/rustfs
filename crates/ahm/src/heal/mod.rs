@@ -19,4 +19,4 @@ pub mod storage;
 pub mod task;
 
 pub use manager::HealManager;
-pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType}; 
+pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};

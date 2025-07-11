@@ -2757,8 +2757,8 @@ impl SetDisks {
                                         false
                                     }
                                 };
-
-                                for disk in out_dated_disks.iter() {
+                                // write to all disks
+                                for disk in self.disks.read().await.iter() {
                                     let writer = create_bitrot_writer(
                                         is_inline_buffer,
                                         disk.as_ref(),
@@ -2821,7 +2821,6 @@ impl SetDisks {
                                     //     writers.push(None);
                                     // }
                                 }
-
                                 // Heal each part. erasure.Heal() will write the healed
                                 // part to .rustfs/tmp/uuid/ which needs to be renamed
                                 // later to the final location.
@@ -2872,7 +2871,6 @@ impl SetDisks {
                                 }
                             }
                         }
-
                         // Rename from tmp location to the actual location.
                         for (index, disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = disk {

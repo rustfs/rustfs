@@ -32,11 +32,11 @@ use super::{
     data_usage::DataUsageInfo,
     metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics},
 };
+use crate::heal::HealManager;
 use crate::{
     error::{Error, Result},
     get_ahm_services_cancel_token, HealRequest,
 };
-use crate::heal::HealManager;
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 
@@ -539,12 +539,12 @@ impl Scanner {
             Ok(volumes) => volumes,
             Err(e) => {
                 error!("Failed to list volumes on disk {}: {}", disk_path, e);
-                
+
                 // 磁盘访问失败，提交磁盘heal任务
                 let enable_healing = self.config.read().await.enable_healing;
                 if enable_healing {
                     if let Some(heal_manager) = &self.heal_manager {
-                        use crate::heal::{HealRequest, HealPriority};
+                        use crate::heal::{HealPriority, HealRequest};
                         let req = HealRequest::new(
                             crate::heal::HealType::Disk {
                                 endpoint: disk.endpoint().clone(),
@@ -562,7 +562,7 @@ impl Scanner {
                         }
                     }
                 }
-                
+
                 return Err(Error::Storage(e.into()));
             }
         };
@@ -674,7 +674,7 @@ impl Scanner {
                     if file_meta.versions.is_empty() {
                         objects_with_issues += 1;
                         warn!("Object {} has no versions", entry.name);
-                        
+
                         // 对象元数据损坏，提交元数据heal任务
                         let enable_healing = self.config.read().await.enable_healing;
                         if enable_healing {
@@ -682,10 +682,16 @@ impl Scanner {
                                 let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
                                 match heal_manager.submit_heal_request(req).await {
                                     Ok(task_id) => {
-                                        warn!("object metadata damaged, submit heal task: {} {} / {}", task_id, bucket, entry.name);
+                                        warn!(
+                                            "object metadata damaged, submit heal task: {} {} / {}",
+                                            task_id, bucket, entry.name
+                                        );
                                     }
                                     Err(e) => {
-                                        error!("object metadata damaged, submit heal task failed: {} / {} {}", bucket, entry.name, e);
+                                        error!(
+                                            "object metadata damaged, submit heal task failed: {} / {} {}",
+                                            bucket, entry.name, e
+                                        );
                                     }
                                 }
                             }
@@ -697,7 +703,7 @@ impl Scanner {
                 } else {
                     objects_with_issues += 1;
                     warn!("Failed to parse metadata for object {}", entry.name);
-                    
+
                     // 对象元数据解析失败，提交元数据heal任务
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
@@ -705,10 +711,16 @@ impl Scanner {
                             let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
-                                    warn!("object metadata parse failed, submit heal task: {} {} / {}", task_id, bucket, entry.name);
+                                    warn!(
+                                        "object metadata parse failed, submit heal task: {} {} / {}",
+                                        task_id, bucket, entry.name
+                                    );
                                 }
                                 Err(e) => {
-                                    error!("object metadata parse failed, submit heal task failed: {} / {} {}", bucket, entry.name, e);
+                                    error!(
+                                        "object metadata parse failed, submit heal task failed: {} / {} {}",
+                                        bucket, entry.name, e
+                                    );
                                 }
                             }
                         }
@@ -816,12 +828,12 @@ impl Scanner {
                     let missing_disks: Vec<usize> = (0..disks.len()).filter(|&i| !locations.contains(&i)).collect();
                     warn!("Object {}/{} missing from disks: {:?}", bucket, object_name, missing_disks);
                     println!("Object {bucket}/{object_name} missing from disks: {missing_disks:?}");
-                    
+
                     // submit heal task
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
                         if let Some(heal_manager) = &self.heal_manager {
-                            use crate::heal::{HealRequest, HealPriority};
+                            use crate::heal::{HealPriority, HealRequest};
                             let req = HealRequest::new(
                                 crate::heal::HealType::Object {
                                     bucket: bucket.clone(),
@@ -833,8 +845,10 @@ impl Scanner {
                             );
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
-                                    warn!("object missing, submit heal task: {} {} / {} (missing disks: {:?})", 
-                                          task_id, bucket, object_name, missing_disks);
+                                    warn!(
+                                        "object missing, submit heal task: {} {} / {} (missing disks: {:?})",
+                                        task_id, bucket, object_name, missing_disks
+                                    );
                                 }
                                 Err(e) => {
                                     error!("object missing, submit heal task failed: {} / {} {}", bucket, object_name, e);
@@ -1142,6 +1156,7 @@ mod tests {
         StorageAPI,
         store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
     };
+    use serial_test::serial;
     use std::fs;
     use std::net::SocketAddr;
 
@@ -1211,7 +1226,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
+    #[serial]
     async fn test_scanner_basic_functionality() {
         const TEST_DIR_BASIC: &str = "/tmp/rustfs_ahm_test_basic";
         let (disk_paths, ecstore) = prepare_test_env(Some(TEST_DIR_BASIC), Some(9001)).await;
@@ -1309,7 +1324,7 @@ mod tests {
 
     // test data usage statistics collection and validation
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
+    #[serial]
     async fn test_scanner_usage_stats() {
         const TEST_DIR_USAGE_STATS: &str = "/tmp/rustfs_ahm_test_usage_stats";
         let (_, ecstore) = prepare_test_env(Some(TEST_DIR_USAGE_STATS), Some(9002)).await;

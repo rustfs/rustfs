@@ -106,87 +106,88 @@ impl HealEvent {
     /// Convert HealEvent to HealRequest
     pub fn to_heal_request(&self) -> HealRequest {
         match self {
-            HealEvent::ObjectCorruption { bucket, object, version_id, severity, .. } => {
-                HealRequest::new(
-                    HealType::Object {
-                        bucket: bucket.clone(),
-                        object: object.clone(),
-                        version_id: version_id.clone(),
-                    },
-                    HealOptions::default(),
-                    Self::severity_to_priority(severity),
-                )
-            }
-            HealEvent::ObjectMissing { bucket, object, version_id, .. } => {
-                HealRequest::new(
-                    HealType::Object {
-                        bucket: bucket.clone(),
-                        object: object.clone(),
-                        version_id: version_id.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::High,
-                )
-            }
-            HealEvent::MetadataCorruption { bucket, object, .. } => {
-                HealRequest::new(
-                    HealType::Metadata {
-                        bucket: bucket.clone(),
-                        object: object.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::High,
-                )
-            }
-            HealEvent::DiskStatusChange { endpoint, .. } => {
-                HealRequest::new(
-                    HealType::Disk {
-                        endpoint: endpoint.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::High,
-                )
-            }
-            HealEvent::ECDecodeFailure { bucket, object, version_id, .. } => {
-                HealRequest::new(
-                    HealType::ECDecode {
-                        bucket: bucket.clone(),
-                        object: object.clone(),
-                        version_id: version_id.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::Urgent,
-                )
-            }
-            HealEvent::ChecksumMismatch { bucket, object, version_id, .. } => {
-                HealRequest::new(
-                    HealType::Object {
-                        bucket: bucket.clone(),
-                        object: object.clone(),
-                        version_id: version_id.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::High,
-                )
-            }
+            HealEvent::ObjectCorruption {
+                bucket,
+                object,
+                version_id,
+                severity,
+                ..
+            } => HealRequest::new(
+                HealType::Object {
+                    bucket: bucket.clone(),
+                    object: object.clone(),
+                    version_id: version_id.clone(),
+                },
+                HealOptions::default(),
+                Self::severity_to_priority(severity),
+            ),
+            HealEvent::ObjectMissing {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => HealRequest::new(
+                HealType::Object {
+                    bucket: bucket.clone(),
+                    object: object.clone(),
+                    version_id: version_id.clone(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ),
+            HealEvent::MetadataCorruption { bucket, object, .. } => HealRequest::new(
+                HealType::Metadata {
+                    bucket: bucket.clone(),
+                    object: object.clone(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ),
+            HealEvent::DiskStatusChange { endpoint, .. } => HealRequest::new(
+                HealType::Disk {
+                    endpoint: endpoint.clone(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ),
+            HealEvent::ECDecodeFailure {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => HealRequest::new(
+                HealType::ECDecode {
+                    bucket: bucket.clone(),
+                    object: object.clone(),
+                    version_id: version_id.clone(),
+                },
+                HealOptions::default(),
+                HealPriority::Urgent,
+            ),
+            HealEvent::ChecksumMismatch {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => HealRequest::new(
+                HealType::Object {
+                    bucket: bucket.clone(),
+                    object: object.clone(),
+                    version_id: version_id.clone(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ),
             HealEvent::BucketMetadataCorruption { bucket, .. } => {
-                HealRequest::new(
-                    HealType::Bucket {
-                        bucket: bucket.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::High,
-                )
+                HealRequest::new(HealType::Bucket { bucket: bucket.clone() }, HealOptions::default(), HealPriority::High)
             }
-            HealEvent::MRFMetadataCorruption { meta_path, .. } => {
-                HealRequest::new(
-                    HealType::MRF {
-                        meta_path: meta_path.clone(),
-                    },
-                    HealOptions::default(),
-                    HealPriority::High,
-                )
-            }
+            HealEvent::MRFMetadataCorruption { meta_path, .. } => HealRequest::new(
+                HealType::MRF {
+                    meta_path: meta_path.clone(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ),
         }
     }
 
@@ -203,29 +204,63 @@ impl HealEvent {
     /// Get event description
     pub fn description(&self) -> String {
         match self {
-            HealEvent::ObjectCorruption { bucket, object, corruption_type, .. } => {
-                format!("Object corruption detected: {}/{} - {:?}", bucket, object, corruption_type)
+            HealEvent::ObjectCorruption {
+                bucket,
+                object,
+                corruption_type,
+                ..
+            } => {
+                format!("Object corruption detected: {bucket}/{object} - {corruption_type:?}")
             }
             HealEvent::ObjectMissing { bucket, object, .. } => {
-                format!("Object missing: {}/{}", bucket, object)
+                format!("Object missing: {bucket}/{object}")
             }
-            HealEvent::MetadataCorruption { bucket, object, corruption_type, .. } => {
-                format!("Metadata corruption: {}/{} - {:?}", bucket, object, corruption_type)
+            HealEvent::MetadataCorruption {
+                bucket,
+                object,
+                corruption_type,
+                ..
+            } => {
+                format!("Metadata corruption: {bucket}/{object} - {corruption_type:?}")
             }
-            HealEvent::DiskStatusChange { endpoint, old_status, new_status, .. } => {
-                format!("Disk status changed: {:?} {} -> {}", endpoint, old_status, new_status)
+            HealEvent::DiskStatusChange {
+                endpoint,
+                old_status,
+                new_status,
+                ..
+            } => {
+                format!("Disk status changed: {endpoint:?} {old_status} -> {new_status}")
             }
-            HealEvent::ECDecodeFailure { bucket, object, missing_shards, .. } => {
-                format!("EC decode failure: {}/{} - missing shards: {:?}", bucket, object, missing_shards)
+            HealEvent::ECDecodeFailure {
+                bucket,
+                object,
+                missing_shards,
+                ..
+            } => {
+                format!("EC decode failure: {bucket}/{object} - missing shards: {missing_shards:?}")
             }
-            HealEvent::ChecksumMismatch { bucket, object, expected_checksum, actual_checksum, .. } => {
-                format!("Checksum mismatch: {}/{} - expected: {}, actual: {}", bucket, object, expected_checksum, actual_checksum)
+            HealEvent::ChecksumMismatch {
+                bucket,
+                object,
+                expected_checksum,
+                actual_checksum,
+                ..
+            } => {
+                format!(
+                    "Checksum mismatch: {bucket}/{object} - expected: {expected_checksum}, actual: {actual_checksum}"
+                )
             }
-            HealEvent::BucketMetadataCorruption { bucket, corruption_type, .. } => {
-                format!("Bucket metadata corruption: {} - {:?}", bucket, corruption_type)
+            HealEvent::BucketMetadataCorruption {
+                bucket, corruption_type, ..
+            } => {
+                format!("Bucket metadata corruption: {bucket} - {corruption_type:?}")
             }
-            HealEvent::MRFMetadataCorruption { meta_path, corruption_type, .. } => {
-                format!("MRF metadata corruption: {} - {:?}", meta_path, corruption_type)
+            HealEvent::MRFMetadataCorruption {
+                meta_path,
+                corruption_type,
+                ..
+            } => {
+                format!("MRF metadata corruption: {meta_path} - {corruption_type:?}")
             }
         }
     }
@@ -292,27 +327,22 @@ impl HealEventHandler {
 
     /// Filter events by severity
     pub fn filter_by_severity(&self, min_severity: Severity) -> Vec<&HealEvent> {
-        self.events
-            .iter()
-            .filter(|event| event.severity() >= min_severity)
-            .collect()
+        self.events.iter().filter(|event| event.severity() >= min_severity).collect()
     }
 
     /// Filter events by type
     pub fn filter_by_type(&self, event_type: &str) -> Vec<&HealEvent> {
         self.events
             .iter()
-            .filter(|event| {
-                match event {
-                    HealEvent::ObjectCorruption { .. } => event_type == "ObjectCorruption",
-                    HealEvent::ObjectMissing { .. } => event_type == "ObjectMissing",
-                    HealEvent::MetadataCorruption { .. } => event_type == "MetadataCorruption",
-                    HealEvent::DiskStatusChange { .. } => event_type == "DiskStatusChange",
-                    HealEvent::ECDecodeFailure { .. } => event_type == "ECDecodeFailure",
-                    HealEvent::ChecksumMismatch { .. } => event_type == "ChecksumMismatch",
-                    HealEvent::BucketMetadataCorruption { .. } => event_type == "BucketMetadataCorruption",
-                    HealEvent::MRFMetadataCorruption { .. } => event_type == "MRFMetadataCorruption",
-                }
+            .filter(|event| match event {
+                HealEvent::ObjectCorruption { .. } => event_type == "ObjectCorruption",
+                HealEvent::ObjectMissing { .. } => event_type == "ObjectMissing",
+                HealEvent::MetadataCorruption { .. } => event_type == "MetadataCorruption",
+                HealEvent::DiskStatusChange { .. } => event_type == "DiskStatusChange",
+                HealEvent::ECDecodeFailure { .. } => event_type == "ECDecodeFailure",
+                HealEvent::ChecksumMismatch { .. } => event_type == "ChecksumMismatch",
+                HealEvent::BucketMetadataCorruption { .. } => event_type == "BucketMetadataCorruption",
+                HealEvent::MRFMetadataCorruption { .. } => event_type == "MRFMetadataCorruption",
             })
             .collect()
     }
@@ -322,4 +352,4 @@ impl Default for HealEventHandler {
     fn default() -> Self {
         Self::new(1000)
     }
-} 
+}

@@ -24,6 +24,9 @@ pub enum Error {
     #[error("Storage error: {0}")]
     Storage(#[from] rustfs_ecstore::error::Error),
 
+    #[error("Disk error: {0}")]
+    Disk(#[from] rustfs_ecstore::disk::error::DiskError),
+
     #[error("Configuration error: {0}")]
     Config(String),
 
@@ -88,4 +91,4 @@ impl From<Error> for std::io::Error {
     fn from(err: Error) -> Self {
         std::io::Error::other(err)
     }
-} 
+}

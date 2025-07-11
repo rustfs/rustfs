@@ -18,6 +18,9 @@ use crate::heal::{
     storage::HealStorageAPI,
     task::{HealRequest, HealTask, HealTaskStatus},
 };
+use rustfs_ecstore::disk::error::DiskError;
+use rustfs_ecstore::disk::DiskAPI;
+use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -121,6 +124,9 @@ impl HealManager {
 
         // start scheduler
         self.start_scheduler().await?;
+
+        // start auto disk scanner
+        self.start_auto_disk_scanner().await?;
 
         info!("HealManager started successfully");
         Ok(())
@@ -253,6 +259,86 @@ impl HealManager {
         Ok(())
     }
 
+    /// Start background task to auto scan local disks and enqueue disk heal requests
+    async fn start_auto_disk_scanner(&self) -> Result<()> {
+        let config = self.config.clone();
+        let heal_queue = self.heal_queue.clone();
+        let active_heals = self.active_heals.clone();
+        let cancel_token = self.cancel_token.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(config.read().await.heal_interval);
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        info!("Auto disk scanner received shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        // Build list of endpoints that need healing
+                        let mut endpoints = Vec::new();
+                        println!("GLOBAL_LOCAL_DISK_MAP length: {:?}", GLOBAL_LOCAL_DISK_MAP.read().await.len());
+                        for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
+                            if let Some(disk) = disk_opt {
+                                // detect unformatted disk via get_disk_id()
+                                if let Err(err) = disk.get_disk_id().await {
+                                    if err == DiskError::UnformattedDisk {
+                                        endpoints.push(disk.endpoint());
+                                        continue;
+                                    }
+                                }
+                                // disk currently healing and not finished
+                                if let Some(h) = disk.healing().await {
+                                    if !h.finished {
+                                        endpoints.push(disk.endpoint());
+                                    }
+                                }
+                            }
+                        }
+
+                        if endpoints.is_empty() {
+                            continue;
+                        }
+                        println!("endpoints length: {:?}", endpoints.len());
+
+                        for ep in endpoints {
+                            // skip if already queued or healing
+                            let mut skip = false;
+                            {
+                                let queue = heal_queue.lock().await;
+                                if queue.iter().any(|req| matches!(&req.heal_type, crate::heal::task::HealType::Disk { endpoint } if endpoint == &ep)) {
+                                    skip = true;
+                                }
+                            }
+                            if !skip {
+                                let active = active_heals.lock().await;
+                                if active.values().any(|task| matches!(&task.heal_type, crate::heal::task::HealType::Disk { endpoint } if endpoint == &ep)) {
+                                    skip = true;
+                                }
+                            }
+
+                            if skip {
+                                continue;
+                            }
+
+                            // enqueue heal request for this disk
+                            let req = crate::heal::task::HealRequest::new(
+                                crate::heal::task::HealType::Disk { endpoint: ep.clone() },
+                                crate::heal::task::HealOptions::default(),
+                                crate::heal::task::HealPriority::Normal,
+                            );
+                            let mut queue = heal_queue.lock().await;
+                            queue.push_back(req);
+                            info!("Enqueued auto disk heal for endpoint: {}", ep);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Process heal queue
     async fn process_heal_queue(
         heal_queue: &Arc<Mutex<VecDeque<HealRequest>>>,
@@ -321,4 +407,4 @@ impl std::fmt::Debug for HealManager {
             .field("queue_length", &"<queue>")
             .finish()
     }
-} 
+}

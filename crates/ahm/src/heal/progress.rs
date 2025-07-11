@@ -66,7 +66,8 @@ impl HealProgress {
     }
 
     pub fn is_completed(&self) -> bool {
-        self.progress_percentage >= 100.0 || self.objects_scanned > 0 && self.objects_healed + self.objects_failed >= self.objects_scanned
+        self.progress_percentage >= 100.0
+            || self.objects_scanned > 0 && self.objects_healed + self.objects_failed >= self.objects_scanned
     }
 
     pub fn get_success_rate(&self) -> f64 {
@@ -95,6 +96,12 @@ pub struct HealStatistics {
     pub total_bytes_healed: u64,
     /// Last update time
     pub last_update_time: SystemTime,
+}
+
+impl Default for HealStatistics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HealStatistics {
@@ -138,4 +145,4 @@ impl HealStatistics {
             0.0
         }
     }
-} 
+}

@@ -1,25 +1,44 @@
 use rustfs_ahm::heal::{
-    manager::HealManager,
+    manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealStorageAPI},
-    task::{HealOptions, HealPriority, HealRequest, HealType, HEAL_NORMAL_SCAN},
+    task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+    heal::heal_commands::HEAL_NORMAL_SCAN,
     store::ECStore,
-    store_api::{PutObjReader, ObjectOptions, StorageAPI, ObjectIO},
+    store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
 };
+use serial_test::serial;
+use std::sync::Once;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tracing::info;
+use walkdir::WalkDir;
+static INIT: Once = Once::new();
+fn init_tracing() {
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt::try_init();
+    });
+}
 
 /// Test helper: Create test environment with ECStore
 async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
-    // create temp dir as 4 disks
-    let test_base_dir = "/tmp/rustfs_ahm_heal_test";
-    let temp_dir = std::path::PathBuf::from(test_base_dir);
+    use std::sync::OnceLock;
+    init_tracing();
+    static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
+
+    // Fast path: already initialized, just clone and return
+    if let Some((paths, ecstore, heal_storage)) = GLOBAL_ENV.get() {
+        return (paths.clone(), ecstore.clone(), heal_storage.clone());
+    }
+
+    // create temp dir as 4 disks with unique base dir
+    let test_base_dir = format!("/tmp/rustfs_ahm_heal_test_{}", uuid::Uuid::new_v4());
+    let temp_dir = std::path::PathBuf::from(&test_base_dir);
     if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).await.unwrap();
+        fs::remove_dir_all(&temp_dir).await.ok();
     }
     fs::create_dir_all(&temp_dir).await.unwrap();
 
@@ -57,11 +76,11 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    // format disks
+    // format disks (only first time)
     rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
 
-    // create ECStore with dynamic port
-    let port = 9001;
+    // create ECStore with dynamic port 0 (let OS assign) or fixed 9001 if free
+    let port = 9001; // for simplicity
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
 
@@ -78,13 +97,16 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
     // Create heal storage layer
     let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
-    
+
+    // Store in global once lock
+    let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone(), heal_storage.clone()));
+
     (disk_paths, ecstore, heal_storage)
 }
 
 /// Test helper: Create a test bucket
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
-    (&**ecstore)
+    (**ecstore)
         .make_bucket(bucket_name, &Default::default())
         .await
         .expect("Failed to create test bucket");
@@ -92,22 +114,14 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
 }
 
 /// Test helper: Upload test object
-async fn upload_test_object(
-    ecstore: &Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    data: &[u8],
-) {
+async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
     let mut reader = PutObjReader::from_vec(data.to_vec());
-    let object_info = (&**ecstore)
+    let object_info = (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await
         .expect("Failed to upload test object");
-    
-    info!(
-        "Uploaded test object: {}/{} ({} bytes)",
-        bucket, object, object_info.size
-    );
+
+    info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
 /// Test helper: Cleanup test environment
@@ -117,31 +131,54 @@ async fn cleanup_test_env(disk_paths: &[PathBuf]) {
             fs::remove_dir_all(disk_path).await.expect("Failed to cleanup disk path");
         }
     }
-    
-    // Clean up test base directory
-    let test_base_dir = PathBuf::from("/tmp/rustfs_ahm_heal_test");
-    if test_base_dir.exists() {
-        fs::remove_dir_all(&test_base_dir).await.expect("Failed to cleanup test base directory");
+
+    // Attempt to clean up base directory inferred from disk_paths[0]
+    if let Some(parent) = disk_paths.first().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+        if parent.exists() {
+            fs::remove_dir_all(parent).await.ok();
+        }
     }
-    
+
     info!("Test environment cleaned up");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_heal_object_basic() {
     let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
-    
+
     // Create test bucket and object
     let bucket_name = "test-bucket";
     let object_name = "test-object.txt";
     let test_data = b"Hello, this is test data for healing!";
-    
+
     create_test_bucket(&ecstore, bucket_name).await;
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
-    
-    // Create heal manager
-    let heal_manager = HealManager::new(heal_storage.clone(), Default::default());
-    
+
+    // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
+    let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+    // find part file at depth 2, e.g. .../<uuid>/part.1
+    let target_part = WalkDir::new(&obj_dir)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+        .map(|e| e.into_path())
+        .expect("Failed to locate part file to delete");
+
+    std::fs::remove_file(&target_part).expect("failed to delete part file");
+    assert!(!target_part.exists());
+    println!("✅ Deleted shard part file: {target_part:?}");
+
+    // Create heal manager with faster interval
+    let cfg = HealConfig {
+        heal_interval: Duration::from_millis(1),
+        ..Default::default()
+    };
+    let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
+    heal_manager.start().await.unwrap();
+
     // Submit heal request for the object
     let heal_request = HealRequest::new(
         HealType::Object {
@@ -160,46 +197,56 @@ async fn test_heal_object_basic() {
         },
         HealPriority::Normal,
     );
-    
+
     let task_id = heal_manager
         .submit_heal_request(heal_request)
         .await
         .expect("Failed to submit heal request");
-    
+
     info!("Submitted heal request with task ID: {}", task_id);
-    
+
     // Wait for task completion
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    
-    // Check task status
-    let task_status = heal_manager.get_task_status(&task_id).await;
-    assert!(task_status.is_ok());
-    
-    let status = task_status.unwrap();
-    info!("Task status: {:?}", status);
-    
-    // Verify object still exists and is accessible
-    let object_exists = heal_storage.object_exists(bucket_name, object_name).await;
-    assert!(object_exists.is_ok());
-    assert!(object_exists.unwrap());
-    
+    tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+
+    // Attempt to fetch task status (might be removed if finished)
+    match heal_manager.get_task_status(&task_id).await {
+        Ok(status) => info!("Task status: {:?}", status),
+        Err(e) => info!("Task status not found (likely completed): {}", e),
+    }
+
+    // ─── 2️⃣ verify each part file is restored ───────
+    assert!(target_part.exists());
+
     // Cleanup
     cleanup_test_env(&disk_paths).await;
-    
+
     info!("Heal object basic test passed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_heal_bucket_basic() {
     let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
-    
+
     // Create test bucket
     let bucket_name = "test-bucket-heal";
     create_test_bucket(&ecstore, bucket_name).await;
-    
-    // Create heal manager
-    let heal_manager = HealManager::new(heal_storage.clone(), Default::default());
-    
+
+    // ─── 1️⃣ delete bucket dir on disk ──────────────
+    let broken_bucket_path = disk_paths[0].join(bucket_name);
+    assert!(broken_bucket_path.exists(), "bucket dir does not exist on disk");
+    std::fs::remove_dir_all(&broken_bucket_path).expect("failed to delete bucket dir on disk");
+    assert!(!broken_bucket_path.exists(), "bucket dir still exists after deletion");
+    println!("✅ Deleted bucket directory on disk: {broken_bucket_path:?}");
+
+    // Create heal manager with faster interval
+    let cfg = HealConfig {
+        heal_interval: Duration::from_millis(1),
+        ..Default::default()
+    };
+    let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
+    heal_manager.start().await.unwrap();
+
     // Submit heal request for the bucket
     let heal_request = HealRequest::new(
         HealType::Bucket {
@@ -216,99 +263,83 @@ async fn test_heal_bucket_basic() {
         },
         HealPriority::Normal,
     );
-    
+
     let task_id = heal_manager
         .submit_heal_request(heal_request)
         .await
         .expect("Failed to submit bucket heal request");
-    
+
     info!("Submitted bucket heal request with task ID: {}", task_id);
-    
+
     // Wait for task completion
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    
-    // Check task status
-    let task_status = heal_manager.get_task_status(&task_id).await;
-    assert!(task_status.is_ok());
-    
-    let status = task_status.unwrap();
-    info!("Bucket heal task status: {:?}", status);
-    
-    // Verify bucket still exists
-    let bucket_exists = heal_storage.get_bucket_info(bucket_name).await;
-    assert!(bucket_exists.is_ok());
-    assert!(bucket_exists.unwrap().is_some());
-    
+
+    // Attempt to fetch task status (optional)
+    if let Ok(status) = heal_manager.get_task_status(&task_id).await {
+        if status == HealTaskStatus::Completed {
+            info!("Bucket heal task status: {:?}", status);
+        } else {
+            panic!("Bucket heal task status: {status:?}");
+        }
+    }
+
+    // ─── 3️⃣ Verify bucket directory is restored on every disk ───────
+    assert!(broken_bucket_path.exists(), "bucket dir does not exist on disk");
+
     // Cleanup
     cleanup_test_env(&disk_paths).await;
-    
+
     info!("Heal bucket basic test passed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_heal_format_basic() {
     let (disk_paths, _ecstore, heal_storage) = setup_test_env().await;
-    
-    // Create heal manager
-    let heal_manager = HealManager::new(heal_storage.clone(), Default::default());
-    
-    // Get disk endpoint for testing
-    let disk_endpoint = Endpoint::try_from(disk_paths[0].to_str().unwrap())
-        .expect("Failed to create disk endpoint");
-    
-    // Submit disk heal request (format heal)
-    let heal_request = HealRequest::new(
-        HealType::Disk { endpoint: disk_endpoint },
-        HealOptions {
-            dry_run: true, // Use dry run for format heal test
-            recursive: false,
-            remove_corrupted: false,
-            recreate_missing: false,
-            scan_mode: HEAL_NORMAL_SCAN,
-            update_parity: false,
-            timeout: Some(Duration::from_secs(300)),
-        },
-        HealPriority::Normal,
-    );
-    
-    let task_id = heal_manager
-        .submit_heal_request(heal_request)
-        .await
-        .expect("Failed to submit disk heal request");
-    
-    info!("Submitted disk heal request with task ID: {}", task_id);
-    
+
+    // ─── 1️⃣ delete format.json on one disk ──────────────
+    let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
+    assert!(format_path.exists(), "format.json does not exist on disk");
+    std::fs::remove_file(&format_path).expect("failed to delete format.json on disk");
+    assert!(!format_path.exists(), "format.json still exists after deletion");
+    println!("✅ Deleted format.json on disk: {format_path:?}");
+
+    // Create heal manager with faster interval
+    let cfg = HealConfig {
+        heal_interval: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
+    heal_manager.start().await.unwrap();
+
     // Wait for task completion
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-    
-    // Check task status
-    let task_status = heal_manager.get_task_status(&task_id).await;
-    assert!(task_status.is_ok());
-    
-    let status = task_status.unwrap();
-    info!("Disk heal task status: {:?}", status);
-    
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // ─── 2️⃣ verify format.json is restored ───────
+    assert!(format_path.exists(), "format.json does not exist on disk after heal");
+
     // Cleanup
     cleanup_test_env(&disk_paths).await;
-    
+
     info!("Heal format basic test passed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_heal_storage_api_direct() {
     let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
-    
+
     // Test direct heal storage API calls
-    
+
     // Test heal_format
     let format_result = heal_storage.heal_format(true).await; // dry run
     assert!(format_result.is_ok());
     info!("Direct heal_format test passed");
-    
+
     // Test heal_bucket
     let bucket_name = "test-bucket-direct";
     create_test_bucket(&ecstore, bucket_name).await;
-    
+
     let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
         recursive: true,
         dry_run: true,
@@ -320,16 +351,16 @@ async fn test_heal_storage_api_direct() {
         pool: None,
         set: None,
     };
-    
+
     let bucket_result = heal_storage.heal_bucket(bucket_name, &heal_opts).await;
     assert!(bucket_result.is_ok());
     info!("Direct heal_bucket test passed");
-    
+
     // Test heal_object
     let object_name = "test-object-direct.txt";
     let test_data = b"Test data for direct heal API";
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
-    
+
     let object_heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
         recursive: false,
         dry_run: true,
@@ -341,13 +372,15 @@ async fn test_heal_storage_api_direct() {
         pool: None,
         set: None,
     };
-    
-    let object_result = heal_storage.heal_object(bucket_name, object_name, None, &object_heal_opts).await;
+
+    let object_result = heal_storage
+        .heal_object(bucket_name, object_name, None, &object_heal_opts)
+        .await;
     assert!(object_result.is_ok());
     info!("Direct heal_object test passed");
-    
+
     // Cleanup
     cleanup_test_env(&disk_paths).await;
-    
+
     info!("Direct heal storage API test passed");
-} 
+}
