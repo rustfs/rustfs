@@ -23,7 +23,7 @@ services:
     container_name: rustfs-server
     build:
       context: .
-      dockerfile: .docker/Dockerfile.multi-stage
+      dockerfile: .docker/ubuntu/Dockerfile.source
       args:
         TARGETPLATFORM: linux/amd64
     ports:
@@ -68,8 +68,8 @@ services:
     container_name: rustfs-dev
     build:
       context: .
-      dockerfile: .docker/Dockerfile.devenv
-      # No VERSION arg = development mode
+      dockerfile: .docker/ubuntu/Dockerfile.dev
+      # Pure development environment
     ports:
       - "9010:9000"
     environment:

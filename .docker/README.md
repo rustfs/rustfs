@@ -1,0 +1,117 @@
+# RustFS Docker Images
+
+This directory contains organized Dockerfile configurations for building RustFS container images across multiple platforms and system versions.
+
+## 📁 Directory Structure
+
+```
+.docker/
+├── alpine/                    # Alpine Linux variants
+│   ├── Dockerfile.prebuild    # Alpine + pre-built binaries
+│   └── Dockerfile.source      # Alpine + source compilation
+├── ubuntu/                    # Ubuntu variants
+│   ├── Dockerfile.prebuild    # Ubuntu + pre-built binaries
+│   ├── Dockerfile.source      # Ubuntu + source compilation
+│   └── Dockerfile.dev         # Ubuntu + development environment
+└── cargo.config.toml         # Rust cargo configuration
+```
+
+## 🎯 Image Variants
+
+### Production Images
+
+| Variant | Base OS | Build Method | Size | Use Case |
+|---------|---------|--------------|------|----------|
+| `production` (default) | Alpine 3.18 | Pre-built | Smallest | Production deployment |
+| `alpine` | Alpine 3.18 | Pre-built | Small | Lightweight production |
+| `alpine-source` | Alpine 3.18 | Source build | Small | Custom builds |
+| `ubuntu` | Ubuntu 22.04 | Pre-built | Medium | Ubuntu environments |
+| `ubuntu-source` | Ubuntu 22.04 | Source build | Medium | Full Ubuntu compatibility |
+
+### Development Images
+
+| Variant | Base OS | Features | Use Case |
+|---------|---------|----------|----------|
+| `ubuntu-dev` | Ubuntu 22.04 | Full toolchain + dev tools | Interactive development |
+
+## 🚀 Usage Examples
+
+### Quick Start (Production)
+
+```bash
+# Default production image (Alpine + pre-built)
+docker run -p 9000:9000 rustfs/rustfs:latest
+
+# Specific version with production variant
+docker run -p 9000:9000 rustfs/rustfs:1.2.3-production
+
+# Ubuntu-based production
+docker run -p 9000:9000 rustfs/rustfs:latest-ubuntu
+
+# Alpine source build
+docker run -p 9000:9000 rustfs/rustfs:latest-alpine-source
+```
+
+### Complete Tag Strategy Examples
+
+```bash
+# Stable Releases
+docker run rustfs/rustfs:1.2.3                # Main version (production)
+docker run rustfs/rustfs:1.2.3-production     # Explicit production variant
+docker run rustfs/rustfs:1.2.3-alpine         # Alpine variant
+docker run rustfs/rustfs:latest               # Latest stable
+
+# Prerelease Versions
+docker run rustfs/rustfs:1.3.0-alpha.2        # Specific alpha version
+docker run rustfs/rustfs:1.3.0-alpha.2-alpine # Alpha with Alpine
+docker run rustfs/rustfs:alpha                # Latest alpha
+docker run rustfs/rustfs:beta                 # Latest beta
+docker run rustfs/rustfs:rc                   # Latest release candidate
+
+# Development Versions
+docker run rustfs/rustfs:dev                  # Latest development
+docker run rustfs/rustfs:dev-13e4a0b          # Specific commit
+docker run rustfs/rustfs:dev-alpine           # Development Alpine
+```
+
+### Development Environment
+
+```bash
+# Start development container
+docker run -it -v $(pwd):/app -p 9000:9000 rustfs/rustfs:latest-ubuntu-dev
+
+# Inside container:
+cd /app
+cargo build --release
+cargo run
+```
+
+## 🏗️ Build Arguments
+
+All images support dynamic version selection:
+
+```bash
+# Build with specific version
+docker build \
+  --build-arg VERSION="1.0.0" \
+  --build-arg BUILD_TYPE="release" \
+  -f .docker/alpine/Dockerfile.prebuild \
+  -t rustfs:1.0.0-alpine .
+```
+
+## 🌐 Multi-Platform Support
+
+All images support multiple architectures:
+
+- `linux/amd64` (Intel/AMD 64-bit)
+- `linux/arm64` (ARM 64-bit, Apple Silicon, etc.)
+
+## 📋 Build Matrix
+
+| Trigger | Version Format | Download Path | Image Tags |
+|---------|---------------|---------------|------------|
+| `push main` | `dev-{sha}` | `artifacts/rustfs/dev/` | `dev-{sha}-{variant}`, `dev-{variant}`, `dev` |
+| `push 1.2.3` | `1.2.3` | `artifacts/rustfs/release/` | `1.2.3-{variant}`, `1.2.3`, `latest-{variant}`, `latest` |
+| `push 1.3.0-alpha.2` | `1.3.0-alpha.2` | `artifacts/rustfs/release/` | `1.3.0-alpha.2-{variant}`, `alpha-{variant}`, `alpha` |
+| `push 1.3.0-beta.1` | `1.3.0-beta.1` | `artifacts/rustfs/release/` | `1.3.0-beta.1-{variant}`, `beta-{variant}`, `beta` |
+| `push 1.3.0-rc.1` | `1.3.0-rc.1` | `artifacts/rustfs/release/` | `1.3.0-rc.1-{variant}`, `rc-{variant}`, `rc` |

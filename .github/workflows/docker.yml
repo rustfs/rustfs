@@ -167,11 +167,17 @@ jobs:
           - name: production
             dockerfile: Dockerfile
             platforms: linux/amd64,linux/arm64
-          - name: ubuntu
-            dockerfile: .docker/Dockerfile.devenv
-            platforms: linux/amd64,linux/arm64
           - name: alpine
-            dockerfile: .docker/Dockerfile.alpine
+            dockerfile: .docker/alpine/Dockerfile.prebuild
+            platforms: linux/amd64,linux/arm64
+          - name: alpine-source
+            dockerfile: .docker/alpine/Dockerfile.source
+            platforms: linux/amd64,linux/arm64
+          - name: ubuntu
+            dockerfile: .docker/ubuntu/Dockerfile.prebuild
+            platforms: linux/amd64,linux/arm64
+          - name: ubuntu-source
+            dockerfile: .docker/ubuntu/Dockerfile.source
             platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout repository
@@ -211,18 +217,61 @@ jobs:
           TAGS=""
 
           if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development build: dev-${short_sha}-${variant}
+            # Development build: dev-${short_sha}-${variant} and dev-${variant}
             TAGS="${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}-${VARIANT}"
             TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${SHORT_SHA}-${VARIANT}"
+
+            # Add rolling dev tag for each variant
+            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev-${VARIANT}"
+            TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${VARIANT}"
+
+            # Special handling for production variant
+            if [[ "$VARIANT" == "production" ]]; then
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}"
+              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${SHORT_SHA}"
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev"
+              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev"
+            fi
           else
             # Release/Prerelease build: ${version}-${variant}
             TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-${VARIANT}"
             TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${VERSION}-${VARIANT}"
 
-            # Add latest tag only for stable releases
+            # Special handling for production variant - create main version tag
+            if [[ "$VARIANT" == "production" ]]; then
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
+              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${VERSION}"
+            fi
+
+            # Add channel tags for prereleases and latest for stable
             if [[ "$CREATE_LATEST" == "true" ]]; then
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest-${VARIANT}"
-              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:latest-${VARIANT}"
+              # Stable release
+              if [[ "$VARIANT" == "production" ]]; then
+                TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
+                TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:latest"
+              else
+                TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest-${VARIANT}"
+                TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:latest-${VARIANT}"
+              fi
+            elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
+              # Prerelease channel tags (alpha, beta, rc)
+              if [[ "$VERSION" == *"alpha"* ]]; then
+                CHANNEL="alpha"
+              elif [[ "$VERSION" == *"beta"* ]]; then
+                CHANNEL="beta"
+              elif [[ "$VERSION" == *"rc"* ]]; then
+                CHANNEL="rc"
+              fi
+
+              if [[ -n "$CHANNEL" ]]; then
+                if [[ "$VARIANT" == "production" ]]; then
+                  TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
+                  TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${CHANNEL}"
+                else
+                  TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}-${VARIANT}"
+                  TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${CHANNEL}-${VARIANT}"
+                fi
+              fi
             fi
           fi
 
@@ -291,19 +340,9 @@ jobs:
           echo "🐳 Creating manifest for stable release: $VERSION"
 
           # Create main image tag (without variant suffix) for stable releases only
-          if [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]]; then
-            echo "Creating Docker Hub manifest..."
-            docker buildx imagetools create \
-              -t ${{ env.REGISTRY_DOCKERHUB }}:${VERSION} \
-              -t ${{ env.REGISTRY_DOCKERHUB }}:latest \
-              ${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-production
-          fi
-
-          echo "Creating GitHub Container Registry manifest..."
-          docker buildx imagetools create \
-            -t ${{ env.REGISTRY_GHCR }}:${VERSION} \
-            -t ${{ env.REGISTRY_GHCR }}:latest \
-            ${{ env.REGISTRY_GHCR }}:${VERSION}-production
+          # Note: The "production" variant already creates the main tags without suffix
+          echo "Manifest creation is handled by the production variant build step"
+          echo "Main tags ${VERSION} and latest are created directly by the production variant"
 
           echo "✅ Manifest created successfully for stable release"
 
