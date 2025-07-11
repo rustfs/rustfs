@@ -1016,8 +1016,8 @@ mod tests {
     use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_ecstore::store::ECStore;
     use rustfs_ecstore::{
-        store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
         StorageAPI,
+        store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
     };
     use std::fs;
     use std::net::SocketAddr;
