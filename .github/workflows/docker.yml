@@ -168,7 +168,7 @@ jobs:
             dockerfile: Dockerfile
             platforms: linux/amd64,linux/arm64
           - name: ubuntu
-            dockerfile: .docker/Dockerfile.ubuntu22.04
+            dockerfile: .docker/Dockerfile.devenv
             platforms: linux/amd64,linux/arm64
           - name: alpine
             dockerfile: .docker/Dockerfile.alpine

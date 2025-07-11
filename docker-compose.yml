@@ -61,6 +61,7 @@ services:
     build:
       context: .
       dockerfile: .docker/Dockerfile.devenv
+      # No VERSION arg = development mode
     ports:
       - "9010:9000"
     environment:
@@ -71,7 +72,7 @@ services:
       - RUSTFS_SECRET_KEY=devadmin
       - RUSTFS_LOG_LEVEL=debug
     volumes:
-      - .:/root/s3-rustfs
+      - .:/app  # Mount source code to /app for development
       - rustfs_dev_data:/data
     networks:
       - rustfs-network
