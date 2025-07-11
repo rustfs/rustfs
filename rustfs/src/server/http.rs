@@ -1,7 +1,21 @@
-// use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
-use crate::auth::IAMAuth;
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Ensure the correct path for parse_license is imported
 use crate::admin;
+// use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
+use crate::auth::IAMAuth;
 use crate::config;
 use crate::server::hybrid::hybrid;
 use crate::server::layer::RedirectLayer;
@@ -44,7 +58,7 @@ const MI_B: usize = 1024 * 1024;
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
-) -> std::io::Result<tokio::sync::broadcast::Sender<()>> {
+) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
@@ -201,7 +215,7 @@ pub async fn start_http_server(
             };
 
             let socket_ref = SockRef::from(&socket);
-            if let Err(err) = socket_ref.set_nodelay(true) {
+            if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {

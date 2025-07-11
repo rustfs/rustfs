@@ -28,12 +28,10 @@ services:
         TARGETPLATFORM: linux/amd64
     ports:
       - "9000:9000"  # S3 API port
-      - "9001:9001"  # Console port
     environment:
       - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_LOG_LEVEL=info
@@ -65,12 +63,10 @@ services:
       dockerfile: .docker/Dockerfile.devenv
     ports:
       - "9010:9000"
-      - "9011:9001"
     environment:
       - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin
       - RUSTFS_LOG_LEVEL=debug

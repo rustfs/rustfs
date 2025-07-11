@@ -18,14 +18,11 @@ mod config;
 mod error;
 // mod grpc;
 pub mod license;
-mod logging;
 mod server;
 mod storage;
 mod update;
 mod version;
 
-use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_ecstore::config::GLOBAL_ServerConfig;
 // Ensure the correct path for parse_license is imported
 use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_http_server, wait_for_shutdown};
 use chrono::Datelike;
@@ -34,10 +31,12 @@ use license::init_license;
 use rustfs_ahm::scanner::data_scanner::ScannerConfig;
 use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_services};
 use rustfs_common::globals::set_global_addr;
+use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_ConfigSys;
+use rustfs_ecstore::config::GLOBAL_ServerConfig;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,

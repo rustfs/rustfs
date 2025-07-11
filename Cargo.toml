@@ -182,9 +182,9 @@ pbkdf2 = "0.12.2"
 percent-encoding = "2.3.1"
 pin-project-lite = "0.2.16"
 prost = "0.13.5"
-quick-xml = "0.37.5"
+quick-xml = "0.38.0"
 rand = "0.9.1"
-rdkafka = { version = "0.37.0", features = ["tokio"] }
+rdkafka = { version = "0.38.0", features = ["tokio"] }
 reed-solomon-simd = { version = "3.0.1" }
 regex = { version = "1.11.1" }
 reqwest = { version = "0.12.22", default-features = false, features = [
@@ -222,9 +222,9 @@ siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"
 snap = "1.1.1"
-socket2 = "0.5.10"
+socket2 = "0.6.0"
 strum = { version = "0.27.1", features = ["derive"] }
-sysinfo = "0.35.2"
+sysinfo = "0.36.0"
 tempfile = "3.20.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
