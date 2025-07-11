@@ -4,6 +4,8 @@ This directory contains specialized Docker Compose configurations for different 
 
 ## 📁 Configuration Files
 
+This directory contains specialized Docker Compose configurations and their associated Dockerfiles, keeping related files organized together.
+
 ### Main Configuration (Root Directory)
 
 - **`../../docker-compose.yml`** - **Default Production Setup**
@@ -23,8 +25,13 @@ This directory contains specialized Docker Compose configurations for different 
 - **`docker-compose.observability.yaml`** - **Observability Focus**
   - Specialized setup for testing observability features
   - Includes OpenTelemetry, Jaeger, Prometheus, Loki, Grafana
-  - Uses `Dockerfile.obs` for builds
+  - Uses `Dockerfile.obs` (in this directory) for builds
   - Perfect for observability development
+
+- **`Dockerfile.obs`** - **Observability Dockerfile**
+  - Ubuntu-based Dockerfile optimized for observability testing
+  - Pre-configured with observability environment variables
+  - Used exclusively by `docker-compose.observability.yaml`
 
 ## 🚀 Usage Examples
 
