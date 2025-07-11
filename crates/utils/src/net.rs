@@ -176,7 +176,7 @@ impl Display for XHost {
 impl TryFrom<String> for XHost {
     type Error = std::io::Error;
 
-    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: String) -> Result<Self, Self::Error> {
         if let Some(addr) = value.to_socket_addrs()?.next() {
             Ok(Self {
                 name: addr.ip().to_string(),
@@ -212,9 +212,9 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
 }
 
 #[allow(dead_code)]
-pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static
+pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
 where
-    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
     AsyncTryStream::<Bytes, E, _>::new(|mut y| async move {

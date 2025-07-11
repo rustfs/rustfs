@@ -79,14 +79,12 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=:9002
       - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
-      - "9001:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
-      - "9101:9002"
+      - "9001:9000"  # Map port 9001 of the host to port 9000 of the container
     volumes:
-      # - ./data:/root/data  # 将当前路径挂载到容器内的 /root/data
+      # - ./data:/root/data  # Mount the current path to /root/data in the container
       - ./.docker/observability/config:/etc/observability/config
     networks:
       - rustfs-network
@@ -100,12 +98,10 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=:9002
       - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
-      - "9002:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
-      - "9102:9002"
+      - "9002:9000"  # Map port 9002 of the host to port 9000 of the container
     volumes:
       # - ./data:/root/data
       - ./.docker/observability/config:/etc/observability/config
@@ -121,12 +117,10 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=:9002
       - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
-      - "9003:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
-      - "9103:9002"
+      - "9003:9000"  # Map port 9003 of the host to port 9000 of the container
     volumes:
       # - ./data:/root/data
       - ./.docker/observability/config:/etc/observability/config
@@ -142,12 +136,10 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=:9002
       - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
-      - "9004:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口
-      - "9104:9002"
+      - "9004:9000"  # Map port 9004 of the host to port 9000 of the container
     volumes:
       # - ./data:/root/data
       - ./.docker/observability/config:/etc/observability/config
