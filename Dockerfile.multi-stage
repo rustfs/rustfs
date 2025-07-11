@@ -111,7 +111,7 @@ RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
 USER rustfs
 
 # Expose ports
-EXPOSE 9000 9001
+EXPOSE 9000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

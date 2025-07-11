@@ -83,7 +83,6 @@ sudo journalctl -u rustfs --since today
 ```bash
 # 检查服务端口
 ss -tunlp | grep 9000
-ss -tunlp | grep 9001
 
 # 测试服务可用性
 curl -I http://localhost:9000

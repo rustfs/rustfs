@@ -14,7 +14,7 @@
 
 services:
   otel-collector:
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.127.0
+    image: otel/opentelemetry-collector-contrib:0.129.1
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -30,7 +30,7 @@ services:
     networks:
       - otel-network
   jaeger:
-    image: jaegertracing/jaeger:2.7.0
+    image: jaegertracing/jaeger:2.8.0
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -40,7 +40,7 @@ services:
     networks:
       - otel-network
   prometheus:
-    image: prom/prometheus:v3.4.1
+    image: prom/prometheus:v3.4.2
     environment:
       - TZ=Asia/Shanghai
     volumes:

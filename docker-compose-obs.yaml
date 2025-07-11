@@ -14,7 +14,7 @@
 
 services:
   otel-collector:
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.127.0
+    image: otel/opentelemetry-collector-contrib:0.129.1
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -30,7 +30,7 @@ services:
     networks:
       - rustfs-network
   jaeger:
-    image: jaegertracing/jaeger:2.6.0
+    image: jaegertracing/jaeger:2.8.0
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -40,7 +40,7 @@ services:
     networks:
       - rustfs-network
   prometheus:
-    image: prom/prometheus:v3.4.1
+    image: prom/prometheus:v3.4.2
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -61,7 +61,7 @@ services:
     networks:
       - rustfs-network
   grafana:
-    image: grafana/grafana:12.0.1
+    image: grafana/grafana:12.0.2
     ports:
       - "3000:3000"  # Web UI
     environment:
@@ -79,13 +79,11 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
       - "9001:9000"  # Map port 9001 of the host to port 9000 of the container
-    volumes:
-      # - ./data:/root/data  # Mount the current path to /root/data in the container
-      - ./.docker/observability/config:/etc/observability/config
     networks:
       - rustfs-network
 
@@ -98,13 +96,11 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
       - "9002:9000"  # Map port 9002 of the host to port 9000 of the container
-    volumes:
-      # - ./data:/root/data
-      - ./.docker/observability/config:/etc/observability/config
     networks:
       - rustfs-network
 
@@ -117,13 +113,11 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
       - "9003:9000"  # Map port 9003 of the host to port 9000 of the container
-    volumes:
-      # - ./data:/root/data
-      - ./.docker/observability/config:/etc/observability/config
     networks:
       - rustfs-network
 
@@ -136,13 +130,11 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
       - "9004:9000"  # Map port 9004 of the host to port 9000 of the container
-    volumes:
-      # - ./data:/root/data
-      - ./.docker/observability/config:/etc/observability/config
     networks:
       - rustfs-network
 
