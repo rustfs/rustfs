@@ -1489,15 +1489,111 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let ListPartsInput {
-            bucket, key, upload_id, ..
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            ..
         } = req.input;
 
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let part_number_marker = part_number_marker.map(|x| x.parse::<usize>().unwrap_or_default());
+        let max_parts = max_parts.unwrap_or_default() as usize;
+
+        let res = store
+            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
         let output = ListPartsOutput {
-            bucket: Some(bucket),
-            key: Some(key),
-            upload_id: Some(upload_id),
+            bucket: Some(res.bucket),
+            key: Some(res.object),
+            upload_id: Some(res.upload_id),
+            parts: Some(
+                res.parts
+                    .into_iter()
+                    .map(|p| Part {
+                        e_tag: p.etag,
+                        last_modified: p.last_mod.map(Timestamp::from),
+                        part_number: Some(p.part_num as i32),
+                        size: Some(p.size as i64),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
             ..Default::default()
         };
+        Ok(S3Response::new(output))
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let ListMultipartUploadsInput {
+            bucket,
+            prefix,
+            delimiter,
+            key_marker,
+            upload_id_marker,
+            max_uploads,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let prefix = prefix.unwrap_or_default();
+
+        let max_uploads = max_uploads.unwrap_or_default() as usize;
+
+        if let Some(key_marker) = &key_marker {
+            if !key_marker.starts_with(prefix.as_str()) {
+                return Err(s3_error!(NotImplemented, "Invalid key marker"));
+            }
+        }
+
+        let result = store
+            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
+            .await
+            .map_err(ApiError::from)?;
+
+        let output = ListMultipartUploadsOutput {
+            bucket: Some(bucket),
+            prefix: Some(prefix),
+            delimiter: result.delimiter,
+            key_marker: result.key_marker,
+            upload_id_marker: result.upload_id_marker,
+            max_uploads: Some(result.max_uploads as i32),
+            is_truncated: Some(result.is_truncated),
+            uploads: Some(
+                result
+                    .uploads
+                    .into_iter()
+                    .map(|u| MultipartUpload {
+                        key: Some(u.object),
+                        upload_id: Some(u.upload_id),
+                        initiated: u.initiated.map(Timestamp::from),
+
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            common_prefixes: Some(
+                result
+                    .common_prefixes
+                    .into_iter()
+                    .map(|c| CommonPrefix { prefix: Some(c) })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
         Ok(S3Response::new(output))
     }
 

@@ -46,6 +46,7 @@ pub struct ObjectPartInfo {
     pub index: Option<Bytes>,
     // Checksums holds checksums of the part
     pub checksums: Option<HashMap<String, String>>,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
@@ -287,6 +288,7 @@ impl FileInfo {
             actual_size,
             index,
             checksums: None,
+            error: None,
         };
 
         for p in self.parts.iter_mut() {

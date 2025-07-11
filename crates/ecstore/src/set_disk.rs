@@ -24,13 +24,13 @@ use crate::disk::{
 };
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
-use crate::error::ObjectApiError;
 use crate::error::{Error, Result};
+use crate::error::{ObjectApiError, is_err_object_not_found};
 use crate::global::GLOBAL_MRFState;
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::heal::data_usage_cache::DataUsageCache;
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
-use crate::store_api::ObjectToDelete;
+use crate::store_api::{ListPartsInfo, ObjectToDelete};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
@@ -119,6 +119,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
+pub const MAX_PARTS_COUNT: usize = 10000;
 
 #[derive(Debug, Clone)]
 pub struct SetDisks {
@@ -315,6 +316,9 @@ impl SetDisks {
             .into_iter()
             .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
             .collect()
+    }
+    fn default_read_quorum(&self) -> usize {
+        self.set_drive_count - self.default_parity_count
     }
     fn default_write_quorum(&self) -> usize {
         let mut data_count = self.set_drive_count - self.default_parity_count;
@@ -548,6 +552,185 @@ impl SetDisks {
         if errs.iter().any(|e| e.is_some()) {
             warn!("cleanup_multipart_path errs {:?}", &errs);
         }
+    }
+
+    async fn read_parts(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        part_meta_paths: &[String],
+        part_numbers: &[usize],
+        read_quorum: usize,
+    ) -> disk::error::Result<Vec<ObjectPartInfo>> {
+        let mut futures = Vec::with_capacity(disks.len());
+        for (i, disk) in disks.iter().enumerate() {
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.read_parts(bucket, part_meta_paths).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let mut errs = Vec::with_capacity(disks.len());
+        let mut object_parts = Vec::with_capacity(disks.len());
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    errs.push(None);
+                    object_parts.push(res);
+                }
+                Err(e) => {
+                    errs.push(Some(e));
+                    object_parts.push(vec![]);
+                }
+            }
+        }
+
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            return Err(err);
+        }
+
+        let mut ret = vec![ObjectPartInfo::default(); part_meta_paths.len()];
+
+        for (part_idx, part_info) in part_meta_paths.iter().enumerate() {
+            let mut part_meta_quorum = HashMap::new();
+            let mut part_infos = Vec::new();
+            for (j, parts) in object_parts.iter().enumerate() {
+                if parts.len() != part_meta_paths.len() {
+                    *part_meta_quorum.entry(part_info.clone()).or_insert(0) += 1;
+                    continue;
+                }
+
+                if let Some(pinfo) = &parts[part_idx]
+                    && !pinfo.etag.is_empty()
+                {
+                    *part_meta_quorum.entry(pinfo.etag.clone()).or_insert(0) += 1;
+                    part_infos.push(pinfo.clone());
+                    continue;
+                }
+
+                *part_meta_quorum.entry(part_info.clone()).or_insert(0) += 1;
+            }
+
+            let mut max_quorum = 0;
+            let mut max_etag = None;
+            let mut max_part_meta = None;
+            for (etag, quorum) in part_meta_quorum.iter() {
+                if quorum > &max_quorum {
+                    max_quorum = *quorum;
+                    max_etag = Some(etag);
+                    max_part_meta = Some(etag);
+                }
+            }
+
+            let mut found = None;
+            for info in part_infos.iter() {
+                if let Some(etag) = max_etag
+                    && info.etag == *etag
+                {
+                    found = Some(info.clone());
+                    break;
+                }
+
+                if let Some(part_meta) = max_part_meta
+                    && info.etag.is_empty()
+                    && part_meta.ends_with(format!("part.{0}.meta", info.number).as_str())
+                {
+                    found = Some(info.clone());
+                    break;
+                }
+            }
+
+            if let (Some(found), Some(max_etag)) = (found, max_etag)
+                && !found.etag.is_empty()
+                && part_meta_quorum.get(max_etag).unwrap_or(&0) >= &read_quorum
+            {
+                ret[part_idx] = found;
+            } else {
+                ret[part_idx] = ObjectPartInfo {
+                    number: part_numbers[part_idx],
+                    error: Some(format!("part.{} not found", part_numbers[part_idx])),
+                    ..Default::default()
+                };
+            }
+        }
+
+        Ok(ret)
+    }
+
+    async fn list_parts(disks: &[Option<DiskStore>], part_path: &str, read_quorum: usize) -> disk::error::Result<Vec<usize>> {
+        let mut futures = Vec::with_capacity(disks.len());
+        for (i, disk) in disks.iter().enumerate() {
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path, -1)
+                        .await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let mut errs = Vec::with_capacity(disks.len());
+        let mut object_parts = Vec::with_capacity(disks.len());
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    errs.push(None);
+                    object_parts.push(res);
+                }
+                Err(e) => {
+                    errs.push(Some(e));
+                    object_parts.push(vec![]);
+                }
+            }
+        }
+
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            return Err(err);
+        }
+
+        let mut part_quorum_map: HashMap<usize, usize> = HashMap::new();
+
+        for drive_parts in object_parts {
+            let mut parts_with_meta_count: HashMap<usize, usize> = HashMap::new();
+
+            // part files can be either part.N or part.N.meta
+            for part_path in drive_parts {
+                if let Some(num_str) = part_path.strip_prefix("part.") {
+                    if let Some(meta_idx) = num_str.find(".meta") {
+                        if let Ok(part_num) = num_str[..meta_idx].parse::<usize>() {
+                            *parts_with_meta_count.entry(part_num).or_insert(0) += 1;
+                        }
+                    } else if let Ok(part_num) = num_str.parse::<usize>() {
+                        *parts_with_meta_count.entry(part_num).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Include only part.N.meta files with corresponding part.N
+            for (&part_num, &cnt) in &parts_with_meta_count {
+                if cnt >= 2 {
+                    *part_quorum_map.entry(part_num).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut part_numbers = Vec::with_capacity(part_quorum_map.len());
+        for (part_num, count) in part_quorum_map {
+            if count >= read_quorum {
+                part_numbers.push(part_num);
+            }
+        }
+
+        part_numbers.sort();
+
+        Ok(part_numbers)
     }
 
     #[tracing::instrument(skip(disks, meta))]
@@ -5064,6 +5247,118 @@ impl StorageAPI for SetDisks {
         };
 
         // error!("put_object_part ret {:?}", &ret);
+
+        Ok(ret)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        mut max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+
+        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+
+        if max_parts > MAX_PARTS_COUNT {
+            max_parts = MAX_PARTS_COUNT;
+        }
+
+        let part_number_marker = part_number_marker.unwrap_or_default();
+
+        let mut ret = ListPartsInfo {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            upload_id: upload_id.to_owned(),
+            max_parts,
+            part_number_marker,
+            user_defined: fi.metadata.clone(),
+            ..Default::default()
+        };
+
+        if max_parts == 0 {
+            return Ok(ret);
+        }
+
+        let online_disks = self.get_disks_internal().await;
+
+        let read_quorum = fi.read_quorum(self.default_read_quorum());
+
+        let part_path = format!(
+            "{}{}",
+            path_join_buf(&[
+                &upload_id_path,
+                fi.data_dir.map(|v| v.to_string()).unwrap_or_default().as_str(),
+            ]),
+            SLASH_SEPARATOR
+        );
+
+        let mut part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                if err == DiskError::FileNotFound {
+                    return Ok(ret);
+                }
+
+                return Err(to_object_err(err.into(), vec![bucket, object]));
+            }
+        };
+
+        if part_numbers.is_empty() {
+            return Ok(ret);
+        }
+        let start_op = part_numbers.iter().find(|&&v| v != 0 && v == part_number_marker);
+        if part_number_marker > 0 && start_op.is_none() {
+            return Ok(ret);
+        }
+
+        if let Some(start) = start_op {
+            if start + 1 > part_numbers.len() {
+                return Ok(ret);
+            }
+
+            part_numbers = part_numbers[start + 1..].to_vec();
+        }
+
+        let mut parts = Vec::with_capacity(part_numbers.len());
+
+        let part_meta_paths = part_numbers
+            .iter()
+            .map(|v| format!("{part_path}part.{v}.meta"))
+            .collect::<Vec<String>>();
+
+        let object_parts = Self::read_parts(&online_disks, bucket, &part_meta_paths, &part_numbers, read_quorum)
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object, upload_id]))?;
+
+        let mut count = max_parts;
+
+        for (i, part) in object_parts.iter().enumerate() {
+            parts.push(PartInfo {
+                etag: Some(part.etag.clone()),
+                part_num: part.number,
+                last_mod: part.mod_time,
+                size: part.size,
+                actual_size: part.actual_size,
+            });
+
+            count -= 1;
+            if count == 0 {
+                break;
+            }
+        }
+
+        ret.parts = parts;
+
+        if object_parts.len() > ret.parts.len() {
+            ret.is_truncated = true;
+            ret.next_part_number_marker = ret.parts.last().map(|v| v.part_num).unwrap_or_default();
+        }
 
         Ok(ret)
     }
