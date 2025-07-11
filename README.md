@@ -83,7 +83,7 @@ To get started with RustFS, follow these steps:
 2. **Docker Quick Start (Option 2)​​**
 
   ```bash
-   podman run -d -p 9000:9000 -p 9001:9001 -v /data:/data quay.io/rustfs/rustfs
+   docker run -d -p 9000:9000  -v /data:/data rustfs/rustfs
    ```
 
 

@@ -70,7 +70,7 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 2. **Docker快速启动（方案二）**
 
   ```bash
-   podman run -d -p 9000:9000 -p 9001:9001 -v /data:/data quay.io/rustfs/rustfs
+   docker run -d -p 9000:9000  -v /data:/data rustfs/rustfs
    ```
 
 
