@@ -345,9 +345,9 @@ impl ExpiryState {
     }
 
     pub async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>) {
-        //let cancel_token = GLOBAL_SCANNER_CANCEL_TOKEN
-        //    .get()
-        //    .ok_or_else(|| Error::other("Scanner not initialized"))?;
+        //let cancel_token =
+        //    get_background_services_cancel_token().ok_or_else(|| Error::other("Background services not initialized"))?;
+
         loop {
             select! {
                 //_ = cancel_token.cancelled() => {

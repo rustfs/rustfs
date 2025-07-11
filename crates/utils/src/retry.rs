@@ -14,11 +14,11 @@
 
 use futures::Stream;
 use hyper::http;
-use lazy_static::lazy_static;
 use std::{
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
+    sync::LazyLock,
 };
 use tokio::time::interval;
 
@@ -77,8 +77,8 @@ impl Stream for RetryTimer {
     }
 }
 
-lazy_static! {
-    static ref RETRYABLE_S3CODES: Vec<String> = vec![
+static RETRYABLE_S3CODES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    vec![
         "RequestError".to_string(),
         "RequestTimeout".to_string(),
         "Throttling".to_string(),
@@ -89,9 +89,11 @@ lazy_static! {
         "ExpiredToken".to_string(),
         "ExpiredTokenException".to_string(),
         "SlowDown".to_string(),
-    ];
+    ]
+});
 
-    static ref RETRYABLE_HTTP_STATUSCODES: Vec<http::StatusCode> = vec![
+static RETRYABLE_HTTP_STATUSCODES: LazyLock<Vec<http::StatusCode>> = LazyLock::new(|| {
+    vec![
         http::StatusCode::REQUEST_TIMEOUT,
         http::StatusCode::TOO_MANY_REQUESTS,
         //499,
@@ -100,8 +102,8 @@ lazy_static! {
         http::StatusCode::SERVICE_UNAVAILABLE,
         http::StatusCode::GATEWAY_TIMEOUT,
         //520,
-    ];
-}
+    ]
+});
 
 pub fn is_s3code_retryable(s3code: &str) -> bool {
     RETRYABLE_S3CODES.contains(&s3code.to_string())
@@ -111,7 +113,7 @@ pub fn is_http_status_retryable(http_statuscode: &http::StatusCode) -> bool {
     RETRYABLE_HTTP_STATUSCODES.contains(http_statuscode)
 }
 
-pub fn is_request_error_retryable(err: std::io::Error) -> bool {
+pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
     /*if err == Err::Canceled) || err == Err::DeadlineExceeded) {
         return ctx.Err() == nil;
     }

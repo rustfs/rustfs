@@ -214,7 +214,6 @@ s3s = { version = "0.12.0-minio-preview.1" }
 shadow-rs = { version = "1.2.0", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["raw_value"] }
-serde-xml-rs = "0.8.1"
 serde_urlencoded = "0.7.1"
 sha1 = "0.10.6"
 sha2 = "0.10.9"

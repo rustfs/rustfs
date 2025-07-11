@@ -125,7 +125,7 @@ impl TransitionClient {
         version_id: &str,
         restore_req: &RestoreRequest,
     ) -> Result<(), std::io::Error> {
-        let restore_request = match serde_xml_rs::to_string(restore_req) {
+        let restore_request = match quick_xml::se::to_string(restore_req) {
             Ok(buf) => buf,
             Err(e) => {
                 return Err(std::io::Error::other(e));

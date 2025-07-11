@@ -91,7 +91,7 @@ impl TransitionClient {
         }
 
         let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-        let mut res = match serde_xml_rs::from_str::<AccessControlPolicy>(&String::from_utf8(b).unwrap()) {
+        let mut res = match quick_xml::de::from_str::<AccessControlPolicy>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));

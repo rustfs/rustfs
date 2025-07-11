@@ -101,7 +101,7 @@ pub fn http_resp_to_error_response(
     object_name: &str,
 ) -> ErrorResponse {
     let err_body = String::from_utf8(b).unwrap();
-    let err_resp_ = serde_xml_rs::from_str::<ErrorResponse>(&err_body);
+    let err_resp_ = quick_xml::de::from_str::<ErrorResponse>(&err_body);
     let mut err_resp = ErrorResponse::default();
     if err_resp_.is_err() {
         match resp.status() {
