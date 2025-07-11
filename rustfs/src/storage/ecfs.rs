@@ -501,8 +501,6 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let get_object_info = store.get_object_info();
-
         if Err(err) = check_request_auth_type(req, policy::RestoreObjectAction, bucket, object) {
             return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
         }
@@ -514,7 +512,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
         };
 
-        let Some(obj_info) = get_object_info(bucket, object, opts) else {
+        let Some(obj_info) = store.get_object_info(bucket, object, opts) else {
             return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
         };
 
@@ -571,7 +569,7 @@ impl S3 for FS {
 
         let restore_object = must_get_uuid();
         if rreq.output_location.s3.bucket_name != "" {
-            w.Header()[AmzRestoreOutputPath] = []string{pathJoin(rreq.OutputLocation.S3.BucketName, rreq.OutputLocation.S3.Prefix, restoreObject)}
+            w.Header()[AmzRestoreOutputPath] = []string{pathJoin(rreq.OutputLocation.S3.BucketName, rreq.OutputLocation.S3.Prefix, restore_object)}
         }
         w.WriteHeader(status_code)
         send_event(EventArgs {

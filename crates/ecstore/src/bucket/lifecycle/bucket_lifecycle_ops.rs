@@ -345,8 +345,12 @@ impl ExpiryState {
     }
 
     pub async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>) {
+        //let cancel_token = GLOBAL_SCANNER_CANCEL_TOKEN
+        //    .get()
+        //    .ok_or_else(|| Error::other("Scanner not initialized"))?;
         loop {
             select! {
+                //_ = cancel_token.cancelled() => {
                 _ = tokio::signal::ctrl_c() => {
                     info!("got ctrl+c, exits");
                     break;
