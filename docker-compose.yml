@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-version: '3.8'
+version: "3.8"
 
 services:
   # RustFS main service
@@ -23,11 +23,11 @@ services:
     container_name: rustfs-server
     build:
       context: .
-      dockerfile: Dockerfile.multi-stage
+      dockerfile: .docker/Dockerfile.multi-stage
       args:
         TARGETPLATFORM: linux/amd64
     ports:
-      - "9000:9000"  # S3 API port
+      - "9000:9000" # S3 API port
     environment:
       - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3
       - RUSTFS_ADDRESS=0.0.0.0:9000
@@ -46,7 +46,15 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health" ]
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:9000/health",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -72,7 +80,7 @@ services:
       - RUSTFS_SECRET_KEY=devadmin
       - RUSTFS_LOG_LEVEL=debug
     volumes:
-      - .:/app  # Mount source code to /app for development
+      - .:/app # Mount source code to /app for development
       - rustfs_dev_data:/data
     networks:
       - rustfs-network
@@ -89,10 +97,10 @@ services:
     volumes:
       - ./.docker/observability/otel-collector.yml:/etc/otelcol-contrib/otel-collector.yml:ro
     ports:
-      - "4317:4317"   # OTLP gRPC receiver
-      - "4318:4318"   # OTLP HTTP receiver
-      - "8888:8888"   # Prometheus metrics
-      - "8889:8889"   # Prometheus exporter metrics
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "8888:8888" # Prometheus metrics
+      - "8889:8889" # Prometheus exporter metrics
     networks:
       - rustfs-network
     restart: unless-stopped
@@ -104,8 +112,8 @@ services:
     image: jaegertracing/all-in-one:latest
     container_name: jaeger
     ports:
-      - "16686:16686"  # Jaeger UI
-      - "14250:14250"  # Jaeger gRPC
+      - "16686:16686" # Jaeger UI
+      - "14250:14250" # Jaeger gRPC
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     networks:
@@ -124,12 +132,12 @@ services:
       - ./.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=200h"
+      - "--web.enable-lifecycle"
     networks:
       - rustfs-network
     restart: unless-stopped
