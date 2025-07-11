@@ -18,6 +18,18 @@ RUN apt-get update && apt-get install -y \
     lld \
     && rm -rf /var/lib/apt/lists/*
 
+# Install sccache for Rust compilation caching
+RUN wget https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
+    && tar -xzf sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
+    && mv sccache-v0.8.1-x86_64-unknown-linux-gnu/sccache /usr/local/bin/ \
+    && chmod +x /usr/local/bin/sccache \
+    && rm -rf sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz sccache-v0.8.1-x86_64-unknown-linux-gnu
+
+# Set up sccache environment
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/tmp/sccache \
+    SCCACHE_CACHE_SIZE=2G
+
 # Install cross-compilation tools for ARM64
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
         apt-get update && \
@@ -50,6 +62,9 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
 WORKDIR /usr/src/rustfs
 
+# Copy cargo configuration for optimized builds
+COPY .docker/cargo.config.toml ./.cargo/config.toml
+
 # Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY */Cargo.toml ./*/
@@ -59,10 +74,19 @@ RUN find . -name "Cargo.toml" -not -path "./Cargo.toml" | \
     xargs -I {} dirname {} | \
     xargs -I {} sh -c 'mkdir -p {}/src && echo "fn main() {}" > {}/src/main.rs'
 
-# Build dependencies only (cache layer)
-RUN case "$TARGETPLATFORM" in \
-        "linux/amd64") cargo build --release --target x86_64-unknown-linux-gnu ;; \
-        "linux/arm64") cargo build --release --target aarch64-unknown-linux-gnu ;; \
+# Configure cargo for optimized builds
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_RELEASE_DEBUG=false \
+    CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
+    CARGO_PROFILE_RELEASE_STRIP=symbols
+
+# Build dependencies only (cache layer) with optimizations
+RUN sccache --start-server 2>/dev/null || true && \
+    case "$TARGETPLATFORM" in \
+        "linux/amd64") cargo build --release --target x86_64-unknown-linux-gnu -j $(nproc) ;; \
+        "linux/arm64") cargo build --release --target aarch64-unknown-linux-gnu -j $(nproc) ;; \
     esac
 
 # Copy source code
@@ -71,17 +95,19 @@ COPY . .
 # Generate protobuf code
 RUN cargo run --bin gproto
 
-# Build the actual application
-RUN case "$TARGETPLATFORM" in \
+# Build the actual application with optimizations
+RUN sccache --start-server 2>/dev/null || true && \
+    case "$TARGETPLATFORM" in \
         "linux/amd64") \
-            cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs && \
+            cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
         "linux/arm64") \
-            cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs && \
+            cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
-    esac
+    esac && \
+    sccache --show-stats || true
 
 # Runtime stage - Ubuntu minimal for better compatibility
 FROM ubuntu:22.04

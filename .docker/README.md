@@ -106,6 +106,43 @@ All images support multiple architectures:
 - `linux/amd64` (Intel/AMD 64-bit)
 - `linux/arm64` (ARM 64-bit, Apple Silicon, etc.)
 
+## ⚡ Build Speed Optimizations
+
+### Docker Build Optimizations
+
+- **Multi-layer caching**: GitHub Actions cache + Registry cache
+- **Parallel matrix builds**: All 5 variants build simultaneously
+- **Multi-platform builds**: amd64/arm64 built in parallel
+- **BuildKit features**: Advanced caching and inline cache
+
+### Rust Compilation Optimizations
+
+- **sccache**: Distributed compilation cache for Rust builds
+- **Parallel compilation**: Uses all available CPU cores (`-j $(nproc)`)
+- **Optimized cargo config**: Sparse registry protocol, fast linker (lld)
+- **Dependency caching**: Separate Docker layers for dependencies vs. source code
+- **Release optimizations**: LTO, strip symbols, optimized codegen
+
+### Cache Strategy
+
+```yaml
+# GitHub Actions cache
+cache-from: type=gha,scope=docker-{variant}
+cache-to: type=gha,mode=max,scope=docker-{variant}
+
+# Registry cache (persistent across runs)
+cache-from: type=registry,ref=ghcr.io/rustfs/rustfs:buildcache-{variant}
+cache-to: type=registry,ref=ghcr.io/rustfs/rustfs:buildcache-{variant}
+```
+
+### Build Performance Comparison
+
+| Build Type | Time (Est.) | Cache Hit | Cache Miss |
+|------------|-------------|-----------|-----------|
+| Pre-built binary | ~2-3 min | ~1 min | ~2 min |
+| Alpine source | ~8-12 min | ~3-5 min | ~10 min |
+| Ubuntu source | ~10-15 min | ~4-6 min | ~12 min |
+
 ## 📋 Build Matrix
 
 | Trigger | Version Format | Download Path | Image Tags |

@@ -304,13 +304,21 @@ jobs:
           push: ${{ needs.build-check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-${{ matrix.variant.name }}
-          cache-to: type=gha,mode=max,scope=docker-${{ matrix.variant.name }}
+          cache-from: |
+            type=gha,scope=docker-${{ matrix.variant.name }}
+            type=registry,ref=${{ env.REGISTRY_GHCR }}:buildcache-${{ matrix.variant.name }}
+          cache-to: |
+            type=gha,mode=max,scope=docker-${{ matrix.variant.name }}
+            type=registry,ref=${{ env.REGISTRY_GHCR }}:buildcache-${{ matrix.variant.name }},mode=max
           build-args: |
             BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
             VERSION=${{ needs.build-check.outputs.version }}
             BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
             REVISION=${{ github.sha }}
+            BUILDKIT_INLINE_CACHE=1
+          # Enable advanced BuildKit features for better performance
+          provenance: false
+          sbom: false
 
   # Create manifest for main production image (only for stable releases)
   create-manifest:
