@@ -160,9 +160,6 @@ jobs:
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -193,11 +190,11 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Login to Docker Hub
-        if: needs.build-check.outputs.should_push == 'true' && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: needs.build-check.outputs.should_push == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
         if: needs.build-check.outputs.should_push == 'true'
@@ -329,16 +326,12 @@ jobs:
     needs: [build-check, build-docker]
     if: needs.build-check.outputs.should_push == 'true' && needs.build-check.outputs.create_latest == 'true' && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - name: Login to Docker Hub
-        if: env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v3
         with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
