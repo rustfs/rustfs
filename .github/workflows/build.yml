@@ -363,6 +363,26 @@ jobs:
           echo "Uploading ${{ steps.package.outputs.package_file }} to $OSS_PATH..."
           $OSSUTIL_BIN cp "${{ steps.package.outputs.package_file }}" "$OSS_PATH" --force
 
+          # For release and prerelease builds, also create a latest version
+          if [[ "$BUILD_TYPE" == "release" ]] || [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            # Extract platform and arch from package name
+            PACKAGE_NAME="${{ steps.package.outputs.package_name }}"
+
+            # Create latest version filename
+            # Convert from rustfs-linux-x86_64-v1.0.0 to rustfs-linux-x86_64-latest
+            LATEST_NAME=$(echo "$PACKAGE_NAME" | sed 's/-v[0-9].*$/-latest/')
+            LATEST_FILE="${LATEST_NAME}.zip"
+
+            # Copy the original file to latest version
+            cp "${{ steps.package.outputs.package_file }}" "$LATEST_FILE"
+
+            # Upload the latest version
+            echo "Uploading latest version: $LATEST_FILE to $OSS_PATH..."
+            $OSSUTIL_BIN cp "$LATEST_FILE" "$OSS_PATH" --force
+
+            echo "✅ Latest version uploaded: $LATEST_FILE"
+          fi
+
           echo "✅ Upload completed successfully"
 
   # Build summary
