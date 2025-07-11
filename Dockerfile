@@ -12,68 +12,96 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.18 AS builder
+# Multi-stage Alpine build for minimal runtime image
+FROM rust:1.85-alpine AS builder
 
 # Build arguments for dynamic artifact download
 ARG VERSION=""
 ARG BUILD_TYPE="release"
 ARG TARGETARCH
 
-RUN apk add -U --no-cache \
-    ca-certificates \
+# Install build dependencies
+RUN apk add --no-cache \
+    musl-dev \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static \
     curl \
+    unzip \
     bash \
-    unzip
+    wget \
+    ca-certificates
 
-# Generate correct filename and path based on build type and version
-RUN set -ex; \
-    # Map TARGETARCH to our naming convention
-    case "${TARGETARCH}" in \
-        amd64) ARCH="x86_64" ;; \
-        arm64) ARCH="aarch64" ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
-    esac; \
-    \
-    # Determine download path and filename based on build type
-    if [ "${BUILD_TYPE}" = "development" ]; then \
-        # Development build: artifacts/rustfs/dev/rustfs-linux-{arch}-dev-{sha}.zip
-        if [ -z "${VERSION}" ]; then \
-            echo "VERSION must be provided for development builds" && exit 1; \
+# Install protoc
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-x86_64.zip \
+    && unzip protoc-31.1-linux-x86_64.zip -d protoc3 \
+    && mv protoc3/bin/* /usr/local/bin/ && chmod +x /usr/local/bin/protoc \
+    && mv protoc3/include/* /usr/local/include/ && rm -rf protoc-31.1-linux-x86_64.zip protoc3
+
+# Install flatc
+RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.flatc.binary.g++-13.zip \
+    && unzip Linux.flatc.binary.g++-13.zip \
+    && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc \
+    && rm -rf Linux.flatc.binary.g++-13.zip
+
+# Option A: Download pre-built binary (faster)
+RUN if [ -n "$VERSION" ]; then \
+        # Map TARGETARCH to our naming convention
+        case "${TARGETARCH}" in \
+            amd64) ARCH="x86_64" ;; \
+            arm64) ARCH="aarch64" ;; \
+            *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+        esac; \
+        \
+        # Determine download path and filename
+        if [ "${BUILD_TYPE}" = "development" ]; then \
+            DOWNLOAD_PATH="artifacts/rustfs/dev"; \
+            FILENAME="rustfs-linux-${ARCH}-dev-${VERSION}.zip"; \
+        else \
+            DOWNLOAD_PATH="artifacts/rustfs/release"; \
+            FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
         fi; \
-        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-        FILENAME="rustfs-linux-${ARCH}-dev-${VERSION}.zip"; \
+        \
+        # Download the binary
+        DOWNLOAD_URL="https://dl.rustfs.com/${DOWNLOAD_PATH}/${FILENAME}"; \
+        echo "Downloading RustFS binary from: ${DOWNLOAD_URL}"; \
+        curl -Lo /tmp/rustfs.zip "${DOWNLOAD_URL}"; \
+        unzip -o /tmp/rustfs.zip -d /tmp; \
+        mv /tmp/rustfs /usr/local/bin/rustfs; \
+        chmod +x /usr/local/bin/rustfs; \
+        rm -rf /tmp/*; \
     else \
-        # Release/Prerelease build: artifacts/rustfs/release/rustfs-linux-{arch}-v{version}.zip
-        if [ -z "${VERSION}" ]; then \
-            echo "VERSION must be provided for release builds" && exit 1; \
-        fi; \
-        DOWNLOAD_PATH="artifacts/rustfs/release"; \
-        FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
-    fi; \
-    \
-    # Download the appropriate binary
-    DOWNLOAD_URL="https://dl.rustfs.com/${DOWNLOAD_PATH}/${FILENAME}"; \
-    echo "Downloading RustFS binary from: ${DOWNLOAD_URL}"; \
-    curl -Lo /tmp/rustfs.zip "${DOWNLOAD_URL}" || { \
-        echo "Failed to download ${DOWNLOAD_URL}"; \
-        echo "Available files might be:"; \
-        echo "  Release: https://dl.rustfs.com/artifacts/rustfs/release/rustfs-linux-${ARCH}-v{version}.zip"; \
-        echo "  Dev: https://dl.rustfs.com/artifacts/rustfs/dev/rustfs-linux-${ARCH}-dev-{sha}.zip"; \
+        echo "No VERSION provided, will build from source"; \
+        rustup target add x86_64-unknown-linux-musl; \
+        echo "Source build not yet implemented in Alpine variant"; \
         exit 1; \
-    }; \
-    unzip -o /tmp/rustfs.zip -d /tmp; \
-    mv /tmp/rustfs /rustfs; \
-    chmod +x /rustfs; \
-    rm -rf /tmp/*
+    fi
 
+# Final Alpine runtime image
 FROM alpine:3.18
 
-RUN apk add -U --no-cache \
+RUN apk add --no-cache \
     ca-certificates \
+    tzdata \
     bash
 
-COPY --from=builder /rustfs /usr/local/bin/rustfs
+# Create rustfs user for security
+RUN addgroup -g 1000 rustfs && \
+    adduser -D -u 1000 -G rustfs rustfs
 
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /usr/local/bin/rustfs /app/rustfs
+RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
+
+# Create data directories
+RUN mkdir -p /data && chown -R rustfs:rustfs /data /app
+
+# Switch to non-root user
+USER rustfs
+
+# Environment variables
 ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
@@ -82,7 +110,8 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
 
 EXPOSE 9000
 
-RUN mkdir -p /data
-VOLUME /data
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
 
-CMD ["rustfs", "/data"]
+CMD ["/app/rustfs"]
