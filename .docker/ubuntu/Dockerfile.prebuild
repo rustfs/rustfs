@@ -110,6 +110,7 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
+    RUSTFS_VOLUMES=/data \
     RUST_LOG=warn
 
 EXPOSE 9000

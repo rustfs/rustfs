@@ -139,6 +139,14 @@ USER rustfs
 # Expose ports
 EXPOSE 9000
 
+# Environment variables
+ENV RUSTFS_ACCESS_KEY=rustfsadmin \
+    RUSTFS_SECRET_KEY=rustfsadmin \
+    RUSTFS_ADDRESS=":9000" \
+    RUSTFS_CONSOLE_ENABLE=true \
+    RUSTFS_VOLUMES=/data \
+    RUST_LOG=warn
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1

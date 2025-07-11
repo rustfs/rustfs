@@ -83,6 +83,7 @@ ENV RUSTFS_ACCESS_KEY=devadmin \
     RUSTFS_SECRET_KEY=devadmin \
     RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
+    RUSTFS_VOLUMES=/data \
     RUST_LOG=debug \
     RUST_BACKTRACE=1
 
