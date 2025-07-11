@@ -185,11 +185,17 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          use: true
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["https://registry-1.docker.io"]
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Login to Docker Hub
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -201,6 +207,31 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Docker authentication and configure buildx
+        run: |
+          echo "Verifying Docker authentication..."
+          docker info
+
+          echo "Testing Docker Hub access..."
+          docker pull hello-world:latest || echo "Warning: Docker Hub access test failed"
+
+          echo "Bootstrap buildx builder..."
+          docker buildx inspect --bootstrap
+
+          echo "Configure buildx authentication..."
+          # Create buildx builder configuration
+          mkdir -p ~/.docker/buildx
+          cat > ~/.docker/buildx/config.toml << EOF
+          [registry."docker.io"]
+            mirrors = ["https://registry-1.docker.io"]
+          EOF
+
+          # Test base image access
+          echo "Testing base image access..."
+          docker buildx build --platform=linux/amd64 -t test-auth - <<< "FROM alpine:3.18"
+          docker buildx build --platform=linux/amd64 -t test-auth - <<< "FROM rust:1.85-alpine"
+          echo "Base image access test completed"
 
       - name: Extract metadata and generate tags
         id: meta
@@ -293,7 +324,49 @@ jobs:
           echo "📋 Build type: $BUILD_TYPE"
           echo "🔖 Version: $VERSION"
 
-      - name: Build and push Docker image
+      - name: Build and push Docker image (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_on: error
+          command: |
+            # Convert comma-separated tags to multiple --tag arguments
+            TAGS_ARG=""
+            IFS=',' read -ra TAGS <<< "${{ steps.meta.outputs.tags }}"
+            for tag in "${TAGS[@]}"; do
+              TAGS_ARG="$TAGS_ARG --tag $tag"
+            done
+
+            # Convert comma-separated labels to multiple --label arguments
+            LABELS_ARG=""
+            IFS=',' read -ra LABELS <<< "${{ steps.meta.outputs.labels }}"
+            for label in "${LABELS[@]}"; do
+              LABELS_ARG="$LABELS_ARG --label $label"
+            done
+
+            docker buildx build \
+              --platform=${{ matrix.variant.platforms }} \
+              --file=${{ matrix.variant.dockerfile }} \
+              $TAGS_ARG \
+              $LABELS_ARG \
+              --cache-from=type=gha,scope=docker-${{ matrix.variant.name }} \
+              --cache-from=type=registry,ref=${{ env.REGISTRY_GHCR }}:buildcache-${{ matrix.variant.name }} \
+              --cache-to=type=gha,mode=max,scope=docker-${{ matrix.variant.name }} \
+              --cache-to=type=registry,ref=${{ env.REGISTRY_GHCR }}:buildcache-${{ matrix.variant.name }},mode=max \
+              --build-arg=BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+              --build-arg=VERSION=${{ needs.build-check.outputs.version }} \
+              --build-arg=BUILD_TYPE=${{ needs.build-check.outputs.build_type }} \
+              --build-arg=REVISION=${{ github.sha }} \
+              --build-arg=BUILDKIT_INLINE_CACHE=1 \
+              --provenance=false \
+              --sbom=false \
+              --pull \
+              ${{ needs.build-check.outputs.should_push == 'true' && '--push' || '--load' }} \
+              .
+
+      - name: Build and push Docker image (fallback)
+        if: failure()
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -317,6 +390,9 @@ jobs:
           # Enable advanced BuildKit features for better performance
           provenance: false
           sbom: false
+          # Add retry mechanism by splitting the build process
+          no-cache: false
+          pull: true
 
   # Create manifest for main production image (only for stable releases)
   create-manifest:
