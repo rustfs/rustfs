@@ -22,7 +22,11 @@ use rustfs_ecstore::{
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOptions,
 };
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{
+    Body, S3Request, S3Response, S3Result,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    s3_error,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -265,7 +269,10 @@ impl Operation for RebalanceStop {
             warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
         }
 
-        Ok(S3Response::new((StatusCode::OK, Body::empty())))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
 
