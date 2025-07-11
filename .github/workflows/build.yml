@@ -277,7 +277,7 @@ jobs:
 
           # Create latest.json (only for the first Linux build to avoid duplication)
           if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
+            VERSION="${GITHUB_REF#refs/tags/}"
             echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
             $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi
