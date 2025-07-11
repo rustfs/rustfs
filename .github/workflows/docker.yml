@@ -260,6 +260,7 @@ jobs:
           build-args: |
             BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
             VERSION=${{ needs.build-check.outputs.version }}
+            BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
             REVISION=${{ github.sha }}
 
   # Create manifest for main production image (only for stable releases)
