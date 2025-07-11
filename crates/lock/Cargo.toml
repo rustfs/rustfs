@@ -30,7 +30,6 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-lazy_static.workspace = true
 rustfs-protos.workspace = true
 rand.workspace = true
 serde.workspace = true

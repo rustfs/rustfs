@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use axum::routing::get;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -27,20 +28,41 @@ use s3s::S3Result;
 use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
+use tower::Service;
 use tracing::error;
 
-use super::ADMIN_PREFIX;
-use super::rpc::RPC_PREFIX;
+use crate::admin::ADMIN_PREFIX;
+use crate::admin::console;
+use crate::admin::rpc::RPC_PREFIX;
+
+const CONSOLE_PREFIX: &str = "/rustfs/console";
 
 pub struct S3Router<T> {
     router: Router<T>,
+    console_enabled: bool,
+    console_router: Option<axum::routing::RouterIntoService<Body>>,
 }
 
 impl<T: Operation> S3Router<T> {
-    pub fn new() -> Self {
+    pub fn new(console_enabled: bool) -> Self {
         let router = Router::new();
 
-        Self { router }
+        let console_router = if console_enabled {
+            Some(
+                axum::Router::new()
+                    .nest(CONSOLE_PREFIX, axum::Router::new().fallback_service(get(console::static_handler)))
+                    .fallback_service(get(console::static_handler))
+                    .into_service::<Body>(),
+            )
+        } else {
+            None
+        };
+
+        Self {
+            router,
+            console_enabled,
+            console_router,
+        }
     }
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
@@ -60,7 +82,7 @@ impl<T: Operation> S3Router<T> {
 
 impl<T: Operation> Default for S3Router<T> {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -79,10 +101,23 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX)
+        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(CONSOLE_PREFIX)
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+            if let Some(console_router) = &self.console_router {
+                let mut console_router = console_router.clone();
+                let req = convert_request(req);
+                let result = console_router.call(req).await;
+                return match result {
+                    Ok(resp) => Ok(convert_response(resp)),
+                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
+                };
+            }
+            return Err(s3_error!(InternalError, "console is not enabled"));
+        }
+
         let uri = format!("{}|{}", &req.method, req.uri.path());
 
         // warn!("get uri {}", &uri);
@@ -99,6 +134,10 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+            return Ok(());
+        }
+
         // Check RPC signature verification
         if req.uri.path().starts_with(RPC_PREFIX) {
             // Skip signature verification for HEAD requests (health checks)
@@ -133,4 +172,35 @@ impl Operation for AdminOperation {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         self.0.call(req, params).await
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Extra {
+    pub credentials: Option<s3s::auth::Credentials>,
+    pub region: Option<String>,
+    pub service: Option<String>,
+}
+
+fn convert_request(req: S3Request<Body>) -> http::Request<Body> {
+    let (mut parts, _) = http::Request::new(Body::empty()).into_parts();
+    parts.method = req.method;
+    parts.uri = req.uri;
+    parts.headers = req.headers;
+    parts.extensions = req.extensions;
+    parts.extensions.insert(Extra {
+        credentials: req.credentials,
+        region: req.region,
+        service: req.service,
+    });
+    http::Request::from_parts(parts, req.input)
+}
+
+fn convert_response(resp: http::Response<axum::body::Body>) -> S3Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let mut s3_resp = S3Response::new(Body::http_body_unsync(body));
+    s3_resp.status = Some(parts.status);
+    s3_resp.headers = parts.headers;
+    s3_resp.extensions = parts.extensions;
+    s3_resp
 }

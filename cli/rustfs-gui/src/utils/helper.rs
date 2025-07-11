@@ -14,12 +14,12 @@
 
 use crate::utils::RustFSConfig;
 use dioxus::logger::tracing::{debug, error, info};
-use lazy_static::lazy_static;
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::fs;
 use tokio::fs::File;
@@ -31,15 +31,13 @@ use tokio::sync::{Mutex, mpsc};
 #[folder = "$CARGO_MANIFEST_DIR/embedded-rustfs/"]
 struct Asset;
 
-// Use `lazy_static` to cache the checksum of embedded resources
-lazy_static! {
-    static ref RUSTFS_HASH: Mutex<String> = {
-        let rustfs_file = if cfg!(windows) { "rustfs.exe" } else { "rustfs" };
-        let rustfs_data = Asset::get(rustfs_file).expect("RustFs binary not embedded");
-        let hash = hex::encode(Sha256::digest(&rustfs_data.data));
-        Mutex::new(hash)
-    };
-}
+// Use `LazyLock` to cache the checksum of embedded resources
+static RUSTFS_HASH: LazyLock<Mutex<String>> = LazyLock::new(|| {
+    let rustfs_file = if cfg!(windows) { "rustfs.exe" } else { "rustfs" };
+    let rustfs_data = Asset::get(rustfs_file).expect("RustFs binary not embedded");
+    let hash = hex::encode(Sha256::digest(&rustfs_data.data));
+    Mutex::new(hash)
+});
 
 /// Service command
 /// This enum represents the commands that can be sent to the service manager

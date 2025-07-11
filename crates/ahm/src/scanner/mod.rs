@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod http;
-mod hybrid;
-mod layer;
-mod service_state;
-pub(crate) use http::start_http_server;
-pub(crate) use service_state::SHUTDOWN_TIMEOUT;
-pub(crate) use service_state::ServiceState;
-pub(crate) use service_state::ServiceStateManager;
-pub(crate) use service_state::ShutdownSignal;
-pub(crate) use service_state::wait_for_shutdown;
+pub mod data_scanner;
+pub mod data_usage;
+pub mod histogram;
+pub mod metrics;
+
+// Re-export main types for convenience
+pub use data_scanner::Scanner;
+pub use data_usage::{
+    load_data_usage_from_backend, store_data_usage_in_backend, BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo,
+};
+pub use metrics::ScannerMetrics;

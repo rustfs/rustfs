@@ -122,7 +122,7 @@ If you have any questions or need assistance, you can:
 RustFS is a community-driven project, and we appreciate all contributions. Check out the [Contributors](https://github.com/rustfs/rustfs/graphs/contributors) page to see the amazing people who have helped make RustFS better.
 
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=rustfs/rustfs" />
+  <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" />
 </a>
 
 ## License

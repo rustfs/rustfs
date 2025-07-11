@@ -14,12 +14,12 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use lazy_static::lazy_static;
 use local_locker::LocalLocker;
 use lock_args::LockArgs;
 use remote_client::RemoteClient;
 use std::io::Result;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::RwLock;
 
 pub mod drwmutex;
@@ -29,9 +29,7 @@ pub mod lrwmutex;
 pub mod namespace_lock;
 pub mod remote_client;
 
-lazy_static! {
-    pub static ref GLOBAL_LOCAL_SERVER: Arc<RwLock<LocalLocker>> = Arc::new(RwLock::new(LocalLocker::new()));
-}
+pub static GLOBAL_LOCAL_SERVER: LazyLock<Arc<RwLock<LocalLocker>>> = LazyLock::new(|| Arc::new(RwLock::new(LocalLocker::new())));
 
 type LockClient = dyn Locker;
 

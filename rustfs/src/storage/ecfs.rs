@@ -36,7 +36,6 @@ use rustfs_s3select_api::server::dbms::DatabaseManagerSystem;
 // use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
 use futures::StreamExt;
 use http::HeaderMap;
-use lazy_static::lazy_static;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
 use rustfs_ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -102,6 +101,7 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
@@ -126,12 +126,10 @@ macro_rules! try_ {
     };
 }
 
-lazy_static! {
-    static ref RUSTFS_OWNER: Owner = Owner {
-        display_name: Some("rustfs".to_owned()),
-        id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
-    };
-}
+static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
+    display_name: Some("rustfs".to_owned()),
+    id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
+});
 
 #[derive(Debug, Clone)]
 pub struct FS {
