@@ -72,7 +72,6 @@ RUN if [ -n "$VERSION" ]; then \
         rm -rf /tmp/*; \
     else \
         echo "No VERSION provided, will build from source"; \
-        rustup target add x86_64-unknown-linux-musl; \
         echo "Source build not yet implemented in Alpine variant"; \
         exit 1; \
     fi

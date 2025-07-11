@@ -52,9 +52,6 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
     && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc \
     && rm -rf Linux.flatc.binary.g++-13.zip
 
-# Add musl target for static linking
-RUN rustup target add x86_64-unknown-linux-musl
-
 WORKDIR /usr/src/rustfs
 
 # Copy cargo configuration for optimized builds
