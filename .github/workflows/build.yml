@@ -16,7 +16,7 @@ name: Build and Release
 
 on:
   push:
-    tags: ["*"]
+    tags: ["v*.*.*"]
     branches: [main]
     paths-ignore:
       - "**.md"
@@ -65,39 +65,79 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Second layer: Business logic level checks (handling build strategy)
+  # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
+      version: ${{ steps.check.outputs.version }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
+      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Determine build strategy
         id: check
         run: |
           should_build=false
           build_type="none"
+          version=""
+          short_sha=""
+          is_prerelease=false
 
-          # Business logic: when we need to build
-          if [[ "${{ github.event_name }}" == "schedule" ]] || \
-             [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-             [[ "${{ github.event.inputs.force_build }}" == "true" ]] || \
-             [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
+          # Get short SHA for all builds
+          short_sha=$(git rev-parse --short HEAD)
+
+          # Determine build type based on trigger
+          if [[ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+            # Tag push - release or prerelease
+            should_build=true
+            tag_name="${GITHUB_REF#refs/tags/}"
+            version="${tag_name#v}"
+
+            # Check if this is a prerelease
+            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
+              build_type="prerelease"
+              is_prerelease=true
+              echo "🚀 Prerelease build detected: $tag_name"
+            else
+              build_type="release"
+              echo "📦 Release build detected: $tag_name"
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # Main branch push - development build
             should_build=true
             build_type="development"
-          fi
-
-          # Always build for tag pushes (version releases)
-          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+            version="dev-${short_sha}"
+            echo "🛠️  Development build detected"
+          elif [[ "${{ github.event_name }}" == "schedule" ]] || \
+               [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+               [[ "${{ github.event.inputs.force_build }}" == "true" ]] || \
+               [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
+            # Scheduled or manual build
             should_build=true
-            build_type="release"
-            echo "🏷️  Tag detected: forcing release build"
+            build_type="development"
+            version="dev-${short_sha}"
+            echo "⚡ Manual/scheduled build detected"
           fi
 
           echo "should_build=$should_build" >> $GITHUB_OUTPUT
           echo "build_type=$build_type" >> $GITHUB_OUTPUT
-          echo "Build needed: $should_build (type: $build_type)"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
+
+          echo "📊 Build Summary:"
+          echo "  - Should build: $should_build"
+          echo "  - Build type: $build_type"
+          echo "  - Version: $version"
+          echo "  - Short SHA: $short_sha"
+          echo "  - Is prerelease: $is_prerelease"
 
   # Build RustFS binaries
   build-rustfs:
@@ -202,7 +242,38 @@ jobs:
         id: package
         shell: bash
         run: |
-          PACKAGE_NAME="rustfs-${{ matrix.target }}"
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
+
+          # Extract platform and arch from target
+          TARGET="${{ matrix.target }}"
+          PLATFORM="${{ matrix.platform }}"
+
+          # Map target to architecture
+          case "$TARGET" in
+            *x86_64*)
+              ARCH="x86_64"
+              ;;
+            *aarch64*|*arm64*)
+              ARCH="aarch64"
+              ;;
+            *armv7*)
+              ARCH="armv7"
+              ;;
+            *)
+              ARCH="unknown"
+              ;;
+          esac
+
+          # Generate package name based on build type
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development build: rustfs-${platform}-${arch}-dev-${short_sha}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-dev-${SHORT_SHA}"
+          else
+            # Release/Prerelease build: rustfs-${platform}-${arch}-v${version}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${VERSION}"
+          fi
 
           # Create zip packages for all platforms
           # Ensure zip is available
@@ -215,9 +286,15 @@ jobs:
           cd target/${{ matrix.target }}/release
           zip "../../../${PACKAGE_NAME}.zip" rustfs
           cd ../../..
+
           echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
           echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
-          echo "Package created: ${PACKAGE_NAME}.zip"
+          echo "build_type=${BUILD_TYPE}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          echo "📦 Package created: ${PACKAGE_NAME}.zip"
+          echo "🔧 Build type: ${BUILD_TYPE}"
+          echo "📊 Version: ${VERSION}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -227,13 +304,15 @@ jobs:
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
       - name: Upload to Aliyun OSS
-        if: needs.build-check.outputs.build_type == 'release' && env.OSS_ACCESS_KEY_ID != ''
+        if: env.OSS_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
           OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+
           # Install ossutil (platform-specific)
           OSSUTIL_VERSION="2.1.1"
           case "${{ matrix.platform }}" in
@@ -271,148 +350,51 @@ jobs:
               ;;
           esac
 
-          # Upload the package file directly to OSS
-          echo "Uploading ${{ steps.package.outputs.package_file }} to OSS..."
-          $OSSUTIL_BIN cp "${{ steps.package.outputs.package_file }}" oss://rustfs-artifacts/artifacts/rustfs/ --force
-
-          # Create latest.json (only for the first Linux build to avoid duplication)
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-            echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
-            $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
+          # Determine upload path based on build type
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/dev/"
+            echo "📤 Uploading development build to OSS dev directory"
+          else
+            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/release/"
+            echo "📤 Uploading release build to OSS release directory"
           fi
 
-  # Release management
-  release:
-    name: GitHub Release
+          # Upload the package file to OSS
+          echo "Uploading ${{ steps.package.outputs.package_file }} to $OSS_PATH..."
+          $OSSUTIL_BIN cp "${{ steps.package.outputs.package_file }}" "$OSS_PATH" --force
+
+          echo "✅ Upload completed successfully"
+
+  # Build summary
+  build-summary:
+    name: Build Summary
     needs: [build-check, build-rustfs]
-    if: always() && needs.build-check.outputs.build_type == 'release'
+    if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./release-artifacts
-
-      - name: Prepare release assets
-        id: release_prep
+      - name: Build completion summary
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          VERSION_CLEAN="${VERSION#v}"
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
 
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "version_clean=${VERSION_CLEAN}" >> $GITHUB_OUTPUT
+          echo "🎉 Build completed successfully!"
+          echo "📦 Build type: $BUILD_TYPE"
+          echo "🔢 Version: $VERSION"
+          echo ""
 
-          # Organize artifacts
-          mkdir -p ./release-files
-
-          # Copy all artifacts (.zip files)
-          find ./release-artifacts -name "*.zip" -exec cp {} ./release-files/ \;
-
-          # Generate checksums for all files
-          cd ./release-files
-          if ls *.zip >/dev/null 2>&1; then
-            sha256sum *.zip >> SHA256SUMS
-            sha512sum *.zip >> SHA512SUMS
-          fi
-          cd ..
-
-          # Display what we're releasing
-          echo "=== Release Files ==="
-          ls -la ./release-files/
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.release_prep.outputs.version }}"
-          VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
-
-          # Check if release already exists
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists, skipping creation"
-          else
-            # Get release notes from tag message
-            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
-            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
-              RELEASE_NOTES="Release ${VERSION_CLEAN}"
-            fi
-
-            # Determine if this is a prerelease
-            PRERELEASE_FLAG=""
-            if [[ "$VERSION" == *"alpha"* ]] || [[ "$VERSION" == *"beta"* ]] || [[ "$VERSION" == *"rc"* ]]; then
-              PRERELEASE_FLAG="--prerelease"
-            fi
-
-            # Create the release only if it doesn't exist
-            gh release create "$VERSION" \
-              --title "RustFS $VERSION_CLEAN" \
-              --notes "$RELEASE_NOTES" \
-              $PRERELEASE_FLAG
-          fi
-
-      - name: Upload release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.release_prep.outputs.version }}"
-
-          cd ./release-files
-
-          # Upload all binary files
-          for file in *.zip; do
-            if [[ -f "$file" ]]; then
-              echo "Uploading $file..."
-              gh release upload "$VERSION" "$file" --clobber
-            fi
-          done
-
-          # Upload checksum files
-          if [[ -f "SHA256SUMS" ]]; then
-            echo "Uploading SHA256SUMS..."
-            gh release upload "$VERSION" "SHA256SUMS" --clobber
-          fi
-
-          if [[ -f "SHA512SUMS" ]]; then
-            echo "Uploading SHA512SUMS..."
-            gh release upload "$VERSION" "SHA512SUMS" --clobber
-          fi
-
-      - name: Update release notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.release_prep.outputs.version }}"
-          VERSION_CLEAN="${{ steps.release_prep.outputs.version_clean }}"
-
-          # Check if release already has custom notes (not auto-generated)
-          EXISTING_NOTES=$(gh release view "$VERSION" --json body --jq '.body' 2>/dev/null || echo "")
-
-          # Only update if release notes are empty or auto-generated
-          if [[ -z "$EXISTING_NOTES" ]] || [[ "$EXISTING_NOTES" == *"Release ${VERSION_CLEAN}"* ]]; then
-            echo "Updating release notes for $VERSION"
-
-            # Get original release notes from tag
-            ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${VERSION}")
-            if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
-              ORIGINAL_NOTES="Release ${VERSION_CLEAN}"
-            fi
-
-            # Use external template file and substitute variables
-            sed -e "s/\${VERSION}/$VERSION/g" \
-                -e "s/\${VERSION_CLEAN}/$VERSION_CLEAN/g" \
-                -e "s/\${ORIGINAL_NOTES}/$(echo "$ORIGINAL_NOTES" | sed 's/[[\.*^$()+?{|]/\\&/g')/g" \
-                .github/workflows/release-notes-template.md > enhanced_notes.md
-
-            # Update the release with enhanced notes
-            gh release edit "$VERSION" --notes-file enhanced_notes.md
-          else
-            echo "Release $VERSION already has custom notes, skipping update to preserve manual edits"
-          fi
+          case "$BUILD_TYPE" in
+            "development")
+              echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
+              echo "⚠️  This is a development build - not suitable for production use"
+              ;;
+            "release")
+              echo "🚀 Release build artifacts have been uploaded to OSS release directory"
+              echo "✅ This build is ready for production use"
+              echo "🏷️  GitHub Release will be created automatically by the release workflow"
+              ;;
+            "prerelease")
+              echo "🧪 Prerelease build artifacts have been uploaded to OSS release directory"
+              echo "⚠️  This is a prerelease build - use with caution"
+              echo "🏷️  GitHub Release will be created automatically by the release workflow"
+              ;;
+          esac

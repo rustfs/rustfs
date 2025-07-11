@@ -16,7 +16,7 @@ name: Docker Images
 
 on:
   push:
-    tags: ["*"]
+    tags: ["v*.*.*"]
     branches: [main]
     paths-ignore:
       - "**.md"
@@ -62,25 +62,71 @@ env:
   REGISTRY_GHCR: ghcr.io/${{ github.repository }}
 
 jobs:
-  # Check if we should build
+  # Docker build strategy check
   build-check:
-    name: Build Check
+    name: Docker Build Check
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       should_push: ${{ steps.check.outputs.should_push }}
+      build_type: ${{ steps.check.outputs.build_type }}
+      version: ${{ steps.check.outputs.version }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
+      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
+      create_latest: ${{ steps.check.outputs.create_latest }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Check build conditions
         id: check
         run: |
           should_build=false
           should_push=false
+          build_type="none"
+          version=""
+          short_sha=""
+          is_prerelease=false
+          create_latest=false
+
+          # Get short SHA for all builds
+          short_sha=$(git rev-parse --short HEAD)
 
           # Always build on workflow_dispatch or when changes detected
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
              [[ "${{ github.event_name }}" == "push" ]] || \
              [[ "${{ github.event_name }}" == "pull_request" ]]; then
             should_build=true
+          fi
+
+          # Determine build type and version
+          if [[ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+            # Tag push - release or prerelease
+            tag_name="${GITHUB_REF#refs/tags/}"
+            version="${tag_name#v}"
+
+            # Check if this is a prerelease
+            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
+              build_type="prerelease"
+              is_prerelease=true
+              echo "🚀 Docker prerelease build detected: $tag_name"
+            else
+              build_type="release"
+              create_latest=true
+              echo "📦 Docker release build detected: $tag_name"
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # Main branch push - development build
+            build_type="development"
+            version="dev-${short_sha}"
+            echo "🛠️  Docker development build detected"
+          else
+            # Other branches - development build
+            build_type="development"
+            version="dev-${short_sha}"
+            echo "🔧 Docker development build detected"
           fi
 
           # Push only on main branch, tags, or manual trigger
@@ -92,7 +138,20 @@ jobs:
 
           echo "should_build=$should_build" >> $GITHUB_OUTPUT
           echo "should_push=$should_push" >> $GITHUB_OUTPUT
-          echo "Build: $should_build, Push: $should_push"
+          echo "build_type=$build_type" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
+          echo "create_latest=$create_latest" >> $GITHUB_OUTPUT
+
+          echo "🐳 Docker Build Summary:"
+          echo "  - Should build: $should_build"
+          echo "  - Should push: $should_push"
+          echo "  - Build type: $build_type"
+          echo "  - Version: $version"
+          echo "  - Short SHA: $short_sha"
+          echo "  - Is prerelease: $is_prerelease"
+          echo "  - Create latest: $create_latest"
 
   # Build multi-arch Docker images
   build-docker:
@@ -139,21 +198,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Extract metadata and generate tags
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.REGISTRY_DOCKERHUB }}
-            ${{ env.REGISTRY_GHCR }}
-          tags: |
-            type=ref,event=branch,suffix=-${{ matrix.variant.name }}
-            type=ref,event=pr,suffix=-${{ matrix.variant.name }}
-            type=semver,pattern={{version}},suffix=-${{ matrix.variant.name }}
-            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.variant.name }}
-            type=raw,value=latest,suffix=-${{ matrix.variant.name }},enable={{is_default_branch}}
-          flavor: |
-            latest=false
+        run: |
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
+          CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
+          VARIANT="${{ matrix.variant.name }}"
+
+          # Generate tags based on build type
+          TAGS=""
+
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development build: dev-${short_sha}-${variant}
+            TAGS="${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}-${VARIANT}"
+            TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${SHORT_SHA}-${VARIANT}"
+          else
+            # Release/Prerelease build: ${version}-${variant}
+            TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-${VARIANT}"
+            TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${VERSION}-${VARIANT}"
+
+            # Add latest tag only for stable releases
+            if [[ "$CREATE_LATEST" == "true" ]]; then
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest-${VARIANT}"
+              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:latest-${VARIANT}"
+            fi
+          fi
+
+          # Output tags
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
+          # Generate labels
+          LABELS="org.opencontainers.image.title=RustFS"
+          LABELS="$LABELS,org.opencontainers.image.description=RustFS distributed object storage system"
+          LABELS="$LABELS,org.opencontainers.image.version=$VERSION"
+          LABELS="$LABELS,org.opencontainers.image.revision=${{ github.sha }}"
+          LABELS="$LABELS,org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+          LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          LABELS="$LABELS,org.opencontainers.image.variant=$VARIANT"
+          LABELS="$LABELS,org.opencontainers.image.build-type=$BUILD_TYPE"
+
+          echo "labels=$LABELS" >> $GITHUB_OUTPUT
+
+          echo "🐳 Generated Docker tags:"
+          echo "$TAGS" | tr ',' '\n' | sed 's/^/  - /'
+          echo "📋 Build type: $BUILD_TYPE"
+          echo "🔖 Version: $VERSION"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -167,15 +258,15 @@ jobs:
           cache-from: type=gha,scope=docker-${{ matrix.variant.name }}
           cache-to: type=gha,mode=max,scope=docker-${{ matrix.variant.name }}
           build-args: |
-            BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
-            VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
-            REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+            BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VERSION=${{ needs.build-check.outputs.version }}
+            REVISION=${{ github.sha }}
 
-  # Create manifest for main production image
+  # Create manifest for main production image (only for stable releases)
   create-manifest:
     name: Create Manifest
     needs: [build-check, build-docker]
-    if: needs.build-check.outputs.should_push == 'true' && startsWith(github.ref, 'refs/tags/')
+    if: needs.build-check.outputs.should_push == 'true' && needs.build-check.outputs.create_latest == 'true' && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Login to Docker Hub
@@ -194,17 +285,60 @@ jobs:
 
       - name: Create and push manifest
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
+          VERSION="${{ needs.build-check.outputs.version }}"
 
-          # Create main image tag (without variant suffix)
+          echo "🐳 Creating manifest for stable release: $VERSION"
+
+          # Create main image tag (without variant suffix) for stable releases only
           if [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]]; then
+            echo "Creating Docker Hub manifest..."
             docker buildx imagetools create \
               -t ${{ env.REGISTRY_DOCKERHUB }}:${VERSION} \
               -t ${{ env.REGISTRY_DOCKERHUB }}:latest \
               ${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-production
           fi
 
+          echo "Creating GitHub Container Registry manifest..."
           docker buildx imagetools create \
             -t ${{ env.REGISTRY_GHCR }}:${VERSION} \
             -t ${{ env.REGISTRY_GHCR }}:latest \
             ${{ env.REGISTRY_GHCR }}:${VERSION}-production
+
+          echo "✅ Manifest created successfully for stable release"
+
+  # Docker build summary
+  docker-summary:
+    name: Docker Build Summary
+    needs: [build-check, build-docker]
+    if: always() && needs.build-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docker build completion summary
+        run: |
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
+
+          echo "🐳 Docker build completed successfully!"
+          echo "📦 Build type: $BUILD_TYPE"
+          echo "🔢 Version: $VERSION"
+          echo ""
+
+          case "$BUILD_TYPE" in
+            "development")
+              echo "🛠️  Development Docker images have been built with dev-${VERSION} tags"
+              echo "⚠️  These are development images - not suitable for production use"
+              ;;
+            "release")
+              echo "🚀 Release Docker images have been built with v${VERSION} tags"
+              echo "✅ These images are ready for production use"
+              if [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tags have been created for stable release"
+              fi
+              ;;
+            "prerelease")
+              echo "🧪 Prerelease Docker images have been built with v${VERSION} tags"
+              echo "⚠️  These are prerelease images - use with caution"
+              echo "🚫 Latest tags NOT created for prerelease"
+              ;;
+          esac
