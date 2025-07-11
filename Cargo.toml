@@ -63,7 +63,7 @@ rustfs-filemeta = { path = "crates/filemeta" }
 rustfs-rio = { path = "crates/rio" }
 
 [workspace.dependencies]
-rustfs-ahm = { path = "crates/ahm", version = "0.0.3" }
+rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
@@ -207,7 +207,7 @@ rumqttc = { version = "0.24" }
 rust-embed = { version = "8.7.2" }
 rust-i18n = { version = "3.1.5" }
 rustfs-rsc = "2025.506.1"
-rustls = { version = "0.23.28" }
+rustls = { version = "0.23.29" }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-minio-preview.1" }

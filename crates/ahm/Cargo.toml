@@ -31,5 +31,5 @@ lazy_static = { workspace = true }
 
 [dev-dependencies]
 rmp-serde = { workspace = true }
-tokio-test = "0.4"
-serde_json = "1.0"
+tokio-test = { workspace = true }
+serde_json = { workspace = true }
