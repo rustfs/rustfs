@@ -28,7 +28,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_display = p.as_ref().display();
     let path_wide: Vec<WCHAR> = p
         .as_ref()
-        .canonicalize()?
+        .to_path_buf()
         .into_os_string()
         .encode_wide()
         .chain(std::iter::once(0)) // Null-terminate the string
@@ -83,12 +83,21 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         used: total - free,
         files: lp_total_number_of_clusters as u64,
         ffree: lp_number_of_free_clusters as u64,
-        fstype: get_fs_type(&path_wide)?,
+
+        // TODO This field is currently unused, and since this logic causes a
+        // NotFound error during startup on Windows systems, it has been commented out here
+        //
+        // The error occurs in GetVolumeInformationW where the path parameter
+        // is of type [WCHAR; MAX_PATH]. For a drive letter, there are excessive
+        // trailing zeros, which causes the failure here.
+        //
+        // fstype: get_fs_type(&path_wide)?,
         ..Default::default()
     })
 }
 
 /// Returns leading volume name.
+#[allow(dead_code)]
 fn get_volume_name(v: &[WCHAR]) -> std::io::Result<LPCWSTR> {
     let volume_name_size: DWORD = MAX_PATH as _;
     let mut lp_volume_name_buffer: [WCHAR; MAX_PATH] = [0; MAX_PATH];
@@ -102,12 +111,14 @@ fn get_volume_name(v: &[WCHAR]) -> std::io::Result<LPCWSTR> {
     Ok(lp_volume_name_buffer.as_ptr())
 }
 
+#[allow(dead_code)]
 fn utf16_to_string(v: &[WCHAR]) -> String {
     let len = v.iter().position(|&x| x == 0).unwrap_or(v.len());
     String::from_utf16_lossy(&v[..len])
 }
 
 /// Returns the filesystem type of the underlying mounted filesystem
+#[allow(dead_code)]
 fn get_fs_type(p: &[WCHAR]) -> std::io::Result<String> {
     let path = get_volume_name(p)?;
 
