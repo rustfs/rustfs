@@ -17,8 +17,8 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use hyper::client::conn::http2::Builder;
 use hyper_util::rt::TokioExecutor;
-use lazy_static::lazy_static;
 use std::net::Ipv6Addr;
+use std::sync::LazyLock;
 use std::{
     collections::HashSet,
     fmt::Display,
@@ -27,9 +27,7 @@ use std::{
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 
-lazy_static! {
-    static ref LOCAL_IPS: Vec<IpAddr> = must_get_local_ips().unwrap();
-}
+static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(|| must_get_local_ips().unwrap());
 
 /// helper for validating if the provided arg is an ip address.
 pub fn is_socket_addr(addr: &str) -> bool {

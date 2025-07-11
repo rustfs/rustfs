@@ -20,9 +20,7 @@ use std::time::UNIX_EPOCH;
 use tracing::error;
 use tracing::info;
 
-lazy_static::lazy_static! {
-    static ref LICENSE: OnceLock<Token> = OnceLock::new();
-}
+static LICENSE: OnceLock<Token> = OnceLock::new();
 
 /// Initialize the license
 pub fn init_license(license: Option<String>) {

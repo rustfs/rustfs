@@ -168,6 +168,7 @@ jobs:
               echo "// Static assets not available" > ./rustfs/static/empty.txt
             fi
           else
+            chmod +w ./rustfs/static/LICENSE || true
             curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
               -o console.zip --retry 3 --retry-delay 5 --max-time 300
             if [[ $? -eq 0 ]]; then
@@ -276,7 +277,7 @@ jobs:
 
           # Create latest.json (only for the first Linux build to avoid duplication)
           if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
+            VERSION="${GITHUB_REF#refs/tags/}"
             echo "{\"version\":\"${VERSION}\",\"release_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > latest.json
             $OSSUTIL_BIN cp latest.json oss://rustfs-version/latest.json --force
           fi

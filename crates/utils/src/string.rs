@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lazy_static::*;
 use rand::{Rng, RngCore};
 use regex::Regex;
 use std::io::{Error, Result};
+use std::sync::LazyLock;
 
 pub fn parse_bool(str: &str) -> Result<bool> {
     match str {
@@ -116,9 +116,7 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     text.len() <= pattern.len()
 }
 
-lazy_static! {
-    static ref ELLIPSES_RE: Regex = Regex::new(r"(.*)(\{[0-9a-z]*\.\.\.[0-9a-z]*\})(.*)").unwrap();
-}
+static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9a-z]*\.\.\.[0-9a-z]*\})(.*)").unwrap());
 
 /// Ellipses constants
 const OPEN_BRACES: &str = "{";

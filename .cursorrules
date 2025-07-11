@@ -517,7 +517,7 @@ let results = join_all(futures).await;
 
 ### 3. Caching Strategy
 
-- Use `lazy_static` or `OnceCell` for global caching
+- Use `LazyLock` for global caching
 - Implement LRU cache to avoid memory leaks
 
 ## Testing Guidelines

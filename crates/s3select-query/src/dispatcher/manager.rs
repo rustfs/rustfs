@@ -33,7 +33,6 @@ use datafusion::{
     execution::{RecordBatchStream, SendableRecordBatchStream},
 };
 use futures::{Stream, StreamExt};
-use lazy_static::lazy_static;
 use rustfs_s3select_api::{
     QueryError, QueryResult,
     query::{
@@ -48,6 +47,7 @@ use rustfs_s3select_api::{
     },
 };
 use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
+use std::sync::LazyLock;
 
 use crate::{
     execution::factory::QueryExecutionFactoryRef,
@@ -55,11 +55,9 @@ use crate::{
     sql::logical::planner::DefaultLogicalPlanner,
 };
 
-lazy_static! {
-    static ref IGNORE: FileHeaderInfo = FileHeaderInfo::from_static(FileHeaderInfo::IGNORE);
-    static ref NONE: FileHeaderInfo = FileHeaderInfo::from_static(FileHeaderInfo::NONE);
-    static ref USE: FileHeaderInfo = FileHeaderInfo::from_static(FileHeaderInfo::USE);
-}
+static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::IGNORE));
+static NONE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+static USE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::USE));
 
 #[derive(Clone)]
 pub struct SimpleQueryDispatcher {

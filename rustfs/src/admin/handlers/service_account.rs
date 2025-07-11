@@ -28,6 +28,7 @@ use rustfs_madmin::{
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_policy::policy::{Args, Policy};
 use s3s::S3ErrorCode::InvalidRequest;
+use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -306,7 +307,7 @@ impl Operation for UpdateServiceAccount {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -607,7 +608,7 @@ impl Operation for DeleteServiceAccount {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }

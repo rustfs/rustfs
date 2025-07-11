@@ -596,6 +596,7 @@ impl Operation for ImportBucketMetadata {
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }

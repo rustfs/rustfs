@@ -60,15 +60,7 @@ runs:
           pkg-config \
           libssl-dev
 
-    - name: Cache protoc binary
-      id: cache-protoc
-      uses: actions/cache@v4
-      with:
-        path: ~/.local/bin/protoc
-        key: protoc-31.1-${{ runner.os }}-${{ runner.arch }}
-
     - name: Install protoc
-      if: steps.cache-protoc.outputs.cache-hit != 'true'
       uses: arduino/setup-protoc@v3
       with:
         version: "31.1"
@@ -104,7 +96,3 @@ runs:
         cache-on-failure: true
         shared-key: ${{ inputs.cache-shared-key }}
         save-if: ${{ inputs.cache-save-if }}
-        # Cache workspace dependencies
-        workspaces: |
-          . -> target
-          cli/rustfs-gui -> cli/rustfs-gui/target

@@ -28,6 +28,5 @@ categories = ["web-programming", "development-tools", "data-structures"]
 workspace = true
 
 [dependencies]
-lazy_static.workspace = true
 tokio.workspace = true
 tonic = { workspace = true }
