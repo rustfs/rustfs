@@ -143,7 +143,7 @@ jobs:
                 is_prerelease=true
                 echo "🧪 Building with prerelease version: $input_version"
                 ;;
-              dev-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]*)
+              dev-[a-f0-9]*)
                 build_type="development"
                 echo "🔧 Building with specific development version: $input_version"
                 ;;
