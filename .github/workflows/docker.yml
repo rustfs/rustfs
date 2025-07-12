@@ -133,7 +133,7 @@ jobs:
                 version="main-latest"
                 echo "🛠️  Building with main branch latest development version"
                 ;;
-              v[0-9].[0-9].[0-9]|v[0-9].[0-9].[0-9][0-9]|v[0-9][0-9].[0-9].[0-9])
+              v[0-9]*)
                 build_type="release"
                 create_latest=true
                 echo "📦 Building with specific release version: $input_version"
