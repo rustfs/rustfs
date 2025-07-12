@@ -370,8 +370,7 @@ jobs:
 
             # Create latest version filename
             # Convert from rustfs-linux-x86_64-v1.0.0 to rustfs-linux-x86_64-latest
-            LATEST_NAME=$(echo "$PACKAGE_NAME" | sed 's/-v[0-9].*$/-latest/')
-            LATEST_FILE="${LATEST_NAME}.zip"
+            LATEST_FILE="${PACKAGE_NAME%-v*}-latest.zip"
 
             # Copy the original file to latest version
             cp "${{ steps.package.outputs.package_file }}" "$LATEST_FILE"
@@ -390,8 +389,7 @@ jobs:
 
             # Create main-latest version filename
             # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
-            MAIN_LATEST_NAME="${PACKAGE_NAME%-dev-*}-main-latest"
-            MAIN_LATEST_FILE="${MAIN_LATEST_NAME}.zip"
+            MAIN_LATEST_FILE="${PACKAGE_NAME%-dev-*}-main-latest.zip"
 
             # Copy the original file to main-latest version
             cp "${{ steps.package.outputs.package_file }}" "$MAIN_LATEST_FILE"
@@ -404,8 +402,7 @@ jobs:
 
             # Also create a generic main-latest for Docker builds
             if [[ "${{ matrix.platform }}" == "linux" ]]; then
-              DOCKER_MAIN_LATEST_NAME="rustfs-linux-${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64' || 'aarch64' }}-main-latest"
-              DOCKER_MAIN_LATEST_FILE="${DOCKER_MAIN_LATEST_NAME}.zip"
+              DOCKER_MAIN_LATEST_FILE="rustfs-linux-${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64' || 'aarch64' }}-main-latest.zip"
 
               cp "${{ steps.package.outputs.package_file }}" "$DOCKER_MAIN_LATEST_FILE"
               $OSSUTIL_BIN cp "$DOCKER_MAIN_LATEST_FILE" "$OSS_PATH" --force
