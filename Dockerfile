@@ -44,37 +44,62 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
     && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc \
     && rm -rf Linux.flatc.binary.g++-13.zip
 
-# Option A: Download pre-built binary (faster)
-RUN if [ -n "$VERSION" ]; then \
-        # Map TARGETARCH to our naming convention
-        case "${TARGETARCH}" in \
-            amd64) ARCH="x86_64" ;; \
-            arm64) ARCH="aarch64" ;; \
-            *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
-        esac; \
-        \
-        # Handle VERSION with potential dev- prefix using variable expansion
-        if [[ "$VERSION" == dev-* ]]; then \
-            DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-            FILENAME="rustfs-linux-${ARCH}-dev-${VERSION#dev-}.zip"; \
-        else \
-            DOWNLOAD_PATH="artifacts/rustfs/release"; \
-            FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
-        fi; \
-        \
-        # Download the binary
-        DOWNLOAD_URL="https://dl.rustfs.com/${DOWNLOAD_PATH}/${FILENAME}"; \
-        echo "Downloading RustFS binary from: ${DOWNLOAD_URL}"; \
-        curl -Lo /tmp/rustfs.zip "${DOWNLOAD_URL}"; \
-        unzip -o /tmp/rustfs.zip -d /tmp; \
-        mv /tmp/rustfs /usr/local/bin/rustfs; \
-        chmod +x /usr/local/bin/rustfs; \
-        rm -rf /tmp/*; \
-    else \
-        echo "No VERSION provided, will build from source"; \
-        echo "Source build not yet implemented in Alpine variant"; \
+# Download pre-built binary (VERSION is required)
+RUN if [ -z "$VERSION" ]; then \
+        echo "❌ ERROR: VERSION build argument is required"; \
+        echo "Please provide VERSION (e.g., main-latest, latest, v1.0.0, dev-abc123)"; \
         exit 1; \
-    fi
+    fi; \
+    \
+    # Map TARGETARCH to our naming convention
+    case "${TARGETARCH}" in \
+        amd64) ARCH="x86_64" ;; \
+        arm64) ARCH="aarch64" ;; \
+        *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    \
+    # Handle VERSION with different patterns
+    if [[ "$VERSION" == "main-latest" ]]; then \
+        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
+        FILENAME="rustfs-linux-${ARCH}-main-latest.zip"; \
+    elif [[ "$VERSION" == "latest" ]]; then \
+        DOWNLOAD_PATH="artifacts/rustfs/release"; \
+        FILENAME="rustfs-linux-${ARCH}-latest.zip"; \
+    elif [[ "$VERSION" == dev-* ]]; then \
+        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
+        FILENAME="rustfs-linux-${ARCH}-dev-${VERSION#dev-}.zip"; \
+    else \
+        DOWNLOAD_PATH="artifacts/rustfs/release"; \
+        FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
+    fi; \
+    \
+    # Download the binary
+    DOWNLOAD_URL="https://dl.rustfs.com/${DOWNLOAD_PATH}/${FILENAME}"; \
+    echo "🔽 Downloading RustFS binary from: ${DOWNLOAD_URL}"; \
+    \
+    # Download with clear error handling
+    if ! curl -fsSL --connect-timeout 30 --max-time 120 -o /tmp/rustfs.zip "${DOWNLOAD_URL}"; then \
+        echo "❌ Failed to download binary from: ${DOWNLOAD_URL}"; \
+        echo "💡 Please ensure the binary exists or trigger a build first"; \
+        echo "💡 Available options:"; \
+        echo "   - For main-latest: Push to main branch or run build workflow"; \
+        echo "   - For latest: Create a release tag"; \
+        echo "   - For dev-xxx: Run build workflow with specific commit"; \
+        exit 1; \
+    fi; \
+    \
+    # Extract binary
+    if ! unzip -o /tmp/rustfs.zip -d /tmp >/dev/null 2>&1; then \
+        echo "❌ Failed to extract downloaded binary"; \
+        exit 1; \
+    fi; \
+    \
+    # Install binary
+    mv /tmp/rustfs /usr/local/bin/rustfs; \
+    chmod +x /usr/local/bin/rustfs; \
+    rm -rf /tmp/*; \
+    \
+    echo "✅ Successfully downloaded and installed RustFS binary (${VERSION})"
 
 # Final Alpine runtime image
 FROM alpine:3.18
