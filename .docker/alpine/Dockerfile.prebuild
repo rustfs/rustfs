@@ -55,12 +55,9 @@ RUN if [ -n "$VERSION" ]; then \
         \
         # Handle VERSION with potential dev- prefix using variable expansion
         if [[ "$VERSION" == dev-* ]]; then \
-            # Remove dev- prefix if present
-            CLEAN_VERSION="${VERSION#dev-}"; \
             DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-            FILENAME="rustfs-linux-${ARCH}-dev-${CLEAN_VERSION}.zip"; \
+            FILENAME="rustfs-linux-${ARCH}-dev-${VERSION#dev-}.zip"; \
         else \
-            # VERSION is a release version
             DOWNLOAD_PATH="artifacts/rustfs/release"; \
             FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
         fi; \
