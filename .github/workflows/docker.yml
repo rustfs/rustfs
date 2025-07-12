@@ -55,6 +55,11 @@ on:
         required: false
         default: true
         type: boolean
+      version:
+        description: "Version to build (latest, main-latest, or specific version like v1.0.0 or dev-abc123)"
+        required: false
+        default: "main-latest"
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,7 +107,37 @@ jobs:
           fi
 
           # Determine build type and version
-          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.version }}" ]]; then
+            # Manual trigger with version input
+            input_version="${{ github.event.inputs.version }}"
+            version="${input_version}"
+
+            case "$input_version" in
+              "latest")
+                build_type="release"
+                create_latest=true
+                echo "🚀 Docker manual build with latest version"
+                ;;
+              "main-latest")
+                build_type="development"
+                version="main-latest"
+                echo "🛠️  Docker manual build with main-latest version"
+                ;;
+              v*.*.*)
+                build_type="release"
+                create_latest=true
+                echo "📦 Docker manual build with specific release version: $input_version"
+                ;;
+              dev-*)
+                build_type="development"
+                echo "🔧 Docker manual build with specific dev version: $input_version"
+                ;;
+              *)
+                build_type="development"
+                echo "🔧 Docker manual build with custom version: $input_version"
+                ;;
+            esac
+          elif [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
             # Tag push - release or prerelease
             tag_name="${GITHUB_REF#refs/tags/}"
             version="${tag_name}"
