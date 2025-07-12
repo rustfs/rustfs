@@ -1,22 +1,39 @@
 # RustFS Project Cursor Rules
 
-## ⚠️ CRITICAL DEVELOPMENT RULES ⚠️
+## 🚨🚨🚨 CRITICAL DEVELOPMENT RULES - ZERO TOLERANCE 🚨🚨🚨
 
-### 🚨 NEVER COMMIT DIRECTLY TO MASTER/MAIN BRANCH 🚨
+### ⛔️ ABSOLUTE PROHIBITION: NEVER COMMIT DIRECTLY TO MASTER/MAIN BRANCH ⛔️
 
-- **This is the most important rule - NEVER modify code directly on main or master branch**
-- **ALL CHANGES MUST GO THROUGH PULL REQUESTS - NO EXCEPTIONS**
-- **Always work on feature branches and use pull requests for all changes**
-- **Any direct commits to master/main branch are strictly forbidden**
-- **Pull requests are the ONLY way to merge code to main branch**
-- Before starting any development, always:
-  1. `git checkout main` (switch to main branch)
-  2. `git pull` (get latest changes)
-  3. `git checkout -b feat/your-feature-name` (create and switch to feature branch)
-  4. Make your changes on the feature branch
-  5. Commit and push to the feature branch
-  6. **Create a pull request for review - THIS IS MANDATORY**
-  7. **Wait for PR approval and merge through GitHub interface only**
+**🔥 THIS IS THE MOST CRITICAL RULE - VIOLATION WILL RESULT IN IMMEDIATE REVERSAL 🔥**
+
+- **🚫 ZERO DIRECT COMMITS TO MAIN/MASTER BRANCH - ABSOLUTELY FORBIDDEN**
+- **🚫 ANY DIRECT COMMIT TO MAIN BRANCH MUST BE IMMEDIATELY REVERTED**
+- **🚫 NO EXCEPTIONS FOR HOTFIXES, EMERGENCIES, OR URGENT CHANGES**
+- **🚫 NO EXCEPTIONS FOR SMALL CHANGES, TYPOS, OR DOCUMENTATION UPDATES**
+- **🚫 NO EXCEPTIONS FOR ANYONE - MAINTAINERS, CONTRIBUTORS, OR ADMINS**
+
+### 📋 MANDATORY WORKFLOW - STRICTLY ENFORCED
+
+**EVERY SINGLE CHANGE MUST FOLLOW THIS WORKFLOW:**
+
+1. **Check current branch**: `git branch` (MUST NOT be on main/master)
+2. **Switch to main**: `git checkout main`
+3. **Pull latest**: `git pull origin main`
+4. **Create feature branch**: `git checkout -b feat/your-feature-name`
+5. **Make changes ONLY on feature branch**
+6. **Test thoroughly before committing**
+7. **Commit and push to feature branch**: `git push origin feat/your-feature-name`
+8. **Create Pull Request**: Use `gh pr create` (MANDATORY)
+9. **Wait for PR approval**: NO self-merging allowed
+10. **Merge through GitHub interface**: ONLY after approval
+
+### 🔒 ENFORCEMENT MECHANISMS
+
+- **Branch protection rules**: Main branch is protected
+- **Pre-commit hooks**: Will block direct commits to main
+- **CI/CD checks**: All PRs must pass before merging
+- **Code review requirement**: At least one approval needed
+- **Automated reversal**: Direct commits to main will be automatically reverted
 
 ## Project Overview
 
