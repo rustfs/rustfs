@@ -370,8 +370,7 @@ jobs:
 
             # Create latest version filename
             # Convert from rustfs-linux-x86_64-v1.0.0 to rustfs-linux-x86_64-latest
-            LATEST_NAME=$(echo "$PACKAGE_NAME" | sed 's/-v[0-9].*$/-latest/')
-            LATEST_FILE="${LATEST_NAME}.zip"
+            LATEST_FILE="${PACKAGE_NAME%-v*}-latest.zip"
 
             # Copy the original file to latest version
             cp "${{ steps.package.outputs.package_file }}" "$LATEST_FILE"
@@ -383,33 +382,47 @@ jobs:
             echo "✅ Latest version uploaded: $LATEST_FILE"
           fi
 
-          # For development builds on main branch, also create a main-latest version
-          if [[ "$BUILD_TYPE" == "development" ]] && [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          # For development builds, create dev-latest version
+          if [[ "$BUILD_TYPE" == "development" ]]; then
             # Extract platform and arch from package name
             PACKAGE_NAME="${{ steps.package.outputs.package_name }}"
 
-            # Create main-latest version filename
-            # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
-            MAIN_LATEST_NAME=$(echo "$PACKAGE_NAME" | sed 's/-dev-[a-f0-9]\+$/-main-latest/')
-            MAIN_LATEST_FILE="${MAIN_LATEST_NAME}.zip"
+            # Create dev-latest version filename
+            # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-dev-latest
+            DEV_LATEST_FILE="${PACKAGE_NAME%-*}-latest.zip"
 
-            # Copy the original file to main-latest version
-            cp "${{ steps.package.outputs.package_file }}" "$MAIN_LATEST_FILE"
+            # Copy the original file to dev-latest version
+            cp "${{ steps.package.outputs.package_file }}" "$DEV_LATEST_FILE"
 
-            # Upload the main-latest version
-            echo "Uploading main-latest version: $MAIN_LATEST_FILE to $OSS_PATH..."
-            $OSSUTIL_BIN cp "$MAIN_LATEST_FILE" "$OSS_PATH" --force
+            # Upload the dev-latest version
+            echo "Uploading dev-latest version: $DEV_LATEST_FILE to $OSS_PATH..."
+            $OSSUTIL_BIN cp "$DEV_LATEST_FILE" "$OSS_PATH" --force
 
-            echo "✅ Main-latest version uploaded: $MAIN_LATEST_FILE"
+            echo "✅ Dev-latest version uploaded: $DEV_LATEST_FILE"
 
-            # Also create a generic main-latest for Docker builds
-            if [[ "${{ matrix.platform }}" == "linux" ]]; then
-              DOCKER_MAIN_LATEST_NAME="rustfs-linux-${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64' || 'aarch64' }}-main-latest"
-              DOCKER_MAIN_LATEST_FILE="${DOCKER_MAIN_LATEST_NAME}.zip"
+            # For main branch builds, also create a main-latest version
+            if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+              # Create main-latest version filename
+              # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
+              MAIN_LATEST_FILE="${PACKAGE_NAME%-dev-*}-main-latest.zip"
 
-              cp "${{ steps.package.outputs.package_file }}" "$DOCKER_MAIN_LATEST_FILE"
-              $OSSUTIL_BIN cp "$DOCKER_MAIN_LATEST_FILE" "$OSS_PATH" --force
-              echo "✅ Docker main-latest version uploaded: $DOCKER_MAIN_LATEST_FILE"
+              # Copy the original file to main-latest version
+              cp "${{ steps.package.outputs.package_file }}" "$MAIN_LATEST_FILE"
+
+              # Upload the main-latest version
+              echo "Uploading main-latest version: $MAIN_LATEST_FILE to $OSS_PATH..."
+              $OSSUTIL_BIN cp "$MAIN_LATEST_FILE" "$OSS_PATH" --force
+
+              echo "✅ Main-latest version uploaded: $MAIN_LATEST_FILE"
+
+              # Also create a generic main-latest for Docker builds
+              if [[ "${{ matrix.platform }}" == "linux" ]]; then
+                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64' || 'aarch64' }}-main-latest.zip"
+
+                cp "${{ steps.package.outputs.package_file }}" "$DOCKER_MAIN_LATEST_FILE"
+                $OSSUTIL_BIN cp "$DOCKER_MAIN_LATEST_FILE" "$OSS_PATH" --force
+                echo "✅ Docker main-latest version uploaded: $DOCKER_MAIN_LATEST_FILE"
+              fi
             fi
           fi
 

@@ -56,7 +56,7 @@ on:
         default: true
         type: boolean
       version:
-        description: "Version to build (latest, main-latest, or specific version like v1.0.0 or dev-abc123)"
+        description: "Version to build (latest, main-latest, dev-latest, or specific version like v1.0.0 or dev-abc123)"
         required: false
         default: "main-latest"
         type: string
@@ -132,6 +132,11 @@ jobs:
                 build_type="development"
                 version="main-latest"
                 echo "🛠️  Building with main branch latest development version"
+                ;;
+              "dev-latest")
+                build_type="development"
+                version="dev-latest"
+                echo "🛠️  Building with development latest version"
                 ;;
               v[0-9]*)
                 build_type="release"
