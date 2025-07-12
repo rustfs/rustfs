@@ -390,7 +390,7 @@ jobs:
 
             # Create main-latest version filename
             # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
-            MAIN_LATEST_NAME=$(echo "$PACKAGE_NAME" | sed 's/-dev-[a-f0-9]\{7\}$/-main-latest/')
+            MAIN_LATEST_NAME=$(echo "$PACKAGE_NAME" | sed 's/-dev-[a-f0-9]\+$/-main-latest/')
             MAIN_LATEST_FILE="${MAIN_LATEST_NAME}.zip"
 
             # Copy the original file to main-latest version
