@@ -246,12 +246,12 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           scopes: repository:rustfs/rustfs:pull,push
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Login to GitHub Container Registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -274,28 +274,22 @@ jobs:
           if [[ "$BUILD_TYPE" == "development" ]]; then
             # Development build: dev-${short_sha}-${variant} and dev-${variant}
             TAGS="${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}-${VARIANT}"
-            TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${SHORT_SHA}-${VARIANT}"
 
             # Add rolling dev tag for each variant
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev-${VARIANT}"
-            TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${VARIANT}"
 
             # Special handling for production variant
             if [[ "$VARIANT" == "production" ]]; then
               TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}"
-              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev-${SHORT_SHA}"
               TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev"
-              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:dev"
             fi
           else
             # Release/Prerelease build: ${version}-${variant}
             TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-${VARIANT}"
-            TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${VERSION}-${VARIANT}"
 
             # Special handling for production variant - create main version tag
             if [[ "$VARIANT" == "production" ]]; then
               TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
-              TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${VERSION}"
             fi
 
             # Add channel tags for prereleases and latest for stable
@@ -303,10 +297,8 @@ jobs:
               # Stable release
               if [[ "$VARIANT" == "production" ]]; then
                 TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
-                TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:latest"
               else
                 TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest-${VARIANT}"
-                TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:latest-${VARIANT}"
               fi
             elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
               # Prerelease channel tags (alpha, beta, rc)
@@ -321,10 +313,8 @@ jobs:
               if [[ -n "$CHANNEL" ]]; then
                 if [[ "$VARIANT" == "production" ]]; then
                   TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
-                  TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${CHANNEL}"
                 else
                   TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}-${VARIANT}"
-                  TAGS="$TAGS,${{ env.REGISTRY_GHCR }}:${CHANNEL}-${VARIANT}"
                 fi
               fi
             fi
@@ -361,10 +351,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
             type=gha,scope=docker-${{ matrix.variant.name }}
-            type=registry,ref=${{ env.REGISTRY_GHCR }}:buildcache-${{ matrix.variant.name }}
           cache-to: |
             type=gha,mode=max,scope=docker-${{ matrix.variant.name }}
-            type=registry,ref=${{ env.REGISTRY_GHCR }}:buildcache-${{ matrix.variant.name }},mode=max
           build-args: |
             BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
             VERSION=${{ needs.build-check.outputs.version }}
@@ -391,12 +379,12 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Login to GitHub Container Registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push manifest
         run: |
