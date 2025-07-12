@@ -73,11 +73,14 @@ RUN if [ -n "$VERSION" ]; then \
             *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
         esac; \
         \
-        # Determine download path and filename
-        if [ "${BUILD_TYPE}" = "development" ]; then \
+        # Handle VERSION with potential dev- prefix using variable expansion
+        if [[ "$VERSION" == dev-* ]]; then \
+            # Remove dev- prefix if present
+            CLEAN_VERSION="${VERSION#dev-}"; \
             DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-            FILENAME="rustfs-linux-${ARCH}-dev-${VERSION}.zip"; \
+            FILENAME="rustfs-linux-${ARCH}-dev-${CLEAN_VERSION}.zip"; \
         else \
+            # VERSION is a release version
             DOWNLOAD_PATH="artifacts/rustfs/release"; \
             FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
         fi; \
