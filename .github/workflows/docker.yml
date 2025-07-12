@@ -60,6 +60,11 @@ on:
         required: false
         default: "main-latest"
         type: string
+      force_rebuild:
+        description: "Force rebuild even if binary exists (useful for testing)"
+        required: false
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
@@ -111,30 +116,41 @@ jobs:
             # Manual trigger with version input
             input_version="${{ github.event.inputs.version }}"
             version="${input_version}"
+            force_rebuild="${{ github.event.inputs.force_rebuild }}"
+
+            echo "🎯 Manual Docker build triggered:"
+            echo "   📋 Requested version: $input_version"
+            echo "   🔧 Force rebuild: $force_rebuild"
 
             case "$input_version" in
               "latest")
                 build_type="release"
                 create_latest=true
-                echo "🚀 Docker manual build with latest version"
+                echo "🚀 Building with latest stable release version"
                 ;;
               "main-latest")
                 build_type="development"
                 version="main-latest"
-                echo "🛠️  Docker manual build with main-latest version"
+                echo "🛠️  Building with main branch latest development version"
                 ;;
-              v*.*.*)
+              v[0-9].[0-9].[0-9]|v[0-9].[0-9].[0-9][0-9]|v[0-9][0-9].[0-9].[0-9])
                 build_type="release"
                 create_latest=true
-                echo "📦 Docker manual build with specific release version: $input_version"
+                echo "📦 Building with specific release version: $input_version"
                 ;;
-              dev-*)
+              v*alpha*|v*beta*|v*rc*)
+                build_type="prerelease"
+                is_prerelease=true
+                echo "🧪 Building with prerelease version: $input_version"
+                ;;
+              dev-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]*)
                 build_type="development"
-                echo "🔧 Docker manual build with specific dev version: $input_version"
+                echo "🔧 Building with specific development version: $input_version"
                 ;;
               *)
                 build_type="development"
-                echo "🔧 Docker manual build with custom version: $input_version"
+                echo "🔧 Building with custom version: $input_version"
+                echo "⚠️  Warning: Custom version format may not follow standard patterns"
                 ;;
             esac
           elif [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
