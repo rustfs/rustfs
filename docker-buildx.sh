@@ -131,7 +131,7 @@ build_and_push() {
     print_message $BLUE "🏗️  Building latest variant..."
     local latest_cmd="$build_cmd"
     latest_cmd+=" -t ${image_base}:latest"
-    latest_cmd+=" -t ${image_base}:latest-cicd"
+    latest_cmd+=" --build-arg RELEASE=latest"
     latest_cmd+=" -f Dockerfile ."
 
     print_message $BLUE "📦 Executing: $latest_cmd"
@@ -140,8 +140,7 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build latest variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/dev/rustfs-linux-x86_64-dev-latest.zip"
-        print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/dev/rustfs-linux-aarch64-dev-latest.zip"
+        print_message $YELLOW "   https://github.com/rustfs/rustfs/releases/latest"
         exit 1
     fi
 
@@ -153,7 +152,8 @@ build_and_push() {
     local release_cmd="$build_cmd"
     release_cmd+=" -t ${image_base}:${version}"
     release_cmd+=" -t ${image_base}:release"
-    release_cmd+=" -f Dockerfile.release ."
+    release_cmd+=" --build-arg RELEASE=${version}"
+    release_cmd+=" -f Dockerfile ."
 
     print_message $BLUE "📦 Executing: $release_cmd"
     if eval $release_cmd; then
@@ -161,8 +161,7 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build release variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/release/rustfs-linux-x86_64-v$version.zip"
-        print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/release/rustfs-linux-aarch64-v$version.zip"
+        print_message $YELLOW "   https://github.com/rustfs/rustfs/releases/tag/$version"
         exit 1
     fi
 
