@@ -227,7 +227,7 @@ jobs:
             dockerfile: Dockerfile.source
             platforms: linux/amd64,linux/arm64
           - name: dev
-            dockerfile: Dockerfile.dev
+            dockerfile: Dockerfile.source
             platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout repository

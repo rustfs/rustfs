@@ -46,7 +46,7 @@ setup-hooks:
 
 .PHONY: init-devenv
 init-devenv:
-	$(DOCKER_CLI) build -t $(IMAGE_NAME) -f $(DOCKERFILE_PATH)/Dockerfile.devenv .
+	$(DOCKER_CLI) build -t $(IMAGE_NAME) -f Dockerfile.source .
 	$(DOCKER_CLI) stop $(CONTAINER_NAME)
 	$(DOCKER_CLI) rm $(CONTAINER_NAME)
 	$(DOCKER_CLI) run -d --name $(CONTAINER_NAME) -p 9010:9010 -p 9000:9000 -v $(shell pwd):/root/s3-rustfs -it $(IMAGE_NAME)

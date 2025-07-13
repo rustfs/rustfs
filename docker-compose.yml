@@ -68,7 +68,7 @@ services:
     container_name: rustfs-dev
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile.source
       # Pure development environment
     ports:
       - "9010:9000"

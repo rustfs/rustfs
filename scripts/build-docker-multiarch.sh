@@ -99,7 +99,7 @@ case "$IMAGE_TYPE" in
         SUFFIX="-rockylinux9.3"
         ;;
     devenv)
-        DOCKERFILE=".docker/Dockerfile.devenv"
+        DOCKERFILE="Dockerfile.source"
         SUFFIX="-devenv"
         ;;
     *)

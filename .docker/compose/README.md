@@ -25,7 +25,7 @@ This directory contains specialized Docker Compose configurations and their asso
 - **`docker-compose.observability.yaml`** - **Observability Focus**
   - Specialized setup for testing observability features
   - Includes OpenTelemetry, Jaeger, Prometheus, Loki, Grafana
-  - Uses `../../Dockerfile.obs` for builds
+  - Uses `../../Dockerfile.source` for builds
   - Perfect for observability development
 
 ## 🚀 Usage Examples

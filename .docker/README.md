@@ -8,7 +8,6 @@ This directory contains Docker configuration files and supporting infrastructure
 rustfs/
 ├── Dockerfile           # Production image (Alpine + GitHub Releases)
 ├── Dockerfile.source    # Source build (Ubuntu + cross-compilation)
-├── Dockerfile.dev       # Development environment (Ubuntu + tools)
 ├── cargo.config.toml    # Rust cargo configuration
 └── .docker/             # Supporting infrastructure
     ├── observability/   # Monitoring and observability configs
@@ -88,7 +87,7 @@ docker build -f Dockerfile.source \
   -t rustfs:source .
 
 # Development build
-docker build -f Dockerfile.dev -t rustfs:dev .
+docker build -f Dockerfile.source -t rustfs:dev .
 ```
 
 ## 🔧 Binary Download Sources
