@@ -117,7 +117,7 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUST_LOG=warn
 
 # Set permissions for /usr/bin (similar to MinIO's approach)
-RUN chmod -R 777 /usr/bin
+RUN chmod -R 755 /usr/bin
 
 # Copy CA certificates and binaries from build stage
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
