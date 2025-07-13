@@ -146,6 +146,11 @@ jobs:
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      WORKSPACE_DIR: ${{ github.workspace }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
     strategy:
       fail-fast: false
       matrix:
@@ -237,9 +242,9 @@ jobs:
           fi
 
           # build-rustfs.sh outputs to target/release/${platform}/rustfs
-          cd target/release/${{ matrix.target }}
-          zip "../../../${PACKAGE_NAME}.zip" rustfs
-          cd ../../..
+          cd ${WORKSPACE_DIR}/target/release/${{ matrix.target }}
+          zip "${WORKSPACE_DIR}/${PACKAGE_NAME}.zip" rustfs
+          cd ${WORKSPACE_DIR}
 
           echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
           echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
