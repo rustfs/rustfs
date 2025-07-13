@@ -58,11 +58,11 @@ OUTPUT_DIR="target/release"
 PLATFORM=$(detect_platform)  # Auto-detect current platform
 BINARY_NAME="rustfs"
 BUILD_TYPE="release"
-UPLOAD=false
 SIGN=false
-DOWNLOAD_CONSOLE=false
+WITH_CONSOLE=true
 FORCE_CONSOLE_UPDATE=false
 CONSOLE_VERSION="latest"
+SKIP_VERIFICATION=false
 
 # Print usage
 usage() {
@@ -71,24 +71,27 @@ usage() {
     echo "Description:"
     echo "  Build RustFS binary for the current platform. Designed for CI/CD pipelines"
     echo "  where different runners build platform-specific binaries natively."
+    echo "  Includes automatic verification to ensure the built binary is functional."
     echo ""
     echo "Options:"
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
     echo "  --dev                      Build in dev mode"
-    echo "  --upload                   Upload binaries after build"
     echo "  --sign                     Sign binaries after build"
-    echo "  --download-console         Download console static assets"
+    echo "  --with-console             Download console static assets (default)"
+    echo "  --no-console               Skip console static assets"
     echo "  --force-console-update     Force update console assets even if they exist"
     echo "  --console-version VERSION  Console version to download (default: latest)"
+    echo "  --skip-verification        Skip binary verification after build"
     echo "  -h, --help                 Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                         # Build for current platform (typical CI usage)"
+    echo "  $0                         # Build for current platform (includes console assets)"
     echo "  $0 --dev                   # Development build"
-    echo "  $0 --upload --sign         # Build, sign and upload (release CI)"
-    echo "  $0 --download-console      # Build with console static assets"
+    echo "  $0 --sign                  # Build and sign binary (release CI)"
+    echo "  $0 --no-console            # Build without console static assets"
     echo "  $0 --force-console-update  # Force update console assets"
+    echo "  $0 --skip-verification     # Skip binary verification (for cross-compilation)"
     echo ""
     echo "Detected platform: $(detect_platform)"
     echo "CI Usage: Run this script on each platform's runner to build native binaries"
@@ -141,7 +144,7 @@ download_console_assets() {
 
     # Determine if we need to download
     local should_download=false
-    if [ "$DOWNLOAD_CONSOLE" = true ]; then
+    if [ "$WITH_CONSOLE" = true ]; then
         if [ "$console_exists" = false ]; then
             print_message $BLUE "🎨 Console assets not found, downloading..."
             should_download=true
@@ -219,6 +222,53 @@ download_console_assets() {
     fi
 }
 
+# Verify binary functionality
+verify_binary() {
+    local binary_path="$1"
+
+    # Check if binary exists
+    if [ ! -f "$binary_path" ]; then
+        print_message $RED "❌ Binary file not found: $binary_path"
+        return 1
+    fi
+
+    # Check if binary is executable
+    if [ ! -x "$binary_path" ]; then
+        print_message $RED "❌ Binary is not executable: $binary_path"
+        return 1
+    fi
+
+    # Check basic functionality - try to run help command
+    print_message $YELLOW "   Testing --help command..."
+    if ! "$binary_path" --help >/dev/null 2>&1; then
+        print_message $RED "❌ Binary failed to run --help command"
+        return 1
+    fi
+
+    # Check version command
+    print_message $YELLOW "   Testing --version command..."
+    if ! "$binary_path" --version >/dev/null 2>&1; then
+        print_message $YELLOW "⚠️  Binary does not support --version command (this is optional)"
+    fi
+
+    # Try to get some basic info about the binary
+    local file_info=$(file "$binary_path" 2>/dev/null || echo "unknown")
+    print_message $YELLOW "   Binary info: $file_info"
+
+    # Check if it's a valid ELF/Mach-O binary
+    if command -v readelf >/dev/null 2>&1; then
+        if readelf -h "$binary_path" >/dev/null 2>&1; then
+            print_message $YELLOW "   ELF binary structure: valid"
+        fi
+    elif command -v otool >/dev/null 2>&1; then
+        if otool -h "$binary_path" >/dev/null 2>&1; then
+            print_message $YELLOW "   Mach-O binary structure: valid"
+        fi
+    fi
+
+    return 0
+}
+
 # Build binary for current platform
 build_binary() {
     local version=$(get_version)
@@ -254,6 +304,19 @@ build_binary() {
         print_message $BLUE "🔐 Generating checksums..."
         (cd "${OUTPUT_DIR}/${PLATFORM}" && sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256sum")
 
+        # Verify binary functionality (if not skipped)
+        if [ "$SKIP_VERIFICATION" = false ]; then
+            print_message $BLUE "🔍 Verifying binary functionality..."
+            if verify_binary "$output_file"; then
+                print_message $GREEN "✅ Binary verification passed"
+            else
+                print_message $RED "❌ Binary verification failed"
+                return 1
+            fi
+        else
+            print_message $YELLOW "⚠️  Binary verification skipped by user request"
+        fi
+
         # Sign binary if requested
         if [ "$SIGN" = true ]; then
             print_message $BLUE "✍️  Signing binary..."
@@ -267,32 +330,7 @@ build_binary() {
     fi
 }
 
-# Upload binary
-upload_binary() {
-    local version=$(get_version)
-    local binary_dir="${OUTPUT_DIR}/${PLATFORM}"
 
-    print_message $BLUE "📤 Uploading binary for $PLATFORM..."
-
-    if [ -f "${binary_dir}/${BINARY_NAME}" ]; then
-        print_message $YELLOW "Uploading $PLATFORM binary..."
-
-        # Example upload command - customize based on your storage
-        # aws s3 cp "${binary_dir}/${BINARY_NAME}" "s3://dl.rustfs.com/release/rustfs.${version}"
-        # aws s3 cp "${binary_dir}/${BINARY_NAME}.sha256sum" "s3://dl.rustfs.com/release/rustfs.${version}.sha256sum"
-
-        # For now, just show what would be uploaded
-        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> dl.rustfs.com/artifacts/rustfs/release/rustfs.${version}"
-        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> dl.rustfs.com/artifacts/rustfs/release/rustfs.${version}.sha256sum"
-
-        if [ "$SIGN" = true ] && [ -f "${binary_dir}/${BINARY_NAME}.minisig" ]; then
-            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> dl.rustfs.com/artifacts/rustfs/release/rustfs.${version}.minisig"
-        fi
-    else
-        print_message $RED "❌ Binary not found: ${binary_dir}/${BINARY_NAME}"
-        return 1
-    fi
-}
 
 # Main build function
 build_rustfs() {
@@ -304,12 +342,12 @@ build_rustfs() {
     print_message $YELLOW "   Output Directory: $OUTPUT_DIR"
     print_message $YELLOW "   Build Type: $BUILD_TYPE"
     print_message $YELLOW "   Sign: $SIGN"
-    print_message $YELLOW "   Upload: $UPLOAD"
-    print_message $YELLOW "   Download Console: $DOWNLOAD_CONSOLE"
-    if [ "$DOWNLOAD_CONSOLE" = true ]; then
+    print_message $YELLOW "   With Console: $WITH_CONSOLE"
+    if [ "$WITH_CONSOLE" = true ]; then
         print_message $YELLOW "   Console Version: $CONSOLE_VERSION"
         print_message $YELLOW "   Force Console Update: $FORCE_CONSOLE_UPDATE"
     fi
+    print_message $YELLOW "   Skip Verification: $SKIP_VERIFICATION"
     echo ""
 
     # Setup environment
@@ -323,11 +361,6 @@ build_rustfs() {
     # Build binary
     build_binary
     echo ""
-
-    # Upload if requested
-    if [ "$UPLOAD" = true ]; then
-        upload_binary
-    fi
 
     print_message $GREEN "🎉 Build process completed successfully!"
 
@@ -351,29 +384,33 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --dev)
-            BUILD_TYPE="dev"
-            shift
-            ;;
-        --upload)
-            UPLOAD=true
+            BUILD_TYPE="debug"
             shift
             ;;
         --sign)
             SIGN=true
             shift
             ;;
-        --download-console)
-            DOWNLOAD_CONSOLE=true
+        --with-console)
+            WITH_CONSOLE=true
+            shift
+            ;;
+        --no-console)
+            WITH_CONSOLE=false
             shift
             ;;
         --force-console-update)
             FORCE_CONSOLE_UPDATE=true
-            DOWNLOAD_CONSOLE=true  # Auto-enable download when forcing update
+            WITH_CONSOLE=true  # Auto-enable download when forcing update
             shift
             ;;
         --console-version)
             CONSOLE_VERSION="$2"
             shift 2
+            ;;
+        --skip-verification)
+            SKIP_VERIFICATION=true
+            shift
             ;;
         -h|--help)
             usage
@@ -404,3 +441,4 @@ main() {
 
 # Run main function
 main
+
