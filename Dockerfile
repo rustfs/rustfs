@@ -24,12 +24,12 @@ RUN case "${TARGETARCH}" in \
     esac && \
     echo "ARCH=${ARCH}" > /build/arch.env
 
-# Download rustfs binary package from Aliyun OSS
+# Download rustfs binary package from dl.rustfs.com
 RUN . /build/arch.env && \
-    OSS_BASE_URL="https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/dev" && \
+    DOWNLOAD_BASE_URL="https://dl.rustfs.com/dev" && \
     PACKAGE_NAME="rustfs-linux-${ARCH}-dev-latest.zip" && \
-    echo "Downloading ${PACKAGE_NAME} from ${OSS_BASE_URL}..." && \
-    curl -s -q "${OSS_BASE_URL}/${PACKAGE_NAME}" -o /build/rustfs.zip && \
+    echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_BASE_URL}..." && \
+    curl -s -q "${DOWNLOAD_BASE_URL}/${PACKAGE_NAME}" -o /build/rustfs.zip && \
     unzip /build/rustfs.zip -d /build && \
     chmod +x /build/rustfs && \
     rm /build/rustfs.zip

@@ -178,15 +178,15 @@ upload_binary() {
         print_message $YELLOW "Uploading $PLATFORM binary..."
 
         # Example upload command - customize based on your storage
-        # aws s3 cp "${binary_dir}/${BINARY_NAME}" "s3://releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}"
-        # aws s3 cp "${binary_dir}/${BINARY_NAME}.sha256sum" "s3://releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}.sha256sum"
+        # aws s3 cp "${binary_dir}/${BINARY_NAME}" "s3://dl.rustfs.com/release/rustfs.${version}"
+        # aws s3 cp "${binary_dir}/${BINARY_NAME}.sha256sum" "s3://dl.rustfs.com/release/rustfs.${version}.sha256sum"
 
         # For now, just show what would be uploaded
-        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}"
-        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}.sha256sum"
+        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> dl.rustfs.com/release/rustfs.${version}"
+        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> dl.rustfs.com/release/rustfs.${version}.sha256sum"
 
         if [ "$SIGN" = true ] && [ -f "${binary_dir}/${BINARY_NAME}.minisig" ]; then
-            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}.minisig"
+            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> dl.rustfs.com/release/rustfs.${version}.minisig"
         fi
     else
         print_message $RED "❌ Binary not found: ${binary_dir}/${BINARY_NAME}"
