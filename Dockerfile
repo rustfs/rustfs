@@ -3,7 +3,7 @@ FROM alpine:3.18 AS build
 
 # Build arguments
 ARG TARGETARCH
-ARG RELEASE
+ARG RELEASE=latest
 
 # Install dependencies for downloading and verifying binaries
 RUN apk add --no-cache \
@@ -11,12 +11,13 @@ RUN apk add --no-cache \
     curl \
     bash \
     wget \
-    unzip
+    unzip \
+    jq
 
 # Create build directory
 WORKDIR /build
 
-# Map TARGETARCH to architecture format used in OSS
+# Map TARGETARCH to architecture format used in GitHub releases
 RUN case "${TARGETARCH}" in \
         "amd64") ARCH="x86_64" ;; \
         "arm64") ARCH="aarch64" ;; \
@@ -24,34 +25,65 @@ RUN case "${TARGETARCH}" in \
     esac && \
     echo "ARCH=${ARCH}" > /build/arch.env
 
-# Download rustfs binary package from dl.rustfs.com
+# Download rustfs binary from GitHub Releases
 RUN . /build/arch.env && \
-    DOWNLOAD_BASE_URL="https://dl.rustfs.com/artifacts/rustfs/dev" && \
-    PACKAGE_NAME="rustfs-linux-${ARCH}-dev-latest.zip" && \
-    echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_BASE_URL}..." && \
-    curl -s -q "${DOWNLOAD_BASE_URL}/${PACKAGE_NAME}" -o /build/rustfs.zip && \
+    GITHUB_REPO="rustfs/rustfs" && \
+    if [ "${RELEASE}" = "latest" ]; then \
+        # Get latest release tag \
+        LATEST_TAG=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name'); \
+        RELEASE_TAG="${LATEST_TAG}"; \
+        echo "Latest release tag: ${RELEASE_TAG}"; \
+    else \
+        RELEASE_TAG="${RELEASE}"; \
+        echo "Using specified release tag: ${RELEASE_TAG}"; \
+    fi && \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE_TAG}.zip" && \
+    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${PACKAGE_NAME}" && \
+    echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}..." && \
+    curl -s -L "${DOWNLOAD_URL}" -o /build/rustfs.zip && \
+    if [ ! -f /build/rustfs.zip ] || [ ! -s /build/rustfs.zip ]; then \
+        echo "❌ Failed to download binary package"; \
+        echo "💡 Make sure the release ${RELEASE_TAG} exists and contains ${PACKAGE_NAME}"; \
+        echo "🔗 Check: https://github.com/${GITHUB_REPO}/releases/tag/${RELEASE_TAG}"; \
+        exit 1; \
+    fi && \
     unzip /build/rustfs.zip -d /build && \
     chmod +x /build/rustfs && \
     rm /build/rustfs.zip
 
-# Install minisign for signature verification (optional, for future use)
-RUN wget -O /tmp/minisign.tar.gz "https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz" && \
-    tar -xzf /tmp/minisign.tar.gz -C /tmp && \
-    mv /tmp/minisign-linux/x86_64/minisign /usr/local/bin/minisign && \
-    chmod +x /usr/local/bin/minisign && \
-    rm -rf /tmp/minisign*
-
-# Verify binary signature using public key (disabled for now, enable when signatures are available)
-# RUN minisign -Vqm /build/rustfs -x /build/rustfs.minisig -P "YOUR_PUBLIC_KEY_HERE"
-
-# Verify checksums (disabled for now, enable when checksums are available)
-# RUN cd /build && sha256sum -c rustfs.sha256sum
+# Optional: Download and verify checksums if available
+RUN . /build/arch.env && \
+    GITHUB_REPO="rustfs/rustfs" && \
+    if [ "${RELEASE}" = "latest" ]; then \
+        LATEST_TAG=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name'); \
+        RELEASE_TAG="${LATEST_TAG}"; \
+    else \
+        RELEASE_TAG="${RELEASE}"; \
+    fi && \
+    CHECKSUM_FILE="SHA256SUMS" && \
+    CHECKSUM_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${CHECKSUM_FILE}" && \
+    echo "Attempting to download checksums from ${CHECKSUM_URL}..." && \
+    if curl -s -L "${CHECKSUM_URL}" -o /build/SHA256SUMS; then \
+        echo "✅ Checksums downloaded, verifying binary..."; \
+        cd /build && \
+        PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE_TAG}.zip" && \
+        if grep -q "${PACKAGE_NAME}" SHA256SUMS; then \
+            echo "${PACKAGE_NAME}" > temp_sums && \
+            grep "${PACKAGE_NAME}" SHA256SUMS >> temp_sums && \
+            sha256sum -c temp_sums || (echo "❌ Checksum verification failed" && exit 1); \
+            echo "✅ Checksum verification passed"; \
+        else \
+            echo "⚠️  Checksum for ${PACKAGE_NAME} not found in SHA256SUMS, skipping verification"; \
+        fi; \
+    else \
+        echo "⚠️  Checksums not available, skipping verification"; \
+    fi
 
 # Runtime stage
 FROM alpine:3.18
 
 # Set build arguments and labels
-ARG RELEASE
+ARG RELEASE=latest
 ARG BUILD_DATE
 ARG VCS_REF
 
