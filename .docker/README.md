@@ -7,11 +7,11 @@ This directory contains Docker configuration files and supporting infrastructure
 ```
 rustfs/
 ├── Dockerfile           # Production image (Alpine + GitHub Releases)
-├── Dockerfile.source    # Source build (Ubuntu + cross-compilation)
+├── Dockerfile.source    # Source build (Debian + cross-compilation)
 ├── cargo.config.toml    # Rust cargo configuration
+├── docker-buildx.sh     # Multi-architecture build script
 └── .docker/             # Supporting infrastructure
     ├── observability/   # Monitoring and observability configs
-    ├── nginx/           # Nginx reverse proxy configs
     ├── compose/         # Docker Compose configurations
     ├── mqtt/            # MQTT broker configs
     └── openobserve-otel/ # OpenObserve + OpenTelemetry configs
@@ -24,8 +24,8 @@ rustfs/
 | Image | Base OS | Build Method | Size | Use Case |
 |-------|---------|--------------|------|----------|
 | `production` (default) | Alpine 3.18 | GitHub Releases | Smallest | Production deployment |
-| `source` | Ubuntu 22.04 | Source build | Medium | Custom builds with cross-compilation |
-| `dev` | Ubuntu 22.04 | Development tools | Large | Interactive development |
+| `source` | Debian Bookworm | Source build | Medium | Custom builds with cross-compilation |
+| `dev` | Debian Bookworm | Development tools | Large | Interactive development |
 
 ## 🚀 Usage Examples
 
@@ -55,9 +55,10 @@ docker run rustfs/rustfs:beta            # Latest beta
 docker run rustfs/rustfs:rc              # Latest release candidate
 
 # Development Versions
-docker run rustfs/rustfs:dev             # Latest development
+docker run rustfs/rustfs:dev             # Latest main branch development
 docker run rustfs/rustfs:dev-13e4a0b     # Specific commit
-docker run rustfs/rustfs:latest-dev      # Development environment
+docker run rustfs/rustfs:dev-latest      # Latest development
+docker run rustfs/rustfs:main-latest     # Main branch latest
 ```
 
 ### Development Environment
@@ -73,7 +74,27 @@ docker build -f Dockerfile.source -t rustfs:custom .
 docker-compose up rustfs-dev
 ```
 
-## 🏗️ Build Arguments
+## 🏗️ Build Arguments and Scripts
+
+### Using docker-buildx.sh (Recommended)
+
+For multi-architecture builds, use the provided script:
+
+```bash
+# Build latest version for all architectures
+./docker-buildx.sh
+
+# Build and push to registry
+./docker-buildx.sh --push
+
+# Build specific version
+./docker-buildx.sh --release v1.2.3
+
+# Build and push specific version
+./docker-buildx.sh --release v1.2.3 --push
+```
+
+### Manual Docker Builds
 
 All images support dynamic version selection:
 
@@ -139,12 +160,38 @@ docker build -f Dockerfile.source -t rustfs:custom .
 docker run -it -v $(pwd):/workspace rustfs:custom bash
 ```
 
+## 🚀 CI/CD Integration
+
+The project uses GitHub Actions for automated multi-architecture Docker builds:
+
+### Automated Builds
+
+- **Tags**: Automatic builds triggered on version tags (e.g., `v1.2.3`)
+- **Main Branch**: Development builds with `dev-latest` and `main-latest` tags
+- **Pull Requests**: Test builds without registry push
+
+### Build Variants
+
+Each build creates three image variants:
+
+- `rustfs/rustfs:v1.2.3` (production - Alpine-based)
+- `rustfs/rustfs:v1.2.3-source` (source build - Debian-based)
+- `rustfs/rustfs:v1.2.3-dev` (development - Debian-based with tools)
+
+### Manual Builds
+
+Trigger custom builds via GitHub Actions:
+
+```bash
+# Use workflow_dispatch to build specific versions
+# Available options: latest, main-latest, dev-latest, v1.2.3, dev-abc123
+```
+
 ## 📦 Supporting Infrastructure
 
 The `.docker/` directory contains supporting configuration files:
 
 - **observability/** - Prometheus, Grafana, OpenTelemetry configs
-- **nginx/** - Reverse proxy and SSL configurations
 - **compose/** - Multi-service Docker Compose setups
 - **mqtt/** - MQTT broker configurations
 - **openobserve-otel/** - Log aggregation and tracing setup
