@@ -93,9 +93,45 @@ To get started with RustFS, follow these steps:
 
    > 💡 **Docker Build Options**: RustFS supports flexible Docker image versions. See our [Docker Build Guide](docs/DOCKER_BUILD_GUIDE.md) for advanced usage and manual build instructions.
 
-3. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
-4. **Create a Bucket**: Use the console to create a new bucket for your objects.
-5. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
+3. **Build from Source (Option 3) - Advanced Users**
+
+   For developers who want to build RustFS Docker images from source with multi-architecture support:
+
+   ```bash
+   # Install Docker Buildx (if not already installed)
+   docker buildx install
+
+   # Build multi-architecture images locally
+   ./docker-buildx.sh
+
+   # Build and push to registry
+   ./docker-buildx.sh --push
+
+   # Build specific version
+   ./docker-buildx.sh --release v1.0.0 --push
+
+   # Build for custom registry
+   ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
+   ```
+
+   The `docker-buildx.sh` script supports:
+   - **Multi-architecture builds**: `linux/amd64`, `linux/arm64`
+   - **Automatic version detection**: Uses git tags or commit hashes
+   - **Registry flexibility**: Supports Docker Hub, GitHub Container Registry, etc.
+   - **Build optimization**: Includes caching and parallel builds
+
+   You can also use Make targets for convenience:
+
+   ```bash
+   make docker-buildx                    # Build locally
+   make docker-buildx-push               # Build and push
+   make docker-buildx-version VERSION=v1.0.0  # Build specific version
+   make help-docker                      # Show all Docker-related commands
+   ```
+
+4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
+5. **Create a Bucket**: Use the console to create a new bucket for your objects.
+6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
 
 ## Documentation
 

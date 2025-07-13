@@ -5,7 +5,10 @@
 DOCKER_CLI ?= docker
 IMAGE_NAME ?= rustfs:v1.0.0
 CONTAINER_NAME ?= rustfs-dev
-DOCKERFILE_PATH = $(shell pwd)/.docker
+# Docker build configurations
+DOCKERFILE_PATH = $(shell pwd)
+DOCKERFILE_PRODUCTION = Dockerfile
+DOCKERFILE_SOURCE = Dockerfile.source
 
 # Code quality and formatting targets
 .PHONY: fmt
@@ -74,12 +77,12 @@ probe-e2e:
 # in target/rockylinux9.3/release/rustfs
 BUILD_OS ?= rockylinux9.3
 .PHONY: build
-build: ROCKYLINUX_BUILD_IMAGE_NAME = rustfs-$(BUILD_OS):v1
-build: ROCKYLINUX_BUILD_CONTAINER_NAME = rustfs-$(BUILD_OS)-build
+build: SOURCE_BUILD_IMAGE_NAME = rustfs-$(BUILD_OS):v1
+build: SOURCE_BUILD_CONTAINER_NAME = rustfs-$(BUILD_OS)-build
 build: BUILD_CMD = /root/.cargo/bin/cargo build --release --bin rustfs --target-dir /root/s3-rustfs/target/$(BUILD_OS)
 build:
-	$(DOCKER_CLI) build -t $(ROCKYLINUX_BUILD_IMAGE_NAME) -f $(DOCKERFILE_PATH)/Dockerfile.$(BUILD_OS) .
-	$(DOCKER_CLI) run --rm --name $(ROCKYLINUX_BUILD_CONTAINER_NAME) -v $(shell pwd):/root/s3-rustfs -it $(ROCKYLINUX_BUILD_IMAGE_NAME) $(BUILD_CMD)
+	$(DOCKER_CLI) build -t $(SOURCE_BUILD_IMAGE_NAME) -f $(DOCKERFILE_SOURCE) .
+	$(DOCKER_CLI) run --rm --name $(SOURCE_BUILD_CONTAINER_NAME) -v $(shell pwd):/root/s3-rustfs -it $(SOURCE_BUILD_IMAGE_NAME) $(BUILD_CMD)
 
 .PHONY: build-musl
 build-musl:
@@ -96,57 +99,55 @@ deploy-dev: build-musl
 	@echo "🚀 Deploying to dev server: $${IP}"
 	./scripts/dev_deploy.sh $${IP}
 
-# Multi-architecture Docker build targets
+# Multi-architecture Docker build targets (NEW: using docker-buildx.sh)
+.PHONY: docker-buildx
+docker-buildx:
+	@echo "🏗️ Building multi-architecture Docker images with buildx..."
+	./docker-buildx.sh
+
+.PHONY: docker-buildx-push
+docker-buildx-push:
+	@echo "🚀 Building and pushing multi-architecture Docker images with buildx..."
+	./docker-buildx.sh --push
+
+.PHONY: docker-buildx-version
+docker-buildx-version:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ 错误: 请指定版本, 例如: make docker-buildx-version VERSION=v1.0.0"; \
+		exit 1; \
+	fi
+	@echo "🏗️ Building multi-architecture Docker images (version: $(VERSION))..."
+	./docker-buildx.sh --release $(VERSION)
+
+.PHONY: docker-buildx-push-version
+docker-buildx-push-version:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ 错误: 请指定版本, 例如: make docker-buildx-push-version VERSION=v1.0.0"; \
+		exit 1; \
+	fi
+	@echo "🚀 Building and pushing multi-architecture Docker images (version: $(VERSION))..."
+	./docker-buildx.sh --release $(VERSION) --push
+
+# Legacy Docker build targets (DEPRECATED: use docker-buildx instead)
 .PHONY: docker-build-multiarch
 docker-build-multiarch:
-	@echo "🏗️ Building multi-architecture Docker images..."
+	@echo "⚠️  WARNING: This target is deprecated. Use 'make docker-buildx' instead."
 	./scripts/build-docker-multiarch.sh
 
 .PHONY: docker-build-multiarch-push
 docker-build-multiarch-push:
-	@echo "🚀 Building and pushing multi-architecture Docker images..."
+	@echo "⚠️  WARNING: This target is deprecated. Use 'make docker-buildx-push' instead."
 	./scripts/build-docker-multiarch.sh --push
 
-.PHONY: docker-build-multiarch-version
-docker-build-multiarch-version:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "❌ 错误: 请指定版本, 例如: make docker-build-multiarch-version VERSION=v1.0.0"; \
-		exit 1; \
-	fi
-	@echo "🏗️ Building multi-architecture Docker images (version: $(VERSION))..."
-	./scripts/build-docker-multiarch.sh --version $(VERSION)
+.PHONY: docker-build-production
+docker-build-production:
+	@echo "🏗️ Building production Docker image..."
+	$(DOCKER_CLI) build -f $(DOCKERFILE_PRODUCTION) -t rustfs:latest .
 
-.PHONY: docker-push-multiarch-version
-docker-push-multiarch-version:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "❌ 错误: 请指定版本, 例如: make docker-push-multiarch-version VERSION=v1.0.0"; \
-		exit 1; \
-	fi
-	@echo "🚀 Building and pushing multi-architecture Docker images (version: $(VERSION))..."
-	./scripts/build-docker-multiarch.sh --version $(VERSION) --push
-
-.PHONY: docker-build-ubuntu
-docker-build-ubuntu:
-	@echo "🏗️ Building multi-architecture Ubuntu Docker images..."
-	./scripts/build-docker-multiarch.sh --type ubuntu
-
-.PHONY: docker-build-rockylinux
-docker-build-rockylinux:
-	@echo "🏗️ Building multi-architecture RockyLinux Docker images..."
-	./scripts/build-docker-multiarch.sh --type rockylinux
-
-.PHONY: docker-build-devenv
-docker-build-devenv:
-	@echo "🏗️ Building multi-architecture development environment Docker images..."
-	./scripts/build-docker-multiarch.sh --type devenv
-
-.PHONY: docker-build-all-types
-docker-build-all-types:
-	@echo "🏗️ Building all multi-architecture Docker image types..."
-	./scripts/build-docker-multiarch.sh --type production
-	./scripts/build-docker-multiarch.sh --type ubuntu
-	./scripts/build-docker-multiarch.sh --type rockylinux
-	./scripts/build-docker-multiarch.sh --type devenv
+.PHONY: docker-build-source
+docker-build-source:
+	@echo "🏗️ Building source Docker image..."
+	$(DOCKER_CLI) build -f $(DOCKERFILE_SOURCE) -t rustfs:source .
 
 .PHONY: docker-inspect-multiarch
 docker-inspect-multiarch:
@@ -176,25 +177,27 @@ build-cross-all:
 help-docker:
 	@echo "🐳 Docker 多架构构建帮助："
 	@echo ""
-	@echo "基本构建:"
-	@echo "  make docker-build-multiarch              # 构建多架构镜像（不推送）"
-	@echo "  make docker-build-multiarch-push         # 构建并推送多架构镜像"
+	@echo "🚀 推荐使用 (新的 docker-buildx 方式):"
+	@echo "  make docker-buildx                       # 构建多架构镜像（不推送）"
+	@echo "  make docker-buildx-push                  # 构建并推送多架构镜像"
+	@echo "  make docker-buildx-version VERSION=v1.0.0        # 构建指定版本"
+	@echo "  make docker-buildx-push-version VERSION=v1.0.0   # 构建并推送指定版本"
 	@echo ""
-	@echo "版本构建:"
-	@echo "  make docker-build-multiarch-version VERSION=v1.0.0   # 构建指定版本"
-	@echo "  make docker-push-multiarch-version VERSION=v1.0.0    # 构建并推送指定版本"
+	@echo "🏗️ 单架构构建:"
+	@echo "  make docker-build-production             # 构建生产环境镜像"
+	@echo "  make docker-build-source                 # 构建源码构建镜像"
 	@echo ""
-	@echo "镜像类型:"
-	@echo "  make docker-build-ubuntu                 # 构建 Ubuntu 镜像"
-	@echo "  make docker-build-rockylinux             # 构建 RockyLinux 镜像"
-	@echo "  make docker-build-devenv                 # 构建开发环境镜像"
-	@echo "  make docker-build-all-types              # 构建所有类型镜像"
-	@echo ""
-	@echo "辅助工具:"
+	@echo "🔧 辅助工具:"
 	@echo "  make build-cross-all                     # 构建所有架构的二进制文件"
 	@echo "  make docker-inspect-multiarch IMAGE=xxx  # 检查镜像的架构支持"
 	@echo ""
-	@echo "环境变量 (在推送时需要设置):"
+	@echo "⚠️  已弃用 (保留兼容性):"
+	@echo "  make docker-build-multiarch              # 使用旧的构建脚本"
+	@echo "  make docker-build-multiarch-push         # 使用旧的构建脚本推送"
+	@echo ""
+	@echo "📋 环境变量 (在推送时需要设置):"
 	@echo "  DOCKERHUB_USERNAME    Docker Hub 用户名"
 	@echo "  DOCKERHUB_TOKEN       Docker Hub 访问令牌"
 	@echo "  GITHUB_TOKEN          GitHub 访问令牌"
+	@echo ""
+	@echo "💡 更多详情请参考项目根目录的 docker-buildx.sh 脚本"
