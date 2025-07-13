@@ -64,7 +64,37 @@ pub async fn start_http_server(
     let server_address = server_addr.to_string();
 
     // The listening address and port are obtained from the parameters
-    let listener = TcpListener::bind(server_address.clone()).await?;
+    // let listener = TcpListener::bind(server_address.clone()).await?;
+
+    // The listening address and port are obtained from the parameters
+    let listener = {
+        let mut server_addr = server_addr;
+        let mut socket = socket2::Socket::new(
+            socket2::Domain::for_address(server_addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+
+        if server_addr.is_ipv6() {
+            if let Err(e) = socket.set_only_v6(false) {
+                warn!("Failed to set IPV6_V6ONLY=false, falling back to IPv4-only: {}", e);
+                // Fallback to a new IPv4 socket if setting dual-stack fails.
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            }
+        }
+
+        // Common setup for both IPv4 and successful dual-stack IPv6
+        let backlog = get_listen_backlog();
+        socket.set_reuse_address(true)?;
+        // Set the socket to non-blocking before passing it to Tokio.
+        socket.set_nonblocking(true)?;
+        socket.bind(&server_addr.into())?;
+        socket.listen(backlog)?;
+        TcpListener::from_std(socket.into())?
+    };
+
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     debug!("Listening on: {}", local_addr);
@@ -425,5 +455,46 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     match req.metadata().get("authorization") {
         Some(t) if token == t => Ok(req),
         _ => Err(Status::unauthenticated("No valid auth token")),
+    }
+}
+
+/// Determines the listen backlog size.
+///
+/// It tries to read the system's maximum connection queue length (`somaxconn`).
+/// If reading fails, it falls back to a default value (e.g., 1024).
+/// This makes the backlog size adaptive to the system configuration.
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+
+    #[cfg(target_os = "linux")]
+    {
+        // For Linux, read from /proc/sys/net/core/somaxconn
+        match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+            Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
+            Err(_) => DEFAULT_BACKLOG,
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+    {
+        // For macOS and BSD variants, use sysctl
+        use sysctl::Sysctl;
+        match sysctl::Ctl::new("kern.ipc.somaxconn") {
+            Ok(ctl) => match ctl.value() {
+                Ok(sysctl::CtlValue::Int(val)) => val,
+                _ => DEFAULT_BACKLOG,
+            },
+            Err(_) => DEFAULT_BACKLOG,
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        // Fallback for Windows and other operating systems
+        DEFAULT_BACKLOG
     }
 }

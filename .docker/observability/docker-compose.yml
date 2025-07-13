@@ -13,6 +13,22 @@
 # limitations under the License.
 
 services:
+
+  tempo:
+    image: grafana/tempo:latest
+    #user: root # The container must be started with root to execute chown in the script
+    #entrypoint: [ "/etc/tempo/entrypoint.sh" ]  # Specify a custom entry point
+    command: [ "-config.file=/etc/tempo.yaml" ] # This is passed as a parameter to the entry point script
+    volumes:
+      - ./tempo-entrypoint.sh:/etc/tempo/entrypoint.sh # Mount entry point script
+      - ./tempo.yaml:/etc/tempo.yaml
+      - ./tempo-data:/var/tempo
+    ports:
+      - "3200:3200" # tempo
+      - "24317:4317" # otlp grpc
+    networks:
+      - otel-network
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.129.1
     environment:
@@ -20,13 +36,13 @@ services:
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
     ports:
-      - 1888:1888
-      - 8888:8888
-      - 8889:8889
-      - 13133:13133
-      - 4317:4317
-      - 4318:4318
-      - 55679:55679
+      - "1888:1888"
+      - "8888:8888"
+      - "8889:8889"
+      - "13133:13133"
+      - "4317:4317"
+      - "4318:4318"
+      - "55679:55679"
     networks:
       - otel-network
   jaeger:
@@ -64,6 +80,8 @@ services:
     image: grafana/grafana:12.0.2
     ports:
       - "3000:3000"  # Web UI
+    volumes:
+      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - TZ=Asia/Shanghai

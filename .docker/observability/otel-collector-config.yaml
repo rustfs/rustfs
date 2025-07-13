@@ -33,6 +33,10 @@ exporters:
     endpoint: "jaeger:4317"  # Jaeger 的 OTLP gRPC 端点
     tls:
       insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
+  otlp/tempo: # OTLP 导出器，用于跟踪数据
+    endpoint: "tempo:4317"  # tempo 的 OTLP gRPC 端点
+    tls:
+      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
   prometheus: # Prometheus 导出器，用于指标数据
     endpoint: "0.0.0.0:8889"  # Prometheus 刮取端点
     namespace: "rustfs"  # 指标前缀
@@ -53,7 +57,7 @@ service:
     traces:
       receivers: [ otlp ]
       processors: [ memory_limiter,batch ]
-      exporters: [ otlp/traces ]
+      exporters: [ otlp/traces,otlp/tempo ]
     metrics:
       receivers: [ otlp ]
       processors: [ batch ]
