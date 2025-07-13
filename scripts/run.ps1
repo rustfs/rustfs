@@ -15,12 +15,15 @@
 #>
 
 # Check if static files need to be downloaded
+# Check console static assets and download if needed
 if (-not (Test-Path .\rustfs\static\index.html)) {
-    Write-Host "Downloading rustfs-console-latest.zip"
-
-    Invoke-WebRequest -Uri "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -OutFile 'tempfile.zip'
-    Expand-Archive -Path 'tempfile.zip' -DestinationPath '.\rustfs\static' -Force
-    Remove-Item tempfile.zip
+    Write-Host "Console assets not found, downloading..."
+    # Use the unified build script to download console assets
+    # Note: For Windows, you may need to run this from WSL or use build-rustfs.sh directly
+    Write-Host "Please run: ./build-rustfs.sh --download-console"
+    Write-Host "Or manually ensure console assets are available in rustfs/static/"
+} else {
+    Write-Host "Console assets already available"
 }
 
 # Check if build should be skipped
