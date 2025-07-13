@@ -60,6 +60,9 @@ BINARY_NAME="rustfs"
 BUILD_TYPE="release"
 UPLOAD=false
 SIGN=false
+DOWNLOAD_CONSOLE=false
+FORCE_CONSOLE_UPDATE=false
+CONSOLE_VERSION="latest"
 
 # Print usage
 usage() {
@@ -75,12 +78,17 @@ usage() {
     echo "  --dev                      Build in dev mode"
     echo "  --upload                   Upload binaries after build"
     echo "  --sign                     Sign binaries after build"
+    echo "  --download-console         Download console static assets"
+    echo "  --force-console-update     Force update console assets even if they exist"
+    echo "  --console-version VERSION  Console version to download (default: latest)"
     echo "  -h, --help                 Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0                         # Build for current platform (typical CI usage)"
     echo "  $0 --dev                   # Development build"
     echo "  $0 --upload --sign         # Build, sign and upload (release CI)"
+    echo "  $0 --download-console      # Build with console static assets"
+    echo "  $0 --force-console-update  # Force update console assets"
     echo ""
     echo "Detected platform: $(detect_platform)"
     echo "CI Usage: Run this script on each platform's runner to build native binaries"
@@ -115,6 +123,98 @@ setup_rust_environment() {
         if ! command -v minisign &> /dev/null; then
             print_message $YELLOW "Installing minisign for binary signing..."
             cargo install minisign
+        fi
+    fi
+}
+
+# Download console static assets
+download_console_assets() {
+    local static_dir="rustfs/static"
+    local console_exists=false
+
+    # Check if console assets already exist
+    if [ -d "$static_dir" ] && [ -f "$static_dir/index.html" ]; then
+        console_exists=true
+        local static_size=$(du -sh "$static_dir" 2>/dev/null | cut -f1 || echo "unknown")
+        print_message $YELLOW "Console static assets already exist ($static_size)"
+    fi
+
+    # Determine if we need to download
+    local should_download=false
+    if [ "$DOWNLOAD_CONSOLE" = true ]; then
+        if [ "$console_exists" = false ]; then
+            print_message $BLUE "🎨 Console assets not found, downloading..."
+            should_download=true
+        elif [ "$FORCE_CONSOLE_UPDATE" = true ]; then
+            print_message $BLUE "🎨 Force updating console assets..."
+            should_download=true
+        else
+            print_message $GREEN "✅ Console assets already available, skipping download"
+        fi
+    else
+        if [ "$console_exists" = true ]; then
+            print_message $GREEN "✅ Using existing console assets"
+        else
+            print_message $YELLOW "⚠️  Console assets not found. Use --download-console to download them."
+        fi
+    fi
+
+    if [ "$should_download" = true ]; then
+        print_message $BLUE "📥 Downloading console static assets..."
+
+        # Create static directory
+        mkdir -p "$static_dir"
+
+        # Download from GitHub Releases (consistent with Docker build)
+        local download_url
+        if [ "$CONSOLE_VERSION" = "latest" ]; then
+            print_message $YELLOW "Getting latest console release info..."
+            # For now, use dl.rustfs.com as fallback until GitHub Releases includes console assets
+            download_url="https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip"
+        else
+            download_url="https://dl.rustfs.com/artifacts/console/rustfs-console-${CONSOLE_VERSION}.zip"
+        fi
+
+        print_message $YELLOW "Downloading from: $download_url"
+
+        # Download with retries
+        local temp_file="console-assets-temp.zip"
+        local download_success=false
+
+        for i in {1..3}; do
+            if curl -L "$download_url" -o "$temp_file" --retry 3 --retry-delay 5 --max-time 300; then
+                download_success=true
+                break
+            else
+                print_message $YELLOW "Download attempt $i failed, retrying..."
+                sleep 2
+            fi
+        done
+
+        if [ "$download_success" = true ]; then
+            # Verify the downloaded file
+            if [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
+                print_message $BLUE "📦 Extracting console assets..."
+
+                # Extract to static directory
+                if unzip -o "$temp_file" -d "$static_dir"; then
+                    rm "$temp_file"
+                    local final_size=$(du -sh "$static_dir" 2>/dev/null | cut -f1 || echo "unknown")
+                    print_message $GREEN "✅ Console assets downloaded successfully ($final_size)"
+                else
+                    print_message $RED "❌ Failed to extract console assets"
+                    rm -f "$temp_file"
+                    return 1
+                fi
+            else
+                print_message $RED "❌ Downloaded file is empty or invalid"
+                rm -f "$temp_file"
+                return 1
+            fi
+        else
+            print_message $RED "❌ Failed to download console assets after 3 attempts"
+            print_message $YELLOW "💡 Console assets are optional. Build will continue without them."
+            rm -f "$temp_file"
         fi
     fi
 }
@@ -205,10 +305,19 @@ build_rustfs() {
     print_message $YELLOW "   Build Type: $BUILD_TYPE"
     print_message $YELLOW "   Sign: $SIGN"
     print_message $YELLOW "   Upload: $UPLOAD"
+    print_message $YELLOW "   Download Console: $DOWNLOAD_CONSOLE"
+    if [ "$DOWNLOAD_CONSOLE" = true ]; then
+        print_message $YELLOW "   Console Version: $CONSOLE_VERSION"
+        print_message $YELLOW "   Force Console Update: $FORCE_CONSOLE_UPDATE"
+    fi
     echo ""
 
     # Setup environment
     setup_rust_environment
+    echo ""
+
+    # Download console assets if requested
+    download_console_assets
     echo ""
 
     # Build binary
@@ -252,6 +361,19 @@ while [[ $# -gt 0 ]]; do
         --sign)
             SIGN=true
             shift
+            ;;
+        --download-console)
+            DOWNLOAD_CONSOLE=true
+            shift
+            ;;
+        --force-console-update)
+            FORCE_CONSOLE_UPDATE=true
+            DOWNLOAD_CONSOLE=true  # Auto-enable download when forcing update
+            shift
+            ;;
+        --console-version)
+            CONSOLE_VERSION="$2"
+            shift 2
             ;;
         -h|--help)
             usage

@@ -12,4 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
+# Updated to use build-rustfs.sh for console assets download
+echo "🎨 Downloading console static assets..."
+echo "💡 This script now uses build-rustfs.sh for unified asset management."
+
+# Use the unified build script to download console assets
+./build-rustfs.sh --download-console --force-console-update
