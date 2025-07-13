@@ -63,6 +63,7 @@ WITH_CONSOLE=true
 FORCE_CONSOLE_UPDATE=false
 CONSOLE_VERSION="latest"
 SKIP_VERIFICATION=false
+CUSTOM_PLATFORM=""
 
 # Print usage
 usage() {
@@ -76,6 +77,7 @@ usage() {
     echo "Options:"
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
+    echo "  -p, --platform TARGET      Target platform (default: auto-detect)"
     echo "  --dev                      Build in dev mode"
     echo "  --sign                     Sign binaries after build"
     echo "  --with-console             Download console static assets (default)"
@@ -91,6 +93,7 @@ usage() {
     echo "  $0 --sign                  # Build and sign binary (release CI)"
     echo "  $0 --no-console            # Build without console static assets"
     echo "  $0 --force-console-update  # Force update console assets"
+    echo "  $0 --platform x86_64-unknown-linux-musl  # Build for specific platform"
     echo "  $0 --skip-verification     # Skip binary verification (for cross-compilation)"
     echo ""
     echo "Detected platform: $(detect_platform)"
@@ -281,8 +284,23 @@ build_binary() {
     # Create output directory
     mkdir -p "${OUTPUT_DIR}/${PLATFORM}"
 
-    # Build command - always use native cargo for current platform
+    # Build command - use cross for cross-compilation if needed
     local build_cmd="cargo build"
+    local current_platform=$(detect_platform)
+
+    # Check if we need cross-compilation
+    if [ "$PLATFORM" != "$current_platform" ]; then
+        # Check if cross is available
+        if command -v cross &> /dev/null; then
+            build_cmd="cross build"
+            print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
+        else
+            print_message $YELLOW "⚠️  Cross-compilation detected but 'cross' tool not found"
+            print_message $YELLOW "📦 Installing cross tool..."
+            cargo install cross --git https://github.com/cross-rs/cross
+            build_cmd="cross build"
+        fi
+    fi
 
     if [ "$BUILD_TYPE" = "release" ]; then
         build_cmd+=" --release"
@@ -326,6 +344,16 @@ build_binary() {
         print_message $GREEN "✅ Build completed successfully"
     else
         print_message $RED "❌ Failed to build for $PLATFORM"
+
+        # Provide helpful suggestions for cross-compilation failures
+        if [ "$PLATFORM" != "$(detect_platform)" ]; then
+            print_message $YELLOW "💡 Cross-compilation suggestions:"
+            print_message $YELLOW "   1. Use Docker build: make build-docker"
+            print_message $YELLOW "   2. Use GitHub Actions for multi-platform builds"
+            print_message $YELLOW "   3. Build natively on the target platform"
+            print_message $YELLOW "   4. Use 'make docker-buildx' for multi-arch Docker images"
+        fi
+
         return 1
     fi
 }
@@ -383,6 +411,10 @@ while [[ $# -gt 0 ]]; do
             BINARY_NAME="$2"
             shift 2
             ;;
+        -p|--platform)
+            CUSTOM_PLATFORM="$2"
+            shift 2
+            ;;
         --dev)
             BUILD_TYPE="debug"
             shift
@@ -433,6 +465,18 @@ main() {
     if [ ! -f "Cargo.toml" ]; then
         print_message $RED "❌ No Cargo.toml found. Are you in a Rust project directory?"
         exit 1
+    fi
+
+    # Override platform if specified
+    if [ -n "$CUSTOM_PLATFORM" ]; then
+        PLATFORM="$CUSTOM_PLATFORM"
+        print_message $YELLOW "🎯 Using specified platform: $PLATFORM"
+
+        # Auto-enable skip verification for cross-compilation
+        if [ "$PLATFORM" != "$(detect_platform)" ]; then
+            SKIP_VERIFICATION=true
+            print_message $YELLOW "⚠️  Cross-compilation detected, enabling --skip-verification"
+        fi
     fi
 
     # Start build process

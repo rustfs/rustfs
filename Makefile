@@ -70,29 +70,43 @@ e2e-server:
 probe-e2e:
 	sh $(shell pwd)/scripts/probe.sh
 
-# make BUILD_OS=ubuntu22.04 build
-# in target/ubuntu22.04/release/rustfs
-
-# make BUILD_OS=rockylinux9.3 build
-# in target/rockylinux9.3/release/rustfs
-BUILD_OS ?= rockylinux9.3
+# Native build using build-rustfs.sh script
 .PHONY: build
-build: SOURCE_BUILD_IMAGE_NAME = rustfs-$(BUILD_OS):v1
-build: SOURCE_BUILD_CONTAINER_NAME = rustfs-$(BUILD_OS)-build
-build: BUILD_CMD = /root/.cargo/bin/cargo build --release --bin rustfs --target-dir /root/s3-rustfs/target/$(BUILD_OS)
 build:
+	@echo "🔨 Building RustFS using build-rustfs.sh script..."
+	./build-rustfs.sh
+
+.PHONY: build-dev
+build-dev:
+	@echo "🔨 Building RustFS in development mode..."
+	./build-rustfs.sh --dev
+
+
+
+# Docker-based build (alternative approach)
+# Usage: make BUILD_OS=ubuntu22.04 build-docker
+# Output: target/ubuntu22.04/release/rustfs
+BUILD_OS ?= rockylinux9.3
+.PHONY: build-docker
+build-docker: SOURCE_BUILD_IMAGE_NAME = rustfs-$(BUILD_OS):v1
+build-docker: SOURCE_BUILD_CONTAINER_NAME = rustfs-$(BUILD_OS)-build
+build-docker: BUILD_CMD = /root/.cargo/bin/cargo build --release --bin rustfs --target-dir /root/s3-rustfs/target/$(BUILD_OS)
+build-docker:
+	@echo "🐳 Building RustFS using Docker ($(BUILD_OS))..."
 	$(DOCKER_CLI) build -t $(SOURCE_BUILD_IMAGE_NAME) -f $(DOCKERFILE_SOURCE) .
 	$(DOCKER_CLI) run --rm --name $(SOURCE_BUILD_CONTAINER_NAME) -v $(shell pwd):/root/s3-rustfs -it $(SOURCE_BUILD_IMAGE_NAME) $(BUILD_CMD)
 
 .PHONY: build-musl
 build-musl:
 	@echo "🔨 Building rustfs for x86_64-unknown-linux-musl..."
-	cargo build --target x86_64-unknown-linux-musl --bin rustfs -r
+	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-buildx' instead"
+	./build-rustfs.sh --platform x86_64-unknown-linux-musl
 
 .PHONY: build-gnu
 build-gnu:
 	@echo "🔨 Building rustfs for x86_64-unknown-linux-gnu..."
-	cargo build --target x86_64-unknown-linux-gnu --bin rustfs -r
+	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-buildx' instead"
+	./build-rustfs.sh --platform x86_64-unknown-linux-gnu
 
 .PHONY: deploy-dev
 deploy-dev: build-musl
@@ -128,16 +142,7 @@ docker-buildx-push-version:
 	@echo "🚀 Building and pushing multi-architecture Docker images (version: $(VERSION))..."
 	./docker-buildx.sh --release $(VERSION) --push
 
-# Legacy Docker build targets (DEPRECATED: use docker-buildx instead)
-.PHONY: docker-build-multiarch
-docker-build-multiarch:
-	@echo "⚠️  WARNING: This target is deprecated. Use 'make docker-buildx' instead."
-	./scripts/build-docker-multiarch.sh
 
-.PHONY: docker-build-multiarch-push
-docker-build-multiarch-push:
-	@echo "⚠️  WARNING: This target is deprecated. Use 'make docker-buildx-push' instead."
-	./scripts/build-docker-multiarch.sh --push
 
 .PHONY: docker-build-production
 docker-build-production:
@@ -161,17 +166,42 @@ docker-inspect-multiarch:
 .PHONY: build-cross-all
 build-cross-all:
 	@echo "🔧 Building all target architectures..."
-	@if ! command -v cross &> /dev/null; then \
-		echo "📦 Installing cross..."; \
-		cargo install cross; \
-	fi
+	@echo "💡 On macOS/Windows, use 'make docker-buildx' for reliable multi-arch builds"
 	@echo "🔨 Generating protobuf code..."
 	cargo run --bin gproto || true
 	@echo "🔨 Building x86_64-unknown-linux-musl..."
-	cargo build --release --target x86_64-unknown-linux-musl --bin rustfs
+	./build-rustfs.sh --platform x86_64-unknown-linux-musl
 	@echo "🔨 Building aarch64-unknown-linux-gnu..."
-	cross build --release --target aarch64-unknown-linux-gnu --bin rustfs
+	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
 	@echo "✅ All architectures built successfully!"
+
+.PHONY: help-build
+help-build:
+	@echo "🔨 RustFS 构建帮助："
+	@echo ""
+	@echo "🚀 本地构建 (推荐使用):"
+	@echo "  make build                               # 构建 RustFS 二进制文件 (默认包含 console)"
+	@echo "  make build-dev                           # 开发模式构建"
+	@echo "  make build-musl                          # 构建 musl 版本"
+	@echo "  make build-gnu                           # 构建 GNU 版本"
+	@echo ""
+	@echo "🐳 Docker 构建:"
+	@echo "  make build-docker                        # 使用 Docker 容器构建"
+	@echo "  make build-docker BUILD_OS=ubuntu22.04   # 指定构建系统"
+	@echo ""
+	@echo "🏗️ 跨架构构建:"
+	@echo "  make build-cross-all                     # 构建所有架构的二进制文件"
+	@echo ""
+	@echo "🔧 直接使用 build-rustfs.sh 脚本:"
+	@echo "  ./build-rustfs.sh --help                 # 查看脚本帮助"
+	@echo "  ./build-rustfs.sh --no-console           # 构建时跳过 console 资源"
+	@echo "  ./build-rustfs.sh --force-console-update # 强制更新 console 资源"
+	@echo "  ./build-rustfs.sh --dev                  # 开发模式构建"
+	@echo "  ./build-rustfs.sh --sign                 # 签名二进制文件"
+	@echo "  ./build-rustfs.sh --platform x86_64-unknown-linux-musl  # 指定目标平台"
+	@echo "  ./build-rustfs.sh --skip-verification    # 跳过二进制验证"
+	@echo ""
+	@echo "💡 build-rustfs.sh 脚本提供了更多选项、智能检测和二进制验证功能"
 
 .PHONY: help-docker
 help-docker:
@@ -190,10 +220,6 @@ help-docker:
 	@echo "🔧 辅助工具:"
 	@echo "  make build-cross-all                     # 构建所有架构的二进制文件"
 	@echo "  make docker-inspect-multiarch IMAGE=xxx  # 检查镜像的架构支持"
-	@echo ""
-	@echo "⚠️  已弃用 (保留兼容性):"
-	@echo "  make docker-build-multiarch              # 使用旧的构建脚本"
-	@echo "  make docker-build-multiarch-push         # 使用旧的构建脚本推送"
 	@echo ""
 	@echo "📋 环境变量 (在推送时需要设置):"
 	@echo "  DOCKERHUB_USERNAME    Docker Hub 用户名"
