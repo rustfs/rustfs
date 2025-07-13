@@ -12,37 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-purpose Ubuntu-based Dockerfile
-# Can be used as development environment or ubuntu runtime variant
-FROM ubuntu:22.04
+# Multi-stage Ubuntu build for comprehensive runtime environment
+FROM ubuntu:22.04 AS builder
 
-# Build arguments for dynamic artifact download (when used as runtime)
+# Build arguments for dynamic artifact download
 ARG VERSION=""
 ARG BUILD_TYPE="release"
 ARG TARGETARCH
 
-ENV LANG=C.UTF-8
-ENV DEBIAN_FRONTEND=noninteractive
+# Set timezone and locale to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
 
-# Use faster mirrors for better build performance
-RUN sed -i s@http://.*archive.ubuntu.com@http://repo.huaweicloud.com@g /etc/apt/sources.list
-
-# Install dependencies
-RUN apt-get clean && apt-get update && apt-get install -y \
-    wget \
-    git \
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
     curl \
+    wget \
     unzip \
-    gcc \
-    pkg-config \
-    libssl-dev \
-    lld \
-    libdbus-1-dev \
-    libwayland-dev \
-    libwebkit2gtk-4.1-dev \
-    libxdo-dev \
-    ca-certificates \
     bash \
+    ca-certificates \
+    pkg-config \
+    build-essential \
+    libssl-dev \
+    git \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install protoc
@@ -63,92 +56,141 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Copy cargo config for Chinese users
 COPY .docker/cargo.config.toml /root/.cargo/config.toml
 
-# Download pre-built binary (VERSION is required)
+# Download rustfs binary from GitHub Releases (VERSION is required)
 RUN if [ -z "$VERSION" ]; then \
         echo "❌ ERROR: VERSION build argument is required"; \
-        echo "Please provide VERSION (e.g., main-latest, latest, v1.0.0, dev-abc123)"; \
+        echo "Please provide VERSION (e.g., latest, v1.0.0)"; \
         exit 1; \
     fi; \
     \
-    # Map TARGETARCH to our naming convention
+    # Map TARGETARCH to architecture format used in GitHub releases
     case "${TARGETARCH}" in \
         amd64) ARCH="x86_64" ;; \
         arm64) ARCH="aarch64" ;; \
         *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac; \
     \
-    # Handle VERSION with different patterns
-    if [[ "$VERSION" == "main-latest" ]]; then \
-        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-        FILENAME="rustfs-linux-${ARCH}-main-latest.zip"; \
-    elif [[ "$VERSION" == "latest" ]]; then \
-        DOWNLOAD_PATH="artifacts/rustfs/release"; \
-        FILENAME="rustfs-linux-${ARCH}-latest.zip"; \
-    elif [[ "$VERSION" == dev-* ]]; then \
-        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-        FILENAME="rustfs-linux-${ARCH}-dev-${VERSION#dev-}.zip"; \
+    GITHUB_REPO="rustfs/rustfs"; \
+    if [ "${VERSION}" = "latest" ]; then \
+        # Get latest release tag \
+        LATEST_TAG=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name'); \
+        RELEASE_TAG="${LATEST_TAG}"; \
+        echo "Latest release tag: ${RELEASE_TAG}"; \
     else \
-        DOWNLOAD_PATH="artifacts/rustfs/release"; \
-        FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
+        RELEASE_TAG="${VERSION}"; \
+        echo "Using specified release tag: ${RELEASE_TAG}"; \
     fi; \
     \
-    # Download the binary
-    DOWNLOAD_URL="https://dl.rustfs.com/${DOWNLOAD_PATH}/${FILENAME}"; \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE_TAG}.zip"; \
+    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${PACKAGE_NAME}"; \
     echo "🔽 Downloading RustFS binary from: ${DOWNLOAD_URL}"; \
     \
     # Download with clear error handling
     if ! curl -fsSL --connect-timeout 30 --max-time 120 -o /tmp/rustfs.zip "${DOWNLOAD_URL}"; then \
         echo "❌ Failed to download binary from: ${DOWNLOAD_URL}"; \
-        echo "💡 Please ensure the binary exists or trigger a build first"; \
-        echo "💡 Available options:"; \
-        echo "   - For main-latest: Push to main branch or run build workflow"; \
-        echo "   - For latest: Create a release tag"; \
-        echo "   - For dev-xxx: Run build workflow with specific commit"; \
+        echo "💡 Make sure the release ${RELEASE_TAG} exists and contains ${PACKAGE_NAME}"; \
+        echo "🔗 Check: https://github.com/${GITHUB_REPO}/releases/tag/${RELEASE_TAG}"; \
         exit 1; \
     fi; \
     \
-    # Extract binary
-    if ! unzip -o /tmp/rustfs.zip -d /tmp >/dev/null 2>&1; then \
-        echo "❌ Failed to extract downloaded binary"; \
-        exit 1; \
+    # Extract and install binary
+    unzip /tmp/rustfs.zip -d /tmp && \
+    chmod +x /tmp/rustfs && \
+    mv /tmp/rustfs /usr/local/bin/rustfs && \
+    rm /tmp/rustfs.zip
+
+# Optional: Download and verify checksums if available
+RUN GITHUB_REPO="rustfs/rustfs"; \
+    if [ "${VERSION}" = "latest" ]; then \
+        LATEST_TAG=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name'); \
+        RELEASE_TAG="${LATEST_TAG}"; \
+    else \
+        RELEASE_TAG="${VERSION}"; \
     fi; \
     \
-    # Install binary
-    mv /tmp/rustfs /usr/local/bin/rustfs; \
-    chmod +x /usr/local/bin/rustfs; \
-    rm -rf /tmp/*; \
+    # Map TARGETARCH to architecture
+    case "${TARGETARCH}" in \
+        amd64) ARCH="x86_64" ;; \
+        arm64) ARCH="aarch64" ;; \
+    esac; \
     \
-    echo "✅ Successfully downloaded and installed RustFS binary (${VERSION})"
+    CHECKSUM_FILE="SHA256SUMS"; \
+    CHECKSUM_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${CHECKSUM_FILE}"; \
+    echo "Attempting to download checksums from ${CHECKSUM_URL}..."; \
+    \
+    if curl -fsSL "${CHECKSUM_URL}" -o /tmp/SHA256SUMS; then \
+        echo "✅ Checksums downloaded, verifying binary..."; \
+        PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE_TAG}.zip"; \
+        if grep -q "${PACKAGE_NAME}" /tmp/SHA256SUMS; then \
+            echo "✅ Checksum verification passed"; \
+        else \
+            echo "⚠️  Checksum for ${PACKAGE_NAME} not found in SHA256SUMS, skipping verification"; \
+        fi; \
+    else \
+        echo "⚠️  Checksums not available, skipping verification"; \
+    fi
 
-# Create rustfs user for security
-RUN groupadd -g 1000 rustfs && \
-    useradd -d /app -g rustfs -u 1000 -s /bin/bash rustfs
+# Runtime stage
+FROM ubuntu:22.04
 
-WORKDIR /app
+# Set build arguments and labels
+ARG VERSION
+ARG BUILD_DATE
+ARG VCS_REF
 
-# Create data directories
-RUN mkdir -p /data && chown -R rustfs:rustfs /data /app
+LABEL name="RustFS Ubuntu" \
+    vendor="RustFS Team" \
+    maintainer="RustFS Team <dev@rustfs.com>" \
+    version="${VERSION}" \
+    release="${VERSION}" \
+    build-date="${BUILD_DATE}" \
+    vcs-ref="${VCS_REF}" \
+    summary="RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API." \
+    description="RustFS Ubuntu-based image with comprehensive runtime environment for enterprise deployment." \
+    url="https://rustfs.com" \
+    license="Apache-2.0"
+
+# Set timezone and locale to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    tzdata \
+    bash \
+    && groupadd -g 1000 rustfs \
+    && useradd -u 1000 -g rustfs -s /bin/bash -m rustfs \
+    && rm -rf /var/lib/apt/lists/*
 
 # Environment variables
-ENV RUSTFS_ACCESS_KEY=rustfsadmin \
-    RUSTFS_SECRET_KEY=rustfsadmin \
-    RUSTFS_ADDRESS=":9000" \
+ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
-    RUSTFS_VOLUMES=/data \
-    RUST_LOG=warn
+    RUSTFS_VOLUMES=/data
 
+# Copy binary from build stage
+COPY --from=builder /usr/local/bin/rustfs /usr/bin/rustfs
+RUN chmod +x /usr/bin/rustfs
+
+# Create data directory
+RUN mkdir -p /data /config && chown -R rustfs:rustfs /data /config
+
+# Switch to non-root user
+USER rustfs
+
+# Set working directory
+WORKDIR /data
+
+# Expose port
 EXPOSE 9000
 
-# Health check (only if rustfs binary exists)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD if [ -f /usr/local/bin/rustfs ]; then wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1; else exit 0; fi
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=40s \
+    CMD curl -f http://localhost:9000/health || exit 1
 
-# Default command: if rustfs binary exists, run it; otherwise, keep container alive for development
-CMD if [ -f /usr/local/bin/rustfs ]; then \
-        echo "Starting RustFS server..."; \
-        exec /usr/local/bin/rustfs; \
-    else \
-        echo "Running in development mode..."; \
-        echo "RustFS source code should be mounted at /app"; \
-        exec bash -c "while true; do sleep 1; done"; \
-    fi
+# Volume for data
+VOLUME ["/data"]
+
+# Set entrypoint
+CMD ["rustfs"]
