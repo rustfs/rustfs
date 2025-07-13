@@ -109,14 +109,12 @@ RUN apk add --no-cache \
     && adduser -u 1000 -G rustfs -s /bin/sh -D rustfs
 
 # Environment variables
-ENV RUSTFS_ACCESS_KEY_FILE=access_key \
-    RUSTFS_SECRET_KEY_FILE=secret_key \
-    RUSTFS_ROOT_USER_FILE=access_key \
-    RUSTFS_ROOT_PASSWORD_FILE=secret_key \
-    RUSTFS_CONFIG_ENV_FILE=config.env \
+ENV RUSTFS_ACCESS_KEY=rustfsadmin \
+    RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
-    RUSTFS_VOLUMES=/data
+    RUSTFS_VOLUMES=/data \
+    RUST_LOG=warn
 
 # Set permissions for /usr/bin (similar to MinIO's approach)
 RUN chmod -R 777 /usr/bin

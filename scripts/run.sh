@@ -14,13 +14,11 @@
 # limitations under the License.
 
 
-# Check console static assets and download if needed
+# check ./rustfs/static/index.html not exists
 if [ ! -f ./rustfs/static/index.html ]; then
-    echo "Console assets not found, downloading..."
-    # Use the unified build script to download console assets
-    ./build-rustfs.sh --download-console
-else
-    echo "Console assets already available"
+    echo "Downloading rustfs-console-latest.zip"
+    # download rustfs-console-latest.zip do not show log
+    curl -s -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -q -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
 fi
 
 if [ -z "$SKIP_BUILD" ]; then

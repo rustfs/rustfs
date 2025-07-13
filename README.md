@@ -91,18 +91,13 @@ To get started with RustFS, follow these steps:
    docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:v1.0.0
    ```
 
-   > 💡 **Docker Build Options**: RustFS supports flexible Docker image versions. See our [Docker Build Guide](docs/DOCKER_BUILD_GUIDE.md) for advanced usage and manual build instructions.
-
 3. **Build from Source (Option 3) - Advanced Users**
 
    For developers who want to build RustFS Docker images from source with multi-architecture support:
 
    ```bash
-   # Install Docker Buildx (if not already installed)
-   docker buildx install
-
    # Build multi-architecture images locally
-   ./docker-buildx.sh
+   ./docker-buildx.sh --build-arg RELEASE=latest
 
    # Build and push to registry
    ./docker-buildx.sh --push
