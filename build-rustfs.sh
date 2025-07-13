@@ -55,37 +55,35 @@ detect_platform() {
 
 # Default values
 OUTPUT_DIR="target/release"
-PLATFORMS=($(detect_platform))  # Auto-detect current platform by default
+PLATFORM=$(detect_platform)  # Auto-detect current platform
 BINARY_NAME="rustfs"
 BUILD_TYPE="release"
-CROSS_COMPILE=false
 UPLOAD=false
 SIGN=false
-ALL_PLATFORMS=false
 
 # Print usage
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
+    echo "Description:"
+    echo "  Build RustFS binary for the current platform. Designed for CI/CD pipelines"
+    echo "  where different runners build platform-specific binaries natively."
+    echo ""
     echo "Options:"
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
-    echo "  -p, --platform PLATFORM   Target platform (default: auto-detect current)"
     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
     echo "  --dev                      Build in dev mode"
-    echo "  --cross                    Use cross compilation"
-    echo "  --all-platforms            Build for all supported platforms (Linux musl)"
     echo "  --upload                   Upload binaries after build"
     echo "  --sign                     Sign binaries after build"
     echo "  -h, --help                 Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                         # Build for current platform (auto-detected)"
-    echo "  $0 --all-platforms         # Build for all supported platforms"
-    echo "  $0 --cross                 # Build using cross compilation"
-    echo "  $0 --upload --sign         # Build, sign and upload binaries"
-    echo "  $0 -p x86_64-unknown-linux-musl  # Build for specific platform"
+    echo "  $0                         # Build for current platform (typical CI usage)"
+    echo "  $0 --dev                   # Development build"
+    echo "  $0 --upload --sign         # Build, sign and upload (release CI)"
     echo ""
     echo "Detected platform: $(detect_platform)"
+    echo "CI Usage: Run this script on each platform's runner to build native binaries"
 }
 
 # Print colored message
@@ -108,29 +106,9 @@ get_version() {
 setup_rust_environment() {
     print_message $BLUE "🔧 Setting up Rust environment..."
 
-    # Check if cross compilation is needed
-    local current_platform=$(detect_platform)
-    local needs_cross=false
-
-    # Install required targets
-    for platform in "${PLATFORMS[@]}"; do
-        print_message $YELLOW "Installing target: $platform"
-        rustup target add "$platform"
-
-        # Check if any platform requires cross compilation
-        if [ "$platform" != "$current_platform" ]; then
-            needs_cross=true
-        fi
-    done
-
-    # Auto-enable cross compilation if building for multiple platforms or different platform
-    if [ "$ALL_PLATFORMS" = true ] || [ "$needs_cross" = true ] || [ "$CROSS_COMPILE" = true ]; then
-        CROSS_COMPILE=true
-        if ! command -v cross &> /dev/null; then
-            print_message $YELLOW "Installing cross compilation tool..."
-            cargo install cross
-        fi
-    fi
+    # Install required target for current platform
+    print_message $YELLOW "Installing target: $PLATFORM"
+    rustup target add "$PLATFORM"
 
     # Install required tools
     if [ "$SIGN" = true ]; then
@@ -141,100 +119,90 @@ setup_rust_environment() {
     fi
 }
 
-# Build for specific platform
-build_for_platform() {
-    local platform=$1
+# Build binary for current platform
+build_binary() {
     local version=$(get_version)
-    local output_file="${OUTPUT_DIR}/${platform}/${BINARY_NAME}"
+    local output_file="${OUTPUT_DIR}/${PLATFORM}/${BINARY_NAME}"
 
-    print_message $BLUE "🏗️  Building for platform: $platform"
+    print_message $BLUE "🏗️  Building for platform: $PLATFORM"
     print_message $YELLOW "   Version: $version"
     print_message $YELLOW "   Output: $output_file"
 
     # Create output directory
-    mkdir -p "${OUTPUT_DIR}/${platform}"
+    mkdir -p "${OUTPUT_DIR}/${PLATFORM}"
 
-    # Build command
-    local build_cmd=""
-    if [ "$CROSS_COMPILE" = true ]; then
-        build_cmd="cross build"
-    else
-        build_cmd="cargo build"
-    fi
+    # Build command - always use native cargo for current platform
+    local build_cmd="cargo build"
 
     if [ "$BUILD_TYPE" = "release" ]; then
         build_cmd+=" --release"
     fi
 
-    build_cmd+=" --target $platform"
+    build_cmd+=" --target $PLATFORM"
     build_cmd+=" --bin $BINARY_NAME"
 
     print_message $BLUE "📦 Executing: $build_cmd"
 
     # Execute build
     if eval $build_cmd; then
-        print_message $GREEN "✅ Successfully built for $platform"
+        print_message $GREEN "✅ Successfully built for $PLATFORM"
 
         # Copy binary to output directory
-        cp "target/${platform}/${BUILD_TYPE}/${BINARY_NAME}" "$output_file"
+        cp "target/${PLATFORM}/${BUILD_TYPE}/${BINARY_NAME}" "$output_file"
 
         # Generate checksums
         print_message $BLUE "🔐 Generating checksums..."
-        (cd "${OUTPUT_DIR}/${platform}" && sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256sum")
+        (cd "${OUTPUT_DIR}/${PLATFORM}" && sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256sum")
 
         # Sign binary if requested
         if [ "$SIGN" = true ]; then
             print_message $BLUE "✍️  Signing binary..."
-            (cd "${OUTPUT_DIR}/${platform}" && minisign -S -m "${BINARY_NAME}" -s ~/.minisign/minisign.key)
+            (cd "${OUTPUT_DIR}/${PLATFORM}" && minisign -S -m "${BINARY_NAME}" -s ~/.minisign/minisign.key)
         fi
 
-        print_message $GREEN "✅ Platform $platform completed successfully"
+        print_message $GREEN "✅ Build completed successfully"
     else
-        print_message $RED "❌ Failed to build for $platform"
+        print_message $RED "❌ Failed to build for $PLATFORM"
         return 1
     fi
 }
 
-# Upload binaries
-upload_binaries() {
+# Upload binary
+upload_binary() {
     local version=$(get_version)
+    local binary_dir="${OUTPUT_DIR}/${PLATFORM}"
 
-    print_message $BLUE "📤 Uploading binaries..."
+    print_message $BLUE "📤 Uploading binary for $PLATFORM..."
 
-    for platform in "${PLATFORMS[@]}"; do
-        local binary_dir="${OUTPUT_DIR}/${platform}"
+    if [ -f "${binary_dir}/${BINARY_NAME}" ]; then
+        print_message $YELLOW "Uploading $PLATFORM binary..."
 
-        if [ -f "${binary_dir}/${BINARY_NAME}" ]; then
-            print_message $YELLOW "Uploading $platform binaries..."
+        # Example upload command - customize based on your storage
+        # aws s3 cp "${binary_dir}/${BINARY_NAME}" "s3://releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}"
+        # aws s3 cp "${binary_dir}/${BINARY_NAME}.sha256sum" "s3://releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}.sha256sum"
 
-            # Example upload command - customize based on your storage
-            # aws s3 cp "${binary_dir}/${BINARY_NAME}" "s3://releases.rustfs.com/server/rustfs/release/${platform}/archive/rustfs.${version}"
-            # aws s3 cp "${binary_dir}/${BINARY_NAME}.sha256sum" "s3://releases.rustfs.com/server/rustfs/release/${platform}/archive/rustfs.${version}.sha256sum"
+        # For now, just show what would be uploaded
+        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}"
+        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}.sha256sum"
 
-            # For now, just show what would be uploaded
-            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> releases.rustfs.com/server/rustfs/release/${platform}/archive/rustfs.${version}"
-            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> releases.rustfs.com/server/rustfs/release/${platform}/archive/rustfs.${version}.sha256sum"
-
-            if [ "$SIGN" = true ] && [ -f "${binary_dir}/${BINARY_NAME}.minisig" ]; then
-                print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> releases.rustfs.com/server/rustfs/release/${platform}/archive/rustfs.${version}.minisig"
-            fi
+        if [ "$SIGN" = true ] && [ -f "${binary_dir}/${BINARY_NAME}.minisig" ]; then
+            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> releases.rustfs.com/server/rustfs/release/${PLATFORM}/archive/rustfs.${version}.minisig"
         fi
-    done
+    else
+        print_message $RED "❌ Binary not found: ${binary_dir}/${BINARY_NAME}"
+        return 1
+    fi
 }
 
 # Main build function
-build_binaries() {
+build_rustfs() {
     local version=$(get_version)
-    local current_platform=$(detect_platform)
 
     print_message $BLUE "🚀 Starting RustFS binary build process..."
     print_message $YELLOW "   Version: $version"
-    print_message $YELLOW "   Current Platform: $current_platform"
-    print_message $YELLOW "   Target Platforms: ${PLATFORMS[*]}"
+    print_message $YELLOW "   Platform: $PLATFORM"
     print_message $YELLOW "   Output Directory: $OUTPUT_DIR"
     print_message $YELLOW "   Build Type: $BUILD_TYPE"
-    print_message $YELLOW "   Cross Compile: $CROSS_COMPILE"
-    print_message $YELLOW "   All Platforms: $ALL_PLATFORMS"
     print_message $YELLOW "   Sign: $SIGN"
     print_message $YELLOW "   Upload: $UPLOAD"
     echo ""
@@ -243,28 +211,23 @@ build_binaries() {
     setup_rust_environment
     echo ""
 
-    # Build for each platform
-    for platform in "${PLATFORMS[@]}"; do
-        build_for_platform "$platform"
-        echo ""
-    done
+    # Build binary
+    build_binary
+    echo ""
 
     # Upload if requested
     if [ "$UPLOAD" = true ]; then
-        upload_binaries
+        upload_binary
     fi
 
     print_message $GREEN "🎉 Build process completed successfully!"
 
-    # Show built binaries
-    print_message $BLUE "📋 Built binaries:"
-    for platform in "${PLATFORMS[@]}"; do
-        local binary_file="${OUTPUT_DIR}/${platform}/${BINARY_NAME}"
-        if [ -f "$binary_file" ]; then
-            local size=$(ls -lh "$binary_file" | awk '{print $5}')
-            print_message $YELLOW "   $platform: $binary_file ($size)"
-        fi
-    done
+    # Show built binary
+    local binary_file="${OUTPUT_DIR}/${PLATFORM}/${BINARY_NAME}"
+    if [ -f "$binary_file" ]; then
+        local size=$(ls -lh "$binary_file" | awk '{print $5}')
+        print_message $BLUE "📋 Built binary: $binary_file ($size)"
+    fi
 }
 
 # Parse command line arguments
@@ -274,26 +237,12 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
-        -p|--platform)
-            # Parse comma-separated platforms
-            IFS=',' read -ra PLATFORMS <<< "$2"
-            shift 2
-            ;;
         -b|--binary-name)
             BINARY_NAME="$2"
             shift 2
             ;;
         --dev)
             BUILD_TYPE="dev"
-            shift
-            ;;
-        --cross)
-            CROSS_COMPILE=true
-            shift
-            ;;
-        --all-platforms)
-            ALL_PLATFORMS=true
-            PLATFORMS=("x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl")
             shift
             ;;
         --upload)
@@ -328,7 +277,7 @@ main() {
     fi
 
     # Start build process
-    build_binaries
+    build_rustfs
 }
 
 # Run main function
