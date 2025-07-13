@@ -223,17 +223,11 @@ jobs:
           - name: production
             dockerfile: Dockerfile
             platforms: linux/amd64,linux/arm64
-          - name: alpine
-            dockerfile: .docker/alpine/Dockerfile.prebuild
+          - name: source
+            dockerfile: Dockerfile.source
             platforms: linux/amd64,linux/arm64
-          - name: alpine-source
-            dockerfile: .docker/alpine/Dockerfile.source
-            platforms: linux/amd64,linux/arm64
-          - name: ubuntu
-            dockerfile: .docker/ubuntu/Dockerfile.prebuild
-            platforms: linux/amd64,linux/arm64
-          - name: ubuntu-source
-            dockerfile: .docker/ubuntu/Dockerfile.source
+          - name: dev
+            dockerfile: Dockerfile.dev
             platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout repository

@@ -67,7 +67,7 @@ RUN /root/.cargo/bin/cargo install \
     cargo-outdated
 
 # Copy cargo config for Chinese users
-COPY .docker/cargo.config.toml /root/.cargo/config.toml
+COPY cargo.config.toml /root/.cargo/config.toml
 
 # Create development user
 RUN groupadd -g 1000 rustfs && \

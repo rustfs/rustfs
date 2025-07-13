@@ -1,0 +1,55 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build optimization settings
+[build]
+# Use all available CPU cores for parallel compilation
+jobs = 0  # 0 = use all cores
+
+[target.x86_64-unknown-linux-musl]
+# Use lld linker for faster linking
+linker = "lld"
+
+[target.x86_64-unknown-linux-gnu]
+# Use lld linker for faster linking
+linker = "lld"
+
+[target.aarch64-unknown-linux-gnu]
+# Use lld linker for faster linking
+linker = "lld"
+
+[profile.release]
+# Optimize for size and speed
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev]
+# Faster incremental builds during development
+incremental = true
+debug = true
+
+[registry]
+# Use sparse registry protocol for faster dependency resolution
+default = "sparse+https://index.crates.io/"
+
+[source.crates-io]
+# Use sparse registry protocol
+replace-with = "sparse+https://index.crates.io/"
+
+[net]
+# Use git CLI for better performance with private repos
+git-fetch-with-cli = true
