@@ -81,7 +81,6 @@ serde_json.workspace = true
 serde_urlencoded = { workspace = true }
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
 socket2 = { workspace = true }
-sysctl = { workspace = true }
 thiserror = { workspace = true }
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
@@ -107,6 +106,9 @@ tower-http = { workspace = true, features = [
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+sysctl = { workspace = true }
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
