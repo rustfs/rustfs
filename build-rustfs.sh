@@ -182,11 +182,11 @@ upload_binary() {
         # aws s3 cp "${binary_dir}/${BINARY_NAME}.sha256sum" "s3://dl.rustfs.com/release/rustfs.${version}.sha256sum"
 
         # For now, just show what would be uploaded
-        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> dl.rustfs.com/release/rustfs.${version}"
-        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> dl.rustfs.com/release/rustfs.${version}.sha256sum"
+        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME} -> dl.rustfs.com/artifacts/rustfs/release/rustfs.${version}"
+        print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.sha256sum -> dl.rustfs.com/artifacts/rustfs/release/rustfs.${version}.sha256sum"
 
         if [ "$SIGN" = true ] && [ -f "${binary_dir}/${BINARY_NAME}.minisig" ]; then
-            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> dl.rustfs.com/release/rustfs.${version}.minisig"
+            print_message $BLUE "Would upload: ${binary_dir}/${BINARY_NAME}.minisig -> dl.rustfs.com/artifacts/rustfs/release/rustfs.${version}.minisig"
         fi
     else
         print_message $RED "❌ Binary not found: ${binary_dir}/${BINARY_NAME}"

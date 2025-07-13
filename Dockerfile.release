@@ -26,7 +26,7 @@ RUN case "${TARGETARCH}" in \
 
 # Download rustfs binary package from dl.rustfs.com (release version)
 RUN . /build/arch.env && \
-    DOWNLOAD_BASE_URL="https://dl.rustfs.com/release" && \
+    DOWNLOAD_BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
     if [ -z "${RELEASE}" ] || [ "${RELEASE}" = "latest" ]; then \
         PACKAGE_NAME="rustfs-linux-${ARCH}-latest.zip"; \
     else \

@@ -26,7 +26,7 @@ RUN case "${TARGETARCH}" in \
 
 # Download rustfs binary package from dl.rustfs.com
 RUN . /build/arch.env && \
-    DOWNLOAD_BASE_URL="https://dl.rustfs.com/dev" && \
+    DOWNLOAD_BASE_URL="https://dl.rustfs.com/artifacts/rustfs/dev" && \
     PACKAGE_NAME="rustfs-linux-${ARCH}-dev-latest.zip" && \
     echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_BASE_URL}..." && \
     curl -s -q "${DOWNLOAD_BASE_URL}/${PACKAGE_NAME}" -o /build/rustfs.zip && \
