@@ -12,14 +12,56 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Auto-detect current platform
+detect_platform() {
+    local arch=$(uname -m)
+    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+    case "$os" in
+        "linux")
+            case "$arch" in
+                "x86_64")
+                    echo "x86_64-unknown-linux-musl"
+                    ;;
+                "aarch64"|"arm64")
+                    echo "aarch64-unknown-linux-musl"
+                    ;;
+                "armv7l")
+                    echo "armv7-unknown-linux-musleabihf"
+                    ;;
+                *)
+                    echo "unknown-platform"
+                    ;;
+            esac
+            ;;
+        "darwin")
+            case "$arch" in
+                "x86_64")
+                    echo "x86_64-apple-darwin"
+                    ;;
+                "arm64"|"aarch64")
+                    echo "aarch64-apple-darwin"
+                    ;;
+                *)
+                    echo "unknown-platform"
+                    ;;
+            esac
+            ;;
+        *)
+            echo "unknown-platform"
+            ;;
+    esac
+}
+
 # Default values
 OUTPUT_DIR="target/release"
-PLATFORMS=("x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl")
+PLATFORMS=($(detect_platform))  # Auto-detect current platform by default
 BINARY_NAME="rustfs"
 BUILD_TYPE="release"
 CROSS_COMPILE=false
 UPLOAD=false
 SIGN=false
+ALL_PLATFORMS=false
 
 # Print usage
 usage() {
@@ -27,19 +69,23 @@ usage() {
     echo ""
     echo "Options:"
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
-    echo "  -p, --platform PLATFORM   Target platform (default: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl)"
+    echo "  -p, --platform PLATFORM   Target platform (default: auto-detect current)"
     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
     echo "  --dev                      Build in dev mode"
     echo "  --cross                    Use cross compilation"
+    echo "  --all-platforms            Build for all supported platforms (Linux musl)"
     echo "  --upload                   Upload binaries after build"
     echo "  --sign                     Sign binaries after build"
     echo "  -h, --help                 Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                         # Build for default platforms"
+    echo "  $0                         # Build for current platform (auto-detected)"
+    echo "  $0 --all-platforms         # Build for all supported platforms"
     echo "  $0 --cross                 # Build using cross compilation"
     echo "  $0 --upload --sign         # Build, sign and upload binaries"
     echo "  $0 -p x86_64-unknown-linux-musl  # Build for specific platform"
+    echo ""
+    echo "Detected platform: $(detect_platform)"
 }
 
 # Print colored message
@@ -62,14 +108,24 @@ get_version() {
 setup_rust_environment() {
     print_message $BLUE "🔧 Setting up Rust environment..."
 
+    # Check if cross compilation is needed
+    local current_platform=$(detect_platform)
+    local needs_cross=false
+
     # Install required targets
     for platform in "${PLATFORMS[@]}"; do
         print_message $YELLOW "Installing target: $platform"
         rustup target add "$platform"
+
+        # Check if any platform requires cross compilation
+        if [ "$platform" != "$current_platform" ]; then
+            needs_cross=true
+        fi
     done
 
-    # Install cross if needed
-    if [ "$CROSS_COMPILE" = true ]; then
+    # Auto-enable cross compilation if building for multiple platforms or different platform
+    if [ "$ALL_PLATFORMS" = true ] || [ "$needs_cross" = true ] || [ "$CROSS_COMPILE" = true ]; then
+        CROSS_COMPILE=true
         if ! command -v cross &> /dev/null; then
             print_message $YELLOW "Installing cross compilation tool..."
             cargo install cross
@@ -169,13 +225,16 @@ upload_binaries() {
 # Main build function
 build_binaries() {
     local version=$(get_version)
+    local current_platform=$(detect_platform)
 
     print_message $BLUE "🚀 Starting RustFS binary build process..."
     print_message $YELLOW "   Version: $version"
-    print_message $YELLOW "   Platforms: ${PLATFORMS[*]}"
+    print_message $YELLOW "   Current Platform: $current_platform"
+    print_message $YELLOW "   Target Platforms: ${PLATFORMS[*]}"
     print_message $YELLOW "   Output Directory: $OUTPUT_DIR"
     print_message $YELLOW "   Build Type: $BUILD_TYPE"
     print_message $YELLOW "   Cross Compile: $CROSS_COMPILE"
+    print_message $YELLOW "   All Platforms: $ALL_PLATFORMS"
     print_message $YELLOW "   Sign: $SIGN"
     print_message $YELLOW "   Upload: $UPLOAD"
     echo ""
@@ -230,6 +289,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --cross)
             CROSS_COMPILE=true
+            shift
+            ;;
+        --all-platforms)
+            ALL_PLATFORMS=true
+            PLATFORMS=("x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl")
             shift
             ;;
         --upload)
