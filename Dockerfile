@@ -123,9 +123,8 @@ RUN chmod -R 777 /usr/bin
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/
 
-# Copy entrypoint script
-COPY scripts/scripts/entrypoint.sh /usr/bin/entrypoint.sh
-RUN chmod +x /usr/bin/entrypoint.sh /usr/bin/rustfs
+# Set executable permissions
+RUN chmod +x /usr/bin/rustfs
 
 # Create data directory
 RUN mkdir -p /data /config && chown -R rustfs:rustfs /data /config
@@ -147,5 +146,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=40s \
 VOLUME ["/data"]
 
 # Set entrypoint
-ENTRYPOINT ["/usr/bin/entrypoint.sh"]
-CMD ["rustfs"]
+ENTRYPOINT ["/usr/bin/rustfs"]
