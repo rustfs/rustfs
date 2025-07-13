@@ -6,7 +6,6 @@ DOCKER_CLI ?= docker
 IMAGE_NAME ?= rustfs:v1.0.0
 CONTAINER_NAME ?= rustfs-dev
 # Docker build configurations
-DOCKERFILE_PATH = $(shell pwd)
 DOCKERFILE_PRODUCTION = Dockerfile
 DOCKERFILE_SOURCE = Dockerfile.source
 
