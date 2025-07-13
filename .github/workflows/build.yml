@@ -146,8 +146,6 @@ jobs:
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    env:
-      RUSTFLAGS: ${{ matrix.cross == 'false' && '-C target-cpu=native' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -155,29 +153,23 @@ jobs:
           # Linux builds
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            cross: false
             platform: linux
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            cross: true
             platform: linux
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
-            cross: false
             platform: macos
           - os: macos-latest
             target: x86_64-apple-darwin
-            cross: false
             platform: macos
           # # Windows builds (temporarily disabled)
           # - os: windows-latest
           #   target: x86_64-pc-windows-msvc
-          #   cross: false
           #   platform: windows
           # - os: windows-latest
           #   target: aarch64-pc-windows-msvc
-          #   cross: true
           #   platform: windows
     steps:
       - name: Checkout repository
@@ -193,31 +185,11 @@ jobs:
           cache-shared-key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
-          install-cross-tools: ${{ matrix.cross }}
 
-      - name: Verify console static assets
+      - name: Build RustFS using build-rustfs.sh
         run: |
-          # Console static assets are already embedded in the repository
-          echo "Console static assets size: $(du -sh rustfs/static/)"
-          echo "Console static assets are embedded via rust-embed, no external download needed"
-
-      - name: Build RustFS
-        run: |
-          # Force rebuild by touching build.rs
-          touch rustfs/build.rs
-
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              # Use cross for Windows ARM64
-              cargo install cross --git https://github.com/cross-rs/cross
-              cross build --release --target ${{ matrix.target }} -p rustfs --bins
-            else
-              # Use zigbuild for Linux ARM64
-              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
-            fi
-          else
-            cargo build --release --target ${{ matrix.target }} -p rustfs --bins
-          fi
+          # Use unified build script for consistent builds
+          ./build-rustfs.sh --platform ${{ matrix.target }}
 
       - name: Create release package
         id: package
@@ -264,7 +236,8 @@ jobs:
             fi
           fi
 
-          cd target/${{ matrix.target }}/release
+          # build-rustfs.sh outputs to target/release/${platform}/rustfs
+          cd target/release/${{ matrix.target }}
           zip "../../../${PACKAGE_NAME}.zip" rustfs
           cd ../../..
 
