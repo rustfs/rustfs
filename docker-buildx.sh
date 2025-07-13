@@ -161,6 +161,7 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build release variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
+<<<<<<< Updated upstream
         print_message $YELLOW "   https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/release/rustfs-linux-x86_64-v$version.zip"
         print_message $YELLOW "   https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/release/rustfs-linux-aarch64-v$version.zip"
         exit 1
