@@ -10,29 +10,42 @@ RUN apk add --no-cache \
     ca-certificates \
     curl \
     bash \
-    wget
+    wget \
+    unzip
 
 # Create build directory
 WORKDIR /build
 
-# Download rustfs binary and signature files
-RUN curl -s -q "https://releases.rustfs.com/server/rustfs/release/linux-${TARGETARCH}/archive/rustfs.${RELEASE}" -o /build/rustfs && \
-    curl -s -q "https://releases.rustfs.com/server/rustfs/release/linux-${TARGETARCH}/archive/rustfs.${RELEASE}.minisig" -o /build/rustfs.minisig && \
-    curl -s -q "https://releases.rustfs.com/server/rustfs/release/linux-${TARGETARCH}/archive/rustfs.${RELEASE}.sha256sum" -o /build/rustfs.sha256sum && \
-    chmod +x /build/rustfs
+# Map TARGETARCH to architecture format used in OSS
+RUN case "${TARGETARCH}" in \
+        "amd64") ARCH="x86_64" ;; \
+        "arm64") ARCH="aarch64" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    echo "ARCH=${ARCH}" > /build/arch.env
 
-# Install minisign for signature verification
+# Download rustfs binary package from Aliyun OSS
+RUN . /build/arch.env && \
+    OSS_BASE_URL="https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/dev" && \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-dev-latest.zip" && \
+    echo "Downloading ${PACKAGE_NAME} from ${OSS_BASE_URL}..." && \
+    curl -s -q "${OSS_BASE_URL}/${PACKAGE_NAME}" -o /build/rustfs.zip && \
+    unzip /build/rustfs.zip -d /build && \
+    chmod +x /build/rustfs && \
+    rm /build/rustfs.zip
+
+# Install minisign for signature verification (optional, for future use)
 RUN wget -O /tmp/minisign.tar.gz "https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz" && \
     tar -xzf /tmp/minisign.tar.gz -C /tmp && \
     mv /tmp/minisign-linux/x86_64/minisign /usr/local/bin/minisign && \
     chmod +x /usr/local/bin/minisign && \
     rm -rf /tmp/minisign*
 
-# Verify binary signature using public key (replace with actual RustFS public key)
+# Verify binary signature using public key (disabled for now, enable when signatures are available)
 # RUN minisign -Vqm /build/rustfs -x /build/rustfs.minisig -P "YOUR_PUBLIC_KEY_HERE"
 
-# Verify checksums
-RUN cd /build && sha256sum -c rustfs.sha256sum
+# Verify checksums (disabled for now, enable when checksums are available)
+# RUN cd /build && sha256sum -c rustfs.sha256sum
 
 # Runtime stage
 FROM alpine:3.18
@@ -78,7 +91,7 @@ RUN chmod -R 777 /usr/bin
 
 # Copy CA certificates and binaries from build stage
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /build/rustfs* /usr/bin/
+COPY --from=build /build/rustfs /usr/bin/
 
 # Copy entrypoint script
 COPY scripts/scripts/entrypoint.sh /usr/bin/entrypoint.sh

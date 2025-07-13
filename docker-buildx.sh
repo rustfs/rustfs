@@ -140,8 +140,8 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build latest variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://releases.rustfs.com/server/rustfs/release/linux-amd64/archive/rustfs.$version"
-        print_message $YELLOW "   https://releases.rustfs.com/server/rustfs/release/linux-arm64/archive/rustfs.$version"
+        print_message $YELLOW "   https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/dev/rustfs-linux-x86_64-dev-latest.zip"
+        print_message $YELLOW "   https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/dev/rustfs-linux-aarch64-dev-latest.zip"
         exit 1
     fi
 
@@ -161,8 +161,8 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build release variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://releases.rustfs.com/server/rustfs/release/linux-amd64/archive/rustfs.$version"
-        print_message $YELLOW "   https://releases.rustfs.com/server/rustfs/release/linux-arm64/archive/rustfs.$version"
+        print_message $YELLOW "   https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/release/rustfs-linux-x86_64-v$version.zip"
+        print_message $YELLOW "   https://rustfs-artifacts.oss-cn-beijing.aliyuncs.com/artifacts/rustfs/release/rustfs-linux-aarch64-v$version.zip"
         exit 1
     fi
 
