@@ -195,30 +195,11 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           install-cross-tools: ${{ matrix.cross }}
 
-      - name: Download static console assets
+      - name: Verify console static assets
         run: |
-          mkdir -p ./rustfs/static
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
-            if [[ $? -eq 0 ]]; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
-            else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
-            fi
-          else
-            chmod +w ./rustfs/static/LICENSE || true
-            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-              -o console.zip --retry 3 --retry-delay 5 --max-time 300
-            if [[ $? -eq 0 ]]; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
-            else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
-            fi
-          fi
+          # Console static assets are already embedded in the repository
+          echo "Console static assets size: $(du -sh rustfs/static/)"
+          echo "Console static assets are embedded via rust-embed, no external download needed"
 
       - name: Build RustFS
         run: |
