@@ -191,6 +191,17 @@ jobs:
         run: |
           # Use unified build script for consistent builds
           ./build-rustfs.sh --platform ${{ matrix.target }}
+        env:
+          # Set environment variables for zstd-sys to avoid target parsing issues
+          ZSTD_SYS_USE_PKG_CONFIG: 1
+          PKG_CONFIG_ALLOW_CROSS: 1
+          # For musl targets, use system zstd if available
+          CC_x86_64_unknown_linux_musl: zig cc -target x86_64-linux-musl
+          CXX_x86_64_unknown_linux_musl: zig c++ -target x86_64-linux-musl
+          AR_x86_64_unknown_linux_musl: zig ar
+          CC_aarch64_unknown_linux_musl: zig cc -target aarch64-linux-musl
+          CXX_aarch64_unknown_linux_musl: zig c++ -target aarch64-linux-musl
+          AR_aarch64_unknown_linux_musl: zig ar
 
       - name: Create release package
         id: package

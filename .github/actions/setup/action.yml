@@ -58,7 +58,9 @@ runs:
           libwebkit2gtk-4.1-dev \
           libxdo-dev \
           pkg-config \
-          libssl-dev
+          libssl-dev \
+          libzstd-dev \
+          zstd
 
     - name: Install protoc
       uses: arduino/setup-protoc@v3
@@ -81,6 +83,8 @@ runs:
     - name: Install Zig
       if: inputs.install-cross-tools == 'true'
       uses: mlugg/setup-zig@v2
+      with:
+        version: 0.13.0
 
     - name: Install cargo-zigbuild
       if: inputs.install-cross-tools == 'true'

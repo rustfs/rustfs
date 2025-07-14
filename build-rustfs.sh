@@ -173,12 +173,27 @@ setup_rust_environment() {
         # For cargo-zigbuild, set up additional environment variables
         if command -v cargo-zigbuild &> /dev/null; then
             print_message $YELLOW "Configuring cargo-zigbuild for musl target..."
+
+            # Set environment variables for better musl support
             export CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl"
             export CXX_x86_64_unknown_linux_musl="zig c++ -target x86_64-linux-musl"
+            export AR_x86_64_unknown_linux_musl="zig ar"
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="zig cc -target x86_64-linux-musl"
+
             export CC_aarch64_unknown_linux_musl="zig cc -target aarch64-linux-musl"
             export CXX_aarch64_unknown_linux_musl="zig c++ -target aarch64-linux-musl"
-            export AR_x86_64_unknown_linux_musl="zig ar"
             export AR_aarch64_unknown_linux_musl="zig ar"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="zig cc -target aarch64-linux-musl"
+
+            # Set environment variables for zstd-sys to avoid target parsing issues
+            export ZSTD_SYS_USE_PKG_CONFIG=1
+            export PKG_CONFIG_ALLOW_CROSS=1
+
+            # Use system zstd if available for musl builds
+            if [[ "$PLATFORM" == *"musl"* ]]; then
+                export ZSTD_SYS_USE_PKG_CONFIG=1
+                export PKG_CONFIG_ALLOW_CROSS=1
+            fi
         fi
     fi
 
