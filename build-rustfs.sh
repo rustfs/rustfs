@@ -188,12 +188,6 @@ setup_rust_environment() {
             # Set environment variables for zstd-sys to avoid target parsing issues
             export ZSTD_SYS_USE_PKG_CONFIG=1
             export PKG_CONFIG_ALLOW_CROSS=1
-
-            # Use system zstd if available for musl builds
-            if [[ "$PLATFORM" == *"musl"* ]]; then
-                export ZSTD_SYS_USE_PKG_CONFIG=1
-                export PKG_CONFIG_ALLOW_CROSS=1
-            fi
         fi
     fi
 

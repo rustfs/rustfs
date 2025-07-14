@@ -83,8 +83,6 @@ runs:
     - name: Install Zig
       if: inputs.install-cross-tools == 'true'
       uses: mlugg/setup-zig@v2
-      with:
-        version: 0.13.0
 
     - name: Install cargo-zigbuild
       if: inputs.install-cross-tools == 'true'

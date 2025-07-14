@@ -195,13 +195,16 @@ jobs:
           # Set environment variables for zstd-sys to avoid target parsing issues
           ZSTD_SYS_USE_PKG_CONFIG: 1
           PKG_CONFIG_ALLOW_CROSS: 1
-          # For musl targets, use system zstd if available
+          # For musl targets with Zig
           CC_x86_64_unknown_linux_musl: zig cc -target x86_64-linux-musl
           CXX_x86_64_unknown_linux_musl: zig c++ -target x86_64-linux-musl
           AR_x86_64_unknown_linux_musl: zig ar
           CC_aarch64_unknown_linux_musl: zig cc -target aarch64-linux-musl
           CXX_aarch64_unknown_linux_musl: zig c++ -target aarch64-linux-musl
           AR_aarch64_unknown_linux_musl: zig ar
+          # Additional environment variables for cross-compilation
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zig cc -target x86_64-linux-musl
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: zig cc -target aarch64-linux-musl
 
       - name: Create release package
         id: package
