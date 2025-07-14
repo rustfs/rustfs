@@ -225,6 +225,14 @@ jobs:
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
+          # Set up environment for musl targets to avoid zstd-sys pkg-config issues
+          if [[ "${{ matrix.target }}" == *"musl"* ]]; then
+            export ZSTD_SYS_USE_PKG_CONFIG=0
+            export LIBZSTD_SYS_USE_PKG_CONFIG=0
+            export PKG_CONFIG_ALLOW_CROSS=1
+            echo "✅ Configured zstd-sys for musl target"
+          fi
+
           if [[ "${{ matrix.cross }}" == "true" ]]; then
             if [[ "${{ matrix.platform }}" == "windows" ]]; then
               # Use cross for Windows ARM64

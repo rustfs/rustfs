@@ -58,7 +58,8 @@ runs:
           libwebkit2gtk-4.1-dev \
           libxdo-dev \
           pkg-config \
-          libssl-dev
+          libssl-dev \
+          libzstd-dev
 
     - name: Install protoc
       uses: arduino/setup-protoc@v3
@@ -85,6 +86,20 @@ runs:
     - name: Install cargo-zigbuild
       if: inputs.install-cross-tools == 'true'
       uses: taiki-e/install-action@cargo-zigbuild
+
+    - name: Setup cross-compilation environment
+      if: inputs.install-cross-tools == 'true'
+      shell: bash
+      run: |
+        # Set environment variables for zstd-sys to avoid pkg-config issues
+        echo "ZSTD_SYS_USE_PKG_CONFIG=0" >> $GITHUB_ENV
+        echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+
+        # For musl targets, disable pkg-config for zstd-sys
+        if [[ "${{ inputs.target }}" == *"musl"* ]]; then
+          echo "LIBZSTD_SYS_USE_PKG_CONFIG=0" >> $GITHUB_ENV
+          echo "ZSTD_SYS_USE_PKG_CONFIG=0" >> $GITHUB_ENV
+        fi
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@cargo-nextest
