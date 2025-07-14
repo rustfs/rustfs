@@ -63,7 +63,7 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 WORKDIR /usr/src/rustfs
 
 # Copy cargo configuration for optimized builds
-COPY .docker/cargo.config.toml ./.cargo/config.toml
+COPY cargo.config.toml ./.cargo/config.toml
 
 # Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -150,6 +150,9 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+
+# Volume for data
+VOLUME ["/data"]
 
 # Set default command
 CMD ["/app/rustfs"]
