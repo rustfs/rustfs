@@ -351,43 +351,41 @@ build_binary() {
     # Create output directory
     mkdir -p "${OUTPUT_DIR}/${PLATFORM}"
 
-    # Build command - choose the best tool for cross-compilation
-    local build_cmd="cargo build"
+    # Simple build logic matching the working version (4fb4b353)
+    # Force rebuild by touching build.rs
+    touch rustfs/build.rs
+
+    # Determine build command based on platform and cross-compilation needs
+    local build_cmd=""
     local current_platform=$(detect_platform)
+
+    print_message $BLUE "📦 Using working version build logic..."
 
     # Check if we need cross-compilation
     if [ "$PLATFORM" != "$current_platform" ]; then
-        # Check if the target is a macOS target
+        # Cross-compilation needed
         if [[ "$PLATFORM" == *"apple-darwin"* ]]; then
-            print_message $YELLOW "🍎 macOS target detected, using native cargo build"
-            print_message $YELLOW "💡 Note: macOS targets must be built natively on macOS runners"
-            build_cmd="cargo build"
-        elif [[ "$PLATFORM" == *"linux"* ]]; then
-            # For Linux targets, prefer cargo-zigbuild over cross for better glibc compatibility
-            if command -v cargo-zigbuild &> /dev/null; then
-                build_cmd="cargo zigbuild"
-                print_message $YELLOW "🔧 Linux cross-compilation detected, using 'cargo-zigbuild' for better glibc compatibility"
-            elif command -v cross &> /dev/null; then
-                build_cmd="cross build"
-                print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
-            else
-                print_message $YELLOW "⚠️  Cross-compilation detected but neither 'cargo-zigbuild' nor 'cross' tool found"
-                print_message $YELLOW "📦 Installing cross tool as fallback..."
-                cargo install cross --git https://github.com/cross-rs/cross
-                build_cmd="cross build"
-            fi
-        else
-            # For other targets, use cross
-            if command -v cross &> /dev/null; then
-                build_cmd="cross build"
-                print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
-            else
-                print_message $YELLOW "⚠️  Cross-compilation detected but 'cross' tool not found"
+            print_message $RED "❌ macOS cross-compilation not supported"
+            print_message $YELLOW "💡 macOS targets must be built natively on macOS runners"
+            return 1
+        elif [[ "$PLATFORM" == *"windows"* ]]; then
+            # Use cross for Windows ARM64
+            if ! command -v cross &> /dev/null; then
                 print_message $YELLOW "📦 Installing cross tool..."
                 cargo install cross --git https://github.com/cross-rs/cross
-                build_cmd="cross build"
             fi
+            build_cmd="cross build"
+        else
+            # Use zigbuild for Linux ARM64 (matches working version)
+            if ! command -v cargo-zigbuild &> /dev/null; then
+                print_message $RED "❌ cargo-zigbuild not found. Please install it first."
+                return 1
+            fi
+            build_cmd="cargo zigbuild"
         fi
+    else
+        # Native compilation
+        build_cmd="cargo build"
     fi
 
     if [ "$BUILD_TYPE" = "release" ]; then
@@ -395,11 +393,11 @@ build_binary() {
     fi
 
     build_cmd+=" --target $PLATFORM"
-    build_cmd+=" --bin $BINARY_NAME"
+    build_cmd+=" -p rustfs --bins"
 
     print_message $BLUE "📦 Executing: $build_cmd"
 
-    # Execute build
+    # Execute build (this matches exactly what the working version does)
     if eval $build_cmd; then
         print_message $GREEN "✅ Successfully built for $PLATFORM"
 
@@ -432,33 +430,6 @@ build_binary() {
         print_message $GREEN "✅ Build completed successfully"
     else
         print_message $RED "❌ Failed to build for $PLATFORM"
-
-        # Provide helpful suggestions for cross-compilation failures
-        if [ "$PLATFORM" != "$(detect_platform)" ]; then
-            if [[ "$PLATFORM" == *"apple-darwin"* ]]; then
-                print_message $YELLOW "💡 macOS build suggestions:"
-                print_message $YELLOW "   1. macOS targets must be built natively on macOS systems"
-                print_message $YELLOW "   2. Use GitHub Actions with macos-latest runner"
-                print_message $YELLOW "   3. Ensure Xcode command line tools are installed"
-                print_message $YELLOW "   4. Try: rustup target add $PLATFORM"
-            elif [[ "$PLATFORM" == *"linux"* ]]; then
-                print_message $YELLOW "💡 Linux cross-compilation suggestions:"
-                print_message $YELLOW "   1. Install cargo-zigbuild for better glibc compatibility:"
-                print_message $YELLOW "      cargo install cargo-zigbuild"
-                print_message $YELLOW "   2. Install Zig compiler: https://ziglang.org/download/"
-                print_message $YELLOW "   3. Use Docker build: make build-docker"
-                print_message $YELLOW "   4. Use GitHub Actions for multi-platform builds"
-                print_message $YELLOW "   5. Build natively on the target platform"
-                print_message $YELLOW "   6. Try: rustup target add $PLATFORM"
-            else
-                print_message $YELLOW "💡 Cross-compilation suggestions:"
-                print_message $YELLOW "   1. Use Docker build: make build-docker"
-                print_message $YELLOW "   2. Use GitHub Actions for multi-platform builds"
-                print_message $YELLOW "   3. Build natively on the target platform"
-                print_message $YELLOW "   4. Use 'make docker-buildx' for multi-arch Docker images"
-            fi
-        fi
-
         return 1
     fi
 }
