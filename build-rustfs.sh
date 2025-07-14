@@ -289,16 +289,24 @@ build_binary() {
     local current_platform=$(detect_platform)
 
     # Check if we need cross-compilation
+    # Note: macOS targets (darwin) cannot use cross tool as it requires Docker
     if [ "$PLATFORM" != "$current_platform" ]; then
-        # Check if cross is available
-        if command -v cross &> /dev/null; then
-            build_cmd="cross build"
-            print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
+        # Check if the target is a macOS target
+        if [[ "$PLATFORM" == *"apple-darwin"* ]]; then
+            print_message $YELLOW "🍎 macOS target detected, using native cargo build"
+            print_message $YELLOW "💡 Note: macOS targets must be built natively on macOS runners"
+            build_cmd="cargo build"
         else
-            print_message $YELLOW "⚠️  Cross-compilation detected but 'cross' tool not found"
-            print_message $YELLOW "📦 Installing cross tool..."
-            cargo install cross --git https://github.com/cross-rs/cross
-            build_cmd="cross build"
+            # Check if cross is available for non-macOS targets
+            if command -v cross &> /dev/null; then
+                build_cmd="cross build"
+                print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
+            else
+                print_message $YELLOW "⚠️  Cross-compilation detected but 'cross' tool not found"
+                print_message $YELLOW "📦 Installing cross tool..."
+                cargo install cross --git https://github.com/cross-rs/cross
+                build_cmd="cross build"
+            fi
         fi
     fi
 
@@ -347,11 +355,19 @@ build_binary() {
 
         # Provide helpful suggestions for cross-compilation failures
         if [ "$PLATFORM" != "$(detect_platform)" ]; then
-            print_message $YELLOW "💡 Cross-compilation suggestions:"
-            print_message $YELLOW "   1. Use Docker build: make build-docker"
-            print_message $YELLOW "   2. Use GitHub Actions for multi-platform builds"
-            print_message $YELLOW "   3. Build natively on the target platform"
-            print_message $YELLOW "   4. Use 'make docker-buildx' for multi-arch Docker images"
+            if [[ "$PLATFORM" == *"apple-darwin"* ]]; then
+                print_message $YELLOW "💡 macOS build suggestions:"
+                print_message $YELLOW "   1. macOS targets must be built natively on macOS systems"
+                print_message $YELLOW "   2. Use GitHub Actions with macos-latest runner"
+                print_message $YELLOW "   3. Ensure Xcode command line tools are installed"
+                print_message $YELLOW "   4. Try: rustup target add $PLATFORM"
+            else
+                print_message $YELLOW "💡 Cross-compilation suggestions:"
+                print_message $YELLOW "   1. Use Docker build: make build-docker"
+                print_message $YELLOW "   2. Use GitHub Actions for multi-platform builds"
+                print_message $YELLOW "   3. Build natively on the target platform"
+                print_message $YELLOW "   4. Use 'make docker-buildx' for multi-arch Docker images"
+            fi
         fi
 
         return 1
