@@ -58,9 +58,7 @@ runs:
           libwebkit2gtk-4.1-dev \
           libxdo-dev \
           pkg-config \
-          libssl-dev \
-          libzstd-dev \
-          zstd
+          libssl-dev
 
     - name: Install protoc
       uses: arduino/setup-protoc@v3
