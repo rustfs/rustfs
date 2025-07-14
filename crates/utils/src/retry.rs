@@ -16,9 +16,9 @@ use futures::Stream;
 use hyper::http;
 use std::{
     pin::Pin,
+    sync::LazyLock,
     task::{Context, Poll},
     time::{Duration, Instant},
-    sync::LazyLock,
 };
 use tokio::time::interval;
 
