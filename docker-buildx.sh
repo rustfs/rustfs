@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# RustFS Docker Buildx Build Script
-# Inspired by MinIO's docker-buildx.sh script for multi-platform Docker image building
-
 set -e
 
 # Colors for output
@@ -19,6 +16,7 @@ PLATFORMS="linux/amd64,linux/arm64"
 PUSH=false
 NO_CACHE=false
 RELEASE=""
+CHANNEL="release"
 
 # Print usage
 usage() {
@@ -31,6 +29,7 @@ usage() {
     echo "  --push                     Push images to registry"
     echo "  --no-cache                 Disable build cache"
     echo "  --release VERSION          Specify release version (default: auto-detect from git)"
+    echo "  --channel CHANNEL          Download channel: release or dev (default: release)"
     echo "  -h, --help                 Show this help message"
     echo ""
     echo "Examples:"
@@ -38,6 +37,8 @@ usage() {
     echo "  $0 --push                  # Build and push all variants"
     echo "  $0 --push --no-cache       # Build and push with no cache"
     echo "  $0 --release v1.0.0        # Build specific release version"
+    echo "  $0 --channel dev           # Build with dev channel binaries"
+    echo "  $0 --release latest --channel dev  # Build latest dev build"
 }
 
 # Print colored message
@@ -104,6 +105,7 @@ build_and_push() {
     print_message $YELLOW "   Registry: $REGISTRY"
     print_message $YELLOW "   Namespace: $NAMESPACE"
     print_message $YELLOW "   Platforms: $PLATFORMS"
+    print_message $YELLOW "   Channel: $CHANNEL"
     print_message $YELLOW "   Build Date: $build_date"
     print_message $YELLOW "   VCS Ref: $vcs_ref"
     print_message $YELLOW "   Push: $PUSH"
@@ -114,6 +116,7 @@ build_and_push() {
     local build_cmd="docker buildx build"
     build_cmd+=" --platform $PLATFORMS"
     build_cmd+=" --build-arg RELEASE=$version"
+    build_cmd+=" --build-arg CHANNEL=$CHANNEL"
     build_cmd+=" --build-arg BUILD_DATE=$build_date"
     build_cmd+=" --build-arg VCS_REF=$vcs_ref"
 
@@ -130,7 +133,14 @@ build_and_push() {
     # Build latest variant
     print_message $BLUE "🏗️  Building latest variant..."
     local latest_cmd="$build_cmd"
-    latest_cmd+=" -t ${image_base}:latest"
+
+    # Add channel-specific tags
+    if [ "$CHANNEL" = "dev" ]; then
+        latest_cmd+=" -t ${image_base}:dev-latest"
+    else
+        latest_cmd+=" -t ${image_base}:latest"
+    fi
+
     latest_cmd+=" --build-arg RELEASE=latest"
     latest_cmd+=" -f Dockerfile ."
 
@@ -140,29 +150,48 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build latest variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://github.com/rustfs/rustfs/releases/latest"
+        if [ "$CHANNEL" = "dev" ]; then
+            print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/dev/"
+        else
+            print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/release/"
+        fi
         exit 1
     fi
 
     # Prune build cache
     docker buildx prune -f
 
-    # Build release variant
-    print_message $BLUE "🏗️  Building release variant..."
-    local release_cmd="$build_cmd"
-    release_cmd+=" -t ${image_base}:${version}"
-    release_cmd+=" -t ${image_base}:release"
-    release_cmd+=" --build-arg RELEASE=${version}"
-    release_cmd+=" -f Dockerfile ."
+    # Build release variant (only if not latest)
+    if [ "$RELEASE" != "latest" ]; then
+        print_message $BLUE "🏗️  Building release variant..."
+        local release_cmd="$build_cmd"
+        release_cmd+=" -t ${image_base}:${version}"
 
-    print_message $BLUE "📦 Executing: $release_cmd"
-    if eval $release_cmd; then
-        print_message $GREEN "✅ Successfully built release variant"
+        # Add channel-specific tags
+        if [ "$CHANNEL" = "dev" ]; then
+            release_cmd+=" -t ${image_base}:dev-${version}"
+        else
+            release_cmd+=" -t ${image_base}:release"
+        fi
+
+        release_cmd+=" --build-arg RELEASE=${version}"
+        release_cmd+=" -f Dockerfile ."
+
+        print_message $BLUE "📦 Executing: $release_cmd"
+        if eval $release_cmd; then
+            print_message $GREEN "✅ Successfully built release variant"
+        else
+            print_message $RED "❌ Failed to build release variant"
+            print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
+            if [ "$CHANNEL" = "dev" ]; then
+                print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/dev/"
+            else
+                print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/release/"
+            fi
+            exit 1
+        fi
     else
-        print_message $RED "❌ Failed to build release variant"
-        print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://github.com/rustfs/rustfs/releases/tag/$version"
-        exit 1
+        print_message $BLUE "⏭️  Skipping release variant (already built as latest)"
     fi
 
     # Final cleanup
@@ -196,6 +225,14 @@ while [[ $# -gt 0 ]]; do
             RELEASE="$2"
             shift 2
             ;;
+        --channel)
+            CHANNEL="$2"
+            if [ "$CHANNEL" != "release" ] && [ "$CHANNEL" != "dev" ]; then
+                print_message $RED "❌ Invalid channel: $CHANNEL. Must be 'release' or 'dev'"
+                exit 1
+            fi
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -211,7 +248,6 @@ done
 # Main execution
 main() {
     print_message $BLUE "🐳 RustFS Docker Buildx Build Script"
-    print_message $BLUE "📋 Inspired by MinIO's docker-buildx.sh"
     echo ""
 
     # Check prerequisites

@@ -1,9 +1,10 @@
 # Multi-stage build for RustFS production image
-FROM alpine:3.18 AS build
+FROM alpine:latest AS build
 
 # Build arguments
 ARG TARGETARCH
 ARG RELEASE=latest
+ARG CHANNEL=release
 
 # Install dependencies for downloading and verifying binaries
 RUN apk add --no-cache \
@@ -17,7 +18,7 @@ RUN apk add --no-cache \
 # Create build directory
 WORKDIR /build
 
-# Map TARGETARCH to architecture format used in GitHub releases
+# Map TARGETARCH to architecture format used in builds
 RUN case "${TARGETARCH}" in \
         "amd64") ARCH="x86_64" ;; \
         "arm64") ARCH="aarch64" ;; \
@@ -25,65 +26,46 @@ RUN case "${TARGETARCH}" in \
     esac && \
     echo "ARCH=${ARCH}" > /build/arch.env
 
-# Download rustfs binary from GitHub Releases
+# Download rustfs binary from dl.rustfs.com
 RUN . /build/arch.env && \
-    GITHUB_REPO="rustfs/rustfs" && \
+    BASE_URL="https://dl.rustfs.com/artifacts/rustfs" && \
+    PLATFORM="linux" && \
     if [ "${RELEASE}" = "latest" ]; then \
-        # Get latest release tag \
-        LATEST_TAG=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name'); \
-        RELEASE_TAG="${LATEST_TAG}"; \
-        echo "Latest release tag: ${RELEASE_TAG}"; \
+        # Download latest version from specified channel \
+        if [ "${CHANNEL}" = "dev" ]; then \
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-dev-latest.zip"; \
+            DOWNLOAD_URL="${BASE_URL}/dev/${PACKAGE_NAME}"; \
+            echo "📥 Downloading latest dev build: ${PACKAGE_NAME}"; \
+        else \
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-latest.zip"; \
+            DOWNLOAD_URL="${BASE_URL}/release/${PACKAGE_NAME}"; \
+            echo "📥 Downloading latest release build: ${PACKAGE_NAME}"; \
+        fi; \
     else \
-        RELEASE_TAG="${RELEASE}"; \
-        echo "Using specified release tag: ${RELEASE_TAG}"; \
+        # Download specific version (always from release channel) \
+        PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${RELEASE}.zip"; \
+        DOWNLOAD_URL="${BASE_URL}/release/${PACKAGE_NAME}"; \
+        echo "📥 Downloading specific version: ${PACKAGE_NAME}"; \
     fi && \
-    PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE_TAG}.zip" && \
-    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${PACKAGE_NAME}" && \
-    echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}..." && \
-    curl -s -L "${DOWNLOAD_URL}" -o /build/rustfs.zip && \
+    echo "🔗 Download URL: ${DOWNLOAD_URL}" && \
+    curl -f -L "${DOWNLOAD_URL}" -o /build/rustfs.zip && \
     if [ ! -f /build/rustfs.zip ] || [ ! -s /build/rustfs.zip ]; then \
         echo "❌ Failed to download binary package"; \
-        echo "💡 Make sure the release ${RELEASE_TAG} exists and contains ${PACKAGE_NAME}"; \
-        echo "🔗 Check: https://github.com/${GITHUB_REPO}/releases/tag/${RELEASE_TAG}"; \
+        echo "💡 Make sure the package ${PACKAGE_NAME} exists"; \
+        echo "🔗 Check: ${DOWNLOAD_URL}"; \
         exit 1; \
     fi && \
     unzip /build/rustfs.zip -d /build && \
     chmod +x /build/rustfs && \
-    rm /build/rustfs.zip
-
-# Optional: Download and verify checksums if available
-RUN . /build/arch.env && \
-    GITHUB_REPO="rustfs/rustfs" && \
-    if [ "${RELEASE}" = "latest" ]; then \
-        LATEST_TAG=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name'); \
-        RELEASE_TAG="${LATEST_TAG}"; \
-    else \
-        RELEASE_TAG="${RELEASE}"; \
-    fi && \
-    CHECKSUM_FILE="SHA256SUMS" && \
-    CHECKSUM_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${CHECKSUM_FILE}" && \
-    echo "Attempting to download checksums from ${CHECKSUM_URL}..." && \
-    if curl -s -L "${CHECKSUM_URL}" -o /build/SHA256SUMS; then \
-        echo "✅ Checksums downloaded, verifying binary..."; \
-        cd /build && \
-        PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE_TAG}.zip" && \
-        if grep -q "${PACKAGE_NAME}" SHA256SUMS; then \
-            echo "${PACKAGE_NAME}" > temp_sums && \
-            grep "${PACKAGE_NAME}" SHA256SUMS >> temp_sums && \
-            sha256sum -c temp_sums || (echo "❌ Checksum verification failed" && exit 1); \
-            echo "✅ Checksum verification passed"; \
-        else \
-            echo "⚠️  Checksum for ${PACKAGE_NAME} not found in SHA256SUMS, skipping verification"; \
-        fi; \
-    else \
-        echo "⚠️  Checksums not available, skipping verification"; \
-    fi
+    rm /build/rustfs.zip && \
+    echo "✅ Successfully downloaded and extracted rustfs binary"
 
 # Runtime stage
-FROM alpine:3.18
+FROM alpine:latest
 
 # Set build arguments and labels
 ARG RELEASE=latest
+ARG CHANNEL=release
 ARG BUILD_DATE
 ARG VCS_REF
 
@@ -92,6 +74,7 @@ LABEL name="RustFS" \
     maintainer="RustFS Team <dev@rustfs.com>" \
     version="${RELEASE}" \
     release="${RELEASE}" \
+    channel="${CHANNEL}" \
     build-date="${BUILD_DATE}" \
     vcs-ref="${VCS_REF}" \
     summary="RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API." \
