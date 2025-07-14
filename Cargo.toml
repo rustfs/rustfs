@@ -265,7 +265,7 @@ wildmatch = { version = "2.4.0", features = ["serde"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
-zstd = "0.13.3"
+zstd = { version = "0.13.3", features = ["pkg-config"] }
 anyhow = "1.0.98"
 
 [profile.wasm-dev]
