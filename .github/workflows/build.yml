@@ -283,7 +283,6 @@ jobs:
             fi
           fi
 
-          # Native/cross compilation outputs to target/${target}/release/rustfs
           cd target/${{ matrix.target }}/release
           zip "../../../${PACKAGE_NAME}.zip" rustfs
           cd ../../..
