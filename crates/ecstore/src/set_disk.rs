@@ -604,11 +604,9 @@ impl SetDisks {
                     continue;
                 }
 
-                if let Some(pinfo) = &parts[part_idx]
-                    && !pinfo.etag.is_empty()
-                {
-                    *part_meta_quorum.entry(pinfo.etag.clone()).or_insert(0) += 1;
-                    part_infos.push(pinfo.clone());
+                if !parts[part_idx].etag.is_empty() {
+                    *part_meta_quorum.entry(parts[part_idx].etag.clone()).or_insert(0) += 1;
+                    part_infos.push(parts[part_idx].clone());
                     continue;
                 }
 

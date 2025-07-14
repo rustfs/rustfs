@@ -332,7 +332,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<Option<ObjectPartInfo>>> {
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         match self {
             Disk::Local(local_disk) => local_disk.read_parts(bucket, paths).await,
             Disk::Remote(remote_disk) => remote_disk.read_parts(bucket, paths).await,
@@ -521,7 +521,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CheckParts
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
     // StatInfoFile
-    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<Option<ObjectPartInfo>>>;
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;

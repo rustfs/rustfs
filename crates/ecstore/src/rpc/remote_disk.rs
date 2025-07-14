@@ -791,7 +791,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<Option<ObjectPartInfo>>> {
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
@@ -806,7 +806,7 @@ impl DiskAPI for RemoteDisk {
             return Err(response.error.unwrap_or_default().into());
         }
 
-        let read_parts_resp = rmp_serde::from_slice::<Vec<Option<ObjectPartInfo>>>(&response.object_part_infos)?;
+        let read_parts_resp = rmp_serde::from_slice::<Vec<ObjectPartInfo>>(&response.object_part_infos)?;
 
         Ok(read_parts_resp)
     }

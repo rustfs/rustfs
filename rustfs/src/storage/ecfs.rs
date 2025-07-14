@@ -1501,7 +1501,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let part_number_marker = part_number_marker.map(|x| x.parse::<usize>().unwrap_or_default());
+        let part_number_marker = part_number_marker.map(|x| x as usize);
         let max_parts = max_parts.unwrap_or_default() as usize;
 
         let res = store

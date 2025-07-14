@@ -1313,8 +1313,65 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<Option<ObjectPartInfo>>> {
-        unimplemented!()
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
+        let volume_dir = self.get_bucket_path(bucket)?;
+
+        let mut ret = vec![ObjectPartInfo::default(); paths.len()];
+
+        for (i, path_str) in paths.iter().enumerate() {
+            let path = Path::new(path_str);
+            let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or_default();
+            let num = file_name
+                .strip_prefix("part.")
+                .and_then(|v| v.strip_suffix(".meta"))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_default();
+
+            if let Err(err) = access(
+                volume_dir
+                    .clone()
+                    .join(path.parent().unwrap_or(Path::new("")).join(format!("part.{num}"))),
+            )
+            .await
+            {
+                ret[i] = ObjectPartInfo {
+                    number: num,
+                    error: Some(err.to_string()),
+                    ..Default::default()
+                };
+                continue;
+            }
+
+            let data = match self
+                .read_all_data(bucket, volume_dir.clone(), volume_dir.clone().join(path))
+                .await
+            {
+                Ok(data) => data,
+                Err(err) => {
+                    ret[i] = ObjectPartInfo {
+                        number: num,
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    };
+                    continue;
+                }
+            };
+
+            match serde_json::from_slice::<ObjectPartInfo>(&data) {
+                Ok(meta) => {
+                    ret[i] = meta;
+                }
+                Err(err) => {
+                    ret[i] = ObjectPartInfo {
+                        number: num,
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    };
+                }
+            };
+        }
+
+        Ok(ret)
     }
     #[tracing::instrument(skip(self))]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
