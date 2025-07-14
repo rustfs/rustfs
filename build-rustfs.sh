@@ -124,6 +124,23 @@ setup_rust_environment() {
     print_message $YELLOW "Installing target: $PLATFORM"
     rustup target add "$PLATFORM"
 
+    # Set up environment variables for musl targets
+    if [[ "$PLATFORM" == *"musl"* ]]; then
+        print_message $YELLOW "Setting up environment for musl target..."
+        export RUSTFLAGS="-C target-feature=-crt-static"
+
+        # For cargo-zigbuild, set up additional environment variables
+        if command -v cargo-zigbuild &> /dev/null; then
+            print_message $YELLOW "Configuring cargo-zigbuild for musl target..."
+            export CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl"
+            export CXX_x86_64_unknown_linux_musl="zig c++ -target x86_64-linux-musl"
+            export CC_aarch64_unknown_linux_musl="zig cc -target aarch64-linux-musl"
+            export CXX_aarch64_unknown_linux_musl="zig c++ -target aarch64-linux-musl"
+            export AR_x86_64_unknown_linux_musl="zig ar"
+            export AR_aarch64_unknown_linux_musl="zig ar"
+        fi
+    fi
+
     # Install required tools
     if [ "$SIGN" = true ]; then
         if ! command -v minisign &> /dev/null; then
@@ -284,20 +301,33 @@ build_binary() {
     # Create output directory
     mkdir -p "${OUTPUT_DIR}/${PLATFORM}"
 
-    # Build command - use cross for cross-compilation if needed
+    # Build command - choose the best tool for cross-compilation
     local build_cmd="cargo build"
     local current_platform=$(detect_platform)
 
     # Check if we need cross-compilation
-    # Note: macOS targets (darwin) cannot use cross tool as it requires Docker
     if [ "$PLATFORM" != "$current_platform" ]; then
         # Check if the target is a macOS target
         if [[ "$PLATFORM" == *"apple-darwin"* ]]; then
             print_message $YELLOW "🍎 macOS target detected, using native cargo build"
             print_message $YELLOW "💡 Note: macOS targets must be built natively on macOS runners"
             build_cmd="cargo build"
+        elif [[ "$PLATFORM" == *"linux"* ]]; then
+            # For Linux targets, prefer cargo-zigbuild over cross for better glibc compatibility
+            if command -v cargo-zigbuild &> /dev/null; then
+                build_cmd="cargo zigbuild"
+                print_message $YELLOW "🔧 Linux cross-compilation detected, using 'cargo-zigbuild' for better glibc compatibility"
+            elif command -v cross &> /dev/null; then
+                build_cmd="cross build"
+                print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
+            else
+                print_message $YELLOW "⚠️  Cross-compilation detected but neither 'cargo-zigbuild' nor 'cross' tool found"
+                print_message $YELLOW "📦 Installing cross tool as fallback..."
+                cargo install cross --git https://github.com/cross-rs/cross
+                build_cmd="cross build"
+            fi
         else
-            # Check if cross is available for non-macOS targets
+            # For other targets, use cross
             if command -v cross &> /dev/null; then
                 build_cmd="cross build"
                 print_message $YELLOW "🔄 Cross-compilation detected, using 'cross' tool"
@@ -361,6 +391,15 @@ build_binary() {
                 print_message $YELLOW "   2. Use GitHub Actions with macos-latest runner"
                 print_message $YELLOW "   3. Ensure Xcode command line tools are installed"
                 print_message $YELLOW "   4. Try: rustup target add $PLATFORM"
+            elif [[ "$PLATFORM" == *"linux"* ]]; then
+                print_message $YELLOW "💡 Linux cross-compilation suggestions:"
+                print_message $YELLOW "   1. Install cargo-zigbuild for better glibc compatibility:"
+                print_message $YELLOW "      cargo install cargo-zigbuild"
+                print_message $YELLOW "   2. Install Zig compiler: https://ziglang.org/download/"
+                print_message $YELLOW "   3. Use Docker build: make build-docker"
+                print_message $YELLOW "   4. Use GitHub Actions for multi-platform builds"
+                print_message $YELLOW "   5. Build natively on the target platform"
+                print_message $YELLOW "   6. Try: rustup target add $PLATFORM"
             else
                 print_message $YELLOW "💡 Cross-compilation suggestions:"
                 print_message $YELLOW "   1. Use Docker build: make build-docker"
