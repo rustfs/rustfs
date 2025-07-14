@@ -146,6 +146,8 @@ jobs:
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.cross == 'false' && '-C target-cpu=native' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -153,23 +155,29 @@ jobs:
           # Linux builds
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            cross: false
             platform: linux
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            cross: true
             platform: linux
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
+            cross: false
             platform: macos
           - os: macos-latest
             target: x86_64-apple-darwin
+            cross: false
             platform: macos
           # # Windows builds (temporarily disabled)
           # - os: windows-latest
           #   target: x86_64-pc-windows-msvc
+          #   cross: false
           #   platform: windows
           # - os: windows-latest
           #   target: aarch64-pc-windows-msvc
+          #   cross: true
           #   platform: windows
     steps:
       - name: Checkout repository
@@ -185,23 +193,50 @@ jobs:
           cache-shared-key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
-          install-cross-tools: true
+          install-cross-tools: ${{ matrix.cross }}
 
-      - name: Build RustFS using build-rustfs.sh
+      - name: Download static console assets
         run: |
-          # Use unified build script for consistent builds
-          ./build-rustfs.sh --platform ${{ matrix.target }}
-        env:
-          # Set environment variables for zstd-sys to avoid target parsing issues
-          ZSTD_SYS_USE_PKG_CONFIG: 1
-          PKG_CONFIG_ALLOW_CROSS: 1
-          # For musl targets, use system zstd if available
-          CC_x86_64_unknown_linux_musl: zig cc -target x86_64-linux-musl
-          CXX_x86_64_unknown_linux_musl: zig c++ -target x86_64-linux-musl
-          AR_x86_64_unknown_linux_musl: zig ar
-          CC_aarch64_unknown_linux_musl: zig cc -target aarch64-linux-musl
-          CXX_aarch64_unknown_linux_musl: zig c++ -target aarch64-linux-musl
-          AR_aarch64_unknown_linux_musl: zig ar
+          mkdir -p ./rustfs/static
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          else
+            chmod +w ./rustfs/static/LICENSE || true
+            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+              -o console.zip --retry 3 --retry-delay 5 --max-time 300
+            if [[ $? -eq 0 ]]; then
+              unzip -o console.zip -d ./rustfs/static
+              rm console.zip
+            else
+              echo "Warning: Failed to download console assets, continuing without them"
+              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            fi
+          fi
+
+      - name: Build RustFS
+        run: |
+          # Force rebuild by touching build.rs
+          touch rustfs/build.rs
+
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Use cross for Windows ARM64
+              cargo install cross --git https://github.com/cross-rs/cross
+              cross build --release --target ${{ matrix.target }} -p rustfs --bins
+            else
+              # Use zigbuild for Linux ARM64
+              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            fi
+          else
+            cargo build --release --target ${{ matrix.target }} -p rustfs --bins
+          fi
 
       - name: Create release package
         id: package
@@ -248,8 +283,8 @@ jobs:
             fi
           fi
 
-          # build-rustfs.sh outputs to target/release/${platform}/rustfs
-          cd target/release/${{ matrix.target }}
+          # Native/cross compilation outputs to target/${target}/release/rustfs
+          cd target/${{ matrix.target }}/release
           zip "../../../${PACKAGE_NAME}.zip" rustfs
           cd ../../..
 
