@@ -53,6 +53,47 @@ detect_platform() {
     esac
 }
 
+# Cross-platform SHA256 checksum generation
+generate_sha256() {
+    local file="$1"
+    local output_file="$2"
+    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+    case "$os" in
+        "linux")
+            if command -v sha256sum &> /dev/null; then
+                sha256sum "$file" > "$output_file"
+            elif command -v shasum &> /dev/null; then
+                shasum -a 256 "$file" > "$output_file"
+            else
+                print_message $RED "❌ No SHA256 command found (sha256sum or shasum)"
+                return 1
+            fi
+            ;;
+        "darwin")
+            if command -v shasum &> /dev/null; then
+                shasum -a 256 "$file" > "$output_file"
+            elif command -v sha256sum &> /dev/null; then
+                sha256sum "$file" > "$output_file"
+            else
+                print_message $RED "❌ No SHA256 command found (shasum or sha256sum)"
+                return 1
+            fi
+            ;;
+        *)
+            # Try common commands in order
+            if command -v sha256sum &> /dev/null; then
+                sha256sum "$file" > "$output_file"
+            elif command -v shasum &> /dev/null; then
+                shasum -a 256 "$file" > "$output_file"
+            else
+                print_message $RED "❌ No SHA256 command found"
+                return 1
+            fi
+            ;;
+    esac
+}
+
 # Default values
 OUTPUT_DIR="target/release"
 PLATFORM=$(detect_platform)  # Auto-detect current platform
@@ -358,7 +399,7 @@ build_binary() {
 
         # Generate checksums
         print_message $BLUE "🔐 Generating checksums..."
-        (cd "${OUTPUT_DIR}/${PLATFORM}" && sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256sum")
+        (cd "${OUTPUT_DIR}/${PLATFORM}" && generate_sha256 "${BINARY_NAME}" "${BINARY_NAME}.sha256sum")
 
         # Verify binary functionality (if not skipped)
         if [ "$SKIP_VERIFICATION" = false ]; then
