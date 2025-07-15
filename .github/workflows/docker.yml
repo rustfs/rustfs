@@ -223,9 +223,9 @@ jobs:
           - name: production
             dockerfile: Dockerfile
             platforms: linux/amd64,linux/arm64
-          #- name: source
-          #  dockerfile: Dockerfile.source
-          #  platforms: linux/amd64,linux/arm64
+          - name: source
+            dockerfile: Dockerfile.source
+            platforms: linux/amd64,linux/arm64
           #- name: dev
           #  dockerfile: Dockerfile.source
           #  platforms: linux/amd64,linux/arm64
