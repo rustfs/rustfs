@@ -43,15 +43,16 @@ pub async fn create_bitrot_reader(
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
     let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
-
+    let offset = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
     if let Some(data) = inline_data {
         // Use inline data
-        let rd = Cursor::new(data.to_vec());
+        let mut rd = Cursor::new(data.to_vec());
+        rd.set_position(offset as u64);
         let reader = BitrotReader::new(Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>, shard_size, checksum_algo);
         Ok(Some(reader))
     } else if let Some(disk) = disk {
         // Read from disk
-        match disk.read_file_stream(bucket, path, offset, length).await {
+        match disk.read_file_stream(bucket, path, offset, length - offset).await {
             Ok(rd) => {
                 let reader = BitrotReader::new(rd, shard_size, checksum_algo);
                 Ok(Some(reader))

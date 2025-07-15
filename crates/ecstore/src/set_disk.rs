@@ -2123,6 +2123,8 @@ impl SetDisks {
 
             let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
 
+            let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
+
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -2131,7 +2133,7 @@ impl SetDisks {
                     disk_op.as_ref(),
                     bucket,
                     &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
-                    part_offset,
+                    read_offset,
                     till_offset,
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,

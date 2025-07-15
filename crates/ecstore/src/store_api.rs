@@ -201,7 +201,7 @@ impl GetObjectReader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HTTPRangeSpec {
     pub is_suffix_length: bool,
     pub start: i64,
