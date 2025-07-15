@@ -770,18 +770,18 @@ impl S3 for FS {
         };
 
         let reader = store
-            .get_object_reader(bucket.as_str(), key.as_str(), rs, h, &opts)
+            .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
             .await
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
         let event_info = info.clone();
         let content_type = {
-            if let Some(content_type) = info.content_type {
-                match ContentType::from_str(&content_type) {
+            if let Some(content_type) = &info.content_type {
+                match ContentType::from_str(content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
-                        error!("parse content-type err {} {:?}", &content_type, err);
+                        error!("parse content-type err {} {:?}", content_type, err);
                         //
                         None
                     }
@@ -797,11 +797,29 @@ impl S3 for FS {
             info.size as usize,
         )));
 
+        let mut rs = rs;
+
+        if let Some(part_number) = part_number {
+            if rs.is_none() {
+                rs = HTTPRangeSpec::from_object_info(&info, part_number);
+            }
+        }
+
+        let content_range = if let Some(rs) = rs {
+            let total_size = info.get_actual_size().map_err(ApiError::from)?;
+            let (start, length) = rs.get_offset_length(total_size as i64).map_err(ApiError::from)?;
+            Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
+        } else {
+            None
+        };
+
         let output = GetObjectOutput {
             body,
             content_length: Some(info.size as i64),
             last_modified,
             content_type,
+            accept_ranges: Some("bytes".to_string()),
+            content_range,
             ..Default::default()
         };
 

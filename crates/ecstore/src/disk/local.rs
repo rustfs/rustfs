@@ -1611,11 +1611,6 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        // warn!(
-        //     "disk read_file_stream: volume: {}, path: {}, offset: {}, length: {}",
-        //     volume, path, offset, length
-        // );
-
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
