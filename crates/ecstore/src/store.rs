@@ -38,7 +38,7 @@ use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
-use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
+use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
@@ -1808,6 +1808,47 @@ impl StorageAPI for ECStore {
         }
 
         Ok((del_objects, del_errs))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        check_list_parts_args(bucket, object, upload_id)?;
+
+        // TODO: nslock
+
+        if self.single_pool() {
+            return self.pools[0]
+                .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+                .await;
+        }
+
+        for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
+            match pool
+                .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+                .await
+            {
+                Ok(res) => return Ok(res),
+                Err(err) => {
+                    if is_err_invalid_upload_id(&err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+        }
+
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
     #[tracing::instrument(skip(self))]

@@ -45,7 +45,7 @@ fn main() -> Result<(), AnyError> {
     }
 
     // path of proto file
-    let project_root_dir = env::current_dir()?.join("");
+    let project_root_dir = env::current_dir()?.join("crates/protos/src");
     let proto_dir = project_root_dir.clone();
     let proto_files = &["node.proto"];
     let proto_out_dir = project_root_dir.join("generated").join("proto_gen");
@@ -268,7 +268,7 @@ fn protobuf_compiler_version() -> Result<Version, String> {
 }
 
 fn fmt() {
-    let output = Command::new("cargo").arg("fmt").arg("-p").arg("protos").status();
+    let output = Command::new("cargo").arg("fmt").arg("-p").arg("rustfs-protos").status();
 
     match output {
         Ok(status) => {

@@ -548,6 +548,7 @@ impl ObjectInfo {
                 mod_time: part.mod_time,
                 checksums: part.checksums.clone(),
                 number: part.number,
+                error: part.error.clone(),
             })
             .collect();
 
@@ -844,6 +845,48 @@ pub struct ListMultipartsInfo {
     // encoding_type: String, // Not supported yet.
 }
 
+/// ListPartsInfo - represents list of all parts.
+#[derive(Debug, Clone, Default)]
+pub struct ListPartsInfo {
+    /// Name of the bucket.
+    pub bucket: String,
+
+    /// Name of the object.
+    pub object: String,
+
+    /// Upload ID identifying the multipart upload whose parts are being listed.
+    pub upload_id: String,
+
+    /// The class of storage used to store the object.
+    pub storage_class: String,
+
+    /// Part number after which listing begins.
+    pub part_number_marker: usize,
+
+    /// When a list is truncated, this element specifies the last part in the list,
+    /// as well as the value to use for the part-number-marker request parameter
+    /// in a subsequent request.
+    pub next_part_number_marker: usize,
+
+    /// Maximum number of parts that were allowed in the response.
+    pub max_parts: usize,
+
+    /// Indicates whether the returned list of parts is truncated.
+    pub is_truncated: bool,
+
+    /// List of all parts.
+    pub parts: Vec<PartInfo>,
+
+    /// Any metadata set during InitMultipartUpload, including encryption headers.
+    pub user_defined: HashMap<String, String>,
+
+    /// ChecksumAlgorithm if set
+    pub checksum_algorithm: String,
+
+    /// ChecksumType if set
+    pub checksum_type: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
@@ -923,10 +966,7 @@ pub trait StorageAPI: ObjectIO {
     ) -> Result<ListObjectVersionsInfo>;
     // Walk TODO:
 
-    // GetObjectNInfo ObjectIO
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-    // PutObject ObjectIO
-    // CopyObject
     async fn copy_object(
         &self,
         src_bucket: &str,
@@ -949,7 +989,6 @@ pub trait StorageAPI: ObjectIO {
     // TransitionObject TODO:
     // RestoreTransitionedObject TODO:
 
-    // ListMultipartUploads
     async fn list_multipart_uploads(
         &self,
         bucket: &str,
@@ -960,7 +999,6 @@ pub trait StorageAPI: ObjectIO {
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo>;
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
-    // CopyObjectPart
     async fn copy_object_part(
         &self,
         src_bucket: &str,
@@ -984,7 +1022,6 @@ pub trait StorageAPI: ObjectIO {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo>;
-    // GetMultipartInfo
     async fn get_multipart_info(
         &self,
         bucket: &str,
@@ -992,7 +1029,15 @@ pub trait StorageAPI: ObjectIO {
         upload_id: &str,
         opts: &ObjectOptions,
     ) -> Result<MultipartInfo>;
-    // ListObjectParts
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo>;
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
     async fn complete_multipart_upload(
         self: Arc<Self>,
@@ -1002,13 +1047,10 @@ pub trait StorageAPI: ObjectIO {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo>;
-    // GetDisks
     async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>>;
-    // SetDriveCounts
     fn set_drive_counts(&self) -> Vec<usize>;
 
     // Health TODO:
-    // PutObjectMetadata
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     // DecomTieredObject
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
