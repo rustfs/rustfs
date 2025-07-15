@@ -49,6 +49,19 @@ pub struct ObjectPartInfo {
     pub error: Option<String>,
 }
 
+impl ObjectPartInfo {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.serialize(&mut Serializer::new(&mut buf))?;
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: ObjectPartInfo = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
 // ChecksumInfo - carries checksums of individual scattered parts per disk.
 pub struct ChecksumInfo {

@@ -5065,7 +5065,7 @@ impl StorageAPI for SetDisks {
     ) -> Result<PartInfo> {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
-        let (mut fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
@@ -5218,9 +5218,9 @@ impl StorageAPI for SetDisks {
 
         // debug!("put_object_part part_info {:?}", part_info);
 
-        fi.parts = vec![part_info];
+        // fi.parts = vec![part_info.clone()];
 
-        let fi_buff = fi.marshal_msg()?;
+        let part_info_buff = part_info.marshal_msg()?;
 
         drop(writers); // drop writers to close all files
 
@@ -5231,7 +5231,7 @@ impl StorageAPI for SetDisks {
             &tmp_part_path,
             RUSTFS_META_MULTIPART_BUCKET,
             &part_path,
-            fi_buff.into(),
+            part_info_buff.into(),
             write_quorum,
         )
         .await?;
@@ -5330,13 +5330,18 @@ impl StorageAPI for SetDisks {
             .map(|v| format!("{part_path}part.{v}.meta"))
             .collect::<Vec<String>>();
 
-        let object_parts = Self::read_parts(&online_disks, bucket, &part_meta_paths, &part_numbers, read_quorum)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object, upload_id]))?;
+        let object_parts =
+            Self::read_parts(&online_disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
+                .await
+                .map_err(|e| to_object_err(e.into(), vec![bucket, object, upload_id]))?;
 
         let mut count = max_parts;
 
         for (i, part) in object_parts.iter().enumerate() {
+            if let Some(err) = &part.error {
+                warn!("list_object_parts part error: {:?}", &err);
+            }
+
             parts.push(PartInfo {
                 etag: Some(part.etag.clone()),
                 part_num: part.number,
@@ -5656,49 +5661,31 @@ impl StorageAPI for SetDisks {
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
 
-        let files: Vec<String> = uploaded_parts.iter().map(|v| format!("part.{}.meta", v.part_num)).collect();
+        let part_meta_paths = uploaded_parts
+            .iter()
+            .map(|v| format!("{part_path}part.{0}.meta", v.part_num))
+            .collect::<Vec<String>>();
 
-        // readMultipleFiles
+        let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
 
-        let req = ReadMultipleReq {
-            bucket: RUSTFS_META_MULTIPART_BUCKET.to_string(),
-            prefix: part_path,
-            files,
-            max_size: 1 << 20,
-            metadata_only: true,
-            abort404: true,
-            max_results: 0,
-        };
+        let object_parts =
+            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, write_quorum).await?;
 
-        let part_files_resp = Self::read_multiple_files(&disks, req, write_quorum).await;
-
-        if part_files_resp.len() != uploaded_parts.len() {
+        if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
         }
 
-        for (i, res) in part_files_resp.iter().enumerate() {
-            let part_id = uploaded_parts[i].part_num;
-            if !res.error.is_empty() || !res.exists {
-                error!("complete_multipart_upload part_id err {:?}, exists={}", res, res.exists);
-                return Err(Error::InvalidPart(part_id, bucket.to_owned(), object.to_owned()));
+        for (i, part) in object_parts.iter().enumerate() {
+            if let Some(err) = &part.error {
+                error!("complete_multipart_upload part error: {:?}", &err);
             }
 
-            let part_fi = FileInfo::unmarshal(&res.data).map_err(|e| {
+            if uploaded_parts[i].part_num != part.number {
                 error!(
-                    "complete_multipart_upload FileInfo::unmarshal err {:?}, part_id={}, bucket={}, object={}",
-                    e, part_id, bucket, object
+                    "complete_multipart_upload part_id err part_id != part_num {} != {}",
+                    uploaded_parts[i].part_num, part.number
                 );
-                Error::InvalidPart(part_id, bucket.to_owned(), object.to_owned())
-            })?;
-            let part = &part_fi.parts[0];
-            let part_num = part.number;
-
-            // debug!("complete part {} file info {:?}", part_num, &part_fi);
-            // debug!("complete part {} object info {:?}", part_num, &part);
-
-            if part_id != part_num {
-                error!("complete_multipart_upload part_id err part_id != part_num {} != {}", part_id, part_num);
-                return Err(Error::InvalidPart(part_id, bucket.to_owned(), object.to_owned()));
+                return Err(Error::InvalidPart(uploaded_parts[i].part_num, bucket.to_owned(), object.to_owned()));
             }
 
             fi.add_object_part(

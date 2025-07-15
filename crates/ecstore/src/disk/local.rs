@@ -1357,7 +1357,7 @@ impl DiskAPI for LocalDisk {
                 }
             };
 
-            match serde_json::from_slice::<ObjectPartInfo>(&data) {
+            match ObjectPartInfo::unmarshal(&data) {
                 Ok(meta) => {
                     ret[i] = meta;
                 }
