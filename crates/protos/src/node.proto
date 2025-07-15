@@ -130,6 +130,18 @@ message VerifyFileResponse {
   optional Error error = 3;
 }
 
+message ReadPartsRequest {
+  string disk = 1;
+  string bucket = 2;
+  repeated string paths = 3;
+}
+
+message ReadPartsResponse {
+  bool success = 1;
+  bytes object_part_infos = 2;
+  optional Error error = 3;
+}
+
 message CheckPartsRequest {
   string disk = 1;  // indicate which one in the disks
   string volume = 2;
@@ -768,6 +780,7 @@ service NodeService {
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {};
   rpc Delete(DeleteRequest) returns (DeleteResponse) {};
   rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {};
+  rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {};
   rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {};
   rpc RenamePart(RenamePartRequest) returns (RenamePartResponse) {};
   rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {};

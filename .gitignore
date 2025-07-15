@@ -19,3 +19,4 @@ deploy/certs/*
 profile.json
 .docker/openobserve-otel/data
 *.zst
+.secrets

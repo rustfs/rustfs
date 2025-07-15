@@ -404,7 +404,42 @@ impl Node for NodeService {
             }))
         }
     }
+    async fn read_parts(&self, request: Request<ReadPartsRequest>) -> Result<Response<ReadPartsResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk.read_parts(&request.bucket, &request.paths).await {
+                Ok(data) => {
+                    let data = match rmp_serde::to_vec(&data) {
+                        Ok(data) => data,
+                        Err(err) => {
+                            return Ok(tonic::Response::new(ReadPartsResponse {
+                                success: false,
+                                object_part_infos: Bytes::new(),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            }));
+                        }
+                    };
+                    Ok(tonic::Response::new(ReadPartsResponse {
+                        success: true,
+                        object_part_infos: Bytes::copy_from_slice(&data),
+                        error: None,
+                    }))
+                }
 
+                Err(err) => Ok(tonic::Response::new(ReadPartsResponse {
+                    success: false,
+                    object_part_infos: Bytes::new(),
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(ReadPartsResponse {
+                success: false,
+                object_part_infos: Bytes::new(),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
+            }))
+        }
+    }
     async fn check_parts(&self, request: Request<CheckPartsRequest>) -> Result<Response<CheckPartsResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {

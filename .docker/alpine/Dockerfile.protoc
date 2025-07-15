@@ -1,0 +1,40 @@
+FROM alpine:3.18
+
+ENV LANG C.UTF-8
+
+# Install base dependencies
+RUN apk add --no-cache \
+    wget \
+    git \
+    curl \
+    unzip \
+    gcc \
+    musl-dev \
+    pkgconfig \
+    openssl-dev \
+    dbus-dev \
+    wayland-dev \
+    webkit2gtk-4.1-dev \
+    build-base \
+    linux-headers
+
+# install protoc
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip \
+    && unzip protoc-30.2-linux-x86_64.zip -d protoc3 \
+    && mv protoc3/bin/* /usr/local/bin/ && chmod +x /usr/local/bin/protoc \
+    && mv protoc3/include/* /usr/local/include/ && rm -rf protoc-30.2-linux-x86_64.zip protoc3
+
+# install flatc
+RUN wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip \
+    && unzip Linux.flatc.binary.g++-13.zip \
+    && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc && rm -rf Linux.flatc.binary.g++-13.zip
+
+# install rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# Set PATH for rust
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY .docker/cargo.config.toml /root/.cargo/config.toml
+
+WORKDIR /root/rustfs

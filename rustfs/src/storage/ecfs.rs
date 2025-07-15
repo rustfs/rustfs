@@ -28,6 +28,7 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
 use rustfs_s3select_api::query::Query;
@@ -769,18 +770,18 @@ impl S3 for FS {
         };
 
         let reader = store
-            .get_object_reader(bucket.as_str(), key.as_str(), rs, h, &opts)
+            .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
             .await
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
         let event_info = info.clone();
         let content_type = {
-            if let Some(content_type) = info.content_type {
-                match ContentType::from_str(&content_type) {
+            if let Some(content_type) = &info.content_type {
+                match ContentType::from_str(content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
-                        error!("parse content-type err {} {:?}", &content_type, err);
+                        error!("parse content-type err {} {:?}", content_type, err);
                         //
                         None
                     }
@@ -796,11 +797,29 @@ impl S3 for FS {
             info.size as usize,
         )));
 
+        let mut rs = rs;
+
+        if let Some(part_number) = part_number {
+            if rs.is_none() {
+                rs = HTTPRangeSpec::from_object_info(&info, part_number);
+            }
+        }
+
+        let content_range = if let Some(rs) = rs {
+            let total_size = info.get_actual_size().map_err(ApiError::from)?;
+            let (start, length) = rs.get_offset_length(total_size as i64).map_err(ApiError::from)?;
+            Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
+        } else {
+            None
+        };
+
         let output = GetObjectOutput {
             body,
             content_length: Some(info.size as i64),
             last_modified,
             content_type,
+            accept_ranges: Some("bytes".to_string()),
+            content_range,
             ..Default::default()
         };
 
@@ -1489,15 +1508,111 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let ListPartsInput {
-            bucket, key, upload_id, ..
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            ..
         } = req.input;
 
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let part_number_marker = part_number_marker.map(|x| x as usize);
+        let max_parts = max_parts.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
+
+        let res = store
+            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
         let output = ListPartsOutput {
-            bucket: Some(bucket),
-            key: Some(key),
-            upload_id: Some(upload_id),
+            bucket: Some(res.bucket),
+            key: Some(res.object),
+            upload_id: Some(res.upload_id),
+            parts: Some(
+                res.parts
+                    .into_iter()
+                    .map(|p| Part {
+                        e_tag: p.etag,
+                        last_modified: p.last_mod.map(Timestamp::from),
+                        part_number: Some(p.part_num as i32),
+                        size: Some(p.size as i64),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
             ..Default::default()
         };
+        Ok(S3Response::new(output))
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let ListMultipartUploadsInput {
+            bucket,
+            prefix,
+            delimiter,
+            key_marker,
+            upload_id_marker,
+            max_uploads,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let prefix = prefix.unwrap_or_default();
+
+        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
+
+        if let Some(key_marker) = &key_marker {
+            if !key_marker.starts_with(prefix.as_str()) {
+                return Err(s3_error!(NotImplemented, "Invalid key marker"));
+            }
+        }
+
+        let result = store
+            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
+            .await
+            .map_err(ApiError::from)?;
+
+        let output = ListMultipartUploadsOutput {
+            bucket: Some(bucket),
+            prefix: Some(prefix),
+            delimiter: result.delimiter,
+            key_marker: result.key_marker,
+            upload_id_marker: result.upload_id_marker,
+            max_uploads: Some(result.max_uploads as i32),
+            is_truncated: Some(result.is_truncated),
+            uploads: Some(
+                result
+                    .uploads
+                    .into_iter()
+                    .map(|u| MultipartUpload {
+                        key: Some(u.object),
+                        upload_id: Some(u.upload_id),
+                        initiated: u.initiated.map(Timestamp::from),
+
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            common_prefixes: Some(
+                result
+                    .common_prefixes
+                    .into_iter()
+                    .map(|c| CommonPrefix { prefix: Some(c) })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
         Ok(S3Response::new(output))
     }
 

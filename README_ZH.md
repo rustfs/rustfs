@@ -7,6 +7,7 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="Build and Push Docker Images" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
   <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
   <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
+  <a href="https://hellogithub.com/repository/rustfs/rustfs" target="_blank"><img src="https://abroad.hellogithub.com/v1/widgets/recommend.svg?rid=b95bcb72bdc340b68f16fdf6790b7d5b&claim_uid=MsbvjYeLDKAH457&theme=small" alt="Featured｜HelloGitHub" /></a>
 </p >
 
 <p align="center">
@@ -61,7 +62,7 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 
 要开始使用 RustFS，请按照以下步骤操作：
 
-1.  **一键脚本快速启动 (方案一)**
+1. **一键脚本快速启动 (方案一)**
 
    ```bash
    curl -O  https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
@@ -70,11 +71,10 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 2. **Docker快速启动（方案二）**
 
   ```bash
-   podman run -d -p 9000:9000 -p 9001:9001 -v /data:/data quay.io/rustfs/rustfs
+   docker run -d -p 9000:9000  -v /data:/data rustfs/rustfs
    ```
 
-
-3. **访问控制台**：打开 Web 浏览器并导航到 `http://localhost:9001` 以访问 RustFS 控制台，默认的用户名和密码是 `rustfsadmin` 。
+3. **访问控制台**：打开 Web 浏览器并导航到 `http://localhost:9000` 以访问 RustFS 控制台，默认的用户名和密码是 `rustfsadmin` 。
 4. **创建存储桶**：使用控制台为您的对象创建新的存储桶。
 5. **上传对象**：您可以直接通过控制台上传文件，或使用 S3 兼容的 API 与您的 RustFS 实例交互。
 
@@ -109,7 +109,7 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 RustFS 是一个社区驱动的项目，我们感谢所有的贡献。查看[贡献者](https://github.com/rustfs/rustfs/graphs/contributors)页面，了解帮助 RustFS 变得更好的杰出人员。
 
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=rustfs/rustfs" />
+  <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" />
 </a >
 
 ## 许可证

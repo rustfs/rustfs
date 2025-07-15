@@ -22,9 +22,7 @@ Environment=RUSTFS_SECRET_KEY=rustfsadmin
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
-    --obs-config /etc/rustfs/obs.yaml \
-    --console-enable \
-    --console-address 0.0.0.0:9001
+    --console-enable
 
 # environment variable configuration (Option 2: Use environment variables)
 # rustfs example file see: `../config/rustfs.env`

@@ -36,15 +36,11 @@ Environment=RUSTFS_SECRET_KEY=rustfsadmin
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
-    --obs-config /etc/rustfs/obs.yaml \
-    --console-enable \
-    --console-address 0.0.0.0:9001
+    --console-enable
 # 定义启动命令，运行 /usr/local/bin/rustfs，带参数：
 # --address 0.0.0.0:9000：服务监听所有接口的 9000 端口。
 # --volumes：指定存储卷路径为 /data/rustfs/vol1 和 /data/rustfs/vol2。
-# --obs-config：指定配置文件路径为 /etc/rustfs/obs.yaml。
 # --console-enable：启用控制台功能。
-# --console-address 0.0.0.0:9001：控制台监听所有接口的 9001 端口。
 
 # 定义环境变量配置，用于传递给服务程序，推荐使用且简洁
 # rustfs 示例文件 详见: `../config/rustfs-zh.env`

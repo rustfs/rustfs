@@ -18,7 +18,7 @@ use futures::future::join_all;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
-use tracing::error;
+use tracing::{error, warn};
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub type PartialFn =
@@ -118,10 +118,14 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                         if let Some(disk) = d.clone() {
                             disk
                         } else {
+                            warn!("list_path_raw: fallback disk is none");
                             break;
                         }
                     }
-                    None => break,
+                    None => {
+                        warn!("list_path_raw: fallback disk is none2");
+                        break;
+                    }
                 };
                 match disk
                     .as_ref()

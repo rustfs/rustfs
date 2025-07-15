@@ -14,70 +14,69 @@
 
 services:
   node0:
-    image: rustfs:v1  # 替换为你的镜像名称和标签
+    image: rustfs/rustfs:latest # Replace with your image name and label
     container_name: node0
     hostname: node0
     environment:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9000:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
-      - "8000:9001"  # 映射宿主机的 9001 端口到容器的 9000 端口
+      - "9000:9000" # Map port 9001 of the host to port 9000 of the container
     volumes:
-      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
-      # - ./data/node0:/data  # 将当前路径挂载到容器内的 /root/data
+      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
 
   node1:
-    image: rustfs:v1
+    image: rustfs/rustfs:latest
     container_name: node1
     hostname: node1
     environment:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9001:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
+      - "9001:9000" # Map port 9002 of the host to port 9000 of the container
     volumes:
-      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs 
-      # - ./data/node1:/data
+      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
 
   node2:
-    image: rustfs:v1
+    image: rustfs/rustfs:latest
     container_name: node2
     hostname: node2
     environment:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9002:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
+      - "9002:9000" # Map port 9003 of the host to port 9000 of the container
     volumes:
-      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
-      # - ./data/node2:/data
+      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"
 
   node3:
-    image: rustfs:v1
+    image: rustfs/rustfs:latest
     container_name: node3
     hostname: node3
     environment:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
     platform: linux/amd64
     ports:
-      - "9003:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口
+      - "9003:9000" # Map port 9004 of the host to port 9000 of the container
     volumes:
-      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
-      # - ./data/node3:/data
+      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
     command: "/app/rustfs"

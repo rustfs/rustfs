@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
+use crate::store_api::ListPartsInfo;
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -617,6 +618,20 @@ impl StorageAPI for Sets {
         }
 
         Ok((del_objects, del_errs))
+    }
+
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        self.get_disks_by_key(object)
+            .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
