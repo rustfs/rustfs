@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 pub mod error;
 pub mod heal;
 pub mod scanner;
 
 pub use error::{Error, Result};
-pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType};
+pub use heal::{channel::HealChannelProcessor, HealManager, HealOptions, HealPriority, HealRequest, HealType};
 pub use scanner::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, Scanner, ScannerMetrics, load_data_usage_from_backend,
     store_data_usage_in_backend,
@@ -53,4 +54,62 @@ pub fn shutdown_ahm_services() {
     if let Some(cancel_token) = GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+}
+
+/// Global heal manager instance
+static GLOBAL_HEAL_MANAGER: OnceLock<Arc<HealManager>> = OnceLock::new();
+
+/// Global heal channel processor instance
+static GLOBAL_HEAL_CHANNEL_PROCESSOR: OnceLock<Arc<tokio::sync::Mutex<HealChannelProcessor>>> = OnceLock::new();
+
+/// Initialize and start heal manager with channel processor
+pub async fn init_heal_manager_with_channel(
+    storage: Arc<dyn heal::storage::HealStorageAPI>,
+    config: Option<heal::manager::HealConfig>,
+) -> Result<()> {
+    // Create heal manager
+    let heal_manager = Arc::new(HealManager::new(storage, config));
+
+    // Start heal manager
+    heal_manager.start().await?;
+
+    // Store global instance
+    GLOBAL_HEAL_MANAGER
+        .set(heal_manager.clone())
+        .map_err(|_| Error::Config("Heal manager already initialized".to_string()))?;
+
+    // Initialize heal channel
+    let channel_receiver = rustfs_common::heal_channel::init_heal_channel();
+
+    // Create channel processor
+    let channel_processor = HealChannelProcessor::new(heal_manager);
+
+    // Store channel processor instance first
+    GLOBAL_HEAL_CHANNEL_PROCESSOR
+        .set(Arc::new(tokio::sync::Mutex::new(channel_processor)))
+        .map_err(|_| Error::Config("Heal channel processor already initialized".to_string()))?;
+
+    // Start channel processor in background
+    let receiver = channel_receiver;
+    tokio::spawn(async move {
+        if let Some(processor_guard) = GLOBAL_HEAL_CHANNEL_PROCESSOR.get() {
+            let mut processor = processor_guard.lock().await;
+            if let Err(e) = processor.start(receiver).await {
+                error!("Heal channel processor failed: {}", e);
+            }
+        }
+    });
+
+    info!("Heal manager with channel processor initialized successfully");
+    Ok(())
+}
+
+/// Get global heal manager instance
+pub fn get_heal_manager() -> Option<&'static Arc<HealManager>> {
+    GLOBAL_HEAL_MANAGER.get()
+}
+
+/// Get global heal channel processor instance
+pub fn get_heal_channel_processor() -> Option<&'static Arc<tokio::sync::Mutex<HealChannelProcessor>>> {
+    GLOBAL_HEAL_CHANNEL_PROCESSOR.get()
 }

@@ -7967,6 +7967,7 @@ version = "0.0.5"
 dependencies = [
  "tokio",
  "tonic",
+ "uuid",
 ]
 
 [[package]]

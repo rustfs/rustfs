@@ -246,9 +246,7 @@ impl HealEvent {
                 actual_checksum,
                 ..
             } => {
-                format!(
-                    "Checksum mismatch: {bucket}/{object} - expected: {expected_checksum}, actual: {actual_checksum}"
-                )
+                format!("Checksum mismatch: {bucket}/{object} - expected: {expected_checksum}, actual: {actual_checksum}")
             }
             HealEvent::BucketMetadataCorruption {
                 bucket, corruption_type, ..

@@ -194,6 +194,8 @@ async fn test_heal_object_basic() {
             scan_mode: HEAL_NORMAL_SCAN,
             update_parity: true,
             timeout: Some(Duration::from_secs(300)),
+            pool_index: None,
+            set_index: None,
         },
         HealPriority::Normal,
     );
@@ -260,6 +262,8 @@ async fn test_heal_bucket_basic() {
             scan_mode: HEAL_NORMAL_SCAN,
             update_parity: false,
             timeout: Some(Duration::from_secs(300)),
+            pool_index: None,
+            set_index: None,
         },
         HealPriority::Normal,
     );

@@ -30,3 +30,4 @@ workspace = true
 [dependencies]
 tokio.workspace = true
 tonic = { workspace = true }
+uuid = { workspace = true }

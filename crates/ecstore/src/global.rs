@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal::mrf::MRFState;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
@@ -53,12 +52,11 @@ pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new()
 pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
 pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
 pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
+// pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
 pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
 pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
 pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();
 //pub static ref GLOBAL_RemoteTargetTransport
-pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
-pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
 static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
 pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
 pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();

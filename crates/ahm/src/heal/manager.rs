@@ -52,7 +52,7 @@ impl Default for HealConfig {
     fn default() -> Self {
         Self {
             enable_auto_heal: true,
-            heal_interval: Duration::from_secs(60), // 1 minute
+            heal_interval: Duration::from_secs(10), // 10 seconds
             max_concurrent_heals: 4,
             task_timeout: Duration::from_secs(300), // 5 minutes
             queue_size: 1000,

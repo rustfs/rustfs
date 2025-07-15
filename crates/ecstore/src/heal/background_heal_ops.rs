@@ -33,7 +33,7 @@ use super::{
     heal_ops::{HealSequence, new_bg_heal_sequence},
 };
 use crate::error::{Error, Result};
-use crate::global::{GLOBAL_MRFState, get_background_services_cancel_token};
+use crate::global::get_background_services_cancel_token;
 use crate::heal::error::ERR_RETRY_HEALING;
 use crate::heal::heal_commands::{HEAL_ITEM_BUCKET, HealScanMode};
 use crate::heal::heal_ops::{BG_HEALING_UUID, HealSource};
@@ -76,10 +76,10 @@ pub async fn init_auto_heal() {
         });
     }
 
-    let cancel_clone = cancel_token.clone();
-    spawn(async move {
-        GLOBAL_MRFState.heal_routine_with_cancel(cancel_clone).await;
-    });
+    // let cancel_clone = cancel_token.clone();
+    // spawn(async move {
+    //     GLOBAL_MRFState.heal_routine_with_cancel(cancel_clone).await;
+    // });
 }
 
 async fn init_background_healing() {

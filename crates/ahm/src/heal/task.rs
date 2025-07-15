@@ -94,6 +94,10 @@ pub struct HealOptions {
     pub dry_run: bool,
     /// Timeout
     pub timeout: Option<Duration>,
+    /// pool index
+    pub pool_index: Option<usize>,
+    /// set index
+    pub set_index: Option<usize>,
 }
 
 impl Default for HealOptions {
@@ -106,6 +110,8 @@ impl Default for HealOptions {
             recursive: false,
             dry_run: false,
             timeout: Some(Duration::from_secs(300)), // 5 minutes default timeout
+            pool_index: None,
+            set_index: None,
         }
     }
 }
@@ -339,8 +345,8 @@ impl HealTask {
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
             no_lock: false,
-            pool: None,
-            set: None,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
         };
 
         match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
@@ -491,8 +497,8 @@ impl HealTask {
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
             no_lock: false,
-            pool: None,
-            set: None,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
         };
 
         match self.storage.heal_bucket(bucket, &heal_opts).await {
@@ -609,8 +615,8 @@ impl HealTask {
             scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
             update_parity: false,
             no_lock: false,
-            pool: None,
-            set: None,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
         };
 
         match self.storage.heal_object(bucket, object, None, &heal_opts).await {

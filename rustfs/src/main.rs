@@ -29,7 +29,10 @@ use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::scanner::data_scanner::ScannerConfig;
-use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_services};
+use rustfs_ahm::{
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager_with_channel,
+    shutdown_ahm_services,
+};
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
@@ -185,6 +188,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init_data_scanner().await;
     // init_auto_heal().await;
     let _ = create_ahm_services_cancel_token();
+
+    // Initialize heal manager with channel processor
+    let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+    init_heal_manager_with_channel(heal_storage, None).await?;
+
     let scanner = Scanner::new(Some(ScannerConfig::default()), None);
     scanner.start().await?;
     print_server_info();
