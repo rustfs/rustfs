@@ -5436,8 +5436,8 @@ impl StorageAPI for SetDisks {
 
                 let splits: Vec<&str> = upload_id.split("x").collect();
                 if splits.len() == 2 {
-                    if let Ok(unix) = splits[1].parse::<i64>() {
-                        OffsetDateTime::from_unix_timestamp(unix)?
+                    if let Ok(unix) = splits[1].parse::<i128>() {
+                        OffsetDateTime::from_unix_timestamp_nanos(unix)?
                     } else {
                         now
                     }

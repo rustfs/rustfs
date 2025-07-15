@@ -28,6 +28,7 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
 use rustfs_s3select_api::query::Query;
@@ -1502,7 +1503,7 @@ impl S3 for FS {
         };
 
         let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = max_parts.unwrap_or_default() as usize;
+        let max_parts = max_parts.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
 
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
@@ -1550,7 +1551,7 @@ impl S3 for FS {
 
         let prefix = prefix.unwrap_or_default();
 
-        let max_uploads = max_uploads.unwrap_or_default() as usize;
+        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
 
         if let Some(key_marker) = &key_marker {
             if !key_marker.starts_with(prefix.as_str()) {
