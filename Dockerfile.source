@@ -79,12 +79,19 @@ RUN cargo run --bin gproto
 # Build the actual application with optimizations
 RUN case "$TARGETPLATFORM" in \
         "linux/amd64") \
+            echo "🔨 Building for amd64..." && \
+            rustup target add x86_64-unknown-linux-gnu && \
             cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
         "linux/arm64") \
+            echo "🔨 Building for arm64..." && \
+            rustup target add aarch64-unknown-linux-gnu && \
             cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+            ;; \
+        *) \
+            echo "❌ Unsupported platform: $TARGETPLATFORM" && exit 1 \
             ;; \
     esac
 
