@@ -12,19 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Release
+# ⚠️ DEPRECATED: This workflow has been deprecated
+# Release logic has been merged into build.yml to avoid cross-workflow artifact access issues.
+# This file is kept for reference but is no longer active.
+
+name: Release (Deprecated)
 
 on:
-  # Automatically triggered when build workflow completes successfully
-  workflow_run:
-    workflows: ["Build and Release"]
-    types: [completed]
-    branches: [main]
-  # Manual trigger for standalone release creation
+  # Disabled - release logic is now in build.yml
+  # workflow_run:
+  #   workflows: ["Build and Release"]
+  #   types: [completed]
+  #   branches: [main]
+  # Manual trigger for standalone release creation (disabled)
+  # workflow_dispatch:
+  #   inputs:
+  #     tag:
+  #       description: "Tag to create release for"
+  #       required: true
+  #       type: string
+
+  # This workflow is disabled - only manual trigger with specific confirmation
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to create release for"
+      confirm_deprecated:
+        description: "This workflow is deprecated. Type 'CONFIRM' to run anyway."
         required: true
         type: string
 
@@ -32,9 +44,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Warning job to inform users this workflow is deprecated
+  deprecated-warning:
+    name: ⚠️ Deprecated Workflow Warning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Display deprecation warning
+        run: |
+          echo "🚨 WARNING: This workflow has been DEPRECATED 🚨"
+          echo ""
+          echo "Release functionality has been moved to the build.yml workflow"
+          echo "to resolve cross-workflow artifact access issues."
+          echo ""
+          echo "Please use tag pushes to trigger releases automatically via build.yml"
+          echo ""
+          if [[ "${{ github.event.inputs.confirm_deprecated }}" != "CONFIRM" ]]; then
+            echo "❌ To run this deprecated workflow anyway, you must type 'CONFIRM' in the input field."
+            echo "⚠️  However, this workflow may not work correctly due to artifact access limitations."
+            exit 1
+          fi
+          echo "⚠️  Proceeding with deprecated workflow as requested..."
+
   # Determine release type and check if we should proceed
   release-check:
     name: Release Type Check
+    needs: deprecated-warning
+    if: github.event.inputs.confirm_deprecated == 'CONFIRM'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}
@@ -133,7 +168,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     needs: release-check
-    if: needs.release-check.outputs.should_release == 'true'
+    if: needs.release-check.outputs.should_release == 'true' && github.event.inputs.confirm_deprecated == 'CONFIRM'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -203,6 +238,7 @@ jobs:
   prepare-assets:
     name: Prepare Release Assets
     needs: [release-check, create-release]
+    if: github.event.inputs.confirm_deprecated == 'CONFIRM'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -367,6 +403,7 @@ jobs:
   upload-assets:
     name: Upload Release Assets
     needs: [release-check, create-release, prepare-assets]
+    if: github.event.inputs.confirm_deprecated == 'CONFIRM'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -399,7 +436,7 @@ jobs:
   update-latest:
     name: Update Latest Version
     needs: [release-check, upload-assets]
-    if: needs.release-check.outputs.is_prerelease == 'false'
+    if: needs.release-check.outputs.is_prerelease == 'false' && github.event.inputs.confirm_deprecated == 'CONFIRM'
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
@@ -444,6 +481,7 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [release-check, create-release, upload-assets]
+    if: github.event.inputs.confirm_deprecated == 'CONFIRM'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -470,17 +508,7 @@ jobs:
             fi
           fi
 
-          # Use release notes template if available
-          if [[ -f ".github/workflows/release-notes-template.md" ]]; then
-            # Substitute variables in template
-            sed -e "s/\${VERSION}/$TAG/g" \
-                -e "s/\${VERSION_CLEAN}/$VERSION/g" \
-                -e "s/\${ORIGINAL_NOTES}/$(echo "$ORIGINAL_NOTES" | sed 's/[[\.*^$()+?{|]/\\&/g')/g" \
-                .github/workflows/release-notes-template.md > enhanced_notes.md
 
-            # Update release notes
-            gh release edit "$TAG" --notes-file enhanced_notes.md
-          fi
 
           # Publish the release (remove draft status)
           gh release edit "$TAG" --draft=false
