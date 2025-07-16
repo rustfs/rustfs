@@ -28,7 +28,7 @@ pub enum HealChannelCommand {
 }
 
 /// Heal request from admin to ahm
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HealChannelRequest {
     /// Unique request ID
     pub id: String,
@@ -120,7 +120,7 @@ pub async fn send_heal_command(command: HealChannelCommand) -> Result<(), String
     if let Some(sender) = get_heal_channel_sender() {
         sender
             .send(command)
-            .map_err(|e| format!("Failed to send heal command: {}", e))?;
+            .map_err(|e| format!("Failed to send heal command: {e}"))?;
         Ok(())
     } else {
         Err("Heal channel not initialized".to_string())
@@ -175,13 +175,6 @@ pub fn create_heal_request_with_options(
     priority: Option<HealChannelPriority>,
     pool_index: Option<usize>,
     set_index: Option<usize>,
-    scan_mode: Option<HealChannelScanMode>,
-    remove_corrupted: Option<bool>,
-    recreate_missing: Option<bool>,
-    update_parity: Option<bool>,
-    recursive: Option<bool>,
-    dry_run: Option<bool>,
-    timeout_seconds: Option<u64>,
 ) -> HealChannelRequest {
     HealChannelRequest {
         id: Uuid::new_v4().to_string(),
@@ -191,13 +184,7 @@ pub fn create_heal_request_with_options(
         priority: priority.unwrap_or_default(),
         pool_index,
         set_index,
-        scan_mode,
-        remove_corrupted,
-        recreate_missing,
-        update_parity,
-        recursive,
-        dry_run,
-        timeout_seconds,
+        ..Default::default()
     }
 }
 

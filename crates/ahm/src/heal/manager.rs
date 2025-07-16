@@ -278,7 +278,6 @@ impl HealManager {
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
                         let mut endpoints = Vec::new();
-                        println!("GLOBAL_LOCAL_DISK_MAP length: {:?}", GLOBAL_LOCAL_DISK_MAP.read().await.len());
                         for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
                             if let Some(disk) = disk_opt {
                                 // detect unformatted disk via get_disk_id()
@@ -300,7 +299,6 @@ impl HealManager {
                         if endpoints.is_empty() {
                             continue;
                         }
-                        println!("endpoints length: {:?}", endpoints.len());
 
                         for ep in endpoints {
                             // skip if already queued or healing

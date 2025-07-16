@@ -103,7 +103,7 @@ impl HealChannelProcessor {
                 let response = HealChannelResponse {
                     request_id: request.id,
                     success: true,
-                    data: Some(format!("Task ID: {}", task_id).into_bytes()),
+                    data: Some(format!("Task ID: {task_id}").into_bytes()),
                     error: None,
                 };
 
@@ -140,7 +140,7 @@ impl HealChannelProcessor {
         let response = HealChannelResponse {
             request_id: client_token,
             success: true,
-            data: Some(format!("Query result for path: {}", heal_path).into_bytes()),
+            data: Some(format!("Query result for path: {heal_path}").into_bytes()),
             error: None,
         };
 
@@ -160,7 +160,7 @@ impl HealChannelProcessor {
         let response = HealChannelResponse {
             request_id: heal_path.clone(),
             success: true,
-            data: Some(format!("Cancel request for path: {}", heal_path).into_bytes()),
+            data: Some(format!("Cancel request for path: {heal_path}").into_bytes()),
             error: None,
         };
 
@@ -196,9 +196,7 @@ impl HealChannelProcessor {
             Some(rustfs_common::heal_channel::HealChannelScanMode::Normal) => {
                 rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN
             }
-            Some(rustfs_common::heal_channel::HealChannelScanMode::Deep) => {
-                rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN
-            }
+            Some(rustfs_common::heal_channel::HealChannelScanMode::Deep) => rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
             None => rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
         };
 
@@ -210,7 +208,7 @@ impl HealChannelProcessor {
             update_parity: request.update_parity.unwrap_or(true),
             recursive: request.recursive.unwrap_or(false),
             dry_run: request.dry_run.unwrap_or(false),
-            timeout: request.timeout_seconds.map(|secs| std::time::Duration::from_secs(secs)),
+            timeout: request.timeout_seconds.map(std::time::Duration::from_secs),
             pool_index: request.pool_index,
             set_index: request.set_index,
         };

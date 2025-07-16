@@ -12,11 +12,15 @@ use rustfs_ecstore::{
 };
 use serial_test::serial;
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tracing::info;
 use walkdir::WalkDir;
+
+static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
 static INIT: Once = Once::new();
+
 fn init_tracing() {
     INIT.call_once(|| {
         let _ = tracing_subscriber::fmt::try_init();
@@ -25,9 +29,7 @@ fn init_tracing() {
 
 /// Test helper: Create test environment with ECStore
 async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
-    use std::sync::OnceLock;
     init_tracing();
-    static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
 
     // Fast path: already initialized, just clone and return
     if let Some((paths, ecstore, heal_storage)) = GLOBAL_ENV.get() {
@@ -124,24 +126,6 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
-/// Test helper: Cleanup test environment
-async fn cleanup_test_env(disk_paths: &[PathBuf]) {
-    for disk_path in disk_paths {
-        if disk_path.exists() {
-            fs::remove_dir_all(disk_path).await.expect("Failed to cleanup disk path");
-        }
-    }
-
-    // Attempt to clean up base directory inferred from disk_paths[0]
-    if let Some(parent) = disk_paths.first().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-        if parent.exists() {
-            fs::remove_dir_all(parent).await.ok();
-        }
-    }
-
-    info!("Test environment cleaned up");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_heal_object_basic() {
@@ -219,9 +203,6 @@ async fn test_heal_object_basic() {
     // ─── 2️⃣ verify each part file is restored ───────
     assert!(target_part.exists());
 
-    // Cleanup
-    cleanup_test_env(&disk_paths).await;
-
     info!("Heal object basic test passed");
 }
 
@@ -290,9 +271,6 @@ async fn test_heal_bucket_basic() {
     // ─── 3️⃣ Verify bucket directory is restored on every disk ───────
     assert!(broken_bucket_path.exists(), "bucket dir does not exist on disk");
 
-    // Cleanup
-    cleanup_test_env(&disk_paths).await;
-
     info!("Heal bucket basic test passed");
 }
 
@@ -322,16 +300,13 @@ async fn test_heal_format_basic() {
     // ─── 2️⃣ verify format.json is restored ───────
     assert!(format_path.exists(), "format.json does not exist on disk after heal");
 
-    // Cleanup
-    cleanup_test_env(&disk_paths).await;
-
     info!("Heal format basic test passed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_heal_storage_api_direct() {
-    let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+    let (_disk_paths, ecstore, heal_storage) = setup_test_env().await;
 
     // Test direct heal storage API calls
 
@@ -382,9 +357,6 @@ async fn test_heal_storage_api_direct() {
         .await;
     assert!(object_result.is_ok());
     info!("Direct heal_object test passed");
-
-    // Cleanup
-    cleanup_test_env(&disk_paths).await;
 
     info!("Direct heal storage API test passed");
 }

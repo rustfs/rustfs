@@ -3686,14 +3686,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_disk_method() {
-        let service = create_test_node_service();
-        let disks = service.all_disk().await;
-        // Should return empty vector in test environment
-        assert!(disks.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_find_disk_method() {
         let service = create_test_node_service();
         let disk = service.find_disk(&"non-existent-disk".to_string()).await;

@@ -1159,8 +1159,17 @@ mod tests {
     use serial_test::serial;
     use std::fs;
     use std::net::SocketAddr;
+    use std::sync::OnceLock;
+
+    // Global test environment cache to avoid repeated initialization
+    static GLOBAL_TEST_ENV: OnceLock<(Vec<std::path::PathBuf>, Arc<ECStore>)> = OnceLock::new();
 
     async fn prepare_test_env(test_dir: Option<&str>, port: Option<u16>) -> (Vec<std::path::PathBuf>, Arc<ECStore>) {
+        // Check if global environment is already initialized
+        if let Some((disk_paths, ecstore)) = GLOBAL_TEST_ENV.get() {
+            return (disk_paths.clone(), ecstore.clone());
+        }
+
         // create temp dir as 4 disks
         let test_base_dir = test_dir.unwrap_or("/tmp/rustfs_ahm_test");
         let temp_dir = std::path::PathBuf::from(test_base_dir);
@@ -1221,6 +1230,9 @@ mod tests {
             .unwrap();
         let buckets = buckets_list.into_iter().map(|v| v.name).collect();
         rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+
+        // Store in global cache
+        let _ = GLOBAL_TEST_ENV.set((disk_paths.clone(), ecstore.clone()));
 
         (disk_paths, ecstore)
     }
