@@ -204,6 +204,9 @@ jobs:
     name: Prepare Release Assets
     needs: [release-check, create-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       assets_prepared: ${{ steps.prepare.outputs.assets_prepared }}
     steps:
@@ -211,11 +214,103 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts from build workflow
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
-          pattern: rustfs-*
-          merge-multiple: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Get the workflow run ID that triggered this workflow
+            WORKFLOW_RUN_ID="${{ github.event.workflow_run.id }}"
+
+            echo "📥 Downloading artifacts from workflow run: $WORKFLOW_RUN_ID"
+
+            # Create artifacts directory
+            mkdir -p ./artifacts
+
+            # List all artifacts from the triggering workflow run
+            echo "📋 Listing artifacts..."
+            gh api repos/${{ github.repository }}/actions/runs/$WORKFLOW_RUN_ID/artifacts \
+              --jq '.artifacts[] | select(.name | startswith("rustfs-")) | {name: .name, download_url: .archive_download_url}' \
+              > artifacts_list.json
+
+            # Download each artifact
+            while IFS= read -r artifact_info; do
+              if [[ -n "$artifact_info" ]]; then
+                name=$(echo "$artifact_info" | jq -r '.name')
+                download_url=$(echo "$artifact_info" | jq -r '.download_url')
+
+                echo "📦 Downloading artifact: $name"
+
+                # Download the artifact zip
+                gh api "$download_url" > "${name}.zip"
+
+                # Extract the artifact (GitHub API returns artifacts as zip files)
+                unzip -q "${name}.zip" -d "./artifacts/"
+                rm "${name}.zip"
+
+                echo "✅ Downloaded and extracted: $name"
+              fi
+            done < <(cat artifacts_list.json | jq -c '.')
+
+            # List what we downloaded
+            echo "📂 Downloaded artifacts:"
+            ls -la ./artifacts/
+
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual trigger - need to find the most recent successful build workflow for the tag
+            TAG="${{ needs.release-check.outputs.tag }}"
+
+            echo "🔍 Manual trigger detected, searching for build artifacts for tag: $TAG"
+
+            # Find the most recent successful "Build and Release" workflow run for this tag
+            echo "📋 Searching for workflow runs..."
+            WORKFLOW_RUN_ID=$(gh api repos/${{ github.repository }}/actions/workflows/build.yml/runs \
+              --jq ".workflow_runs[] | select(.head_branch == \"refs/tags/$TAG\" and .conclusion == \"success\") | .id" \
+              | head -n 1)
+
+            if [[ -z "$WORKFLOW_RUN_ID" ]]; then
+              echo "❌ No successful build workflow found for tag $TAG"
+              echo "💡 Please ensure the build workflow has completed successfully for this tag"
+              exit 1
+            fi
+
+            echo "📥 Found build workflow run: $WORKFLOW_RUN_ID"
+
+            # Create artifacts directory
+            mkdir -p ./artifacts
+
+            # List all artifacts from the build workflow run
+            echo "📋 Listing artifacts..."
+            gh api repos/${{ github.repository }}/actions/runs/$WORKFLOW_RUN_ID/artifacts \
+              --jq '.artifacts[] | select(.name | startswith("rustfs-")) | {name: .name, download_url: .archive_download_url}' \
+              > artifacts_list.json
+
+            # Download each artifact
+            while IFS= read -r artifact_info; do
+              if [[ -n "$artifact_info" ]]; then
+                name=$(echo "$artifact_info" | jq -r '.name')
+                download_url=$(echo "$artifact_info" | jq -r '.download_url')
+
+                echo "📦 Downloading artifact: $name"
+
+                # Download the artifact zip
+                gh api "$download_url" > "${name}.zip"
+
+                # Extract the artifact (GitHub API returns artifacts as zip files)
+                unzip -q "${name}.zip" -d "./artifacts/"
+                rm "${name}.zip"
+
+                echo "✅ Downloaded and extracted: $name"
+              fi
+            done < <(cat artifacts_list.json | jq -c '.')
+
+            # List what we downloaded
+            echo "📂 Downloaded artifacts:"
+            ls -la ./artifacts/
+
+          else
+            echo "❌ Unsupported event type: ${{ github.event_name }}"
+            exit 1
+          fi
 
       - name: Prepare release assets
         id: prepare
