@@ -234,7 +234,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-            - name: Extract metadata and generate tags
+      - name: Extract metadata and generate tags
         id: meta
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
