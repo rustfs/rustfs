@@ -25,17 +25,7 @@ RUN apt-get update && apt-get install -y \
     lld \
     && rm -rf /var/lib/apt/lists/*
 
-# Install sccache for Rust compilation caching
-RUN wget https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-dist-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-    && tar -xzf sccache-dist-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-    && mv sccache-dist-v0.10.0-x86_64-unknown-linux-musl/sccache-dist /usr/local/bin/sccache \
-    && chmod +x /usr/local/bin/sccache \
-    && rm -rf sccache-dist-v0.10.0-x86_64-unknown-linux-musl.tar.gz sccache-dist-v0.10.0-x86_64-unknown-linux-musl
-
-# Set up sccache environment
-ENV RUSTC_WRAPPER=sccache \
-    SCCACHE_DIR=/tmp/sccache \
-    SCCACHE_CACHE_SIZE=2G
+# Note: sccache removed for simpler builds
 
 # Install cross-compilation tools for ARM64
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -87,8 +77,7 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
 RUN cargo run --bin gproto
 
 # Build the actual application with optimizations
-RUN sccache --start-server 2>/dev/null || true && \
-    case "$TARGETPLATFORM" in \
+RUN case "$TARGETPLATFORM" in \
         "linux/amd64") \
             cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
@@ -97,8 +86,7 @@ RUN sccache --start-server 2>/dev/null || true && \
             cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
-    esac && \
-    sccache --show-stats || true
+    esac
 
 # Runtime stage - Ubuntu minimal for better compatibility
 FROM ubuntu:22.04
