@@ -153,7 +153,7 @@ jobs:
         uses: lewagon/wait-on-check-action@v1.3.1
         with:
           ref: ${{ needs.release-check.outputs.tag }}
-          check-name: "Build RustFS"
+          check-name: Build RustFS
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 30
           allowed-conclusions: success
