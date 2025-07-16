@@ -242,7 +242,7 @@ jobs:
               cargo install cross --git https://github.com/cross-rs/cross
               cross build --release --target ${{ matrix.target }} -p rustfs --bins
             else
-              # Use zigbuild for Linux ARM64
+              # Use zigbuild for other cross-compilation
               cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
             fi
           else
@@ -456,6 +456,13 @@ jobs:
           echo "🔢 Version: $VERSION"
           echo ""
 
+          # Check build status
+          BUILD_STATUS="${{ needs.build-rustfs.result }}"
+
+          echo "📊 Build Results:"
+          echo "  📦 All platforms: $BUILD_STATUS"
+          echo ""
+
           case "$BUILD_TYPE" in
             "development")
               echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
@@ -477,21 +484,8 @@ jobs:
           echo "🐳 Docker Images:"
           if [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
             echo "⏭️  Docker image build was skipped (binary only build)"
+          elif [[ "$BUILD_STATUS" == "success" ]]; then
+            echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
           else
-            echo "🔄 Docker images will be built and pushed automatically using the binary artifacts"
+            echo "❌ Docker image build will be skipped due to build failure"
           fi
-
-  # Call Docker workflow after successful build
-  call-docker-build:
-    name: Build And Push Docker Images
-    needs: [build-check, build-rustfs]
-    if: needs.build-check.outputs.should_build == 'true' && github.event.inputs.build_docker != 'false'
-    uses: ./.github/workflows/docker.yml
-    with:
-      build_type: ${{ needs.build-check.outputs.build_type }}
-      version: ${{ needs.build-check.outputs.version }}
-      short_sha: ${{ needs.build-check.outputs.short_sha }}
-      is_prerelease: ${{ needs.build-check.outputs.is_prerelease }}
-      push_images: true
-      force_rebuild: false
-    secrets: inherit

@@ -1,8 +1,9 @@
 # Multi-stage build for RustFS production image
 FROM alpine:latest AS build
 
-# Build arguments
-ARG TARGETARCH
+# Build arguments - use TARGETPLATFORM for consistency with Dockerfile.source
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
 ARG RELEASE=latest
 ARG CHANNEL=release
 
@@ -18,11 +19,11 @@ RUN apk add --no-cache \
 # Create build directory
 WORKDIR /build
 
-# Map TARGETARCH to architecture format used in builds
-RUN case "${TARGETARCH}" in \
-        "amd64") ARCH="x86_64" ;; \
-        "arm64") ARCH="aarch64" ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+# Map TARGETPLATFORM to architecture format used in builds
+RUN case "${TARGETPLATFORM}" in \
+        "linux/amd64") ARCH="x86_64" ;; \
+        "linux/arm64") ARCH="aarch64" ;; \
+        *) echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 ;; \
     esac && \
     echo "ARCH=${ARCH}" > /build/arch.env
 
