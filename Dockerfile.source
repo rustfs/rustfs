@@ -19,11 +19,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install sccache for Rust compilation caching
-RUN wget https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
-    && tar -xzf sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
-    && mv sccache-v0.8.1-x86_64-unknown-linux-gnu/sccache /usr/local/bin/ \
+RUN wget https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-dist-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
+    && tar -xzf sccache-dist-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
+    && mv sccache-dist-v0.10.0-x86_64-unknown-linux-musl/sccache-dist /usr/local/bin/sccache \
     && chmod +x /usr/local/bin/sccache \
-    && rm -rf sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz sccache-v0.8.1-x86_64-unknown-linux-gnu
+    && rm -rf sccache-dist-v0.10.0-x86_64-unknown-linux-musl.tar.gz sccache-dist-v0.10.0-x86_64-unknown-linux-musl
 
 # Set up sccache environment
 ENV RUSTC_WRAPPER=sccache \
@@ -63,7 +63,7 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 WORKDIR /usr/src/rustfs
 
 # Copy cargo configuration for optimized builds
-COPY cargo.config.toml ./.cargo/config.toml
+COPY Cargo.toml ./.cargo/config.toml
 
 # Copy Cargo files for dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -147,9 +147,6 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_VOLUMES=/data \
     RUST_LOG=warn
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
 
 # Volume for data
 VOLUME ["/data"]
