@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Build and Release Workflow
+#
+# This workflow builds RustFS binaries and automatically triggers Docker image builds.
+#
+# Flow:
+# 1. Build binaries for multiple platforms
+# 2. Upload binaries to OSS storage
+# 3. Trigger docker.yml to build and push images using the uploaded binaries
+#
+# Manual Parameters:
+# - build_docker: Build and push Docker images (default: true)
+
 name: Build and Release
 
 on:
@@ -52,10 +64,10 @@ on:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
     inputs:
-      force_build:
-        description: "Force build even without changes"
+      build_docker:
+        description: "Build and push Docker images after binary build"
         required: false
-        default: false
+        default: true
         type: boolean
 
 env:
@@ -117,7 +129,6 @@ jobs:
             echo "🛠️  Development build detected"
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
                [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-               [[ "${{ github.event.inputs.force_build }}" == "true" ]] || \
                [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
             # Scheduled or manual build
             should_build=true
@@ -461,3 +472,26 @@ jobs:
               echo "🏷️  GitHub Release will be created automatically by the release workflow"
               ;;
           esac
+
+          echo ""
+          echo "🐳 Docker Images:"
+          if [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
+            echo "⏭️  Docker image build was skipped (binary only build)"
+          else
+            echo "🔄 Docker images will be built and pushed automatically using the binary artifacts"
+          fi
+
+  # Call Docker workflow after successful build
+  call-docker-build:
+    name: Build And Push Docker Images
+    needs: [build-check, build-rustfs]
+    if: needs.build-check.outputs.should_build == 'true' && github.event.inputs.build_docker != 'false'
+    uses: ./.github/workflows/docker.yml
+    with:
+      build_type: ${{ needs.build-check.outputs.build_type }}
+      version: ${{ needs.build-check.outputs.version }}
+      short_sha: ${{ needs.build-check.outputs.short_sha }}
+      is_prerelease: ${{ needs.build-check.outputs.is_prerelease }}
+      push_images: true
+      force_rebuild: false
+    secrets: inherit

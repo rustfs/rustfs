@@ -1,4 +1,13 @@
-# Multi-stage Dockerfile for RustFS
+# Multi-stage Dockerfile for RustFS - LOCAL DEVELOPMENT ONLY
+#
+# ⚠️  IMPORTANT: This Dockerfile is for local development and testing only.
+# ⚠️  It builds RustFS from source code and is NOT used in CI/CD pipelines.
+# ⚠️  CI/CD pipeline uses pre-built binaries from Dockerfile instead.
+#
+# Usage for local development:
+#   docker build -f Dockerfile.source -t rustfs:dev-local .
+#   docker run --rm -p 9000:9000 rustfs:dev-local
+#
 # Supports cross-compilation for amd64 and arm64 architectures
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
