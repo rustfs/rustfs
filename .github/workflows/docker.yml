@@ -169,21 +169,23 @@ jobs:
                 create_latest=true
                 echo "🚀 Building with latest stable release version"
                 ;;
-              v[0-9]*)
-                build_type="release"
-                create_latest=true
-                echo "📦 Building with specific release version: $input_version"
-                ;;
-              v*alpha*|v*beta*|v*rc*)
+              # Prerelease versions (must match first, more specific)
+              v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
                 echo "🧪 Building with prerelease version: $input_version"
+                ;;
+              # Release versions (match after prereleases, more general)
+              v[0-9]*|[0-9]*.*.*)
+                build_type="release"
+                create_latest=true
+                echo "📦 Building with specific release version: $input_version"
                 ;;
               *)
                 # Invalid version for Docker build
                 should_build=false
                 echo "❌ Invalid version for Docker build: $input_version"
-                echo "⚠️  Only release versions (latest, v1.0.0) and prereleases (v1.0.0-alpha1) are supported"
+                echo "⚠️  Only release versions (latest, v1.0.0, 1.0.0) and prereleases (v1.0.0-alpha1, 1.0.0-beta2) are supported"
                 ;;
             esac
           fi
