@@ -15,8 +15,12 @@
 name: Release
 
 on:
-  push:
-    tags: ["*.*.*"]
+  # Automatically triggered when build workflow completes successfully
+  workflow_run:
+    workflows: ["Build and Release"]
+    types: [completed]
+    branches: [main]
+  # Manual trigger for standalone release creation
   workflow_dispatch:
     inputs:
       tag:
@@ -28,7 +32,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Determine release type
+  # Determine release type and check if we should proceed
   release-check:
     name: Release Type Check
     runs-on: ubuntu-latest
@@ -37,47 +41,99 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
       release_type: ${{ steps.check.outputs.release_type }}
+      should_release: ${{ steps.check.outputs.should_release }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Determine release type
         id: check
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
+          should_release=false
+          tag=""
+          version=""
+          is_prerelease=false
+          release_type="release"
+
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Triggered by build workflow completion
+            echo "🔗 Triggered by build workflow completion"
+
+            # Only proceed if the build workflow was successful
+            if [[ "${{ github.event.workflow_run.conclusion }}" != "success" ]]; then
+              echo "❌ Build workflow failed (conclusion: ${{ github.event.workflow_run.conclusion }}), skipping release"
+              should_release=false
+            else
+              echo "✅ Build workflow succeeded, checking if this is a tag push"
+
+              # Check if this was triggered by a tag push
+              if [[ "${{ github.event.workflow_run.event }}" == "push" ]]; then
+                # Extract tag from head_branch for tag pushes
+                head_branch="${{ github.event.workflow_run.head_branch }}"
+                if [[ "$head_branch" =~ ^refs/tags/ ]]; then
+                  tag="${head_branch#refs/tags/}"
+                  should_release=true
+                  echo "🏷️  Tag push detected: $tag"
+                else
+                  echo "⏭️  Not a tag push, skipping release (branch: $head_branch)"
+                  should_release=false
+                fi
+              else
+                echo "⏭️  Not a push event, skipping release (event: ${{ github.event.workflow_run.event }})"
+                should_release=false
+              fi
+            fi
+
+            echo "🔄 Release triggered by workflow_run:"
+            echo "   📋 Conclusion: ${{ github.event.workflow_run.conclusion }}"
+            echo "   🌿 Branch: ${{ github.event.workflow_run.head_branch }}"
+            echo "   📎 SHA: ${{ github.event.workflow_run.head_sha }}"
+            echo "   🎯 Event: ${{ github.event.workflow_run.event }}"
+
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual trigger
+            tag="${{ github.event.inputs.tag }}"
+            should_release=true
+            echo "🎯 Manual release triggered for tag: $tag"
           fi
 
-          VERSION="${TAG}"
+          # Process tag if we should proceed
+          if [[ "$should_release" == "true" && -n "$tag" ]]; then
+            version="$tag"
 
-          # Check if this is a prerelease
-          IS_PRERELEASE=false
-          RELEASE_TYPE="release"
-
-          if [[ "$TAG" == *"alpha"* ]] || [[ "$TAG" == *"beta"* ]] || [[ "$TAG" == *"rc"* ]]; then
-            IS_PRERELEASE=true
-            if [[ "$TAG" == *"alpha"* ]]; then
-              RELEASE_TYPE="alpha"
-            elif [[ "$TAG" == *"beta"* ]]; then
-              RELEASE_TYPE="beta"
-            elif [[ "$TAG" == *"rc"* ]]; then
-              RELEASE_TYPE="rc"
+            # Check if this is a prerelease
+            if [[ "$tag" == *"alpha"* ]] || [[ "$tag" == *"beta"* ]] || [[ "$tag" == *"rc"* ]]; then
+              is_prerelease=true
+              if [[ "$tag" == *"alpha"* ]]; then
+                release_type="alpha"
+              elif [[ "$tag" == *"beta"* ]]; then
+                release_type="beta"
+              elif [[ "$tag" == *"rc"* ]]; then
+                release_type="rc"
+              fi
             fi
           fi
 
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
-          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+          echo "should_release=$should_release" >> $GITHUB_OUTPUT
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
+          echo "release_type=$release_type" >> $GITHUB_OUTPUT
 
-          echo "📦 Release Type: $RELEASE_TYPE"
-          echo "🏷️  Tag: $TAG"
-          echo "🔢 Version: $VERSION"
-          echo "🚀 Is Prerelease: $IS_PRERELEASE"
+          echo "📊 Release Summary:"
+          echo "  - Should release: $should_release"
+          echo "  - Tag: $tag"
+          echo "  - Version: $version"
+          echo "  - Is prerelease: $is_prerelease"
+          echo "  - Release type: $release_type"
 
   # Create GitHub Release
   create-release:
     name: Create GitHub Release
     needs: release-check
+    if: needs.release-check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -143,25 +199,10 @@ jobs:
           echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
           echo "Created release: $RELEASE_URL"
 
-  # Wait for build artifacts from build.yml
-  wait-for-artifacts:
-    name: Wait for Build Artifacts
-    needs: release-check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wait for build workflow
-        uses: lewagon/wait-on-check-action@v1.4.0
-        with:
-          ref: ${{ needs.release-check.outputs.tag }}
-          check-name: Build RustFS
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 600
-          allowed-conclusions: success
-
   # Download and prepare release assets
   prepare-assets:
     name: Prepare Release Assets
-    needs: [release-check, wait-for-artifacts]
+    needs: [release-check, create-release]
     runs-on: ubuntu-latest
     outputs:
       assets_prepared: ${{ steps.prepare.outputs.assets_prepared }}
