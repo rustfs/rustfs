@@ -27,10 +27,9 @@
 
 name: Docker Images
 
-# Permissions needed for workflow_run event and GitHub API access
+# Permissions needed for workflow_run event and Docker registry access
 permissions:
   contents: read
-  actions: read
   packages: write
 
 on:
@@ -102,44 +101,16 @@ jobs:
             echo "🔗 Triggered by build workflow completion"
 
             # Check if the triggering workflow was successful
-            if [[ "${{ github.event.workflow_run.conclusion }}" != "success" ]]; then
-              echo "❌ Build workflow failed, skipping Docker build"
-              exit 0
-            fi
-
-            # Get workflow run details via GitHub API to check Linux build status
-            echo "🔍 Checking Linux build status from workflow run..."
-
-            # Use GitHub API to get detailed job information
-            WORKFLOW_RUN_ID="${{ github.event.workflow_run.id }}"
-
-            # Get jobs from the workflow run
-            echo "📡 Fetching job details for workflow run: $WORKFLOW_RUN_ID"
-
-            # Check if Linux builds were successful using GitHub API
-            JOBS_RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$WORKFLOW_RUN_ID/jobs")
-
-            # Extract Linux build job status
-            LINUX_X64_SUCCESS=$(echo "$JOBS_RESPONSE" | jq -r '.jobs[] | select(.name | contains("x86_64-unknown-linux-musl")) | .conclusion')
-            LINUX_ARM64_SUCCESS=$(echo "$JOBS_RESPONSE" | jq -r '.jobs[] | select(.name | contains("aarch64-unknown-linux-musl")) | .conclusion')
-
-            echo "🐧 Linux build status:"
-            echo "   x86_64: $LINUX_X64_SUCCESS"
-            echo "   aarch64: $LINUX_ARM64_SUCCESS"
-
-            # Only proceed if both Linux builds are successful
-            if [[ "$LINUX_X64_SUCCESS" == "success" ]] && [[ "$LINUX_ARM64_SUCCESS" == "success" ]]; then
+            # If the workflow succeeded, it means ALL builds (including Linux x86_64 and aarch64) succeeded
+            if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+              echo "✅ Build workflow succeeded, all builds including Linux are successful"
               linux_builds_success=true
               should_build=true
               should_push=true
-              echo "✅ Both Linux builds successful, proceeding with Docker build"
             else
+              echo "❌ Build workflow failed (conclusion: ${{ github.event.workflow_run.conclusion }}), skipping Docker build"
               linux_builds_success=false
               should_build=false
-              echo "❌ Linux builds not both successful, skipping Docker build"
-              echo "   x86_64 status: $LINUX_X64_SUCCESS"
-              echo "   aarch64 status: $LINUX_ARM64_SUCCESS"
             fi
 
             # Extract version info from commit message or use commit SHA
@@ -225,12 +196,6 @@ jobs:
             esac
           fi
 
-          # Only proceed if Linux builds were successful
-          if [[ "$linux_builds_success" != "true" ]]; then
-            echo "❌ Linux builds not successful, skipping Docker image build"
-            should_build=false
-          fi
-
           echo "should_build=$should_build" >> $GITHUB_OUTPUT
           echo "should_push=$should_push" >> $GITHUB_OUTPUT
           echo "build_type=$build_type" >> $GITHUB_OUTPUT
@@ -253,7 +218,7 @@ jobs:
   # Build multi-arch Docker images
   # Strategy: Build images using pre-built binaries from dl.rustfs.com
   # Supports both release and dev channel binaries based on build context
-  # Only runs when Linux builds (x86_64 + aarch64) are successful
+  # Only runs when the triggering build workflow was successful
   build-docker:
     name: Build Docker Images
     needs: build-check
