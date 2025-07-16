@@ -150,12 +150,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for build workflow
-        uses: lewagon/wait-on-check-action@v1.3.1
+        uses: lewagon/wait-on-check-action@v1.4.0
         with:
           ref: ${{ needs.release-check.outputs.tag }}
           check-name: Build RustFS
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 30
+          wait-interval: 600
           allowed-conclusions: success
 
   # Download and prepare release assets
