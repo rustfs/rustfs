@@ -77,14 +77,13 @@ jobs:
       short_sha: ${{ steps.check.outputs.short_sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
       create_latest: ${{ steps.check.outputs.create_latest }}
-      linux_builds_success: ${{ steps.check.outputs.linux_builds_success }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check build conditions and Linux build status
+      - name: Check build conditions
         id: check
         run: |
           should_build=false
@@ -94,7 +93,6 @@ jobs:
           short_sha=""
           is_prerelease=false
           create_latest=false
-          linux_builds_success=false
 
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             # Triggered by build workflow completion
@@ -104,12 +102,10 @@ jobs:
             # If the workflow succeeded, it means ALL builds (including Linux x86_64 and aarch64) succeeded
             if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
               echo "✅ Build workflow succeeded, all builds including Linux are successful"
-              linux_builds_success=true
               should_build=true
               should_push=true
             else
               echo "❌ Build workflow failed (conclusion: ${{ github.event.workflow_run.conclusion }}), skipping Docker build"
-              linux_builds_success=false
               should_build=false
             fi
 
@@ -147,7 +143,6 @@ jobs:
             input_version="${{ github.event.inputs.version }}"
             version="${input_version}"
             should_push="${{ github.event.inputs.push_images }}"
-            linux_builds_success=true  # Assume true for manual builds
             should_build=true
 
             # Get short SHA
@@ -203,7 +198,6 @@ jobs:
           echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
           echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
           echo "create_latest=$create_latest" >> $GITHUB_OUTPUT
-          echo "linux_builds_success=$linux_builds_success" >> $GITHUB_OUTPUT
 
           echo "🐳 Docker Build Summary:"
           echo "  - Should build: $should_build"
@@ -213,16 +207,15 @@ jobs:
           echo "  - Short SHA: $short_sha"
           echo "  - Is prerelease: $is_prerelease"
           echo "  - Create latest: $create_latest"
-          echo "  - Linux builds success: $linux_builds_success"
 
   # Build multi-arch Docker images
   # Strategy: Build images using pre-built binaries from dl.rustfs.com
   # Supports both release and dev channel binaries based on build context
-  # Only runs when the triggering build workflow was successful
+  # Only runs when should_build is true (which includes workflow success check)
   build-docker:
     name: Build Docker Images
     needs: build-check
-    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.linux_builds_success == 'true'
+    if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
