@@ -5,7 +5,6 @@ FROM alpine:latest AS build
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG RELEASE=latest
-ARG CHANNEL=release
 
 # Install dependencies for downloading and verifying binaries
 RUN apk add --no-cache \
@@ -27,30 +26,19 @@ RUN case "${TARGETPLATFORM}" in \
     esac && \
     echo "ARCH=${ARCH}" > /build/arch.env
 
-# Download rustfs binary from dl.rustfs.com
+# Download rustfs binary from dl.rustfs.com (release channel only)
 RUN . /build/arch.env && \
-    BASE_URL="https://dl.rustfs.com/artifacts/rustfs" && \
+    BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
     PLATFORM="linux" && \
     if [ "${RELEASE}" = "latest" ]; then \
-        # Download latest version from specified channel \
-        if [ "${CHANNEL}" = "dev" ]; then \
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-dev-latest.zip"; \
-            DOWNLOAD_URL="${BASE_URL}/dev/${PACKAGE_NAME}"; \
-            echo "📥 Downloading latest dev build: ${PACKAGE_NAME}"; \
-        else \
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-latest.zip"; \
-            DOWNLOAD_URL="${BASE_URL}/release/${PACKAGE_NAME}"; \
-            echo "📥 Downloading latest release build: ${PACKAGE_NAME}"; \
-        fi; \
-    elif [ "${CHANNEL}" = "dev" ]; then \
-        # Download specific dev version \
-        PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-${RELEASE}.zip"; \
-        DOWNLOAD_URL="${BASE_URL}/dev/${PACKAGE_NAME}"; \
-        echo "📥 Downloading specific dev version: ${PACKAGE_NAME}"; \
+        # Download latest release version \
+        PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-latest.zip"; \
+        DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}"; \
+        echo "📥 Downloading latest release build: ${PACKAGE_NAME}"; \
     else \
         # Download specific release version \
         PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${RELEASE}.zip"; \
-        DOWNLOAD_URL="${BASE_URL}/release/${PACKAGE_NAME}"; \
+        DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}"; \
         echo "📥 Downloading specific release version: ${PACKAGE_NAME}"; \
     fi && \
     echo "🔗 Download URL: ${DOWNLOAD_URL}" && \
@@ -71,7 +59,6 @@ FROM alpine:latest
 
 # Set build arguments and labels
 ARG RELEASE=latest
-ARG CHANNEL=release
 ARG BUILD_DATE
 ARG VCS_REF
 
@@ -80,7 +67,6 @@ LABEL name="RustFS" \
     maintainer="RustFS Team <dev@rustfs.com>" \
     version="${RELEASE}" \
     release="${RELEASE}" \
-    channel="${CHANNEL}" \
     build-date="${BUILD_DATE}" \
     vcs-ref="${VCS_REF}" \
     summary="RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API." \
