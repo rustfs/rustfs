@@ -114,32 +114,51 @@ jobs:
             # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
             short_sha=$(git rev-parse --short "${{ github.event.workflow_run.head_sha }}")
 
-            # Determine build type based on branch and commit
-            if [[ "${{ github.event.workflow_run.head_branch }}" == "main" ]]; then
-              build_type="development"
-              version="dev-${short_sha}"
-              # Skip Docker build for development builds
-              should_build=false
-              echo "⏭️  Skipping Docker build for development version (main branch)"
-            elif [[ "${{ github.event.workflow_run.event }}" == "push" ]] && [[ "${{ github.event.workflow_run.head_branch }}" =~ ^refs/tags/ ]]; then
-              # Tag push - only build for releases and prereleases
-              tag_name="${{ github.event.workflow_run.head_branch }}"
-              version="${tag_name#refs/tags/}"
-              if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
-                build_type="prerelease"
-                is_prerelease=true
-                echo "🧪 Building Docker image for prerelease: $version"
+            # Determine build type based on event type and git refs
+            # Check if this is a tag push (release build)
+            if [[ "${{ github.event.workflow_run.event }}" == "push" ]]; then
+              # Get git refs to determine if this is a tag or branch push
+              git_ref="${{ github.event.workflow_run.head_branch }}"
+
+              # Check if this is a tag push by looking at the git ref
+              if git show-ref --tags | grep -q "${{ github.event.workflow_run.head_sha }}"; then
+                # This commit has tags, extract the tag name
+                tag_name=$(git tag --points-at "${{ github.event.workflow_run.head_sha }}" | head -n1)
+                if [[ -n "$tag_name" ]]; then
+                  version="$tag_name"
+                  # Remove 'v' prefix if present for consistent version format
+                  if [[ "$version" == v* ]]; then
+                    version="${version#v}"
+                  fi
+
+                  if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                    build_type="prerelease"
+                    is_prerelease=true
+                    echo "🧪 Building Docker image for prerelease: $version"
+                  else
+                    build_type="release"
+                    create_latest=true
+                    echo "🚀 Building Docker image for release: $version"
+                  fi
+                else
+                  # Regular branch push
+                  build_type="development"
+                  version="dev-${short_sha}"
+                  should_build=false
+                  echo "⏭️  Skipping Docker build for development version (branch push)"
+                fi
               else
-                build_type="release"
-                create_latest=true
-                echo "🚀 Building Docker image for release: $version"
+                # Regular branch push
+                build_type="development"
+                version="dev-${short_sha}"
+                should_build=false
+                echo "⏭️  Skipping Docker build for development version (branch push)"
               fi
             else
               build_type="development"
               version="dev-${short_sha}"
-              # Skip Docker build for development builds
               should_build=false
-              echo "⏭️  Skipping Docker build for development version"
+              echo "⏭️  Skipping Docker build for development version (non-push event)"
             fi
 
             echo "🔄 Build triggered by workflow_run:"
