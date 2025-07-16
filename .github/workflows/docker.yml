@@ -227,7 +227,6 @@ jobs:
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          scopes: repository:rustfs/rustfs:pull,push
 
       # - name: Login to GitHub Container Registry
       #   uses: docker/login-action@v3
@@ -249,6 +248,43 @@ jobs:
           VERSION="${{ needs.build-check.outputs.version }}"
           SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
           CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
+
+          # Convert version format for Dockerfile compatibility
+          case "$VERSION" in
+            "main-latest"|"dev-latest")
+              # For latest builds, use RELEASE=latest + appropriate CHANNEL
+              DOCKER_RELEASE="latest"
+              DOCKER_CHANNEL="dev"
+              ;;
+            "latest")
+              # For stable latest, use RELEASE=latest + release CHANNEL
+              DOCKER_RELEASE="latest"
+              DOCKER_CHANNEL="release"
+              ;;
+            dev-*)
+              # For development builds (dev-abc123), pass as-is without 'v' prefix
+              DOCKER_RELEASE="${VERSION}"
+              DOCKER_CHANNEL="dev"
+              ;;
+            v*)
+              # For versioned releases (v1.0.0), remove 'v' prefix for Dockerfile
+              DOCKER_RELEASE="${VERSION#v}"
+              DOCKER_CHANNEL="release"
+              ;;
+            *)
+              # For custom versions, pass as-is
+              DOCKER_RELEASE="${VERSION}"
+              DOCKER_CHANNEL="release"
+              ;;
+          esac
+
+          echo "docker_release=$DOCKER_RELEASE" >> $GITHUB_OUTPUT
+          echo "docker_channel=$DOCKER_CHANNEL" >> $GITHUB_OUTPUT
+
+          echo "🐳 Docker build parameters:"
+          echo "  - Original version: $VERSION"
+          echo "  - Docker RELEASE: $DOCKER_RELEASE"
+          echo "  - Docker CHANNEL: $DOCKER_CHANNEL"
 
           # Generate tags based on build type
           TAGS=""
@@ -318,7 +354,8 @@ jobs:
             VERSION=${{ needs.build-check.outputs.version }}
             BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
             REVISION=${{ github.sha }}
-            RELEASE=${{ needs.build-check.outputs.version }}
+            RELEASE=${{ steps.meta.outputs.docker_release }}
+            CHANNEL=${{ steps.meta.outputs.docker_channel }}
             BUILDKIT_INLINE_CACHE=1
           # Enable advanced BuildKit features for better performance
           provenance: false
