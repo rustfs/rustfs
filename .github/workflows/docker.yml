@@ -17,45 +17,29 @@
 # This workflow builds Docker images using pre-built binaries from the build workflow.
 #
 # Trigger Types:
-# 1. workflow_call: Called by build.yml after binary build completes (primary use)
+# 1. workflow_run: Automatically triggered when "Build and Release" workflow completes
 # 2. workflow_dispatch: Manual trigger for standalone Docker builds
 #
-# Architecture:
-# build.yml (binaries) -> docker.yml (images) -> registry
+# Key Features:
+# - Only triggers when Linux builds (x86_64 + aarch64) are successful
+# - Independent of macOS/Windows build status
+# - Uses workflow_run event for precise control
 
 name: Docker Images
 
+# Permissions needed for workflow_run event and GitHub API access
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
 on:
-  # Called by build.yml after binary build completes
-  workflow_call:
-    inputs:
-      build_type:
-        description: "Build type: development, release, or prerelease"
-        required: true
-        type: string
-      version:
-        description: "Version to build"
-        required: true
-        type: string
-      short_sha:
-        description: "Short commit SHA"
-        required: true
-        type: string
-      is_prerelease:
-        description: "Whether this is a prerelease"
-        required: true
-        type: boolean
-      push_images:
-        description: "Push images to registries"
-        required: false
-        default: true
-        type: boolean
-      force_rebuild:
-        description: "Force rebuild even if binary exists"
-        required: false
-        default: false
-        type: boolean
-  # Manual trigger with same parameters as build.yml for consistency
+  # Automatically triggered when build workflow completes
+  workflow_run:
+    workflows: ["Build and Release"]
+    types: [completed]
+    branches: [main]
+  # Manual trigger with same parameters for consistency
   workflow_dispatch:
     inputs:
       push_images:
@@ -82,7 +66,7 @@ env:
   DOCKER_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  # Docker build strategy check
+  # Check if we should build Docker images
   build-check:
     name: Docker Build Check
     runs-on: ubuntu-latest
@@ -94,48 +78,106 @@ jobs:
       short_sha: ${{ steps.check.outputs.short_sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
       create_latest: ${{ steps.check.outputs.create_latest }}
+      linux_builds_success: ${{ steps.check.outputs.linux_builds_success }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check build conditions
+      - name: Check build conditions and Linux build status
         id: check
         run: |
-          should_build=true  # Always build when called
+          should_build=false
           should_push=false
           build_type="none"
           version=""
           short_sha=""
           is_prerelease=false
           create_latest=false
+          linux_builds_success=false
 
-          if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
-            # Called by build.yml - use provided parameters
-            build_type="${{ inputs.build_type }}"
-            version="${{ inputs.version }}"
-            short_sha="${{ inputs.short_sha }}"
-            is_prerelease="${{ inputs.is_prerelease }}"
-            should_push="${{ inputs.push_images }}"
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Triggered by build workflow completion
+            echo "🔗 Triggered by build workflow completion"
 
-            # Determine create_latest based on build_type
-            if [[ "$build_type" == "release" ]] && [[ "$is_prerelease" == "false" ]]; then
-              create_latest=true
+            # Check if the triggering workflow was successful
+            if [[ "${{ github.event.workflow_run.conclusion }}" != "success" ]]; then
+              echo "❌ Build workflow failed, skipping Docker build"
+              exit 0
             fi
 
-            echo "🔗 Called by build workflow:"
-            echo "   📋 Build type: $build_type"
-            echo "   🔢 Version: $version"
-            echo "   📎 Short SHA: $short_sha"
-            echo "   🧪 Is prerelease: $is_prerelease"
-            echo "   🚀 Push images: $should_push"
+            # Get workflow run details via GitHub API to check Linux build status
+            echo "🔍 Checking Linux build status from workflow run..."
+
+            # Use GitHub API to get detailed job information
+            WORKFLOW_RUN_ID="${{ github.event.workflow_run.id }}"
+
+            # Get jobs from the workflow run
+            echo "📡 Fetching job details for workflow run: $WORKFLOW_RUN_ID"
+
+            # Check if Linux builds were successful using GitHub API
+            JOBS_RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$WORKFLOW_RUN_ID/jobs")
+
+            # Extract Linux build job status
+            LINUX_X64_SUCCESS=$(echo "$JOBS_RESPONSE" | jq -r '.jobs[] | select(.name | contains("x86_64-unknown-linux-musl")) | .conclusion')
+            LINUX_ARM64_SUCCESS=$(echo "$JOBS_RESPONSE" | jq -r '.jobs[] | select(.name | contains("aarch64-unknown-linux-musl")) | .conclusion')
+
+            echo "🐧 Linux build status:"
+            echo "   x86_64: $LINUX_X64_SUCCESS"
+            echo "   aarch64: $LINUX_ARM64_SUCCESS"
+
+            # Only proceed if both Linux builds are successful
+            if [[ "$LINUX_X64_SUCCESS" == "success" ]] && [[ "$LINUX_ARM64_SUCCESS" == "success" ]]; then
+              linux_builds_success=true
+              should_build=true
+              should_push=true
+              echo "✅ Both Linux builds successful, proceeding with Docker build"
+            else
+              linux_builds_success=false
+              should_build=false
+              echo "❌ Linux builds not both successful, skipping Docker build"
+              echo "   x86_64 status: $LINUX_X64_SUCCESS"
+              echo "   aarch64 status: $LINUX_ARM64_SUCCESS"
+            fi
+
+            # Extract version info from commit message or use commit SHA
+            short_sha=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+
+            # Determine build type based on branch and commit
+            if [[ "${{ github.event.workflow_run.head_branch }}" == "main" ]]; then
+              build_type="development"
+              version="dev-${short_sha}"
+            elif [[ "${{ github.event.workflow_run.event }}" == "push" ]] && [[ "${{ github.event.workflow_run.head_branch }}" =~ ^refs/tags/ ]]; then
+              # Tag push
+              tag_name="${{ github.event.workflow_run.head_branch }}"
+              version="${tag_name#refs/tags/}"
+              if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                build_type="prerelease"
+                is_prerelease=true
+              else
+                build_type="release"
+                create_latest=true
+              fi
+            else
+              build_type="development"
+              version="dev-${short_sha}"
+            fi
+
+            echo "🔄 Build triggered by workflow_run:"
+            echo "   📋 Conclusion: ${{ github.event.workflow_run.conclusion }}"
+            echo "   🌿 Branch: ${{ github.event.workflow_run.head_branch }}"
+            echo "   📎 SHA: ${{ github.event.workflow_run.head_sha }}"
+            echo "   🎯 Event: ${{ github.event.workflow_run.event }}"
 
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # Manual trigger with version input
+            # Manual trigger
             input_version="${{ github.event.inputs.version }}"
             version="${input_version}"
             should_push="${{ github.event.inputs.push_images }}"
+            linux_builds_success=true  # Assume true for manual builds
+            should_build=true
 
             # Get short SHA
             short_sha=$(git rev-parse --short HEAD)
@@ -183,6 +225,12 @@ jobs:
             esac
           fi
 
+          # Only proceed if Linux builds were successful
+          if [[ "$linux_builds_success" != "true" ]]; then
+            echo "❌ Linux builds not successful, skipping Docker image build"
+            should_build=false
+          fi
+
           echo "should_build=$should_build" >> $GITHUB_OUTPUT
           echo "should_push=$should_push" >> $GITHUB_OUTPUT
           echo "build_type=$build_type" >> $GITHUB_OUTPUT
@@ -190,6 +238,7 @@ jobs:
           echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
           echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
           echo "create_latest=$create_latest" >> $GITHUB_OUTPUT
+          echo "linux_builds_success=$linux_builds_success" >> $GITHUB_OUTPUT
 
           echo "🐳 Docker Build Summary:"
           echo "  - Should build: $should_build"
@@ -199,15 +248,16 @@ jobs:
           echo "  - Short SHA: $short_sha"
           echo "  - Is prerelease: $is_prerelease"
           echo "  - Create latest: $create_latest"
+          echo "  - Linux builds success: $linux_builds_success"
 
   # Build multi-arch Docker images
   # Strategy: Build images using pre-built binaries from dl.rustfs.com
   # Supports both release and dev channel binaries based on build context
-  # Note: Dockerfile.source is available for local development but not used in CI/CD
+  # Only runs when Linux builds (x86_64 + aarch64) are successful
   build-docker:
     name: Build Docker Images
     needs: build-check
-    if: needs.build-check.outputs.should_build == 'true'
+    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.linux_builds_success == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
