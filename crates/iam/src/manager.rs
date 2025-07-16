@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
+use crate::sys::get_claims_from_token_with_secret;
 use crate::{
     cache::{Cache, CacheEntity},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
@@ -26,7 +27,7 @@ use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, Credentials, UserIdentity, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign},
+    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
     format::Format,
     policy::{
         EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
