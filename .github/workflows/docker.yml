@@ -24,6 +24,7 @@
 # - Only triggers when Linux builds (x86_64 + aarch64) are successful
 # - Independent of macOS/Windows build status
 # - Uses workflow_run event for precise control
+# - Only builds Docker images for releases and prereleases (development builds are skipped)
 
 name: Docker Images
 
@@ -47,9 +48,9 @@ on:
         default: true
         type: boolean
       version:
-        description: "Version to build (latest, main-latest, dev-latest, or specific version like v1.0.0 or dev-abc123)"
+        description: "Version to build (latest for stable release, or specific version like v1.0.0, v1.0.0-alpha1)"
         required: false
-        default: "main-latest"
+        default: "latest"
         type: string
       force_rebuild:
         description: "Force rebuild even if binary exists (useful for testing)"
@@ -117,20 +118,28 @@ jobs:
             if [[ "${{ github.event.workflow_run.head_branch }}" == "main" ]]; then
               build_type="development"
               version="dev-${short_sha}"
+              # Skip Docker build for development builds
+              should_build=false
+              echo "⏭️  Skipping Docker build for development version (main branch)"
             elif [[ "${{ github.event.workflow_run.event }}" == "push" ]] && [[ "${{ github.event.workflow_run.head_branch }}" =~ ^refs/tags/ ]]; then
-              # Tag push
+              # Tag push - only build for releases and prereleases
               tag_name="${{ github.event.workflow_run.head_branch }}"
               version="${tag_name#refs/tags/}"
               if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                 build_type="prerelease"
                 is_prerelease=true
+                echo "🧪 Building Docker image for prerelease: $version"
               else
                 build_type="release"
                 create_latest=true
+                echo "🚀 Building Docker image for release: $version"
               fi
             else
               build_type="development"
               version="dev-${short_sha}"
+              # Skip Docker build for development builds
+              should_build=false
+              echo "⏭️  Skipping Docker build for development version"
             fi
 
             echo "🔄 Build triggered by workflow_run:"
@@ -160,16 +169,6 @@ jobs:
                 create_latest=true
                 echo "🚀 Building with latest stable release version"
                 ;;
-              "main-latest")
-                build_type="development"
-                version="main-latest"
-                echo "🛠️  Building with main branch latest development version"
-                ;;
-              "dev-latest")
-                build_type="development"
-                version="dev-latest"
-                echo "🛠️  Building with development latest version"
-                ;;
               v[0-9]*)
                 build_type="release"
                 create_latest=true
@@ -180,14 +179,11 @@ jobs:
                 is_prerelease=true
                 echo "🧪 Building with prerelease version: $input_version"
                 ;;
-              dev-[a-f0-9]*)
-                build_type="development"
-                echo "🔧 Building with specific development version: $input_version"
-                ;;
               *)
-                build_type="development"
-                echo "🔧 Building with custom version: $input_version"
-                echo "⚠️  Warning: Custom version format may not follow standard patterns"
+                # Invalid version for Docker build
+                should_build=false
+                echo "❌ Invalid version for Docker build: $input_version"
+                echo "⚠️  Only release versions (latest, v1.0.0) and prereleases (v1.0.0-alpha1) are supported"
                 ;;
             esac
           fi
@@ -252,20 +248,10 @@ jobs:
 
           # Convert version format for Dockerfile compatibility
           case "$VERSION" in
-            "main-latest"|"dev-latest")
-              # For latest builds, use RELEASE=latest + appropriate CHANNEL
-              DOCKER_RELEASE="latest"
-              DOCKER_CHANNEL="dev"
-              ;;
             "latest")
               # For stable latest, use RELEASE=latest + release CHANNEL
               DOCKER_RELEASE="latest"
               DOCKER_CHANNEL="release"
-              ;;
-            dev-*)
-              # For development builds (dev-abc123), pass as-is without 'v' prefix
-              DOCKER_RELEASE="${VERSION}"
-              DOCKER_CHANNEL="dev"
               ;;
             v*)
               # For versioned releases (v1.0.0), remove 'v' prefix for Dockerfile
@@ -273,7 +259,7 @@ jobs:
               DOCKER_CHANNEL="release"
               ;;
             *)
-              # For custom versions, pass as-is
+              # For other versions, pass as-is
               DOCKER_RELEASE="${VERSION}"
               DOCKER_CHANNEL="release"
               ;;
@@ -288,33 +274,25 @@ jobs:
           echo "  - Docker CHANNEL: $DOCKER_CHANNEL"
 
           # Generate tags based on build type
-          TAGS=""
+          # Only support release and prerelease builds (no development builds)
+          TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
 
-          if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development build: dev-${short_sha} and dev
-            TAGS="${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}"
-            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev"
-          else
-            # Release/Prerelease build: ${version}
-            TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
+          # Add channel tags for prereleases and latest for stable
+          if [[ "$CREATE_LATEST" == "true" ]]; then
+            # Stable release
+            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
+          elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            # Prerelease channel tags (alpha, beta, rc)
+            if [[ "$VERSION" == *"alpha"* ]]; then
+              CHANNEL="alpha"
+            elif [[ "$VERSION" == *"beta"* ]]; then
+              CHANNEL="beta"
+            elif [[ "$VERSION" == *"rc"* ]]; then
+              CHANNEL="rc"
+            fi
 
-            # Add channel tags for prereleases and latest for stable
-            if [[ "$CREATE_LATEST" == "true" ]]; then
-              # Stable release
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
-            elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
-              # Prerelease channel tags (alpha, beta, rc)
-              if [[ "$VERSION" == *"alpha"* ]]; then
-                CHANNEL="alpha"
-              elif [[ "$VERSION" == *"beta"* ]]; then
-                CHANNEL="beta"
-              elif [[ "$VERSION" == *"rc"* ]]; then
-                CHANNEL="rc"
-              fi
-
-              if [[ -n "$CHANNEL" ]]; then
-                TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
-              fi
+            if [[ -n "$CHANNEL" ]]; then
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
             fi
           fi
 
@@ -384,14 +362,10 @@ jobs:
           echo "🐳 Docker build completed successfully!"
           echo "📦 Build type: $BUILD_TYPE"
           echo "🔢 Version: $VERSION"
-          echo "🚀 Strategy: Images using pre-built binaries (supports both release and dev channels)"
+          echo "🚀 Strategy: Images using pre-built binaries (release channel only)"
           echo ""
 
           case "$BUILD_TYPE" in
-            "development")
-              echo "🛠️  Development Docker image has been built with dev-${VERSION} tags"
-              echo "⚠️  This is a development image - not suitable for production use"
-              ;;
             "release")
               echo "🚀 Release Docker image has been built with ${VERSION} tags"
               echo "✅ This image is ready for production use"
@@ -403,5 +377,8 @@ jobs:
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
               echo "🚫 Latest tag NOT created for prerelease"
+              ;;
+            *)
+              echo "❌ Unexpected build type: $BUILD_TYPE"
               ;;
           esac
