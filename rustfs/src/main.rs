@@ -199,7 +199,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
-                            "🚀 New version available: {} -> {} (current: {})",
+                            "🚀 Version check: New version available: {} -> {} (current: {})",
                             result.current_version, latest.version, result.current_version
                         );
                         if let Some(notes) = &latest.release_notes {
@@ -210,14 +210,14 @@ async fn run(opt: config::Opt) -> Result<()> {
                         }
                     }
                 } else {
-                    debug!("✅ Current version is up to date: {}", result.current_version);
+                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
                 }
             }
             Err(UpdateCheckError::HttpError(e)) => {
-                debug!("Version check network error (this is normal): {}", e);
+                debug!("Version check: network error (this is normal): {}", e);
             }
             Err(e) => {
-                debug!("Version check failed (this is normal): {}", e);
+                debug!("Version check: failed (this is normal): {}", e);
             }
         }
     });
