@@ -110,7 +110,8 @@ jobs:
             fi
 
             # Extract version info from commit message or use commit SHA
-            short_sha=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+            # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
+            short_sha=$(git rev-parse --short "${{ github.event.workflow_run.head_sha }}")
 
             # Determine build type based on branch and commit
             if [[ "${{ github.event.workflow_run.head_branch }}" == "main" ]]; then
