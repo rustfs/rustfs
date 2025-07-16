@@ -6,6 +6,13 @@ ARG BUILDPLATFORM
 # Build stage
 FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 
+# Re-declare build arguments after FROM (required for multi-stage builds)
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+# Debug: Print platform information
+RUN echo "🐳 Build Info: BUILDPLATFORM=$BUILDPLATFORM, TARGETPLATFORM=$TARGETPLATFORM"
+
 # Install required build dependencies
 RUN apt-get update && apt-get install -y \
     wget \
@@ -49,10 +56,13 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
     && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc && rm -rf Linux.flatc.binary.g++-13.zip
 
 # Set up Rust targets based on platform
-RUN case "$TARGETPLATFORM" in \
+RUN set -e && \
+    PLATFORM="${TARGETPLATFORM:-linux/amd64}" && \
+    echo "🎯 Setting up Rust target for platform: $PLATFORM" && \
+    case "$PLATFORM" in \
         "linux/amd64") rustup target add x86_64-unknown-linux-gnu ;; \
         "linux/arm64") rustup target add aarch64-unknown-linux-gnu ;; \
-        *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+        *) echo "❌ Unsupported platform: $PLATFORM" && exit 1 ;; \
     esac
 
 # Set up environment for cross-compilation
@@ -62,17 +72,8 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
 WORKDIR /usr/src/rustfs
 
-# Copy cargo configuration for optimized builds
-COPY Cargo.toml ./.cargo/config.toml
-
-# Copy Cargo files for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY */Cargo.toml ./*/
-
-# Create dummy main.rs files for dependency compilation
-RUN find . -name "Cargo.toml" -not -path "./Cargo.toml" | \
-    xargs -I {} dirname {} | \
-    xargs -I {} sh -c 'mkdir -p {}/src && echo "fn main() {}" > {}/src/main.rs'
+# Copy all source code
+COPY . .
 
 # Configure cargo for optimized builds
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
@@ -81,16 +82,6 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_PROFILE_RELEASE_DEBUG=false \
     CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
     CARGO_PROFILE_RELEASE_STRIP=symbols
-
-# Build dependencies only (cache layer) with optimizations
-RUN sccache --start-server 2>/dev/null || true && \
-    case "$TARGETPLATFORM" in \
-        "linux/amd64") cargo build --release --target x86_64-unknown-linux-gnu -j $(nproc) ;; \
-        "linux/arm64") cargo build --release --target aarch64-unknown-linux-gnu -j $(nproc) ;; \
-    esac
-
-# Copy source code
-COPY . .
 
 # Generate protobuf code
 RUN cargo run --bin gproto
