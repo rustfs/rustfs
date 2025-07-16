@@ -16,8 +16,6 @@ use crate::error::Error as IamError;
 use crate::error::{Error, Result};
 use crate::policy::{INHERITED_POLICY_TYPE, Policy, Validator, iam_policy_claim_name_sa};
 use crate::utils;
-use crate::utils::extract_claims;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -251,12 +249,6 @@ pub fn create_new_credentials_with_metadata(
         expiration,
         ..Default::default()
     })
-}
-
-pub fn get_claims_from_token_with_secret<T: DeserializeOwned>(token: &str, secret: &str) -> Result<T> {
-    let ms = extract_claims::<T>(token, secret)?;
-    // TODO SessionPolicyName
-    Ok(ms.claims)
 }
 
 pub fn jwt_sign<T: Serialize>(claims: &T, token_secret: &str) -> Result<String> {
