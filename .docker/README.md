@@ -6,10 +6,10 @@ This directory contains Docker configuration files and supporting infrastructure
 
 ```
 rustfs/
-├── Dockerfile           # Production image (Alpine + GitHub Releases)
-├── Dockerfile.source    # Source build (Debian + cross-compilation)
-├── cargo.config.toml    # Rust cargo configuration
+├── Dockerfile           # Production image (Alpine + pre-built binaries)
+├── Dockerfile.source    # Development image (Debian + source build)
 ├── docker-buildx.sh     # Multi-architecture build script
+├── Makefile             # Build automation with simplified commands
 └── .docker/             # Supporting infrastructure
     ├── observability/   # Monitoring and observability configs
     ├── compose/         # Docker Compose configurations
@@ -64,7 +64,11 @@ docker run rustfs/rustfs:main-latest     # Main branch latest
 ### Development Environment
 
 ```bash
-# Start development container
+# Quick setup using Makefile (recommended)
+make docker-dev-local     # Build development image locally
+make dev-env-start        # Start development container
+
+# Manual Docker commands
 docker run -it -v $(pwd):/workspace -p 9000:9000 rustfs/rustfs:latest-dev
 
 # Build from source locally
@@ -76,9 +80,33 @@ docker-compose up rustfs-dev
 
 ## 🏗️ Build Arguments and Scripts
 
-### Using docker-buildx.sh (Recommended)
+### Using Makefile Commands (Recommended)
 
-For multi-architecture builds, use the provided script:
+The easiest way to build images using simplified commands:
+
+```bash
+# Development images (build from source)
+make docker-dev-local             # Build for local use (single arch)
+make docker-dev                   # Build multi-arch (for CI/CD)
+make docker-dev-push REGISTRY=xxx # Build and push to registry
+
+# Production images (using pre-built binaries)
+make docker-buildx                # Build multi-arch production images
+make docker-buildx-push           # Build and push production images
+make docker-buildx-version VERSION=v1.0.0  # Build specific version
+
+# Development environment
+make dev-env-start                # Start development container
+make dev-env-stop                 # Stop development container
+make dev-env-restart              # Restart development container
+
+# Help
+make help-docker                  # Show all Docker-related commands
+```
+
+### Using docker-buildx.sh (Advanced)
+
+For direct script usage and advanced scenarios:
 
 ```bash
 # Build latest version for all architectures
@@ -147,17 +175,51 @@ Architecture is automatically detected during build using Docker's `TARGETARCH` 
 
 ## 🛠️ Development Workflow
 
-For local development and testing:
+### Quick Start with Makefile (Recommended)
 
 ```bash
-# Quick development setup
-docker-compose up rustfs-dev
+# 1. Start development environment
+make dev-env-start
 
-# Custom source build
-docker build -f Dockerfile.source -t rustfs:custom .
+# 2. Your development container is now running with:
+#    - Port 9000 exposed for RustFS
+#    - Port 9010 exposed for admin console
+#    - Current directory mounted as /workspace
+
+# 3. Stop when done
+make dev-env-stop
+```
+
+### Manual Development Setup
+
+```bash
+# Build development image from source
+make docker-dev-local
+
+# Or use traditional Docker commands
+docker build -f Dockerfile.source -t rustfs:dev .
 
 # Run with development tools
-docker run -it -v $(pwd):/workspace rustfs:custom bash
+docker run -it -v $(pwd):/workspace -p 9000:9000 rustfs:dev bash
+
+# Or use docker-compose for complex setups
+docker-compose up rustfs-dev
+```
+
+### Common Development Tasks
+
+```bash
+# Build and test locally
+make build                        # Build binary natively
+make docker-dev-local            # Build development Docker image
+make test                        # Run tests
+make fmt                         # Format code
+make clippy                      # Run linter
+
+# Get help
+make help                        # General help
+make help-docker                 # Docker-specific help
+make help-build                  # Build-specific help
 ```
 
 ## 🚀 CI/CD Integration
