@@ -42,11 +42,16 @@ RUN . /build/arch.env && \
             DOWNLOAD_URL="${BASE_URL}/release/${PACKAGE_NAME}"; \
             echo "📥 Downloading latest release build: ${PACKAGE_NAME}"; \
         fi; \
+    elif [ "${CHANNEL}" = "dev" ]; then \
+        # Download specific dev version \
+        PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-${RELEASE}.zip"; \
+        DOWNLOAD_URL="${BASE_URL}/dev/${PACKAGE_NAME}"; \
+        echo "📥 Downloading specific dev version: ${PACKAGE_NAME}"; \
     else \
-        # Download specific version (always from release channel) \
+        # Download specific release version \
         PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${RELEASE}.zip"; \
         DOWNLOAD_URL="${BASE_URL}/release/${PACKAGE_NAME}"; \
-        echo "📥 Downloading specific version: ${PACKAGE_NAME}"; \
+        echo "📥 Downloading specific release version: ${PACKAGE_NAME}"; \
     fi && \
     echo "🔗 Download URL: ${DOWNLOAD_URL}" && \
     curl -f -L "${DOWNLOAD_URL}" -o /build/rustfs.zip && \
