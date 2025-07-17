@@ -83,6 +83,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # For workflow_run events, checkout the specific commit that triggered the workflow
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Check build conditions
         id: check
@@ -114,51 +116,46 @@ jobs:
             # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
             short_sha=$(git rev-parse --short "${{ github.event.workflow_run.head_sha }}")
 
-            # Determine build type based on event type and git refs
-            # Check if this is a tag push (release build)
-            if [[ "${{ github.event.workflow_run.event }}" == "push" ]]; then
-              # Get git refs to determine if this is a tag or branch push
-              git_ref="${{ github.event.workflow_run.head_branch }}"
+            # Determine build type based on GitHub releases
+            # Use GitHub API to check if this commit has a release/tag
+            echo "🔍 Checking for releases/tags on commit ${{ github.event.workflow_run.head_sha }}"
 
-              # Check if this is a tag push by looking at the git ref
-              if git show-ref --tags | grep -q "${{ github.event.workflow_run.head_sha }}"; then
-                # This commit has tags, extract the tag name
-                tag_name=$(git tag --points-at "${{ github.event.workflow_run.head_sha }}" | head -n1)
-                if [[ -n "$tag_name" ]]; then
-                  version="$tag_name"
-                  # Remove 'v' prefix if present for consistent version format
-                  if [[ "$version" == v* ]]; then
-                    version="${version#v}"
-                  fi
+            # Get all tags for this repository and check if any point to this commit
+            GITHUB_API_URL="https://api.github.com/repos/${{ github.repository }}/tags"
 
-                  if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
-                    build_type="prerelease"
-                    is_prerelease=true
-                    echo "🧪 Building Docker image for prerelease: $version"
-                  else
-                    build_type="release"
-                    create_latest=true
-                    echo "🚀 Building Docker image for release: $version"
-                  fi
-                else
-                  # Regular branch push
-                  build_type="development"
-                  version="dev-${short_sha}"
-                  should_build=false
-                  echo "⏭️  Skipping Docker build for development version (branch push)"
-                fi
+            # Use curl to get tags (more reliable than git in workflow_run context)
+            if command -v gh >/dev/null 2>&1; then
+              # Use GitHub CLI if available
+              tag_info=$(gh api repos/${{ github.repository }}/tags --jq '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -n1)
+            else
+              # Fallback to curl
+              tag_info=$(curl -s "$GITHUB_API_URL" | jq -r '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -n1)
+            fi
+
+            if [[ -n "$tag_info" ]] && [[ "$tag_info" != "null" ]]; then
+              # This commit has a tag, treat as release build
+              version="$tag_info"
+              # Remove 'v' prefix if present for consistent version format
+              if [[ "$version" == v* ]]; then
+                version="${version#v}"
+              fi
+
+              if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                build_type="prerelease"
+                is_prerelease=true
+                echo "🧪 Building Docker image for prerelease: $version"
               else
-                # Regular branch push
-                build_type="development"
-                version="dev-${short_sha}"
-                should_build=false
-                echo "⏭️  Skipping Docker build for development version (branch push)"
+                build_type="release"
+                create_latest=true
+                echo "🚀 Building Docker image for release: $version"
               fi
             else
+              # No tag found, treat as development build
               build_type="development"
               version="dev-${short_sha}"
               should_build=false
-              echo "⏭️  Skipping Docker build for development version (non-push event)"
+              echo "⏭️  Skipping Docker build for development version (no tag found)"
+              echo "🔍 Debug: Checked commit ${{ github.event.workflow_run.head_sha }} for tags"
             fi
 
             echo "🔄 Build triggered by workflow_run:"
