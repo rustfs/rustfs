@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Build and Release Workflow
+#
+# This workflow builds RustFS binaries and automatically triggers Docker image builds.
+#
+# Flow:
+# 1. Build binaries for multiple platforms
+# 2. Upload binaries to OSS storage
+# 3. Trigger docker.yml to build and push images using the uploaded binaries
+#
+# Manual Parameters:
+# - build_docker: Build and push Docker images (default: true)
+
 name: Build and Release
 
 on:
@@ -52,10 +64,10 @@ on:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
     inputs:
-      force_build:
-        description: "Force build even without changes"
+      build_docker:
+        description: "Build and push Docker images after binary build"
         required: false
-        default: false
+        default: true
         type: boolean
 
 env:
@@ -117,7 +129,6 @@ jobs:
             echo "🛠️  Development build detected"
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
                [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-               [[ "${{ github.event.inputs.force_build }}" == "true" ]] || \
                [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
             # Scheduled or manual build
             should_build=true
@@ -231,7 +242,7 @@ jobs:
               cargo install cross --git https://github.com/cross-rs/cross
               cross build --release --target ${{ matrix.target }} -p rustfs --bins
             else
-              # Use zigbuild for Linux ARM64
+              # Use zigbuild for other cross-compilation
               cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
             fi
           else
@@ -445,6 +456,13 @@ jobs:
           echo "🔢 Version: $VERSION"
           echo ""
 
+          # Check build status
+          BUILD_STATUS="${{ needs.build-rustfs.result }}"
+
+          echo "📊 Build Results:"
+          echo "  📦 All platforms: $BUILD_STATUS"
+          echo ""
+
           case "$BUILD_TYPE" in
             "development")
               echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
@@ -453,11 +471,282 @@ jobs:
             "release")
               echo "🚀 Release build artifacts have been uploaded to OSS release directory"
               echo "✅ This build is ready for production use"
-              echo "🏷️  GitHub Release will be created automatically by the release workflow"
+              echo "🏷️  GitHub Release will be created in this workflow"
               ;;
             "prerelease")
               echo "🧪 Prerelease build artifacts have been uploaded to OSS release directory"
               echo "⚠️  This is a prerelease build - use with caution"
-              echo "🏷️  GitHub Release will be created automatically by the release workflow"
+              echo "🏷️  GitHub Release will be created in this workflow"
               ;;
           esac
+
+          echo ""
+          echo "🐳 Docker Images:"
+          if [[ "${{ github.event.inputs.build_docker }}" == "false" ]]; then
+            echo "⏭️  Docker image build was skipped (binary only build)"
+          elif [[ "$BUILD_STATUS" == "success" ]]; then
+            echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
+          else
+            echo "❌ Docker image build will be skipped due to build failure"
+          fi
+
+  # Create GitHub Release (only for tag pushes)
+  create-release:
+    name: Create GitHub Release
+    needs: [build-check, build-rustfs]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      release_url: ${{ steps.create.outputs.release_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.build-check.outputs.version }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+
+          # Determine release type for title
+          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            if [[ "$TAG" == *"alpha"* ]]; then
+              RELEASE_TYPE="alpha"
+            elif [[ "$TAG" == *"beta"* ]]; then
+              RELEASE_TYPE="beta"
+            elif [[ "$TAG" == *"rc"* ]]; then
+              RELEASE_TYPE="rc"
+            else
+              RELEASE_TYPE="prerelease"
+            fi
+          else
+            RELEASE_TYPE="release"
+          fi
+
+          # Check if release already exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
+            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          else
+            # Get release notes from tag message
+            RELEASE_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
+            if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" =~ ^[[:space:]]*$ ]]; then
+              if [[ "$IS_PRERELEASE" == "true" ]]; then
+                RELEASE_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
+              else
+                RELEASE_NOTES="Release ${VERSION}"
+              fi
+            fi
+
+            # Create release title
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              TITLE="RustFS $VERSION (${RELEASE_TYPE})"
+            else
+              TITLE="RustFS $VERSION"
+            fi
+
+            # Create the release
+            PRERELEASE_FLAG=""
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes "$RELEASE_NOTES" \
+              $PRERELEASE_FLAG \
+              --draft
+
+            RELEASE_ID=$(gh release view "$TAG" --json databaseId --jq '.databaseId')
+            RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          fi
+
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+          echo "Created release: $RELEASE_URL"
+
+  # Prepare and upload release assets
+  upload-release-assets:
+    name: Upload Release Assets
+    needs: [build-check, build-rustfs, create-release]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          pattern: rustfs-*
+          merge-multiple: true
+
+      - name: Prepare release assets
+        id: prepare
+        run: |
+          VERSION="${{ needs.build-check.outputs.version }}"
+          TAG="${{ needs.build-check.outputs.version }}"
+
+          mkdir -p ./release-assets
+
+          # Copy and verify artifacts
+          ASSETS_COUNT=0
+          for file in ./artifacts/*.zip; do
+            if [[ -f "$file" ]]; then
+              cp "$file" ./release-assets/
+              ASSETS_COUNT=$((ASSETS_COUNT + 1))
+            fi
+          done
+
+          if [[ $ASSETS_COUNT -eq 0 ]]; then
+            echo "❌ No artifacts found!"
+            exit 1
+          fi
+
+          cd ./release-assets
+
+          # Generate checksums
+          if ls *.zip >/dev/null 2>&1; then
+            sha256sum *.zip > SHA256SUMS
+            sha512sum *.zip > SHA512SUMS
+          fi
+
+          # Create signature placeholder files
+          for file in *.zip; do
+            echo "# Signature for $file" > "${file}.asc"
+            echo "# GPG signature will be added in future versions" >> "${file}.asc"
+          done
+
+          echo "📦 Prepared assets:"
+          ls -la
+
+          echo "🔢 Asset count: $ASSETS_COUNT"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.build-check.outputs.version }}"
+
+          cd ./release-assets
+
+          # Upload all files
+          for file in *; do
+            if [[ -f "$file" ]]; then
+              echo "📤 Uploading $file..."
+              gh release upload "$TAG" "$file" --clobber
+            fi
+          done
+
+          echo "✅ All assets uploaded successfully"
+
+  # Update latest.json for stable releases only
+  update-latest-version:
+    name: Update Latest Version
+    needs: [build-check, upload-release-assets]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update latest.json
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+        run: |
+          if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
+            echo "⚠️ OSS credentials not available, skipping latest.json update"
+            exit 0
+          fi
+
+          VERSION="${{ needs.build-check.outputs.version }}"
+          TAG="${{ needs.build-check.outputs.version }}"
+
+          # Install ossutil
+          OSSUTIL_VERSION="2.1.1"
+          OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+
+          curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          unzip "$OSSUTIL_ZIP"
+          chmod +x "${OSSUTIL_DIR}/ossutil"
+
+          # Create latest.json
+          cat > latest.json << EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "release_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "release_type": "stable",
+            "download_url": "https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+          }
+          EOF
+
+          # Upload to OSS
+          ./${OSSUTIL_DIR}/ossutil cp latest.json oss://rustfs-version/latest.json --force
+
+          echo "✅ Updated latest.json for stable release $VERSION"
+
+  # Publish release (remove draft status)
+  publish-release:
+    name: Publish Release
+    needs: [build-check, create-release, upload-release-assets]
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update release notes and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.build-check.outputs.version }}"
+          VERSION="${{ needs.build-check.outputs.version }}"
+          IS_PRERELEASE="${{ needs.build-check.outputs.is_prerelease }}"
+          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
+
+          # Determine release type
+          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            if [[ "$TAG" == *"alpha"* ]]; then
+              RELEASE_TYPE="alpha"
+            elif [[ "$TAG" == *"beta"* ]]; then
+              RELEASE_TYPE="beta"
+            elif [[ "$TAG" == *"rc"* ]]; then
+              RELEASE_TYPE="rc"
+            else
+              RELEASE_TYPE="prerelease"
+            fi
+          else
+            RELEASE_TYPE="release"
+          fi
+
+          # Get original release notes from tag
+          ORIGINAL_NOTES=$(git tag -l --format='%(contents)' "${TAG}")
+          if [[ -z "$ORIGINAL_NOTES" || "$ORIGINAL_NOTES" =~ ^[[:space:]]*$ ]]; then
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              ORIGINAL_NOTES="Pre-release ${VERSION} (${RELEASE_TYPE})"
+            else
+              ORIGINAL_NOTES="Release ${VERSION}"
+            fi
+          fi
+
+          # Publish the release (remove draft status)
+          gh release edit "$TAG" --draft=false
+
+          echo "🎉 Released $TAG successfully!"
+          echo "📄 Release URL: ${{ needs.create-release.outputs.release_url }}"

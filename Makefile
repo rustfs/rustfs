@@ -46,21 +46,6 @@ setup-hooks:
 	chmod +x .git/hooks/pre-commit
 	@echo "✅ Git hooks setup complete!"
 
-.PHONY: init-devenv
-init-devenv:
-	$(DOCKER_CLI) build -t $(IMAGE_NAME) -f Dockerfile.source .
-	$(DOCKER_CLI) stop $(CONTAINER_NAME)
-	$(DOCKER_CLI) rm $(CONTAINER_NAME)
-	$(DOCKER_CLI) run -d --name $(CONTAINER_NAME) -p 9010:9010 -p 9000:9000 -v $(shell pwd):/root/s3-rustfs -it $(IMAGE_NAME)
-
-.PHONY: start
-start:
-	$(DOCKER_CLI) start $(CONTAINER_NAME)
-
-.PHONY: stop
-stop:
-	$(DOCKER_CLI) stop $(CONTAINER_NAME)
-
 .PHONY: e2e-server
 e2e-server:
 	sh $(shell pwd)/scripts/run.sh
@@ -80,8 +65,6 @@ build-dev:
 	@echo "🔨 Building RustFS in development mode..."
 	./build-rustfs.sh --dev
 
-
-
 # Docker-based build (alternative approach)
 # Usage: make BUILD_OS=ubuntu22.04 build-docker
 # Output: target/ubuntu22.04/release/rustfs
@@ -98,13 +81,13 @@ build-docker:
 .PHONY: build-musl
 build-musl:
 	@echo "🔨 Building rustfs for x86_64-unknown-linux-musl..."
-	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-buildx' instead"
+	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-dev' instead"
 	./build-rustfs.sh --platform x86_64-unknown-linux-musl
 
 .PHONY: build-gnu
 build-gnu:
 	@echo "🔨 Building rustfs for x86_64-unknown-linux-gnu..."
-	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-buildx' instead"
+	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-dev' instead"
 	./build-rustfs.sh --platform x86_64-unknown-linux-gnu
 
 .PHONY: deploy-dev
@@ -112,15 +95,19 @@ deploy-dev: build-musl
 	@echo "🚀 Deploying to dev server: $${IP}"
 	./scripts/dev_deploy.sh $${IP}
 
-# Multi-architecture Docker build targets (NEW: using docker-buildx.sh)
+# ========================================================================================
+# Docker Multi-Architecture Builds (Primary Methods)
+# ========================================================================================
+
+# Production builds using docker-buildx.sh (for CI/CD and production)
 .PHONY: docker-buildx
 docker-buildx:
-	@echo "🏗️ Building multi-architecture Docker images with buildx..."
+	@echo "🏗️ Building multi-architecture production Docker images with buildx..."
 	./docker-buildx.sh
 
 .PHONY: docker-buildx-push
 docker-buildx-push:
-	@echo "🚀 Building and pushing multi-architecture Docker images with buildx..."
+	@echo "🚀 Building and pushing multi-architecture production Docker images with buildx..."
 	./docker-buildx.sh --push
 
 .PHONY: docker-buildx-version
@@ -129,7 +116,7 @@ docker-buildx-version:
 		echo "❌ 错误: 请指定版本, 例如: make docker-buildx-version VERSION=v1.0.0"; \
 		exit 1; \
 	fi
-	@echo "🏗️ Building multi-architecture Docker images (version: $(VERSION))..."
+	@echo "🏗️ Building multi-architecture production Docker images (version: $(VERSION))..."
 	./docker-buildx.sh --release $(VERSION)
 
 .PHONY: docker-buildx-push-version
@@ -138,20 +125,113 @@ docker-buildx-push-version:
 		echo "❌ 错误: 请指定版本, 例如: make docker-buildx-push-version VERSION=v1.0.0"; \
 		exit 1; \
 	fi
-	@echo "🚀 Building and pushing multi-architecture Docker images (version: $(VERSION))..."
+	@echo "🚀 Building and pushing multi-architecture production Docker images (version: $(VERSION))..."
 	./docker-buildx.sh --release $(VERSION) --push
 
+# Development/Source builds using direct buildx commands
+.PHONY: docker-dev
+docker-dev:
+	@echo "🏗️ Building multi-architecture development Docker images with buildx..."
+	@echo "💡 This builds from source code and is intended for local development and testing"
+	@echo "⚠️  Multi-arch images cannot be loaded locally, use docker-dev-push to push to registry"
+	$(DOCKER_CLI) buildx build \
+		--platform linux/amd64,linux/arm64 \
+		--file $(DOCKERFILE_SOURCE) \
+		--tag rustfs:source-latest \
+		--tag rustfs:dev-latest \
+		.
 
+.PHONY: docker-dev-local
+docker-dev-local:
+	@echo "🏗️ Building single-architecture development Docker image for local use..."
+	@echo "💡 This builds from source code for the current platform and loads locally"
+	$(DOCKER_CLI) buildx build \
+		--file $(DOCKERFILE_SOURCE) \
+		--tag rustfs:source-latest \
+		--tag rustfs:dev-latest \
+		--load \
+		.
+
+.PHONY: docker-dev-push
+docker-dev-push:
+	@if [ -z "$(REGISTRY)" ]; then \
+		echo "❌ 错误: 请指定镜像仓库, 例如: make docker-dev-push REGISTRY=ghcr.io/username"; \
+		exit 1; \
+	fi
+	@echo "🚀 Building and pushing multi-architecture development Docker images..."
+	@echo "💡 推送到仓库: $(REGISTRY)"
+	$(DOCKER_CLI) buildx build \
+		--platform linux/amd64,linux/arm64 \
+		--file $(DOCKERFILE_SOURCE) \
+		--tag $(REGISTRY)/rustfs:source-latest \
+		--tag $(REGISTRY)/rustfs:dev-latest \
+		--push \
+		.
+
+
+
+# Local production builds using direct buildx (alternative to docker-buildx.sh)
+.PHONY: docker-buildx-production-local
+docker-buildx-production-local:
+	@echo "🏗️ Building single-architecture production Docker image locally..."
+	@echo "💡 Alternative to docker-buildx.sh for local testing"
+	$(DOCKER_CLI) buildx build \
+		--file $(DOCKERFILE_PRODUCTION) \
+		--tag rustfs:production-latest \
+		--tag rustfs:latest \
+		--load \
+		--build-arg RELEASE=latest \
+		.
+
+# ========================================================================================
+# Single Architecture Docker Builds (Traditional)
+# ========================================================================================
 
 .PHONY: docker-build-production
 docker-build-production:
-	@echo "🏗️ Building production Docker image..."
+	@echo "🏗️ Building single-architecture production Docker image..."
+	@echo "💡 Consider using 'make docker-buildx-production-local' for multi-arch support"
 	$(DOCKER_CLI) build -f $(DOCKERFILE_PRODUCTION) -t rustfs:latest .
 
 .PHONY: docker-build-source
 docker-build-source:
-	@echo "🏗️ Building source Docker image..."
+	@echo "🏗️ Building single-architecture source Docker image..."
+	@echo "💡 Consider using 'make docker-dev-local' for multi-arch support"
 	$(DOCKER_CLI) build -f $(DOCKERFILE_SOURCE) -t rustfs:source .
+
+# ========================================================================================
+# Development Environment
+# ========================================================================================
+
+.PHONY: dev-env-start
+dev-env-start:
+	@echo "🚀 Starting development environment..."
+	$(DOCKER_CLI) buildx build \
+		--file $(DOCKERFILE_SOURCE) \
+		--tag rustfs:dev \
+		--load \
+		.
+	$(DOCKER_CLI) stop $(CONTAINER_NAME) 2>/dev/null || true
+	$(DOCKER_CLI) rm $(CONTAINER_NAME) 2>/dev/null || true
+	$(DOCKER_CLI) run -d --name $(CONTAINER_NAME) \
+		-p 9010:9010 -p 9000:9000 \
+		-v $(shell pwd):/workspace \
+		-it rustfs:dev
+
+.PHONY: dev-env-stop
+dev-env-stop:
+	@echo "🛑 Stopping development environment..."
+	$(DOCKER_CLI) stop $(CONTAINER_NAME) 2>/dev/null || true
+	$(DOCKER_CLI) rm $(CONTAINER_NAME) 2>/dev/null || true
+
+.PHONY: dev-env-restart
+dev-env-restart: dev-env-stop dev-env-start
+
+
+
+# ========================================================================================
+# Build Utilities
+# ========================================================================================
 
 .PHONY: docker-inspect-multiarch
 docker-inspect-multiarch:
@@ -165,7 +245,7 @@ docker-inspect-multiarch:
 .PHONY: build-cross-all
 build-cross-all:
 	@echo "🔧 Building all target architectures..."
-	@echo "💡 On macOS/Windows, use 'make docker-buildx' for reliable multi-arch builds"
+	@echo "💡 On macOS/Windows, use 'make docker-dev' for reliable multi-arch builds"
 	@echo "🔨 Generating protobuf code..."
 	cargo run --bin gproto || true
 	@echo "🔨 Building x86_64-unknown-linux-musl..."
@@ -173,6 +253,10 @@ build-cross-all:
 	@echo "🔨 Building aarch64-unknown-linux-gnu..."
 	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
 	@echo "✅ All architectures built successfully!"
+
+# ========================================================================================
+# Help and Documentation
+# ========================================================================================
 
 .PHONY: help-build
 help-build:
@@ -206,23 +290,61 @@ help-build:
 help-docker:
 	@echo "🐳 Docker 多架构构建帮助："
 	@echo ""
-	@echo "🚀 推荐使用 (新的 docker-buildx 方式):"
-	@echo "  make docker-buildx                       # 构建多架构镜像（不推送）"
-	@echo "  make docker-buildx-push                  # 构建并推送多架构镜像"
+	@echo "🚀 生产镜像构建 (推荐使用 docker-buildx.sh):"
+	@echo "  make docker-buildx                       # 构建生产多架构镜像（不推送）"
+	@echo "  make docker-buildx-push                  # 构建并推送生产多架构镜像"
 	@echo "  make docker-buildx-version VERSION=v1.0.0        # 构建指定版本"
 	@echo "  make docker-buildx-push-version VERSION=v1.0.0   # 构建并推送指定版本"
 	@echo ""
-	@echo "🏗️ 单架构构建:"
-	@echo "  make docker-build-production             # 构建生产环境镜像"
-	@echo "  make docker-build-source                 # 构建源码构建镜像"
+	@echo "🔧 开发/源码镜像构建 (本地开发测试):"
+	@echo "  make docker-dev                          # 构建开发多架构镜像（无法本地加载）"
+	@echo "  make docker-dev-local                    # 构建开发单架构镜像（本地加载）"
+	@echo "  make docker-dev-push REGISTRY=xxx       # 构建并推送开发镜像"
+	@echo ""
+	@echo "🏗️ 本地生产镜像构建 (替代方案):"
+	@echo "  make docker-buildx-production-local      # 本地构建生产单架构镜像"
+	@echo ""
+	@echo "📦 单架构构建 (传统方式):"
+	@echo "  make docker-build-production             # 构建单架构生产镜像"
+	@echo "  make docker-build-source                 # 构建单架构源码镜像"
+	@echo ""
+	@echo "🚀 开发环境管理:"
+	@echo "  make dev-env-start                       # 启动开发容器环境"
+	@echo "  make dev-env-stop                        # 停止开发容器环境"
+	@echo "  make dev-env-restart                     # 重启开发容器环境"
 	@echo ""
 	@echo "🔧 辅助工具:"
 	@echo "  make build-cross-all                     # 构建所有架构的二进制文件"
 	@echo "  make docker-inspect-multiarch IMAGE=xxx  # 检查镜像的架构支持"
 	@echo ""
-	@echo "📋 环境变量 (在推送时需要设置):"
+	@echo "📋 环境变量:"
+	@echo "  REGISTRY          镜像仓库地址 (推送时需要)"
 	@echo "  DOCKERHUB_USERNAME    Docker Hub 用户名"
 	@echo "  DOCKERHUB_TOKEN       Docker Hub 访问令牌"
 	@echo "  GITHUB_TOKEN          GitHub 访问令牌"
 	@echo ""
-	@echo "💡 更多详情请参考项目根目录的 docker-buildx.sh 脚本"
+	@echo "💡 建议："
+	@echo "  - 生产用途: 使用 docker-buildx* 命令 (基于预编译二进制)"
+	@echo "  - 本地开发: 使用 docker-dev* 命令 (从源码构建)"
+	@echo "  - 开发环境: 使用 dev-env-* 命令管理开发容器"
+
+.PHONY: help
+help:
+	@echo "🦀 RustFS Makefile 帮助："
+	@echo ""
+	@echo "📋 主要命令分类："
+	@echo "  make help-build                          # 显示构建相关帮助"
+	@echo "  make help-docker                         # 显示 Docker 相关帮助"
+	@echo ""
+	@echo "🔧 代码质量："
+	@echo "  make fmt                                 # 格式化代码"
+	@echo "  make clippy                              # 运行 clippy 检查"
+	@echo "  make test                                # 运行测试"
+	@echo "  make pre-commit                          # 运行所有预提交检查"
+	@echo ""
+	@echo "🚀 快速开始："
+	@echo "  make build                               # 构建 RustFS 二进制"
+	@echo "  make docker-dev-local                    # 构建开发 Docker 镜像（本地）"
+	@echo "  make dev-env-start                       # 启动开发环境"
+	@echo ""
+	@echo "💡 更多帮助请使用 'make help-build' 或 'make help-docker'"

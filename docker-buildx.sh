@@ -248,6 +248,8 @@ done
 # Main execution
 main() {
     print_message $BLUE "🐳 RustFS Docker Buildx Build Script"
+    print_message $YELLOW "📋 Build Strategy: Uses pre-built binaries from dl.rustfs.com"
+    print_message $YELLOW "🚀 Production images only - optimized for distribution"
     echo ""
 
     # Check prerequisites
