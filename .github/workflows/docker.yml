@@ -38,7 +38,6 @@ on:
   workflow_run:
     workflows: ["Build and Release"]
     types: [completed]
-    branches: [main]
   # Manual trigger with same parameters for consistency
   workflow_dispatch:
     inputs:
@@ -116,46 +115,62 @@ jobs:
             # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
             short_sha=$(git rev-parse --short "${{ github.event.workflow_run.head_sha }}")
 
-            # Determine build type based on GitHub releases
-            # Use GitHub API to check if this commit has a release/tag
-            echo "🔍 Checking for releases/tags on commit ${{ github.event.workflow_run.head_sha }}"
+            # Determine build type based on triggering workflow event and ref
+            triggering_event="${{ github.event.workflow_run.event }}"
+            head_branch="${{ github.event.workflow_run.head_branch }}"
 
-            # Get all tags for this repository and check if any point to this commit
-            GITHUB_API_URL="https://api.github.com/repos/${{ github.repository }}/tags"
+            echo "🔍 Analyzing triggering workflow:"
+            echo "   📋 Event: $triggering_event"
+            echo "   🌿 Head branch: $head_branch"
+            echo "   📎 Head SHA: ${{ github.event.workflow_run.head_sha }}"
 
-            # Use curl to get tags (more reliable than git in workflow_run context)
-            if command -v gh >/dev/null 2>&1; then
-              # Use GitHub CLI if available
-              tag_info=$(gh api repos/${{ github.repository }}/tags --jq '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -n1)
-            else
-              # Fallback to curl
-              tag_info=$(curl -s "$GITHUB_API_URL" | jq -r '.[] | select(.commit.sha == "${{ github.event.workflow_run.head_sha }}") | .name' | head -n1)
-            fi
-
-            if [[ -n "$tag_info" ]] && [[ "$tag_info" != "null" ]]; then
-              # This commit has a tag, treat as release build
-              version="$tag_info"
-              # Remove 'v' prefix if present for consistent version format
-              if [[ "$version" == v* ]]; then
-                version="${version#v}"
-              fi
-
-              if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
-                build_type="prerelease"
-                is_prerelease=true
-                echo "🧪 Building Docker image for prerelease: $version"
+            # Check if this was triggered by a tag push
+            if [[ "$triggering_event" == "push" ]]; then
+              # For tag pushes, head_branch will be like "refs/tags/v1.0.0" or just "v1.0.0"
+              if [[ "$head_branch" == refs/tags/* ]]; then
+                # Extract tag name from refs/tags/TAG_NAME
+                tag_name="${head_branch#refs/tags/}"
+                version="$tag_name"
+              elif [[ "$head_branch" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                # Direct tag name like "v1.0.0" or "1.0.0-alpha.1"
+                version="$head_branch"
+              elif [[ "$head_branch" == "main" ]]; then
+                # Regular branch push to main
+                build_type="development"
+                version="dev-${short_sha}"
+                should_build=false
+                echo "⏭️  Skipping Docker build for development version (main branch push)"
               else
-                build_type="release"
-                create_latest=true
-                echo "🚀 Building Docker image for release: $version"
+                # Other branch push
+                build_type="development"
+                version="dev-${short_sha}"
+                should_build=false
+                echo "⏭️  Skipping Docker build for development version (branch: $head_branch)"
+              fi
+
+              # If we extracted a version (tag), determine release type
+              if [[ -n "$version" ]] && [[ "$version" != "dev-${short_sha}" ]]; then
+                # Remove 'v' prefix if present for consistent version format
+                if [[ "$version" == v* ]]; then
+                  version="${version#v}"
+                fi
+
+                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                  build_type="prerelease"
+                  is_prerelease=true
+                  echo "🧪 Building Docker image for prerelease: $version"
+                else
+                  build_type="release"
+                  create_latest=true
+                  echo "🚀 Building Docker image for release: $version"
+                fi
               fi
             else
-              # No tag found, treat as development build
+              # Non-push events
               build_type="development"
               version="dev-${short_sha}"
               should_build=false
-              echo "⏭️  Skipping Docker build for development version (no tag found)"
-              echo "🔍 Debug: Checked commit ${{ github.event.workflow_run.head_sha }} for tags"
+              echo "⏭️  Skipping Docker build for development version (event: $triggering_event)"
             fi
 
             echo "🔄 Build triggered by workflow_run:"
