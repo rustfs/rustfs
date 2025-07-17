@@ -805,9 +805,12 @@ impl S3 for FS {
             }
         }
 
+        let mut content_length = Some(info.size as i64);
+
         let content_range = if let Some(rs) = rs {
             let total_size = info.get_actual_size().map_err(ApiError::from)?;
             let (start, length) = rs.get_offset_length(total_size as i64).map_err(ApiError::from)?;
+            content_length = Some(length);
             Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
         } else {
             None
@@ -815,7 +818,7 @@ impl S3 for FS {
 
         let output = GetObjectOutput {
             body,
-            content_length: Some(info.size as i64),
+            content_length,
             last_modified,
             content_type,
             accept_ranges: Some("bytes".to_string()),
