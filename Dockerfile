@@ -88,6 +88,7 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_CONSOLE_ENABLE=true \
     RUSTFS_VOLUMES=/data \
     RUST_LOG=warn \
+# Directory where RustFS stores observability logs. Ensure this path exists and has appropriate permissions.
     RUSTFS_OBS_LOG_DIRECTORY=/logs
 
 # Set permissions for /usr/bin (similar to MinIO's approach)
