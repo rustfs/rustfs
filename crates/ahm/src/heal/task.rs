@@ -13,20 +13,10 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::heal::{progress::HealProgress, storage::HealStorageAPI};
-use rustfs_ecstore::config::RUSTFS_CONFIG_PREFIX;
-use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_ecstore::disk::error::DiskError;
-use rustfs_ecstore::disk::{DiskAPI, DiskInfoOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::heal::{erasure_healer::ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
+use rustfs_ecstore::heal::heal_commands::HealScanMode;
 use rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN;
-use rustfs_ecstore::heal::heal_commands::{init_healing_tracker, load_healing_tracker, HealScanMode};
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store::get_disk_via_endpoint;
-use rustfs_ecstore::store_api::BucketInfo;
-use rustfs_utils::path::path_join;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -44,8 +34,8 @@ pub enum HealType {
     },
     /// Bucket heal
     Bucket { bucket: String },
-    /// Disk heal
-    Disk { endpoint: Endpoint },
+    /// Erasure Set heal (includes disk format repair)
+    ErasureSet { buckets: Vec<String>, set_disk_id: String },
     /// Metadata heal
     Metadata { bucket: String, object: String },
     /// MRF heal
@@ -175,10 +165,6 @@ impl HealRequest {
         Self::new(HealType::Bucket { bucket }, HealOptions::default(), HealPriority::Normal)
     }
 
-    pub fn disk(endpoint: Endpoint) -> Self {
-        Self::new(HealType::Disk { endpoint }, HealOptions::default(), HealPriority::High)
-    }
-
     pub fn metadata(bucket: String, object: String) -> Self {
         Self::new(HealType::Metadata { bucket, object }, HealOptions::default(), HealPriority::High)
     }
@@ -256,7 +242,7 @@ impl HealTask {
                 version_id,
             } => self.heal_object(bucket, object, version_id.as_deref()).await,
             HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
-            HealType::Disk { endpoint } => self.heal_disk(endpoint).await,
+
             HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
             HealType::MRF { meta_path } => self.heal_mrf(meta_path).await,
             HealType::ECDecode {
@@ -264,6 +250,7 @@ impl HealTask {
                 object,
                 version_id,
             } => self.heal_ec_decode(bucket, object, version_id.as_deref()).await,
+            HealType::ErasureSet { buckets, set_disk_id } => self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await,
         };
 
         // update completed time and status
@@ -524,62 +511,6 @@ impl HealTask {
         }
     }
 
-    async fn heal_disk(&self, endpoint: &Endpoint) -> Result<()> {
-        info!("Healing disk: {:?}", endpoint);
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("disk: {endpoint:?}")));
-            progress.update_progress(0, 3, 0, 0);
-        }
-
-        // Step 1: Perform disk format heal using ecstore
-        info!("Step 1: Performing disk format heal using ecstore");
-
-        match self.storage.heal_format(self.options.dry_run).await {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!("Disk heal failed: {:?} - {}", endpoint, e);
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal disk {endpoint:?}: {e}"),
-                    });
-                }
-
-                info!("Disk heal completed successfully: {:?} ({} drives)", endpoint, result.after.drives.len());
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(2, 3, 0, 0);
-                }
-
-                // Step 2: Synchronize data/buckets on the fresh disk
-                info!("Step 2: Healing buckets on fresh disk");
-                self.heal_fresh_disk(endpoint).await?;
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                error!("Disk heal failed: {:?} - {}", endpoint, e);
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
-                }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal disk {endpoint:?}: {e}"),
-                })
-            }
-        }
-    }
-
     async fn heal_metadata(&self, bucket: &str, object: &str) -> Result<()> {
         info!("Healing metadata: {}/{}", bucket, object);
 
@@ -807,79 +738,93 @@ impl HealTask {
         }
     }
 
-    async fn heal_fresh_disk(&self, endpoint: &Endpoint) -> Result<()> {
-        // Locate disk via endpoint
-        let disk = get_disk_via_endpoint(endpoint)
-            .await
-            .ok_or_else(|| Error::other(format!("Disk not found for endpoint: {endpoint}")))?;
+    async fn heal_erasure_set(&self, buckets: Vec<String>, set_disk_id: String) -> Result<()> {
+        info!("Healing Erasure Set: {} ({} buckets)", set_disk_id, buckets.len());
 
-        // Skip if drive is root or other fatal errors
-        if let Err(e) = disk.disk_info(&DiskInfoOptions::default()).await {
-            match e {
-                DiskError::DriveIsRoot => return Ok(()),
-                DiskError::UnformattedDisk => { /* continue healing */ }
-                _ => return Err(Error::other(e)),
+        // update progress
+        {
+            let mut progress = self.progress.write().await;
+            progress.set_current_object(Some(format!("erasure_set: {} ({} buckets)", set_disk_id, buckets.len())));
+            progress.update_progress(0, 4, 0, 0);
+        }
+
+        // Step 1: Perform disk format heal using ecstore
+        info!("Step 1: Performing disk format heal using ecstore");
+        match self.storage.heal_format(self.options.dry_run).await {
+            Ok((result, error)) => {
+                if let Some(e) = error {
+                    error!("Disk format heal failed: {} - {}", set_disk_id, e);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(4, 4, 0, 0);
+                    }
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
+                    });
+                }
+
+                info!(
+                    "Disk format heal completed successfully: {} ({} drives)",
+                    set_disk_id,
+                    result.after.drives.len()
+                );
+            }
+            Err(e) => {
+                error!("Disk format heal failed: {} - {}", set_disk_id, e);
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(4, 4, 0, 0);
+                }
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
+                });
             }
         }
 
-        // Load or init HealingTracker
-        let mut tracker = match load_healing_tracker(&Some(disk.clone())).await {
-            Ok(t) => t,
-            Err(err) => match err {
-                DiskError::FileNotFound => init_healing_tracker(disk.clone(), &Uuid::new_v4().to_string())
-                    .await
-                    .map_err(Error::other)?,
-                _ => return Err(Error::other(err)),
-            },
-        };
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(1, 4, 0, 0);
+        }
 
-        // Build bucket list
-        let mut buckets = self.storage.list_buckets().await.map_err(Error::other)?;
-        buckets.push(BucketInfo {
-            name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(RUSTFS_CONFIG_PREFIX)])
-                .to_string_lossy()
-                .to_string(),
-            ..Default::default()
-        });
-        buckets.push(BucketInfo {
-            name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)])
-                .to_string_lossy()
-                .to_string(),
-            ..Default::default()
-        });
+        // Step 2: Get disk for resume functionality
+        info!("Step 2: Getting disk for resume functionality");
+        let disk = self.storage.get_disk_for_resume(&set_disk_id).await?;
 
-        // Sort: system buckets first, others by creation time desc
-        buckets.sort_by(|a, b| {
-            let a_sys = a.name.starts_with(RUSTFS_META_BUCKET);
-            let b_sys = b.name.starts_with(RUSTFS_META_BUCKET);
-            match (a_sys, b_sys) {
-                (true, false) => Ordering::Less,
-                (false, true) => Ordering::Greater,
-                _ => b.created.cmp(&a.created),
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(2, 4, 0, 0);
+        }
+
+        // Step 3: Create erasure set healer with resume support
+        info!("Step 3: Creating erasure set healer with resume support");
+        let erasure_healer = ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk);
+
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(3, 4, 0, 0);
+        }
+
+        // Step 4: Execute erasure set heal with resume
+        info!("Step 4: Executing erasure set heal with resume");
+        let result = erasure_healer.heal_erasure_set(&buckets, &set_disk_id).await;
+
+        {
+            let mut progress = self.progress.write().await;
+            progress.update_progress(4, 4, 0, 0);
+        }
+
+        match result {
+            Ok(_) => {
+                info!("Erasure set heal completed successfully: {} ({} buckets)", set_disk_id, buckets.len());
+                Ok(())
             }
-        });
-
-        // Update tracker queue and persist
-        tracker.set_queue_buckets(&buckets).await;
-        tracker.save().await.map_err(Error::other)?;
-
-        // Prepare bucket names list
-        let bucket_names: Vec<String> = buckets.iter().map(|b| b.name.clone()).collect();
-
-        // Run heal_erasure_set using underlying SetDisk
-        let (pool_idx, set_idx) = (endpoint.pool_idx as usize, endpoint.set_idx as usize);
-        let Some(store) = new_object_layer_fn() else {
-            return Err(Error::other("errServerNotInitialized"));
-        };
-        let set_disk = store.pools[pool_idx].disk_set[set_idx].clone();
-
-        let tracker_arc = Arc::new(RwLock::new(tracker));
-        set_disk
-            .heal_erasure_set(&bucket_names, tracker_arc)
-            .await
-            .map_err(Error::other)?;
-
-        Ok(())
+            Err(e) => {
+                error!("Erasure set heal failed: {} - {}", set_disk_id, e);
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal erasure set {set_disk_id}: {e}"),
+                })
+            }
+        }
     }
 }
 

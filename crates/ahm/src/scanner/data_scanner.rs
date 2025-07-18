@@ -22,7 +22,7 @@ use ecstore::{
     disk::{DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
-use rustfs_ecstore as ecstore;
+use rustfs_ecstore::{self as ecstore, StorageAPI};
 use rustfs_filemeta::MetacacheReader;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -502,18 +502,43 @@ impl Scanner {
                 metrics.free_space = disk_info.free;
                 metrics.is_online = disk.is_online().await;
 
-                // 检查磁盘状态，如果离线则提交heal任务
+                // check disk status, if offline, submit erasure set heal task
                 if !metrics.is_online {
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
                         if let Some(heal_manager) = &self.heal_manager {
-                            let req = HealRequest::disk(disk.endpoint().clone());
+                                                    // Get bucket list for erasure set healing
+                        let buckets = match rustfs_ecstore::new_object_layer_fn() {
+                            Some(ecstore) => {
+                                match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                                    Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                                    Err(e) => {
+                                        error!("Failed to get bucket list for disk healing: {}", e);
+                                        return Err(Error::Storage(e.into()));
+                                    }
+                                }
+                            }
+                            None => {
+                                error!("No ECStore available for getting bucket list");
+                                return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
+                            }
+                        };
+
+                            let set_disk_id = format!("{}_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
+                            let req = HealRequest::new(
+                                crate::heal::task::HealType::ErasureSet {
+                                    buckets,
+                                    set_disk_id,
+                                },
+                                crate::heal::task::HealOptions::default(),
+                                crate::heal::task::HealPriority::High,
+                            );
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
-                                    warn!("disk offline, submit heal task: {} {}", task_id, disk_path);
+                                    warn!("disk offline, submit erasure set heal task: {} {}", task_id, disk_path);
                                 }
                                 Err(e) => {
-                                    error!("disk offline, submit heal task failed: {} {}", disk_path, e);
+                                    error!("disk offline, submit erasure set heal task failed: {} {}", disk_path, e);
                                 }
                             }
                         }
@@ -540,24 +565,42 @@ impl Scanner {
             Err(e) => {
                 error!("Failed to list volumes on disk {}: {}", disk_path, e);
 
-                // 磁盘访问失败，提交磁盘heal任务
+                // disk access failed, submit erasure set heal task
                 let enable_healing = self.config.read().await.enable_healing;
                 if enable_healing {
                     if let Some(heal_manager) = &self.heal_manager {
-                        use crate::heal::{HealPriority, HealRequest};
+                        // Get bucket list for erasure set healing
+                        let buckets = match rustfs_ecstore::new_object_layer_fn() {
+                            Some(ecstore) => {
+                                match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                                    Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                                    Err(e) => {
+                                        error!("Failed to get bucket list for disk healing: {}", e);
+                                        return Err(Error::Storage(e.into()));
+                                    }
+                                }
+                            }
+                            None => {
+                                error!("No ECStore available for getting bucket list");
+                                return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
+                            }
+                        };
+
+                        let set_disk_id = format!("{}_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
                         let req = HealRequest::new(
-                            crate::heal::HealType::Disk {
-                                endpoint: disk.endpoint().clone(),
+                            crate::heal::task::HealType::ErasureSet {
+                                buckets,
+                                set_disk_id,
                             },
-                            crate::heal::HealOptions::default(),
-                            HealPriority::Urgent,
+                            crate::heal::task::HealOptions::default(),
+                            crate::heal::task::HealPriority::Urgent,
                         );
                         match heal_manager.submit_heal_request(req).await {
                             Ok(task_id) => {
-                                warn!("disk access failed, submit heal task: {} {}", task_id, disk_path);
+                                warn!("disk access failed, submit erasure set heal task: {} {}", task_id, disk_path);
                             }
                             Err(heal_err) => {
-                                error!("disk access failed, submit heal task failed: {} {}", disk_path, heal_err);
+                                error!("disk access failed, submit erasure set heal task failed: {} {}", disk_path, heal_err);
                             }
                         }
                     }

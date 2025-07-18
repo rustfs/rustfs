@@ -143,13 +143,19 @@ impl HealEvent {
                 HealOptions::default(),
                 HealPriority::High,
             ),
-            HealEvent::DiskStatusChange { endpoint, .. } => HealRequest::new(
-                HealType::Disk {
-                    endpoint: endpoint.clone(),
-                },
-                HealOptions::default(),
-                HealPriority::High,
-            ),
+            HealEvent::DiskStatusChange { endpoint, .. } => {
+                // Convert disk status change to erasure set heal
+                // Note: This requires access to storage to get bucket list, which is not available here
+                // The actual bucket list will need to be provided by the caller or retrieved differently
+                HealRequest::new(
+                    HealType::ErasureSet {
+                        buckets: vec![], // Empty bucket list - caller should populate this
+                        set_disk_id: format!("{}_{}", endpoint.pool_idx, endpoint.set_idx),
+                    },
+                    HealOptions::default(),
+                    HealPriority::High,
+                )
+            }
             HealEvent::ECDecodeFailure {
                 bucket,
                 object,

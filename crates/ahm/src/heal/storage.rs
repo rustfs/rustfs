@@ -15,7 +15,7 @@
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use rustfs_ecstore::{
-    disk::endpoint::Endpoint,
+    disk::{endpoint::Endpoint, DiskStore},
     heal::heal_commands::{HealOpts, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
     store::ECStore,
     store_api::{BucketInfo, ObjectIO, StorageAPI},
@@ -109,6 +109,9 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// List objects for healing
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>>;
+
+    /// Get disk for resume functionality
+    async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore>;
 }
 
 /// ECStore Heal storage layer implementation
@@ -459,5 +462,45 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(Error::other(e))
             }
         }
+    }
+
+    async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
+        debug!("Getting disk for resume: {}", set_disk_id);
+
+        // Parse set_disk_id to extract pool and set indices
+        // Format: "pool_{pool_idx}_set_{set_idx}"
+        let parts: Vec<&str> = set_disk_id.split('_').collect();
+        if parts.len() != 4 || parts[0] != "pool" || parts[2] != "set" {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Invalid set_disk_id format: {set_disk_id}"),
+            });
+        }
+
+        let pool_idx: usize = parts[1].parse().map_err(|_| Error::TaskExecutionFailed {
+            message: format!("Invalid pool index in set_disk_id: {set_disk_id}"),
+        })?;
+
+        let set_idx: usize = parts[3].parse().map_err(|_| Error::TaskExecutionFailed {
+            message: format!("Invalid set index in set_disk_id: {set_disk_id}"),
+        })?;
+
+        // Get the first available disk from the set
+        let disks = self
+            .ecstore
+            .get_disks(pool_idx, set_idx)
+            .await
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
+            })?;
+
+        // Find the first available disk
+        if let Some(disk_store) = disks.into_iter().flatten().next() {
+            info!("Found disk for resume: {:?}", disk_store);
+            return Ok(disk_store);
+        }
+
+        Err(Error::TaskExecutionFailed {
+            message: format!("No available disk found for set_disk_id: {set_disk_id}"),
+        })
     }
 }

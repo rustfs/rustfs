@@ -259,12 +259,13 @@ impl HealManager {
         Ok(())
     }
 
-    /// Start background task to auto scan local disks and enqueue disk heal requests
+    /// Start background task to auto scan local disks and enqueue erasure set heal requests
     async fn start_auto_disk_scanner(&self) -> Result<()> {
         let config = self.config.clone();
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let cancel_token = self.cancel_token.clone();
+        let storage = self.storage.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(config.read().await.heal_interval);
@@ -300,18 +301,28 @@ impl HealManager {
                             continue;
                         }
 
+                        // Get bucket list for erasure set healing
+                        let buckets = match storage.list_buckets().await {
+                            Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                            Err(e) => {
+                                error!("Failed to get bucket list for auto healing: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Create erasure set heal requests for each endpoint
                         for ep in endpoints {
                             // skip if already queued or healing
                             let mut skip = false;
                             {
                                 let queue = heal_queue.lock().await;
-                                if queue.iter().any(|req| matches!(&req.heal_type, crate::heal::task::HealType::Disk { endpoint } if endpoint == &ep)) {
+                                if queue.iter().any(|req| matches!(&req.heal_type, crate::heal::task::HealType::ErasureSet { set_disk_id, .. } if set_disk_id == &format!("{}_{}", ep.pool_idx, ep.set_idx))) {
                                     skip = true;
                                 }
                             }
                             if !skip {
                                 let active = active_heals.lock().await;
-                                if active.values().any(|task| matches!(&task.heal_type, crate::heal::task::HealType::Disk { endpoint } if endpoint == &ep)) {
+                                if active.values().any(|task| matches!(&task.heal_type, crate::heal::task::HealType::ErasureSet { set_disk_id, .. } if set_disk_id == &format!("{}_{}", ep.pool_idx, ep.set_idx))) {
                                     skip = true;
                                 }
                             }
@@ -320,15 +331,19 @@ impl HealManager {
                                 continue;
                             }
 
-                            // enqueue heal request for this disk
+                            // enqueue erasure set heal request for this disk
+                            let set_disk_id = format!("{}_{}", ep.pool_idx, ep.set_idx);
                             let req = crate::heal::task::HealRequest::new(
-                                crate::heal::task::HealType::Disk { endpoint: ep.clone() },
+                                crate::heal::task::HealType::ErasureSet { 
+                                    buckets: buckets.clone(), 
+                                    set_disk_id: set_disk_id.clone() 
+                                },
                                 crate::heal::task::HealOptions::default(),
                                 crate::heal::task::HealPriority::Normal,
                             );
                             let mut queue = heal_queue.lock().await;
                             queue.push_back(req);
-                            info!("Enqueued auto disk heal for endpoint: {}", ep);
+                            info!("Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
                         }
                     }
                 }
@@ -365,7 +380,8 @@ impl HealManager {
             // start heal task
             tokio::spawn(async move {
                 info!("Starting heal task: {}", task_id);
-                match task.execute().await {
+                let result = task.execute().await;
+                match result {
                     Ok(_) => {
                         info!("Heal task completed successfully: {}", task_id);
                     }

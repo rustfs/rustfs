@@ -3468,7 +3468,7 @@ impl SetDisks {
                 return Err(Error::other(format!("unable to get disk information before healing it: {err}")));
             }
         };
-        let num_cores = num_cpus::get(); // 使用 num_cpus crate 获取核心数
+        let num_cores = num_cpus::get(); // use num_cpus crate to get the number of cores
         let mut num_healers: usize;
 
         if info.nr_requests as usize > num_cores {
@@ -3577,44 +3577,6 @@ impl SetDisks {
                 continue;
             }
 
-            // let vc: VersioningConfiguration;
-            // let lc: BucketLifecycleConfiguration;
-            // let lr: ObjectLockConfiguration;
-            // let rcfg: ReplicationConfiguration;
-            // if !is_rustfs_meta_bucket_name(bucket) {
-            //     vc = match get_versioning_config(bucket).await {
-            //         Ok((r, _)) => r,
-            //         Err(err) => {
-            //             ret_err = Some(err);
-            //             info!("get versioning config failed, err: {}", err.to_string());
-            //             continue;
-            //         }
-            //     };
-            //     lc = match get_lifecycle_config(bucket).await {
-            //         Ok((r, _)) => r,
-            //         Err(err) => {
-            //             ret_err = Some(err);
-            //             info!("get lifecycle config failed, err: {}", err.to_string());
-            //             continue;
-            //         }
-            //     };
-            //     lr = match get_object_lock_config(bucket).await {
-            //         Ok((r, _)) => r,
-            //         Err(err) => {
-            //             ret_err = Some(err);
-            //             info!("get object lock config failed, err: {}", err.to_string());
-            //             continue;
-            //         }
-            //     };
-            //     rcfg = match get_replication_config(bucket).await {
-            //         Ok((r, _)) => r,
-            //         Err(err) => {
-            //             ret_err = Some(err);
-            //             info!("get replication config failed, err: {}", err.to_string());
-            //             continue;
-            //         }
-            //     };
-            // }
             let (mut disks, _, healing) = self.get_online_disk_with_healing_and_info(true).await?;
             if disks.len() == healing {
                 info!("all drives are in healing state, aborting..");
@@ -3644,17 +3606,6 @@ impl SetDisks {
             let expected_disk = disks.len() / 2 + 1;
             let fallback_disks = disks[expected_disk..].to_vec();
             disks = disks[..expected_disk].to_vec();
-
-            //todo
-            // let filter_life_cycle = |bucket: &str, object: &str, fi: FileInfo| {
-            //     if lc.rules.is_empty() {
-            //         return false;
-            //     }
-            //     // todo: versioning
-            //     let versioned = false;
-            //     let obj_info = fi.to_object_info(bucket, object, versioned);
-            //
-            // };
 
             let result_tx_send = result_tx.clone();
             let bg_seq_send = bg_seq.clone();
