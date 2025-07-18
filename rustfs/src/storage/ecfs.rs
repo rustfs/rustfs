@@ -792,11 +792,6 @@ impl S3 for FS {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
-        let body = Some(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
-            info.size as usize,
-        )));
-
         let mut rs = rs;
 
         if let Some(part_number) = part_number {
@@ -805,17 +800,25 @@ impl S3 for FS {
             }
         }
 
+        let mut content_length = info.size as i64;
+
         let content_range = if let Some(rs) = rs {
             let total_size = info.get_actual_size().map_err(ApiError::from)?;
             let (start, length) = rs.get_offset_length(total_size as i64).map_err(ApiError::from)?;
+            content_length = length;
             Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
         } else {
             None
         };
 
+        let body = Some(StreamingBlob::wrap(bytes_stream(
+            ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
+            content_length as usize,
+        )));
+
         let output = GetObjectOutput {
             body,
-            content_length: Some(info.size as i64),
+            content_length: Some(content_length),
             last_modified,
             content_type,
             accept_ranges: Some("bytes".to_string()),

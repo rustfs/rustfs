@@ -51,7 +51,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # 可观测性 相关配置信息
-export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
 #export RUSTFS_OBS_USE_STDOUT=false # 是否使用标准输出
 #export RUSTFS_OBS_SAMPLE_RATIO=2.0 # 采样率，0.0-1.0之间，0.0表示不采样，1.0表示全部采样
 #export RUSTFS_OBS_METER_INTERVAL=1 # 采样间隔，单位为秒

@@ -1,121 +1,94 @@
 # Multi-stage build for RustFS production image
-FROM alpine:latest AS build
 
-# Build arguments - use TARGETPLATFORM for consistency with Dockerfile.source
+# Build stage: Download and extract RustFS binary
+FROM alpine:3.22 AS build
+
+# Build arguments for platform and release
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG RELEASE=latest
 
-# Install dependencies for downloading and verifying binaries
-RUN apk add --no-cache \
-    ca-certificates \
-    curl \
-    bash \
-    wget \
-    unzip \
-    jq
+# Install minimal dependencies for downloading and extracting
+RUN apk add --no-cache ca-certificates curl unzip
 
 # Create build directory
 WORKDIR /build
 
-# Map TARGETPLATFORM to architecture format used in builds
+# Map TARGETPLATFORM to architecture
 RUN case "${TARGETPLATFORM}" in \
         "linux/amd64") ARCH="x86_64" ;; \
         "linux/arm64") ARCH="aarch64" ;; \
-        *) echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 ;; \
+        *) echo "Unsupported platform: ${TARGETPLATFORM}" >&2 && exit 1 ;; \
     esac && \
     echo "ARCH=${ARCH}" > /build/arch.env
 
-# Download rustfs binary from dl.rustfs.com (release channel only)
+# Download and extract RustFS binary
 RUN . /build/arch.env && \
     BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
-    PLATFORM="linux" && \
-    if [ "${RELEASE}" = "latest" ]; then \
-        # Download latest release version \
-        PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-latest.zip"; \
-        DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}"; \
-        echo "📥 Downloading latest release build: ${PACKAGE_NAME}"; \
-    else \
-        # Download specific release version \
-        PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${RELEASE}.zip"; \
-        DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}"; \
-        echo "📥 Downloading specific release version: ${PACKAGE_NAME}"; \
-    fi && \
-    echo "🔗 Download URL: ${DOWNLOAD_URL}" && \
-    curl -f -L "${DOWNLOAD_URL}" -o /build/rustfs.zip && \
-    if [ ! -f /build/rustfs.zip ] || [ ! -s /build/rustfs.zip ]; then \
-        echo "❌ Failed to download binary package"; \
-        echo "💡 Make sure the package ${PACKAGE_NAME} exists"; \
-        echo "🔗 Check: ${DOWNLOAD_URL}"; \
-        exit 1; \
-    fi && \
-    unzip /build/rustfs.zip -d /build && \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE}.zip" && \
+    DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}" && \
+    echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}" >&2 && \
+    curl -f -L "${DOWNLOAD_URL}" -o rustfs.zip && \
+    unzip rustfs.zip -d /build && \
     chmod +x /build/rustfs && \
-    rm /build/rustfs.zip && \
-    echo "✅ Successfully downloaded and extracted rustfs binary"
+    rm rustfs.zip || { echo "Failed to download or extract ${PACKAGE_NAME}" >&2; exit 1; }
 
-# Runtime stage
-FROM alpine:latest
+# Runtime stage: Configure runtime environment
+FROM alpine:3.22.1
 
-# Set build arguments and labels
+# Build arguments and labels
 ARG RELEASE=latest
 ARG BUILD_DATE
 ARG VCS_REF
 
 LABEL name="RustFS" \
-    vendor="RustFS Team" \
-    maintainer="RustFS Team <dev@rustfs.com>" \
-    version="${RELEASE}" \
-    release="${RELEASE}" \
-    build-date="${BUILD_DATE}" \
-    vcs-ref="${VCS_REF}" \
-    summary="RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API." \
-    description="RustFS is a high-performance distributed object storage software built using Rust. It supports erasure coding storage, multi-tenant management, observability, and other enterprise-level features." \
-    url="https://rustfs.com" \
-    license="Apache-2.0"
+      vendor="RustFS Team" \
+      maintainer="RustFS Team <dev@rustfs.com>" \
+      version="${RELEASE}" \
+      release="${RELEASE}" \
+      build-date="${BUILD_DATE}" \
+      vcs-ref="${VCS_REF}" \
+      summary="High-performance distributed object storage system compatible with S3 API" \
+      description="RustFS is a distributed object storage system written in Rust, supporting erasure coding, multi-tenant management, and observability." \
+      url="https://rustfs.com" \
+      license="Apache-2.0"
 
 # Install runtime dependencies
-RUN apk add --no-cache \
-    ca-certificates \
-    curl \
-    tzdata \
-    bash \
-    && addgroup -g 1000 rustfs \
-    && adduser -u 1000 -G rustfs -s /bin/sh -D rustfs
+RUN echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/community" >> /etc/apk/repositories && \
+    apk update && \
+    apk add --no-cache ca-certificates bash gosu && \
+    addgroup -g 1000 rustfs && \
+    adduser -u 1000 -G rustfs -s /bin/bash -D rustfs
 
-# Environment variables
-ENV RUSTFS_ACCESS_KEY=rustfsadmin \
+# Copy CA certificates and RustFS binary from build stage
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /build/rustfs /usr/bin/rustfs
+
+# Copy entry point script
+COPY entrypoint.sh /entrypoint.sh
+
+# Set permissions
+RUN chmod +x /usr/bin/rustfs /entrypoint.sh && \
+    mkdir -p /data /logs && \
+    chown rustfs:rustfs /data /logs && \
+    chmod 700 /data /logs
+
+# Environment variables (credentials should be set via environment or secrets)
+ENV RUSTFS_ADDRESS=":9000" \
+    RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_SECRET_KEY=rustfsadmin \
-    RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
     RUSTFS_VOLUMES=/data \
-    RUST_LOG=warn
-
-# Set permissions for /usr/bin (similar to MinIO's approach)
-RUN chmod -R 755 /usr/bin
-
-# Copy CA certificates and binaries from build stage
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /build/rustfs /usr/bin/
-
-# Set executable permissions
-RUN chmod +x /usr/bin/rustfs
-
-# Create data directory
-RUN mkdir -p /data /config && chown -R rustfs:rustfs /data /config
-
-# Switch to non-root user
-USER rustfs
-
-# Set working directory
-WORKDIR /data
+    RUST_LOG=warn \
+    RUSTFS_OBS_LOG_DIRECTORY=/logs \
+    RUSTFS_SINKS_FILE_PATH=/logs
 
 # Expose port
 EXPOSE 9000
 
+# Volumes for data and logs
+VOLUME ["/data", "/logs"]
 
-# Volume for data
-VOLUME ["/data"]
-
-# Set entrypoint
-ENTRYPOINT ["/usr/bin/rustfs"]
+# Set entry point
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/usr/bin/rustfs"]
