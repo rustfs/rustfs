@@ -108,8 +108,8 @@ cfg-if = "1.0.1"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.41", features = ["derive", "env"] }
-const-str = { version = "0.6.2", features = ["std", "proc"] }
-crc32fast = "1.4.2"
+const-str = { version = "0.6.3", features = ["std", "proc"] }
+crc32fast = "1.5.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 dashmap = "6.1.0"
 datafusion = "46.0.1"
@@ -196,7 +196,7 @@ reqwest = { version = "0.12.22", default-features = false, features = [
     "json",
     "blocking",
 ] }
-rfd = { version = "0.15.3", default-features = false, features = [
+rfd = { version = "0.15.4", default-features = false, features = [
     "xdg-portal",
     "tokio",
 ] }

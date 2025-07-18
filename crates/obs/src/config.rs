@@ -14,7 +14,8 @@
 
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_FILENAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB,
-    DEFAULT_LOG_ROTATION_TIME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME, DEFAULT_SINK_FILE_LOG_FILE, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    SERVICE_VERSION, USE_STDOUT,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -104,7 +105,7 @@ impl OtelConfig {
             log_filename: env::var("RUSTFS_OBS_LOG_FILENAME")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_FILENAME.to_string())),
+                .or(Some(DEFAULT_OBS_LOG_FILENAME.to_string())),
             log_rotation_size_mb: env::var("RUSTFS_OBS_LOG_ROTATION_SIZE_MB")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -210,16 +211,15 @@ pub struct FileSinkConfig {
 
 impl FileSinkConfig {
     pub fn get_default_log_path() -> String {
-        let temp_dir = env::temp_dir().join("rustfs");
-
+        let temp_dir = env::temp_dir().join(DEFAULT_LOG_FILENAME);
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
             eprintln!("Failed to create log directory: {e}");
-            return "rustfs/rustfs.log".to_string();
+            return DEFAULT_LOG_DIR.to_string();
         }
         temp_dir
-            .join("rustfs.log")
+            .join(DEFAULT_SINK_FILE_LOG_FILE)
             .to_str()
-            .unwrap_or("rustfs/rustfs.log")
+            .unwrap_or(DEFAULT_LOG_DIR)
             .to_string()
     }
     pub fn new() -> Self {

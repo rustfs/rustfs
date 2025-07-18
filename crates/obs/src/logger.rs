@@ -77,8 +77,7 @@ impl Logger {
     }
 
     /// Asynchronous logging of unified log entries
-    #[tracing::instrument(skip(self), fields(log_source = "logger"))]
-    #[tracing::instrument(level = "error", skip_all)]
+    #[tracing::instrument(skip_all, fields(log_source = "logger"))]
     pub async fn log_entry(&self, entry: UnifiedLogEntry) -> Result<(), GlobalError> {
         // Extract information for tracing based on entry type
         match &entry {

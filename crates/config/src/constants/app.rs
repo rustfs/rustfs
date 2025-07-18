@@ -108,14 +108,26 @@ pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
 /// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
-pub const DEFAULT_LOG_FILENAME: &str = "rustfs.log";
+pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
+
+/// Default OBS log filename for rustfs
+/// This is the default log filename for OBS.
+/// It is used to store the logs of the application.
+/// Default value: rustfs.log
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".log");
+
+/// Default sink file log file for rustfs
+/// This is the default sink file log file for rustfs.
+/// It is used to store the logs of the application.
+/// Default value: rustfs-sink.log
+pub const DEFAULT_SINK_FILE_LOG_FILE: &str = concat!(DEFAULT_LOG_FILENAME, "-sink.log");
 
 /// Default log directory for rustfs
 /// This is the default log directory for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: logs
 /// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
-pub const DEFAULT_LOG_DIR: &str = "deploy/logs";
+pub const DEFAULT_LOG_DIR: &str = "/logs";
 
 /// Default log rotation size mb for rustfs
 /// This is the default log rotation size for rustfs.
