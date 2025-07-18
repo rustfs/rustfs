@@ -77,8 +77,6 @@ LABEL name="RustFS" \
 # Install runtime dependencies
 RUN apk add --no-cache \
     ca-certificates \
-    curl \
-    tzdata \
     bash \
     && addgroup -g 1000 rustfs \
     && adduser -u 1000 -G rustfs -s /bin/sh -D rustfs
@@ -89,7 +87,8 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
     RUSTFS_VOLUMES=/data \
-    RUST_LOG=warn
+    RUST_LOG=warn \
+    RUSTFS_OBS_LOG_DIRECTORY=/logs
 
 # Set permissions for /usr/bin (similar to MinIO's approach)
 RUN chmod -R 755 /usr/bin
@@ -102,7 +101,7 @@ COPY --from=build /build/rustfs /usr/bin/
 RUN chmod +x /usr/bin/rustfs
 
 # Create data directory
-RUN mkdir -p /data /config && chown -R rustfs:rustfs /data /config
+RUN mkdir -p /data /logs && chown -R rustfs:rustfs /data /logs
 
 # Switch to non-root user
 USER rustfs
