@@ -14,6 +14,7 @@
 
 use crate::{AppConfig, SinkConfig, UnifiedLogEntry};
 use async_trait::async_trait;
+use rustfs_config::DEFAULT_SINK_FILE_LOG_FILE;
 use std::sync::Arc;
 
 #[cfg(feature = "file")]
@@ -71,7 +72,7 @@ pub async fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
             SinkConfig::File(file_config) => {
                 tracing::debug!("FileSink: Using path: {}", file_config.path);
                 match file::FileSink::new(
-                    file_config.path.clone(),
+                    format!("{}/{}", file_config.path.clone(), DEFAULT_SINK_FILE_LOG_FILE),
                     file_config.buffer_size.unwrap_or(8192),
                     file_config.flush_interval_ms.unwrap_or(1000),
                     file_config.flush_threshold.unwrap_or(100),

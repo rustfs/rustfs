@@ -89,7 +89,8 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_VOLUMES=/data \
     RUST_LOG=warn \
 # Directory where RustFS stores observability logs. Ensure this path exists and has appropriate permissions.
-    RUSTFS_OBS_LOG_DIRECTORY=/logs
+    RUSTFS_OBS_LOG_DIRECTORY=/logs \
+    RUSTFS_SINKS_FILE_PATH=/logs
 
 # Set permissions for /usr/bin (similar to MinIO's approach)
 RUN chmod -R 755 /usr/bin
@@ -115,7 +116,7 @@ EXPOSE 9000
 
 
 # Volume for data
-VOLUME ["/data"]
+VOLUME ["/data","/logs"]
 
 # Set entrypoint
 ENTRYPOINT ["/usr/bin/rustfs"]
