@@ -18,9 +18,10 @@ use crate::{
     factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
     target::Target,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
-use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_OFF, ENABLE_ON, KVS};
+use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KVS};
 use std::collections::HashMap;
 use tracing::{debug, error, info};
 
@@ -75,76 +76,94 @@ impl TargetRegistry {
 
     /// Creates all targets from a configuration
     pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn Target + Send + Sync>>, TargetError> {
-        let mut targets: Vec<Box<dyn Target + Send + Sync>> = Vec::new();
+        let mut new_map: HashMap<String, HashMap<String, KVS>> = HashMap::new();
+        // 1. 预先收集所有环境变量
+        let all_env: Vec<(String, String)> = std::env::vars().collect();
+        // 2. 创建异步任务集合
+        let mut tasks = FuturesUnordered::new();
 
-        // Iterate through configuration sections
-        for (section, subsections) in &config.0 {
-            // Only process notification sections
-            if !section.starts_with(NOTIFY_ROUTE_PREFIX) {
-                continue;
+        for target_type in self.factories.keys() {
+            let section = format!("{}{}", NOTIFY_ROUTE_PREFIX, target_type);
+            let mut sec_cfg = config.0.get(&section).cloned().unwrap_or_default();
+            // 确保默认段存在并克隆
+            let default_cfg = sec_cfg.entry(DEFAULT_DELIMITER.to_string()).or_insert_with(KVS::new).clone();
+            info!("Processing target type: {}", target_type);
+            // 3. 筛选当前类型相关的环境变量覆盖
+            let env_pref = format!("{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type.to_uppercase()).to_uppercase();
+            let mut overrides: HashMap<Option<String>, HashMap<String, String>> = HashMap::new();
+            for (k, v) in &all_env {
+                if let Some(rest) = k.strip_prefix(&env_pref) {
+                    let parts: Vec<&str> = rest.trim_start_matches(DEFAULT_DELIMITER).split(DEFAULT_DELIMITER).collect();
+                    let (field, id) = if parts.len() > 1 {
+                        (parts[0].to_lowercase(), Some(parts[1].to_string()))
+                    } else {
+                        (parts[0].to_lowercase(), None)
+                    };
+                    overrides.entry(id.clone()).or_default().insert(field, v.clone());
+                }
+            }
+            debug!("Collected environment overrides for {}: {:?}", target_type, overrides);
+            // 4. 合并所有实例 ID
+            let mut ids: Vec<String> = sec_cfg.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
+            for id in overrides.keys().filter_map(|x| x.clone()) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
             }
 
-            // Extract target type from section name
-            let target_type = section.trim_start_matches(NOTIFY_ROUTE_PREFIX);
-
-            // Iterate through subsections (each representing a target instance)
-            for (target_id, target_config) in subsections {
-                // Skip disabled targets
-
-                let enable_from_config = target_config.lookup(ENABLE_KEY).unwrap_or_else(|| ENABLE_OFF.to_string());
-                debug!("Target enablement from config: {}/{}: {}", target_type, target_id, enable_from_config);
-                // Check environment variable for target enablement example: RUSTFS_NOTIFY_WEBHOOK_ENABLE|RUSTFS_NOTIFY_WEBHOOK_ENABLE_[TARGET_ID]
-                let env_key = if target_id == DEFAULT_DELIMITER {
-                    // If no specific target ID, use the base target type, example: RUSTFS_NOTIFY_WEBHOOK_ENABLE
-                    format!(
-                        "{}{}{}{}{}",
-                        ENV_PREFIX,
-                        NOTIFY_ROUTE_PREFIX,
-                        target_type.to_uppercase(),
-                        DEFAULT_DELIMITER,
-                        ENABLE_KEY
-                    )
-                } else {
-                    // If specific target ID, append it to the key, example: RUSTFS_NOTIFY_WEBHOOK_ENABLE_[TARGET_ID]
-                    format!(
-                        "{}{}{}{}{}{}{}",
-                        ENV_PREFIX,
-                        NOTIFY_ROUTE_PREFIX,
-                        target_type.to_uppercase(),
-                        DEFAULT_DELIMITER,
-                        ENABLE_KEY,
-                        DEFAULT_DELIMITER,
-                        target_id.to_uppercase()
-                    )
+            // 5. 为每个实例合并配置并创建异步任务
+            for id in ids {
+                let mut merged = default_cfg.clone();
+                if let Some(cfg) = sec_cfg.get(&id) {
+                    merged.extend(cfg.clone());
                 }
-                .to_uppercase();
-                debug!("Target env key: {},Target id: {}", env_key, target_id);
-                let enable_from_env = std::env::var(&env_key)
-                    .map(|v| v.eq_ignore_ascii_case(ENABLE_ON) || v.eq_ignore_ascii_case("true"))
+                if let Some(gens) = overrides.get(&None) {
+                    for (f, val) in gens {
+                        merged.insert(f.clone(), val.clone());
+                    }
+                }
+                if let Some(spec) = overrides.get(&Some(id.clone())) {
+                    for (f, val) in spec {
+                        merged.insert(f.clone(), val.clone());
+                    }
+                }
+                debug!("Merged config for {}/{}: {:?}", target_type, id, merged);
+                let enabled = merged
+                    .lookup(ENABLE_KEY)
+                    .map(|v| v.eq_ignore_ascii_case(ENABLE_ON))
                     .unwrap_or(false);
-                debug!("Target env value: {},key: {},Target id: {}", enable_from_env, env_key, target_id);
-                debug!(
-                    "Target enablement from env: {}/{}: result: {}",
-                    target_type, target_id, enable_from_config
-                );
-                if enable_from_config != ENABLE_ON && !enable_from_env {
-                    info!("Skipping disabled target: {}/{}", target_type, target_id);
-                    continue;
-                }
-                debug!("create target: {}/{} start", target_type, target_id);
-                // Create target
-                match self.create_target(target_type, target_id.clone(), target_config).await {
-                    Ok(target) => {
-                        info!("Created target: {}/{}", target_type, target_id);
-                        targets.push(target);
-                    }
-                    Err(e) => {
-                        error!("Failed to create target {}/{}: reason: {}", target_type, target_id, e);
-                    }
+
+                // 将 merged 移动进闭包，并在 new_map 中 clone
+                let ttype = target_type.clone();
+                let tid = id.clone();
+                let mv = merged;
+                new_map.entry(section.clone()).or_default().insert(tid.clone(), mv.clone());
+
+                if enabled {
+                    info!("Creating target {}/{}", target_type, id);
+                    tasks.push(async move {
+                        let res = self.create_target(&ttype, tid.clone(), &mv).await;
+                        (ttype, tid, res)
+                    });
+                } else {
+                    info!("Skipping disabled target {}/{}", target_type, id);
                 }
             }
         }
 
-        Ok(targets)
+        // 6. 并发收集创建结果
+        let mut results = Vec::new();
+        while let Some((tpe, id, res)) = tasks.next().await {
+            match res {
+                Ok(t) => {
+                    info!("Successfully created target {}/{}", tpe, id);
+                    results.push(t)
+                }
+                Err(e) => error!("创建目标失败 {}/{}: {}", tpe, id, e),
+            }
+        }
+        info!("Finished creating targets. Total: {}, Successful: {}", results.len(), results.len());
+        // 7. （可选）写回 new_map 到系统配置
+        Ok(results)
     }
 }

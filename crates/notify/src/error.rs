@@ -82,6 +82,9 @@ pub enum TargetError {
 
     #[error("Target is disabled")]
     Disabled,
+
+    #[error("Configuration parsing error: {0}")]
+    ParseError(String),
 }
 
 /// Error types for the notification system

@@ -20,7 +20,7 @@ pub mod storageclass;
 
 use crate::error::Result;
 use crate::store::ECStore;
-use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
+use com::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
 use lazy_static::lazy_static;
 use rustfs_config::DEFAULT_DELIMITER;
 use serde::{Deserialize, Serialize};
@@ -130,6 +130,28 @@ impl KVS {
         }
 
         keys
+    }
+
+    /// Insert or update a pair of key/values in KVS
+    pub fn insert(&mut self, key: String, value: String) {
+        for kv in self.0.iter_mut() {
+            if kv.key == key {
+                kv.value = value.clone();
+                return;
+            }
+        }
+        self.0.push(KV {
+            key,
+            value,
+            hidden_if_empty: false,
+        });
+    }
+
+    /// Merge all entries from another KVS to the current instance
+    pub fn extend(&mut self, other: KVS) {
+        for KV { key, value, .. } in other.0.into_iter() {
+            self.insert(key, value);
+        }
     }
 }
 

@@ -93,6 +93,10 @@ export RUSTFS_NOTIFY_WEBHOOK_ENABLE="true" # 是否启用 webhook 通知
 export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # webhook 通知地址
 export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
 
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="true" # 是否启用 webhook 通知
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # webhook 通知地址
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
+
 
 export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
