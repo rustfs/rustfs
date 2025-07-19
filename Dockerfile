@@ -19,8 +19,13 @@ RUN case "${TARGETARCH}" in \
         arm64) ARCH="aarch64" ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" >&2 && exit 1 ;; \
     esac && \
+    if [ "${RELEASE}" = "latest" ]; then \
+        VERSION="latest"; \
+    else \
+        VERSION="v${RELEASE#v}"; \
+    fi && \
     BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
-    PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE#v}.zip" && \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-${VERSION}.zip" && \
     DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}" && \
     echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}" >&2 && \
     curl -f -L "${DOWNLOAD_URL}" -o rustfs.zip && \
