@@ -62,8 +62,12 @@ pub trait Store: Clone + Send + Sync + 'static {
         is_group: bool,
         m: &mut HashMap<String, MappedPolicy>,
     ) -> Result<()>;
-    async fn load_mapped_policies(&self, user_type: UserType, is_group: bool, m: &mut HashMap<String, MappedPolicy>)
-    -> Result<()>;
+    async fn load_mapped_policies(
+        &self,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+    ) -> Result<()>;
 
     async fn load_all(&self, cache: &Cache) -> Result<()>;
 }

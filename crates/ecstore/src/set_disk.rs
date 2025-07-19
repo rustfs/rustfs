@@ -2641,8 +2641,7 @@ impl SetDisks {
                             warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
-                                self.default_heal_result(latest_meta, &errs, bucket, object, version_id)
-                                    .await,
+                                self.default_heal_result(latest_meta, &errs, bucket, object, version_id).await,
                                 Some(err),
                             ));
                         }
@@ -2656,8 +2655,7 @@ impl SetDisks {
                             warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
-                                self.default_heal_result(latest_meta, &errs, bucket, object, version_id)
-                                    .await,
+                                self.default_heal_result(latest_meta, &errs, bucket, object, version_id).await,
                                 Some(err),
                             ));
                         }
@@ -2674,15 +2672,13 @@ impl SetDisks {
                             warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
-                                self.default_heal_result(latest_meta, &errs, bucket, object, version_id)
-                                    .await,
+                                self.default_heal_result(latest_meta, &errs, bucket, object, version_id).await,
                                 Some(err),
                             ));
                         }
 
                         let out_dated_disks = Self::shuffle_disks(&outdate_disks, &latest_meta.erasure.distribution);
-                        let mut parts_metadata =
-                            Self::shuffle_parts_metadata(&parts_metadata, &latest_meta.erasure.distribution);
+                        let mut parts_metadata = Self::shuffle_parts_metadata(&parts_metadata, &latest_meta.erasure.distribution);
                         let mut copy_parts_metadata = vec![None; parts_metadata.len()];
                         for (index, disk) in latest_disks.iter().enumerate() {
                             if disk.is_some() {
