@@ -112,6 +112,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     tzdata \
     wget \
+    coreutils \
+    passwd \
     && rm -rf /var/lib/apt/lists/*
 
 # Create rustfs user and group
@@ -128,6 +130,10 @@ RUN mkdir -p /data/rustfs{0,1,2,3} && \
 COPY --from=builder /usr/local/bin/rustfs /app/rustfs
 RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
 
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Switch to non-root user
 USER rustfs
 
@@ -142,9 +148,9 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_VOLUMES=/data \
     RUST_LOG=warn
 
-
 # Volume for data
 VOLUME ["/data"]
 
-# Set default command
+# Set entrypoint and default command
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/app/rustfs"]
