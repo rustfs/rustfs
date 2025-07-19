@@ -276,7 +276,7 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        Err(Error::other("range value invaild"))
+        Err(Error::other("range value invalid"))
     }
 }
 
@@ -336,7 +336,7 @@ pub struct BucketInfo {
     pub name: String,
     pub created: Option<OffsetDateTime>,
     pub deleted: Option<OffsetDateTime>,
-    pub versionning: bool,
+    pub versioning: bool,
     pub object_locking: bool,
 }
 

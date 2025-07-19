@@ -124,13 +124,13 @@ impl<T: Store> IamSys<T> {
         })
     }
 
-    pub async fn load_mapped_policys(
+    pub async fn load_mapped_policies(
         &self,
         user_type: UserType,
         is_group: bool,
         m: &mut HashMap<String, MappedPolicy>,
     ) -> Result<()> {
-        self.store.api.load_mapped_policys(user_type, is_group, m).await
+        self.store.api.load_mapped_policies(user_type, is_group, m).await
     }
 
     pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {

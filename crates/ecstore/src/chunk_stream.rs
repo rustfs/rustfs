@@ -41,7 +41,7 @@
 //                 pin_mut!(body);
 //                 // 上一次没用完的数据
 //                 let mut prev_bytes = Bytes::new();
-//                 let mut readed_size = 0;
+//                 let mut read_size = 0;
 
 //                 loop {
 //                     let data: Vec<Bytes> = {
@@ -51,9 +51,9 @@
 //                             Some(Err(e)) => return Err(e),
 //                             Some(Ok((data, remaining_bytes))) => {
 //                                 // debug!(
-//                                 //     "content_length:{},readed_size:{}, read_data data:{}, remaining_bytes: {} ",
+//                                 //     "content_length:{},read_size:{}, read_data data:{}, remaining_bytes: {} ",
 //                                 //     content_length,
-//                                 //     readed_size,
+//                                 //     read_size,
 //                                 //     data.len(),
 //                                 //     remaining_bytes.len()
 //                                 // );
@@ -65,15 +65,15 @@
 //                     };
 
 //                     for bytes in data {
-//                         readed_size += bytes.len();
-//                         // debug!("readed_size {}, content_length {}", readed_size, content_length,);
+//                         read_size += bytes.len();
+//                         // debug!("read_size {}, content_length {}", read_size, content_length,);
 //                         y.yield_ok(bytes).await;
 //                     }
 
-//                     if readed_size + prev_bytes.len() >= content_length {
+//                     if read_size + prev_bytes.len() >= content_length {
 //                         // debug!(
-//                         //     "读完了 readed_size:{} + prev_bytes.len({}) == content_length {}",
-//                         //     readed_size,
+//                         //     "读完了 read_size:{} + prev_bytes.len({}) == content_length {}",
+//                         //     read_size,
 //                         //     prev_bytes.len(),
 //                         //     content_length,
 //                         // );

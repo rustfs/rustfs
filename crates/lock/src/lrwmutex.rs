@@ -22,7 +22,7 @@ pub struct LRWMutex {
     id: RwLock<String>,
     source: RwLock<String>,
     is_write: RwLock<bool>,
-    refrence: RwLock<usize>,
+    reference: RwLock<usize>,
 }
 
 impl LRWMutex {
@@ -66,13 +66,13 @@ impl LRWMutex {
 
         let mut locked = false;
         if is_write {
-            if *self.refrence.read().await == 0 && !*self.is_write.read().await {
-                *self.refrence.write().await = 1;
+            if *self.reference.read().await == 0 && !*self.is_write.read().await {
+                *self.reference.write().await = 1;
                 *self.is_write.write().await = true;
                 locked = true;
             }
         } else if !*self.is_write.read().await {
-            *self.refrence.write().await += 1;
+            *self.reference.write().await += 1;
             locked = true;
         }
 
@@ -115,13 +115,13 @@ impl LRWMutex {
     async fn unlock(&self, is_write: bool) -> bool {
         let mut unlocked = false;
         if is_write {
-            if *self.is_write.read().await && *self.refrence.read().await == 1 {
-                *self.refrence.write().await = 0;
+            if *self.is_write.read().await && *self.reference.read().await == 1 {
+                *self.reference.write().await = 0;
                 *self.is_write.write().await = false;
                 unlocked = true;
             }
-        } else if !*self.is_write.read().await && *self.refrence.read().await > 0 {
-            *self.refrence.write().await -= 1;
+        } else if !*self.is_write.read().await && *self.reference.read().await > 0 {
+            *self.reference.write().await -= 1;
             unlocked = true;
         }
 
@@ -129,7 +129,7 @@ impl LRWMutex {
     }
 
     pub async fn force_un_lock(&self) {
-        *self.refrence.write().await = 0;
+        *self.reference.write().await = 0;
         *self.is_write.write().await = false;
     }
 }

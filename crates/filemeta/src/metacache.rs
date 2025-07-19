@@ -221,7 +221,7 @@ impl MetaCacheEntry {
         };
 
         if self_vers.versions.len() != other_vers.versions.len() {
-            match self_vers.lastest_mod_time().cmp(&other_vers.lastest_mod_time()) {
+            match self_vers.latest_mod_time().cmp(&other_vers.latest_mod_time()) {
                 Ordering::Greater => return (Some(self.clone()), false),
                 Ordering::Less => return (Some(other.clone()), false),
                 _ => {}

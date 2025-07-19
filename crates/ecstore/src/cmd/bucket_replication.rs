@@ -2422,7 +2422,7 @@ impl ReplicateObjectInfo {
 // let mut arns = Vec::new();
 // let mut tgts_map = std::collections::HashSet::new();
 // for rule in cfg.rules {
-//     if rule.status.as_str() == "Disabe" {
+//     if rule.status.as_str() == "Disable" {
 //         continue;
 //     }
 

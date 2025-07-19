@@ -30,9 +30,9 @@ use super::{
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
-    pub fn is_match(&self, resource: &str, conditons: &HashMap<String, Vec<String>>) -> bool {
+    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
         for re in self.0.iter() {
-            if re.is_match(resource, conditons) {
+            if re.is_match(resource, conditions) {
                 return true;
             }
         }
@@ -85,14 +85,14 @@ pub enum Resource {
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
 
-    pub fn is_match(&self, resource: &str, conditons: &HashMap<String, Vec<String>>) -> bool {
+    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
         let mut pattern = match self {
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
-        if !conditons.is_empty() {
+        if !conditions.is_empty() {
             for key in KeyName::COMMON_KEYS {
-                if let Some(rvalue) = conditons.get(key.name()) {
+                if let Some(rvalue) = conditions.get(key.name()) {
                     if matches!(rvalue.first().map(|c| !c.is_empty()), Some(true)) {
                         pattern = pattern.replace(&key.var_name(), &rvalue[0]);
                     }

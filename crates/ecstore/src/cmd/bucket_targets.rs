@@ -95,7 +95,7 @@ impl ArnTarget {
         Self {
             client: TargetClient {
                 bucket,
-                storage_class: "STANDRD".to_string(),
+                storage_class: "STANDARD".to_string(),
                 disable_proxy: false,
                 health_check_duration: Duration::from_secs(100),
                 endpoint,
@@ -361,7 +361,7 @@ impl BucketTargetSys {
     //     // Mocked implementation for obtaining a remote client
     //     let tcli = TargetClient {
     //         bucket: _tgt.target_bucket.clone(),
-    //         storage_class: "STANDRD".to_string(),
+    //         storage_class: "STANDARD".to_string(),
     //         disable_proxy: false,
     //         health_check_duration: Duration::from_secs(100),
     //         endpoint: _tgt.endpoint.clone(),
@@ -379,7 +379,7 @@ impl BucketTargetSys {
     //     // Mocked implementation for obtaining a remote client
     //     let tcli = TargetClient {
     //         bucket: _tgt.target_bucket.clone(),
-    //         storage_class: "STANDRD".to_string(),
+    //         storage_class: "STANDARD".to_string(),
     //         disable_proxy: false,
     //         health_check_duration: Duration::from_secs(100),
     //         endpoint: _tgt.endpoint.clone(),
@@ -403,7 +403,7 @@ impl BucketTargetSys {
         match store.get_bucket_info(_bucket, &store_api::BucketOptions::default()).await {
             Ok(info) => {
                 println!("Bucket Info: {info:?}");
-                info.versionning
+                info.versioning
             }
             Err(err) => {
                 eprintln!("Error: {err:?}");
@@ -431,7 +431,7 @@ impl BucketTargetSys {
         // {
         //     Ok(info) => {
         //         println!("Bucket Info: {:?}", info);
-        //         info.versionning
+        //         info.versioning
         //     }
         //     Err(err) => {
         //         eprintln!("Error: {:?}", err);
@@ -475,8 +475,7 @@ impl BucketTargetSys {
         {
             Ok(info) => {
                 println!("Bucket Info: {info:?}");
-                if !info.versionning {
-                    println!("2222222222 {}", info.versionning);
+                if !info.versioning {
                     return Err(SetTargetError::TargetNotVersioned(tgt.target_bucket.to_string()));
                 }
             }

@@ -107,7 +107,7 @@ mod tests {
     #[test_case("jwt:dwebsite/aaa")]
     #[test_case("sfvc:DuratdionSeconds")]
     #[test_case("svc:DursationSeconds/aaa")]
-    fn test_deserialize_falied(key: &str) {
+    fn test_deserialize_failed(key: &str) {
         let val = serde_json::from_str::<Key>(key);
         assert!(val.is_err());
     }
