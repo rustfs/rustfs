@@ -15,7 +15,7 @@ read -ra ALL_VOLUMES <<< "$VOLUME_RAW"
 # Only keep local volumes (start with /, not http/https)
 LOCAL_VOLUMES=()
 for vol in "${ALL_VOLUMES[@]}"; do
-  if [[ "$vol" =~ ^/ ]] && [[ ! "$vol" =~ ^/+/ ]]; then
+  if [[ "$vol" =~ ^/ ]] && [[ ! "$vol" =~ ^https?:// ]]; then
     # Not a URL (http/https), just a local path
     LOCAL_VOLUMES+=("$vol")
   fi
