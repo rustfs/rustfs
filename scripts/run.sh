@@ -64,7 +64,6 @@ export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
 
-#
 export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs/rustfs.log"
 export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
 export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000

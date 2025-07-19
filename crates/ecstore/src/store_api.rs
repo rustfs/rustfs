@@ -26,11 +26,11 @@ use crate::{
 use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
+use rustfs_filemeta::{headers::AMZ_OBJECT_TAGGING, FileInfo, MetaCacheEntriesSorted, ObjectPartInfo};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
-use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::decode_dir_object;
+use rustfs_utils::CompressionAlgorithm;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -276,7 +276,10 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        Err(Error::other("range value invalid"))
+        Err(Error::other(format!(
+            "range value invalid: start={}, end={}, expected start <= end and end >= -1",
+            self.start, self.end
+        )))
     }
 }
 

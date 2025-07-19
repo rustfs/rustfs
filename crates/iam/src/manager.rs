@@ -12,25 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result, is_err_config_not_found};
+use crate::error::{is_err_config_not_found, Error, Result};
 use crate::sys::get_claims_from_token_with_secret;
 use crate::{
     cache::{Cache, CacheEntity},
-    error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
-    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
+    error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
+    store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
     sys::{
-        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
-        UpdateServiceAccountOpts,
+        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED,
+        STATUS_ENABLED,
     },
 };
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
+    auth::{self, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
     format::Format,
     policy::{
-        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
+        default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
     },
 };
 use rustfs_utils::crypto::base64_encode;
@@ -40,8 +40,8 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -814,7 +814,7 @@ where
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::other(format!("need policy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::other(format!("Required policy not found: {}", IamError::NoSuchPolicy)));
             }
 
             self.api

@@ -26,8 +26,8 @@ use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
-use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
@@ -53,13 +53,13 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
 use rustfs_ecstore::cmd::bucket_replication::get_must_replicate_options;
 use rustfs_ecstore::cmd::bucket_replication::must_replicate;
 use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
-use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
+use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
+use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
 use rustfs_ecstore::compress::is_compressible;
+use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -87,15 +87,15 @@ use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
 use rustfs_s3select_query::instance::make_rustfsms;
-use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_zip::CompressionFormat;
-use s3s::S3;
+use s3s::dto::*;
+use s3s::s3_error;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
-use s3s::dto::*;
-use s3s::s3_error;
+use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -103,8 +103,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
@@ -740,7 +740,7 @@ impl S3 for FS {
 
         if let Some(part_num) = part_number {
             if part_num == 0 {
-                return Err(s3_error!(InvalidArgument, "part_number invalid"));
+                return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
             }
         }
 
@@ -2707,7 +2707,10 @@ impl S3 for FS {
                 .finish()
                 .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
         } else {
-            return Err(s3_error!(InvalidArgument, "unknown output format"));
+            return Err(s3_error!(
+                InvalidArgument,
+                "Unsupported output format. Supported formats are CSV and JSON"
+            ));
         }
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
