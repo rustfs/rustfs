@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/en/introduction.html">Getting Started</a>
-  · <a href="https://docs.rustfs.com/en/">Docs</a>
+  <a href="https://docs.rustfs.com/introduction.html">Getting Started</a>
+  · <a href="https://docs.rustfs.com">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
 </p>
