@@ -13,7 +13,7 @@ RUN apk add --no-cache ca-certificates curl unzip
 # Create build directory
 WORKDIR /build
 
-# 架构判断并下载对应平台产物
+# Detect architecture and download corresponding binary
 RUN case "${TARGETARCH}" in \
         amd64) ARCH="x86_64" ;; \
         arm64) ARCH="aarch64" ;; \
