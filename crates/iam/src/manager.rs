@@ -814,7 +814,7 @@ where
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::other(format!("need policy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::other(format!("Required policy not found: {}", IamError::NoSuchPolicy)));
             }
 
             self.api

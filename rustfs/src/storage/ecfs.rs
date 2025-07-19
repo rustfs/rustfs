@@ -740,7 +740,7 @@ impl S3 for FS {
 
         if let Some(part_num) = part_number {
             if part_num == 0 {
-                return Err(s3_error!(InvalidArgument, "part_number invalid"));
+                return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
             }
         }
 
@@ -2707,7 +2707,10 @@ impl S3 for FS {
                 .finish()
                 .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
         } else {
-            return Err(s3_error!(InvalidArgument, "unknown output format"));
+            return Err(s3_error!(
+                InvalidArgument,
+                "Unsupported output format. Supported formats are CSV and JSON"
+            ));
         }
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);

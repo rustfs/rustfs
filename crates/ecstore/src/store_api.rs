@@ -276,7 +276,10 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        Err(Error::other("range value invalid"))
+        Err(Error::other(format!(
+            "range value invalid: start={}, end={}, expected start <= end and end >= -1",
+            self.start, self.end
+        )))
     }
 }
 
