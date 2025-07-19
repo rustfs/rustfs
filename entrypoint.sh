@@ -6,8 +6,36 @@ APP_GROUP=rustfs
 APP_UID=${PUID:-1000}
 APP_GID=${PGID:-1000}
 
-# Parse RUSTFS_VOLUMES into array (comma-separated)
-IFS=',' read -ra VOLUMES <<< "${RUSTFS_VOLUMES:-/data}"
+# Parse RUSTFS_VOLUMES into array (support space, comma, tab as separator)
+VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
+# Replace comma and tab with space, then split
+VOLUME_RAW=$(echo "$VOLUME_RAW" | tr ',\t' '  ')
+read -ra ALL_VOLUMES <<< "$VOLUME_RAW"
+
+# Only keep local volumes (start with /, not http/https)
+LOCAL_VOLUMES=()
+for vol in "${ALL_VOLUMES[@]}"; do
+  if [[ "$vol" =~ ^/ ]] && [[ ! "$vol" =~ ^/+/ ]]; then
+    # Not a URL (http/https), just a local path
+    LOCAL_VOLUMES+=("$vol")
+  fi
+  # If it's a URL (http/https), skip
+  # If it's an empty string, skip
+  # If it's a local path, keep
+  # (We don't support other protocols here)
+done
+
+# Always ensure /logs is included for permission fix
+include_logs=1
+for vol in "${LOCAL_VOLUMES[@]}"; do
+  if [ "$vol" = "/logs" ]; then
+    include_logs=0
+    break
+  fi
+done
+if [ $include_logs -eq 1 ]; then
+  LOCAL_VOLUMES+=("/logs")
+fi
 
 # Try to update rustfs UID/GID if needed (requires root and shadow tools)
 update_user_group_ids() {
@@ -33,9 +61,9 @@ update_user_group_ids() {
   return $updated
 }
 
-echo "📦 Initializing mount directories: ${VOLUMES[*]}"
+echo "📦 Initializing mount directories: ${LOCAL_VOLUMES[*]}"
 
-for vol in "${VOLUMES[@]}"; do
+for vol in "${LOCAL_VOLUMES[@]}"; do
   if [ ! -d "$vol" ]; then
     echo "📁 Creating directory: $vol"
     mkdir -p "$vol"
