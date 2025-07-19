@@ -563,7 +563,7 @@ impl LocalDisk {
     }
 
     async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // TODO: suport timeout
+        // TODO: support timeout
         let (data, _) = self.read_metadata_with_dmtime(file_path.as_ref()).await?;
         Ok(data)
     }
@@ -595,7 +595,7 @@ impl LocalDisk {
     }
 
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // TODO: timeout suport
+        // TODO: timeout support
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data)
     }
@@ -750,7 +750,7 @@ impl LocalDisk {
 
         let mut f = {
             if sync {
-                // TODO: suport sync
+                // TODO: support sync
                 self.open_file(file_path, flags, skip_parent).await?
             } else {
                 self.open_file(file_path, flags, skip_parent).await?
@@ -2336,7 +2336,7 @@ impl DiskAPI for LocalDisk {
                     };
                     done_sz(buf.len() as u64);
                     res.insert("metasize".to_string(), buf.len().to_string());
-                    item.transform_meda_dir();
+                    item.transform_meta_dir();
                     let meta_cache = MetaCacheEntry {
                         name: item.object_path().to_string_lossy().to_string(),
                         metadata: buf,

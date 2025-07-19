@@ -253,7 +253,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
 
         warn!("load_data_usage_from_backend end {:?}", after3 - after2);
 
-        let backen_info = store.clone().backend_info().await;
+        let backend_info = store.clone().backend_info().await;
 
         let after4 = OffsetDateTime::now_utc();
 
@@ -272,10 +272,10 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
             backend_type: rustfs_madmin::BackendType::ErasureType,
             online_disks: online_disks.sum(),
             offline_disks: offline_disks.sum(),
-            standard_sc_parity: backen_info.standard_sc_parity,
-            rr_sc_parity: backen_info.rr_sc_parity,
-            total_sets: backen_info.total_sets,
-            drives_per_set: backen_info.drives_per_set,
+            standard_sc_parity: backend_info.standard_sc_parity,
+            rr_sc_parity: backend_info.rr_sc_parity,
+            total_sets: backend_info.total_sets,
+            drives_per_set: backend_info.drives_per_set,
         };
         if get_pools {
             pools = get_pools_info(&all_disks).await.unwrap_or_default();

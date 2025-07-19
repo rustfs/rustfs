@@ -215,7 +215,7 @@ pub struct FileInfo {
 
 impl FileInfo {
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
-        let indexs = {
+        let indices = {
             let cardinality = data_blocks + parity_blocks;
             let mut nums = vec![0; cardinality];
             let key_crc = crc32fast::hash(object.as_bytes());
@@ -233,7 +233,7 @@ impl FileInfo {
                 data_blocks,
                 parity_blocks,
                 block_size: BLOCK_SIZE_V2,
-                distribution: indexs,
+                distribution: indices,
                 ..Default::default()
             },
             ..Default::default()

@@ -740,7 +740,7 @@ impl S3 for FS {
 
         if let Some(part_num) = part_number {
             if part_num == 0 {
-                return Err(s3_error!(InvalidArgument, "part_numer invalid"));
+                return Err(s3_error!(InvalidArgument, "part_number invalid"));
             }
         }
 
@@ -882,7 +882,7 @@ impl S3 for FS {
 
         if let Some(part_num) = part_number {
             if part_num == 0 {
-                return Err(s3_error!(InvalidArgument, "part_numer invalid"));
+                return Err(s3_error!(InvalidArgument, "part_number invalid"));
             }
         }
 
@@ -1941,7 +1941,7 @@ impl S3 for FS {
 
         let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
 
-        let read_olny = PolicySys::is_allowed(&BucketPolicyArgs {
+        let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
             action: Action::S3Action(S3Action::ListBucketAction),
             is_owner: false,
@@ -1952,7 +1952,7 @@ impl S3 for FS {
         })
         .await;
 
-        let write_olny = PolicySys::is_allowed(&BucketPolicyArgs {
+        let write_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
             action: Action::S3Action(S3Action::PutObjectAction),
             is_owner: false,
@@ -1963,7 +1963,7 @@ impl S3 for FS {
         })
         .await;
 
-        let is_public = read_olny && write_olny;
+        let is_public = read_only && write_only;
 
         let output = GetBucketPolicyStatusOutput {
             policy_status: Some(PolicyStatus {
@@ -1996,9 +1996,9 @@ impl S3 for FS {
             }
         };
 
-        let policys = try_!(serde_json::to_string(&cfg));
+        let policies = try_!(serde_json::to_string(&cfg));
 
-        Ok(S3Response::new(GetBucketPolicyOutput { policy: Some(policys) }))
+        Ok(S3Response::new(GetBucketPolicyOutput { policy: Some(policies) }))
     }
 
     async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
@@ -2692,7 +2692,7 @@ impl S3 for FS {
             for batch in results {
                 csv_writer
                     .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "cann't encode output to csv. e: {}", e.to_string()))?;
+                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
             }
         } else if input.request.output_serialization.json.is_some() {
             let mut json_writer = JsonWriterBuilder::new()
@@ -2701,13 +2701,13 @@ impl S3 for FS {
             for batch in results {
                 json_writer
                     .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "cann't encode output to json. e: {}", e.to_string()))?;
+                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
             }
             json_writer
                 .finish()
                 .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
         } else {
-            return Err(s3_error!(InvalidArgument, "unknow output format"));
+            return Err(s3_error!(InvalidArgument, "unknown output format"));
         }
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);

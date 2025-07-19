@@ -656,7 +656,7 @@ impl Store for ObjectStore {
 
         Ok(())
     }
-    async fn load_mapped_policys(
+    async fn load_mapped_policies(
         &self,
         user_type: UserType,
         is_group: bool,

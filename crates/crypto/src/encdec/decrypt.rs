@@ -33,11 +33,11 @@ pub fn decrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
     match id {
         ID::Argon2idChaCHa20Poly1305 => {
             let key = id.get_key(password, salt)?;
-            decryp(ChaCha20Poly1305::new_from_slice(&key)?, nonce, data)
+            decrypt(ChaCha20Poly1305::new_from_slice(&key)?, nonce, data)
         }
         _ => {
             let key = id.get_key(password, salt)?;
-            decryp(Aes256Gcm::new_from_slice(&key)?, nonce, data)
+            decrypt(Aes256Gcm::new_from_slice(&key)?, nonce, data)
         }
     }
 }
@@ -135,7 +135,7 @@ pub fn decrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
 
 #[cfg(any(test, feature = "crypto"))]
 #[inline]
-fn decryp<T: aes_gcm::aead::Aead>(stream: T, nonce: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
+fn decrypt<T: aes_gcm::aead::Aead>(stream: T, nonce: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
     use crate::error::Error;
     stream
         .decrypt(aes_gcm::Nonce::from_slice(nonce), data)
