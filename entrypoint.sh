@@ -78,8 +78,14 @@ for vol in "${LOCAL_VOLUMES[@]}"; do
       # Prefer to update rustfs user/group UID/GID
       update_user_group_ids "$dir_uid" "$dir_gid" "$APP_USER" "$APP_GROUP" || \
       {
-        echo "🔧 Fixing ownership for: $vol → $APP_USER:$APP_GROUP (recursive chown)"
-        chown -R "$APP_USER:$APP_GROUP" "$vol"
+        echo "🔧 Fixing ownership for: $vol → $APP_USER:$APP_GROUP"
+        if [[ -n "$CHOWN_RECURSION_DEPTH" ]]; then
+          echo "🔧 Applying ownership fix with recursion depth: $CHOWN_RECURSION_DEPTH"
+          find "$vol" -mindepth 0 -maxdepth "$CHOWN_RECURSION_DEPTH" -exec chown "$APP_USER:$APP_GROUP" {} \;
+        else
+          echo "🔧 Applying ownership fix recursively (full depth)"
+          chown -R "$APP_USER:$APP_GROUP" "$vol"
+        fi
       }
     else
       echo "⚠️ SKIP_CHOWN is enabled. Skipping ownership fix for: $vol"
