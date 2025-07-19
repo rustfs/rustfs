@@ -88,4 +88,3 @@ VOLUME ["/data", "/logs"]
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/bin/rustfs"]
 
-USER rustfs
