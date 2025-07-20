@@ -135,7 +135,7 @@ impl Default for PutObjectOptions {
 
 #[allow(dead_code)]
 impl PutObjectOptions {
-    fn set_matche_tag(&mut self, etag: &str) {
+    fn set_match_tag(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
                 .insert("If-Match", HeaderValue::from_str("*").expect("err"));
@@ -145,7 +145,7 @@ impl PutObjectOptions {
         }
     }
 
-    fn set_matche_tag_except(&mut self, etag: &str) {
+    fn set_match_tag_except(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
                 .insert("If-None-Match", HeaderValue::from_str("*").expect("err"));
@@ -181,7 +181,7 @@ impl PutObjectOptions {
             header.insert(
                 "Expires",
                 HeaderValue::from_str(&self.expires.format(ISO8601_DATEFORMAT).unwrap()).expect("err"),
-            ); //rustfs invalid heade
+            ); //rustfs invalid header
         }
 
         if self.mode.as_str() != "" {

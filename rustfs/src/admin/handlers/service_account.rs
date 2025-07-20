@@ -135,7 +135,7 @@ impl Operation for AddServiceAccount {
 
         let is_svc_acc = target_user == req_user || target_user == req_parent_user;
 
-        let mut taget_groups = None;
+        let mut target_groups = None;
         let mut opts = NewServiceAccountOpts {
             access_key: create_req.access_key,
             secret_key: create_req.secret_key,
@@ -154,7 +154,7 @@ impl Operation for AddServiceAccount {
                 target_user = req_parent_user;
             }
 
-            taget_groups = req_groups;
+            target_groups = req_groups;
 
             if let Some(claims) = cred.claims {
                 if opts.claims.is_none() {
@@ -172,7 +172,7 @@ impl Operation for AddServiceAccount {
         }
 
         let (new_cred, _) = iam_store
-            .new_service_account(&target_user, taget_groups, opts)
+            .new_service_account(&target_user, target_groups, opts)
             .await
             .map_err(|e| {
                 debug!("create service account failed, e: {:?}", e);

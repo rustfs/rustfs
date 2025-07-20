@@ -4,8 +4,7 @@
 FROM alpine:3.22 AS build
 
 # Build arguments for platform and release
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
+ARG TARGETARCH
 ARG RELEASE=latest
 
 # Install minimal dependencies for downloading and extracting
@@ -14,18 +13,19 @@ RUN apk add --no-cache ca-certificates curl unzip
 # Create build directory
 WORKDIR /build
 
-# Map TARGETPLATFORM to architecture
-RUN case "${TARGETPLATFORM}" in \
-        "linux/amd64") ARCH="x86_64" ;; \
-        "linux/arm64") ARCH="aarch64" ;; \
-        *) echo "Unsupported platform: ${TARGETPLATFORM}" >&2 && exit 1 ;; \
+# Detect architecture and download corresponding binary
+RUN case "${TARGETARCH}" in \
+        amd64) ARCH="x86_64" ;; \
+        arm64) ARCH="aarch64" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2 && exit 1 ;; \
     esac && \
-    echo "ARCH=${ARCH}" > /build/arch.env
-
-# Download and extract RustFS binary
-RUN . /build/arch.env && \
+    if [ "${RELEASE}" = "latest" ]; then \
+        VERSION="latest"; \
+    else \
+        VERSION="v${RELEASE#v}"; \
+    fi && \
     BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
-    PACKAGE_NAME="rustfs-linux-${ARCH}-${RELEASE}.zip" && \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-${VERSION}.zip" && \
     DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}" && \
     echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}" >&2 && \
     curl -f -L "${DOWNLOAD_URL}" -o rustfs.zip && \
@@ -56,7 +56,7 @@ LABEL name="RustFS" \
 # Install runtime dependencies
 RUN echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/community" >> /etc/apk/repositories && \
     apk update && \
-    apk add --no-cache ca-certificates bash gosu && \
+    apk add --no-cache ca-certificates bash gosu coreutils shadow && \
     addgroup -g 1000 rustfs && \
     adduser -u 1000 -G rustfs -s /bin/bash -D rustfs
 
@@ -74,7 +74,7 @@ RUN chmod +x /usr/bin/rustfs /entrypoint.sh && \
     chmod 700 /data /logs
 
 # Environment variables (credentials should be set via environment or secrets)
-ENV RUSTFS_ADDRESS=":9000" \
+ENV RUSTFS_ADDRESS=:9000 \
     RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_SECRET_KEY=rustfsadmin \
     RUSTFS_CONSOLE_ENABLE=true \
@@ -92,3 +92,4 @@ VOLUME ["/data", "/logs"]
 # Set entry point
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/bin/rustfs"]
+

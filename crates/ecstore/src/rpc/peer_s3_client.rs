@@ -449,7 +449,7 @@ impl PeerS3Client for LocalPeerS3Client {
                 op.as_ref().map(|v| BucketInfo {
                     name: v.name.clone(),
                     created: v.created,
-                    versionning: versioned,
+                    versioning: versioned,
                     ..Default::default()
                 })
             })

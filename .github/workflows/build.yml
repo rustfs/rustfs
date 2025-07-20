@@ -658,13 +658,15 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [build-check, upload-release-assets]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.is_prerelease == 'false'
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
           if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
             echo "⚠️ OSS credentials not available, skipping latest.json update"
@@ -681,7 +683,9 @@ jobs:
 
           curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
           unzip "$OSSUTIL_ZIP"
-          chmod +x "${OSSUTIL_DIR}/ossutil"
+          mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+          rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+          chmod +x /usr/local/bin/ossutil
 
           # Create latest.json
           cat > latest.json << EOF
@@ -695,7 +699,7 @@ jobs:
           EOF
 
           # Upload to OSS
-          ./${OSSUTIL_DIR}/ossutil cp latest.json oss://rustfs-version/latest.json --force
+          ossutil cp latest.json oss://rustfs-version/latest.json --force
 
           echo "✅ Updated latest.json for stable release $VERSION"
 

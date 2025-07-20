@@ -545,7 +545,7 @@ impl Operation for ExportIam {
                 USER_POLICY_MAPPINGS_FILE => {
                     let mut user_policy_mappings: HashMap<String, MappedPolicy> = HashMap::new();
                     iam_store
-                        .load_mapped_policys(UserType::Reg, false, &mut user_policy_mappings)
+                        .load_mapped_policies(UserType::Reg, false, &mut user_policy_mappings)
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
@@ -561,7 +561,7 @@ impl Operation for ExportIam {
                 GROUP_POLICY_MAPPINGS_FILE => {
                     let mut group_policy_mappings = HashMap::new();
                     iam_store
-                        .load_mapped_policys(UserType::Reg, true, &mut group_policy_mappings)
+                        .load_mapped_policies(UserType::Reg, true, &mut group_policy_mappings)
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
@@ -577,7 +577,7 @@ impl Operation for ExportIam {
                 STS_USER_POLICY_MAPPINGS_FILE => {
                     let mut sts_user_policy_mappings: HashMap<String, MappedPolicy> = HashMap::new();
                     iam_store
-                        .load_mapped_policys(UserType::Sts, false, &mut sts_user_policy_mappings)
+                        .load_mapped_policies(UserType::Sts, false, &mut sts_user_policy_mappings)
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                     let json_str = serde_json::to_vec(&sts_user_policy_mappings)

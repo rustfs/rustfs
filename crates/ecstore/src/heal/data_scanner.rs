@@ -563,12 +563,12 @@ impl CurrentScannerCycle {
     }
 }
 
-// 将 SystemTime 转换为时间戳
+// Convert `SystemTime` to timestamp
 fn system_time_to_timestamp(time: &DateTime<Utc>) -> i64 {
     time.timestamp_micros()
 }
 
-// 将时间戳转换为 SystemTime
+// Convert timestamp to `SystemTime`
 fn timestamp_to_system_time(timestamp: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_micros(timestamp).unwrap_or_default()
 }
@@ -593,7 +593,7 @@ pub struct ScannerItem {
 }
 
 impl ScannerItem {
-    pub fn transform_meda_dir(&mut self) {
+    pub fn transform_meta_dir(&mut self) {
         let split = self.prefix.split(SLASH_SEPARATOR).map(PathBuf::from).collect::<Vec<_>>();
         if split.len() > 1 {
             self.prefix = path_join(&split[0..split.len() - 1]).to_string_lossy().to_string();
@@ -1101,7 +1101,7 @@ impl FolderScanner {
                     // successfully read means we have a valid object.
                     found_objects = true;
                     // Remove filename i.e is the meta file to construct object name
-                    item.transform_meda_dir();
+                    item.transform_meta_dir();
                     // Object already accounted for, remove from heal map,
                     // simply because getSize() function already heals the
                     // object.
