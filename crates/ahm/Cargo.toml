@@ -1,10 +1,16 @@
 [package]
 name = "rustfs-ahm"
-version = "0.0.3"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 authors = ["RustFS Team"]
-license = "Apache-2.0"
+license.workspace = true
 description = "RustFS AHM (Automatic Health Management) Scanner"
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rustfs-ahm/latest/rustfs_ahm/"
+keywords = ["RustFS", "AHM", "health-management", "scanner", "Minio"]
+categories = ["web-programming", "development-tools", "filesystem"]
 
 [dependencies]
 rustfs-ecstore = { workspace = true }
@@ -31,5 +37,5 @@ lazy_static = { workspace = true }
 
 [dev-dependencies]
 rmp-serde = { workspace = true }
-tokio-test = "0.4"
-serde_json = "1.0"
+tokio-test = { workspace = true }
+serde_json = { workspace = true }

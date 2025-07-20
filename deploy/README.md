@@ -25,17 +25,16 @@ managing and monitoring the system.
 |--certs
 |  ├── rustfs_cert.pem        // Default｜fallback certificate
 |  ├── rustfs_key.pem         // Default｜fallback private key
-|  ├── example.com/    // certificate directory of specific domain names
+|  ├── rustfs.com/    // certificate directory of specific domain names
 |  │   ├── rustfs_cert.pem
 |  │   └── rustfs_key.pem
-|  ├── api.example.com/
+|  ├── api.rustfs.com/
 |  │   ├── rustfs_cert.pem
 |  │   └── rustfs_key.pem
-|  └── cdn.example.com/
+|  └── cdn.rustfs.com/
 |      ├── rustfs_cert.pem
 |      └── rustfs_key.pem
 |--config
 |  |--rustfs.env // env config
 |  |--rustfs-zh.env // env config in Chinese
-|  |--event.example.toml // event config
 ```

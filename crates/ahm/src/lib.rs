@@ -20,8 +20,8 @@ pub mod scanner;
 
 pub use error::{Error, Result};
 pub use scanner::{
-    load_data_usage_from_backend, store_data_usage_in_backend, BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, Scanner,
-    ScannerMetrics,
+    BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, Scanner, ScannerMetrics, load_data_usage_from_backend,
+    store_data_usage_in_backend,
 };
 
 // Global cancellation token for AHM services (scanner and other background tasks)

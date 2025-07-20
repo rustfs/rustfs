@@ -1,7 +1,21 @@
-// use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
-use crate::auth::IAMAuth;
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Ensure the correct path for parse_license is imported
 use crate::admin;
+// use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
+use crate::auth::IAMAuth;
 use crate::config;
 use crate::server::hybrid::hybrid;
 use crate::server::layer::RedirectLayer;
@@ -44,13 +58,43 @@ const MI_B: usize = 1024 * 1024;
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
-) -> std::io::Result<tokio::sync::broadcast::Sender<()>> {
+) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
     // The listening address and port are obtained from the parameters
-    let listener = TcpListener::bind(server_address.clone()).await?;
+    // let listener = TcpListener::bind(server_address.clone()).await?;
+
+    // The listening address and port are obtained from the parameters
+    let listener = {
+        let mut server_addr = server_addr;
+        let mut socket = socket2::Socket::new(
+            socket2::Domain::for_address(server_addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+
+        if server_addr.is_ipv6() {
+            if let Err(e) = socket.set_only_v6(false) {
+                warn!("Failed to set IPV6_V6ONLY=false, falling back to IPv4-only: {}", e);
+                // Fallback to a new IPv4 socket if setting dual-stack fails.
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            }
+        }
+
+        // Common setup for both IPv4 and successful dual-stack IPv6
+        let backlog = get_listen_backlog();
+        socket.set_reuse_address(true)?;
+        // Set the socket to non-blocking before passing it to Tokio.
+        socket.set_nonblocking(true)?;
+        socket.bind(&server_addr.into())?;
+        socket.listen(backlog)?;
+        TcpListener::from_std(socket.into())?
+    };
+
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     debug!("Listening on: {}", local_addr);
@@ -201,7 +245,7 @@ pub async fn start_http_server(
             };
 
             let socket_ref = SockRef::from(&socket);
-            if let Err(err) = socket_ref.set_nodelay(true) {
+            if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
@@ -411,5 +455,46 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     match req.metadata().get("authorization") {
         Some(t) if token == t => Ok(req),
         _ => Err(Status::unauthenticated("No valid auth token")),
+    }
+}
+
+/// Determines the listen backlog size.
+///
+/// It tries to read the system's maximum connection queue length (`somaxconn`).
+/// If reading fails, it falls back to a default value (e.g., 1024).
+/// This makes the backlog size adaptive to the system configuration.
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+
+    #[cfg(target_os = "linux")]
+    {
+        // For Linux, read from /proc/sys/net/core/somaxconn
+        match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+            Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
+            Err(_) => DEFAULT_BACKLOG,
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+    {
+        // For macOS and BSD variants, use sysctl
+        use sysctl::Sysctl;
+        match sysctl::Ctl::new("kern.ipc.somaxconn") {
+            Ok(ctl) => match ctl.value() {
+                Ok(sysctl::CtlValue::Int(val)) => val,
+                _ => DEFAULT_BACKLOG,
+            },
+            Err(_) => DEFAULT_BACKLOG,
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        // Fallback for Windows and other operating systems
+        DEFAULT_BACKLOG
     }
 }

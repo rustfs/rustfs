@@ -68,15 +68,7 @@ pub struct Opt {
     #[arg(long, default_value_t = true, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
-    /// Console server bind address
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string(), env = "RUSTFS_CONSOLE_ADDRESS")]
-    pub console_address: String,
-
-    /// rustfs endpoint for console
-    #[arg(long, env = "RUSTFS_CONSOLE_FS_ENDPOINT")]
-    pub console_fs_endpoint: Option<String>,
-
-    /// Observability configuration file
+    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,
 

@@ -63,7 +63,7 @@ rustfs-filemeta = { path = "crates/filemeta" }
 rustfs-rio = { path = "crates/rio" }
 
 [workspace.dependencies]
-rustfs-ahm = { path = "crates/ahm", version = "0.0.3" }
+rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
@@ -89,7 +89,7 @@ aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
 argon2 = { version = "0.5.3", features = ["std"] }
 atoi = "2.0.0"
-async-channel = "2.4.0"
+async-channel = "2.5.0"
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
 async-compression = { version = "0.4.0" }
@@ -107,7 +107,7 @@ byteorder = "1.5.0"
 cfg-if = "1.0.1"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.40", features = ["derive", "env"] }
+clap = { version = "4.5.41", features = ["derive", "env"] }
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -116,7 +116,7 @@ datafusion = "46.0.1"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
-enumset = "1.1.6"
+enumset = "1.1.7"
 flatbuffers = "25.2.10"
 flate2 = "1.1.2"
 flexi_logger = { version = "0.31.2", features = ["trc", "dont_minimize_extra_stacks"] }
@@ -130,7 +130,7 @@ hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 hmac = "0.12.1"
 hyper = "1.6.0"
-hyper-util = { version = "0.1.14", features = [
+hyper-util = { version = "0.1.15", features = [
     "tokio",
     "server-auto",
     "server-graceful",
@@ -182,9 +182,9 @@ pbkdf2 = "0.12.2"
 percent-encoding = "2.3.1"
 pin-project-lite = "0.2.16"
 prost = "0.13.5"
-quick-xml = "0.37.5"
+quick-xml = "0.38.0"
 rand = "0.9.1"
-rdkafka = { version = "0.37.0", features = ["tokio"] }
+rdkafka = { version = "0.38.0", features = ["tokio"] }
 reed-solomon-simd = { version = "3.0.1" }
 regex = { version = "1.11.1" }
 reqwest = { version = "0.12.22", default-features = false, features = [
@@ -207,7 +207,7 @@ rumqttc = { version = "0.24" }
 rust-embed = { version = "8.7.2" }
 rust-i18n = { version = "3.1.5" }
 rustfs-rsc = "2025.506.1"
-rustls = { version = "0.23.28" }
+rustls = { version = "0.23.29" }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-minio-preview.1" }
@@ -221,10 +221,12 @@ siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"
 snap = "1.1.1"
-socket2 = "0.5.10"
+socket2 = "0.6.0"
 strum = { version = "0.27.1", features = ["derive"] }
-sysinfo = "0.35.2"
+sysinfo = "0.36.0"
+sysctl = "0.6.0"
 tempfile = "3.20.0"
+temp-env = "0.3.6"
 test-case = "3.3.1"
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = [
@@ -238,6 +240,7 @@ tokio = { version = "1.46.1", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
+tokio-test = "0.4.4"
 tokio-util = { version = "0.7.15", features = ["io", "compat"] }
 tonic = { version = "0.13.1", features = ["gzip"] }
 tonic-build = { version = "0.13.1" }
@@ -262,7 +265,7 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
-anyhow = "1.0.86"
+anyhow = "1.0.98"
 
 [profile.wasm-dev]
 inherits = "dev"

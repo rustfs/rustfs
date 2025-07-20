@@ -45,5 +45,4 @@ serde_json.workspace = true
 md-5 = { workspace = true }
 
 [dev-dependencies]
-#criterion = { version = "0.5.1", features = ["async", "async_tokio", "tokio"] }
-tokio-test = "0.4"
+tokio-test = { workspace = true }

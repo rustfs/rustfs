@@ -109,8 +109,8 @@ winapi = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-criterion = { version = "0.5", features = ["html_reports"] }
-temp-env = "0.3.6"
+criterion = { workspace = true, features = ["html_reports"] }
+temp-env = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
