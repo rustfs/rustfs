@@ -305,6 +305,54 @@ async fn test_heal_format_basic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn test_heal_format_with_data() {
+    let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+
+    // Create test bucket and object
+    let bucket_name = "test-bucket";
+    let object_name = "test-object.txt";
+    let test_data = b"Hello, this is test data for healing!";
+
+    create_test_bucket(&ecstore, bucket_name).await;
+    upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+
+    let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+    let target_part = WalkDir::new(&obj_dir)
+    .min_depth(2)
+    .max_depth(2)
+    .into_iter()
+    .filter_map(Result::ok)
+    .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+    .map(|e| e.into_path())
+    .expect("Failed to locate part file to delete");
+
+    // ─── 1️⃣ delete format.json on one disk ──────────────
+    let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
+    std::fs::remove_dir_all(&disk_paths[0]).expect("failed to delete all contents under disk_paths[0]");
+    std::fs::create_dir_all(&disk_paths[0]).expect("failed to recreate disk_paths[0] directory");
+    println!("✅ Deleted format.json on disk: {:?}", disk_paths[0]);
+
+    // Create heal manager with faster interval
+    let cfg = HealConfig {
+        heal_interval: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
+    heal_manager.start().await.unwrap();
+
+    // Wait for task completion
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // ─── 2️⃣ verify format.json is restored ───────
+    assert!(format_path.exists(), "format.json does not exist on disk after heal");
+    // ─── 3 verify each part file is restored ───────
+    assert!(target_part.exists());
+
+    info!("Heal format basic test passed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_heal_storage_api_direct() {
     let (_disk_paths, ecstore, heal_storage) = setup_test_env().await;
 

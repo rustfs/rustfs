@@ -507,29 +507,24 @@ impl Scanner {
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
                         if let Some(heal_manager) = &self.heal_manager {
-                                                    // Get bucket list for erasure set healing
-                        let buckets = match rustfs_ecstore::new_object_layer_fn() {
-                            Some(ecstore) => {
-                                match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                            // Get bucket list for erasure set healing
+                            let buckets = match rustfs_ecstore::new_object_layer_fn() {
+                                Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
                                     Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
                                     Err(e) => {
                                         error!("Failed to get bucket list for disk healing: {}", e);
-                                        return Err(Error::Storage(e.into()));
+                                        return Err(Error::Storage(e));
                                     }
-                                }
-                            }
-                            None => {
-                                error!("No ECStore available for getting bucket list");
-                                return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
-                            }
-                        };
-
-                            let set_disk_id = format!("{}_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
-                            let req = HealRequest::new(
-                                crate::heal::task::HealType::ErasureSet {
-                                    buckets,
-                                    set_disk_id,
                                 },
+                                None => {
+                                    error!("No ECStore available for getting bucket list");
+                                    return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
+                                }
+                            };
+
+                            let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
+                            let req = HealRequest::new(
+                                crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
                                 crate::heal::task::HealOptions::default(),
                                 crate::heal::task::HealPriority::High,
                             );
@@ -571,27 +566,22 @@ impl Scanner {
                     if let Some(heal_manager) = &self.heal_manager {
                         // Get bucket list for erasure set healing
                         let buckets = match rustfs_ecstore::new_object_layer_fn() {
-                            Some(ecstore) => {
-                                match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
-                                    Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
-                                    Err(e) => {
-                                        error!("Failed to get bucket list for disk healing: {}", e);
-                                        return Err(Error::Storage(e.into()));
-                                    }
+                            Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                                Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                                Err(e) => {
+                                    error!("Failed to get bucket list for disk healing: {}", e);
+                                    return Err(Error::Storage(e));
                                 }
-                            }
+                            },
                             None => {
                                 error!("No ECStore available for getting bucket list");
                                 return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
                             }
                         };
 
-                        let set_disk_id = format!("{}_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
+                        let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
                         let req = HealRequest::new(
-                            crate::heal::task::HealType::ErasureSet {
-                                buckets,
-                                set_disk_id,
-                            },
+                            crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
                             crate::heal::task::HealOptions::default(),
                             crate::heal::task::HealPriority::Urgent,
                         );

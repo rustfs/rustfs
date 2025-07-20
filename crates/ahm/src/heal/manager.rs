@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
     storage::HealStorageAPI,
-    task::{HealRequest, HealTask, HealTaskStatus},
+    task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
 };
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::DiskAPI;
@@ -332,14 +332,14 @@ impl HealManager {
                             }
 
                             // enqueue erasure set heal request for this disk
-                            let set_disk_id = format!("{}_{}", ep.pool_idx, ep.set_idx);
-                            let req = crate::heal::task::HealRequest::new(
-                                crate::heal::task::HealType::ErasureSet { 
-                                    buckets: buckets.clone(), 
-                                    set_disk_id: set_disk_id.clone() 
+                            let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
+                            let req = HealRequest::new(
+                                HealType::ErasureSet {
+                                    buckets: buckets.clone(),
+                                    set_disk_id: set_disk_id.clone()
                                 },
-                                crate::heal::task::HealOptions::default(),
-                                crate::heal::task::HealPriority::Normal,
+                                HealOptions::default(),
+                                HealPriority::Normal,
                             );
                             let mut queue = heal_queue.lock().await;
                             queue.push_back(req);

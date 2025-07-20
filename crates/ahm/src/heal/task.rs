@@ -795,6 +795,13 @@ impl HealTask {
             progress.update_progress(2, 4, 0, 0);
         }
 
+        // Step 3: Heal bucket structure
+        for bucket in buckets.iter() {
+            if let Err(err) = self.heal_bucket(bucket).await {
+                info!("{}", err.to_string());
+            }
+        }
+
         // Step 3: Create erasure set healer with resume support
         info!("Step 3: Creating erasure set healer with resume support");
         let erasure_healer = ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk);
