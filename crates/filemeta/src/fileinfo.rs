@@ -46,6 +46,20 @@ pub struct ObjectPartInfo {
     pub index: Option<Bytes>,
     // Checksums holds checksums of the part
     pub checksums: Option<HashMap<String, String>>,
+    pub error: Option<String>,
+}
+
+impl ObjectPartInfo {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.serialize(&mut Serializer::new(&mut buf))?;
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: ObjectPartInfo = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
@@ -201,7 +215,7 @@ pub struct FileInfo {
 
 impl FileInfo {
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
-        let indexs = {
+        let indices = {
             let cardinality = data_blocks + parity_blocks;
             let mut nums = vec![0; cardinality];
             let key_crc = crc32fast::hash(object.as_bytes());
@@ -219,7 +233,7 @@ impl FileInfo {
                 data_blocks,
                 parity_blocks,
                 block_size: BLOCK_SIZE_V2,
-                distribution: indexs,
+                distribution: indices,
                 ..Default::default()
             },
             ..Default::default()
@@ -287,6 +301,7 @@ impl FileInfo {
             actual_size,
             index,
             checksums: None,
+            error: None,
         };
 
         for p in self.parts.iter_mut() {

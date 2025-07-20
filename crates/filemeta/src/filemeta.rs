@@ -702,7 +702,7 @@ impl FileMeta {
         })
     }
 
-    pub fn lastest_mod_time(&self) -> Option<OffsetDateTime> {
+    pub fn latest_mod_time(&self) -> Option<OffsetDateTime> {
         if self.versions.is_empty() {
             return None;
         }
@@ -1762,7 +1762,7 @@ impl MetaDeleteMarker {
 
         //             self.meta_sys = Some(map);
         //         }
-        //         name => return Err(Error::other(format!("not suport field name {name}"))),
+        //         name => return Err(Error::other(format!("not support field name {name}"))),
         //     }
         // }
 
@@ -1962,32 +1962,32 @@ pub fn merge_file_meta_versions(
                 n_versions += 1;
             }
         } else {
-            let mut lastest_count = 0;
+            let mut latest_count = 0;
             for (i, ver) in tops.iter().enumerate() {
                 if ver.header == latest.header {
-                    lastest_count += 1;
+                    latest_count += 1;
                     continue;
                 }
 
                 if i == 0 || ver.header.sorts_before(&latest.header) {
-                    if i == 0 || lastest_count == 0 {
-                        lastest_count = 1;
+                    if i == 0 || latest_count == 0 {
+                        latest_count = 1;
                     } else if !strict && ver.header.matches_not_strict(&latest.header) {
-                        lastest_count += 1;
+                        latest_count += 1;
                     } else {
-                        lastest_count = 1;
+                        latest_count = 1;
                     }
                     latest = ver.clone();
                     continue;
                 }
 
                 // Mismatch, but older.
-                if lastest_count > 0 && !strict && ver.header.matches_not_strict(&latest.header) {
-                    lastest_count += 1;
+                if latest_count > 0 && !strict && ver.header.matches_not_strict(&latest.header) {
+                    latest_count += 1;
                     continue;
                 }
 
-                if lastest_count > 0 && ver.header.version_id == latest.header.version_id {
+                if latest_count > 0 && ver.header.version_id == latest.header.version_id {
                     let mut x: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
                     for a in tops.iter() {
                         if a.header.version_id != ver.header.version_id {
@@ -1999,12 +1999,12 @@ pub fn merge_file_meta_versions(
                         }
                         *x.entry(a_clone.header).or_insert(1) += 1;
                     }
-                    lastest_count = 0;
+                    latest_count = 0;
                     for (k, v) in x.iter() {
-                        if *v < lastest_count {
+                        if *v < latest_count {
                             continue;
                         }
-                        if *v == lastest_count && latest.header.sorts_before(k) {
+                        if *v == latest_count && latest.header.sorts_before(k) {
                             continue;
                         }
                         tops.iter().for_each(|a| {
@@ -2017,12 +2017,12 @@ pub fn merge_file_meta_versions(
                             }
                         });
 
-                        lastest_count = *v;
+                        latest_count = *v;
                     }
                     break;
                 }
             }
-            if lastest_count >= quorum {
+            if latest_count >= quorum {
                 if !latest.header.free_version() {
                     n_versions += 1;
                 }

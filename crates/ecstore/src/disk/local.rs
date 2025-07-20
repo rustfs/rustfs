@@ -57,8 +57,8 @@ use bytes::Bytes;
 use path_absolutize::Absolutize;
 use rustfs_common::defer;
 use rustfs_filemeta::{
-    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, Opts, RawFileInfo, UpdateFn, get_file_info,
-    read_xl_meta_no_data,
+    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
+    get_file_info, read_xl_meta_no_data,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -563,7 +563,7 @@ impl LocalDisk {
     }
 
     async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // TODO: suport timeout
+        // TODO: support timeout
         let (data, _) = self.read_metadata_with_dmtime(file_path.as_ref()).await?;
         Ok(data)
     }
@@ -595,7 +595,7 @@ impl LocalDisk {
     }
 
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // TODO: timeout suport
+        // TODO: timeout support
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data)
     }
@@ -750,7 +750,7 @@ impl LocalDisk {
 
         let mut f = {
             if sync {
-                // TODO: suport sync
+                // TODO: support sync
                 self.open_file(file_path, flags, skip_parent).await?
             } else {
                 self.open_file(file_path, flags, skip_parent).await?
@@ -1313,6 +1313,67 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
+        let volume_dir = self.get_bucket_path(bucket)?;
+
+        let mut ret = vec![ObjectPartInfo::default(); paths.len()];
+
+        for (i, path_str) in paths.iter().enumerate() {
+            let path = Path::new(path_str);
+            let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or_default();
+            let num = file_name
+                .strip_prefix("part.")
+                .and_then(|v| v.strip_suffix(".meta"))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_default();
+
+            if let Err(err) = access(
+                volume_dir
+                    .clone()
+                    .join(path.parent().unwrap_or(Path::new("")).join(format!("part.{num}"))),
+            )
+            .await
+            {
+                ret[i] = ObjectPartInfo {
+                    number: num,
+                    error: Some(err.to_string()),
+                    ..Default::default()
+                };
+                continue;
+            }
+
+            let data = match self
+                .read_all_data(bucket, volume_dir.clone(), volume_dir.clone().join(path))
+                .await
+            {
+                Ok(data) => data,
+                Err(err) => {
+                    ret[i] = ObjectPartInfo {
+                        number: num,
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    };
+                    continue;
+                }
+            };
+
+            match ObjectPartInfo::unmarshal(&data) {
+                Ok(meta) => {
+                    ret[i] = meta;
+                }
+                Err(err) => {
+                    ret[i] = ObjectPartInfo {
+                        number: num,
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    };
+                }
+            };
+        }
+
+        Ok(ret)
+    }
+    #[tracing::instrument(skip(self))]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
         check_path_length(volume_dir.join(path).to_string_lossy().as_ref())?;
@@ -1550,11 +1611,6 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        // warn!(
-        //     "disk read_file_stream: volume: {}, path: {}, offset: {}, length: {}",
-        //     volume, path, offset, length
-        // );
-
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -2280,7 +2336,7 @@ impl DiskAPI for LocalDisk {
                     };
                     done_sz(buf.len() as u64);
                     res.insert("metasize".to_string(), buf.len().to_string());
-                    item.transform_meda_dir();
+                    item.transform_meta_dir();
                     let meta_cache = MetaCacheEntry {
                         name: item.object_path().to_string_lossy().to_string(),
                         metadata: buf,

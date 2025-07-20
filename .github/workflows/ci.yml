@@ -83,6 +83,16 @@ jobs:
           # Never skip release events and tag pushes
           do_not_skip: '["workflow_dispatch", "schedule", "merge_group", "release", "push"]'
 
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Typos check with custom config file
+        uses: crate-ci/typos@master
+
   test-and-lint:
     name: Test and Lint
     needs: skip-check

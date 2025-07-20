@@ -74,7 +74,7 @@ use tracing::{error, info, warn};
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
-pub mod policys;
+pub mod policies;
 pub mod pools;
 pub mod rebalance;
 pub mod service_account;
@@ -798,9 +798,9 @@ pub struct GetReplicationMetricsHandler {}
 impl Operation for GetReplicationMetricsHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         error!("GetReplicationMetricsHandler");
-        let querys = extract_query_params(&_req.uri);
-        if let Some(bucket) = querys.get("bucket") {
-            error!("get bucket:{} metris", bucket);
+        let queries = extract_query_params(&_req.uri);
+        if let Some(bucket) = queries.get("bucket") {
+            error!("get bucket:{} metrics", bucket);
         }
         //return Err(s3_error!(InvalidArgument, "Invalid bucket name"));
         //Ok(S3Response::with_headers((StatusCode::OK, Body::from()), header))
@@ -815,7 +815,7 @@ impl Operation for SetRemoteTargetHandler {
         //return Ok(S3Response::new((StatusCode::OK, Body::from("OK".to_string()))));
         // println!("handle MetricsHandler, params: {:?}", _req.input);
         info!("SetRemoteTargetHandler params: {:?}", _req.credentials);
-        let querys = extract_query_params(&_req.uri);
+        let queries = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -825,7 +825,7 @@ impl Operation for SetRemoteTargetHandler {
         //println!("body: {}", std::str::from_utf8(&body.clone()).unwrap());
 
         //println!("bucket is:{}", bucket.clone());
-        if let Some(bucket) = querys.get("bucket") {
+        if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 info!("have bucket: {}", bucket);
                 return Ok(S3Response::new((StatusCode::OK, Body::from("fuck".to_string()))));
@@ -842,7 +842,7 @@ impl Operation for SetRemoteTargetHandler {
             {
                 Ok(info) => {
                     info!("Bucket Info: {:?}", info);
-                    if !info.versionning {
+                    if !info.versioning {
                         return Ok(S3Response::new((StatusCode::FORBIDDEN, Body::from("bucket need versioned".to_string()))));
                     }
                 }
@@ -932,13 +932,13 @@ impl Operation for ListRemoteTargetHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("list GetRemoteTargetHandler, params: {:?}", _req.credentials);
 
-        let querys = extract_query_params(&_req.uri);
+        let queries = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        if let Some(bucket) = querys.get("bucket") {
+        if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 error!("bucket parameter is empty");
                 return Ok(S3Response::new((
@@ -957,7 +957,7 @@ impl Operation for ListRemoteTargetHandler {
             {
                 Ok(info) => {
                     info!("Bucket Info: {:?}", info);
-                    if !info.versionning {
+                    if !info.versioning {
                         return Ok(S3Response::new((
                             StatusCode::FORBIDDEN,
                             Body::from("Bucket needs versioning".to_string()),
@@ -1009,8 +1009,8 @@ pub struct RemoveRemoteTargetHandler {}
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         debug!("remove remote target called");
-        let querys = extract_query_params(&_req.uri);
-        let Some(bucket) = querys.get("bucket") else {
+        let queries = extract_query_params(&_req.uri);
+        let Some(bucket) = queries.get("bucket") else {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
                 Body::from("Bucket parameter is required".to_string()),
@@ -1019,7 +1019,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let mut need_delete = true;
 
-        if let Some(arnstr) = querys.get("arn") {
+        if let Some(arnstr) = queries.get("arn") {
             let _arn = bucket_targets::ARN::parse(arnstr);
 
             match get_replication_config(bucket).await {

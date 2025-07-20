@@ -851,8 +851,8 @@ impl ECStore {
                         }
                     };
 
-                    if let Some(fiter) = opts.filter {
-                        if fiter(&fi) {
+                    if let Some(filter) = opts.filter {
+                        if filter(&fi) {
                             let item = ObjectInfoOrErr {
                                 item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
@@ -899,8 +899,8 @@ impl ECStore {
                 }
 
                 for fi in fvs.versions.iter() {
-                    if let Some(fiter) = opts.filter {
-                        if fiter(fi) {
+                    if let Some(filter) = opts.filter {
+                        if filter(fi) {
                             let item = ObjectInfoOrErr {
                                 item: Some(ObjectInfo::from_file_info(fi, &bucket, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
@@ -972,7 +972,7 @@ async fn gather_results(
     let mut sender = Some(results_tx);
 
     let mut recv = recv;
-    let mut entrys = Vec::new();
+    let mut entries = Vec::new();
     while let Some(mut entry) = recv.recv().await {
         if returned {
             continue;
@@ -1009,11 +1009,11 @@ async fn gather_results(
 
         // TODO: Lifecycle
 
-        if opts.limit > 0 && entrys.len() >= opts.limit as usize {
+        if opts.limit > 0 && entries.len() >= opts.limit as usize {
             if let Some(tx) = sender {
                 tx.send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
-                        o: MetaCacheEntries(entrys.clone()),
+                        o: MetaCacheEntries(entries.clone()),
                         ..Default::default()
                     }),
                     err: None,
@@ -1027,15 +1027,15 @@ async fn gather_results(
             continue;
         }
 
-        entrys.push(Some(entry));
-        // entrys.push(entry);
+        entries.push(Some(entry));
+        // entries.push(entry);
     }
 
     // finish not full, return eof
     if let Some(tx) = sender {
         tx.send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
-                o: MetaCacheEntries(entrys.clone()),
+                o: MetaCacheEntries(entries.clone()),
                 ..Default::default()
             }),
             err: Some(Error::Unexpected.into()),
@@ -1125,10 +1125,10 @@ async fn merge_entry_channels(
 
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
                         let dir_matches = best_entry.is_dir() && other_entry.is_dir();
-                        let suffix_matche =
+                        let suffix_matches =
                             best_entry.name.ends_with(SLASH_SEPARATOR) == other_entry.name.ends_with(SLASH_SEPARATOR);
 
-                        if dir_matches && suffix_matche {
+                        if dir_matches && suffix_matches {
                             to_merge.push(other_idx);
                             continue;
                         }

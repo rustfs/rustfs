@@ -23,6 +23,7 @@ use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
+use crate::utils::extract_claims;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
@@ -123,13 +124,13 @@ impl<T: Store> IamSys<T> {
         })
     }
 
-    pub async fn load_mapped_policys(
+    pub async fn load_mapped_policies(
         &self,
         user_type: UserType,
         is_group: bool,
         m: &mut HashMap<String, MappedPolicy>,
     ) -> Result<()> {
-        self.store.api.load_mapped_policys(user_type, is_group, m).await
+        self.store.api.load_mapped_policies(user_type, is_group, m).await
     }
 
     pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
@@ -542,7 +543,7 @@ impl<T: Store> IamSys<T> {
             }
         };
 
-        if policies.is_empty() {
+        if !is_owner && policies.is_empty() {
             return false;
         }
 
@@ -731,4 +732,19 @@ pub struct UpdateServiceAccountOpts {
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
     pub status: Option<String>,
+}
+
+pub fn get_claims_from_token_with_secret(token: &str, secret: &str) -> Result<HashMap<String, Value>> {
+    let mut ms =
+        extract_claims::<HashMap<String, Value>>(token, secret).map_err(|e| Error::other(format!("extract claims err {e}")))?;
+
+    if let Some(session_policy) = ms.claims.get(SESSION_POLICY_NAME) {
+        let policy_str = session_policy.as_str().unwrap_or_default();
+        let policy = base64_decode(policy_str.as_bytes()).map_err(|e| Error::other(format!("base64 decode err {e}")))?;
+        ms.claims.insert(
+            SESSION_POLICY_NAME_EXTRACTED.to_string(),
+            Value::String(String::from_utf8(policy).map_err(|e| Error::other(format!("utf8 decode err {e}")))?),
+        );
+    }
+    Ok(ms.claims)
 }

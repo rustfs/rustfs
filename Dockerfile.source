@@ -1,10 +1,26 @@
-# Multi-stage Dockerfile for RustFS
+# Multi-stage Dockerfile for RustFS - LOCAL DEVELOPMENT ONLY
+#
+# ⚠️  IMPORTANT: This Dockerfile is for local development and testing only.
+# ⚠️  It builds RustFS from source code and is NOT used in CI/CD pipelines.
+# ⚠️  CI/CD pipeline uses pre-built binaries from Dockerfile instead.
+#
+# Usage for local development:
+#   docker build -f Dockerfile.source -t rustfs:dev-local .
+#   docker run --rm -p 9000:9000 rustfs:dev-local
+#
 # Supports cross-compilation for amd64 and arm64 architectures
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 
 # Build stage
 FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+
+# Re-declare build arguments after FROM (required for multi-stage builds)
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+# Debug: Print platform information
+RUN echo "🐳 Build Info: BUILDPLATFORM=$BUILDPLATFORM, TARGETPLATFORM=$TARGETPLATFORM"
 
 # Install required build dependencies
 RUN apt-get update && apt-get install -y \
@@ -18,17 +34,7 @@ RUN apt-get update && apt-get install -y \
     lld \
     && rm -rf /var/lib/apt/lists/*
 
-# Install sccache for Rust compilation caching
-RUN wget https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
-    && tar -xzf sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
-    && mv sccache-v0.8.1-x86_64-unknown-linux-gnu/sccache /usr/local/bin/ \
-    && chmod +x /usr/local/bin/sccache \
-    && rm -rf sccache-v0.8.1-x86_64-unknown-linux-gnu.tar.gz sccache-v0.8.1-x86_64-unknown-linux-gnu
-
-# Set up sccache environment
-ENV RUSTC_WRAPPER=sccache \
-    SCCACHE_DIR=/tmp/sccache \
-    SCCACHE_CACHE_SIZE=2G
+# Note: sccache removed for simpler builds
 
 # Install cross-compilation tools for ARM64
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -49,10 +55,13 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
     && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc && rm -rf Linux.flatc.binary.g++-13.zip
 
 # Set up Rust targets based on platform
-RUN case "$TARGETPLATFORM" in \
+RUN set -e && \
+    PLATFORM="${TARGETPLATFORM:-linux/amd64}" && \
+    echo "🎯 Setting up Rust target for platform: $PLATFORM" && \
+    case "$PLATFORM" in \
         "linux/amd64") rustup target add x86_64-unknown-linux-gnu ;; \
         "linux/arm64") rustup target add aarch64-unknown-linux-gnu ;; \
-        *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+        *) echo "❌ Unsupported platform: $PLATFORM" && exit 1 ;; \
     esac
 
 # Set up environment for cross-compilation
@@ -62,17 +71,8 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
 WORKDIR /usr/src/rustfs
 
-# Copy cargo configuration for optimized builds
-COPY .docker/cargo.config.toml ./.cargo/config.toml
-
-# Copy Cargo files for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY */Cargo.toml ./*/
-
-# Create dummy main.rs files for dependency compilation
-RUN find . -name "Cargo.toml" -not -path "./Cargo.toml" | \
-    xargs -I {} dirname {} | \
-    xargs -I {} sh -c 'mkdir -p {}/src && echo "fn main() {}" > {}/src/main.rs'
+# Copy all source code
+COPY . .
 
 # Configure cargo for optimized builds
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
@@ -82,32 +82,27 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
     CARGO_PROFILE_RELEASE_STRIP=symbols
 
-# Build dependencies only (cache layer) with optimizations
-RUN sccache --start-server 2>/dev/null || true && \
-    case "$TARGETPLATFORM" in \
-        "linux/amd64") cargo build --release --target x86_64-unknown-linux-gnu -j $(nproc) ;; \
-        "linux/arm64") cargo build --release --target aarch64-unknown-linux-gnu -j $(nproc) ;; \
-    esac
-
-# Copy source code
-COPY . .
-
 # Generate protobuf code
 RUN cargo run --bin gproto
 
 # Build the actual application with optimizations
-RUN sccache --start-server 2>/dev/null || true && \
-    case "$TARGETPLATFORM" in \
+RUN case "$TARGETPLATFORM" in \
         "linux/amd64") \
+            echo "🔨 Building for amd64..." && \
+            rustup target add x86_64-unknown-linux-gnu && \
             cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
         "linux/arm64") \
+            echo "🔨 Building for arm64..." && \
+            rustup target add aarch64-unknown-linux-gnu && \
             cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
             cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
-    esac && \
-    sccache --show-stats || true
+        *) \
+            echo "❌ Unsupported platform: $TARGETPLATFORM" && exit 1 \
+            ;; \
+    esac
 
 # Runtime stage - Ubuntu minimal for better compatibility
 FROM ubuntu:22.04
@@ -117,6 +112,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     tzdata \
     wget \
+    coreutils \
+    passwd \
     && rm -rf /var/lib/apt/lists/*
 
 # Create rustfs user and group
@@ -133,6 +130,10 @@ RUN mkdir -p /data/rustfs{0,1,2,3} && \
 COPY --from=builder /usr/local/bin/rustfs /app/rustfs
 RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
 
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Switch to non-root user
 USER rustfs
 
@@ -147,9 +148,9 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_VOLUMES=/data \
     RUST_LOG=warn
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+# Volume for data
+VOLUME ["/data"]
 
-# Set default command
+# Set entrypoint and default command
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/app/rustfs"]

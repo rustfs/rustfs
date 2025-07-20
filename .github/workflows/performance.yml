@@ -18,10 +18,10 @@ on:
   push:
     branches: [main]
     paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/performance.yml'
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/performance.yml"
   workflow_dispatch:
     inputs:
       profile_duration:
@@ -73,12 +73,11 @@ jobs:
           echo "RUSTFS_VOLUMES=./target/volume/test{0...4}" >> $GITHUB_ENV
           echo "RUST_LOG=rustfs=info,ecstore=info,s3s=info,iam=info,rustfs-obs=info" >> $GITHUB_ENV
 
-      - name: Download static files
+      - name: Verify console static assets
         run: |
-          curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-            -o tempfile.zip --retry 3 --retry-delay 5
-          unzip -o tempfile.zip -d ./rustfs/static
-          rm tempfile.zip
+          # Console static assets are already embedded in the repository
+          echo "Console static assets size: $(du -sh rustfs/static/)"
+          echo "Console static assets are embedded via rust-embed, no external download needed"
 
       - name: Build with profiling optimizations
         run: |

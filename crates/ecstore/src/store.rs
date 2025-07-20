@@ -38,7 +38,7 @@ use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
-use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
+use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
@@ -152,7 +152,7 @@ impl ECStore {
                 common_parity_drives = parity_drives;
             }
 
-            // validate_parity(partiy_count, pool_eps.drives_per_set)?;
+            // validate_parity(parity_count, pool_eps.drives_per_set)?;
 
             let (disks, errs) = store_init::init_disks(
                 &pool_eps.endpoints,
@@ -302,13 +302,13 @@ impl ECStore {
         }
 
         let pools = meta.return_resumable_pools();
-        let mut pool_indeces = Vec::with_capacity(pools.len());
+        let mut pool_indices = Vec::with_capacity(pools.len());
 
         let endpoints = get_global_endpoints();
 
         for p in pools.iter() {
             if let Some(idx) = endpoints.get_pool_idx(&p.cmd_line) {
-                pool_indeces.push(idx);
+                pool_indices.push(idx);
             } else {
                 return Err(Error::other(format!(
                     "unexpected state present for decommission status pool({}) not found",
@@ -317,8 +317,8 @@ impl ECStore {
             }
         }
 
-        if !pool_indeces.is_empty() {
-            let idx = pool_indeces[0];
+        if !pool_indices.is_empty() {
+            let idx = pool_indices[0];
             if endpoints.as_ref()[idx].endpoints.as_ref()[0].is_local {
                 let (_tx, rx) = broadcast::channel(1);
 
@@ -328,9 +328,9 @@ impl ECStore {
                     // wait  3 minutes for cluster init
                     tokio::time::sleep(Duration::from_secs(60 * 3)).await;
 
-                    if let Err(err) = store.decommission(rx.resubscribe(), pool_indeces.clone()).await {
+                    if let Err(err) = store.decommission(rx.resubscribe(), pool_indices.clone()).await {
                         if err == StorageError::DecommissionAlreadyRunning {
-                            for i in pool_indeces.iter() {
+                            for i in pool_indices.iter() {
                                 store.do_decommission_in_routine(rx.resubscribe(), *i).await;
                             }
                             return;
@@ -417,9 +417,9 @@ impl ECStore {
     //                 // TODO handle errs
     //                 continue;
     //             }
-    //             let entrys = disks_res.as_ref().unwrap();
+    //             let entries = disks_res.as_ref().unwrap();
 
-    //             for entry in entrys {
+    //             for entry in entries {
     //                 // warn!("lst_merged entry---- {}", &entry.name);
 
     //                 if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
@@ -1415,7 +1415,7 @@ impl StorageAPI for ECStore {
 
         if let Ok(sys) = metadata_sys::get(bucket).await {
             info.created = Some(sys.created);
-            info.versionning = sys.versioning();
+            info.versioning = sys.versioning();
             info.object_locking = sys.object_locking();
         }
 
@@ -1808,6 +1808,47 @@ impl StorageAPI for ECStore {
         }
 
         Ok((del_objects, del_errs))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        check_list_parts_args(bucket, object, upload_id)?;
+
+        // TODO: nslock
+
+        if self.single_pool() {
+            return self.pools[0]
+                .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+                .await;
+        }
+
+        for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
+            match pool
+                .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+                .await
+            {
+                Ok(res) => return Ok(res),
+                Err(err) => {
+                    if is_err_invalid_upload_id(&err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+        }
+
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
     #[tracing::instrument(skip(self))]

@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
+use crate::store_api::ListPartsInfo;
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -64,7 +65,7 @@ pub struct Sets {
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
     pub format: FormatV3,
-    pub partiy_count: usize,
+    pub parity_count: usize,
     pub set_count: usize,
     pub set_drive_count: usize,
     pub default_parity_count: usize,
@@ -81,13 +82,13 @@ impl Drop for Sets {
 }
 
 impl Sets {
-    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, partiy_count))]
+    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
     pub async fn new(
         disks: Vec<Option<DiskStore>>,
         endpoints: &PoolEndpoints,
         fm: &FormatV3,
         pool_idx: usize,
-        partiy_count: usize,
+        parity_count: usize,
     ) -> Result<Arc<Self>> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
@@ -172,7 +173,7 @@ impl Sets {
                 Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
-                partiy_count,
+                parity_count,
                 i,
                 pool_idx,
                 set_endpoints,
@@ -193,10 +194,10 @@ impl Sets {
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),
-            partiy_count,
+            parity_count,
             set_count,
             set_drive_count,
-            default_parity_count: partiy_count,
+            default_parity_count: parity_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
             exit_signal: Some(tx),
         });
@@ -617,6 +618,20 @@ impl StorageAPI for Sets {
         }
 
         Ok((del_objects, del_errs))
+    }
+
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        self.get_disks_by_key(object)
+            .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]

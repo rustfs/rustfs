@@ -22,8 +22,8 @@ use rustfs_protos::{
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
         DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
-        ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        ReadAllRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+        RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
 
@@ -44,7 +44,7 @@ use crate::{
         heal_commands::{HealScanMode, HealingTracker},
     },
 };
-use rustfs_filemeta::{FileInfo, RawFileInfo};
+use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
 use tokio::{
@@ -788,6 +788,27 @@ impl DiskAPI for RemoteDisk {
         let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
 
         Ok(check_parts_resp)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        let request = Request::new(ReadPartsRequest {
+            disk: self.endpoint.to_string(),
+            bucket: bucket.to_string(),
+            paths: paths.to_vec(),
+        });
+
+        let response = client.read_parts(request).await?.into_inner();
+        if !response.success {
+            return Err(response.error.unwrap_or_default().into());
+        }
+
+        let read_parts_resp = rmp_serde::from_slice::<Vec<ObjectPartInfo>>(&response.object_part_infos)?;
+
+        Ok(read_parts_resp)
     }
 
     #[tracing::instrument(skip(self))]

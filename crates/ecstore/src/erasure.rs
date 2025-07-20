@@ -308,7 +308,7 @@ impl Erasure {
             // ec encode, 结果会写进 data_buffer
             let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(shard_size).collect();
 
-            // partiy 数量大于 0 才 ec
+            // parity 数量大于 0 才 ec
             if self.parity_shards > 0 {
                 self.encoder.as_ref().unwrap().encode(data_slices).map_err(Error::other)?;
             }

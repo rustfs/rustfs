@@ -1,142 +1,95 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Multi-stage build for RustFS production image
 
-# Multi-stage Alpine build for minimal runtime image
-FROM rust:1.85-alpine AS builder
+# Build stage: Download and extract RustFS binary
+FROM alpine:3.22 AS build
 
-# Build arguments for dynamic artifact download
-ARG VERSION=""
-ARG BUILD_TYPE="release"
+# Build arguments for platform and release
 ARG TARGETARCH
+ARG RELEASE=latest
 
-# Install build dependencies
-RUN apk add --no-cache \
-    musl-dev \
-    pkgconfig \
-    openssl-dev \
-    openssl-libs-static \
-    curl \
-    unzip \
-    bash \
-    wget \
-    ca-certificates
+# Install minimal dependencies for downloading and extracting
+RUN apk add --no-cache ca-certificates curl unzip
 
-# Install protoc
-RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-x86_64.zip \
-    && unzip protoc-31.1-linux-x86_64.zip -d protoc3 \
-    && mv protoc3/bin/* /usr/local/bin/ && chmod +x /usr/local/bin/protoc \
-    && mv protoc3/include/* /usr/local/include/ && rm -rf protoc-31.1-linux-x86_64.zip protoc3
+# Create build directory
+WORKDIR /build
 
-# Install flatc
-RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.flatc.binary.g++-13.zip \
-    && unzip Linux.flatc.binary.g++-13.zip \
-    && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc \
-    && rm -rf Linux.flatc.binary.g++-13.zip
-
-# Download pre-built binary (VERSION is required)
-RUN if [ -z "$VERSION" ]; then \
-        echo "❌ ERROR: VERSION build argument is required"; \
-        echo "Please provide VERSION (e.g., main-latest, latest, v1.0.0, dev-abc123)"; \
-        exit 1; \
-    fi; \
-    \
-    # Map TARGETARCH to our naming convention
-    case "${TARGETARCH}" in \
+# Detect architecture and download corresponding binary
+RUN case "${TARGETARCH}" in \
         amd64) ARCH="x86_64" ;; \
         arm64) ARCH="aarch64" ;; \
-        *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
-    esac; \
-    \
-    # Handle VERSION with different patterns
-    if [[ "$VERSION" == "main-latest" ]]; then \
-        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-        FILENAME="rustfs-linux-${ARCH}-main-latest.zip"; \
-    elif [[ "$VERSION" == "latest" ]]; then \
-        DOWNLOAD_PATH="artifacts/rustfs/release"; \
-        FILENAME="rustfs-linux-${ARCH}-latest.zip"; \
-    elif [[ "$VERSION" == dev-* ]]; then \
-        DOWNLOAD_PATH="artifacts/rustfs/dev"; \
-        FILENAME="rustfs-linux-${ARCH}-dev-${VERSION#dev-}.zip"; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2 && exit 1 ;; \
+    esac && \
+    if [ "${RELEASE}" = "latest" ]; then \
+        VERSION="latest"; \
     else \
-        DOWNLOAD_PATH="artifacts/rustfs/release"; \
-        FILENAME="rustfs-linux-${ARCH}-v${VERSION}.zip"; \
-    fi; \
-    \
-    # Download the binary
-    DOWNLOAD_URL="https://dl.rustfs.com/${DOWNLOAD_PATH}/${FILENAME}"; \
-    echo "🔽 Downloading RustFS binary from: ${DOWNLOAD_URL}"; \
-    \
-    # Download with clear error handling
-    if ! curl -fsSL --connect-timeout 30 --max-time 120 -o /tmp/rustfs.zip "${DOWNLOAD_URL}"; then \
-        echo "❌ Failed to download binary from: ${DOWNLOAD_URL}"; \
-        echo "💡 Please ensure the binary exists or trigger a build first"; \
-        echo "💡 Available options:"; \
-        echo "   - For main-latest: Push to main branch or run build workflow"; \
-        echo "   - For latest: Create a release tag"; \
-        echo "   - For dev-xxx: Run build workflow with specific commit"; \
-        exit 1; \
-    fi; \
-    \
-    # Extract binary
-    if ! unzip -o /tmp/rustfs.zip -d /tmp >/dev/null 2>&1; then \
-        echo "❌ Failed to extract downloaded binary"; \
-        exit 1; \
-    fi; \
-    \
-    # Install binary
-    mv /tmp/rustfs /usr/local/bin/rustfs; \
-    chmod +x /usr/local/bin/rustfs; \
-    rm -rf /tmp/*; \
-    \
-    echo "✅ Successfully downloaded and installed RustFS binary (${VERSION})"
+        VERSION="v${RELEASE#v}"; \
+    fi && \
+    BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
+    PACKAGE_NAME="rustfs-linux-${ARCH}-${VERSION}.zip" && \
+    DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}" && \
+    echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}" >&2 && \
+    curl -f -L "${DOWNLOAD_URL}" -o rustfs.zip && \
+    unzip rustfs.zip -d /build && \
+    chmod +x /build/rustfs && \
+    rm rustfs.zip || { echo "Failed to download or extract ${PACKAGE_NAME}" >&2; exit 1; }
 
-# Final Alpine runtime image
-FROM alpine:3.18
+# Runtime stage: Configure runtime environment
+FROM alpine:3.22.1
 
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
-    bash
+# Build arguments and labels
+ARG RELEASE=latest
+ARG BUILD_DATE
+ARG VCS_REF
 
-# Create rustfs user for security
-RUN addgroup -g 1000 rustfs && \
-    adduser -D -u 1000 -G rustfs rustfs
+LABEL name="RustFS" \
+      vendor="RustFS Team" \
+      maintainer="RustFS Team <dev@rustfs.com>" \
+      version="${RELEASE}" \
+      release="${RELEASE}" \
+      build-date="${BUILD_DATE}" \
+      vcs-ref="${VCS_REF}" \
+      summary="High-performance distributed object storage system compatible with S3 API" \
+      description="RustFS is a distributed object storage system written in Rust, supporting erasure coding, multi-tenant management, and observability." \
+      url="https://rustfs.com" \
+      license="Apache-2.0"
 
-WORKDIR /app
+# Install runtime dependencies
+RUN echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/community" >> /etc/apk/repositories && \
+    apk update && \
+    apk add --no-cache ca-certificates bash gosu coreutils shadow && \
+    addgroup -g 1000 rustfs && \
+    adduser -u 1000 -G rustfs -s /bin/bash -D rustfs
 
-# Copy binary from builder
-COPY --from=builder /usr/local/bin/rustfs /app/rustfs
-RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
+# Copy CA certificates and RustFS binary from build stage
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /build/rustfs /usr/bin/rustfs
 
-# Create data directories
-RUN mkdir -p /data && chown -R rustfs:rustfs /data /app
+# Copy entry point script
+COPY entrypoint.sh /entrypoint.sh
 
-# Switch to non-root user
-USER rustfs
+# Set permissions
+RUN chmod +x /usr/bin/rustfs /entrypoint.sh && \
+    mkdir -p /data /logs && \
+    chown rustfs:rustfs /data /logs && \
+    chmod 700 /data /logs
 
-# Environment variables
-ENV RUSTFS_ACCESS_KEY=rustfsadmin \
+# Environment variables (credentials should be set via environment or secrets)
+ENV RUSTFS_ADDRESS=:9000 \
+    RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_SECRET_KEY=rustfsadmin \
-    RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
     RUSTFS_VOLUMES=/data \
-    RUST_LOG=warn
+    RUST_LOG=warn \
+    RUSTFS_OBS_LOG_DIRECTORY=/logs \
+    RUSTFS_SINKS_FILE_PATH=/logs
 
+# Expose port
 EXPOSE 9000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+# Volumes for data and logs
+VOLUME ["/data", "/logs"]
 
-CMD ["/app/rustfs"]
+# Set entry point
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/usr/bin/rustfs"]
+

@@ -288,6 +288,12 @@ impl From<rmp_serde::encode::Error> for DiskError {
     }
 }
 
+impl From<rmp_serde::decode::Error> for DiskError {
+    fn from(e: rmp_serde::decode::Error) -> Self {
+        DiskError::other(e)
+    }
+}
+
 impl From<rmp::encode::ValueWriteError> for DiskError {
     fn from(e: rmp::encode::ValueWriteError) -> Self {
         DiskError::other(e)
