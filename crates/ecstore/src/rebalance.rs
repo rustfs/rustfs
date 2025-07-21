@@ -1172,7 +1172,7 @@ impl SetDisks {
             ListPathRawOptions {
                 disks: disks.iter().cloned().map(Some).collect(),
                 bucket: bucket.clone(),
-                recursice: true,
+                recursive: true,
                 min_disks: listing_quorum,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);

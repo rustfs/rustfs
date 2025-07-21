@@ -1262,7 +1262,7 @@ impl FolderScanner {
                     disks: self.disks.clone(),
                     bucket: bucket.clone(),
                     path: prefix.clone(),
-                    recursice: true,
+                    recursive: true,
                     report_not_found: true,
                     min_disks: self.disks_quorum,
                     agreed: Some(Box::new(move |entry: MetaCacheEntry| {

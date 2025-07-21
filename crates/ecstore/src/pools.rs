@@ -1355,7 +1355,7 @@ impl SetDisks {
                 disks: disks.iter().cloned().map(Some).collect(),
                 bucket: bucket_info.name.clone(),
                 path: bucket_info.prefix.clone(),
-                recursice: true,
+                recursive: true,
                 min_disks: listing_quorum,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
