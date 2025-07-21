@@ -241,6 +241,7 @@ jobs:
           fi
 
       - name: Build RustFS
+        shell: bash
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
@@ -330,6 +331,7 @@ jobs:
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
           OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
 
@@ -456,6 +458,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Build completion summary
+        shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
           VERSION="${{ needs.build-check.outputs.version }}"
@@ -520,6 +523,7 @@ jobs:
         id: create
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
           VERSION="${{ needs.build-check.outputs.version }}"
@@ -606,6 +610,7 @@ jobs:
 
       - name: Prepare release assets
         id: prepare
+        shell: bash
         run: |
           VERSION="${{ needs.build-check.outputs.version }}"
           TAG="${{ needs.build-check.outputs.version }}"
@@ -648,6 +653,7 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
 
@@ -676,6 +682,7 @@ jobs:
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
           OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        shell: bash
         run: |
           if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
             echo "⚠️ OSS credentials not available, skipping latest.json update"
@@ -727,6 +734,7 @@ jobs:
       - name: Update release notes and publish
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
           VERSION="${{ needs.build-check.outputs.version }}"
