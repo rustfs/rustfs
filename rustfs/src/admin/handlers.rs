@@ -23,15 +23,15 @@ use http::{HeaderMap, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
+use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::get_global_action_cred;
-use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::heal::heal_commands::HealOpts;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
@@ -1095,7 +1095,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
 #[cfg(test)]
 mod test {
-    use rustfs_ecstore::heal::heal_commands::HealOpts;
+    use rustfs_common::heal_channel::HealOpts;
 
     #[ignore] // FIXME: failed in github actions
     #[test]
