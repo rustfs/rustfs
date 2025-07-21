@@ -305,7 +305,6 @@ jobs:
           fi
           
           cd target/${{ matrix.target }}/release
-          
           # Determine the binary name based on platform
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
             BINARY_NAME="rustfs.exe"
@@ -316,19 +315,39 @@ jobs:
           # Verify the binary exists before packaging
           if [[ ! -f "$BINARY_NAME" ]]; then
             echo "❌ Binary $BINARY_NAME not found in $(pwd)"
-            ls -la
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              dir
+            else
+              ls -la
+            fi
             exit 1
           fi
           
+          # 通用打包函数
+          package_zip() {
+            local src=$1
+            local dst=$2
+            if command -v zip &> /dev/null; then
+              zip "$dst" "$src"
+            else
+              powershell -Command "Compress-Archive -Path $src -DestinationPath $dst"
+            fi
+          }
+          
           # Create the zip package
-          zip "../../../${PACKAGE_NAME}.zip" "$BINARY_NAME"
+          echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
+          package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
           
           cd ../../..
           
           # Verify the package was created
           if [[ -f "${PACKAGE_NAME}.zip" ]]; then
             echo "✅ Package created successfully: ${PACKAGE_NAME}.zip"
-            echo "📦 Package size: $(ls -lh ${PACKAGE_NAME}.zip | awk '{print $5}')"
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              dir
+            else
+              ls -lh ${PACKAGE_NAME}.zip
+            fi
           else
             echo "❌ Failed to create package: ${PACKAGE_NAME}.zip"
             exit 1
