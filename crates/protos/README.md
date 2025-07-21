@@ -28,6 +28,12 @@
 - Type-safe message definitions
 - Code generation for multiple programming languages
 
+## generate code
+
+```
+cargo run --bin gproto
+```
+
 ## 📚 Documentation
 
 For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
