@@ -28,8 +28,8 @@ name: Build and Release
 
 on:
   push:
-    tags: ["*.*.*"]
-    branches: [main]
+    tags: [ "*.*.*" ]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -45,7 +45,7 @@ on:
       - ".gitignore"
       - ".dockerignore"
   pull_request:
-    branches: [main]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -153,7 +153,7 @@ jobs:
   # Build RustFS binaries
   build-rustfs:
     name: Build RustFS
-    needs: [build-check]
+    needs: [ build-check ]
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -172,14 +172,14 @@ jobs:
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
-            platform: linux
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            platform: linux
+          #          - os: ubuntu-latest
+          #            target: x86_64-unknown-linux-gnu
+          #            cross: false
+          #            platform: linux
+          #          - os: ubuntu-latest
+          #            target: aarch64-unknown-linux-gnu
+          #            cross: true
+          #            platform: linux
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -215,6 +215,7 @@ jobs:
           install-cross-tools: ${{ matrix.cross }}
 
       - name: Download static console assets
+        shell: bash
         run: |
           mkdir -p ./rustfs/static
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
@@ -450,7 +451,7 @@ jobs:
   # Build summary
   build-summary:
     name: Build Summary
-    needs: [build-check, build-rustfs]
+    needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -501,7 +502,7 @@ jobs:
   # Create GitHub Release (only for tag pushes)
   create-release:
     name: Create GitHub Release
-    needs: [build-check, build-rustfs]
+    needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
@@ -586,7 +587,7 @@ jobs:
   # Prepare and upload release assets
   upload-release-assets:
     name: Upload Release Assets
-    needs: [build-check, build-rustfs, create-release]
+    needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
@@ -665,7 +666,7 @@ jobs:
   # Update latest.json for stable releases only
   update-latest-version:
     name: Update Latest Version
-    needs: [build-check, upload-release-assets]
+    needs: [ build-check, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -714,7 +715,7 @@ jobs:
   # Publish release (remove draft status)
   publish-release:
     name: Publish Release
-    needs: [build-check, create-release, upload-release-assets]
+    needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
