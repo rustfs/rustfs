@@ -15,16 +15,16 @@
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
+use crate::disk::DiskStore;
 use crate::error::{Error, Result};
-use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent,
     bucket::lifecycle::lifecycle::ExpirationOptions,
     bucket::lifecycle::{bucket_lifecycle_ops::TransitionedObject, lifecycle::TransitionOptions},
 };
-use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -1072,8 +1072,8 @@ pub trait StorageAPI: ObjectIO {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
-    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, hs: Arc<HealSequence>, is_meta: bool)
-    -> Result<()>;
+    // async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, hs: Arc<HealSequence>, is_meta: bool)
+    // -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }

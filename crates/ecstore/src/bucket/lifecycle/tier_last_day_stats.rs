@@ -25,7 +25,7 @@ use std::ops::Sub;
 use time::OffsetDateTime;
 use tracing::{error, warn};
 
-use crate::heal::data_usage_cache::TierStats;
+use rustfs_common::data_usage::TierStats;
 
 pub type DailyAllTierStats = HashMap<String, LastDayTierStats>;
 

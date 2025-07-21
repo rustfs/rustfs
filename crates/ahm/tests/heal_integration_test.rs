@@ -3,10 +3,10 @@ use rustfs_ahm::heal::{
     storage::{ECStoreHealStorage, HealStorageAPI},
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
+use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    heal::heal_commands::HEAL_NORMAL_SCAN,
     store::ECStore,
     store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
 };
@@ -175,7 +175,7 @@ async fn test_heal_object_basic() {
             recursive: false,
             remove_corrupted: false,
             recreate_missing: true,
-            scan_mode: HEAL_NORMAL_SCAN,
+            scan_mode: HealScanMode::Normal,
             update_parity: true,
             timeout: Some(Duration::from_secs(300)),
             pool_index: None,
@@ -240,7 +240,7 @@ async fn test_heal_bucket_basic() {
             recursive: true,
             remove_corrupted: false,
             recreate_missing: false,
-            scan_mode: HEAL_NORMAL_SCAN,
+            scan_mode: HealScanMode::Normal,
             update_parity: false,
             timeout: Some(Duration::from_secs(300)),
             pool_index: None,
@@ -367,12 +367,12 @@ async fn test_heal_storage_api_direct() {
     let bucket_name = "test-bucket-direct";
     create_test_bucket(&ecstore, bucket_name).await;
 
-    let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+    let heal_opts = HealOpts {
         recursive: true,
         dry_run: true,
         remove: false,
         recreate: false,
-        scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
+        scan_mode: HealScanMode::Normal,
         update_parity: false,
         no_lock: false,
         pool: None,
@@ -388,12 +388,12 @@ async fn test_heal_storage_api_direct() {
     let test_data = b"Test data for direct heal API";
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
-    let object_heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+    let object_heal_opts = HealOpts {
         recursive: false,
         dry_run: true,
         remove: false,
         recreate: false,
-        scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
+        scan_mode: HealScanMode::Normal,
         update_parity: false,
         no_lock: false,
         pool: None,

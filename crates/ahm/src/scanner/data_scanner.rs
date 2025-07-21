@@ -22,22 +22,22 @@ use ecstore::{
     disk::{DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
-use rustfs_ecstore::{self as ecstore, StorageAPI};
+use rustfs_ecstore::{self as ecstore, data_usage::store_data_usage_in_backend, StorageAPI};
 use rustfs_filemeta::MetacacheReader;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{
-    data_usage::DataUsageInfo,
-    metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics},
-};
+use super::metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics};
 use crate::heal::HealManager;
 use crate::{
     error::{Error, Result},
     get_ahm_services_cancel_token, HealRequest,
 };
-use rustfs_common::metrics::{globalMetrics, Metric, Metrics};
+use rustfs_common::{
+    data_usage::DataUsageInfo,
+    metrics::{globalMetrics, Metric, Metrics},
+};
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 
@@ -1182,7 +1182,7 @@ impl Scanner {
                 // Offload persistence to background task
                 let data_clone = data_usage.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = super::data_usage::store_data_usage_in_backend(data_clone, store).await {
+                    if let Err(e) = store_data_usage_in_backend(data_clone, store).await {
                         error!("Failed to store data usage statistics to backend: {}", e);
                     } else {
                         info!("Successfully stored data usage statistics to backend");
@@ -1214,6 +1214,7 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_ecstore::data_usage::load_data_usage_from_backend;
     use rustfs_ecstore::disk::endpoint::Endpoint;
     use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_ecstore::store::ECStore;
@@ -1441,7 +1442,7 @@ mod tests {
 
         // verify correctness of persisted data
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let persisted = crate::scanner::data_usage::load_data_usage_from_backend(ecstore.clone())
+        let persisted = load_data_usage_from_backend(ecstore.clone())
             .await
             .expect("load persisted usage");
         assert_eq!(persisted.objects_total_count, du_after.objects_total_count);

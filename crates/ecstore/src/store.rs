@@ -30,11 +30,6 @@ use crate::global::{
     GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_endpoints, is_dist_erasure,
     is_erasure_sd, set_global_deployment_id, set_object_layer,
 };
-use crate::heal::data_usage::{DATA_USAGE_ROOT, DataUsageInfo};
-use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
-use crate::heal::heal_commands::{HEAL_ITEM_METADATA, HealOpts, HealScanMode};
-use crate::heal::heal_ops::{HealEntryFn, HealSequence};
-use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
@@ -54,13 +49,12 @@ use crate::{
     store_init,
 };
 use futures::future::join_all;
-use glob::Pattern;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng as _;
 use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
+use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_filemeta::FileInfo;
-use rustfs_filemeta::MetaCacheEntry;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::crypto::base64_decode;
 use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
@@ -73,9 +67,8 @@ use std::time::SystemTime;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::select;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{RwLock, broadcast, mpsc};
-use tokio::time::{interval, sleep};
+use tokio::sync::{RwLock, broadcast};
+use tokio::time::sleep;
 use tracing::{debug, info};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -811,123 +804,6 @@ impl ECStore {
         errs
     }
 
-    pub async fn ns_scanner(
-        &self,
-        updates: Sender<DataUsageInfo>,
-        want_cycle: usize,
-        heal_scan_mode: HealScanMode,
-    ) -> Result<()> {
-        info!("ns_scanner updates - {}", want_cycle);
-        let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
-        if all_buckets.is_empty() {
-            info!("No buckets found");
-            let _ = updates.send(DataUsageInfo::default()).await;
-            return Ok(());
-        }
-
-        let mut total_results = 0;
-        let mut result_index = 0;
-        self.pools.iter().for_each(|pool| {
-            total_results += pool.disk_set.len();
-        });
-        let results = Arc::new(RwLock::new(vec![DataUsageCache::default(); total_results]));
-        let (cancel, _) = broadcast::channel(100);
-        let first_err = Arc::new(RwLock::new(None));
-        let mut futures = Vec::new();
-        for pool in self.pools.iter() {
-            for set in pool.disk_set.iter() {
-                let index = result_index;
-                let results_clone = results.clone();
-                let first_err_clone = first_err.clone();
-                let cancel_clone = cancel.clone();
-                let all_buckets_clone = all_buckets.clone();
-                futures.push(async move {
-                    let (tx, mut rx) = mpsc::channel(1);
-                    let task = tokio::spawn(async move {
-                        loop {
-                            match rx.recv().await {
-                                Some(info) => {
-                                    results_clone.write().await[index] = info;
-                                }
-                                None => {
-                                    return;
-                                }
-                            }
-                        }
-                    });
-                    if let Err(err) = set
-                        .clone()
-                        .ns_scanner(&all_buckets_clone, want_cycle as u32, tx, heal_scan_mode)
-                        .await
-                    {
-                        let mut f_w = first_err_clone.write().await;
-                        if f_w.is_none() {
-                            *f_w = Some(err);
-                        }
-                        let _ = cancel_clone.send(true);
-                        return;
-                    }
-                    let _ = task.await;
-                });
-                result_index += 1;
-            }
-        }
-        let (update_closer_tx, mut update_close_rx) = mpsc::channel(10);
-        let mut ctx_clone = cancel.subscribe();
-        let all_buckets_clone = all_buckets.clone();
-        // 新增：从环境变量读取 interval，默认 30 秒
-        let ns_scanner_interval_secs = std::env::var("RUSTFS_NS_SCANNER_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30);
-
-        // 检查是否跳过后台任务
-        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        if skip_background_task {
-            info!("跳过后台任务执行：RUSTFS_SKIP_BACKGROUND_TASK=true");
-            return Ok(());
-        }
-
-        let task = tokio::spawn(async move {
-            let mut last_update: Option<SystemTime> = None;
-            let mut interval = interval(Duration::from_secs(ns_scanner_interval_secs));
-            let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
-            loop {
-                select! {
-                    _ = ctx_clone.recv() => {
-                        return;
-                    }
-                    _ = update_close_rx.recv() => {
-                        update_scan(all_merged.clone(), results.clone(), &mut last_update, all_buckets_clone.clone(), updates.clone()).await;
-                        return;
-                    }
-                    _ = interval.tick() => {
-                        update_scan(all_merged.clone(), results.clone(), &mut last_update, all_buckets_clone.clone(), updates.clone()).await;
-                    }
-                }
-            }
-        });
-        let _ = join_all(futures).await;
-        let mut ctx_closer = cancel.subscribe();
-        select! {
-            _ = update_closer_tx.send(true) => {
-
-            }
-            _ = ctx_closer.recv() => {
-
-            }
-        }
-        let _ = task.await;
-        if let Some(err) = first_err.read().await.as_ref() {
-            return Err(err.clone());
-        }
-        Ok(())
-    }
-
     async fn get_latest_object_info_with_idx(
         &self,
         bucket: &str,
@@ -1065,34 +941,6 @@ impl ECStore {
         *pool_meta = meta;
         // *self.pool_meta.write().unwrap() = meta;
         Ok(())
-    }
-}
-
-#[tracing::instrument(level = "info", skip(all_buckets, updates))]
-async fn update_scan(
-    all_merged: Arc<RwLock<DataUsageCache>>,
-    results: Arc<RwLock<Vec<DataUsageCache>>>,
-    last_update: &mut Option<SystemTime>,
-    all_buckets: Vec<BucketInfo>,
-    updates: Sender<DataUsageInfo>,
-) {
-    let mut w = all_merged.write().await;
-    *w = DataUsageCache {
-        info: DataUsageCacheInfo {
-            name: DATA_USAGE_ROOT.to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    for info in results.read().await.iter() {
-        if info.info.last_update.is_none() {
-            return;
-        }
-        w.merge(info);
-    }
-    if (last_update.is_none() || w.info.last_update > *last_update) && w.root().is_some() {
-        let _ = updates.send(w.dui(&w.info.name, &all_buckets)).await;
-        *last_update = w.info.last_update;
     }
 }
 
@@ -2237,7 +2085,7 @@ impl StorageAPI for ECStore {
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         info!("heal_format");
         let mut r = HealResultItem {
-            heal_item_type: HEAL_ITEM_METADATA.to_string(),
+            heal_item_type: HealItemType::Metadata.to_string(),
             detail: "disk-format".to_string(),
             ..Default::default()
         };
@@ -2349,120 +2197,6 @@ impl StorageAPI for ECStore {
         }
 
         Ok((HealResultItem::default(), Some(Error::FileNotFound)))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_objects(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        opts: &HealOpts,
-        hs: Arc<HealSequence>,
-        is_meta: bool,
-    ) -> Result<()> {
-        info!("heal objects");
-        let opts_clone = *opts;
-        let heal_entry: HealEntryFn = Arc::new(move |bucket: String, entry: MetaCacheEntry, scan_mode: HealScanMode| {
-            let opts_clone = opts_clone;
-            let hs_clone = hs.clone();
-            Box::pin(async move {
-                if entry.is_dir() {
-                    return Ok(());
-                }
-
-                if bucket == RUSTFS_META_BUCKET
-                    && Pattern::new("buckets/*/.metacache/*")
-                        .map(|p| p.matches(&entry.name))
-                        .unwrap_or(false)
-                    || Pattern::new("tmp/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                    || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                    || Pattern::new("tmp-old/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                {
-                    return Ok(());
-                }
-                let fivs = match entry.file_info_versions(&bucket) {
-                    Ok(fivs) => fivs,
-                    Err(_) => {
-                        return if is_meta {
-                            HealSequence::heal_meta_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
-                        } else {
-                            HealSequence::heal_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
-                        };
-                    }
-                };
-
-                if opts_clone.remove && !opts_clone.dry_run {
-                    let Some(store) = new_object_layer_fn() else {
-                        return Err(Error::other("errServerNotInitialized"));
-                    };
-
-                    if let Err(err) = store.check_abandoned_parts(&bucket, &entry.name, &opts_clone).await {
-                        info!("unable to check object {}/{} for abandoned data: {}", bucket, entry.name, err.to_string());
-                    }
-                }
-                for version in fivs.versions.iter() {
-                    if is_meta {
-                        if let Err(err) = HealSequence::heal_meta_object(
-                            hs_clone.clone(),
-                            &bucket,
-                            &version.name,
-                            &version.version_id.map(|v| v.to_string()).unwrap_or("".to_string()),
-                            scan_mode,
-                        )
-                        .await
-                        {
-                            match err {
-                                Error::FileNotFound | Error::FileVersionNotFound => {}
-                                _ => {
-                                    return Err(err);
-                                }
-                            }
-                        }
-                    } else if let Err(err) = HealSequence::heal_object(
-                        hs_clone.clone(),
-                        &bucket,
-                        &version.name,
-                        &version.version_id.map(|v| v.to_string()).unwrap_or("".to_string()),
-                        scan_mode,
-                    )
-                    .await
-                    {
-                        match err {
-                            Error::FileNotFound | Error::FileVersionNotFound => {}
-                            _ => {
-                                return Err(err);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            })
-        });
-        let mut first_err = None;
-        for (idx, pool) in self.pools.iter().enumerate() {
-            if opts.pool.is_some() && opts.pool.unwrap() != idx {
-                continue;
-            }
-            //TODO: IsSuspended
-
-            for (idx, set) in pool.disk_set.iter().enumerate() {
-                if opts.set.is_some() && opts.set.unwrap() != idx {
-                    continue;
-                }
-
-                if let Err(err) = set.list_and_heal(bucket, prefix, opts, heal_entry.clone()).await {
-                    if first_err.is_none() {
-                        first_err = Some(err)
-                    }
-                }
-            }
-        }
-
-        if first_err.is_some() {
-            return Err(first_err.unwrap());
-        }
-
-        Ok(())
     }
 
     #[tracing::instrument(skip(self))]

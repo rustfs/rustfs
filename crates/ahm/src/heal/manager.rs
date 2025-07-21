@@ -288,12 +288,6 @@ impl HealManager {
                                         continue;
                                     }
                                 }
-                                // disk currently healing and not finished
-                                if let Some(h) = disk.healing().await {
-                                    if !h.finished {
-                                        endpoints.push(disk.endpoint());
-                                    }
-                                }
                             }
                         }
 

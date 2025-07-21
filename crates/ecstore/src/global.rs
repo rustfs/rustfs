@@ -17,7 +17,6 @@ use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
     event_notification::EventNotifier,
-    heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
     store::ECStore,
     tier::tier::TierConfigMgr,
 };
@@ -50,9 +49,6 @@ pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStor
 pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
 pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
 pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
-pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
-pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
-// pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
 pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
 pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
 pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();

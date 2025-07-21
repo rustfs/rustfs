@@ -18,9 +18,9 @@ use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::cmd::bucket_targets;
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
-use crate::heal::heal_commands::HealOpts;
 use crate::store::ECStore;
 use futures::future::join_all;
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,

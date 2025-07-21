@@ -19,7 +19,7 @@ use crate::heal::{
 };
 
 use rustfs_common::heal_channel::{
-    HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse,
+    HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -173,15 +173,27 @@ impl HealChannelProcessor {
 
     /// Convert channel request to heal request
     fn convert_to_heal_request(&self, request: HealChannelRequest) -> Result<HealRequest> {
-        let heal_type = match &request.object_prefix {
-            Some(prefix) if !prefix.is_empty() => HealType::Object {
+        let heal_type = if let Some(disk_id) = &request.disk {
+            HealType::ErasureSet {
+                buckets: vec![],
+                set_disk_id: disk_id.clone(),
+            }
+        } else if let Some(prefix) = &request.object_prefix {
+            if !prefix.is_empty() {
+                HealType::Object {
+                    bucket: request.bucket.clone(),
+                    object: prefix.clone(),
+                    version_id: None,
+                }
+            } else {
+                HealType::Bucket {
+                    bucket: request.bucket.clone(),
+                }
+            }
+        } else {
+            HealType::Bucket {
                 bucket: request.bucket.clone(),
-                object: prefix.clone(),
-                version_id: None,
-            },
-            _ => HealType::Bucket {
-                bucket: request.bucket.clone(),
-            },
+            }
         };
 
         let priority = match request.priority {
@@ -191,18 +203,9 @@ impl HealChannelProcessor {
             HealChannelPriority::Critical => HealPriority::Urgent,
         };
 
-        // Convert scan mode
-        let scan_mode = match request.scan_mode {
-            Some(rustfs_common::heal_channel::HealChannelScanMode::Normal) => {
-                rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN
-            }
-            Some(rustfs_common::heal_channel::HealChannelScanMode::Deep) => rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
-            None => rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN,
-        };
-
         // Build HealOptions with all available fields
         let mut options = HealOptions {
-            scan_mode,
+            scan_mode: request.scan_mode.unwrap_or(HealScanMode::Normal),
             remove_corrupted: request.remove_corrupted.unwrap_or(false),
             recreate_missing: request.recreate_missing.unwrap_or(true),
             update_parity: request.update_parity.unwrap_or(true),

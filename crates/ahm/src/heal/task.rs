@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::heal::{erasure_healer::ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
-use rustfs_ecstore::heal::heal_commands::HealScanMode;
-use rustfs_ecstore::heal::heal_commands::HEAL_NORMAL_SCAN;
+use crate::heal::ErasureSetHealer;
+use crate::heal::{progress::HealProgress, storage::HealStorageAPI};
+use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -93,7 +93,7 @@ pub struct HealOptions {
 impl Default for HealOptions {
     fn default() -> Self {
         Self {
-            scan_mode: HEAL_NORMAL_SCAN,
+            scan_mode: HealScanMode::Normal,
             remove_corrupted: false,
             recreate_missing: true,
             update_parity: true,
@@ -324,7 +324,7 @@ impl HealTask {
 
         // Step 2: directly call ecstore to perform heal
         info!("Step 2: Performing heal using ecstore");
-        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+        let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
             remove: self.options.remove_corrupted,
@@ -410,12 +410,12 @@ impl HealTask {
         info!("Attempting to recreate missing object: {}/{}", bucket, object);
 
         // Use ecstore's heal_object with recreate option
-        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+        let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
             remove: false,
             recreate: true,
-            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: false,
             pool: None,
@@ -476,7 +476,7 @@ impl HealTask {
 
         // Step 2: Perform bucket heal using ecstore
         info!("Step 2: Performing bucket heal using ecstore");
-        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+        let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
             remove: self.options.remove_corrupted,
@@ -538,12 +538,12 @@ impl HealTask {
 
         // Step 2: Perform metadata heal using ecstore
         info!("Step 2: Performing metadata heal using ecstore");
-        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+        let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
             remove: false,
             recreate: false,
-            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            scan_mode: HealScanMode::Deep,
             update_parity: false,
             no_lock: false,
             pool: self.options.pool_index,
@@ -612,12 +612,12 @@ impl HealTask {
 
         // Step 1: Perform MRF heal using ecstore
         info!("Step 1: Performing MRF heal using ecstore");
-        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+        let heal_opts = HealOpts {
             recursive: true,
             dry_run: self.options.dry_run,
             remove: self.options.remove_corrupted,
             recreate: self.options.recreate_missing,
-            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: false,
             pool: None,
@@ -685,12 +685,12 @@ impl HealTask {
 
         // Step 2: Perform EC decode heal using ecstore
         info!("Step 2: Performing EC decode heal using ecstore");
-        let heal_opts = rustfs_ecstore::heal::heal_commands::HealOpts {
+        let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
             remove: false,
             recreate: true,
-            scan_mode: rustfs_ecstore::heal::heal_commands::HEAL_DEEP_SCAN,
+            scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: false,
             pool: None,
@@ -747,6 +747,14 @@ impl HealTask {
             progress.set_current_object(Some(format!("erasure_set: {} ({} buckets)", set_disk_id, buckets.len())));
             progress.update_progress(0, 4, 0, 0);
         }
+
+        let buckets = if buckets.is_empty() {
+            info!("No buckets specified, listing all buckets");
+            let bucket_infos = self.storage.list_buckets().await?;
+            bucket_infos.into_iter().map(|info| info.name).collect()
+        } else {
+            buckets
+        };
 
         // Step 1: Perform disk format heal using ecstore
         info!("Step 1: Performing disk format heal using ecstore");

@@ -7966,8 +7966,14 @@ dependencies = [
 name = "rustfs-common"
 version = "0.0.5"
 dependencies = [
+ "async-trait",
  "chrono",
+ "path-clean",
+ "rmp-serde",
+ "rustfs-filemeta",
  "rustfs-madmin",
+ "s3s",
+ "serde",
  "tokio",
  "tonic",
  "uuid",

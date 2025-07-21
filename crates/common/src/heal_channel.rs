@@ -12,9 +12,108 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::OnceLock;
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt::{self, Display},
+    sync::OnceLock,
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+pub const HEAL_DELETE_DANGLING: bool = true;
+pub const RUSTFS_RESERVED_BUCKET: &str = "rustfs";
+pub const RUSTFS_RESERVED_BUCKET_PATH: &str = "/rustfs";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum HealItemType {
+    Metadata,
+    Bucket,
+    BucketMetadata,
+    Object,
+}
+
+impl HealItemType {
+    pub fn to_str(&self) -> &str {
+        match self {
+            HealItemType::Metadata => "metadata",
+            HealItemType::Bucket => "bucket",
+            HealItemType::BucketMetadata => "bucket-metadata",
+            HealItemType::Object => "object",
+        }
+    }
+}
+
+impl Display for HealItemType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum DriveState {
+    Ok,
+    Offline,
+    Corrupt,
+    Missing,
+    PermissionDenied,
+    Faulty,
+    RootMount,
+    Unknown,
+    Unformatted, // only returned by disk
+}
+
+impl DriveState {
+    pub fn to_str(&self) -> &str {
+        match self {
+            DriveState::Ok => "ok",
+            DriveState::Offline => "offline",
+            DriveState::Corrupt => "corrupt",
+            DriveState::Missing => "missing",
+            DriveState::PermissionDenied => "permission-denied",
+            DriveState::Faulty => "faulty",
+            DriveState::RootMount => "root-mount",
+            DriveState::Unknown => "unknown",
+            DriveState::Unformatted => "unformatted",
+        }
+    }
+}
+
+impl Display for DriveState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HealScanMode {
+    Unknown,
+    Normal,
+    Deep,
+}
+
+impl Default for HealScanMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct HealOpts {
+    pub recursive: bool,
+    #[serde(rename = "dryRun")]
+    pub dry_run: bool,
+    pub remove: bool,
+    pub recreate: bool,
+    #[serde(rename = "scanMode")]
+    pub scan_mode: HealScanMode,
+    #[serde(rename = "updateParity")]
+    pub update_parity: bool,
+    #[serde(rename = "nolock")]
+    pub no_lock: bool,
+    pub pool: Option<usize>,
+    pub set: Option<usize>,
+}
 
 /// Heal channel command type
 #[derive(Debug, Clone)]
@@ -32,6 +131,8 @@ pub enum HealChannelCommand {
 pub struct HealChannelRequest {
     /// Unique request ID
     pub id: String,
+    /// Disk ID for heal disk/erasure set task
+    pub disk: Option<String>,
     /// Bucket name
     pub bucket: String,
     /// Object prefix (optional)
@@ -45,7 +146,7 @@ pub struct HealChannelRequest {
     /// Set index (optional)
     pub set_index: Option<usize>,
     /// Scan mode (optional)
-    pub scan_mode: Option<HealChannelScanMode>,
+    pub scan_mode: Option<HealScanMode>,
     /// Whether to remove corrupted data
     pub remove_corrupted: Option<bool>,
     /// Whether to recreate missing data
@@ -164,6 +265,7 @@ pub fn create_heal_request(
         recursive: None,
         dry_run: None,
         timeout_seconds: None,
+        disk: None,
     }
 }
 
@@ -203,11 +305,123 @@ pub fn create_heal_response(
     }
 }
 
-/// Heal scan mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealChannelScanMode {
-    /// Normal scan
-    Normal,
-    /// Deep scan
-    Deep,
+fn lc_get_prefix(rule: &LifecycleRule) -> String {
+    if let Some(p) = &rule.prefix {
+        return p.to_string();
+    } else if let Some(filter) = &rule.filter {
+        if let Some(p) = &filter.prefix {
+            return p.to_string();
+        } else if let Some(and) = &filter.and {
+            if let Some(p) = &and.prefix {
+                return p.to_string();
+            }
+        }
+    }
+
+    "".into()
+}
+
+pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) -> bool {
+    if config.rules.is_empty() {
+        return false;
+    }
+
+    for rule in config.rules.iter() {
+        if rule.status == ExpirationStatus::from_static(ExpirationStatus::DISABLED) {
+            continue;
+        }
+        let rule_prefix = lc_get_prefix(rule);
+        if !prefix.is_empty() && !rule_prefix.is_empty() && !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix)
+        {
+            continue;
+        }
+
+        if let Some(e) = &rule.noncurrent_version_expiration {
+            if let Some(true) = e.noncurrent_days.map(|d| d > 0) {
+                return true;
+            }
+            if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {
+                return true;
+            }
+        }
+
+        if rule.noncurrent_version_transitions.is_some() {
+            return true;
+        }
+        if let Some(true) = rule.expiration.as_ref().map(|e| e.date.is_some()) {
+            return true;
+        }
+
+        if let Some(true) = rule.expiration.as_ref().map(|e| e.days.is_some()) {
+            return true;
+        }
+
+        if let Some(Some(true)) = rule.expiration.as_ref().map(|e| e.expired_object_delete_marker) {
+            return true;
+        }
+
+        if let Some(true) = rule.transitions.as_ref().map(|t| !t.is_empty()) {
+            return true;
+        }
+
+        if rule.transitions.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursive: bool) -> bool {
+    if config.rules.is_empty() {
+        return false;
+    }
+
+    for rule in config.rules.iter() {
+        if rule
+            .status
+            .eq(&ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED))
+        {
+            continue;
+        }
+        if !prefix.is_empty() {
+            if let Some(filter) = &rule.filter {
+                if let Some(r_prefix) = &filter.prefix {
+                    if !r_prefix.is_empty() {
+                        // incoming prefix must be in rule prefix
+                        if !recursive && !prefix.starts_with(r_prefix) {
+                            continue;
+                        }
+                        // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
+                        // does not match
+                        if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
+pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPriority>) -> Result<(), String> {
+    let req = HealChannelRequest {
+        id: Uuid::new_v4().to_string(),
+        bucket: "".to_string(),
+        object_prefix: None,
+        disk: Some(set_disk_id),
+        force_start: false,
+        priority: priority.unwrap_or_default(),
+        pool_index: None,
+        set_index: None,
+        scan_mode: None,
+        remove_corrupted: None,
+        recreate_missing: None,
+        update_parity: None,
+        recursive: None,
+        dry_run: None,
+        timeout_seconds: None,
+    };
+    send_heal_request(req).await
 }

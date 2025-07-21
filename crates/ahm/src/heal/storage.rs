@@ -14,9 +14,9 @@
 
 use crate::error::{Error, Result};
 use async_trait::async_trait;
+use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::{endpoint::Endpoint, DiskStore},
-    heal::heal_commands::{HealOpts, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
     store::ECStore,
     store_api::{BucketInfo, ObjectIO, StorageAPI},
 };
@@ -238,7 +238,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             dry_run: false,
             remove: false,
             recreate: true,
-            scan_mode: HEAL_DEEP_SCAN,
+            scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: false,
             pool: None,
@@ -322,7 +322,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             dry_run: false,
             remove: false,
             recreate: false,
-            scan_mode: HEAL_NORMAL_SCAN,
+            scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
             pool: None,

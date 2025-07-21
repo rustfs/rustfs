@@ -19,10 +19,8 @@ use crate::heal::{
     storage::HealStorageAPI,
 };
 use futures::future::join_all;
-use rustfs_ecstore::{
-    disk::DiskStore,
-    heal::heal_commands::{HealOpts, HEAL_NORMAL_SCAN},
-};
+use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_ecstore::disk::DiskStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -252,7 +250,7 @@ impl ErasureSetHealer {
 
             // heal object
             let heal_opts = HealOpts {
-                scan_mode: HEAL_NORMAL_SCAN,
+                scan_mode: HealScanMode::Normal,
                 remove: true,
                 recreate: true,
                 ..Default::default()
@@ -361,7 +359,7 @@ impl ErasureSetHealer {
 
         // 4. heal objects concurrently
         let heal_opts = HealOpts {
-            scan_mode: HEAL_NORMAL_SCAN,
+            scan_mode: HealScanMode::Normal,
             remove: true,   // remove corrupted data
             recreate: true, // recreate missing data
             ..Default::default()
