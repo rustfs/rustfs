@@ -2306,7 +2306,7 @@ impl SetDisks {
                     Some(filter_prefix.to_string())
                 }
             },
-            recursice: true,
+            recursive: true,
             forward_to: None,
             min_disks: 1,
             report_not_found: false,
@@ -3836,7 +3836,7 @@ impl SetDisks {
                     disks,
                     fallback_disks,
                     bucket: bucket.clone(),
-                    recursice: true,
+                    recursive: true,
                     forward_to,
                     min_disks: 1,
                     report_not_found: false,
