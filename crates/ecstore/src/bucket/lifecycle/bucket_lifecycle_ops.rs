@@ -22,6 +22,7 @@ use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
+use rustfs_common::metrics::{IlmAction, Metrics};
 use s3s::Body;
 use sha2::{Digest, Sha256};
 use std::any::Any;
@@ -41,7 +42,7 @@ use xxhash_rust::xxh64;
 //use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
 //use rustfs_notify::{initialize, notification_system};
 use super::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
-use super::lifecycle::{self, ExpirationOptions, IlmAction, Lifecycle, TransitionOptions};
+use super::lifecycle::{self, ExpirationOptions, Lifecycle, TransitionOptions};
 use super::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use super::tier_sweeper::{Jentry, delete_object_from_remote_tier};
 use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
@@ -54,7 +55,6 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::heal::{
     data_scanner::{apply_expiry_on_non_transitioned_objects, apply_expiry_on_transitioned_object},
-    data_scanner_metric::ScannerMetrics,
     data_usage_cache::TierStats,
 };
 use crate::store::ECStore;
@@ -631,7 +631,7 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     if !lc.is_none() {
         let event = lc.expect("err").eval(&oi.to_lifecycle_opts()).await;
         match event.action {
-            lifecycle::IlmAction::TransitionAction | lifecycle::IlmAction::TransitionVersionAction => {
+            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                 if oi.delete_marker || oi.is_dir {
                     return;
                 }
@@ -728,7 +728,7 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
 }
 
 pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
-    let time_ilm = ScannerMetrics::time_ilm(lae.event.action);
+    let time_ilm = Metrics::time_ilm(lae.event.action);
 
     let opts = ObjectOptions {
         transition: TransitionOptions {

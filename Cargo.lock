@@ -7930,6 +7930,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "lazy_static",
  "rmp-serde",
@@ -7965,6 +7966,8 @@ dependencies = [
 name = "rustfs-common"
 version = "0.0.5"
 dependencies = [
+ "chrono",
+ "rustfs-madmin",
  "tokio",
  "tonic",
  "uuid",

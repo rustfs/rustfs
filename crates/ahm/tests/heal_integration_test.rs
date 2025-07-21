@@ -318,13 +318,13 @@ async fn test_heal_format_with_data() {
 
     let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
     let target_part = WalkDir::new(&obj_dir)
-    .min_depth(2)
-    .max_depth(2)
-    .into_iter()
-    .filter_map(Result::ok)
-    .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-    .map(|e| e.into_path())
-    .expect("Failed to locate part file to delete");
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+        .map(|e| e.into_path())
+        .expect("Failed to locate part file to delete");
 
     // ─── 1️⃣ delete format.json on one disk ──────────────
     let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");

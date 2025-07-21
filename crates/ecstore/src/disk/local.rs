@@ -39,13 +39,13 @@ use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{
     ScannerItem, ShouldSleepFn, SizeSummary, lc_has_active_rules, rep_has_active_rules, scan_data_folder,
 };
-use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
 use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
 use crate::new_object_layer_fn;
 use crate::store_api::{ObjectInfo, StorageAPI};
+use rustfs_common::metrics::{Metric, Metrics};
 use rustfs_utils::path::{
     GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
     path_join, path_join_buf,
@@ -2323,9 +2323,9 @@ impl DiskAPI for LocalDisk {
                     if !item.path.ends_with(&format!("{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}")) {
                         return Err(Error::other(ERR_SKIP_FILE).into());
                     }
-                    let stop_fn = ScannerMetrics::log(ScannerMetric::ScanObject);
+                    let stop_fn = Metrics::log(Metric::ScanObject);
                     let mut res = HashMap::new();
-                    let done_sz = ScannerMetrics::time_size(ScannerMetric::ReadMetadata);
+                    let done_sz = Metrics::time_size(Metric::ReadMetadata);
                     let buf = match disk.read_metadata(item.path.clone()).await {
                         Ok(buf) => buf,
                         Err(err) => {
@@ -2351,7 +2351,7 @@ impl DiskAPI for LocalDisk {
                         }
                     };
                     let mut size_s = SizeSummary::default();
-                    let done = ScannerMetrics::time(ScannerMetric::ApplyAll);
+                    let done = Metrics::time(Metric::ApplyAll);
                     let obj_infos = match item.apply_versions_actions(&fivs.versions).await {
                         Ok(obj_infos) => obj_infos,
                         Err(err) => {
@@ -2369,7 +2369,7 @@ impl DiskAPI for LocalDisk {
 
                     let mut obj_deleted = false;
                     for info in obj_infos.iter() {
-                        let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
+                        let done = Metrics::time(Metric::ApplyVersion);
                         let sz: i64;
                         (obj_deleted, sz) = item.apply_actions(info, &mut size_s).await;
                         done();
@@ -2405,7 +2405,7 @@ impl DiskAPI for LocalDisk {
                             &item.object_path().to_string_lossy(),
                             versioned,
                         );
-                        let done = ScannerMetrics::time(ScannerMetric::TierObjSweep);
+                        let done = Metrics::time(Metric::TierObjSweep);
                         done();
                     }
 

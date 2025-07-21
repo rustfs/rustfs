@@ -31,3 +31,5 @@ workspace = true
 tokio.workspace = true
 tonic = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
+rustfs-madmin = { workspace = true }

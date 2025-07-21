@@ -29,7 +29,6 @@ use std::{
 use time::{self, OffsetDateTime};
 
 use super::{
-    data_scanner_metric::{ScannerMetric, ScannerMetrics, globalScannerMetrics},
     data_usage::{DATA_USAGE_BLOOM_NAME_PATH, DataUsageInfo, store_data_usage_in_backend},
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
     heal_commands::{HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN, HealScanMode},
@@ -39,6 +38,7 @@ use crate::bucket::{
     utils::is_meta_bucketname,
 };
 use crate::cmd::bucket_replication::queue_replication_heal;
+use crate::disk::local::LocalDisk;
 use crate::event::name::EventName;
 use crate::{
     bucket::{
@@ -57,7 +57,7 @@ use crate::{
     bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
     cmd::bucket_replication::ReplicationStatusType,
     disk,
-    heal::data_usage::DATA_USAGE_ROOT,
+    // heal::data_usage::DATA_USAGE_ROOT,
 };
 use crate::{
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
@@ -66,7 +66,7 @@ use crate::{
         heal::Config,
     },
     disk::{DiskInfoOptions, DiskStore},
-    global::{GLOBAL_BackgroundHealState, GLOBAL_IsErasure, GLOBAL_IsErasureSD},
+    global::{GLOBAL_BackgroundHealState, GLOBAL_IsErasureSD},
     heal::{
         data_usage::BACKGROUND_HEAL_INFO_PATH,
         data_usage_cache::{DataUsageHashMap, hash_path},
@@ -83,7 +83,6 @@ use crate::{
     disk::error::DiskError,
     error::{Error, Result},
 };
-use crate::{disk::local::LocalDisk, heal::data_scanner_metric::current_path_updater};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use rand::Rng;
@@ -300,14 +299,14 @@ async fn run_data_scanner_cycle() {
     };
 
     // Start metrics collection for this cycle
-    let stop_fn = ScannerMetrics::log(ScannerMetric::ScanCycle);
+    // let stop_fn = ScannerMetrics::log(ScannerMetric::ScanCycle);
 
     // Update cycle information
     cycle_info.current = cycle_info.next;
     cycle_info.started = Utc::now();
 
     // Update global scanner metrics
-    globalScannerMetrics.set_cycle(Some(cycle_info.clone())).await;
+    // globalScannerMetrics.set_cycle(Some(cycle_info.clone())).await;
 
     // Read background healing information and determine scan mode
     let bg_heal_info = read_background_heal_info(store.clone()).await;
@@ -357,7 +356,7 @@ async fn run_data_scanner_cycle() {
             }
 
             // Update global metrics with completion info
-            globalScannerMetrics.set_cycle(Some(cycle_info.clone())).await;
+            // globalScannerMetrics.set_cycle(Some(cycle_info.clone())).await;
 
             // Persist updated cycle information
             // ignore error, continue.
@@ -379,7 +378,7 @@ async fn run_data_scanner_cycle() {
     }
 
     // Complete metrics collection for this cycle
-    stop_fn(&scan_result);
+    // stop_fn(&scan_result);
 }
 
 /// Execute namespace scan with cancellation support
@@ -781,7 +780,7 @@ impl ScannerItem {
     }
 
     pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, i64) {
-        let done = ScannerMetrics::time(ScannerMetric::Ilm);
+        // let done = ScannerMetrics::time(ScannerMetric::Ilm);
 
         let (action, _size) = self.apply_lifecycle(oi).await;
 
@@ -807,7 +806,7 @@ impl ScannerItem {
             self.heal_replication(&oi, _size_s).await;
         }
 
-        done();
+        // done();
 
         if action.delete_all() {
             return (true, 0);
@@ -1572,68 +1571,69 @@ pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, rec
 
 pub type LocalDrive = Arc<LocalDisk>;
 pub async fn scan_data_folder(
-    disks: &[Option<DiskStore>],
-    drive: LocalDrive,
-    cache: &DataUsageCache,
-    get_size_fn: GetSizeFn,
-    heal_scan_mode: HealScanMode,
-    should_sleep: ShouldSleepFn,
+    _disks: &[Option<DiskStore>],
+    _drive: LocalDrive,
+    _cache: &DataUsageCache,
+    _get_size_fn: GetSizeFn,
+    _heal_scan_mode: HealScanMode,
+    _should_sleep: ShouldSleepFn,
 ) -> disk::error::Result<DataUsageCache> {
-    if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
-        return Err(DiskError::other("internal error: root scan attempted"));
-    }
+    // if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
+    //     return Err(DiskError::other("internal error: root scan attempted"));
+    // }
 
-    let base_path = drive.to_string();
-    let (update_path, close_disk) = current_path_updater(&base_path, &cache.info.name);
-    let skip_heal = if *GLOBAL_IsErasure.read().await || cache.info.skip_healing {
-        AtomicBool::new(true)
-    } else {
-        AtomicBool::new(false)
-    };
-    let mut s = FolderScanner {
-        root: base_path,
-        get_size: get_size_fn,
-        old_cache: cache.clone(),
-        new_cache: DataUsageCache {
-            info: cache.info.clone(),
-            ..Default::default()
-        },
-        update_cache: DataUsageCache {
-            info: cache.info.clone(),
-            ..Default::default()
-        },
-        data_usage_scanner_debug: false,
-        heal_object_select: 0,
-        scan_mode: heal_scan_mode,
-        updates: cache.info.updates.clone().unwrap(),
-        last_update: SystemTime::now(),
-        update_current_path: update_path,
-        disks: disks.to_vec(),
-        disks_quorum: disks.len() / 2,
-        skip_heal,
-        drive: drive.clone(),
-        we_sleep: should_sleep,
-    };
+    // let base_path = drive.to_string();
+    // // let (update_path, close_disk) = current_path_updater(&base_path, &cache.info.name);
+    // let skip_heal = if *GLOBAL_IsErasure.read().await || cache.info.skip_healing {
+    //     AtomicBool::new(true)
+    // } else {
+    //     AtomicBool::new(false)
+    // };
+    // let mut s = FolderScanner {
+    //     root: base_path,
+    //     get_size: get_size_fn,
+    //     old_cache: cache.clone(),
+    //     new_cache: DataUsageCache {
+    //         info: cache.info.clone(),
+    //         ..Default::default()
+    //     },
+    //     update_cache: DataUsageCache {
+    //         info: cache.info.clone(),
+    //         ..Default::default()
+    //     },
+    //     data_usage_scanner_debug: false,
+    //     heal_object_select: 0,
+    //     scan_mode: heal_scan_mode,
+    //     updates: cache.info.updates.clone().unwrap(),
+    //     last_update: SystemTime::now(),
+    //     update_current_path: update_path,
+    //     disks: disks.to_vec(),
+    //     disks_quorum: disks.len() / 2,
+    //     skip_heal,
+    //     drive: drive.clone(),
+    //     we_sleep: should_sleep,
+    // };
 
-    if *GLOBAL_IsErasure.read().await || !cache.info.skip_healing {
-        s.heal_object_select = HEAL_OBJECT_SELECT_PROB as u32;
-    }
+    // if *GLOBAL_IsErasure.read().await || !cache.info.skip_healing {
+    //     s.heal_object_select = HEAL_OBJECT_SELECT_PROB as u32;
+    // }
 
-    let mut root = DataUsageEntry::default();
-    let folder = CachedFolder {
-        name: cache.info.name.clone(),
-        object_heal_prob_div: 1,
-        parent: DataUsageHash("".to_string()),
-    };
+    // let mut root = DataUsageEntry::default();
+    // let folder = CachedFolder {
+    //     name: cache.info.name.clone(),
+    //     object_heal_prob_div: 1,
+    //     parent: DataUsageHash("".to_string()),
+    // };
 
-    if s.scan_folder(&folder, &mut root).await.is_err() {
-        close_disk().await;
-    }
-    s.new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN as usize);
-    s.new_cache.info.last_update = Some(SystemTime::now());
-    s.new_cache.info.next_cycle = cache.info.next_cycle;
-    close_disk().await;
-    Ok(s.new_cache)
+    // if s.scan_folder(&folder, &mut root).await.is_err() {
+    //     close_disk().await;
+    // }
+    // s.new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN as usize);
+    // s.new_cache.info.last_update = Some(SystemTime::now());
+    // s.new_cache.info.next_cycle = cache.info.next_cycle;
+    // close_disk().await;
+    // Ok(s.new_cache)
+    todo!()
 }
 
 pub async fn eval_action_from_lifecycle(
@@ -1695,11 +1695,11 @@ pub async fn apply_expiry_on_transitioned_object(
     lc_event: &lifecycle::Event,
     src: &LcEventSrc,
 ) -> bool {
-    let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
     if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src).await {
         return false;
     }
-    let _ = time_ilm(1);
+    // let _ = time_ilm(1);
 
     true
 }
@@ -1727,7 +1727,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         opts.delete_prefix_object = true;
     }
 
-    let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
 
     let mut dobj = api
         .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
@@ -1759,11 +1759,11 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     });
 
     if lc_event.action != lifecycle::IlmAction::NoneAction {
-        let mut num_versions = 1_u64;
-        if lc_event.action.delete_all() {
-            num_versions = oi.num_versions as u64;
-        }
-        let _ = time_ilm(num_versions);
+        // let mut num_versions = 1_u64;
+        // if lc_event.action.delete_all() {
+        //     num_versions = oi.num_versions as u64;
+        // }
+        // let _ = time_ilm(num_versions);
     }
 
     true

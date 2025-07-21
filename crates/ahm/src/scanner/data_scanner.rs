@@ -37,6 +37,7 @@ use crate::{
     error::{Error, Result},
     get_ahm_services_cancel_token, HealRequest,
 };
+use rustfs_common::metrics::{globalMetrics, Metric, Metrics};
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 
@@ -117,7 +118,7 @@ pub struct Scanner {
     config: Arc<RwLock<ScannerConfig>>,
     /// Scanner state
     state: Arc<RwLock<ScannerState>>,
-    /// Metrics collector
+    /// Local metrics collector (for backward compatibility)
     metrics: Arc<MetricsCollector>,
     /// Bucket metrics cache
     bucket_metrics: Arc<Mutex<HashMap<String, BucketMetrics>>>,
@@ -286,9 +287,17 @@ impl Scanner {
         metrics
     }
 
+    /// Get global metrics from common crate
+    pub async fn get_global_metrics(&self) -> rustfs_madmin::metrics::ScannerMetrics {
+        globalMetrics.report().await
+    }
+
     /// Perform a single scan cycle
     pub async fn scan_cycle(&self) -> Result<()> {
         let start_time = SystemTime::now();
+
+        // Start global metrics collection for this cycle
+        let stop_fn = Metrics::time(Metric::ScanCycle);
 
         info!("Starting scan cycle {} for all EC sets", self.metrics.get_metrics().current_cycle + 1);
 
@@ -300,6 +309,14 @@ impl Scanner {
             state.scanning_buckets.clear();
             state.scanning_disks.clear();
         }
+
+        // Update global metrics cycle information
+        let cycle_info = rustfs_common::metrics::CurrentCycle {
+            current: self.state.read().await.current_cycle,
+            cycle_completed: vec![chrono::Utc::now()],
+            started: chrono::Utc::now(),
+        };
+        globalMetrics.set_cycle(Some(cycle_info)).await;
 
         self.metrics.set_current_cycle(self.state.read().await.current_cycle);
         self.metrics.increment_total_cycles();
@@ -392,6 +409,9 @@ impl Scanner {
             state.current_scan_duration = Some(scan_duration);
         }
 
+        // Complete global metrics collection for this cycle
+        stop_fn();
+
         info!(
             "Completed scan cycle in {:?} ({} successful, {} failed)",
             scan_duration, successful_scans, failed_scans
@@ -474,6 +494,9 @@ impl Scanner {
     /// Scan a single disk
     async fn scan_disk(&self, disk: &DiskStore) -> Result<HashMap<String, HashMap<String, rustfs_filemeta::FileMeta>>> {
         let disk_path = disk.path().to_string_lossy().to_string();
+
+        // Start global metrics collection for disk scan
+        let stop_fn = Metrics::time(Metric::ScanBucketDrive);
 
         info!("Scanning disk: {}", disk_path);
 
@@ -638,6 +661,9 @@ impl Scanner {
             state.scanning_disks.retain(|d| d != &disk_path);
         }
 
+        // Complete global metrics collection for disk scan
+        stop_fn();
+
         Ok(disk_objects)
     }
 
@@ -646,6 +672,9 @@ impl Scanner {
     /// This method collects all objects from a disk for a specific bucket.
     /// It returns a map of object names to their metadata for later analysis.
     async fn scan_volume(&self, disk: &DiskStore, bucket: &str) -> Result<HashMap<String, rustfs_filemeta::FileMeta>> {
+        // Start global metrics collection for volume scan
+        let stop_fn = Metrics::time(Metric::ScanObject);
+
         info!("Scanning bucket: {} on disk: {}", bucket, disk.to_string());
 
         // Initialize bucket metrics if not exists
@@ -784,6 +813,9 @@ impl Scanner {
             let mut state = self.state.write().await;
             state.scanning_buckets.retain(|b| b != bucket);
         }
+
+        // Complete global metrics collection for volume scan
+        stop_fn();
 
         debug!(
             "Completed scanning bucket: {} on disk {} ({} objects, {} issues)",
