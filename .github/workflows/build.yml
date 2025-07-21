@@ -172,6 +172,14 @@ jobs:
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            platform: linux
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            platform: linux
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -181,15 +189,15 @@ jobs:
             target: x86_64-apple-darwin
             cross: false
             platform: macos
-          # # Windows builds (temporarily disabled)
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   cross: false
-          #   platform: windows
-          # - os: windows-latest
-          #   target: aarch64-pc-windows-msvc
-          #   cross: true
-          #   platform: windows
+          # Windows builds (temporarily disabled)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            platform: windows
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross: true
+            platform: windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
