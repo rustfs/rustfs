@@ -90,6 +90,18 @@ build-gnu:
 	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-dev' instead"
 	./build-rustfs.sh --platform x86_64-unknown-linux-gnu
 
+.PHONY: build-musl-arm64
+build-musl-arm64:
+	@echo "🔨 Building rustfs for aarch64-unknown-linux-musl..."
+	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-dev' instead"
+	./build-rustfs.sh --platform aarch64-unknown-linux-musl
+
+.PHONY: build-gnu-arm64
+build-gnu-arm64:
+	@echo "🔨 Building rustfs for aarch64-unknown-linux-gnu..."
+	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-dev' instead"
+	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
+
 .PHONY: deploy-dev
 deploy-dev: build-musl
 	@echo "🚀 Deploying to dev server: $${IP}"
@@ -248,10 +260,14 @@ build-cross-all:
 	@echo "💡 On macOS/Windows, use 'make docker-dev' for reliable multi-arch builds"
 	@echo "🔨 Generating protobuf code..."
 	cargo run --bin gproto || true
-	@echo "🔨 Building x86_64-unknown-linux-musl..."
-	./build-rustfs.sh --platform x86_64-unknown-linux-musl
+	@echo "🔨 Building x86_64-unknown-linux-gnu..."
+	./build-rustfs.sh --platform x86_64-unknown-linux-gnu
 	@echo "🔨 Building aarch64-unknown-linux-gnu..."
 	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
+	@echo "🔨 Building x86_64-unknown-linux-musl..."
+	./build-rustfs.sh --platform x86_64-unknown-linux-musl
+	@echo "🔨 Building aarch64-unknown-linux-musl..."
+	./build-rustfs.sh --platform aarch64-unknown-linux-musl
 	@echo "✅ All architectures built successfully!"
 
 # ========================================================================================
@@ -265,8 +281,10 @@ help-build:
 	@echo "🚀 本地构建 (推荐使用):"
 	@echo "  make build                               # 构建 RustFS 二进制文件 (默认包含 console)"
 	@echo "  make build-dev                           # 开发模式构建"
-	@echo "  make build-musl                          # 构建 musl 版本"
-	@echo "  make build-gnu                           # 构建 GNU 版本"
+	@echo "  make build-musl                          # 构建 x86_64 musl 版本"
+	@echo "  make build-gnu                           # 构建 x86_64 GNU 版本"
+	@echo "  make build-musl-arm64                    # 构建 aarch64 musl 版本"
+	@echo "  make build-gnu-arm64                     # 构建 aarch64 GNU 版本"
 	@echo ""
 	@echo "🐳 Docker 构建:"
 	@echo "  make build-docker                        # 使用 Docker 容器构建"
@@ -281,7 +299,7 @@ help-build:
 	@echo "  ./build-rustfs.sh --force-console-update # 强制更新 console 资源"
 	@echo "  ./build-rustfs.sh --dev                  # 开发模式构建"
 	@echo "  ./build-rustfs.sh --sign                 # 签名二进制文件"
-	@echo "  ./build-rustfs.sh --platform x86_64-unknown-linux-musl  # 指定目标平台"
+	@echo "  ./build-rustfs.sh --platform x86_64-unknown-linux-gnu   # 指定目标平台"
 	@echo "  ./build-rustfs.sh --skip-verification    # 跳过二进制验证"
 	@echo ""
 	@echo "💡 build-rustfs.sh 脚本提供了更多选项、智能检测和二进制验证功能"
