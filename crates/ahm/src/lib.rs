@@ -66,7 +66,7 @@ static GLOBAL_HEAL_CHANNEL_PROCESSOR: OnceLock<Arc<tokio::sync::Mutex<HealChanne
 pub async fn init_heal_manager(
     storage: Arc<dyn heal::storage::HealStorageAPI>,
     config: Option<heal::manager::HealConfig>,
-) -> Result<()> {
+) -> Result<Arc<HealManager>> {
     // Create heal manager
     let heal_manager = Arc::new(HealManager::new(storage, config));
 
@@ -82,7 +82,7 @@ pub async fn init_heal_manager(
     let channel_receiver = rustfs_common::heal_channel::init_heal_channel();
 
     // Create channel processor
-    let channel_processor = HealChannelProcessor::new(heal_manager);
+    let channel_processor = HealChannelProcessor::new(heal_manager.clone());
 
     // Store channel processor instance first
     GLOBAL_HEAL_CHANNEL_PROCESSOR
@@ -101,7 +101,7 @@ pub async fn init_heal_manager(
     });
 
     info!("Heal manager with channel processor initialized successfully");
-    Ok(())
+    Ok(heal_manager)
 }
 
 /// Get global heal manager instance
