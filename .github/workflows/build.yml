@@ -28,8 +28,8 @@ name: Build and Release
 
 on:
   push:
-    tags: [ "*.*.*" ]
-    branches: [ main ]
+    tags: ["*.*.*"]
+    branches: [main]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -45,7 +45,7 @@ on:
       - ".gitignore"
       - ".dockerignore"
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -153,7 +153,7 @@ jobs:
   # Build RustFS binaries
   build-rustfs:
     name: Build RustFS
-    needs: [ build-check ]
+    needs: [build-check]
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -172,14 +172,14 @@ jobs:
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
-          #- os: ubuntu-latest
-          #  target: x86_64-unknown-linux-gnu
-          #  cross: false
-          #  platform: linux
-          #- os: ubuntu-latest
-          #  target: aarch64-unknown-linux-gnu
-          #  cross: true
-          #  platform: linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            platform: linux
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            platform: linux
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -270,30 +270,55 @@ jobs:
           # Extract platform and arch from target
           TARGET="${{ matrix.target }}"
           PLATFORM="${{ matrix.platform }}"
-
-          # Map target to architecture
+          # Map target to architecture and variant
           case "$TARGET" in
+            *x86_64*musl*)
+              ARCH="x86_64"
+              VARIANT="musl"
+              ;;
+            *x86_64*gnu*)
+              ARCH="x86_64"
+              VARIANT="gnu"
+              ;;
             *x86_64*)
               ARCH="x86_64"
+              VARIANT=""
+              ;;
+            *aarch64*musl*|*arm64*musl*)
+              ARCH="aarch64"
+              VARIANT="musl"
+              ;;
+            *aarch64*gnu*|*arm64*gnu*)
+              ARCH="aarch64"
+              VARIANT="gnu"
               ;;
             *aarch64*|*arm64*)
               ARCH="aarch64"
+              VARIANT=""
               ;;
             *armv7*)
               ARCH="armv7"
+              VARIANT=""
               ;;
             *)
               ARCH="unknown"
+              VARIANT=""
               ;;
           esac
 
           # Generate package name based on build type
-          if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development build: rustfs-${platform}-${arch}-dev-${short_sha}.zip
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-dev-${SHORT_SHA}"
+          if [[ -n "$VARIANT" ]]; then
+            ARCH_WITH_VARIANT="${ARCH}-${VARIANT}"
           else
-            # Release/Prerelease build: rustfs-${platform}-${arch}-v${version}.zip
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${VERSION}"
+            ARCH_WITH_VARIANT="${ARCH}"
+          fi
+
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development build: rustfs-${platform}-${arch}-${variant}-dev-${short_sha}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-dev-${SHORT_SHA}"
+          else
+            # Release/Prerelease build: rustfs-${platform}-${arch}-${variant}-v${version}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-v${VERSION}"
           fi
 
           # Create zip packages for all platforms
@@ -303,7 +328,7 @@ jobs:
               sudo apt-get update && sudo apt-get install -y zip
             fi
           fi
-          
+
           cd target/${{ matrix.target }}/release
           # Determine the binary name based on platform
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
@@ -311,7 +336,7 @@ jobs:
           else
             BINARY_NAME="rustfs"
           fi
-          
+
           # Verify the binary exists before packaging
           if [[ ! -f "$BINARY_NAME" ]]; then
             echo "❌ Binary $BINARY_NAME not found in $(pwd)"
@@ -322,24 +347,29 @@ jobs:
             fi
             exit 1
           fi
-          
-          # 通用打包函数
+
+          # Universal packaging function
           package_zip() {
             local src=$1
             local dst=$2
-            if command -v zip &> /dev/null; then
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Windows uses PowerShell Compress-Archive
+              powershell -Command "Compress-Archive -Path '$src' -DestinationPath '$dst' -Force"
+            elif command -v zip &> /dev/null; then
+              # Unix systems use zip command
               zip "$dst" "$src"
             else
-              powershell -Command "Compress-Archive -Path $src -DestinationPath $dst"
+              echo "❌ No zip utility available"
+              exit 1
             fi
           }
-          
+
           # Create the zip package
           echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
           package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
-          
+
           cd ../../..
-          
+
           # Verify the package was created
           if [[ -f "${PACKAGE_NAME}.zip" ]]; then
             echo "✅ Package created successfully: ${PACKAGE_NAME}.zip"
@@ -415,6 +445,16 @@ jobs:
               chmod +x /usr/local/bin/ossutil
               OSSUTIL_BIN=ossutil
               ;;
+            windows)
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              OSSUTIL_BIN=./ossutil.exe
+              ;;
           esac
 
           # Determine upload path based on build type
@@ -484,7 +524,8 @@ jobs:
 
               # Also create a generic main-latest for Docker builds
               if [[ "${{ matrix.platform }}" == "linux" ]]; then
-                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64' || 'aarch64' }}-main-latest.zip"
+                # Use the same ARCH_WITH_VARIANT logic for Docker files
+                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${ARCH_WITH_VARIANT}-main-latest.zip"
 
                 cp "${{ steps.package.outputs.package_file }}" "$DOCKER_MAIN_LATEST_FILE"
                 $OSSUTIL_BIN cp "$DOCKER_MAIN_LATEST_FILE" "$OSS_PATH" --force
@@ -498,7 +539,7 @@ jobs:
   # Build summary
   build-summary:
     name: Build Summary
-    needs: [ build-check, build-rustfs ]
+    needs: [build-check, build-rustfs]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -550,7 +591,7 @@ jobs:
   # Create GitHub Release (only for tag pushes)
   create-release:
     name: Create GitHub Release
-    needs: [ build-check, build-rustfs ]
+    needs: [build-check, build-rustfs]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
@@ -636,7 +677,7 @@ jobs:
   # Prepare and upload release assets
   upload-release-assets:
     name: Upload Release Assets
-    needs: [ build-check, build-rustfs, create-release ]
+    needs: [build-check, build-rustfs, create-release]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
@@ -717,7 +758,7 @@ jobs:
   # Update latest.json for stable releases only
   update-latest-version:
     name: Update Latest Version
-    needs: [ build-check, upload-release-assets ]
+    needs: [build-check, upload-release-assets]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -767,7 +808,7 @@ jobs:
   # Publish release (remove draft status)
   publish-release:
     name: Publish Release
-    needs: [ build-check, create-release, upload-release-assets ]
+    needs: [build-check, create-release, upload-release-assets]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
