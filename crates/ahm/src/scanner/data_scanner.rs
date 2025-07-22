@@ -429,8 +429,15 @@ impl Scanner {
 
         info!("Scanning EC set {} in pool {}", set_index, pool_index);
 
+        // list all bucket for heal bucket
+
         // Get online disks from this EC set
         let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
+
+        // Check volume consistency across disks and heal missing buckets
+        if !disks.is_empty() {
+            self.check_and_heal_missing_volumes(&disks, set_index, pool_index).await?;
+        }
 
         if disks.is_empty() {
             warn!("No online disks available for EC set {} in pool {}", set_index, pool_index);
@@ -1196,6 +1203,91 @@ impl Scanner {
         Ok(())
     }
 
+    /// Check volume consistency across disks and heal missing buckets
+    async fn check_and_heal_missing_volumes(&self, disks: &[DiskStore], set_index: usize, pool_index: usize) -> Result<()> {
+        info!("Checking volume consistency for EC set {} in pool {}", set_index, pool_index);
+
+        // Step 1: Collect bucket lists from all online disks
+        let mut disk_bucket_lists = Vec::new();
+        let mut all_buckets = std::collections::HashSet::new();
+
+        for (disk_idx, disk) in disks.iter().enumerate() {
+            match disk.list_volumes().await {
+                Ok(volumes) => {
+                    let bucket_names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
+                    for bucket in &bucket_names {
+                        all_buckets.insert(bucket.clone());
+                    }
+                    disk_bucket_lists.push((disk_idx, bucket_names));
+                    debug!("Disk {} has {} buckets", disk_idx, volumes.len());
+                }
+                Err(e) => {
+                    warn!("Failed to list volumes on disk {}: {}", disk_idx, e);
+                    disk_bucket_lists.push((disk_idx, Vec::new()));
+                }
+            }
+        }
+
+        // Step 2: Find missing buckets on each disk
+        let mut missing_buckets_count = 0;
+        for (disk_idx, disk_buckets) in &disk_bucket_lists {
+            let disk_bucket_set: std::collections::HashSet<_> = disk_buckets.iter().collect();
+            let missing_buckets: Vec<_> = all_buckets
+                .iter()
+                .filter(|bucket| !disk_bucket_set.contains(bucket))
+                .collect();
+
+            if !missing_buckets.is_empty() {
+                missing_buckets_count += missing_buckets.len();
+                warn!("Disk {} is missing {} buckets: {:?}", disk_idx, missing_buckets.len(), missing_buckets);
+
+                // Step 3: Submit heal tasks for missing buckets
+                let enable_healing = self.config.read().await.enable_healing;
+                if enable_healing {
+                    if let Some(heal_manager) = &self.heal_manager {
+                        for bucket in missing_buckets {
+                            let req = crate::heal::HealRequest::bucket(bucket.clone());
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    info!(
+                                        "Submitted bucket heal task {} for missing bucket '{}' on disk {}",
+                                        task_id, bucket, disk_idx
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("Failed to submit bucket heal task for '{}' on disk {}: {}", bucket, disk_idx, e);
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("Healing is enabled but no heal manager available");
+                    }
+                } else {
+                    info!("Healing is disabled, skipping bucket heal tasks");
+                }
+            }
+        }
+
+        if missing_buckets_count > 0 {
+            warn!(
+                "Found {} missing bucket instances across {} disks in EC set {} (pool {})",
+                missing_buckets_count,
+                disks.len(),
+                set_index,
+                pool_index
+            );
+        } else {
+            info!(
+                "All buckets are consistent across {} disks in EC set {} (pool {})",
+                disks.len(),
+                set_index,
+                pool_index
+            );
+        }
+
+        Ok(())
+    }
+
     /// Clone scanner for background tasks
     fn clone_for_background(&self) -> Self {
         Self {
@@ -1459,5 +1551,67 @@ mod tests {
 
         // clean up temp dir
         let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_USAGE_STATS));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_volume_healing_functionality() {
+        const TEST_DIR_VOLUME_HEAL: &str = "/tmp/rustfs_ahm_test_volume_heal";
+        let (disk_paths, ecstore) = prepare_test_env(Some(TEST_DIR_VOLUME_HEAL), Some(9003)).await;
+
+        // Create test buckets
+        let bucket1 = "test-bucket-1";
+        let bucket2 = "test-bucket-2";
+
+        ecstore.make_bucket(bucket1, &Default::default()).await.unwrap();
+        ecstore.make_bucket(bucket2, &Default::default()).await.unwrap();
+
+        // Add some test objects
+        let mut pr1 = PutObjReader::from_vec(b"test data 1".to_vec());
+        ecstore
+            .put_object(bucket1, "obj1", &mut pr1, &Default::default())
+            .await
+            .unwrap();
+
+        let mut pr2 = PutObjReader::from_vec(b"test data 2".to_vec());
+        ecstore
+            .put_object(bucket2, "obj2", &mut pr2, &Default::default())
+            .await
+            .unwrap();
+
+        // Simulate missing bucket on one disk by removing bucket directory
+        let disk1_bucket1_path = disk_paths[0].join(bucket1);
+        if disk1_bucket1_path.exists() {
+            println!("Removing bucket directory to simulate missing volume: {disk1_bucket1_path:?}");
+            match fs::remove_dir_all(&disk1_bucket1_path) {
+                Ok(_) => println!("Successfully removed bucket directory from disk 0"),
+                Err(e) => println!("Failed to remove bucket directory: {e}"),
+            }
+        }
+
+        // Create scanner without heal manager for now (testing the detection logic)
+        let scanner = Scanner::new(None, None);
+
+        // Enable healing in config
+        {
+            let mut config = scanner.config.write().await;
+            config.enable_healing = true;
+        }
+
+        println!("=== Testing volume healing functionality ===");
+
+        // Run scan cycle which should detect missing volume
+        // The new check_and_heal_missing_volumes function should be called
+        let scan_result = scanner.scan_cycle().await;
+        assert!(scan_result.is_ok(), "Scan cycle should succeed");
+
+        // Get metrics to verify scan completed
+        let metrics = scanner.get_metrics().await;
+        assert!(metrics.total_cycles > 0, "Should have completed scan cycles");
+        println!("Volume healing detection test completed successfully");
+        println!("Scan metrics: {metrics:?}");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_VOLUME_HEAL));
     }
 }
