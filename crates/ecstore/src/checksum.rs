@@ -20,7 +20,7 @@
 #![allow(clippy::all)]
 
 use lazy_static::lazy_static;
-use rustfs_utils::HashAlgorithm;
+use rustfs_checksums::ChecksumAlgorithm;
 use std::collections::HashMap;
 
 use crate::client::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
@@ -123,33 +123,35 @@ impl ChecksumMode {
         if u == ChecksumMode::ChecksumCRC32 as u8 || u == ChecksumMode::ChecksumCRC32C as u8 {
             4
         } else if u == ChecksumMode::ChecksumSHA1 as u8 {
-            4 //sha1.size
+            use sha1::Digest;
+            sha1::Sha1::output_size() as usize
         } else if u == ChecksumMode::ChecksumSHA256 as u8 {
-            4 //sha256.size
+            use sha2::Digest;
+            sha2::Sha256::output_size() as usize
         } else if u == ChecksumMode::ChecksumCRC64NVME as u8 {
-            4 //crc64.size
+            8
         } else {
             0
         }
     }
 
-    pub fn hasher(&self) -> Result<HashAlgorithm, std::io::Error> {
+    pub fn hasher(&self) -> Result<Box<dyn rustfs_checksums::http::HttpChecksum>, std::io::Error> {
         match /*C_ChecksumMask & **/self {
-            /*ChecksumMode::ChecksumCRC32 => {
-                return Ok(Box::new(crc32fast::Hasher::new()));
-            }*/
-            /*ChecksumMode::ChecksumCRC32C => {
-                return Ok(Box::new(crc32::new(crc32.MakeTable(crc32.Castagnoli))));
+            ChecksumMode::ChecksumCRC32 => {
+                return Ok(ChecksumAlgorithm::Crc32.into_impl());
+            }
+            ChecksumMode::ChecksumCRC32C => {
+                return Ok(ChecksumAlgorithm::Crc32c.into_impl());
             }
             ChecksumMode::ChecksumSHA1 => {
-                return Ok(Box::new(sha1::new()));
-            }*/
-            ChecksumMode::ChecksumSHA256 => {
-                return Ok(HashAlgorithm::SHA256);
+                return Ok(ChecksumAlgorithm::Sha1.into_impl());
             }
-            /*ChecksumMode::ChecksumCRC64NVME => {
-                return Ok(Box::new(crc64nvme.New());
-            }*/
+            ChecksumMode::ChecksumSHA256 => {
+                return Ok(ChecksumAlgorithm::Sha256.into_impl());
+            }
+            ChecksumMode::ChecksumCRC64NVME => {
+                return Ok(ChecksumAlgorithm::Crc64Nvme.into_impl());
+            }
             _ => return Err(std::io::Error::other("unsupported checksum type")),
         }
     }
@@ -170,7 +172,8 @@ impl ChecksumMode {
             return Ok("".to_string());
         }
         let mut h = self.hasher()?;
-        let hash = h.hash_encode(b);
+        h.update(b);
+        let hash = h.finalize();
         Ok(base64_encode(hash.as_ref()))
     }
 
@@ -227,7 +230,8 @@ impl ChecksumMode {
         let c = self.base();
         let crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
         let mut h = self.hasher()?;
-        let hash = h.hash_encode(crc_bytes.as_ref());
+        h.update(crc_bytes.as_ref());
+        let hash = h.finalize();
         Ok(Checksum {
             checksum_type: self.clone(),
             r: hash.as_ref().to_vec(),

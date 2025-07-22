@@ -156,7 +156,8 @@ impl TransitionClient {
                 md5_base64 = base64_encode(hash.as_ref());
             } else {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
@@ -303,7 +304,8 @@ impl TransitionClient {
             let mut custom_header = HeaderMap::new();
             if !opts.send_content_md5 {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));

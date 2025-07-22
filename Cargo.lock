@@ -2887,6 +2887,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7025,6 +7031,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+dependencies = [
+ "diff",
+ "yansi",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7955,6 +7971,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-checksums"
+version = "0.0.5"
+dependencies = [
+ "base64-simd",
+ "bytes",
+ "bytes-utils",
+ "crc-fast",
+ "hex",
+ "http 1.3.1",
+ "http-body 1.0.1",
+ "md-5",
+ "pin-project-lite",
+ "pretty_assertions",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "tracing-test",
+]
+
+[[package]]
 name = "rustfs-common"
 version = "0.0.5"
 dependencies = [
@@ -8021,13 +8058,14 @@ dependencies = [
  "path-absolutize",
  "path-clean",
  "pin-project-lite",
- "quick-xml",
+ "quick-xml 0.38.0",
  "rand 0.9.1",
  "reed-solomon-simd",
  "regex",
  "reqwest",
  "rmp",
  "rmp-serde",
+ "rustfs-checksums",
  "rustfs-common",
  "rustfs-config",
  "rustfs-filemeta",
@@ -8044,6 +8082,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "shadow-rs",
  "smallvec",
@@ -10285,6 +10324,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-test"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "557b891436fe0d5e0e363427fc7f217abf9ccd510d5136549847bdcbcd011d68"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracing-test-macro",
+]
+
+[[package]]
+name = "tracing-test-macro"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
+dependencies = [
+ "quote",
+ "syn 2.0.104",
+]
+
+[[package]]
 name = "tracing-wasm"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11622,6 +11682,12 @@ checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
 dependencies = [
  "lzma-sys",
 ]
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

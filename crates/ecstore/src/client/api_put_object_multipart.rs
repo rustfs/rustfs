@@ -18,20 +18,15 @@
 #![allow(clippy::all)]
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderName, StatusCode};
 use s3s::S3ErrorCode;
-use std::io::Read;
-use std::{collections::HashMap, sync::Arc};
-use time::{OffsetDateTime, format_description};
-use tokio_util::sync::CancellationToken;
+use std::collections::HashMap;
+use time::OffsetDateTime;
 use tracing::warn;
-use tracing::{error, info};
-use url::form_urlencoded::Serializer;
 use uuid::Uuid;
 
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 use s3s::{Body, dto::StreamingBlob};
-//use crate::disk::{Reader, BufferReader};
 use crate::client::{
     api_error_response::{
         err_entity_too_large, err_entity_too_small, err_invalid_argument, http_resp_to_error_response, to_error_response,
@@ -132,7 +127,8 @@ impl TransitionClient {
             //}
             if hash_sums.len() == 0 {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
