@@ -49,7 +49,8 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
     let mut count = 0usize;
     for c in path_name.chars() {
         match c {
-            '/' | '\\' if cfg!(target_os = "windows") => count = 0, // Reset
+            '/' => count = 0,
+            '\\' if cfg!(target_os = "windows") => count = 0, // Reset
             _ => {
                 count += 1;
                 if count > 255 {
