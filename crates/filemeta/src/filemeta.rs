@@ -1523,8 +1523,7 @@ impl MetaObject {
     }
 
     pub fn uses_data_dir(&self) -> bool {
-        // TODO: when use inlinedata
-        true
+        !self.inlinedata()
     }
 
     pub fn inlinedata(&self) -> bool {
