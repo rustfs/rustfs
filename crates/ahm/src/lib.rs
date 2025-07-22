@@ -63,7 +63,7 @@ static GLOBAL_HEAL_MANAGER: OnceLock<Arc<HealManager>> = OnceLock::new();
 static GLOBAL_HEAL_CHANNEL_PROCESSOR: OnceLock<Arc<tokio::sync::Mutex<HealChannelProcessor>>> = OnceLock::new();
 
 /// Initialize and start heal manager with channel processor
-pub async fn init_heal_manager_with_channel(
+pub async fn init_heal_manager(
     storage: Arc<dyn heal::storage::HealStorageAPI>,
     config: Option<heal::manager::HealConfig>,
 ) -> Result<()> {

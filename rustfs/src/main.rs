@@ -30,7 +30,7 @@ use clap::Parser;
 use license::init_license;
 use rustfs_ahm::scanner::data_scanner::ScannerConfig;
 use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager_with_channel,
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
     shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
@@ -191,7 +191,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize heal manager with channel processor
     let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-    init_heal_manager_with_channel(heal_storage, None).await?;
+    init_heal_manager(heal_storage, None).await?;
 
     let scanner = Scanner::new(Some(ScannerConfig::default()), None);
     scanner.start().await?;
