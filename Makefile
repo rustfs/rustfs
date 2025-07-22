@@ -23,7 +23,7 @@ fmt-check:
 .PHONY: clippy
 clippy:
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
 
 .PHONY: check
 check:
