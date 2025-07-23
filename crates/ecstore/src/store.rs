@@ -2235,6 +2235,13 @@ impl StorageAPI for ECStore {
 
         Ok(())
     }
+
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let mut get_object_reader =
+            <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let _ = get_object_reader.read_all().await?;
+        Ok(())
+    }
 }
 
 async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, port: &String) {

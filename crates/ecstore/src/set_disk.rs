@@ -5950,6 +5950,14 @@ impl StorageAPI for SetDisks {
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let mut get_object_reader =
+            <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let _ = get_object_reader.read_all().await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

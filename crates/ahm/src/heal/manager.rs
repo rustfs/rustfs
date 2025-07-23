@@ -188,6 +188,10 @@ impl HealManager {
     }
 
     /// Get task progress
+    pub async fn get_active_tasks_count(&self) -> usize {
+        self.active_heals.lock().await.len()
+    }
+
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
         let active_heals = self.active_heals.lock().await;
         if let Some(task) = active_heals.get(task_id) {

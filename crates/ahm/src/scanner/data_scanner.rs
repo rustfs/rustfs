@@ -2114,13 +2114,17 @@ mod tests {
         if final_heal_stats.successful_tasks > 0 {
             println!("Healing completed successfully, checking file recovery...");
             if recovered_files > 0 {
-                println!("Successfully recovered {}/{} deleted xl.meta files", recovered_files, deleted_meta_paths.len());
+                println!(
+                    "Successfully recovered {}/{} deleted xl.meta files",
+                    recovered_files,
+                    deleted_meta_paths.len()
+                );
             } else {
                 println!("No xl.meta files recovered yet - healing may have recreated metadata elsewhere");
             }
         } else {
             println!("No successful heal tasks completed yet - healing may still be in progress or failed");
-            
+
             // If healing failed, this is acceptable for this test scenario
             // The important thing is that the scanner detected the issue and submitted heal tasks
             if final_heal_stats.failed_tasks > 0 {
@@ -2140,7 +2144,11 @@ mod tests {
         println!("  - Scanner submitted {} heal tasks", final_heal_stats.total_tasks);
         println!("  - Scanner handled the situation gracefully");
         if recovered_files > 0 {
-            println!("  - Successfully recovered {}/{} xl.meta files", recovered_files, deleted_meta_paths.len());
+            println!(
+                "  - Successfully recovered {}/{} xl.meta files",
+                recovered_files,
+                deleted_meta_paths.len()
+            );
         } else {
             println!("  - Note: xl.meta file recovery may require additional time or manual intervention");
         }

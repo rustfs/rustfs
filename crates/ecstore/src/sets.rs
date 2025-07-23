@@ -875,6 +875,13 @@ impl StorageAPI for Sets {
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .verify_object_integrity(bucket, object, opts)
+            .await
+    }
 }
 
 async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
