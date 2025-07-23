@@ -494,7 +494,7 @@ impl Scanner {
             let object_info = match ecstore.get_object_info(bucket, object, &Default::default()).await {
                 Ok(info) => info,
                 Err(e) => {
-                    return Err(Error::Other(format!("Failed to get object info: {}", e)));
+                    return Err(Error::Other(format!("Failed to get object info: {e}")));
                 }
             };
 
@@ -611,7 +611,7 @@ impl Scanner {
             );
 
             if has_missing_parts {
-                return Err(Error::Other(format!("Object has missing or corrupt data parts: {}/{}", bucket, object)));
+                return Err(Error::Other(format!("Object has missing or corrupt data parts: {bucket}/{object}")));
             }
         }
 
@@ -1789,12 +1789,12 @@ mod tests {
                         if part_file_path.exists() {
                             match fs::remove_file(&part_file_path) {
                                 Ok(_) => {
-                                    println!("Deleted part file: {:?}", part_file_path);
+                                    println!("Deleted part file: {part_file_path:?}");
                                     deleted_part_paths.push(part_file_path); // Store path for verification
                                     deleted_parts += 1;
                                 }
                                 Err(e) => {
-                                    println!("Failed to delete part file {:?}: {}", part_file_path, e);
+                                    println!("Failed to delete part file {part_file_path:?}: {e}");
                                 }
                             }
                         }
@@ -1803,7 +1803,7 @@ mod tests {
             }
         }
 
-        println!("Deleted {} part files to simulate data loss", deleted_parts);
+        println!("Deleted {deleted_parts} part files to simulate data loss");
         assert!(deleted_parts > 0, "Should have deleted some part files");
 
         // Scan again to detect missing parts
@@ -1816,7 +1816,7 @@ mod tests {
         // Add debug information
         println!("=== Debug: Checking heal manager state ===");
         let tasks_count = heal_manager.get_active_tasks_count().await;
-        println!("Active heal tasks count: {}", tasks_count);
+        println!("Active heal tasks count: {tasks_count}");
 
         // Check heal statistics to see if any tasks were submitted
         let heal_stats = heal_manager.get_statistics().await;
@@ -1839,7 +1839,7 @@ mod tests {
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
             match ecstore.verify_object_integrity(bucket_name, object_name, &object_opts).await {
                 Ok(_) => println!("Manual verification: Object is healthy"),
-                Err(e) => println!("Manual verification: Object verification failed: {}", e),
+                Err(e) => println!("Manual verification: Object verification failed: {e}"),
             }
         }
 
@@ -1853,7 +1853,7 @@ mod tests {
                 println!("Scanner completed successfully despite missing data");
             }
             Err(e) => {
-                println!("Scanner detected errors (expected): {}", e);
+                println!("Scanner detected errors (expected): {e}");
                 // This is acceptable - scanner may report errors when data is missing
             }
         }
@@ -1876,7 +1876,7 @@ mod tests {
                 // EC should allow recovery if enough shards remain
             }
             Err(e) => {
-                println!("Object not accessible due to missing data: {}", e);
+                println!("Object not accessible due to missing data: {e}");
                 // This is expected if too many shards are missing
             }
         }
@@ -1889,7 +1889,7 @@ mod tests {
         let mut recovered_files = 0;
         for deleted_path in &deleted_part_paths {
             assert!(deleted_path.exists(), "Deleted file should have been recovered");
-            println!("Recovered file: {:?}", deleted_path);
+            println!("Recovered file: {deleted_path:?}");
             recovered_files += 1;
         }
 
@@ -1993,18 +1993,18 @@ mod tests {
             if xl_meta_path.exists() {
                 match fs::remove_file(&xl_meta_path) {
                     Ok(_) => {
-                        println!("Deleted xl.meta file: {:?}", xl_meta_path);
+                        println!("Deleted xl.meta file: {xl_meta_path:?}");
                         deleted_meta_paths.push(xl_meta_path);
                         deleted_meta_files += 1;
                     }
                     Err(e) => {
-                        println!("Failed to delete xl.meta file {:?}: {}", xl_meta_path, e);
+                        println!("Failed to delete xl.meta file {xl_meta_path:?}: {e}");
                     }
                 }
             }
         }
 
-        println!("Deleted {} xl.meta files to simulate metadata loss", deleted_meta_files);
+        println!("Deleted {deleted_meta_files} xl.meta files to simulate metadata loss");
         assert!(deleted_meta_files > 0, "Should have deleted some xl.meta files");
 
         // Scan again to detect missing metadata
@@ -2017,7 +2017,7 @@ mod tests {
         // Add debug information
         println!("=== Debug: Checking heal manager state ===");
         let tasks_count = heal_manager.get_active_tasks_count().await;
-        println!("Active heal tasks count: {}", tasks_count);
+        println!("Active heal tasks count: {tasks_count}");
 
         // Check heal statistics to see if any tasks were submitted
         let heal_stats = heal_manager.get_statistics().await;
@@ -2040,7 +2040,7 @@ mod tests {
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
             match ecstore.verify_object_integrity(bucket_name, object_name, &object_opts).await {
                 Ok(_) => println!("Manual verification: Object is healthy"),
-                Err(e) => println!("Manual verification: Object verification failed: {}", e),
+                Err(e) => println!("Manual verification: Object verification failed: {e}"),
             }
         }
 
@@ -2054,7 +2054,7 @@ mod tests {
                 println!("Scanner completed successfully despite missing metadata");
             }
             Err(e) => {
-                println!("Scanner detected errors (expected): {}", e);
+                println!("Scanner detected errors (expected): {e}");
                 // This is acceptable - scanner may report errors when metadata is missing
             }
         }
@@ -2077,7 +2077,7 @@ mod tests {
                 // Object should still be accessible if enough metadata copies remain
             }
             Err(e) => {
-                println!("Object not accessible due to missing metadata: {}", e);
+                println!("Object not accessible due to missing metadata: {e}");
                 // This might happen if too many metadata files are missing
             }
         }
@@ -2096,12 +2096,9 @@ mod tests {
         println!("=== Verifying xl.meta file recovery ===");
         let mut recovered_files = 0;
         for deleted_path in &deleted_meta_paths {
-            if deleted_path.exists() {
-                println!("Recovered xl.meta file: {:?}", deleted_path);
-                recovered_files += 1;
-            } else {
-                println!("xl.meta file still missing: {:?}", deleted_path);
-            }
+            assert!(deleted_path.exists(), "Deleted xl.meta file should exist after healing");
+            recovered_files += 1;
+            println!("Recovered xl.meta file: {deleted_path:?}");
         }
 
         // Assert that healing was attempted
