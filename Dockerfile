@@ -13,12 +13,18 @@ RUN apk add --no-cache ca-certificates curl unzip
 # Create build directory
 WORKDIR /build
 
-# Detect architecture and download corresponding binary
-RUN case "${TARGETARCH}" in \
-        amd64) ARCH="x86_64" ;; \
-        arm64) ARCH="aarch64" ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" >&2 && exit 1 ;; \
-    esac && \
+# Set architecture-specific variables
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        echo "x86_64-gnu" > /tmp/arch; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        echo "aarch64-gnu" > /tmp/arch; \
+    else \
+        echo "unsupported" > /tmp/arch; \
+    fi
+RUN ARCH=$(cat /tmp/arch) && \
+    if [ "$ARCH" = "unsupported" ]; then \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi && \
     if [ "${RELEASE}" = "latest" ]; then \
         VERSION="latest"; \
     else \
