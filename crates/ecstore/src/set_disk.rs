@@ -83,7 +83,7 @@ use rustfs_filemeta::{
     headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     merge_file_meta_versions,
 };
-use rustfs_lock::{NamespaceLockManager, NsLockMap};
+use rustfs_lock::NamespaceLockManager;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
@@ -123,9 +123,8 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
-    pub lockers: Vec<Arc<rustfs_lock::NamespaceLock>>,
+    pub namespace_lock: Arc<rustfs_lock::NamespaceLock>,
     pub locker_owner: String,
-    pub ns_mutex: Arc<NsLockMap>,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
     pub set_endpoints: Vec<Endpoint>,
     pub set_drive_count: usize,
@@ -138,9 +137,8 @@ pub struct SetDisks {
 impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        lockers: Vec<Arc<rustfs_lock::NamespaceLock>>,
+        namespace_lock: Arc<rustfs_lock::NamespaceLock>,
         locker_owner: String,
-        ns_mutex: Arc<NsLockMap>,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
         set_drive_count: usize,
         default_parity_count: usize,
@@ -150,9 +148,8 @@ impl SetDisks {
         format: FormatV3,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
-            lockers,
+            namespace_lock,
             locker_owner,
-            ns_mutex,
             disks,
             set_drive_count,
             default_parity_count,
@@ -4066,25 +4063,21 @@ impl ObjectIO for SetDisks {
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.disks.read().await;
 
-        let mut _ns = None;
         if !opts.no_lock {
             let paths = vec![object.to_string()];
-            let ns_lock = self
-                .ns_mutex
-                .new_nslock(None)
-                .await
-                .map_err(|err| Error::other(err.to_string()))?;
-
-            let lock_acquired = ns_lock
-                .lock_batch(&paths, &self.locker_owner, std::time::Duration::from_secs(5))
-                .await
-                .map_err(|err| Error::other(err.to_string()))?;
+            let lock_acquired = self
+                .namespace_lock
+                .lock_batch(
+                    &paths,
+                    &self.locker_owner,
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
 
             if !lock_acquired {
                 return Err(Error::other("can not get lock. please retry".to_string()));
             }
-
-            _ns = Some(ns_lock);
         }
 
         let mut user_defined = opts.user_defined.clone();
@@ -4291,9 +4284,10 @@ impl ObjectIO for SetDisks {
 
         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
-        if let Some(ns_lock) = _ns {
+        // Release lock if it was acquired
+        if !opts.no_lock {
             let paths = vec![object.to_string()];
-            if let Err(err) = ns_lock.unlock_batch(&paths, &self.locker_owner).await {
+            if let Err(err) = self.namespace_lock.unlock_batch(&paths, &self.locker_owner).await {
                 error!("Failed to unlock object {}: {}", object, err);
             }
         }

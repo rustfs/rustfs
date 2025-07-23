@@ -242,14 +242,14 @@ pub struct LockRequest {
     pub lock_type: LockType,
     /// Lock owner
     pub owner: String,
-    /// Timeout duration
-    pub timeout: Duration,
+    /// Acquire timeout duration (how long to wait for lock acquisition)
+    pub acquire_timeout: Duration,
+    /// Lock TTL (Time To Live - how long the lock remains valid after acquisition)
+    pub ttl: Duration,
     /// Lock metadata
     pub metadata: LockMetadata,
     /// Lock priority
     pub priority: LockPriority,
-    /// Wait timeout duration
-    pub wait_timeout: Option<Duration>,
     /// Deadlock detection
     pub deadlock_detection: bool,
 }
@@ -263,17 +263,23 @@ impl LockRequest {
             resource: resource_str,
             lock_type,
             owner: owner.into(),
-            timeout: Duration::from_secs(30),
+            acquire_timeout: Duration::from_secs(10), // Default 10 seconds to acquire
+            ttl: Duration::from_secs(30),             // Default 30 seconds lock lifetime
             metadata: LockMetadata::default(),
             priority: LockPriority::default(),
-            wait_timeout: None,
             deadlock_detection: false,
         }
     }
 
-    /// Set timeout
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    /// Set acquire timeout (how long to wait for lock acquisition)
+    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = timeout;
+        self
+    }
+
+    /// Set lock TTL (how long the lock remains valid after acquisition)
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
         self
     }
 
@@ -286,12 +292,6 @@ impl LockRequest {
     /// Set priority
     pub fn with_priority(mut self, priority: LockPriority) -> Self {
         self.priority = priority;
-        self
-    }
-
-    /// Set wait timeout
-    pub fn with_wait_timeout(mut self, wait_timeout: Duration) -> Self {
-        self.wait_timeout = Some(wait_timeout);
         self
     }
 
@@ -640,14 +640,14 @@ mod tests {
     #[test]
     fn test_lock_request() {
         let request = LockRequest::new("test-resource", LockType::Exclusive, "test-owner")
-            .with_timeout(Duration::from_secs(60))
+            .with_acquire_timeout(Duration::from_secs(60))
             .with_priority(LockPriority::High)
             .with_deadlock_detection(true);
 
         assert_eq!(request.resource, "test-resource");
         assert_eq!(request.lock_type, LockType::Exclusive);
         assert_eq!(request.owner, "test-owner");
-        assert_eq!(request.timeout, Duration::from_secs(60));
+        assert_eq!(request.acquire_timeout, Duration::from_secs(60));
         assert_eq!(request.priority, LockPriority::High);
         assert!(request.deadlock_detection);
     }

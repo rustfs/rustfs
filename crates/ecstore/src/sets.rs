@@ -40,11 +40,10 @@ use crate::{
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
 use futures::future::join_all;
-use futures_util::FutureExt;
 use http::HeaderMap;
 use rustfs_common::globals::GLOBAL_Local_Node_Name;
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::NamespaceLock;
+
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
@@ -56,12 +55,13 @@ use tokio::time::Duration;
 use tracing::warn;
 use tracing::{error, info};
 
+use crate::lock_utils::create_unique_clients;
+
 #[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
-    pub lockers: Vec<Vec<Arc<NamespaceLock>>>,
     pub disk_set: Vec<Arc<SetDisks>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
@@ -95,45 +95,24 @@ impl Sets {
         let set_drive_count = fm.erasure.sets[0].len();
 
         let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
-        let mut lockers: Vec<Vec<Arc<NamespaceLock>>> = (0..set_count).map(|_| vec![]).collect();
 
         for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
             let set_idx = idx / set_drive_count;
             if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
                 unique[set_idx].push("local".to_string());
-                let local_manager = rustfs_lock::NsLockMap::new(false, None);
-                let local_lock = Arc::new(local_manager.new_nslock(None).await.unwrap_or_else(|_| {
-                    // If creation fails, create an empty lock manager
-                    rustfs_lock::NsLockMap::new(false, None)
-                        .new_nslock(None)
-                        .now_or_never()
-                        .unwrap()
-                        .unwrap()
-                }));
-                lockers[set_idx].push(local_lock);
             }
 
             if !endpoint.is_local {
                 let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
                 if !unique[set_idx].contains(&host_port) {
                     unique[set_idx].push(host_port);
-                    let dist_manager = rustfs_lock::NsLockMap::new(true, None);
-                    let dist_lock = Arc::new(dist_manager.new_nslock(Some(endpoint.url.clone())).await.unwrap_or_else(|_| {
-                        // If creation fails, create an empty lock manager
-                        rustfs_lock::NsLockMap::new(true, None)
-                            .new_nslock(Some(endpoint.url.clone()))
-                            .now_or_never()
-                            .unwrap()
-                            .unwrap()
-                    }));
-                    lockers[set_idx].push(dist_lock);
                 }
             }
         }
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        for (i, locker) in lockers.iter().enumerate().take(set_count) {
+        for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
@@ -141,7 +120,6 @@ impl Sets {
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
-                // let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -185,12 +163,13 @@ impl Sets {
                 }
             }
 
-            // warn!("sets new set_drive {:?}", &set_drive);
+            let lock_clients = create_unique_clients(&set_endpoints).await?;
+
+            let namespace_lock = rustfs_lock::NamespaceLock::with_clients(format!("set-{i}"), lock_clients);
 
             let set_disks = SetDisks::new(
-                locker.clone(),
+                Arc::new(namespace_lock),
                 GLOBAL_Local_Node_Name.read().await.to_string(),
-                Arc::new(rustfs_lock::NsLockMap::new(is_dist_erasure().await, None)),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
@@ -210,7 +189,6 @@ impl Sets {
             id: fm.id,
             // sets: todo!(),
             disk_set,
-            lockers,
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),

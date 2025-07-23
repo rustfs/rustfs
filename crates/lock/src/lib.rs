@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// #![allow(dead_code)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
-
 // ============================================================================
 // Core Module Declarations
 // ============================================================================
@@ -25,14 +23,10 @@ pub mod namespace;
 // Abstraction Layer Modules
 pub mod client;
 
-// Distributed Layer Modules
-pub mod distributed;
-
 // Local Layer Modules
 pub mod local;
 
 // Core Modules
-pub mod config;
 pub mod error;
 pub mod types;
 
@@ -43,15 +37,12 @@ pub mod types;
 // Re-export main types for easy access
 pub use crate::{
     // Client interfaces
-    client::{LockClient, local::LocalClient, remote::{RemoteClient, LockArgs}},
-    // Configuration
-    config::{DistributedLockConfig, LocalLockConfig, LockConfig, NetworkConfig},
-    distributed::{DistributedLockEntry, DistributedLockManager, QuorumConfig},
+    client::{LockClient, local::LocalClient, remote::RemoteClient},
     // Error types
     error::{LockError, Result},
     local::LocalLockMap,
     // Main components
-    namespace::{NamespaceLock, NamespaceLockManager, NsLockMap},
+    namespace::{NamespaceLock, NamespaceLockManager},
     // Core types
     types::{
         HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,
@@ -88,59 +79,12 @@ pub fn get_global_lock_map() -> Arc<local::LocalLockMap> {
 }
 
 // ============================================================================
-// Feature Flags
-// ============================================================================
-
-#[cfg(feature = "distributed")]
-pub mod distributed_features {
-    // Distributed locking specific features
-}
-
-#[cfg(feature = "metrics")]
-pub mod metrics {
-    // Metrics collection features
-}
-
-#[cfg(feature = "tracing")]
-pub mod tracing_features {
-    // Tracing features
-}
-
-// ============================================================================
 // Convenience Functions
 // ============================================================================
 
 /// Create a new namespace lock
-pub fn create_namespace_lock(namespace: String, distributed: bool) -> NamespaceLock {
-    if distributed {
-        // Create a namespace lock that uses RPC to communicate with the server
-        // This will use the NsLockMap with distributed mode enabled
-        NamespaceLock::new(namespace, true)
-    } else {
-        NamespaceLock::new(namespace, false)
-    }
-}
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-/// Generate a new lock ID
-pub fn generate_lock_id() -> LockId {
-    LockId::new_deterministic("default")
-}
-
-/// Create a lock request with default settings
-pub fn create_lock_request(resource: String, lock_type: LockType, owner: String) -> LockRequest {
-    LockRequest::new(resource, lock_type, owner)
-}
-
-/// Create an exclusive lock request
-pub fn create_exclusive_lock_request(resource: String, owner: String) -> LockRequest {
-    create_lock_request(resource, LockType::Exclusive, owner)
-}
-
-/// Create a shared lock request
-pub fn create_shared_lock_request(resource: String, owner: String) -> LockRequest {
-    create_lock_request(resource, LockType::Shared, owner)
+pub fn create_namespace_lock(namespace: String, _distributed: bool) -> NamespaceLock {
+    // The distributed behavior is now determined by the type of clients added to the NamespaceLock
+    // This function just creates an empty NamespaceLock
+    NamespaceLock::new(namespace)
 }

@@ -37,27 +37,6 @@ impl LocalClient {
     pub fn get_lock_map(&self) -> Arc<LocalLockMap> {
         crate::get_global_lock_map()
     }
-
-    /// Convert LockRequest to batch operation
-    async fn request_to_batch(&self, request: LockRequest) -> Result<bool> {
-        let lock_map = self.get_lock_map();
-        let resources = vec![request.resource];
-        let timeout = request.timeout;
-
-        match request.lock_type {
-            LockType::Exclusive => lock_map.lock_batch(&resources, &request.owner, timeout, None).await,
-            LockType::Shared => lock_map.rlock_batch(&resources, &request.owner, timeout, None).await,
-        }
-    }
-
-    /// Convert LockId to resource for release
-    async fn lock_id_to_batch_release(&self, lock_id: &LockId) -> Result<()> {
-        let lock_map = self.get_lock_map();
-        // For simplicity, we'll use the lock_id as resource name
-        // In a real implementation, you might want to maintain a mapping
-        let resources = vec![lock_id.as_str().to_string()];
-        lock_map.unlock_batch(&resources, "unknown").await
-    }
 }
 
 impl Default for LocalClient {
@@ -68,10 +47,10 @@ impl Default for LocalClient {
 
 #[async_trait::async_trait]
 impl LockClient for LocalClient {
-    async fn acquire_exclusive(&self, request: LockRequest) -> Result<LockResponse> {
+    async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
         let lock_map = self.get_lock_map();
         let success = lock_map
-            .lock_with_ttl_id(&request.resource, &request.owner, request.timeout, None)
+            .lock_with_ttl_id(request)
             .await
             .map_err(|e| crate::error::LockError::internal(format!("Lock acquisition failed: {e}")))?;
         if success {
@@ -82,7 +61,7 @@ impl LockClient for LocalClient {
                 status: crate::types::LockStatus::Acquired,
                 owner: request.owner.clone(),
                 acquired_at: std::time::SystemTime::now(),
-                expires_at: std::time::SystemTime::now() + request.timeout,
+                expires_at: std::time::SystemTime::now() + request.ttl,
                 last_refreshed: std::time::SystemTime::now(),
                 metadata: request.metadata.clone(),
                 priority: request.priority,
@@ -94,10 +73,10 @@ impl LockClient for LocalClient {
         }
     }
 
-    async fn acquire_shared(&self, request: LockRequest) -> Result<LockResponse> {
+    async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
         let lock_map = self.get_lock_map();
         let success = lock_map
-            .rlock_with_ttl_id(&request.resource, &request.owner, request.timeout, None)
+            .rlock_with_ttl_id(request)
             .await
             .map_err(|e| crate::error::LockError::internal(format!("Shared lock acquisition failed: {e}")))?;
         if success {
@@ -108,7 +87,7 @@ impl LockClient for LocalClient {
                 status: crate::types::LockStatus::Acquired,
                 owner: request.owner.clone(),
                 acquired_at: std::time::SystemTime::now(),
-                expires_at: std::time::SystemTime::now() + request.timeout,
+                expires_at: std::time::SystemTime::now() + request.ttl,
                 last_refreshed: std::time::SystemTime::now(),
                 metadata: request.metadata.clone(),
                 priority: request.priority,
@@ -122,11 +101,19 @@ impl LockClient for LocalClient {
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
         let lock_map = self.get_lock_map();
-        lock_map
-            .unlock_by_id(lock_id)
-            .await
-            .map_err(|e| crate::error::LockError::internal(format!("Release failed: {e}")))?;
-        Ok(true)
+
+        // Try to release the lock directly by ID
+        match lock_map.unlock_by_id(lock_id).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Try as read lock if exclusive unlock failed
+                match lock_map.runlock_by_id(lock_id).await {
+                    Ok(()) => Ok(true),
+                    Err(_) => Err(crate::error::LockError::internal("Lock ID not found".to_string())),
+                }
+            }
+            Err(e) => Err(crate::error::LockError::internal(format!("Release lock failed: {e}"))),
+        }
     }
 
     async fn refresh(&self, _lock_id: &LockId) -> Result<bool> {
@@ -140,15 +127,34 @@ impl LockClient for LocalClient {
 
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>> {
         let lock_map = self.get_lock_map();
-        if let Some((resource, owner)) = lock_map.lockid_map.get(lock_id).map(|v| v.clone()) {
-            let is_locked = lock_map.is_locked(&resource).await;
-            if is_locked {
+
+        // Check if the lock exists in our locks map
+        let locks_guard = lock_map.locks.read().await;
+        if let Some(entry) = locks_guard.get(lock_id) {
+            let entry_guard = entry.read().await;
+
+            // Determine lock type and owner based on the entry
+            if let Some(owner) = &entry_guard.writer {
                 Ok(Some(LockInfo {
                     id: lock_id.clone(),
-                    resource,
-                    lock_type: LockType::Exclusive, // 这里可进一步完善
+                    resource: lock_id.resource.clone(),
+                    lock_type: crate::types::LockType::Exclusive,
                     status: crate::types::LockStatus::Acquired,
-                    owner,
+                    owner: owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: LockMetadata::default(),
+                    priority: LockPriority::Normal,
+                    wait_start_time: None,
+                }))
+            } else if !entry_guard.readers.is_empty() {
+                Ok(Some(LockInfo {
+                    id: lock_id.clone(),
+                    resource: lock_id.resource.clone(),
+                    lock_type: crate::types::LockType::Shared,
+                    status: crate::types::LockStatus::Acquired,
+                    owner: entry_guard.readers.iter().next().map(|(k, _)| k.clone()).unwrap_or_default(),
                     acquired_at: std::time::SystemTime::now(),
                     expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
                     last_refreshed: std::time::SystemTime::now(),
@@ -189,31 +195,44 @@ mod tests {
     #[tokio::test]
     async fn test_local_client_acquire_exclusive() {
         let client = LocalClient::new();
-        let request =
-            LockRequest::new("test-resource", LockType::Exclusive, "test-owner").with_timeout(std::time::Duration::from_secs(30));
+        let resource_name = format!("test-resource-exclusive-{}", uuid::Uuid::new_v4());
+        let request = LockRequest::new(&resource_name, LockType::Exclusive, "test-owner")
+            .with_acquire_timeout(std::time::Duration::from_secs(30));
 
-        let response = client.acquire_exclusive(request).await.unwrap();
+        let response = client.acquire_exclusive(&request).await.unwrap();
         assert!(response.is_success());
+
+        // Clean up
+        if let Some(lock_info) = response.lock_info() {
+            let _ = client.release(&lock_info.id).await;
+        }
     }
 
     #[tokio::test]
     async fn test_local_client_acquire_shared() {
         let client = LocalClient::new();
-        let request =
-            LockRequest::new("test-resource", LockType::Shared, "test-owner").with_timeout(std::time::Duration::from_secs(30));
+        let resource_name = format!("test-resource-shared-{}", uuid::Uuid::new_v4());
+        let request = LockRequest::new(&resource_name, LockType::Shared, "test-owner")
+            .with_acquire_timeout(std::time::Duration::from_secs(30));
 
-        let response = client.acquire_shared(request).await.unwrap();
+        let response = client.acquire_shared(&request).await.unwrap();
         assert!(response.is_success());
+
+        // Clean up
+        if let Some(lock_info) = response.lock_info() {
+            let _ = client.release(&lock_info.id).await;
+        }
     }
 
     #[tokio::test]
     async fn test_local_client_release() {
         let client = LocalClient::new();
+        let resource_name = format!("test-resource-release-{}", uuid::Uuid::new_v4());
 
         // First acquire a lock
-        let request =
-            LockRequest::new("test-resource", LockType::Exclusive, "test-owner").with_timeout(std::time::Duration::from_secs(30));
-        let response = client.acquire_exclusive(request).await.unwrap();
+        let request = LockRequest::new(&resource_name, LockType::Exclusive, "test-owner")
+            .with_acquire_timeout(std::time::Duration::from_secs(30));
+        let response = client.acquire_exclusive(&request).await.unwrap();
         assert!(response.is_success());
 
         // Get the lock ID from the response
@@ -229,5 +248,119 @@ mod tests {
     async fn test_local_client_is_local() {
         let client = LocalClient::new();
         assert!(client.is_local().await);
+    }
+
+    #[tokio::test]
+    async fn test_local_client_read_write_lock_exclusion() {
+        let client = LocalClient::new();
+        let resource_name = format!("test-resource-exclusion-{}", uuid::Uuid::new_v4());
+
+        // First, acquire an exclusive lock
+        let exclusive_request = LockRequest::new(&resource_name, LockType::Exclusive, "exclusive-owner")
+            .with_acquire_timeout(std::time::Duration::from_millis(10));
+        let exclusive_response = client.acquire_exclusive(&exclusive_request).await.unwrap();
+        assert!(exclusive_response.is_success());
+
+        // Try to acquire a shared lock on the same resource - should fail
+        let shared_request = LockRequest::new(&resource_name, LockType::Shared, "shared-owner")
+            .with_acquire_timeout(std::time::Duration::from_millis(10));
+        let shared_response = client.acquire_shared(&shared_request).await.unwrap();
+        assert!(!shared_response.is_success(), "Shared lock should fail when exclusive lock exists");
+
+        // Clean up exclusive lock
+        if let Some(exclusive_info) = exclusive_response.lock_info() {
+            let _ = client.release(&exclusive_info.id).await;
+        }
+
+        // Now shared lock should succeed
+        let shared_request2 = LockRequest::new(&resource_name, LockType::Shared, "shared-owner")
+            .with_acquire_timeout(std::time::Duration::from_millis(10));
+        let shared_response2 = client.acquire_shared(&shared_request2).await.unwrap();
+        assert!(
+            shared_response2.is_success(),
+            "Shared lock should succeed after exclusive lock is released"
+        );
+
+        // Clean up
+        if let Some(shared_info) = shared_response2.lock_info() {
+            let _ = client.release(&shared_info.id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_client_read_write_lock_distinction() {
+        let client = LocalClient::new();
+        let resource_name = format!("test-resource-rw-{}", uuid::Uuid::new_v4());
+
+        // Test exclusive lock
+        let exclusive_request = LockRequest::new(&resource_name, LockType::Exclusive, "exclusive-owner")
+            .with_acquire_timeout(std::time::Duration::from_secs(30));
+        let exclusive_response = client.acquire_exclusive(&exclusive_request).await.unwrap();
+        assert!(exclusive_response.is_success());
+
+        if let Some(exclusive_info) = exclusive_response.lock_info() {
+            assert_eq!(exclusive_info.lock_type, LockType::Exclusive);
+
+            // Check status should return correct lock type
+            let status = client.check_status(&exclusive_info.id).await.unwrap();
+            assert!(status.is_some());
+            assert_eq!(status.unwrap().lock_type, LockType::Exclusive);
+
+            // Release exclusive lock
+            let result = client.release(&exclusive_info.id).await.unwrap();
+            assert!(result);
+        }
+
+        // Test shared lock
+        let shared_request = LockRequest::new(&resource_name, LockType::Shared, "shared-owner")
+            .with_acquire_timeout(std::time::Duration::from_secs(30));
+        let shared_response = client.acquire_shared(&shared_request).await.unwrap();
+        assert!(shared_response.is_success());
+
+        if let Some(shared_info) = shared_response.lock_info() {
+            assert_eq!(shared_info.lock_type, LockType::Shared);
+
+            // Check status should return correct lock type
+            let status = client.check_status(&shared_info.id).await.unwrap();
+            assert!(status.is_some());
+            assert_eq!(status.unwrap().lock_type, LockType::Shared);
+
+            // Release shared lock
+            let result = client.release(&shared_info.id).await.unwrap();
+            assert!(result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_local_clients_exclusive_mutex() {
+        let client1 = LocalClient::new();
+        let client2 = LocalClient::new();
+        let resource_name = format!("test-multi-client-mutex-{}", uuid::Uuid::new_v4());
+
+        // client1 acquire exclusive lock
+        let req1 = LockRequest::new(&resource_name, LockType::Exclusive, "owner1")
+            .with_acquire_timeout(std::time::Duration::from_millis(50));
+        let resp1 = client1.acquire_exclusive(&req1).await.unwrap();
+        assert!(resp1.is_success(), "client1 should acquire exclusive lock");
+
+        // client2 try to acquire exclusive lock, should fail
+        let req2 = LockRequest::new(&resource_name, LockType::Exclusive, "owner2")
+            .with_acquire_timeout(std::time::Duration::from_millis(50));
+        let resp2 = client2.acquire_exclusive(&req2).await.unwrap();
+        assert!(!resp2.is_success(), "client2 should not acquire exclusive lock while client1 holds it");
+
+        // client1 release lock
+        if let Some(lock_info) = resp1.lock_info() {
+            let _ = client1.release(&lock_info.id).await;
+        }
+
+        // client2 try again, should succeed
+        let resp3 = client2.acquire_exclusive(&req2).await.unwrap();
+        assert!(resp3.is_success(), "client2 should acquire exclusive lock after client1 releases it");
+
+        // clean up
+        if let Some(lock_info) = resp3.lock_info() {
+            let _ = client2.release(&lock_info.id).await;
+        }
     }
 }

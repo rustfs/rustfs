@@ -88,6 +88,61 @@ pub enum LockError {
     NotOwner { lock_id: LockId, owner: String },
 }
 
+impl Clone for LockError {
+    fn clone(&self) -> Self {
+        match self {
+            LockError::Timeout { resource, timeout } => LockError::Timeout {
+                resource: resource.clone(),
+                timeout: *timeout,
+            },
+            LockError::ResourceNotFound { resource } => LockError::ResourceNotFound {
+                resource: resource.clone(),
+            },
+            LockError::PermissionDenied { reason } => LockError::PermissionDenied { reason: reason.clone() },
+            LockError::Network { message, source: _ } => LockError::Network {
+                message: message.clone(),
+                source: Box::new(std::io::Error::other(message.clone())),
+            },
+            LockError::Internal { message } => LockError::Internal {
+                message: message.clone(),
+            },
+            LockError::AlreadyLocked { resource, owner } => LockError::AlreadyLocked {
+                resource: resource.clone(),
+                owner: owner.clone(),
+            },
+            LockError::InvalidHandle { handle_id } => LockError::InvalidHandle {
+                handle_id: handle_id.clone(),
+            },
+            LockError::Configuration { message } => LockError::Configuration {
+                message: message.clone(),
+            },
+            LockError::Serialization { message, source: _ } => LockError::Serialization {
+                message: message.clone(),
+                source: Box::new(std::io::Error::other(message.clone())),
+            },
+            LockError::Deserialization { message, source: _ } => LockError::Deserialization {
+                message: message.clone(),
+                source: Box::new(std::io::Error::other(message.clone())),
+            },
+            LockError::InsufficientNodes { required, available } => LockError::InsufficientNodes {
+                required: *required,
+                available: *available,
+            },
+            LockError::QuorumNotReached { required, achieved } => LockError::QuorumNotReached {
+                required: *required,
+                achieved: *achieved,
+            },
+            LockError::QueueFull { message } => LockError::QueueFull {
+                message: message.clone(),
+            },
+            LockError::NotOwner { lock_id, owner } => LockError::NotOwner {
+                lock_id: lock_id.clone(),
+                owner: owner.clone(),
+            },
+        }
+    }
+}
+
 impl LockError {
     /// Create timeout error
     pub fn timeout(resource: impl Into<String>, timeout: Duration) -> Self {

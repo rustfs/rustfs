@@ -38,3 +38,4 @@ url.workspace = true
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
+serial_test = "3.2.0"

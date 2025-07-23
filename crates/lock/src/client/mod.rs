@@ -27,13 +27,13 @@ use crate::{
 #[async_trait]
 pub trait LockClient: Send + Sync + std::fmt::Debug {
     /// Acquire exclusive lock
-    async fn acquire_exclusive(&self, request: LockRequest) -> Result<LockResponse>;
+    async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse>;
 
     /// Acquire shared lock
-    async fn acquire_shared(&self, request: LockRequest) -> Result<LockResponse>;
+    async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse>;
 
     /// Acquire lock (generic method)
-    async fn acquire_lock(&self, request: LockRequest) -> Result<LockResponse> {
+    async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         match request.lock_type {
             crate::types::LockType::Exclusive => self.acquire_exclusive(request).await,
             crate::types::LockType::Shared => self.acquire_shared(request).await,
@@ -101,7 +101,7 @@ mod tests {
         let request = crate::types::LockRequest::new("test-resource", LockType::Exclusive, "test-owner");
 
         // Test lock acquisition
-        let response = client.acquire_exclusive(request).await;
+        let response = client.acquire_exclusive(&request).await;
         assert!(response.is_ok());
 
         if let Ok(response) = response {

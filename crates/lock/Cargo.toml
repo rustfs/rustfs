@@ -30,6 +30,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+lazy_static.workspace = true
 rustfs-protos.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -42,10 +45,3 @@ uuid.workspace = true
 thiserror.workspace = true
 once_cell.workspace = true
 lru.workspace = true
-dashmap.workspace = true
-
-[features]
-default = []
-distributed = []
-metrics = []
-tracing = []
