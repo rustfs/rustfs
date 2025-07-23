@@ -37,6 +37,7 @@ members = [
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
     "crates/ahm",
+    "crates/rustfs-mcp-server", # MCP server for S3 operations
 ]
 resolver = "2"
 
@@ -85,6 +86,7 @@ rustfs-rio = { path = "crates/rio", version = "0.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
+rustfs-mcp-server = { path = "crates/rustfs-mcp-server", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
 argon2 = { version = "0.5.3", features = ["std"] }
