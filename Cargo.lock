@@ -449,7 +449,7 @@ dependencies = [
  "enumflags2",
  "futures-channel",
  "futures-util",
- "rand 0.9.1",
+ "rand 0.9.2",
  "raw-window-handle 0.6.2",
  "serde",
  "serde_repr",
@@ -2008,7 +2008,7 @@ dependencies = [
  "crc",
  "digest 0.10.7",
  "libc",
- "rand 0.9.1",
+ "rand 0.9.2",
  "regex",
 ]
 
@@ -4705,9 +4705,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-util"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66d5bd4c6f02bf0542fad85d626775bab9258cf795a4256dcaf3161114d1df"
+checksum = "8d9b05277c7e8da2c93a568989bb6207bef0112e8d17df7a6eda4a3cf143bc5e"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4721,7 +4721,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -6463,7 +6463,7 @@ dependencies = [
  "futures-util",
  "opentelemetry",
  "percent-encoding",
- "rand 0.9.1",
+ "rand 0.9.2",
  "serde_json",
  "thiserror 2.0.12",
  "tokio",
@@ -7224,7 +7224,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.3",
  "lru-slab",
- "rand 0.9.1",
+ "rand 0.9.2",
  "ring",
  "rustc-hash 2.1.1",
  "rustls 0.23.29",
@@ -7292,9 +7292,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.1"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fbfd9d094a40bf3ae768db9361049ace4c0e04a4fd6b359518bd7b73a73dd97"
+checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.3",
@@ -7981,7 +7981,7 @@ dependencies = [
  "chacha20poly1305",
  "jsonwebtoken",
  "pbkdf2",
- "rand 0.9.1",
+ "rand 0.9.2",
  "serde_json",
  "sha2 0.10.9",
  "test-case",
@@ -8021,7 +8021,7 @@ dependencies = [
  "path-absolutize",
  "path-clean",
  "pin-project-lite",
- "rand 0.9.1",
+ "rand 0.9.2",
  "reed-solomon-simd",
  "regex",
  "reqwest",
@@ -8114,7 +8114,7 @@ dependencies = [
  "base64-simd",
  "futures",
  "jsonwebtoken",
- "rand 0.9.1",
+ "rand 0.9.2",
  "rustfs-crypto",
  "rustfs-ecstore",
  "rustfs-madmin",
@@ -8133,7 +8133,7 @@ name = "rustfs-lock"
 version = "0.0.5"
 dependencies = [
  "async-trait",
- "rand 0.9.1",
+ "rand 0.9.2",
  "rustfs-protos",
  "serde",
  "serde_json",
@@ -8225,7 +8225,7 @@ dependencies = [
  "base64-simd",
  "ipnetwork",
  "jsonwebtoken",
- "rand 0.9.1",
+ "rand 0.9.2",
  "regex",
  "rustfs-crypto",
  "serde",
@@ -8259,7 +8259,7 @@ dependencies = [
  "http 1.3.1",
  "md-5",
  "pin-project-lite",
- "rand 0.9.1",
+ "rand 0.9.2",
  "reqwest",
  "rustfs-utils",
  "serde",
@@ -8344,7 +8344,7 @@ dependencies = [
  "bytes",
  "http 1.3.1",
  "hyper 1.6.0",
- "rand 0.9.1",
+ "rand 0.9.2",
  "rustfs-utils",
  "s3s",
  "serde",
@@ -8375,7 +8375,7 @@ dependencies = [
  "md-5",
  "netif",
  "nix 0.30.1",
- "rand 0.9.1",
+ "rand 0.9.2",
  "regex",
  "rustfs-config",
  "rustls 0.23.29",
@@ -8865,9 +8865,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.140"
+version = "1.0.141"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20068b6e96dc6c9bd23e01df8827e6c7e1f2fddd43c21810382803c136b99373"
+checksum = "30b9eff21ebe718216c6ec64e1d9ac57087aad11efc64e32002bce4a0d4c03d3"
 dependencies = [
  "itoa 1.0.15",
  "memchr",
@@ -9408,9 +9408,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.27.1"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f64def088c51c9510a8579e3c5d67c65349dcf755e5479ad3d010aa6454e2c32"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
 dependencies = [
  "strum_macros",
 ]
@@ -9570,9 +9570,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.36.0"
+version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aab138f5c1bb35231de19049060a87977ad23e04f2303e953bc5c2947ac7dec4"
+checksum = "252800745060e7b9ffb7b2badbd8b31cfa4aa2e61af879d0a3bf2a317c20217d"
 dependencies = [
  "libc",
  "memchr",
@@ -10533,7 +10533,7 @@ checksum = "3cf4199d1e5d15ddd86a694e4d0dffa9c323ce759fea589f00fef9d81cc1931d"
 dependencies = [
  "getrandom 0.3.3",
  "js-sys",
- "rand 0.9.1",
+ "rand 0.9.2",
  "serde",
  "uuid-macro-internal",
  "wasm-bindgen",
