@@ -21,7 +21,7 @@ pub mod heal;
 pub mod scanner;
 
 pub use error::{Error, Result};
-pub use heal::{channel::HealChannelProcessor, HealManager, HealOptions, HealPriority, HealRequest, HealType};
+pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
 pub use scanner::Scanner;
 
 // Global cancellation token for AHM services (scanner and other background tasks)

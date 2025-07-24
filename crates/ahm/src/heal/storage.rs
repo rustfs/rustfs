@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use async_trait::async_trait;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
-    disk::{endpoint::Endpoint, DiskStore},
+    disk::{DiskStore, endpoint::Endpoint},
     store::ECStore,
     store_api::{BucketInfo, ObjectIO, StorageAPI},
 };

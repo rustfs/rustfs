@@ -18,8 +18,8 @@ use crate::heal::{
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
 };
-use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::DiskAPI;
+use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 use std::{
     collections::{HashMap, VecDeque},

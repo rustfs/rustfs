@@ -22,7 +22,7 @@ use ecstore::{
     disk::{DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
-use rustfs_ecstore::{self as ecstore, data_usage::store_data_usage_in_backend, StorageAPI};
+use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
 use rustfs_filemeta::MetacacheReader;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -31,12 +31,13 @@ use tracing::{debug, error, info, warn};
 use super::metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics};
 use crate::heal::HealManager;
 use crate::{
+    HealRequest,
     error::{Error, Result},
-    get_ahm_services_cancel_token, HealRequest,
+    get_ahm_services_cancel_token,
 };
 use rustfs_common::{
     data_usage::DataUsageInfo,
-    metrics::{globalMetrics, Metric, Metrics},
+    metrics::{Metric, Metrics, globalMetrics},
 };
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -1393,8 +1394,8 @@ mod tests {
     use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_ecstore::store::ECStore;
     use rustfs_ecstore::{
-        store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
         StorageAPI,
+        store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
     };
     use serial_test::serial;
     use std::fs;

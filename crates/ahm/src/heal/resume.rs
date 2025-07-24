@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use rustfs_ecstore::disk::{DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use rustfs_ecstore::disk::{BUCKET_META_PREFIX, DiskAPI, DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -618,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resumable_tasks_integration() {
-        use rustfs_ecstore::disk::{endpoint::Endpoint, new_disk, DiskOption};
+        use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
         use tempfile::TempDir;
 
         // Create a temporary directory for testing
