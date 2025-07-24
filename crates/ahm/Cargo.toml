@@ -1,9 +1,9 @@
 [package]
 name = "rustfs-ahm"
-version = "0.0.5"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 authors = ["RustFS Team"]
-license = "Apache-2.0"
+license.workspace = true
 description = "RustFS AHM (Automatic Health Management) Scanner"
 
 [dependencies]
@@ -32,10 +32,10 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 rmp-serde = { workspace = true }
-tokio-test = "0.4"
+tokio-test = { workspace = true }
 serde_json = { workspace = true }
 serial_test = "3.2.0"
 once_cell = { workspace = true }
 tracing-subscriber = { workspace = true }
 walkdir = "2.5.0"
-tempfile = "3.10"
+tempfile = { workspace = true }
