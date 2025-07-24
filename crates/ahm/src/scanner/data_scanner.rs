@@ -527,6 +527,7 @@ impl Scanner {
                         mod_time: p.mod_time,
                         index: p.index.clone(),
                         checksums: p.checksums.clone(),
+                        error: None,
                     })
                     .collect(),
                 erasure: rustfs_filemeta::ErasureInfo {
@@ -1392,8 +1393,8 @@ mod tests {
     use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_ecstore::store::ECStore;
     use rustfs_ecstore::{
-        StorageAPI,
         store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
+        StorageAPI,
     };
     use serial_test::serial;
     use std::fs;

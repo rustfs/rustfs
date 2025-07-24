@@ -54,6 +54,7 @@ use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_utils::net::parse_and_resolve_address;
 use std::io::{Error, Result};
+use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]

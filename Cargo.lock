@@ -7933,6 +7933,7 @@ dependencies = [
  "chrono",
  "futures",
  "lazy_static",
+ "once_cell",
  "rmp-serde",
  "rustfs-common",
  "rustfs-ecstore",
@@ -7942,14 +7943,18 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
+ "serial_test",
+ "tempfile",
  "thiserror 2.0.12",
  "time",
  "tokio",
  "tokio-test",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -7968,6 +7973,7 @@ version = "0.0.5"
 dependencies = [
  "async-trait",
  "chrono",
+ "lazy_static",
  "path-clean",
  "rmp-serde",
  "rustfs-filemeta",

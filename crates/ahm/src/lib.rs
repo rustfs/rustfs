@@ -22,10 +22,7 @@ pub mod scanner;
 
 pub use error::{Error, Result};
 pub use heal::{channel::HealChannelProcessor, HealManager, HealOptions, HealPriority, HealRequest, HealType};
-pub use scanner::{
-    BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, Scanner, ScannerMetrics, load_data_usage_from_backend,
-    store_data_usage_in_backend,
-};
+pub use scanner::Scanner;
 
 // Global cancellation token for AHM services (scanner and other background tasks)
 static GLOBAL_AHM_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();

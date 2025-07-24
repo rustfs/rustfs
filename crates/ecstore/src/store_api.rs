@@ -970,6 +970,7 @@ pub trait StorageAPI: ObjectIO {
     // Walk TODO:
 
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
     async fn copy_object(
         &self,
         src_bucket: &str,
