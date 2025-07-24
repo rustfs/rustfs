@@ -130,7 +130,7 @@ hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 hmac = "0.12.1"
 hyper = "1.6.0"
-hyper-util = { version = "0.1.15", features = [
+hyper-util = { version = "0.1.16", features = [
     "tokio",
     "server-auto",
     "server-graceful",
