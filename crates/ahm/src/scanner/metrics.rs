@@ -42,6 +42,10 @@ pub struct ScannerMetrics {
     pub heal_tasks_completed: u64,
     /// Total heal tasks failed
     pub heal_tasks_failed: u64,
+    /// Total healthy objects found
+    pub healthy_objects: u64,
+    /// Total corrupted objects found
+    pub corrupted_objects: u64,
     /// Last scan activity time
     pub last_activity: Option<SystemTime>,
     /// Current scan cycle
@@ -122,6 +126,8 @@ pub struct MetricsCollector {
     heal_tasks_failed: AtomicU64,
     current_cycle: AtomicU64,
     total_cycles: AtomicU64,
+    healthy_objects: AtomicU64,
+    corrupted_objects: AtomicU64,
 }
 
 impl MetricsCollector {
@@ -139,6 +145,8 @@ impl MetricsCollector {
             heal_tasks_failed: AtomicU64::new(0),
             current_cycle: AtomicU64::new(0),
             total_cycles: AtomicU64::new(0),
+            healthy_objects: AtomicU64::new(0),
+            corrupted_objects: AtomicU64::new(0),
         }
     }
 
@@ -197,6 +205,16 @@ impl MetricsCollector {
         self.total_cycles.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment healthy objects count
+    pub fn increment_healthy_objects(&self) {
+        self.healthy_objects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment corrupted objects count
+    pub fn increment_corrupted_objects(&self) {
+        self.corrupted_objects.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get current metrics snapshot
     pub fn get_metrics(&self) -> ScannerMetrics {
         ScannerMetrics {
@@ -209,6 +227,8 @@ impl MetricsCollector {
             heal_tasks_queued: self.heal_tasks_queued.load(Ordering::Relaxed),
             heal_tasks_completed: self.heal_tasks_completed.load(Ordering::Relaxed),
             heal_tasks_failed: self.heal_tasks_failed.load(Ordering::Relaxed),
+            healthy_objects: self.healthy_objects.load(Ordering::Relaxed),
+            corrupted_objects: self.corrupted_objects.load(Ordering::Relaxed),
             last_activity: Some(SystemTime::now()),
             current_cycle: self.current_cycle.load(Ordering::Relaxed),
             total_cycles: self.total_cycles.load(Ordering::Relaxed),
@@ -234,6 +254,8 @@ impl MetricsCollector {
         self.heal_tasks_failed.store(0, Ordering::Relaxed);
         self.current_cycle.store(0, Ordering::Relaxed);
         self.total_cycles.store(0, Ordering::Relaxed);
+        self.healthy_objects.store(0, Ordering::Relaxed);
+        self.corrupted_objects.store(0, Ordering::Relaxed);
 
         info!("Scanner metrics reset");
     }

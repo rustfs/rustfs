@@ -15,9 +15,9 @@ WORKDIR /build
 
 # Set architecture-specific variables
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
-        echo "x86_64-gnu" > /tmp/arch; \
+        echo "x86_64-musl" > /tmp/arch; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
-        echo "aarch64-gnu" > /tmp/arch; \
+        echo "aarch64-musl" > /tmp/arch; \
     else \
         echo "unsupported" > /tmp/arch; \
     fi

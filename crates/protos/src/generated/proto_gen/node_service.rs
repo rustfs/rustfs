@@ -604,26 +604,6 @@ pub struct DiskInfoResponse {
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct NsScannerRequest {
-    #[prost(string, tag = "1")]
-    pub disk: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub cache: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "3")]
-    pub scan_mode: u64,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct NsScannerResponse {
-    #[prost(bool, tag = "1")]
-    pub success: bool,
-    #[prost(string, tag = "2")]
-    pub update: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub data_usage_cache: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "4")]
-    pub error: ::core::option::Option<Error>,
-}
 /// lock api have same argument type
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerallyLockRequest {
@@ -1660,21 +1640,6 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "DiskInfo"));
             self.inner.unary(req, path, codec).await
         }
-        pub async fn ns_scanner(
-            &mut self,
-            request: impl tonic::IntoStreamingRequest<Message = super::NsScannerRequest>,
-        ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<super::NsScannerResponse>>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/NsScanner");
-            let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("node_service.NodeService", "NsScanner"));
-            self.inner.streaming(req, path, codec).await
-        }
         pub async fn lock(
             &mut self,
             request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
@@ -2466,14 +2431,6 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::DiskInfoRequest>,
         ) -> std::result::Result<tonic::Response<super::DiskInfoResponse>, tonic::Status>;
-        /// Server streaming response type for the NsScanner method.
-        type NsScannerStream: tonic::codegen::tokio_stream::Stream<Item = std::result::Result<super::NsScannerResponse, tonic::Status>>
-            + std::marker::Send
-            + 'static;
-        async fn ns_scanner(
-            &self,
-            request: tonic::Request<tonic::Streaming<super::NsScannerRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::NsScannerStream>, tonic::Status>;
         async fn lock(
             &self,
             request: tonic::Request<super::GenerallyLockRequest>,
@@ -3666,35 +3623,6 @@ pub mod node_service_server {
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
                         let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/node_service.NodeService/NsScanner" => {
-                    #[allow(non_camel_case_types)]
-                    struct NsScannerSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::StreamingService<super::NsScannerRequest> for NsScannerSvc<T> {
-                        type Response = super::NsScannerResponse;
-                        type ResponseStream = T::NsScannerStream;
-                        type Future = BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<tonic::Streaming<super::NsScannerRequest>>) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move { <T as NodeService>::ns_scanner(&inner, request).await };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = NsScannerSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
-                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
-                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

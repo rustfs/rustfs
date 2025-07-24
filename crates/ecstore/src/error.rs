@@ -183,6 +183,9 @@ pub enum StorageError {
 
     #[error("Io error: {0}")]
     Io(std::io::Error),
+
+    #[error("Lock error: {0}")]
+    Lock(#[from] rustfs_lock::LockError),
 }
 
 impl StorageError {
@@ -409,6 +412,7 @@ impl Clone for StorageError {
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
+            StorageError::Lock(e) => StorageError::Lock(e.clone()),
         }
     }
 }
@@ -471,6 +475,7 @@ impl StorageError {
             StorageError::ConfigNotFound => 0x35,
             StorageError::TooManyOpenFiles => 0x36,
             StorageError::NoHealRequired => 0x37,
+            StorageError::Lock(_) => 0x38,
         }
     }
 
@@ -535,6 +540,7 @@ impl StorageError {
             0x35 => Some(StorageError::ConfigNotFound),
             0x36 => Some(StorageError::TooManyOpenFiles),
             0x37 => Some(StorageError::NoHealRequired),
+            0x38 => Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string()))),
             _ => None,
         }
     }

@@ -23,18 +23,15 @@ use http::{HeaderMap, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
+use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::GLOBAL_ALlHealState;
 use rustfs_ecstore::global::get_global_action_cred;
-// use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::heal::heal_commands::HealOpts;
-use rustfs_ecstore::heal::heal_ops::new_heal_sequence;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
@@ -689,33 +686,20 @@ impl Operation for HealHandler {
         }
 
         let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
-        if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
-            match GLOBAL_ALlHealState
-                .pop_heal_status_json(heal_path.to_str().unwrap_or_default(), &hip.client_token)
-                .await
-            {
-                Ok(b) => {
-                    info!("pop_heal_status_json success");
-                    return Ok(S3Response::new((StatusCode::OK, Body::from(b))));
-                }
-                Err(_e) => {
-                    info!("pop_heal_status_json failed");
-                    return Ok(S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::from(vec![]))));
-                }
-            }
-        }
         let (tx, mut rx) = mpsc::channel(1);
-        if hip.force_stop {
+
+        if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
+            // Query heal status
             let tx_clone = tx.clone();
+            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
+            let client_token = hip.client_token.clone();
             spawn(async move {
-                match GLOBAL_ALlHealState
-                    .stop_heal_sequence(heal_path.to_str().unwrap_or_default())
-                    .await
-                {
-                    Ok(b) => {
+                match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
+                    Ok(_) => {
+                        // TODO: Get actual response from channel
                         let _ = tx_clone
                             .send(HealResp {
-                                resp_bytes: b,
+                                resp_bytes: vec![],
                                 ..Default::default()
                             })
                             .await;
@@ -723,7 +707,32 @@ impl Operation for HealHandler {
                     Err(e) => {
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(e),
+                                _api_err: Some(StorageError::other(e)),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                }
+            });
+        } else if hip.force_stop {
+            // Cancel heal task
+            let tx_clone = tx.clone();
+            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
+            spawn(async move {
+                match rustfs_common::heal_channel::cancel_heal_task(heal_path_str).await {
+                    Ok(_) => {
+                        // TODO: Get actual response from channel
+                        let _ = tx_clone
+                            .send(HealResp {
+                                resp_bytes: vec![],
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx_clone
+                            .send(HealResp {
+                                _api_err: Some(StorageError::other(e)),
                                 ..Default::default()
                             })
                             .await;
@@ -731,22 +740,36 @@ impl Operation for HealHandler {
                 }
             });
         } else if hip.client_token.is_empty() {
-            let nh = Arc::new(new_heal_sequence(&hip.bucket, &hip.obj_prefix, "", hip.hs, hip.force_start));
+            // Use new heal channel mechanism
             let tx_clone = tx.clone();
             spawn(async move {
-                match GLOBAL_ALlHealState.launch_new_heal_sequence(nh).await {
-                    Ok(b) => {
+                // Create heal request through channel
+                let heal_request = rustfs_common::heal_channel::create_heal_request(
+                    hip.bucket.clone(),
+                    if hip.obj_prefix.is_empty() {
+                        None
+                    } else {
+                        Some(hip.obj_prefix.clone())
+                    },
+                    hip.force_start,
+                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+                );
+
+                match rustfs_common::heal_channel::send_heal_request(heal_request).await {
+                    Ok(_) => {
+                        // Success - send empty response for now
                         let _ = tx_clone
                             .send(HealResp {
-                                resp_bytes: b,
+                                resp_bytes: vec![],
                                 ..Default::default()
                             })
                             .await;
                     }
                     Err(e) => {
+                        // Error - send error response
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(e),
+                                _api_err: Some(StorageError::other(e)),
                                 ..Default::default()
                             })
                             .await;
@@ -1072,7 +1095,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
 #[cfg(test)]
 mod test {
-    use rustfs_ecstore::heal::heal_commands::HealOpts;
+    use rustfs_common::heal_channel::HealOpts;
 
     #[ignore] // FIXME: failed in github actions
     #[test]

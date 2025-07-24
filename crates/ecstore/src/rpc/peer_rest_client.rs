@@ -16,7 +16,6 @@ use crate::error::{Error, Result};
 use crate::{
     endpoints::EndpointServerPools,
     global::is_dist_erasure,
-    heal::heal_commands::BgHealState,
     metrics_realtime::{CollectMetricsOpts, MetricType},
 };
 use rmp_serde::{Deserializer, Serializer};
@@ -29,13 +28,12 @@ use rustfs_madmin::{
 use rustfs_protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
-        BackgroundHealStatusRequest, DeleteBucketMetadataRequest, DeletePolicyRequest, DeleteServiceAccountRequest,
-        DeleteUserRequest, GetCpusRequest, GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest,
-        GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
-        LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
-        LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss,
-        ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ServerInfoRequest, SignalServiceRequest,
-        StartProfilingRequest, StopRebalanceRequest,
+        DeleteBucketMetadataRequest, DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest,
+        GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
+        GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest,
+        ReloadSiteReplicationConfigRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StopRebalanceRequest,
     },
 };
 use rustfs_utils::XHost;
@@ -599,27 +597,6 @@ impl PeerRestClient {
             return Err(Error::other(""));
         }
         Ok(())
-    }
-
-    pub async fn background_heal_status(&self) -> Result<BgHealState> {
-        let mut client = node_service_time_out_client(&self.grid_host)
-            .await
-            .map_err(|err| Error::other(err.to_string()))?;
-        let request = Request::new(BackgroundHealStatusRequest {});
-
-        let response = client.background_heal_status(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
-        let data = response.bg_heal_state;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let bg_heal_state: BgHealState = Deserialize::deserialize(&mut buf)?;
-
-        Ok(bg_heal_state)
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
