@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use rustfs_lock::client::{LockClient, local::LocalClient, remote::RemoteClient};
 use crate::disk::endpoint::Endpoint;
 use crate::error::Result;
+use rustfs_lock::client::{LockClient, local::LocalClient, remote::RemoteClient};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Create unique lock clients from endpoints
 /// This function creates one client per unique host:port combination
 /// to avoid duplicate connections to the same server
 pub async fn create_unique_clients(endpoints: &[Endpoint]) -> Result<Vec<Arc<dyn LockClient>>> {
     let mut unique_endpoints: HashMap<String, &Endpoint> = HashMap::new();
-    
+
     // Collect unique endpoints based on host:port
     for endpoint in endpoints {
         if endpoint.is_local {
@@ -32,16 +32,16 @@ pub async fn create_unique_clients(endpoints: &[Endpoint]) -> Result<Vec<Arc<dyn
         } else {
             // For remote endpoints, use host:port as the key
             let host_port = format!(
-                "{}:{}", 
-                endpoint.url.host_str().unwrap_or("localhost"), 
+                "{}:{}",
+                endpoint.url.host_str().unwrap_or("localhost"),
                 endpoint.url.port().unwrap_or(9000)
             );
             unique_endpoints.insert(host_port, endpoint);
         }
     }
-    
+
     let mut clients = Vec::new();
-    
+
     // Create clients for unique endpoints
     for (_key, endpoint) in unique_endpoints {
         if endpoint.is_local {
@@ -54,7 +54,7 @@ pub async fn create_unique_clients(endpoints: &[Endpoint]) -> Result<Vec<Arc<dyn
             clients.push(Arc::new(remote_client) as Arc<dyn LockClient>);
         }
     }
-    
+
     Ok(clients)
 }
 
@@ -124,11 +124,11 @@ mod tests {
         let clients = create_unique_clients(&endpoints).await.unwrap();
         // Should create 3 clients: 1 local + 2 unique remote
         assert_eq!(clients.len(), 3);
-        
+
         // Check that we have one local client
         let local_count = clients.iter().filter(|c| futures::executor::block_on(c.is_local())).count();
         assert_eq!(local_count, 1);
-        
+
         // Check that we have two remote clients
         let remote_count = clients.iter().filter(|c| !futures::executor::block_on(c.is_local())).count();
         assert_eq!(remote_count, 2);
