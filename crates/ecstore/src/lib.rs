@@ -30,7 +30,6 @@ pub mod endpoints;
 pub mod erasure_coding;
 pub mod error;
 pub mod global;
-pub mod heal;
 pub mod lock_utils;
 pub mod metrics_realtime;
 pub mod notification_sys;
