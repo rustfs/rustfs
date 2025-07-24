@@ -36,6 +36,7 @@ use rustfs_common::{globals::GLOBAL_Local_Node_Name, heal_channel::HealOpts};
 use bytes::Bytes;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{FileInfo, MetacacheReader};
+use rustfs_lock::{LockClient, LockRequest};
 use rustfs_madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
@@ -1436,20 +1437,28 @@ impl Node for NodeService {
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.lock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        // Parse the request to extract resource and owner
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not lock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.acquire_exclusive(&args).await {
+            Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: result.success,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not lock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
