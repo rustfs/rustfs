@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod background_heal_ops;
-pub mod data_scanner;
-pub mod data_scanner_metric;
-pub mod data_usage;
-pub mod data_usage_cache;
-pub mod error;
-pub mod heal_commands;
-pub mod heal_ops;
-pub mod mrf;
+pub mod channel;
+pub mod erasure_healer;
+pub mod event;
+pub mod manager;
+pub mod progress;
+pub mod resume;
+pub mod storage;
+pub mod task;
+
+pub use erasure_healer::ErasureSetHealer;
+pub use manager::HealManager;
+pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
+pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};

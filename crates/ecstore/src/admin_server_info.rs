@@ -12,23 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
 use crate::{
     disk::endpoint::Endpoint,
     global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
-    heal::{
-        data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend},
-        data_usage_cache::DataUsageCache,
-        heal_commands::{DRIVE_STATE_OK, DRIVE_STATE_UNFORMATTED},
-    },
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     store_api::StorageAPI,
 };
-use rustfs_common::{
-    // error::{Error, Result},
-    globals::GLOBAL_Local_Node_Name,
-};
+
+use crate::data_usage::load_data_usage_cache;
+use rustfs_common::{globals::GLOBAL_Local_Node_Name, heal_channel::DriveState};
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
 };
@@ -318,7 +313,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
     for disk in disks_info {
         let ep = &disk.endpoint;
         let state = &disk.state;
-        if *state != DRIVE_STATE_OK && *state != DRIVE_STATE_UNFORMATTED {
+        if *state != DriveState::Ok.to_string() && *state != DriveState::Unformatted.to_string() {
             *offline_disks.get_mut(ep).unwrap() += 1;
             continue;
         }
@@ -359,13 +354,13 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
 
         if erasure_set.id == 0 {
             erasure_set.id = d.set_index;
-            if let Ok(cache) = DataUsageCache::load(
+            if let Ok(cache) = load_data_usage_cache(
                 &store.pools[d.pool_index as usize].disk_set[d.set_index as usize].clone(),
                 DATA_USAGE_CACHE_NAME,
             )
             .await
             {
-                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &[]);
+                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &Vec::<String>::new());
                 erasure_set.objects_count = data_usage_info.objects_total_count;
                 erasure_set.versions_count = data_usage_info.versions_total_count;
                 erasure_set.delete_markers_count = data_usage_info.delete_markers_total_count;
