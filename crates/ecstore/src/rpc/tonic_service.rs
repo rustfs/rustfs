@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, io::Cursor, pin::Pin};
+use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 
 // use common::error::Error as EcsError;
 use crate::{
@@ -34,9 +34,9 @@ use crate::{
 };
 use futures::{Stream, StreamExt};
 use futures_util::future::join_all;
-use rustfs_lock::{GLOBAL_LOCAL_SERVER, Locker, lock_args::LockArgs};
 
 use rustfs_common::globals::GLOBAL_Local_Node_Name;
+use rustfs_lock::{LockClient, LockRequest};
 
 use bytes::Bytes;
 use rmp_serde::{Deserializer, Serializer};
@@ -81,11 +81,16 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + S
 #[derive(Debug)]
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
+    lock_manager: Arc<rustfs_lock::LocalClient>,
 }
 
 pub fn make_server() -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer }
+    let lock_manager = Arc::new(rustfs_lock::LocalClient::new());
+    NodeService {
+        local_peer,
+        lock_manager,
+    }
 }
 
 impl NodeService {
@@ -1526,122 +1531,156 @@ impl Node for NodeService {
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.lock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        // Parse the request to extract resource and owner
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not lock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.acquire_exclusive(&args).await {
+            Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: result.success,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not lock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.unlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not unlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.release(&args.lock_id).await {
+            Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not unlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.rlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not rlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.acquire_shared(&args).await {
+            Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: result.success,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not rlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.runlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not runlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.release(&args.lock_id).await {
+            Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not runlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.force_unlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not force_unlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.release(&args.lock_id).await {
+            Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not force_unlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.refresh(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let _args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not refresh, args: {args}, err: {err}")),
-                })),
-            },
-            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
-            })),
-        }
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        Ok(tonic::Response::new(GenerallyLockResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn local_storage_info(
@@ -3629,15 +3668,15 @@ mod tests {
 
     // Note: signal_service test is skipped because it contains todo!() and would panic
 
-    #[test]
-    fn test_node_service_debug() {
+    #[tokio::test]
+    async fn test_node_service_debug() {
         let service = create_test_node_service();
         let debug_str = format!("{service:?}");
         assert!(debug_str.contains("NodeService"));
     }
 
-    #[test]
-    fn test_node_service_creation() {
+    #[tokio::test]
+    async fn test_node_service_creation() {
         let service1 = make_server();
         let service2 = make_server();
 

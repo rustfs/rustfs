@@ -43,7 +43,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::globals::GLOBAL_Local_Node_Name;
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
+
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
@@ -55,12 +55,13 @@ use tokio::time::Duration;
 use tracing::warn;
 use tracing::{error, info};
 
+use crate::lock_utils::create_unique_clients;
+
 #[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
-    pub lockers: Vec<Vec<LockApi>>,
     pub disk_set: Vec<Arc<SetDisks>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
@@ -93,27 +94,25 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = vec![vec![]; set_count];
-        let mut lockers: Vec<Vec<LockApi>> = vec![vec![]; set_count];
-        endpoints.endpoints.as_ref().iter().enumerate().for_each(|(idx, endpoint)| {
+        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
+
+        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
             let set_idx = idx / set_drive_count;
             if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
                 unique[set_idx].push("local".to_string());
-                lockers[set_idx].push(new_lock_api(true, None));
             }
 
             if !endpoint.is_local {
                 let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
                 if !unique[set_idx].contains(&host_port) {
                     unique[set_idx].push(host_port);
-                    lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));
                 }
             }
-        });
+        }
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        for (i, locker) in lockers.iter().enumerate().take(set_count) {
+        for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
@@ -121,7 +120,6 @@ impl Sets {
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
-                // let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -165,12 +163,13 @@ impl Sets {
                 }
             }
 
-            // warn!("sets new set_drive {:?}", &set_drive);
+            let lock_clients = create_unique_clients(&set_endpoints).await?;
+
+            let namespace_lock = rustfs_lock::NamespaceLock::with_clients(format!("set-{i}"), lock_clients);
 
             let set_disks = SetDisks::new(
-                locker.clone(),
+                Arc::new(namespace_lock),
                 GLOBAL_Local_Node_Name.read().await.to_string(),
-                Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
@@ -190,7 +189,6 @@ impl Sets {
             id: fm.id,
             // sets: todo!(),
             disk_set,
-            lockers,
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),
@@ -543,7 +541,7 @@ impl StorageAPI for Sets {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
-        // 默认返回值
+        // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
@@ -602,7 +600,7 @@ impl StorageAPI for Sets {
         //     del_errs.extend(errs);
         // }
 
-        // TODO: 并发
+        // TODO: Implement concurrency
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
