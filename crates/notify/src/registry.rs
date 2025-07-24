@@ -83,15 +83,17 @@ impl TargetRegistry {
         let mut tasks = FuturesUnordered::new();
 
         for target_type in self.factories.keys() {
-            let section = format!("{}{}", NOTIFY_ROUTE_PREFIX, target_type);
+            let section = format!("{}{}", NOTIFY_ROUTE_PREFIX, target_type).to_lowercase();
             let mut sec_cfg = config.0.get(&section).cloned().unwrap_or_default();
             // 确保默认段存在并克隆
             let default_cfg = sec_cfg.entry(DEFAULT_DELIMITER.to_string()).or_insert_with(KVS::new).clone();
             info!("Processing target type: {}", target_type);
             // 3. 筛选当前类型相关的环境变量覆盖
-            let env_pref = format!("{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type.to_uppercase()).to_uppercase();
+            let env_pref = format!("{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type).to_uppercase();
+            debug!("Collected environment variables for {}: {:?}", target_type, all_env);
             let mut overrides: HashMap<Option<String>, HashMap<String, String>> = HashMap::new();
             for (k, v) in &all_env {
+                // 检查环境变量是否以目标类型前缀开头
                 if let Some(rest) = k.strip_prefix(&env_pref) {
                     let parts: Vec<&str> = rest.trim_start_matches(DEFAULT_DELIMITER).split(DEFAULT_DELIMITER).collect();
                     let (field, id) = if parts.len() > 1 {
