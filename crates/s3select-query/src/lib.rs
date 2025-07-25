@@ -20,9 +20,9 @@ pub mod instance;
 pub mod metadata;
 pub mod sql;
 
-use std::sync::{Arc, LazyLock};
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use s3s::dto::SelectObjectContentInput;
+use std::sync::{Arc, LazyLock};
 
 use crate::{
     execution::{factory::SqlQueryExecutionFactory, scheduler::local::LocalScheduler},
@@ -46,7 +46,7 @@ static GLOBAL_COMPONENTS: LazyLock<GlobalComponents> = LazyLock::new(|| {
     let scheduler = Arc::new(LocalScheduler {});
     let query_execution_factory = Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler));
     let default_table_provider = Arc::new(BaseTableProvider::default());
-    
+
     GlobalComponents {
         func_manager,
         parser,
@@ -68,8 +68,9 @@ pub async fn get_global_db(
         components.parser.clone(),
         components.query_execution_factory.clone(),
         components.default_table_provider.clone(),
-    ).await?;
-    
+    )
+    .await?;
+
     Ok(Arc::new(db) as Arc<dyn DatabaseManagerSystem + Send + Sync>)
 }
 
