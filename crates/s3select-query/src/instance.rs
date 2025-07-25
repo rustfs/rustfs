@@ -108,7 +108,7 @@ pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) 
 }
 
 pub async fn make_rustfsms_with_components(
-    input: Arc<SelectObjectContentInput>, 
+    input: Arc<SelectObjectContentInput>,
     is_test: bool,
     func_manager: Arc<SimpleFunctionMetadataManager>,
     parser: Arc<DefaultParser>,
