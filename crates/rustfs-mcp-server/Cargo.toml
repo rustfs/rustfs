@@ -20,7 +20,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "RustFS MCP (Model Context Protocol) Server for S3 operations"
+description = "RustFS MCP (Model Context Protocol) Server"
 keywords = ["mcp", "s3", "aws", "rustfs", "server"]
 categories = ["development-tools", "web-programming"]
 
@@ -39,11 +39,12 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "signal"]
 rmcp = { version = "0.3.0", features = ["server", "transport-io", "macros"] }
 
 # Command line argument parsing
-clap = { version = "4.0", features = ["derive", "env"] }
+clap = { workspace = true, features = ["derive", "env"] }
 
 # Serialization (still needed for S3 data structures)
 serde.workspace = true
 serde_json.workspace = true
+schemars = "1.0"
 
 # Error handling
 anyhow.workspace = true

@@ -15,16 +15,26 @@
 use anyhow::Result;
 use rmcp::{
     ServerHandler,
-    handler::server::router::tool::ToolRouter,
+    handler::server::{router::tool::ToolRouter, tool::Parameters},
     model::{ServerInfo, Implementation, ServerCapabilities, ProtocolVersion, ToolsCapability},
     service::{RequestContext, NotificationContext},
     RoleServer, ErrorData,
     tool, tool_handler, tool_router,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::s3_client::S3Client;
+use crate::s3_client::{S3Client, ListObjectsOptions};
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ListObjectsRequest {
+    pub bucket_name: String,
+    #[serde(default)]
+    #[schemars(description = "Optional prefix to filter objects")]
+    pub prefix: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct RustfsMcpServer {
@@ -33,7 +43,7 @@ pub struct RustfsMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl RustfsMcpServer {
     pub async fn new(config: Config) -> Result<Self> {
         info!("Creating RustFS MCP Server");
@@ -93,9 +103,127 @@ impl RustfsMcpServer {
             }
         }
     }
+
+    #[tool(description = "List objects in a specific S3 bucket with optional prefix filtering")]
+    pub async fn list_objects(&self, Parameters(req): Parameters<ListObjectsRequest>) -> String {
+        info!("Executing list_objects tool for bucket: {}", req.bucket_name);
+
+        let options = ListObjectsOptions {
+            prefix: req.prefix.clone(),
+            delimiter: None,
+            max_keys: Some(1000), // Default limit
+            ..ListObjectsOptions::default()
+        };
+
+        match self.s3_client.list_objects_v2(&req.bucket_name, options).await {
+            Ok(result) => {
+                debug!(
+                    "Successfully retrieved {} objects and {} common prefixes from bucket '{}'",
+                    result.objects.len(),
+                    result.common_prefixes.len(),
+                    req.bucket_name
+                );
+
+                if result.objects.is_empty() && result.common_prefixes.is_empty() {
+                    let prefix_msg = req.prefix
+                        .as_ref()
+                        .map(|p| format!(" with prefix '{}'", p))
+                        .unwrap_or_default();
+                    return format!(
+                        "No objects found in bucket '{}'{prefix_msg}. The bucket may be empty or the prefix may not match any objects.",
+                        req.bucket_name
+                    );
+                }
+
+                let mut result_text = format!(
+                    "Found {} object(s) in bucket **{}**",
+                    result.key_count, req.bucket_name
+                );
+
+                if let Some(ref p) = req.prefix {
+                    result_text.push_str(&format!(" with prefix '{}'", p));
+                }
+                result_text.push_str(":\n\n");
+
+                // Display common prefixes (directories) first
+                if !result.common_prefixes.is_empty() {
+                    result_text.push_str("**Directories:**\n");
+                    for (index, prefix) in result.common_prefixes.iter().enumerate() {
+                        result_text.push_str(&format!("{}. 📁 {}\n", index + 1, prefix));
+                    }
+                    result_text.push('\n');
+                }
+
+                // Display objects
+                if !result.objects.is_empty() {
+                    result_text.push_str("**Objects:**\n");
+                    for (index, obj) in result.objects.iter().enumerate() {
+                        result_text.push_str(&format!("{}. **{}**\n", index + 1, obj.key));
+
+                        if let Some(size) = obj.size {
+                            result_text.push_str(&format!("   - Size: {} bytes\n", size));
+                        }
+
+                        if let Some(ref last_modified) = obj.last_modified {
+                            result_text.push_str(&format!("   - Last Modified: {}\n", last_modified));
+                        }
+
+                        if let Some(ref etag) = obj.etag {
+                            result_text.push_str(&format!("   - ETag: {}\n", etag));
+                        }
+
+                        if let Some(ref storage_class) = obj.storage_class {
+                            result_text.push_str(&format!("   - Storage Class: {}\n", storage_class));
+                        }
+
+                        result_text.push('\n');
+                    }
+                }
+
+                // Add pagination info if truncated
+                if result.is_truncated {
+                    result_text.push_str("**Note:** Results are truncated. ");
+                    if let Some(ref token) = result.next_continuation_token {
+                        result_text.push_str(&format!("Use continuation token '{}' to get more results.\n", token));
+                    }
+                    result_text.push('\n');
+                }
+
+                // Add summary information
+                result_text.push_str("---\n");
+                result_text.push_str(&format!(
+                    "Total: {} object(s), {} directory/ies",
+                    result.objects.len(),
+                    result.common_prefixes.len()
+                ));
+
+                if let Some(max_keys) = result.max_keys {
+                    result_text.push_str(&format!(", Max keys: {}", max_keys));
+                }
+
+                info!("list_objects tool executed successfully for bucket '{}'", req.bucket_name);
+                result_text
+            }
+            Err(e) => {
+                error!("Failed to list objects in bucket '{}': {:?}", req.bucket_name, e);
+
+                format!(
+                    "Failed to list objects in S3 bucket '{}': {}\n\nPossible causes:\n\
+                     • Bucket does not exist or is not accessible\n\
+                     • AWS credentials lack permissions to list objects in this bucket\n\
+                     • Network connectivity issues\n\
+                     • Custom endpoint is misconfigured\n\
+                     • Bucket name contains invalid characters\n\n\
+                     Please verify the bucket name, your AWS configuration, and permissions.",
+                    req.bucket_name, e
+                )
+            }
+        }
+    }
+
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for RustfsMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
