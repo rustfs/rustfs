@@ -58,11 +58,11 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # 服务名称
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # 服务版本
 export RUSTFS_OBS_ENVIRONMENT=develop # 环境名称
-export RUSTFS_OBS_LOGGER_LEVEL=debug # 日志级别，支持 trace, debug, info, warn, error
+export RUSTFS_OBS_LOGGER_LEVEL=info # 日志级别，支持 trace, debug, info, warn, error
 export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # 是否启用本地日志记录
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
-export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
-export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
+export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
+export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
 
 export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs"
 export RUSTFS_SINKS_FILE_BUFFER_SIZE=12

@@ -126,8 +126,8 @@ pub const DEFAULT_SINK_FILE_LOG_FILE: &str = concat!(DEFAULT_LOG_FILENAME, "-sin
 /// This is the default log directory for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: logs
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
-pub const DEFAULT_LOG_DIR: &str = "/logs";
+/// Environment variable: RUSTFS_LOG_DIRECTORY
+pub const DEFAULT_LOG_DIR: &str = "logs";
 
 /// Default log rotation size mb for rustfs
 /// This is the default log rotation size for rustfs.

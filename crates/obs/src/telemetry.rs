@@ -13,25 +13,25 @@
 // limitations under the License.
 
 use crate::OtelConfig;
-use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode, style};
+use flexi_logger::{style, Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode};
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::{KeyValue, global};
+use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::{
-    Resource,
     metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
+    Resource,
 };
 use opentelemetry_semantic_conventions::{
-    SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
+    SCHEMA_URL,
 };
+use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
-    SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
@@ -43,7 +43,7 @@ use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::LocalTime;
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// A guard object that manages the lifecycle of OpenTelemetry components.
 ///
@@ -293,7 +293,8 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         }
     } else {
         // Obtain the log directory and file name configuration
-        let log_directory = config.log_directory.as_deref().unwrap_or(DEFAULT_LOG_DIR);
+        let default_log_directory = rustfs_utils::dirs::get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY);
+        let log_directory = config.log_directory.as_deref().unwrap_or(default_log_directory.as_str());
         let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
 
         if let Err(e) = fs::create_dir_all(log_directory) {

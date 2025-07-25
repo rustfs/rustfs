@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod config;
-pub(crate) mod file;
-pub(crate) mod kafka;
-pub(crate) mod logger;
-pub(crate) mod otel;
-pub(crate) mod sink;
-pub(crate) mod webhook;
+mod config;
+mod file;
+mod kafka;
+mod webhook;
+
+pub use config::*;
+pub use file::*;
+pub use kafka::*;
+pub use webhook::*;

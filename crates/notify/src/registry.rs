@@ -23,7 +23,7 @@ use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KVS};
 use std::collections::HashMap;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Registry for managing target factories
 pub struct TargetRegistry {
@@ -87,16 +87,25 @@ impl TargetRegistry {
             let mut sec_cfg = config.0.get(&section).cloned().unwrap_or_default();
             // 确保默认段存在并克隆
             let default_cfg = sec_cfg.entry(DEFAULT_DELIMITER.to_string()).or_insert_with(KVS::new).clone();
-            info!("Processing target type: {}", target_type);
+            info!(
+                "Processing target type: {} Config: {:?} ,default config:{:?}",
+                target_type, sec_cfg, default_cfg
+            );
             // 3. 筛选当前类型相关的环境变量覆盖
-            let env_pref = format!("{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type).to_uppercase();
-            debug!("Collected environment variables for {}: {:?}", target_type, all_env);
+            let env_pref = format!("{}{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type, DEFAULT_DELIMITER).to_uppercase();
+            info!("Collected environment variables for {}: env_pref: {} ", target_type, env_pref.clone(),);
             let mut overrides: HashMap<Option<String>, HashMap<String, String>> = HashMap::new();
             for (k, v) in &all_env {
                 // 检查环境变量是否以目标类型前缀开头
                 if let Some(rest) = k.strip_prefix(&env_pref) {
+                    info!("Processing environment variable: {}", rest);
                     let parts: Vec<&str> = rest.trim_start_matches(DEFAULT_DELIMITER).split(DEFAULT_DELIMITER).collect();
                     let (field, id) = if parts.len() > 1 {
+                        info!(
+                            "Processing environment variable field: {},id: {}",
+                            parts[0].to_lowercase(),
+                            parts[1].to_lowercase(),
+                        );
                         (parts[0].to_lowercase(), Some(parts[1].to_string()))
                     } else {
                         (parts[0].to_lowercase(), None)
@@ -104,7 +113,7 @@ impl TargetRegistry {
                     overrides.entry(id.clone()).or_default().insert(field, v.clone());
                 }
             }
-            debug!("Collected environment overrides for {}: {:?}", target_type, overrides);
+            info!("Collected environment overrides for {}: {:?}", target_type, overrides);
             // 4. 合并所有实例 ID
             let mut ids: Vec<String> = sec_cfg.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
             for id in overrides.keys().filter_map(|x| x.clone()) {
@@ -129,12 +138,12 @@ impl TargetRegistry {
                         merged.insert(f.clone(), val.clone());
                     }
                 }
-                debug!("Merged config for {}/{}: {:?}", target_type, id, merged);
+                info!("Merged config for {}/{}: {:?}", target_type, id, merged);
                 let enabled = merged
                     .lookup(ENABLE_KEY)
                     .map(|v| v.eq_ignore_ascii_case(ENABLE_ON))
                     .unwrap_or(false);
-
+                info!("Enabled: {}/{},{}", target_type, id, enabled);
                 // 将 merged 移动进闭包，并在 new_map 中 clone
                 let ttype = target_type.clone();
                 let tid = id.clone();
@@ -161,7 +170,7 @@ impl TargetRegistry {
                     info!("Successfully created target {}/{}", tpe, id);
                     results.push(t)
                 }
-                Err(e) => error!("创建目标失败 {}/{}: {}", tpe, id, e),
+                Err(e) => error!("Failed to create a target {}/{}: {}", tpe, id, e),
             }
         }
         info!("Finished creating targets. Total: {}, Successful: {}", results.len(), results.len());

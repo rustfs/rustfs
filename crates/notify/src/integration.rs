@@ -15,15 +15,15 @@
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
 use crate::{
-    Event, EventName, StoreError, Target, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry,
-    rules::BucketNotificationConfig, stream,
+    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event, EventName,
+    StoreError, Target,
 };
 use rustfs_ecstore::config::{Config, KVS};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Notify the system of monitoring indicators
@@ -130,6 +130,12 @@ impl NotificationSystem {
         let targets: Vec<Box<dyn Target + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
+        if targets.len() > 0 {
+            info!("{} notification targets were enabled", targets.iter().filter(|t| t.is_enabled()).count());
+            return Err(NotificationError::Target(crate::error::TargetError::Unknown(
+                "No targets enabled".to_string(),
+            )));
+        }
 
         // Initiate event stream processing for each storage enabled target
         let mut cancellers = HashMap::new();
