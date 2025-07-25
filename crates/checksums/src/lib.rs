@@ -1,5 +1,18 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![allow(clippy::derive_partial_eq_without_eq)]
 #![warn(
     // missing_docs,
@@ -319,15 +332,12 @@ impl Checksum for Md5 {
 #[cfg(test)]
 mod tests {
     use super::{
-        http::{
-            CRC_32_C_HEADER_NAME, CRC_32_HEADER_NAME, MD5_HEADER_NAME, SHA_1_HEADER_NAME,
-            SHA_256_HEADER_NAME,
-        },
         Crc32, Crc32c, Md5, Sha1, Sha256,
+        http::{CRC_32_C_HEADER_NAME, CRC_32_HEADER_NAME, MD5_HEADER_NAME, SHA_1_HEADER_NAME, SHA_256_HEADER_NAME},
     };
 
-    use crate::http::HttpChecksum;
     use crate::ChecksumAlgorithm;
+    use crate::http::HttpChecksum;
 
     use crate::base64;
     use http::HeaderValue;
@@ -338,12 +348,10 @@ mod tests {
 
     fn base64_encoded_checksum_to_hex_string(header_value: &HeaderValue) -> String {
         let decoded_checksum = base64::decode(header_value.to_str().unwrap()).unwrap();
-        let decoded_checksum = decoded_checksum
-            .into_iter()
-            .fold(String::new(), |mut acc, byte| {
-                write!(acc, "{byte:02X?}").expect("string will always be writeable");
-                acc
-            });
+        let decoded_checksum = decoded_checksum.into_iter().fold(String::new(), |mut acc, byte| {
+            write!(acc, "{byte:02X?}").expect("string will always be writeable");
+            acc
+        });
 
         format!("0x{}", decoded_checksum)
     }
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_crc64nvme_checksum() {
-        use crate::{http::CRC_64_NVME_HEADER_NAME, Crc64Nvme};
+        use crate::{Crc64Nvme, http::CRC_64_NVME_HEADER_NAME};
         let mut checksum = Crc64Nvme::default();
         checksum.update(TEST_DATA.as_bytes());
         let checksum_result = Box::new(checksum).headers();
@@ -410,8 +418,7 @@ mod tests {
         let encoded_checksum = checksum_result.get(SHA_256_HEADER_NAME).unwrap();
         let decoded_checksum = base64_encoded_checksum_to_hex_string(encoded_checksum);
 
-        let expected_checksum =
-            "0x916F0027A575074CE72A331777C3478D6513F786A591BD892DA1A577BF2335F9";
+        let expected_checksum = "0x916F0027A575074CE72A331777C3478D6513F786A591BD892DA1A577BF2335F9";
 
         assert_eq!(decoded_checksum, expected_checksum);
     }
@@ -434,9 +441,6 @@ mod tests {
         let error = "some invalid checksum algorithm"
             .parse::<ChecksumAlgorithm>()
             .expect_err("it should error");
-        assert_eq!(
-            "some invalid checksum algorithm",
-            error.checksum_algorithm()
-        );
+        assert_eq!("some invalid checksum algorithm", error.checksum_algorithm());
     }
 }

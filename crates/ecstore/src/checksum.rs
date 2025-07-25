@@ -103,15 +103,30 @@ impl ChecksumMode {
     }
 
     pub fn can_composite(&self) -> bool {
-        todo!();
+        let s = EnumSet::from(*self).intersection(*C_ChecksumMask);
+        match s.as_u8() {
+            2_u8 => true,
+            4_u8 => true,
+            8_u8 => true,
+            16_u8 => true,
+            _ => false,
+        }
     }
 
     pub fn can_merge_crc(&self) -> bool {
-        todo!();
+        /*switch c & checksumMask {
+            case ChecksumCRC32, ChecksumCRC32C, ChecksumCRC64NVME:
+              return true
+        }
+        return false*/
     }
 
     pub fn full_object_requested(&self) -> bool {
-        todo!();
+        /*switch self & (ChecksumFullObject | checksumMask) {
+        case ChecksumFullObjectCRC32C, ChecksumFullObjectCRC32, ChecksumCRC64NVME:
+          return true
+        }
+        return false*/
     }
 
     pub fn key_capitalized(&self) -> String {

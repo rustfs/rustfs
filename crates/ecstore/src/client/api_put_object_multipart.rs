@@ -25,8 +25,6 @@ use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 
-use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
-use s3s::{Body, dto::StreamingBlob};
 use crate::client::{
     api_error_response::{
         err_entity_too_large, err_entity_too_small, err_invalid_argument, http_resp_to_error_response, to_error_response,
@@ -45,6 +43,8 @@ use crate::{
     store_api::{GetObjectReader, StorageAPI},
 };
 use rustfs_utils::{crypto::base64_encode, path::trim_etag};
+use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
+use s3s::{Body, dto::StreamingBlob};
 
 impl TransitionClient {
     pub async fn put_object_multipart(
