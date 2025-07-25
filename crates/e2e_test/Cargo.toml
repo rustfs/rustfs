@@ -39,3 +39,5 @@ rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
 serial_test = "3.2.0"
+aws-sdk-s3 = "1.99.0"
+aws-config = "1.8.3"
