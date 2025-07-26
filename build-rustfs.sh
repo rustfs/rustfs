@@ -21,13 +21,17 @@ detect_platform() {
         "linux")
             case "$arch" in
                 "x86_64")
-                    echo "x86_64-unknown-linux-musl"
+                    # Default to GNU for better compatibility
+                    echo "x86_64-unknown-linux-gnu"
                     ;;
                 "aarch64"|"arm64")
-                    echo "aarch64-unknown-linux-musl"
+                    echo "aarch64-unknown-linux-gnu"
                     ;;
                 "armv7l")
-                    echo "armv7-unknown-linux-musleabihf"
+                    echo "armv7-unknown-linux-gnueabihf"
+                    ;;
+                "loongarch64")
+                    echo "loongarch64-unknown-linux-musl"
                     ;;
                 *)
                     echo "unknown-platform"
@@ -119,6 +123,17 @@ usage() {
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
     echo "  -p, --platform TARGET      Target platform (default: auto-detect)"
+    echo "                              Supported platforms:"
+    echo "                                x86_64-unknown-linux-gnu"
+    echo "                                aarch64-unknown-linux-gnu"
+    echo "                                armv7-unknown-linux-gnueabihf"
+    echo "                                x86_64-unknown-linux-musl"
+    echo "                                aarch64-unknown-linux-musl"
+    echo "                                armv7-unknown-linux-musleabihf"
+    echo "                                x86_64-apple-darwin"
+    echo "                                aarch64-apple-darwin"
+    echo "                                x86_64-pc-windows-msvc"
+    echo "                                aarch64-pc-windows-msvc"
     echo "  --dev                      Build in dev mode"
     echo "  --sign                     Sign binaries after build"
     echo "  --with-console             Download console static assets (default)"
@@ -385,7 +400,7 @@ build_binary() {
         fi
     else
         # Native compilation
-        build_cmd="cargo build"
+        build_cmd="RUSTFLAGS=-Clink-arg=-lm cargo build"
     fi
 
     if [ "$BUILD_TYPE" = "release" ]; then

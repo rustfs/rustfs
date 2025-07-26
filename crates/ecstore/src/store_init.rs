@@ -24,7 +24,6 @@ use crate::{
         new_disk,
     },
     endpoints::Endpoints,
-    heal::heal_commands::init_healing_tracker,
 };
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
@@ -288,7 +287,7 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
     let mut futures = Vec::with_capacity(disks.len());
 
     for (i, disk) in disks.iter().enumerate() {
-        futures.push(save_format_file(disk, &formats[i], ""));
+        futures.push(save_format_file(disk, &formats[i]));
     }
 
     let mut errors = Vec::with_capacity(disks.len());
@@ -312,7 +311,7 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
     Ok(())
 }
 
-pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>, heal_id: &str) -> disk::error::Result<()> {
+pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -> disk::error::Result<()> {
     if disk.is_none() {
         return Err(DiskError::DiskNotFound);
     }
@@ -331,10 +330,6 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
         .await?;
 
     disk.set_disk_id(Some(format.erasure.this)).await?;
-    if !heal_id.is_empty() {
-        let mut ht = init_healing_tracker(disk.clone(), heal_id).await?;
-        return ht.save().await;
-    }
 
     Ok(())
 }

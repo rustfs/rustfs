@@ -16,12 +16,12 @@
 
 # 脚本名称：scp_to_servers.sh
 
-rm ./target/x86_64-unknown-linux-musl/release/rustfs.zip
-# 压缩./target/x86_64-unknown-linux-musl/release/rustfs
-zip -j ./target/x86_64-unknown-linux-musl/release/rustfs.zip ./target/x86_64-unknown-linux-musl/release/rustfs
+rm ./target/x86_64-unknown-linux-gnu/release/rustfs.zip
+# 压缩./target/x86_64-unknown-linux-gnu/release/rustfs
+zip -j ./target/x86_64-unknown-linux-gnu/release/rustfs.zip ./target/x86_64-unknown-linux-gnu/release/rustfs
 
-# 本地文件路径
-LOCAL_FILE="./target/x86_64-unknown-linux-musl/release/rustfs.zip"
+# 上传到服务器
+LOCAL_FILE="./target/x86_64-unknown-linux-gnu/release/rustfs.zip"
 REMOTE_PATH="~"
 
 # 必须传入IP参数，否则报错退出

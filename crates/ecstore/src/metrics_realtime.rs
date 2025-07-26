@@ -15,7 +15,11 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr};
+use rustfs_common::{
+    globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr},
+    heal_channel::DriveState,
+    metrics::globalMetrics,
+};
 use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
@@ -23,10 +27,6 @@ use tracing::info;
 
 use crate::{
     admin_server_info::get_local_server_property,
-    heal::{
-        data_scanner_metric::globalScannerMetrics,
-        heal_commands::{DRIVE_STATE_OK, DRIVE_STATE_UNFORMATTED},
-    },
     new_object_layer_fn,
     store_api::StorageAPI,
     // utils::os::get_drive_stats,
@@ -108,7 +108,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     if types.contains(&MetricType::SCANNER) {
         info!("start get scanner metrics");
-        let metrics = globalScannerMetrics.report().await;
+        let metrics = globalMetrics.report().await;
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
 
@@ -147,7 +147,7 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
             continue;
         }
 
-        if d.state != *DRIVE_STATE_OK && d.state != *DRIVE_STATE_UNFORMATTED {
+        if d.state != DriveState::Ok.to_string() && d.state != DriveState::Unformatted.to_string() {
             metrics.insert(
                 d.endpoint.clone(),
                 DiskMetric {

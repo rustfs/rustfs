@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, io::Cursor, pin::Pin};
+use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 
 // use common::error::Error as EcsError;
 use crate::{
@@ -22,25 +22,21 @@ use crate::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
         error::DiskError,
     },
-    heal::{
-        data_usage_cache::DataUsageCache,
-        heal_commands::{HealOpts, get_local_background_heal_status},
-    },
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
     rpc::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use futures_util::future::join_all;
-use rustfs_lock::{GLOBAL_LOCAL_SERVER, Locker, lock_args::LockArgs};
 
-use rustfs_common::globals::GLOBAL_Local_Node_Name;
+use rustfs_common::{globals::GLOBAL_Local_Node_Name, heal_channel::HealOpts};
 
 use bytes::Bytes;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{FileInfo, MetacacheReader};
+use rustfs_lock::{LockClient, LockRequest};
 use rustfs_madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
@@ -81,11 +77,16 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + S
 #[derive(Debug)]
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
+    lock_manager: Arc<rustfs_lock::LocalClient>,
 }
 
 pub fn make_server() -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer }
+    let lock_manager = Arc::new(rustfs_lock::LocalClient::new());
+    NodeService {
+        local_peer,
+        lock_manager,
+    }
 }
 
 impl NodeService {
@@ -1434,214 +1435,158 @@ impl Node for NodeService {
         }
     }
 
-    type NsScannerStream = ResponseStream<NsScannerResponse>;
-    async fn ns_scanner(&self, request: Request<Streaming<NsScannerRequest>>) -> Result<Response<Self::NsScannerStream>, Status> {
-        info!("ns_scanner");
-
-        let mut in_stream = request.into_inner();
-        let (tx, rx) = mpsc::channel(10);
-
-        tokio::spawn(async move {
-            match in_stream.next().await {
-                Some(Ok(request)) => {
-                    if let Some(disk) = find_local_disk(&request.disk).await {
-                        let cache = match serde_json::from_str::<DataUsageCache>(&request.cache) {
-                            Ok(cache) => cache,
-                            Err(err) => {
-                                tx.send(Ok(NsScannerResponse {
-                                    success: false,
-                                    update: "".to_string(),
-                                    data_usage_cache: "".to_string(),
-                                    error: Some(DiskError::other(format!("decode DataUsageCache failed: {err}")).into()),
-                                }))
-                                .await
-                                .expect("working rx");
-                                return;
-                            }
-                        };
-                        let (updates_tx, mut updates_rx) = mpsc::channel(100);
-                        let tx_clone = tx.clone();
-                        let task = tokio::spawn(async move {
-                            loop {
-                                match updates_rx.recv().await {
-                                    Some(update) => {
-                                        let update = serde_json::to_string(&update).expect("encode failed");
-                                        tx_clone
-                                            .send(Ok(NsScannerResponse {
-                                                success: true,
-                                                update,
-                                                data_usage_cache: "".to_string(),
-                                                error: None,
-                                            }))
-                                            .await
-                                            .expect("working rx");
-                                    }
-                                    None => return,
-                                }
-                            }
-                        });
-                        let data_usage_cache = disk.ns_scanner(&cache, updates_tx, request.scan_mode as usize, None).await;
-                        let _ = task.await;
-                        match data_usage_cache {
-                            Ok(data_usage_cache) => {
-                                let data_usage_cache = serde_json::to_string(&data_usage_cache).expect("encode failed");
-                                tx.send(Ok(NsScannerResponse {
-                                    success: true,
-                                    update: "".to_string(),
-                                    data_usage_cache,
-                                    error: None,
-                                }))
-                                .await
-                                .expect("working rx");
-                            }
-                            Err(err) => {
-                                tx.send(Ok(NsScannerResponse {
-                                    success: false,
-                                    update: "".to_string(),
-                                    data_usage_cache: "".to_string(),
-                                    error: Some(err.into()),
-                                }))
-                                .await
-                                .expect("working rx");
-                            }
-                        }
-                    } else {
-                        tx.send(Ok(NsScannerResponse {
-                            success: false,
-                            update: "".to_string(),
-                            data_usage_cache: "".to_string(),
-                            error: Some(DiskError::other("can not find disk".to_string()).into()),
-                        }))
-                        .await
-                        .expect("working rx");
-                    }
-                }
-                _ => todo!(),
-            }
-        });
-
-        let out_stream = ReceiverStream::new(rx);
-        Ok(tonic::Response::new(Box::pin(out_stream)))
-    }
-
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.lock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        // Parse the request to extract resource and owner
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not lock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.acquire_exclusive(&args).await {
+            Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: result.success,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not lock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.unlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not unlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.release(&args.lock_id).await {
+            Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not unlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.rlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not rlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.acquire_shared(&args).await {
+            Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: result.success,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not rlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.runlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not runlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.release(&args.lock_id).await {
+            Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not runlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.force_unlock(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not force_unlock, args: {args}, err: {err}")),
-                })),
-            },
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        match self.lock_manager.release(&args.lock_id).await {
+            Ok(_) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
+                error_info: Some(format!(
+                    "can not force_unlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
             })),
         }
     }
 
     async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        match &serde_json::from_str::<LockArgs>(&request.args) {
-            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.refresh(args).await {
-                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
-                    success: result,
-                    error_info: None,
-                })),
-                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+        let _args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not refresh, args: {args}, err: {err}")),
-                })),
-            },
-            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!("can not decode args, err: {err}")),
-            })),
-        }
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                }));
+            }
+        };
+
+        Ok(tonic::Response::new(GenerallyLockResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn local_storage_info(
@@ -2157,28 +2102,7 @@ impl Node for NodeService {
         &self,
         _request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
-        let (state, ok) = get_local_background_heal_status().await;
-        if !ok {
-            return Ok(tonic::Response::new(BackgroundHealStatusResponse {
-                success: false,
-                bg_heal_state: Bytes::new(),
-                error_info: Some("errServerNotInitialized".to_string()),
-            }));
-        }
-
-        let mut buf = Vec::new();
-        if let Err(err) = state.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(tonic::Response::new(BackgroundHealStatusResponse {
-                success: false,
-                bg_heal_state: Bytes::new(),
-                error_info: Some(err.to_string()),
-            }));
-        }
-        Ok(tonic::Response::new(BackgroundHealStatusResponse {
-            success: true,
-            bg_heal_state: buf.into(),
-            error_info: None,
-        }))
+        todo!()
     }
 
     async fn get_metacache_listing(
@@ -3374,20 +3298,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_background_heal_status() {
-        let service = create_test_node_service();
-
-        let request = Request::new(BackgroundHealStatusRequest {});
-
-        let response = service.background_heal_status(request).await;
-        assert!(response.is_ok());
-
-        let heal_response = response.unwrap().into_inner();
-        // May fail if heal status is not available
-        assert!(heal_response.success || heal_response.error_info.is_some());
-    }
-
-    #[tokio::test]
     async fn test_reload_pool_meta() {
         let service = create_test_node_service();
 
@@ -3629,29 +3539,21 @@ mod tests {
 
     // Note: signal_service test is skipped because it contains todo!() and would panic
 
-    #[test]
-    fn test_node_service_debug() {
+    #[tokio::test]
+    async fn test_node_service_debug() {
         let service = create_test_node_service();
         let debug_str = format!("{service:?}");
         assert!(debug_str.contains("NodeService"));
     }
 
-    #[test]
-    fn test_node_service_creation() {
+    #[tokio::test]
+    async fn test_node_service_creation() {
         let service1 = make_server();
         let service2 = make_server();
 
         // Both services should be created successfully
         assert!(format!("{service1:?}").contains("NodeService"));
         assert!(format!("{service2:?}").contains("NodeService"));
-    }
-
-    #[tokio::test]
-    async fn test_all_disk_method() {
-        let service = create_test_node_service();
-        let disks = service.all_disk().await;
-        // Should return empty vector in test environment
-        assert!(disks.is_empty());
     }
 
     #[tokio::test]

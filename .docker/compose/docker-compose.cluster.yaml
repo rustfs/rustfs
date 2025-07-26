@@ -27,7 +27,7 @@ services:
     ports:
       - "9000:9000" # Map port 9001 of the host to port 9000 of the container
     volumes:
-      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      - ../../target/x86_64-unknown-linux-gnu/release/rustfs:/app/rustfs
     command: "/app/rustfs"
 
   node1:
@@ -44,7 +44,7 @@ services:
     ports:
       - "9001:9000" # Map port 9002 of the host to port 9000 of the container
     volumes:
-      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      - ../../target/x86_64-unknown-linux-gnu/release/rustfs:/app/rustfs
     command: "/app/rustfs"
 
   node2:
@@ -61,7 +61,7 @@ services:
     ports:
       - "9002:9000" # Map port 9003 of the host to port 9000 of the container
     volumes:
-      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      - ../../target/x86_64-unknown-linux-gnu/release/rustfs:/app/rustfs
     command: "/app/rustfs"
 
   node3:
@@ -78,5 +78,5 @@ services:
     ports:
       - "9003:9000" # Map port 9004 of the host to port 9000 of the container
     volumes:
-      - ../../target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      - ../../target/x86_64-unknown-linux-gnu/release/rustfs:/app/rustfs
     command: "/app/rustfs"

@@ -30,11 +30,6 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
-use crate::heal::{
-    data_scanner::ShouldSleepFn,
-    data_usage_cache::{DataUsageCache, DataUsageEntry},
-    heal_commands::{HealScanMode, HealingTracker},
-};
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
@@ -46,10 +41,7 @@ use rustfs_madmin::info_commands::DiskMetrics;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::mpsc::Sender,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Disk>;
@@ -406,28 +398,6 @@ impl DiskAPI for Disk {
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
         }
     }
-
-    #[tracing::instrument(skip(self, cache, we_sleep, scan_mode))]
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache> {
-        match self {
-            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
-            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn healing(&self) -> Option<HealingTracker> {
-        match self {
-            Disk::Local(local_disk) => local_disk.healing().await,
-            Disk::Remote(remote_disk) => remote_disk.healing().await,
-        }
-    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
@@ -527,14 +497,6 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache>;
-    async fn healing(&self) -> Option<HealingTracker>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

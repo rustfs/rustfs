@@ -22,19 +22,22 @@ use ecstore::{
     disk::{DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
-use rustfs_ecstore as ecstore;
+use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
 use rustfs_filemeta::MetacacheReader;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{
-    data_usage::DataUsageInfo,
-    metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics},
-};
+use super::metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics};
+use crate::heal::HealManager;
 use crate::{
+    HealRequest,
     error::{Error, Result},
     get_ahm_services_cancel_token,
+};
+use rustfs_common::{
+    data_usage::DataUsageInfo,
+    metrics::{Metric, Metrics, globalMetrics},
 };
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -116,7 +119,7 @@ pub struct Scanner {
     config: Arc<RwLock<ScannerConfig>>,
     /// Scanner state
     state: Arc<RwLock<ScannerState>>,
-    /// Metrics collector
+    /// Local metrics collector (for backward compatibility)
     metrics: Arc<MetricsCollector>,
     /// Bucket metrics cache
     bucket_metrics: Arc<Mutex<HashMap<String, BucketMetrics>>>,
@@ -126,15 +129,15 @@ pub struct Scanner {
     data_usage_stats: Arc<Mutex<HashMap<String, DataUsageInfo>>>,
     /// Last data usage statistics collection time
     last_data_usage_collection: Arc<RwLock<Option<SystemTime>>>,
+    /// Heal manager for auto-heal integration
+    heal_manager: Option<Arc<HealManager>>,
 }
 
 impl Scanner {
     /// Create a new scanner
-    pub fn new(config: Option<ScannerConfig>) -> Self {
+    pub fn new(config: Option<ScannerConfig>, heal_manager: Option<Arc<HealManager>>) -> Self {
         let config = config.unwrap_or_default();
-
         info!("Creating AHM scanner for all EC sets");
-
         Self {
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(ScannerState::default())),
@@ -143,7 +146,13 @@ impl Scanner {
             disk_metrics: Arc::new(Mutex::new(HashMap::new())),
             data_usage_stats: Arc::new(Mutex::new(HashMap::new())),
             last_data_usage_collection: Arc::new(RwLock::new(None)),
+            heal_manager,
         }
+    }
+
+    /// Set the heal manager after construction
+    pub fn set_heal_manager(&mut self, heal_manager: Arc<HealManager>) {
+        self.heal_manager = Some(heal_manager);
     }
 
     /// Start the scanner
@@ -279,9 +288,17 @@ impl Scanner {
         metrics
     }
 
+    /// Get global metrics from common crate
+    pub async fn get_global_metrics(&self) -> rustfs_madmin::metrics::ScannerMetrics {
+        globalMetrics.report().await
+    }
+
     /// Perform a single scan cycle
     pub async fn scan_cycle(&self) -> Result<()> {
         let start_time = SystemTime::now();
+
+        // Start global metrics collection for this cycle
+        let stop_fn = Metrics::time(Metric::ScanCycle);
 
         info!("Starting scan cycle {} for all EC sets", self.metrics.get_metrics().current_cycle + 1);
 
@@ -293,6 +310,14 @@ impl Scanner {
             state.scanning_buckets.clear();
             state.scanning_disks.clear();
         }
+
+        // Update global metrics cycle information
+        let cycle_info = rustfs_common::metrics::CurrentCycle {
+            current: self.state.read().await.current_cycle,
+            cycle_completed: vec![chrono::Utc::now()],
+            started: chrono::Utc::now(),
+        };
+        globalMetrics.set_cycle(Some(cycle_info)).await;
 
         self.metrics.set_current_cycle(self.state.read().await.current_cycle);
         self.metrics.increment_total_cycles();
@@ -385,10 +410,214 @@ impl Scanner {
             state.current_scan_duration = Some(scan_duration);
         }
 
+        // Complete global metrics collection for this cycle
+        stop_fn();
+
         info!(
             "Completed scan cycle in {:?} ({} successful, {} failed)",
             scan_duration, successful_scans, failed_scans
         );
+        Ok(())
+    }
+
+    /// Verify object integrity and trigger healing if necessary
+    async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<()> {
+        debug!("Starting verify_object_integrity for {}/{}", bucket, object);
+
+        let config = self.config.read().await;
+        if !config.enable_healing || config.scan_mode != ScanMode::Deep {
+            debug!("Healing disabled or not in deep scan mode, skipping verification");
+            return Ok(());
+        }
+
+        if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
+            // First try the standard integrity check
+            let object_opts = ecstore::store_api::ObjectOptions::default();
+            let mut integrity_failed = false;
+
+            debug!("Running standard object verification for {}/{}", bucket, object);
+            match ecstore.verify_object_integrity(bucket, object, &object_opts).await {
+                Ok(_) => {
+                    debug!("Standard verification passed for {}/{}", bucket, object);
+                    // Standard verification passed, now check for missing data parts
+                    match self.check_data_parts_integrity(bucket, object).await {
+                        Ok(_) => {
+                            // Object is completely healthy
+                            debug!("Data parts integrity check passed for {}/{}", bucket, object);
+                            self.metrics.increment_healthy_objects();
+                        }
+                        Err(e) => {
+                            // Data parts are missing or corrupt
+                            debug!("Data parts integrity check failed for {}/{}: {}", bucket, object, e);
+                            warn!("Data parts integrity check failed for {}/{}: {}. Triggering heal.", bucket, object, e);
+                            integrity_failed = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Standard object verification failed
+                    debug!("Standard verification failed for {}/{}: {}", bucket, object, e);
+                    warn!("Object verification failed for {}/{}: {}. Triggering heal.", bucket, object, e);
+                    integrity_failed = true;
+                }
+            }
+
+            debug!("integrity_failed = {} for {}/{}", integrity_failed, bucket, object);
+            if integrity_failed {
+                self.metrics.increment_corrupted_objects();
+
+                if let Some(heal_manager) = &self.heal_manager {
+                    debug!("Submitting heal request for {}/{}", bucket, object);
+                    let heal_request = HealRequest::object(bucket.to_string(), object.to_string(), None);
+                    if let Err(e) = heal_manager.submit_heal_request(heal_request).await {
+                        error!("Failed to submit heal task for {}/{}: {}", bucket, object, e);
+                    } else {
+                        debug!("Successfully submitted heal request for {}/{}", bucket, object);
+                    }
+                } else {
+                    debug!("No heal manager available for {}/{}", bucket, object);
+                }
+            }
+        } else {
+            debug!("No ECStore available for {}/{}", bucket, object);
+        }
+
+        debug!("Completed verify_object_integrity for {}/{}", bucket, object);
+        Ok(())
+    }
+
+    /// Check data parts integrity by verifying all parts exist on disks
+    async fn check_data_parts_integrity(&self, bucket: &str, object: &str) -> Result<()> {
+        debug!("Checking data parts integrity for {}/{}", bucket, object);
+
+        if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
+            // Get object info
+            let object_info = match ecstore.get_object_info(bucket, object, &Default::default()).await {
+                Ok(info) => info,
+                Err(e) => {
+                    return Err(Error::Other(format!("Failed to get object info: {e}")));
+                }
+            };
+
+            debug!(
+                "Object info for {}/{}: data_blocks={}, parity_blocks={}, parts={}",
+                bucket,
+                object,
+                object_info.data_blocks,
+                object_info.parity_blocks,
+                object_info.parts.len()
+            );
+
+            // Create FileInfo from ObjectInfo
+            let file_info = rustfs_filemeta::FileInfo {
+                volume: bucket.to_string(),
+                name: object.to_string(),
+                version_id: object_info.version_id,
+                is_latest: object_info.is_latest,
+                deleted: object_info.delete_marker,
+                size: object_info.size,
+                mod_time: object_info.mod_time,
+                parts: object_info
+                    .parts
+                    .iter()
+                    .map(|p| rustfs_filemeta::ObjectPartInfo {
+                        etag: p.etag.clone(),
+                        number: 0, // Will be set by erasure info
+                        size: p.size,
+                        actual_size: p.actual_size,
+                        mod_time: p.mod_time,
+                        index: p.index.clone(),
+                        checksums: p.checksums.clone(),
+                        error: None,
+                    })
+                    .collect(),
+                erasure: rustfs_filemeta::ErasureInfo {
+                    algorithm: "ReedSolomon".to_string(),
+                    data_blocks: object_info.data_blocks,
+                    parity_blocks: object_info.parity_blocks,
+                    block_size: 0, // Default value
+                    index: 1,      // Default index
+                    distribution: (1..=object_info.data_blocks + object_info.parity_blocks).collect(),
+                    checksums: vec![],
+                },
+                ..Default::default()
+            };
+
+            // Get all disks from ECStore's disk_map
+            let mut has_missing_parts = false;
+            let mut total_disks_checked = 0;
+            let mut disks_with_errors = 0;
+
+            debug!("Checking {} pools in disk_map", ecstore.disk_map.len());
+
+            for (pool_idx, pool_disks) in &ecstore.disk_map {
+                debug!("Checking pool {}, {} disks", pool_idx, pool_disks.len());
+
+                for (disk_idx, disk_option) in pool_disks.iter().enumerate() {
+                    if let Some(disk) = disk_option {
+                        total_disks_checked += 1;
+                        debug!("Checking disk {} in pool {}: {}", disk_idx, pool_idx, disk.path().display());
+
+                        match disk.check_parts(bucket, object, &file_info).await {
+                            Ok(check_result) => {
+                                debug!(
+                                    "check_parts returned {} results for disk {}",
+                                    check_result.results.len(),
+                                    disk.path().display()
+                                );
+
+                                // Check if any parts are missing or corrupt
+                                for (part_idx, &result) in check_result.results.iter().enumerate() {
+                                    debug!("Part {} result: {} on disk {}", part_idx, result, disk.path().display());
+
+                                    if result == 4 || result == 5 {
+                                        // CHECK_PART_FILE_NOT_FOUND or CHECK_PART_FILE_CORRUPT
+                                        has_missing_parts = true;
+                                        disks_with_errors += 1;
+                                        warn!(
+                                            "Found missing or corrupt part {} for object {}/{} on disk {} (pool {}): result={}",
+                                            part_idx,
+                                            bucket,
+                                            object,
+                                            disk.path().display(),
+                                            pool_idx,
+                                            result
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                disks_with_errors += 1;
+                                warn!("Failed to check parts on disk {}: {}", disk.path().display(), e);
+                                // Continue checking other disks
+                            }
+                        }
+
+                        if has_missing_parts {
+                            break; // No need to check other disks if we found missing parts
+                        }
+                    } else {
+                        debug!("Disk {} in pool {} is None", disk_idx, pool_idx);
+                    }
+                }
+
+                if has_missing_parts {
+                    break; // No need to check other pools if we found missing parts
+                }
+            }
+
+            debug!(
+                "Data parts check completed for {}/{}: total_disks={}, disks_with_errors={}, has_missing_parts={}",
+                bucket, object, total_disks_checked, disks_with_errors, has_missing_parts
+            );
+
+            if has_missing_parts {
+                return Err(Error::Other(format!("Object has missing or corrupt data parts: {bucket}/{object}")));
+            }
+        }
+
+        debug!("Data parts integrity verified for {}/{}", bucket, object);
         Ok(())
     }
 
@@ -402,8 +631,15 @@ impl Scanner {
 
         info!("Scanning EC set {} in pool {}", set_index, pool_index);
 
+        // list all bucket for heal bucket
+
         // Get online disks from this EC set
         let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
+
+        // Check volume consistency across disks and heal missing buckets
+        if !disks.is_empty() {
+            self.check_and_heal_missing_volumes(&disks, set_index, pool_index).await?;
+        }
 
         if disks.is_empty() {
             warn!("No online disks available for EC set {} in pool {}", set_index, pool_index);
@@ -468,6 +704,9 @@ impl Scanner {
     async fn scan_disk(&self, disk: &DiskStore) -> Result<HashMap<String, HashMap<String, rustfs_filemeta::FileMeta>>> {
         let disk_path = disk.path().to_string_lossy().to_string();
 
+        // Start global metrics collection for disk scan
+        let stop_fn = Metrics::time(Metric::ScanBucketDrive);
+
         info!("Scanning disk: {}", disk_path);
 
         // Update disk metrics
@@ -495,6 +734,44 @@ impl Scanner {
                 metrics.free_space = disk_info.free;
                 metrics.is_online = disk.is_online().await;
 
+                // check disk status, if offline, submit erasure set heal task
+                if !metrics.is_online {
+                    let enable_healing = self.config.read().await.enable_healing;
+                    if enable_healing {
+                        if let Some(heal_manager) = &self.heal_manager {
+                            // Get bucket list for erasure set healing
+                            let buckets = match rustfs_ecstore::new_object_layer_fn() {
+                                Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                                    Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                                    Err(e) => {
+                                        error!("Failed to get bucket list for disk healing: {}", e);
+                                        return Err(Error::Storage(e));
+                                    }
+                                },
+                                None => {
+                                    error!("No ECStore available for getting bucket list");
+                                    return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
+                                }
+                            };
+
+                            let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
+                            let req = HealRequest::new(
+                                crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
+                                crate::heal::task::HealOptions::default(),
+                                crate::heal::task::HealPriority::High,
+                            );
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    warn!("disk offline, submit erasure set heal task: {} {}", task_id, disk_path);
+                                }
+                                Err(e) => {
+                                    error!("disk offline, submit erasure set heal task failed: {} {}", disk_path, e);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Additional disk info for debugging
                 debug!(
                     "Disk {}: total={}, used={}, free={}, online={}",
@@ -514,6 +791,43 @@ impl Scanner {
             Ok(volumes) => volumes,
             Err(e) => {
                 error!("Failed to list volumes on disk {}: {}", disk_path, e);
+
+                // disk access failed, submit erasure set heal task
+                let enable_healing = self.config.read().await.enable_healing;
+                if enable_healing {
+                    if let Some(heal_manager) = &self.heal_manager {
+                        // Get bucket list for erasure set healing
+                        let buckets = match rustfs_ecstore::new_object_layer_fn() {
+                            Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                                Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                                Err(e) => {
+                                    error!("Failed to get bucket list for disk healing: {}", e);
+                                    return Err(Error::Storage(e));
+                                }
+                            },
+                            None => {
+                                error!("No ECStore available for getting bucket list");
+                                return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
+                            }
+                        };
+
+                        let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
+                        let req = HealRequest::new(
+                            crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
+                            crate::heal::task::HealOptions::default(),
+                            crate::heal::task::HealPriority::Urgent,
+                        );
+                        match heal_manager.submit_heal_request(req).await {
+                            Ok(task_id) => {
+                                warn!("disk access failed, submit erasure set heal task: {} {}", task_id, disk_path);
+                            }
+                            Err(heal_err) => {
+                                error!("disk access failed, submit erasure set heal task failed: {} {}", disk_path, heal_err);
+                            }
+                        }
+                    }
+                }
+
                 return Err(Error::Storage(e.into()));
             }
         };
@@ -556,6 +870,9 @@ impl Scanner {
             state.scanning_disks.retain(|d| d != &disk_path);
         }
 
+        // Complete global metrics collection for disk scan
+        stop_fn();
+
         Ok(disk_objects)
     }
 
@@ -564,6 +881,9 @@ impl Scanner {
     /// This method collects all objects from a disk for a specific bucket.
     /// It returns a map of object names to their metadata for later analysis.
     async fn scan_volume(&self, disk: &DiskStore, bucket: &str) -> Result<HashMap<String, rustfs_filemeta::FileMeta>> {
+        // Start global metrics collection for volume scan
+        let stop_fn = Metrics::time(Metric::ScanObject);
+
         info!("Scanning bucket: {} on disk: {}", bucket, disk.to_string());
 
         // Initialize bucket metrics if not exists
@@ -625,6 +945,28 @@ impl Scanner {
                     if file_meta.versions.is_empty() {
                         objects_with_issues += 1;
                         warn!("Object {} has no versions", entry.name);
+
+                        // 对象元数据损坏，提交元数据heal任务
+                        let enable_healing = self.config.read().await.enable_healing;
+                        if enable_healing {
+                            if let Some(heal_manager) = &self.heal_manager {
+                                let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
+                                match heal_manager.submit_heal_request(req).await {
+                                    Ok(task_id) => {
+                                        warn!(
+                                            "object metadata damaged, submit heal task: {} {} / {}",
+                                            task_id, bucket, entry.name
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "object metadata damaged, submit heal task failed: {} / {} {}",
+                                            bucket, entry.name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         // Store object metadata for later analysis
                         object_metadata.insert(entry.name.clone(), file_meta.clone());
@@ -632,6 +974,28 @@ impl Scanner {
                 } else {
                     objects_with_issues += 1;
                     warn!("Failed to parse metadata for object {}", entry.name);
+
+                    // 对象元数据解析失败，提交元数据heal任务
+                    let enable_healing = self.config.read().await.enable_healing;
+                    if enable_healing {
+                        if let Some(heal_manager) = &self.heal_manager {
+                            let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    warn!(
+                                        "object metadata parse failed, submit heal task: {} {} / {}",
+                                        task_id, bucket, entry.name
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "object metadata parse failed, submit heal task failed: {} / {} {}",
+                                        bucket, entry.name, e
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -658,6 +1022,9 @@ impl Scanner {
             let mut state = self.state.write().await;
             state.scanning_buckets.retain(|b| b != bucket);
         }
+
+        // Complete global metrics collection for volume scan
+        stop_fn();
 
         debug!(
             "Completed scanning bucket: {} on disk {} ({} objects, {} issues)",
@@ -734,27 +1101,42 @@ impl Scanner {
                     objects_needing_heal += 1;
                     let missing_disks: Vec<usize> = (0..disks.len()).filter(|&i| !locations.contains(&i)).collect();
                     warn!("Object {}/{} missing from disks: {:?}", bucket, object_name, missing_disks);
-                    println!("Object {bucket}/{object_name} missing from disks: {missing_disks:?}");
-                    // TODO: Trigger heal for this object
+
+                    // submit heal task
+                    let enable_healing = self.config.read().await.enable_healing;
+                    if enable_healing {
+                        if let Some(heal_manager) = &self.heal_manager {
+                            use crate::heal::{HealPriority, HealRequest};
+                            let req = HealRequest::new(
+                                crate::heal::HealType::Object {
+                                    bucket: bucket.clone(),
+                                    object: object_name.clone(),
+                                    version_id: None,
+                                },
+                                crate::heal::HealOptions::default(),
+                                HealPriority::High,
+                            );
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    warn!(
+                                        "object missing, submit heal task: {} {} / {} (missing disks: {:?})",
+                                        task_id, bucket, object_name, missing_disks
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("object missing, submit heal task failed: {} / {} {}", bucket, object_name, e);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Step 3: Deep scan EC verification
                 let config = self.config.read().await;
                 if config.scan_mode == ScanMode::Deep {
-                    // Find the first disk that has this object to get metadata
-                    if let Some(&first_disk_idx) = locations.first() {
-                        if let Some(file_meta) = all_disk_objects[first_disk_idx]
-                            .get(bucket)
-                            .and_then(|objects| objects.get(object_name))
-                        {
-                            if let Err(e) = self
-                                .verify_ec_decode_with_locations(bucket, object_name, file_meta, locations, disks)
-                                .await
-                            {
-                                objects_with_ec_issues += 1;
-                                warn!("EC decode verification failed for object {}/{}: {}", bucket, object_name, e);
-                            }
-                        }
+                    if let Err(e) = self.verify_object_integrity(bucket, object_name).await {
+                        objects_with_ec_issues += 1;
+                        warn!("Object integrity verification failed for object {}/{}: {}", bucket, object_name, e);
                     }
                 }
             }
@@ -775,98 +1157,6 @@ impl Scanner {
         drop(config);
 
         Ok(())
-    }
-
-    /// Verify EC decode capability for an object using known disk locations
-    ///
-    /// This method is optimized to use the known locations of object copies
-    /// instead of scanning all disks.
-    async fn verify_ec_decode_with_locations(
-        &self,
-        bucket: &str,
-        object: &str,
-        file_meta: &rustfs_filemeta::FileMeta,
-        locations: &[usize],
-        all_disks: &[DiskStore],
-    ) -> Result<()> {
-        // Get EC parameters from the latest version
-        let (data_blocks, _parity_blocks) = if let Some(latest_version) = file_meta.versions.last() {
-            if let Ok(version) = rustfs_filemeta::FileMetaVersion::try_from(latest_version.clone()) {
-                if let Some(obj) = version.object {
-                    (obj.erasure_m, obj.erasure_n)
-                } else {
-                    // Not an object version, skip EC verification
-                    return Ok(());
-                }
-            } else {
-                // Cannot parse version, skip EC verification
-                return Ok(());
-            }
-        } else {
-            // No versions, skip EC verification
-            return Ok(());
-        };
-
-        let read_quorum = data_blocks; // Need at least data_blocks to decode
-
-        if locations.len() < read_quorum {
-            return Err(Error::Scanner(format!(
-                "Insufficient object copies for EC decode: need {}, have {}",
-                read_quorum,
-                locations.len()
-            )));
-        }
-
-        // Try to read object metadata from the known locations
-        let mut successful_reads = 0;
-        let mut errors = Vec::new();
-
-        for &disk_idx in locations {
-            if successful_reads >= read_quorum {
-                break; // We have enough copies for EC decode
-            }
-
-            let disk = &all_disks[disk_idx];
-            match disk.read_xl(bucket, object, false).await {
-                Ok(_) => {
-                    successful_reads += 1;
-                    debug!(
-                        "Successfully read object {}/{} from disk {} (index: {})",
-                        bucket,
-                        object,
-                        disk.to_string(),
-                        disk_idx
-                    );
-                }
-                Err(e) => {
-                    let error_msg = format!("{e}");
-                    errors.push(error_msg);
-                    debug!(
-                        "Failed to read object {}/{} from disk {} (index: {}): {}",
-                        bucket,
-                        object,
-                        disk.to_string(),
-                        disk_idx,
-                        e
-                    );
-                }
-            }
-        }
-
-        if successful_reads >= read_quorum {
-            debug!(
-                "EC decode verification passed for object {}/{} ({} successful reads from {} locations)",
-                bucket,
-                object,
-                successful_reads,
-                locations.len()
-            );
-            Ok(())
-        } else {
-            Err(Error::Scanner(format!(
-                "EC decode verification failed for object {bucket}/{object}: need {read_quorum} reads, got {successful_reads} (errors: {errors:?})"
-            )))
-        }
     }
 
     /// Background scan loop with graceful shutdown
@@ -981,7 +1271,7 @@ impl Scanner {
                 // Offload persistence to background task
                 let data_clone = data_usage.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = super::data_usage::store_data_usage_in_backend(data_clone, store).await {
+                    if let Err(e) = store_data_usage_in_backend(data_clone, store).await {
                         error!("Failed to store data usage statistics to backend: {}", e);
                     } else {
                         info!("Successfully stored data usage statistics to backend");
@@ -990,6 +1280,91 @@ impl Scanner {
             } else {
                 warn!("Storage not available, skipping backend persistence");
             }
+        }
+
+        Ok(())
+    }
+
+    /// Check volume consistency across disks and heal missing buckets
+    async fn check_and_heal_missing_volumes(&self, disks: &[DiskStore], set_index: usize, pool_index: usize) -> Result<()> {
+        info!("Checking volume consistency for EC set {} in pool {}", set_index, pool_index);
+
+        // Step 1: Collect bucket lists from all online disks
+        let mut disk_bucket_lists = Vec::new();
+        let mut all_buckets = std::collections::HashSet::new();
+
+        for (disk_idx, disk) in disks.iter().enumerate() {
+            match disk.list_volumes().await {
+                Ok(volumes) => {
+                    let bucket_names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
+                    for bucket in &bucket_names {
+                        all_buckets.insert(bucket.clone());
+                    }
+                    disk_bucket_lists.push((disk_idx, bucket_names));
+                    debug!("Disk {} has {} buckets", disk_idx, volumes.len());
+                }
+                Err(e) => {
+                    warn!("Failed to list volumes on disk {}: {}", disk_idx, e);
+                    disk_bucket_lists.push((disk_idx, Vec::new()));
+                }
+            }
+        }
+
+        // Step 2: Find missing buckets on each disk
+        let mut missing_buckets_count = 0;
+        for (disk_idx, disk_buckets) in &disk_bucket_lists {
+            let disk_bucket_set: std::collections::HashSet<_> = disk_buckets.iter().collect();
+            let missing_buckets: Vec<_> = all_buckets
+                .iter()
+                .filter(|bucket| !disk_bucket_set.contains(bucket))
+                .collect();
+
+            if !missing_buckets.is_empty() {
+                missing_buckets_count += missing_buckets.len();
+                warn!("Disk {} is missing {} buckets: {:?}", disk_idx, missing_buckets.len(), missing_buckets);
+
+                // Step 3: Submit heal tasks for missing buckets
+                let enable_healing = self.config.read().await.enable_healing;
+                if enable_healing {
+                    if let Some(heal_manager) = &self.heal_manager {
+                        for bucket in missing_buckets {
+                            let req = crate::heal::HealRequest::bucket(bucket.clone());
+                            match heal_manager.submit_heal_request(req).await {
+                                Ok(task_id) => {
+                                    info!(
+                                        "Submitted bucket heal task {} for missing bucket '{}' on disk {}",
+                                        task_id, bucket, disk_idx
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("Failed to submit bucket heal task for '{}' on disk {}: {}", bucket, disk_idx, e);
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("Healing is enabled but no heal manager available");
+                    }
+                } else {
+                    info!("Healing is disabled, skipping bucket heal tasks");
+                }
+            }
+        }
+
+        if missing_buckets_count > 0 {
+            warn!(
+                "Found {} missing bucket instances across {} disks in EC set {} (pool {})",
+                missing_buckets_count,
+                disks.len(),
+                set_index,
+                pool_index
+            );
+        } else {
+            info!(
+                "All buckets are consistent across {} disks in EC set {} (pool {})",
+                disks.len(),
+                set_index,
+                pool_index
+            );
         }
 
         Ok(())
@@ -1005,6 +1380,7 @@ impl Scanner {
             disk_metrics: Arc::clone(&self.disk_metrics),
             data_usage_stats: Arc::clone(&self.data_usage_stats),
             last_data_usage_collection: Arc::clone(&self.last_data_usage_collection),
+            heal_manager: self.heal_manager.clone(),
         }
     }
 }
@@ -1012,6 +1388,8 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::manager::HealConfig;
+    use rustfs_ecstore::data_usage::load_data_usage_from_backend;
     use rustfs_ecstore::disk::endpoint::Endpoint;
     use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_ecstore::store::ECStore;
@@ -1019,10 +1397,20 @@ mod tests {
         StorageAPI,
         store_api::{MakeBucketOptions, ObjectIO, PutObjReader},
     };
+    use serial_test::serial;
     use std::fs;
     use std::net::SocketAddr;
+    use std::sync::OnceLock;
+
+    // Global test environment cache to avoid repeated initialization
+    static GLOBAL_TEST_ENV: OnceLock<(Vec<std::path::PathBuf>, Arc<ECStore>)> = OnceLock::new();
 
     async fn prepare_test_env(test_dir: Option<&str>, port: Option<u16>) -> (Vec<std::path::PathBuf>, Arc<ECStore>) {
+        // Check if global environment is already initialized
+        if let Some((disk_paths, ecstore)) = GLOBAL_TEST_ENV.get() {
+            return (disk_paths.clone(), ecstore.clone());
+        }
+
         // create temp dir as 4 disks
         let test_base_dir = test_dir.unwrap_or("/tmp/rustfs_ahm_test");
         let temp_dir = std::path::PathBuf::from(test_base_dir);
@@ -1084,11 +1472,14 @@ mod tests {
         let buckets = buckets_list.into_iter().map(|v| v.name).collect();
         rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
+        // Store in global cache
+        let _ = GLOBAL_TEST_ENV.set((disk_paths.clone(), ecstore.clone()));
+
         (disk_paths, ecstore)
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
+    #[serial]
     async fn test_scanner_basic_functionality() {
         const TEST_DIR_BASIC: &str = "/tmp/rustfs_ahm_test_basic";
         let (disk_paths, ecstore) = prepare_test_env(Some(TEST_DIR_BASIC), Some(9001)).await;
@@ -1121,7 +1512,7 @@ mod tests {
             .expect("put_object failed");
 
         // create Scanner and test basic functionality
-        let scanner = Scanner::new(None);
+        let scanner = Scanner::new(None, None);
 
         // Test 1: Normal scan - verify object is found
         println!("=== Test 1: Normal scan ===");
@@ -1186,7 +1577,7 @@ mod tests {
 
     // test data usage statistics collection and validation
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
+    #[serial]
     async fn test_scanner_usage_stats() {
         const TEST_DIR_USAGE_STATS: &str = "/tmp/rustfs_ahm_test_usage_stats";
         let (_, ecstore) = prepare_test_env(Some(TEST_DIR_USAGE_STATS), Some(9002)).await;
@@ -1200,7 +1591,7 @@ mod tests {
             .await
             .unwrap();
 
-        let scanner = Scanner::new(None);
+        let scanner = Scanner::new(None, None);
 
         // enable statistics
         {
@@ -1226,7 +1617,7 @@ mod tests {
 
         // verify correctness of persisted data
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let persisted = crate::scanner::data_usage::load_data_usage_from_backend(ecstore.clone())
+        let persisted = load_data_usage_from_backend(ecstore.clone())
             .await
             .expect("load persisted usage");
         assert_eq!(persisted.objects_total_count, du_after.objects_total_count);
@@ -1243,5 +1634,525 @@ mod tests {
 
         // clean up temp dir
         let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_USAGE_STATS));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_volume_healing_functionality() {
+        const TEST_DIR_VOLUME_HEAL: &str = "/tmp/rustfs_ahm_test_volume_heal";
+        let (disk_paths, ecstore) = prepare_test_env(Some(TEST_DIR_VOLUME_HEAL), Some(9003)).await;
+
+        // Create test buckets
+        let bucket1 = "test-bucket-1";
+        let bucket2 = "test-bucket-2";
+
+        ecstore.make_bucket(bucket1, &Default::default()).await.unwrap();
+        ecstore.make_bucket(bucket2, &Default::default()).await.unwrap();
+
+        // Add some test objects
+        let mut pr1 = PutObjReader::from_vec(b"test data 1".to_vec());
+        ecstore
+            .put_object(bucket1, "obj1", &mut pr1, &Default::default())
+            .await
+            .unwrap();
+
+        let mut pr2 = PutObjReader::from_vec(b"test data 2".to_vec());
+        ecstore
+            .put_object(bucket2, "obj2", &mut pr2, &Default::default())
+            .await
+            .unwrap();
+
+        // Simulate missing bucket on one disk by removing bucket directory
+        let disk1_bucket1_path = disk_paths[0].join(bucket1);
+        if disk1_bucket1_path.exists() {
+            println!("Removing bucket directory to simulate missing volume: {disk1_bucket1_path:?}");
+            match fs::remove_dir_all(&disk1_bucket1_path) {
+                Ok(_) => println!("Successfully removed bucket directory from disk 0"),
+                Err(e) => println!("Failed to remove bucket directory: {e}"),
+            }
+        }
+
+        // Create scanner without heal manager for now (testing the detection logic)
+        let scanner = Scanner::new(None, None);
+
+        // Enable healing in config
+        {
+            let mut config = scanner.config.write().await;
+            config.enable_healing = true;
+        }
+
+        println!("=== Testing volume healing functionality ===");
+
+        // Run scan cycle which should detect missing volume
+        // The new check_and_heal_missing_volumes function should be called
+        let scan_result = scanner.scan_cycle().await;
+        assert!(scan_result.is_ok(), "Scan cycle should succeed");
+
+        // Get metrics to verify scan completed
+        let metrics = scanner.get_metrics().await;
+        assert!(metrics.total_cycles > 0, "Should have completed scan cycles");
+        println!("Volume healing detection test completed successfully");
+        println!("Scan metrics: {metrics:?}");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_VOLUME_HEAL));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_scanner_detect_missing_data_parts() {
+        const TEST_DIR_MISSING_PARTS: &str = "/tmp/rustfs_ahm_test_missing_parts";
+        let (disk_paths, ecstore) = prepare_test_env(Some(TEST_DIR_MISSING_PARTS), Some(9004)).await;
+
+        // Create test bucket
+        let bucket_name = "test-bucket-parts";
+        let object_name = "large-object-20mb";
+
+        ecstore.make_bucket(bucket_name, &Default::default()).await.unwrap();
+
+        // Create a 20MB object to ensure it has multiple parts (MIN_PART_SIZE is 16MB)
+        let large_data = vec![b'A'; 20 * 1024 * 1024]; // 20MB of 'A' characters
+        let mut put_reader = PutObjReader::from_vec(large_data);
+        let object_opts = rustfs_ecstore::store_api::ObjectOptions::default();
+
+        println!("=== Creating 20MB object ===");
+        ecstore
+            .put_object(bucket_name, object_name, &mut put_reader, &object_opts)
+            .await
+            .expect("put_object failed for large object");
+
+        // Verify object was created and get its info
+        let obj_info = ecstore
+            .get_object_info(bucket_name, object_name, &object_opts)
+            .await
+            .expect("get_object_info failed");
+
+        println!(
+            "Object info: size={}, parts={}, inlined={}",
+            obj_info.size,
+            obj_info.parts.len(),
+            obj_info.inlined
+        );
+        assert!(!obj_info.inlined, "20MB object should not be inlined");
+        // Note: Even 20MB might be stored as single part depending on configuration
+        println!("Object has {} parts", obj_info.parts.len());
+
+        // Create HealManager and Scanner with shorter heal interval for testing
+        let heal_storage = Arc::new(crate::heal::storage::ECStoreHealStorage::new(ecstore.clone()));
+        let heal_config = HealConfig {
+            enable_auto_heal: true,
+            heal_interval: Duration::from_millis(100), // 100ms for faster testing
+            max_concurrent_heals: 4,
+            task_timeout: Duration::from_secs(300),
+            queue_size: 1000,
+        };
+        let heal_manager = Arc::new(crate::heal::HealManager::new(heal_storage, Some(heal_config)));
+        heal_manager.start().await.unwrap();
+        let scanner = Scanner::new(None, Some(heal_manager.clone()));
+
+        // Enable healing to detect missing parts
+        {
+            let mut config = scanner.config.write().await;
+            config.enable_healing = true;
+            config.scan_mode = ScanMode::Deep;
+        }
+
+        println!("=== Initial scan (all parts present) ===");
+        let initial_scan = scanner.scan_cycle().await;
+        assert!(initial_scan.is_ok(), "Initial scan should succeed");
+
+        let initial_metrics = scanner.get_metrics().await;
+        println!("Initial scan metrics: objects_scanned={}", initial_metrics.objects_scanned);
+
+        // Simulate data part loss by deleting part files from some disks
+        println!("=== Simulating data part loss ===");
+        let mut deleted_parts = 0;
+        let mut deleted_part_paths = Vec::new(); // Track deleted file paths for later verification
+
+        for (disk_idx, disk_path) in disk_paths.iter().enumerate() {
+            if disk_idx > 0 {
+                // Only delete from first two disks
+                break;
+            }
+            let bucket_path = disk_path.join(bucket_name);
+            let object_path = bucket_path.join(object_name);
+
+            if !object_path.exists() {
+                continue;
+            }
+
+            // Find the data directory (UUID)
+            if let Ok(entries) = fs::read_dir(&object_path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        // This is likely the data_dir, look for part files inside
+                        let part_file_path = entry_path.join("part.1");
+                        if part_file_path.exists() {
+                            match fs::remove_file(&part_file_path) {
+                                Ok(_) => {
+                                    println!("Deleted part file: {part_file_path:?}");
+                                    deleted_part_paths.push(part_file_path); // Store path for verification
+                                    deleted_parts += 1;
+                                }
+                                Err(e) => {
+                                    println!("Failed to delete part file {part_file_path:?}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("Deleted {deleted_parts} part files to simulate data loss");
+        assert!(deleted_parts > 0, "Should have deleted some part files");
+
+        // Scan again to detect missing parts
+        println!("=== Scan after data deletion (should detect missing data) ===");
+        let scan_after_deletion = scanner.scan_cycle().await;
+
+        // Wait a bit for the heal manager to process the queue
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Add debug information
+        println!("=== Debug: Checking heal manager state ===");
+        let tasks_count = heal_manager.get_active_tasks_count().await;
+        println!("Active heal tasks count: {tasks_count}");
+
+        // Check heal statistics to see if any tasks were submitted
+        let heal_stats = heal_manager.get_statistics().await;
+        println!("Heal statistics:");
+        println!("  - total_tasks: {}", heal_stats.total_tasks);
+        println!("  - successful_tasks: {}", heal_stats.successful_tasks);
+        println!("  - failed_tasks: {}", heal_stats.failed_tasks);
+        println!("  - running_tasks: {}", heal_stats.running_tasks);
+
+        // Get scanner metrics to see what was scanned
+        let final_metrics = scanner.get_metrics().await;
+        println!("Scanner metrics after deletion scan:");
+        println!("  - objects_scanned: {}", final_metrics.objects_scanned);
+        println!("  - healthy_objects: {}", final_metrics.healthy_objects);
+        println!("  - corrupted_objects: {}", final_metrics.corrupted_objects);
+        println!("  - objects_with_issues: {}", final_metrics.objects_with_issues);
+
+        // Try to manually verify the object to see what happens
+        println!("=== Manual object verification ===");
+        if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
+            match ecstore.verify_object_integrity(bucket_name, object_name, &object_opts).await {
+                Ok(_) => println!("Manual verification: Object is healthy"),
+                Err(e) => println!("Manual verification: Object verification failed: {e}"),
+            }
+        }
+
+        // Check if a heal task was submitted (check total tasks instead of active tasks)
+        assert!(heal_stats.total_tasks > 0, "Heal task should have been submitted");
+        println!("{} heal tasks submitted in total", heal_stats.total_tasks);
+
+        // Scanner should handle missing parts gracefully but may detect errors
+        match scan_after_deletion {
+            Ok(_) => {
+                println!("Scanner completed successfully despite missing data");
+            }
+            Err(e) => {
+                println!("Scanner detected errors (expected): {e}");
+                // This is acceptable - scanner may report errors when data is missing
+            }
+        }
+
+        let final_metrics = scanner.get_metrics().await;
+        println!("Final scan metrics: objects_scanned={}", final_metrics.objects_scanned);
+
+        // Verify that scanner completed additional cycles
+        assert!(
+            final_metrics.total_cycles > initial_metrics.total_cycles,
+            "Should have completed additional scan cycles"
+        );
+
+        // Test object retrieval after data loss
+        println!("=== Testing object retrieval after data loss ===");
+        let get_result = ecstore.get_object_info(bucket_name, object_name, &object_opts).await;
+        match get_result {
+            Ok(info) => {
+                println!("Object still accessible: size={}", info.size);
+                // EC should allow recovery if enough shards remain
+            }
+            Err(e) => {
+                println!("Object not accessible due to missing data: {e}");
+                // This is expected if too many shards are missing
+            }
+        }
+
+        println!("=== Test completed ===");
+        println!("Scanner successfully handled missing data scenario");
+
+        // Verify that deleted part files have been restored by the healing process
+        println!("=== Verifying file recovery ===");
+        let mut recovered_files = 0;
+        for deleted_path in &deleted_part_paths {
+            assert!(deleted_path.exists(), "Deleted file should have been recovered");
+            println!("Recovered file: {deleted_path:?}");
+            recovered_files += 1;
+        }
+
+        // Assert that at least some files have been recovered
+        // Note: In a real scenario, healing might take longer, but our test setup should allow recovery
+        if heal_stats.successful_tasks > 0 {
+            assert!(
+                recovered_files == deleted_part_paths.len(),
+                "Expected at least some deleted files to be recovered by healing process. \
+                    Deleted {} files, recovered {} files, successful heal tasks: {}",
+                deleted_part_paths.len(),
+                recovered_files,
+                heal_stats.successful_tasks
+            );
+            println!("Successfully recovered {}/{} deleted files", recovered_files, deleted_part_paths.len());
+        } else {
+            println!("No successful heal tasks completed yet - healing may still be in progress");
+        }
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_MISSING_PARTS));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_scanner_detect_missing_xl_meta() {
+        const TEST_DIR_MISSING_META: &str = "/tmp/rustfs_ahm_test_missing_meta";
+        let (disk_paths, ecstore) = prepare_test_env(Some(TEST_DIR_MISSING_META), Some(9005)).await;
+
+        // Create test bucket
+        let bucket_name = "test-bucket-meta";
+        let object_name = "test-object-meta";
+
+        ecstore.make_bucket(bucket_name, &Default::default()).await.unwrap();
+
+        // Create a test object
+        let test_data = vec![b'B'; 5 * 1024 * 1024]; // 5MB of 'B' characters
+        let mut put_reader = PutObjReader::from_vec(test_data);
+        let object_opts = rustfs_ecstore::store_api::ObjectOptions::default();
+
+        println!("=== Creating test object ===");
+        ecstore
+            .put_object(bucket_name, object_name, &mut put_reader, &object_opts)
+            .await
+            .expect("put_object failed");
+
+        // Verify object was created and get its info
+        let obj_info = ecstore
+            .get_object_info(bucket_name, object_name, &object_opts)
+            .await
+            .expect("get_object_info failed");
+
+        println!("Object info: size={}, parts={}", obj_info.size, obj_info.parts.len());
+
+        // Create HealManager and Scanner with shorter heal interval for testing
+        let heal_storage = Arc::new(crate::heal::storage::ECStoreHealStorage::new(ecstore.clone()));
+        let heal_config = HealConfig {
+            enable_auto_heal: true,
+            heal_interval: Duration::from_millis(100), // 100ms for faster testing
+            max_concurrent_heals: 4,
+            task_timeout: Duration::from_secs(300),
+            queue_size: 1000,
+        };
+        let heal_manager = Arc::new(crate::heal::HealManager::new(heal_storage, Some(heal_config)));
+        heal_manager.start().await.unwrap();
+        let scanner = Scanner::new(None, Some(heal_manager.clone()));
+
+        // Enable healing to detect missing metadata
+        {
+            let mut config = scanner.config.write().await;
+            config.enable_healing = true;
+            config.scan_mode = ScanMode::Deep;
+        }
+
+        println!("=== Initial scan (all metadata present) ===");
+        let initial_scan = scanner.scan_cycle().await;
+        assert!(initial_scan.is_ok(), "Initial scan should succeed");
+
+        let initial_metrics = scanner.get_metrics().await;
+        println!("Initial scan metrics: objects_scanned={}", initial_metrics.objects_scanned);
+
+        // Simulate xl.meta file loss by deleting xl.meta files from some disks
+        println!("=== Simulating xl.meta file loss ===");
+        let mut deleted_meta_files = 0;
+        let mut deleted_meta_paths = Vec::new(); // Track deleted file paths for later verification
+
+        for (disk_idx, disk_path) in disk_paths.iter().enumerate() {
+            if disk_idx >= 2 {
+                // Only delete from first two disks to ensure some copies remain for recovery
+                break;
+            }
+            let bucket_path = disk_path.join(bucket_name);
+            let object_path = bucket_path.join(object_name);
+
+            if !object_path.exists() {
+                continue;
+            }
+
+            // Delete xl.meta file
+            let xl_meta_path = object_path.join("xl.meta");
+            if xl_meta_path.exists() {
+                match fs::remove_file(&xl_meta_path) {
+                    Ok(_) => {
+                        println!("Deleted xl.meta file: {xl_meta_path:?}");
+                        deleted_meta_paths.push(xl_meta_path);
+                        deleted_meta_files += 1;
+                    }
+                    Err(e) => {
+                        println!("Failed to delete xl.meta file {xl_meta_path:?}: {e}");
+                    }
+                }
+            }
+        }
+
+        println!("Deleted {deleted_meta_files} xl.meta files to simulate metadata loss");
+        assert!(deleted_meta_files > 0, "Should have deleted some xl.meta files");
+
+        // Scan again to detect missing metadata
+        println!("=== Scan after xl.meta deletion (should detect missing metadata) ===");
+        let scan_after_deletion = scanner.scan_cycle().await;
+
+        // Wait a bit for the heal manager to process the queue
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Add debug information
+        println!("=== Debug: Checking heal manager state ===");
+        let tasks_count = heal_manager.get_active_tasks_count().await;
+        println!("Active heal tasks count: {tasks_count}");
+
+        // Check heal statistics to see if any tasks were submitted
+        let heal_stats = heal_manager.get_statistics().await;
+        println!("Heal statistics:");
+        println!("  - total_tasks: {}", heal_stats.total_tasks);
+        println!("  - successful_tasks: {}", heal_stats.successful_tasks);
+        println!("  - failed_tasks: {}", heal_stats.failed_tasks);
+        println!("  - running_tasks: {}", heal_stats.running_tasks);
+
+        // Get scanner metrics to see what was scanned
+        let final_metrics = scanner.get_metrics().await;
+        println!("Scanner metrics after deletion scan:");
+        println!("  - objects_scanned: {}", final_metrics.objects_scanned);
+        println!("  - healthy_objects: {}", final_metrics.healthy_objects);
+        println!("  - corrupted_objects: {}", final_metrics.corrupted_objects);
+        println!("  - objects_with_issues: {}", final_metrics.objects_with_issues);
+
+        // Try to manually verify the object to see what happens
+        println!("=== Manual object verification ===");
+        if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
+            match ecstore.verify_object_integrity(bucket_name, object_name, &object_opts).await {
+                Ok(_) => println!("Manual verification: Object is healthy"),
+                Err(e) => println!("Manual verification: Object verification failed: {e}"),
+            }
+        }
+
+        // Check if a heal task was submitted for metadata recovery
+        assert!(heal_stats.total_tasks > 0, "Heal task should have been submitted for missing xl.meta");
+        println!("{} heal tasks submitted in total", heal_stats.total_tasks);
+
+        // Scanner should handle missing metadata gracefully but may detect errors
+        match scan_after_deletion {
+            Ok(_) => {
+                println!("Scanner completed successfully despite missing metadata");
+            }
+            Err(e) => {
+                println!("Scanner detected errors (expected): {e}");
+                // This is acceptable - scanner may report errors when metadata is missing
+            }
+        }
+
+        let final_metrics = scanner.get_metrics().await;
+        println!("Final scan metrics: objects_scanned={}", final_metrics.objects_scanned);
+
+        // Verify that scanner completed additional cycles
+        assert!(
+            final_metrics.total_cycles > initial_metrics.total_cycles,
+            "Should have completed additional scan cycles"
+        );
+
+        // Test object retrieval after metadata loss
+        println!("=== Testing object retrieval after metadata loss ===");
+        let get_result = ecstore.get_object_info(bucket_name, object_name, &object_opts).await;
+        match get_result {
+            Ok(info) => {
+                println!("Object still accessible: size={}", info.size);
+                // Object should still be accessible if enough metadata copies remain
+            }
+            Err(e) => {
+                println!("Object not accessible due to missing metadata: {e}");
+                // This might happen if too many metadata files are missing
+            }
+        }
+
+        // Wait a bit more for healing to complete
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        // Check heal statistics again after waiting
+        let final_heal_stats = heal_manager.get_statistics().await;
+        println!("Final heal statistics:");
+        println!("  - total_tasks: {}", final_heal_stats.total_tasks);
+        println!("  - successful_tasks: {}", final_heal_stats.successful_tasks);
+        println!("  - failed_tasks: {}", final_heal_stats.failed_tasks);
+
+        // Verify that deleted xl.meta files have been restored by the healing process
+        println!("=== Verifying xl.meta file recovery ===");
+        let mut recovered_files = 0;
+        for deleted_path in &deleted_meta_paths {
+            assert!(deleted_path.exists(), "Deleted xl.meta file should exist after healing");
+            recovered_files += 1;
+            println!("Recovered xl.meta file: {deleted_path:?}");
+        }
+
+        // Assert that healing was attempted
+        assert!(
+            final_heal_stats.total_tasks > 0,
+            "Heal tasks should have been submitted for missing xl.meta files"
+        );
+
+        // Check if any heal tasks were successful
+        if final_heal_stats.successful_tasks > 0 {
+            println!("Healing completed successfully, checking file recovery...");
+            if recovered_files > 0 {
+                println!(
+                    "Successfully recovered {}/{} deleted xl.meta files",
+                    recovered_files,
+                    deleted_meta_paths.len()
+                );
+            } else {
+                println!("No xl.meta files recovered yet - healing may have recreated metadata elsewhere");
+            }
+        } else {
+            println!("No successful heal tasks completed yet - healing may still be in progress or failed");
+
+            // If healing failed, this is acceptable for this test scenario
+            // The important thing is that the scanner detected the issue and submitted heal tasks
+            if final_heal_stats.failed_tasks > 0 {
+                println!("Heal tasks failed - this is acceptable for missing xl.meta scenario");
+                println!("The scanner correctly detected missing metadata and submitted heal requests");
+            }
+        }
+
+        // The key success criteria for this test is that:
+        // 1. Scanner detected missing xl.meta files
+        // 2. Scanner submitted heal tasks for the missing metadata
+        // 3. Scanner handled the situation gracefully without crashing
+        println!("=== Test completed ===");
+        println!("Scanner successfully handled missing xl.meta scenario");
+        println!("Key achievements:");
+        println!("  - Scanner detected missing xl.meta files");
+        println!("  - Scanner submitted {} heal tasks", final_heal_stats.total_tasks);
+        println!("  - Scanner handled the situation gracefully");
+        if recovered_files > 0 {
+            println!(
+                "  - Successfully recovered {}/{} xl.meta files",
+                recovered_files,
+                deleted_meta_paths.len()
+            );
+        } else {
+            println!("  - Note: xl.meta file recovery may require additional time or manual intervention");
+        }
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_MISSING_META));
     }
 }

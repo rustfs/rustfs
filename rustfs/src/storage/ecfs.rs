@@ -32,7 +32,7 @@ use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
 use rustfs_s3select_api::query::Query;
-use rustfs_s3select_api::server::dbms::DatabaseManagerSystem;
+use rustfs_s3select_query::get_global_db;
 
 // use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
 use futures::StreamExt;
@@ -86,7 +86,6 @@ use rustfs_rio::EtagReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
-use rustfs_s3select_query::instance::make_rustfsms;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
@@ -2822,8 +2821,8 @@ impl S3 for FS {
         let input = Arc::new(req.input);
         info!("{:?}", input);
 
-        let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
-            error!("make db failed, {}", e.to_string());
+        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
+            error!("get global db failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
         let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());

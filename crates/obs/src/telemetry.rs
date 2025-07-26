@@ -36,6 +36,7 @@ use rustfs_config::{
 use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::fs;
 use std::io::IsTerminal;
 use tracing::info;
 use tracing_error::ErrorLayer;
@@ -295,6 +296,21 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         let log_directory = config.log_directory.as_deref().unwrap_or(DEFAULT_LOG_DIR);
         let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
 
+        if let Err(e) = fs::create_dir_all(log_directory) {
+            eprintln!("Failed to create log directory {log_directory}: {e}");
+        }
+        #[cfg(unix)]
+        {
+            // Linux/macOS Setting Permissions
+            // Set the log directory permissions to 755 (rwxr-xr-x)
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            match fs::set_permissions(log_directory, Permissions::from_mode(0o755)) {
+                Ok(_) => eprintln!("Log directory permissions set to 755: {log_directory}"),
+                Err(e) => eprintln!("Failed to set log directory permissions {log_directory}: {e}"),
+            }
+        }
+
         // Build log cutting conditions
         let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
             // Cut by time and size at the same time
@@ -354,13 +370,15 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                 FileSpec::default()
                     .directory(log_directory)
                     .basename(log_filename)
-                    .suffix("log"),
+                    .suppress_timestamp(),
             )
             .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files.into()))
             .format_for_files(format_for_file) // Add a custom formatting function for file output
             .duplicate_to_stdout(level_filter) // Use dynamic levels
             .format_for_stdout(format_with_color) // Add a custom formatting function for terminal output
-            .write_mode(WriteMode::Async)
+            .write_mode(WriteMode::BufferAndFlush)
+            .append() // Avoid clearing existing logs at startup
+            .print_message() // Startup information output to console
             .start();
 
         if let Ok(logger) = flexi_logger_result {
@@ -420,7 +438,7 @@ fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: 
     writeln!(
         w,
         "[{}] {} [{}] [{}:{}] [{}:{}] {}",
-        now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
+        now.now().format(flexi_logger::TS_DASHES_BLANK_COLONS_DOT_BLANK),
         level_style.paint(level.to_string()),
         Color::Magenta.paint(record.target()),
         Color::Blue.paint(record.file().unwrap_or("unknown")),
@@ -444,7 +462,7 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
     writeln!(
         w,
         "[{}] {} [{}] [{}:{}] [{}:{}] {}",
-        now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
+        now.now().format(flexi_logger::TS_DASHES_BLANK_COLONS_DOT_BLANK),
         level,
         record.target(),
         record.file().unwrap_or("unknown"),

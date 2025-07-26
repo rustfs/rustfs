@@ -16,7 +16,7 @@ use std::{cmp, env, fs, io::Write, path::Path, process::Command};
 
 type AnyError = Box<dyn std::error::Error>;
 
-const VERSION_PROTOBUF: Version = Version(30, 2, 0); // 30.2.0
+const VERSION_PROTOBUF: Version = Version(27, 2, 0); // 27.2.0
 const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
 /// Build protos if the major version of `flatc` or `protoc` is greater
 /// or lesser than the expected version.
@@ -27,7 +27,7 @@ const ENV_FLATC_PATH: &str = "FLATC_PATH";
 fn main() -> Result<(), AnyError> {
     let version = protobuf_compiler_version()?;
     let need_compile = match version.compare_ext(&VERSION_PROTOBUF) {
-        Ok(cmp::Ordering::Equal) => true,
+        Ok(cmp::Ordering::Greater) => true,
         Ok(_) => {
             let version_err = Version::build_error_message(&version, &VERSION_PROTOBUF).unwrap();
             println!("cargo:warning=Tool `protoc` {version_err}, skip compiling.");
@@ -47,6 +47,7 @@ fn main() -> Result<(), AnyError> {
     // path of proto file
     let project_root_dir = env::current_dir()?.join("crates/protos/src");
     let proto_dir = project_root_dir.clone();
+    println!("proto_dir: {proto_dir:?}");
     let proto_files = &["node.proto"];
     let proto_out_dir = project_root_dir.join("generated").join("proto_gen");
     let flatbuffer_out_dir = project_root_dir.join("generated").join("flatbuffers_generated");
@@ -67,12 +68,44 @@ fn main() -> Result<(), AnyError> {
 
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
     writeln!(&mut generated_mod_rs, "pub mod node_service;")?;
+    writeln!(
+        &mut generated_mod_rs,
+        r#"// Copyright 2024 RustFS Team
+    //
+    // Licensed under the Apache License, Version 2.0 (the "License");
+    // you may not use this file except in compliance with the License.
+    // You may obtain a copy of the License at
+    //
+    //     http://www.apache.org/licenses/LICENSE-2.0
+    //
+    // Unless required by applicable law or agreed to in writing, software
+    // distributed under the License is distributed on an "AS IS" BASIS,
+    // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    // See the License for the specific language governing permissions and
+    // limitations under the License."#
+    )?;
     generated_mod_rs.flush()?;
 
     let generated_mod_rs_path = project_root_dir.join("generated").join("mod.rs");
 
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
     writeln!(&mut generated_mod_rs, "#![allow(unused_imports)]")?;
+    writeln!(
+        &mut generated_mod_rs,
+        r#"// Copyright 2024 RustFS Team
+    //
+    // Licensed under the Apache License, Version 2.0 (the "License");
+    // you may not use this file except in compliance with the License.
+    // You may obtain a copy of the License at
+    //
+    //     http://www.apache.org/licenses/LICENSE-2.0
+    //
+    // Unless required by applicable law or agreed to in writing, software
+    // distributed under the License is distributed on an "AS IS" BASIS,
+    // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    // See the License for the specific language governing permissions and
+    // limitations under the License."#
+    )?;
     writeln!(&mut generated_mod_rs, "#![allow(clippy::all)]")?;
     writeln!(&mut generated_mod_rs, "pub mod proto_gen;")?;
     generated_mod_rs.flush()?;
@@ -107,7 +140,7 @@ fn compile_flatbuffers_models<P: AsRef<Path>, S: AsRef<str>>(
 ) -> Result<(), AnyError> {
     let version = flatbuffers_compiler_version(flatc_path)?;
     let need_compile = match version.compare_ext(&VERSION_FLATBUFFERS) {
-        Ok(cmp::Ordering::Equal) => true,
+        Ok(cmp::Ordering::Greater) => true,
         Ok(_) => {
             let version_err = Version::build_error_message(&version, &VERSION_FLATBUFFERS).unwrap();
             println!("cargo:warning=Tool `{flatc_path}` {version_err}, skip compiling.");
@@ -217,7 +250,7 @@ impl Version {
                     Ok(self.compare_major_version(expected_version))
                 } else {
                     match self.compare_major_version(expected_version) {
-                        cmp::Ordering::Equal => Ok(cmp::Ordering::Equal),
+                        cmp::Ordering::Greater => Ok(cmp::Ordering::Greater),
                         _ => Err(Self::build_error_message(self, expected_version).unwrap()),
                     }
                 }

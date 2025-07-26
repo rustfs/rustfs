@@ -28,9 +28,6 @@ use crate::{
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
-    heal::heal_commands::{
-        DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA, HealOpts,
-    },
     set_disk::SetDisks,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
@@ -41,26 +38,30 @@ use crate::{
 };
 use futures::future::join_all;
 use http::HeaderMap;
-use rustfs_common::globals::GLOBAL_Local_Node_Name;
+use rustfs_common::heal_channel::HealOpts;
+use rustfs_common::{
+    globals::GLOBAL_Local_Node_Name,
+    heal_channel::{DriveState, HealItemType},
+};
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
+
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::heal::heal_ops::HealSequence;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
 use tracing::warn;
 use tracing::{error, info};
+
+use crate::lock_utils::create_unique_clients;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
-    pub lockers: Vec<Vec<LockApi>>,
     pub disk_set: Vec<Arc<SetDisks>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
@@ -93,27 +94,25 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = vec![vec![]; set_count];
-        let mut lockers: Vec<Vec<LockApi>> = vec![vec![]; set_count];
-        endpoints.endpoints.as_ref().iter().enumerate().for_each(|(idx, endpoint)| {
+        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
+
+        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
             let set_idx = idx / set_drive_count;
             if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
                 unique[set_idx].push("local".to_string());
-                lockers[set_idx].push(new_lock_api(true, None));
             }
 
             if !endpoint.is_local {
                 let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
                 if !unique[set_idx].contains(&host_port) {
                     unique[set_idx].push(host_port);
-                    lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));
                 }
             }
-        });
+        }
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        for (i, locker) in lockers.iter().enumerate().take(set_count) {
+        for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
@@ -121,7 +120,6 @@ impl Sets {
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
-                // let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -165,12 +163,13 @@ impl Sets {
                 }
             }
 
-            // warn!("sets new set_drive {:?}", &set_drive);
+            let lock_clients = create_unique_clients(&set_endpoints).await?;
+
+            let namespace_lock = rustfs_lock::NamespaceLock::with_clients(format!("set-{i}"), lock_clients);
 
             let set_disks = SetDisks::new(
-                locker.clone(),
+                Arc::new(namespace_lock),
                 GLOBAL_Local_Node_Name.read().await.to_string(),
-                Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
@@ -190,7 +189,6 @@ impl Sets {
             id: fm.id,
             // sets: todo!(),
             disk_set,
-            lockers,
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),
@@ -543,7 +541,7 @@ impl StorageAPI for Sets {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
-        // 默认返回值
+        // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
@@ -602,7 +600,7 @@ impl StorageAPI for Sets {
         //     del_errs.extend(errs);
         // }
 
-        // TODO: 并发
+        // TODO: Implement concurrency
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
@@ -789,7 +787,7 @@ impl StorageAPI for Sets {
             Err(err) => return Ok((HealResultItem::default(), Some(err))),
         };
         let mut res = HealResultItem {
-            heal_item_type: HEAL_ITEM_METADATA.to_string(),
+            heal_item_type: HealItemType::Metadata.to_string(),
             detail: "disk-format".to_string(),
             disk_count: self.set_count * self.set_drive_count,
             set_count: self.set_count,
@@ -813,7 +811,6 @@ impl StorageAPI for Sets {
         //     return Ok((res, Some(Error::new(DiskError::CorruptedFormat))));
         // }
 
-        let format_op_id = Uuid::new_v4().to_string();
         let (new_format_sets, _) = new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
         if !dry_run {
             let mut tmp_new_formats = vec![None; self.set_count * self.set_drive_count];
@@ -821,14 +818,14 @@ impl StorageAPI for Sets {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
                         res.after.drives[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
-                        res.after.drives[i * self.set_drive_count + j].state = DRIVE_STATE_OK.to_string();
+                        res.after.drives[i * self.set_drive_count + j].state = DriveState::Ok.to_string();
                         tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
             }
             // Save new formats `format.json` on unformatted disks.
             for (fm, disk) in tmp_new_formats.iter_mut().zip(disks.iter()) {
-                if fm.is_some() && disk.is_some() && save_format_file(disk, fm, &format_op_id).await.is_err() {
+                if fm.is_some() && disk.is_some() && save_format_file(disk, fm).await.is_err() {
                     let _ = disk.as_ref().unwrap().close().await;
                     *fm = None;
                 }
@@ -871,23 +868,19 @@ impl StorageAPI for Sets {
             .await
     }
     #[tracing::instrument(skip(self))]
-    async fn heal_objects(
-        &self,
-        _bucket: &str,
-        _prefix: &str,
-        _opts: &HealOpts,
-        _hs: Arc<HealSequence>,
-        _is_meta: bool,
-    ) -> Result<()> {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
     async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
         unimplemented!()
     }
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .verify_object_integrity(bucket, object, opts)
+            .await
     }
 }
 
@@ -959,17 +952,17 @@ fn formats_to_drives_info(endpoints: &Endpoints, formats: &[Option<FormatV3>], e
     for (index, format) in formats.iter().enumerate() {
         let drive = endpoints.get_string(index);
         let state = if format.is_some() {
-            DRIVE_STATE_OK
+            DriveState::Ok.to_string()
         } else if let Some(Some(err)) = errs.get(index) {
             if *err == DiskError::UnformattedDisk {
-                DRIVE_STATE_MISSING
+                DriveState::Missing.to_string()
             } else if *err == DiskError::DiskNotFound {
-                DRIVE_STATE_OFFLINE
+                DriveState::Offline.to_string()
             } else {
-                DRIVE_STATE_CORRUPT
+                DriveState::Corrupt.to_string()
             }
         } else {
-            DRIVE_STATE_CORRUPT
+            DriveState::Corrupt.to_string()
         };
 
         let uuid = if let Some(format) = format {

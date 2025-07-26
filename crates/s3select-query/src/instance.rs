@@ -107,27 +107,51 @@ pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) 
     Ok(db_server)
 }
 
+pub async fn make_rustfsms_with_components(
+    input: Arc<SelectObjectContentInput>,
+    is_test: bool,
+    func_manager: Arc<SimpleFunctionMetadataManager>,
+    parser: Arc<DefaultParser>,
+    query_execution_factory: Arc<SqlQueryExecutionFactory>,
+    default_table_provider: Arc<BaseTableProvider>,
+) -> QueryResult<impl DatabaseManagerSystem> {
+    // TODO session config need load global system config
+    let session_factory = Arc::new(SessionCtxFactory { is_test });
+
+    let query_dispatcher = SimpleQueryDispatcherBuilder::default()
+        .with_input(input)
+        .with_func_manager(func_manager)
+        .with_default_table_provider(default_table_provider)
+        .with_session_factory(session_factory)
+        .with_parser(parser)
+        .with_query_execution_factory(query_execution_factory)
+        .build()?;
+
+    let mut builder = RustFSmsBuilder::default();
+
+    let db_server = builder.query_dispatcher(query_dispatcher).build().expect("build db server");
+
+    Ok(db_server)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use datafusion::{arrow::util::pretty, assert_batches_eq};
-    use rustfs_s3select_api::{
-        query::{Context, Query},
-        server::dbms::DatabaseManagerSystem,
-    };
+    use rustfs_s3select_api::query::{Context, Query};
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FieldDelimiter, FileHeaderInfo, InputSerialization, OutputSerialization,
         RecordDelimiter, SelectObjectContentInput, SelectObjectContentRequest,
     };
 
-    use crate::instance::make_rustfsms;
+    use crate::get_global_db;
 
     #[tokio::test]
     #[ignore]
     async fn test_simple_sql() {
         let sql = "select * from S3Object";
-        let input = Arc::new(SelectObjectContentInput {
+        let input = SelectObjectContentInput {
             bucket: "dandan".to_string(),
             expected_bucket_owner: None,
             key: "test.csv".to_string(),
@@ -151,9 +175,9 @@ mod tests {
                 request_progress: None,
                 scan_range: None,
             },
-        });
-        let db = make_rustfsms(input.clone(), true).await.unwrap();
-        let query = Query::new(Context { input }, sql.to_string());
+        };
+        let db = get_global_db(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await.unwrap();
 
@@ -184,7 +208,7 @@ mod tests {
     #[ignore]
     async fn test_func_sql() {
         let sql = "SELECT * FROM S3Object s";
-        let input = Arc::new(SelectObjectContentInput {
+        let input = SelectObjectContentInput {
             bucket: "dandan".to_string(),
             expected_bucket_owner: None,
             key: "test.csv".to_string(),
@@ -210,9 +234,9 @@ mod tests {
                 request_progress: None,
                 scan_range: None,
             },
-        });
-        let db = make_rustfsms(input.clone(), true).await.unwrap();
-        let query = Query::new(Context { input }, sql.to_string());
+        };
+        let db = get_global_db(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await.unwrap();
 

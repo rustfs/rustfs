@@ -43,49 +43,7 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an retention bucket";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IlmAction {
-    NoneAction = 0,
-    DeleteAction,
-    DeleteVersionAction,
-    TransitionAction,
-    TransitionVersionAction,
-    DeleteRestoredAction,
-    DeleteRestoredVersionAction,
-    DeleteAllVersionsAction,
-    DelMarkerDeleteAllVersionsAction,
-    ActionCount,
-}
-
-impl IlmAction {
-    pub fn delete_restored(&self) -> bool {
-        *self == Self::DeleteRestoredAction || *self == Self::DeleteRestoredVersionAction
-    }
-
-    pub fn delete_versioned(&self) -> bool {
-        *self == Self::DeleteVersionAction || *self == Self::DeleteRestoredVersionAction
-    }
-
-    pub fn delete_all(&self) -> bool {
-        *self == Self::DeleteAllVersionsAction || *self == Self::DelMarkerDeleteAllVersionsAction
-    }
-
-    pub fn delete(&self) -> bool {
-        if self.delete_restored() {
-            return true;
-        }
-        *self == Self::DeleteVersionAction
-            || *self == Self::DeleteAction
-            || *self == Self::DeleteAllVersionsAction
-            || *self == Self::DelMarkerDeleteAllVersionsAction
-    }
-}
-
-impl Display for IlmAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
+pub use rustfs_common::metrics::IlmAction;
 
 #[async_trait::async_trait]
 pub trait RuleValidate {

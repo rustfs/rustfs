@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// #![allow(dead_code)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,115 +13,78 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
-use local_locker::LocalLocker;
-use lock_args::LockArgs;
-use remote_client::RemoteClient;
-use std::io::Result;
+// ============================================================================
+// Core Module Declarations
+// ============================================================================
+
+// Application Layer Modules
+pub mod namespace;
+
+// Abstraction Layer Modules
+pub mod client;
+
+// Local Layer Modules
+pub mod local;
+
+// Core Modules
+pub mod error;
+pub mod types;
+
+// ============================================================================
+// Public API Exports
+// ============================================================================
+
+// Re-export main types for easy access
+pub use crate::{
+    // Client interfaces
+    client::{LockClient, local::LocalClient, remote::RemoteClient},
+    // Error types
+    error::{LockError, Result},
+    local::LocalLockMap,
+    // Main components
+    namespace::{NamespaceLock, NamespaceLockManager},
+    // Core types
+    types::{
+        HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,
+        LockType,
+    },
+};
+
+// ============================================================================
+// Version Information
+// ============================================================================
+
+/// Current version of the lock crate
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build timestamp
+pub const BUILD_TIMESTAMP: &str = "unknown";
+
+/// Maximum number of items in delete list
+pub const MAX_DELETE_LIST: usize = 1000;
+
+// ============================================================================
+// Global Lock Map
+// ============================================================================
+
+// Global singleton lock map shared across all lock implementations
+use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use tokio::sync::RwLock;
 
-pub mod drwmutex;
-pub mod local_locker;
-pub mod lock_args;
-pub mod lrwmutex;
-pub mod namespace_lock;
-pub mod remote_client;
+static GLOBAL_LOCK_MAP: OnceCell<Arc<local::LocalLockMap>> = OnceCell::new();
 
-pub static GLOBAL_LOCAL_SERVER: LazyLock<Arc<RwLock<LocalLocker>>> = LazyLock::new(|| Arc::new(RwLock::new(LocalLocker::new())));
-
-type LockClient = dyn Locker;
-
-#[async_trait]
-pub trait Locker {
-    async fn lock(&mut self, args: &LockArgs) -> Result<bool>;
-    async fn unlock(&mut self, args: &LockArgs) -> Result<bool>;
-    async fn rlock(&mut self, args: &LockArgs) -> Result<bool>;
-    async fn runlock(&mut self, args: &LockArgs) -> Result<bool>;
-    async fn refresh(&mut self, args: &LockArgs) -> Result<bool>;
-    async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool>;
-    async fn close(&self);
-    async fn is_online(&self) -> bool;
-    async fn is_local(&self) -> bool;
+/// Get the global shared lock map instance
+pub fn get_global_lock_map() -> Arc<local::LocalLockMap> {
+    GLOBAL_LOCK_MAP.get_or_init(|| Arc::new(local::LocalLockMap::new())).clone()
 }
 
-#[derive(Debug, Clone)]
-pub enum LockApi {
-    Local,
-    Remote(RemoteClient),
-}
+// ============================================================================
+// Convenience Functions
+// ============================================================================
 
-#[async_trait]
-impl Locker for LockApi {
-    async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.lock(args).await,
-            LockApi::Remote(r) => r.lock(args).await,
-        }
-    }
-
-    async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.unlock(args).await,
-            LockApi::Remote(r) => r.unlock(args).await,
-        }
-    }
-
-    async fn rlock(&mut self, args: &LockArgs) -> Result<bool> {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.rlock(args).await,
-            LockApi::Remote(r) => r.rlock(args).await,
-        }
-    }
-
-    async fn runlock(&mut self, args: &LockArgs) -> Result<bool> {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.runlock(args).await,
-            LockApi::Remote(r) => r.runlock(args).await,
-        }
-    }
-
-    async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.refresh(args).await,
-            LockApi::Remote(r) => r.refresh(args).await,
-        }
-    }
-
-    async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.force_unlock(args).await,
-            LockApi::Remote(r) => r.force_unlock(args).await,
-        }
-    }
-
-    async fn close(&self) {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.read().await.close().await,
-            LockApi::Remote(r) => r.close().await,
-        }
-    }
-
-    async fn is_online(&self) -> bool {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.read().await.is_online().await,
-            LockApi::Remote(r) => r.is_online().await,
-        }
-    }
-
-    async fn is_local(&self) -> bool {
-        match self {
-            LockApi::Local => GLOBAL_LOCAL_SERVER.write().await.is_local().await,
-            LockApi::Remote(r) => r.is_local().await,
-        }
-    }
-}
-
-pub fn new_lock_api(is_local: bool, url: Option<url::Url>) -> LockApi {
-    if is_local {
-        return LockApi::Local;
-    }
-
-    LockApi::Remote(RemoteClient::new(url.unwrap()))
+/// Create a new namespace lock
+pub fn create_namespace_lock(namespace: String, _distributed: bool) -> NamespaceLock {
+    // The distributed behavior is now determined by the type of clients added to the NamespaceLock
+    // This function just creates an empty NamespaceLock
+    NamespaceLock::new(namespace)
 }
