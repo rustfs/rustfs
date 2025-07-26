@@ -92,7 +92,8 @@ impl TargetRegistry {
                 target_type, sec_cfg, default_cfg
             );
             // 3. 筛选当前类型相关的环境变量覆盖
-            let env_pref = format!("{}{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type, DEFAULT_DELIMITER).to_uppercase();
+            let env_pref =
+                format!("{}{}{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type, DEFAULT_DELIMITER, ENABLE_KEY).to_uppercase();
             info!("Collected environment variables for {}: env_pref: {} ", target_type, env_pref.clone(),);
             let mut overrides: HashMap<Option<String>, HashMap<String, String>> = HashMap::new();
             for (k, v) in &all_env {
