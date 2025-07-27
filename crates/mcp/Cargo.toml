@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-mcp-server"
+name = "rustfs-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,7 +25,7 @@ keywords = ["mcp", "s3", "aws", "rustfs", "server"]
 categories = ["development-tools", "web-programming"]
 
 [[bin]]
-name = "rustfs-mcp-server"
+name = "rustfs-mcp"
 path = "src/main.rs"
 
 [dependencies]

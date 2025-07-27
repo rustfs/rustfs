@@ -15,7 +15,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rmcp::ServiceExt;
-use rustfs_mcp_server::{Config, RustfsMcpServer};
+use rustfs_mcp::{Config, RustfsMcpServer};
 use std::env;
 use tokio::io::{stdin, stdout};
 use tracing::{Level, error, info};
@@ -94,20 +94,20 @@ fn print_usage_help() {
     eprintln!();
     eprintln!("RustFS MCP Server - Model Context Protocol server for S3 operations");
     eprintln!();
-    eprintln!("For more help, run: rustfs-mcp-server --help");
+    eprintln!("For more help, run: rustfs-mcp --help");
     eprintln!();
     eprintln!("QUICK START:");
     eprintln!("  # Using command-line arguments");
-    eprintln!("  rustfs-mcp-server --access-key-id YOUR_KEY --secret-access-key YOUR_SECRET");
+    eprintln!("  rustfs-mcp --access-key-id YOUR_KEY --secret-access-key YOUR_SECRET");
     eprintln!();
     eprintln!("  # Using environment variables");
     eprintln!("  export AWS_ACCESS_KEY_ID=YOUR_KEY");
     eprintln!("  export AWS_SECRET_ACCESS_KEY=YOUR_SECRET");
-    eprintln!("  rustfs-mcp-server");
+    eprintln!("  rustfs-mcp");
     eprintln!();
     eprintln!("  # For local development with RustFS");
     eprintln!(
-        "  rustfs-mcp-server --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000"
+        "  rustfs-mcp --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000"
     );
     eprintln!();
 }

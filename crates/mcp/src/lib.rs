@@ -19,7 +19,7 @@
 //! ### Command Line Arguments
 //!
 //! ```bash
-//! rustfs-mcp-server --access-key-id YOUR_KEY --secret-access-key YOUR_SECRET
+//! rustfs-mcp --access-key-id YOUR_KEY --secret-access-key YOUR_SECRET
 //! ```
 //!
 //! ### Environment Variables
@@ -29,14 +29,14 @@
 //! export AWS_SECRET_ACCESS_KEY=YOUR_SECRET
 //! export AWS_REGION=us-west-2  # Optional, defaults to us-east-1
 //! export AWS_ENDPOINT_URL=http://localhost:9000  # Optional, for custom endpoints
-//! rustfs-mcp-server
+//! rustfs-mcp
 //! ```
 //!
 //! ### Mixed Configuration
 //!
 //! ```bash
 //! export AWS_REGION=us-east-1
-//! rustfs-mcp-server --access-key-id YOUR_KEY --secret-access-key YOUR_SECRET --endpoint-url http://localhost:9000
+//! rustfs-mcp --access-key-id YOUR_KEY --secret-access-key YOUR_SECRET --endpoint-url http://localhost:9000
 //! ```
 //!
 //! ## Available Tools
@@ -50,17 +50,17 @@
 //!
 //! ### AWS S3
 //! ```bash
-//! rustfs-mcp-server --access-key-id AKIAIOSFODNN7EXAMPLE --secret-access-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY --region us-west-2
+//! rustfs-mcp --access-key-id AKIAIOSFODNN7EXAMPLE --secret-access-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY --region us-west-2
 //! ```
 //!
 //! ### MinIO/LocalStack
 //! ```bash
-//! rustfs-mcp-server --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000
+//! rustfs-mcp --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000
 //! ```
 //!
 //! ### RustFS Development
 //! ```bash
-//! rustfs-mcp-server --access-key-id T0d8VFu1yHL2nGri6KqZ --secret-access-key V6jsCTgSEbHwODz2dkQrKZxXiFUnhGM4e0cWIqPB --endpoint-url http://localhost:9000
+//! rustfs-mcp --access-key-id T0d8VFu1yHL2nGri6KqZ --secret-access-key V6jsCTgSEbHwODz2dkQrKZxXiFUnhGM4e0cWIqPB --endpoint-url http://localhost:9000
 //! ```
 
 // Copyright 2024 RustFS Team
