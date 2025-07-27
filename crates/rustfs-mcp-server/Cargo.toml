@@ -53,3 +53,18 @@ thiserror.workspace = true
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# File handling and MIME type detection
+mime_guess = "2.0"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+# Async trait support for trait abstractions
+async-trait = "0.1"
+
+[dev-dependencies]
+# Testing framework and utilities
+mockall = "0.13"
+tempfile = "3.12"
+tokio-test = "0.4"
+test-case = "3.3"

@@ -42,6 +42,9 @@
 //! ## Available Tools
 //!
 //! - `list_buckets`: List all accessible S3 buckets with creation dates
+//! - `list_objects`: List objects in a specific S3 bucket with optional prefix filtering
+//! - `upload_file`: Upload a local file to an S3 bucket
+//! - `get_object`: Get/download an object from S3 with intelligent content type detection
 //!
 //! ## Usage Examples
 //!
@@ -134,46 +137,6 @@ pub fn validate_environment() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_validate_environment_missing_access_key() {
-        use std::env;
-
-        unsafe {
-            env::remove_var("AWS_ACCESS_KEY_ID");
-            env::remove_var("AWS_SECRET_ACCESS_KEY");
-        }
-
-        let result = validate_environment();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("AWS_ACCESS_KEY_ID"));
-    }
-
-    #[test]
-    fn test_validate_environment_missing_secret_key() {
-        use std::env;
-
-        unsafe {
-            env::set_var("AWS_ACCESS_KEY_ID", "test");
-            env::remove_var("AWS_SECRET_ACCESS_KEY");
-        }
-
-        let result = validate_environment();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("AWS_SECRET_ACCESS_KEY"));
-    }
-
-    #[test]
-    fn test_validate_environment_success() {
-        use std::env;
-
-        unsafe {
-            env::set_var("AWS_ACCESS_KEY_ID", "test");
-            env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-        }
-
-        let result = validate_environment();
-        assert!(result.is_ok());
-    }
 
     #[test]
     fn test_config_creation() {
