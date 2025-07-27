@@ -14,8 +14,10 @@
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config as S3Config};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tracing::{debug, info};
 
 use crate::config::Config;
@@ -52,6 +54,30 @@ pub struct ListObjectsResult {
     pub next_continuation_token: Option<String>,
     pub max_keys: Option<i32>,
     pub key_count: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UploadFileOptions {
+    pub content_type: Option<String>,
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadResult {
+    pub bucket: String,
+    pub key: String,
+    pub etag: String,
+    pub location: String,
+    pub version_id: Option<String>,
+    pub file_size: u64,
+    pub content_type: String,
+    pub upload_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +224,128 @@ impl S3Client {
         );
 
         Ok(result)
+    }
+
+    pub async fn upload_file(
+        &self,
+        local_path: &str,
+        bucket_name: &str,
+        object_key: &str,
+        options: UploadFileOptions,
+    ) -> Result<UploadResult> {
+        info!("Starting file upload: '{}' -> s3://{}/{}", local_path, bucket_name, object_key);
+
+        // Validate and canonicalize file path for security
+        let path = Path::new(local_path);
+        let canonical_path = path
+            .canonicalize()
+            .context(format!("Failed to resolve file path: {}", local_path))?;
+
+        // Check if file exists and is readable
+        if !canonical_path.exists() {
+            anyhow::bail!("File does not exist: {}", local_path);
+        }
+
+        if !canonical_path.is_file() {
+            anyhow::bail!("Path is not a file: {}", local_path);
+        }
+
+        // Get file metadata
+        let metadata = tokio::fs::metadata(&canonical_path)
+            .await
+            .context(format!("Failed to read file metadata: {}", local_path))?;
+        
+        let file_size = metadata.len();
+        debug!("File size: {} bytes", file_size);
+
+        // Auto-detect content type if not provided
+        let content_type = options.content_type.unwrap_or_else(|| {
+            let detected = mime_guess::from_path(&canonical_path)
+                .first_or_octet_stream()
+                .to_string();
+            debug!("Auto-detected content type: {}", detected);
+            detected
+        });
+
+        // Read file content into memory for better compatibility with RustFS
+        let file_content = tokio::fs::read(&canonical_path)
+            .await
+            .context(format!("Failed to read file content: {}", local_path))?;
+        
+        let byte_stream = ByteStream::from(file_content);
+
+        // Prepare upload request
+        let mut request = self.client
+            .put_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .body(byte_stream)
+            .content_type(&content_type)
+            .content_length(file_size as i64);
+
+        // Add optional parameters
+        if let Some(storage_class) = &options.storage_class {
+            request = request.storage_class(storage_class.as_str().into());
+        }
+
+        if let Some(cache_control) = &options.cache_control {
+            request = request.cache_control(cache_control);
+        }
+
+        if let Some(content_disposition) = &options.content_disposition {
+            request = request.content_disposition(content_disposition);
+        }
+
+        if let Some(content_encoding) = &options.content_encoding {
+            request = request.content_encoding(content_encoding);
+        }
+
+        if let Some(content_language) = &options.content_language {
+            request = request.content_language(content_language);
+        }
+
+        if let Some(sse) = &options.server_side_encryption {
+            request = request.server_side_encryption(sse.as_str().into());
+        }
+
+        // Add metadata if provided
+        if let Some(metadata_map) = &options.metadata {
+            for (key, value) in metadata_map {
+                request = request.metadata(key, value);
+            }
+        }
+
+        // Execute upload
+        debug!("Executing S3 put_object request");
+        let response = request
+            .send()
+            .await
+            .context(format!("Failed to upload file to s3://{}/{}", bucket_name, object_key))?;
+
+        // Extract response information
+        let etag = response.e_tag().unwrap_or("unknown").to_string();
+        let version_id = response.version_id().map(|v| v.to_string());
+        
+        // Construct result URL (this is a simplified approach)
+        let location = format!("s3://{}/{}", bucket_name, object_key);
+
+        let upload_result = UploadResult {
+            bucket: bucket_name.to_string(),
+            key: object_key.to_string(),
+            etag,
+            location,
+            version_id,
+            file_size,
+            content_type,
+            upload_id: None, // Only used for multipart uploads
+        };
+
+        info!(
+            "File upload completed successfully: {} bytes uploaded to s3://{}/{}",
+            file_size, bucket_name, object_key
+        );
+
+        Ok(upload_result)
     }
 
     pub async fn health_check(&self) -> Result<()> {

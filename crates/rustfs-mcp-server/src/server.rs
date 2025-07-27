@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::s3_client::{S3Client, ListObjectsOptions};
+use crate::s3_client::{S3Client, ListObjectsOptions, UploadFileOptions};
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ListObjectsRequest {
@@ -34,6 +34,25 @@ pub struct ListObjectsRequest {
     #[serde(default)]
     #[schemars(description = "Optional prefix to filter objects")]
     pub prefix: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct UploadFileRequest {
+    #[schemars(description = "Path to the local file to upload")]
+    pub local_file_path: String,
+    #[schemars(description = "Name of the S3 bucket to upload to")]
+    pub bucket_name: String,
+    #[schemars(description = "S3 object key (path/filename in the bucket)")]
+    pub object_key: String,
+    #[serde(default)]
+    #[schemars(description = "Optional content type (auto-detected if not specified)")]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Optional storage class (STANDARD, REDUCED_REDUNDANCY, etc.)")]
+    pub storage_class: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Optional cache control header")]
+    pub cache_control: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +235,109 @@ impl RustfsMcpServer {
                      • Bucket name contains invalid characters\n\n\
                      Please verify the bucket name, your AWS configuration, and permissions.",
                     req.bucket_name, e
+                )
+            }
+        }
+    }
+
+    #[tool(description = "Upload a local file to an S3 bucket")]
+    pub async fn upload_file(&self, Parameters(req): Parameters<UploadFileRequest>) -> String {
+        info!(
+            "Executing upload_file tool: '{}' -> s3://{}/{}",
+            req.local_file_path, req.bucket_name, req.object_key
+        );
+
+        // Prepare upload options from request
+        let options = UploadFileOptions {
+            content_type: req.content_type.clone(),
+            storage_class: req.storage_class.clone(),
+            cache_control: req.cache_control.clone(),
+            ..UploadFileOptions::default()
+        };
+
+        match self
+            .s3_client
+            .upload_file(&req.local_file_path, &req.bucket_name, &req.object_key, options)
+            .await
+        {
+            Ok(result) => {
+                debug!(
+                    "Successfully uploaded file '{}' to s3://{}/{} ({} bytes)",
+                    req.local_file_path, req.bucket_name, req.object_key, result.file_size
+                );
+
+                let mut result_text = format!(
+                    "✅ **File uploaded successfully!**\n\n\
+                     **Local File:** {}\n\
+                     **S3 Location:** s3://{}/{}\n\
+                     **File Size:** {} bytes ({:.2} MB)\n\
+                     **Content Type:** {}\n\
+                     **ETag:** {}\n",
+                    req.local_file_path,
+                    result.bucket,
+                    result.key,
+                    result.file_size,
+                    result.file_size as f64 / 1_048_576.0, // Convert to MB
+                    result.content_type,
+                    result.etag
+                );
+
+                // Add version ID if available (for versioned buckets)
+                if let Some(ref version_id) = result.version_id {
+                    result_text.push_str(&format!("**Version ID:** {}\n", version_id));
+                }
+
+                // Add upload summary
+                result_text.push_str("\n---\n");
+                result_text.push_str("**Upload Summary:**\n");
+                result_text.push_str(&format!("• Source: {}\n", req.local_file_path));
+                result_text.push_str(&format!("• Destination: {}\n", result.location));
+                result_text.push_str(&format!("• Size: {} bytes\n", result.file_size));
+                result_text.push_str(&format!("• Type: {}\n", result.content_type));
+
+                if result.file_size > 5 * 1024 * 1024 {
+                    result_text.push_str("\n💡 **Note:** Large file uploaded successfully. Consider using multipart upload for files larger than 100MB for better performance and reliability.");
+                }
+
+                info!(
+                    "upload_file tool executed successfully: {} bytes uploaded to s3://{}/{}",
+                    result.file_size, req.bucket_name, req.object_key
+                );
+                result_text
+            }
+            Err(e) => {
+                error!(
+                    "Failed to upload file '{}' to s3://{}/{}: {:?}",
+                    req.local_file_path, req.bucket_name, req.object_key, e
+                );
+
+                format!(
+                    "❌ **Failed to upload file '{}' to S3 bucket '{}'**\n\n\
+                     **Error:** {}\n\n\
+                     **Possible causes:**\n\
+                     • Local file does not exist or is not readable\n\
+                     • AWS credentials lack permissions to upload to this bucket\n\
+                     • S3 bucket does not exist or is not accessible\n\
+                     • Network connectivity issues\n\
+                     • File path contains invalid characters or is too long\n\
+                     • Insufficient disk space or memory\n\
+                     • Custom endpoint is misconfigured\n\
+                     • File is locked by another process\n\n\
+                     **Troubleshooting steps:**\n\
+                     1. Verify the local file exists and is readable\n\
+                     2. Check your AWS credentials and permissions\n\
+                     3. Ensure the bucket name is correct and accessible\n\
+                     4. Try with a smaller file to test connectivity\n\
+                     5. Check the file path for special characters\n\n\
+                     **File:** {}\n\
+                     **Bucket:** {}\n\
+                     **Object Key:** {}",
+                    req.local_file_path,
+                    req.bucket_name,
+                    e,
+                    req.local_file_path,
+                    req.bucket_name,
+                    req.object_key
                 )
             }
         }
