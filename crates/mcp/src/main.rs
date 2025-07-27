@@ -106,8 +106,6 @@ fn print_usage_help() {
     eprintln!("  rustfs-mcp");
     eprintln!();
     eprintln!("  # For local development with RustFS");
-    eprintln!(
-        "  rustfs-mcp --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000"
-    );
+    eprintln!("  rustfs-mcp --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000");
     eprintln!();
 }

@@ -178,11 +178,7 @@ impl RustfsMcpServer {
                 );
 
                 if result.objects.is_empty() && result.common_prefixes.is_empty() {
-                    let prefix_msg = req
-                        .prefix
-                        .as_ref()
-                        .map(|p| format!(" with prefix '{p}'"))
-                        .unwrap_or_default();
+                    let prefix_msg = req.prefix.as_ref().map(|p| format!(" with prefix '{p}'")).unwrap_or_default();
                     return format!(
                         "No objects found in bucket '{}'{prefix_msg}. The bucket may be empty or the prefix may not match any objects.",
                         req.bucket_name
