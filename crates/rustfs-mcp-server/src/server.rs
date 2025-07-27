@@ -14,11 +14,10 @@
 
 use anyhow::Result;
 use rmcp::{
-    ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Parameters},
-    model::{ServerInfo, Implementation, ServerCapabilities, ProtocolVersion, ToolsCapability},
-    service::{RequestContext, NotificationContext},
-    RoleServer, ErrorData,
+    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability},
+    service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -26,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::s3_client::{S3Client, ListObjectsOptions, UploadFileOptions, GetObjectOptions, DetectedFileType};
+use crate::s3_client::{DetectedFileType, GetObjectOptions, ListObjectsOptions, S3Client, UploadFileOptions};
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ListObjectsRequest {
@@ -78,13 +77,17 @@ pub struct GetObjectRequest {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub enum GetObjectMode {
     #[serde(rename = "read")]
-    Read,      // 直接读取内容返回
+    Read, // 直接读取内容返回
     #[serde(rename = "download")]
-    Download,  // 下载到本地文件
+    Download, // 下载到本地文件
 }
 
-fn default_operation_mode() -> GetObjectMode { GetObjectMode::Read }
-fn default_max_content_size() -> usize { 1024 * 1024 } // 1MB
+fn default_operation_mode() -> GetObjectMode {
+    GetObjectMode::Read
+}
+fn default_max_content_size() -> usize {
+    1024 * 1024
+} // 1MB
 
 #[derive(Debug, Clone)]
 pub struct RustfsMcpServer {
@@ -175,9 +178,10 @@ impl RustfsMcpServer {
                 );
 
                 if result.objects.is_empty() && result.common_prefixes.is_empty() {
-                    let prefix_msg = req.prefix
+                    let prefix_msg = req
+                        .prefix
                         .as_ref()
-                        .map(|p| format!(" with prefix '{}'", p))
+                        .map(|p| format!(" with prefix '{p}'"))
                         .unwrap_or_default();
                     return format!(
                         "No objects found in bucket '{}'{prefix_msg}. The bucket may be empty or the prefix may not match any objects.",
@@ -185,13 +189,10 @@ impl RustfsMcpServer {
                     );
                 }
 
-                let mut result_text = format!(
-                    "Found {} object(s) in bucket **{}**",
-                    result.key_count, req.bucket_name
-                );
+                let mut result_text = format!("Found {} object(s) in bucket **{}**", result.key_count, req.bucket_name);
 
                 if let Some(ref p) = req.prefix {
-                    result_text.push_str(&format!(" with prefix '{}'", p));
+                    result_text.push_str(&format!(" with prefix '{p}'"));
                 }
                 result_text.push_str(":\n\n");
 
@@ -199,7 +200,7 @@ impl RustfsMcpServer {
                 if !result.common_prefixes.is_empty() {
                     result_text.push_str("**Directories:**\n");
                     for (index, prefix) in result.common_prefixes.iter().enumerate() {
-                        result_text.push_str(&format!("{}. 📁 {}\n", index + 1, prefix));
+                        result_text.push_str(&format!("{}. 📁 {prefix}\n", index + 1));
                     }
                     result_text.push('\n');
                 }
@@ -211,19 +212,19 @@ impl RustfsMcpServer {
                         result_text.push_str(&format!("{}. **{}**\n", index + 1, obj.key));
 
                         if let Some(size) = obj.size {
-                            result_text.push_str(&format!("   - Size: {} bytes\n", size));
+                            result_text.push_str(&format!("   - Size: {size} bytes\n"));
                         }
 
                         if let Some(ref last_modified) = obj.last_modified {
-                            result_text.push_str(&format!("   - Last Modified: {}\n", last_modified));
+                            result_text.push_str(&format!("   - Last Modified: {last_modified}\n"));
                         }
 
                         if let Some(ref etag) = obj.etag {
-                            result_text.push_str(&format!("   - ETag: {}\n", etag));
+                            result_text.push_str(&format!("   - ETag: {etag}\n"));
                         }
 
                         if let Some(ref storage_class) = obj.storage_class {
-                            result_text.push_str(&format!("   - Storage Class: {}\n", storage_class));
+                            result_text.push_str(&format!("   - Storage Class: {storage_class}\n"));
                         }
 
                         result_text.push('\n');
@@ -234,7 +235,7 @@ impl RustfsMcpServer {
                 if result.is_truncated {
                     result_text.push_str("**Note:** Results are truncated. ");
                     if let Some(ref token) = result.next_continuation_token {
-                        result_text.push_str(&format!("Use continuation token '{}' to get more results.\n", token));
+                        result_text.push_str(&format!("Use continuation token '{token}' to get more results.\n"));
                     }
                     result_text.push('\n');
                 }
@@ -248,7 +249,7 @@ impl RustfsMcpServer {
                 ));
 
                 if let Some(max_keys) = result.max_keys {
-                    result_text.push_str(&format!(", Max keys: {}", max_keys));
+                    result_text.push_str(&format!(", Max keys: {max_keys}"));
                 }
 
                 info!("list_objects tool executed successfully for bucket '{}'", req.bucket_name);
@@ -271,7 +272,9 @@ impl RustfsMcpServer {
         }
     }
 
-    #[tool(description = "Get/download an object from an S3 bucket - supports read mode for text files and download mode for all files")]
+    #[tool(
+        description = "Get/download an object from an S3 bucket - supports read mode for text files and download mode for all files"
+    )]
     pub async fn get_object(&self, Parameters(req): Parameters<GetObjectRequest>) -> String {
         info!(
             "Executing get_object tool: s3://{}/{} (mode: {:?})",
@@ -307,11 +310,7 @@ impl RustfsMcpServer {
                                  **File Size:** {} bytes\n\
                                  **Content Type:** {}\n\n\
                                  **Content:**\n```\n{}\n```",
-                                result.bucket,
-                                result.key,
-                                result.content_length,
-                                result.content_type,
-                                text_content
+                                result.bucket, result.key, result.content_length, result.content_type, text_content
                             )
                         } else {
                             format!(
@@ -367,7 +366,8 @@ impl RustfsMcpServer {
             Some(ref path) => path,
             None => {
                 return "❌ **Error:** local_path is required when using download mode.\n\n\
-                        **Example:**\n```json\n{\n  \"mode\": \"download\",\n  \"local_path\": \"/path/to/save/file.ext\"\n}\n```".to_string();
+                        **Example:**\n```json\n{\n  \"mode\": \"download\",\n  \"local_path\": \"/path/to/save/file.ext\"\n}\n```"
+                    .to_string();
             }
         };
 
@@ -376,7 +376,11 @@ impl RustfsMcpServer {
             ..GetObjectOptions::default()
         };
 
-        match self.s3_client.download_object_to_file(&req.bucket_name, &req.object_key, local_path, options).await {
+        match self
+            .s3_client
+            .download_object_to_file(&req.bucket_name, &req.object_key, local_path, options)
+            .await
+        {
             Ok((bytes_downloaded, absolute_path)) => {
                 info!(
                     "Successfully downloaded object s3://{}/{} to {} ({} bytes)",
@@ -496,7 +500,7 @@ impl RustfsMcpServer {
 
                 // Add version ID if available (for versioned buckets)
                 if let Some(ref version_id) = result.version_id {
-                    result_text.push_str(&format!("**Version ID:** {}\n", version_id));
+                    result_text.push_str(&format!("**Version ID:** {version_id}\n"));
                 }
 
                 // Add upload summary
@@ -544,17 +548,11 @@ impl RustfsMcpServer {
                      **File:** {}\n\
                      **Bucket:** {}\n\
                      **Object Key:** {}",
-                    req.local_file_path,
-                    req.bucket_name,
-                    e,
-                    req.local_file_path,
-                    req.bucket_name,
-                    req.object_key
+                    req.local_file_path, req.bucket_name, e, req.local_file_path, req.bucket_name, req.object_key
                 )
             }
         }
     }
-
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -660,7 +658,7 @@ mod tests {
         assert_eq!(request.max_content_size, 1024 * 1024); // Should use default
     }
 
-    #[test] 
+    #[test]
     fn test_default_functions() {
         assert_eq!(default_operation_mode(), GetObjectMode::Read);
         assert_eq!(default_max_content_size(), 1024 * 1024);

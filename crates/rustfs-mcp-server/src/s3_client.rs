@@ -94,7 +94,7 @@ pub struct GetObjectResult {
     pub etag: Option<String>,
     pub version_id: Option<String>,
     pub detected_type: DetectedFileType,
-    pub content: Option<Vec<u8>>, // Raw content bytes
+    pub content: Option<Vec<u8>>,     // Raw content bytes
     pub text_content: Option<String>, // UTF-8 decoded content for text files
 }
 
@@ -173,11 +173,7 @@ impl S3Client {
         Ok(buckets)
     }
 
-    pub async fn list_objects_v2(
-        &self,
-        bucket_name: &str,
-        options: ListObjectsOptions,
-    ) -> Result<ListObjectsResult> {
+    pub async fn list_objects_v2(&self, bucket_name: &str, options: ListObjectsOptions) -> Result<ListObjectsResult> {
         debug!("Listing objects in bucket '{}' with options: {:?}", bucket_name, options);
 
         let mut request = self.client.list_objects_v2().bucket(bucket_name);
@@ -205,7 +201,7 @@ impl S3Client {
         let response = request
             .send()
             .await
-            .context(format!("Failed to list objects in bucket '{}'", bucket_name))?;
+            .context(format!("Failed to list objects in bucket '{bucket_name}'"))?;
 
         let objects: Vec<ObjectInfo> = response
             .contents()
@@ -268,7 +264,7 @@ impl S3Client {
         let path = Path::new(local_path);
         let canonical_path = path
             .canonicalize()
-            .context(format!("Failed to resolve file path: {}", local_path))?;
+            .context(format!("Failed to resolve file path: {local_path}"))?;
 
         // Check if file exists and is readable
         if !canonical_path.exists() {
@@ -282,29 +278,28 @@ impl S3Client {
         // Get file metadata
         let metadata = tokio::fs::metadata(&canonical_path)
             .await
-            .context(format!("Failed to read file metadata: {}", local_path))?;
-        
+            .context(format!("Failed to read file metadata: {local_path}"))?;
+
         let file_size = metadata.len();
-        debug!("File size: {} bytes", file_size);
+        debug!("File size: {file_size} bytes");
 
         // Auto-detect content type if not provided
         let content_type = options.content_type.unwrap_or_else(|| {
-            let detected = mime_guess::from_path(&canonical_path)
-                .first_or_octet_stream()
-                .to_string();
-            debug!("Auto-detected content type: {}", detected);
+            let detected = mime_guess::from_path(&canonical_path).first_or_octet_stream().to_string();
+            debug!("Auto-detected content type: {detected}");
             detected
         });
 
         // Read file content into memory for better compatibility with RustFS
         let file_content = tokio::fs::read(&canonical_path)
             .await
-            .context(format!("Failed to read file content: {}", local_path))?;
-        
+            .context(format!("Failed to read file content: {local_path}"))?;
+
         let byte_stream = ByteStream::from(file_content);
 
         // Prepare upload request
-        let mut request = self.client
+        let mut request = self
+            .client
             .put_object()
             .bucket(bucket_name)
             .key(object_key)
@@ -349,14 +344,14 @@ impl S3Client {
         let response = request
             .send()
             .await
-            .context(format!("Failed to upload file to s3://{}/{}", bucket_name, object_key))?;
+            .context(format!("Failed to upload file to s3://{bucket_name}/{object_key}"))?;
 
         // Extract response information
         let etag = response.e_tag().unwrap_or("unknown").to_string();
         let version_id = response.version_id().map(|v| v.to_string());
-        
+
         // Construct result URL (this is a simplified approach)
-        let location = format!("s3://{}/{}", bucket_name, object_key);
+        let location = format!("s3://{bucket_name}/{object_key}");
 
         let upload_result = UploadResult {
             bucket: bucket_name.to_string(),
@@ -377,18 +372,10 @@ impl S3Client {
         Ok(upload_result)
     }
 
-    pub async fn get_object(
-        &self,
-        bucket_name: &str,
-        object_key: &str,
-        options: GetObjectOptions,
-    ) -> Result<GetObjectResult> {
+    pub async fn get_object(&self, bucket_name: &str, object_key: &str, options: GetObjectOptions) -> Result<GetObjectResult> {
         info!("Getting object: s3://{}/{}", bucket_name, object_key);
 
-        let mut request = self.client
-            .get_object()
-            .bucket(bucket_name)
-            .key(object_key);
+        let mut request = self.client.get_object().bucket(bucket_name).key(object_key);
 
         // Apply optional parameters
         if let Some(version_id) = &options.version_id {
@@ -403,7 +390,7 @@ impl S3Client {
             // Parse and set if_modified_since
             request = request.if_modified_since(
                 aws_sdk_s3::primitives::DateTime::from_str(if_modified_since, aws_sdk_s3::primitives::DateTimeFormat::DateTime)
-                    .context("Failed to parse if_modified_since date")?
+                    .context("Failed to parse if_modified_since date")?,
             );
         }
 
@@ -412,12 +399,13 @@ impl S3Client {
         let response = request
             .send()
             .await
-            .context(format!("Failed to get object from s3://{}/{}", bucket_name, object_key))?;
+            .context(format!("Failed to get object from s3://{bucket_name}/{object_key}"))?;
 
         // Extract metadata
         let content_type = response.content_type().unwrap_or("application/octet-stream").to_string();
         let content_length = response.content_length().unwrap_or(0) as u64;
-        let last_modified = response.last_modified()
+        let last_modified = response
+            .last_modified()
             .map(|dt| dt.fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime).unwrap());
         let etag = response.e_tag().map(|e| e.to_string());
         let version_id = response.version_id().map(|v| v.to_string());
@@ -440,19 +428,17 @@ impl S3Client {
 
         // Detect file type
         let detected_type = Self::detect_file_type(Some(&content_type), &content);
-        debug!("Detected file type: {:?}", detected_type);
+        debug!("Detected file type: {detected_type:?}");
 
         // Try to decode as UTF-8 text for text files
         let text_content = match &detected_type {
-            DetectedFileType::Text => {
-                match std::str::from_utf8(&content) {
-                    Ok(text) => Some(text.to_string()),
-                    Err(_) => {
-                        debug!("Failed to decode content as UTF-8, treating as binary");
-                        None
-                    }
+            DetectedFileType::Text => match std::str::from_utf8(&content) {
+                Ok(text) => Some(text.to_string()),
+                Err(_) => {
+                    debug!("Failed to decode content as UTF-8, treating as binary");
+                    None
                 }
-            }
+            },
             _ => None,
         };
 
@@ -481,11 +467,11 @@ impl S3Client {
         // 1. Check Content-Type header first for text types
         if let Some(ct) = content_type {
             let ct_lower = ct.to_lowercase();
-            
+
             // Text types - be comprehensive about what we consider text
-            if ct_lower.starts_with("text/") 
-                || ct_lower == "application/json" 
-                || ct_lower == "application/xml" 
+            if ct_lower.starts_with("text/")
+                || ct_lower == "application/json"
+                || ct_lower == "application/xml"
                 || ct_lower == "application/yaml"
                 || ct_lower == "application/javascript"
                 || ct_lower == "application/x-yaml"
@@ -493,10 +479,11 @@ impl S3Client {
                 || ct_lower == "application/x-shellscript"
                 || ct_lower.contains("script")
                 || ct_lower.contains("xml")
-                || ct_lower.contains("json") {
+                || ct_lower.contains("json")
+            {
                 return DetectedFileType::Text;
             }
-            
+
             // All other types are considered non-text
             return DetectedFileType::NonText(ct.to_string());
         }
@@ -526,13 +513,14 @@ impl S3Client {
         }
 
         // 3. Check if content is valid UTF-8 text as fallback
-        if let Ok(_) = std::str::from_utf8(content_bytes) {
+        if std::str::from_utf8(content_bytes).is_ok() {
             // Additional heuristics for text detection
-            let non_printable_count = content_bytes.iter()
+            let non_printable_count = content_bytes
+                .iter()
                 .filter(|&&b| b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D) // Control chars except tab, LF, CR
                 .count();
             let total_chars = content_bytes.len();
-            
+
             // If less than 5% are non-printable control characters, consider it text
             if total_chars > 0 && (non_printable_count as f64 / total_chars as f64) < 0.05 {
                 return DetectedFileType::Text;
@@ -552,10 +540,7 @@ impl S3Client {
     ) -> Result<(u64, String)> {
         info!("Downloading object: s3://{}/{} -> {}", bucket_name, object_key, local_path);
 
-        let mut request = self.client
-            .get_object()
-            .bucket(bucket_name)
-            .key(object_key);
+        let mut request = self.client.get_object().bucket(bucket_name).key(object_key);
 
         // Apply optional parameters
         if let Some(version_id) = &options.version_id {
@@ -569,7 +554,7 @@ impl S3Client {
         if let Some(if_modified_since) = &options.if_modified_since {
             request = request.if_modified_since(
                 aws_sdk_s3::primitives::DateTime::from_str(if_modified_since, aws_sdk_s3::primitives::DateTimeFormat::DateTime)
-                    .context("Failed to parse if_modified_since date")?
+                    .context("Failed to parse if_modified_since date")?,
             );
         }
 
@@ -578,21 +563,21 @@ impl S3Client {
         let response = request
             .send()
             .await
-            .context(format!("Failed to get object from s3://{}/{}", bucket_name, object_key))?;
+            .context(format!("Failed to get object from s3://{bucket_name}/{object_key}"))?;
 
         // Create local file
         let local_file_path = Path::new(local_path);
-        
+
         // Create parent directories if they don't exist
         if let Some(parent) = local_file_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .context(format!("Failed to create parent directories for {}", local_path))?;
+                .context(format!("Failed to create parent directories for {local_path}"))?;
         }
 
         let mut file = tokio::fs::File::create(local_file_path)
             .await
-            .context(format!("Failed to create local file: {}", local_path))?;
+            .context(format!("Failed to create local file: {local_path}"))?;
 
         // Stream content from S3 to local file
         let mut byte_stream = response.body;
@@ -601,7 +586,7 @@ impl S3Client {
         while let Some(bytes_result) = byte_stream.try_next().await.context("Failed to read object content")? {
             file.write_all(&bytes_result)
                 .await
-                .context(format!("Failed to write to local file: {}", local_path))?;
+                .context(format!("Failed to write to local file: {local_path}"))?;
             total_bytes += bytes_result.len() as u64;
         }
 
@@ -609,7 +594,8 @@ impl S3Client {
         file.flush().await.context("Failed to flush file to disk")?;
 
         // Get absolute path and file metadata for detailed information
-        let absolute_path = local_file_path.canonicalize()
+        let absolute_path = local_file_path
+            .canonicalize()
             .unwrap_or_else(|_| local_file_path.to_path_buf())
             .to_string_lossy()
             .to_string();
@@ -679,8 +665,8 @@ mod tests {
         for (content_type, content) in test_cases {
             let result = S3Client::detect_file_type(Some(content_type), content.as_bytes());
             match result {
-                DetectedFileType::Text => {},
-                _ => panic!("Expected Text for content type {}", content_type),
+                DetectedFileType::Text => {}
+                _ => panic!("Expected Text for content type {content_type}"),
             }
         }
     }
@@ -701,8 +687,8 @@ mod tests {
             match result {
                 DetectedFileType::NonText(mime_type) => {
                     assert_eq!(mime_type, expected_mime);
-                },
-                _ => panic!("Expected NonText for content type {}", content_type),
+                }
+                _ => panic!("Expected NonText for content type {content_type}"),
             }
         }
     }
@@ -724,12 +710,11 @@ mod tests {
             match result {
                 DetectedFileType::NonText(mime_type) => {
                     assert_eq!(mime_type, expected_mime);
-                },
-                _ => panic!("Expected NonText for magic bytes: {:?}", content),
+                }
+                _ => panic!("Expected NonText for magic bytes: {content:?}"),
             }
         }
     }
-
 
     #[test]
     fn test_detect_file_type_webp_magic_bytes() {
@@ -742,7 +727,7 @@ mod tests {
         match result {
             DetectedFileType::NonText(mime_type) => {
                 assert_eq!(mime_type, "image/webp");
-            },
+            }
             _ => panic!("Expected WebP NonText detection"),
         }
     }
@@ -758,12 +743,10 @@ mod tests {
         match result {
             DetectedFileType::NonText(mime_type) => {
                 assert_eq!(mime_type, "audio/wav");
-            },
+            }
             _ => panic!("Expected WAV NonText detection"),
         }
     }
-
-
 
     #[test]
     fn test_detect_file_type_utf8_text() {
@@ -771,7 +754,7 @@ mod tests {
         let utf8_content = "Hello, 世界! 🌍".as_bytes();
         let result = S3Client::detect_file_type(None, utf8_content);
         match result {
-            DetectedFileType::Text => {},
+            DetectedFileType::Text => {}
             _ => panic!("Expected Text for UTF-8 content"),
         }
 
@@ -779,7 +762,7 @@ mod tests {
         let ascii_content = b"Hello, world! This is ASCII text.";
         let result = S3Client::detect_file_type(None, ascii_content);
         match result {
-            DetectedFileType::Text => {},
+            DetectedFileType::Text => {}
             _ => panic!("Expected Text for ASCII content"),
         }
     }
@@ -792,7 +775,7 @@ mod tests {
         match result {
             DetectedFileType::NonText(mime_type) => {
                 assert_eq!(mime_type, "application/octet-stream");
-            },
+            }
             _ => panic!("Expected NonText for binary content"),
         }
     }
@@ -801,11 +784,11 @@ mod tests {
     fn test_detect_file_type_priority() {
         // Content-Type should take priority over magic bytes
         let png_magic_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        
+
         // Even with PNG magic bytes, text content-type should win
         let result = S3Client::detect_file_type(Some("text/plain"), &png_magic_bytes);
         match result {
-            DetectedFileType::Text => {},
+            DetectedFileType::Text => {}
             _ => panic!("Expected Text due to content-type priority"),
         }
     }
@@ -832,9 +815,9 @@ mod tests {
         for file_type in test_cases {
             let json = serde_json::to_string(&file_type).unwrap();
             let deserialized: DetectedFileType = serde_json::from_str(&json).unwrap();
-            
+
             match (&file_type, &deserialized) {
-                (DetectedFileType::Text, DetectedFileType::Text) => {},
+                (DetectedFileType::Text, DetectedFileType::Text) => {}
                 (DetectedFileType::NonText(a), DetectedFileType::NonText(b)) => assert_eq!(a, b),
                 _ => panic!("Serialization/deserialization mismatch"),
             }

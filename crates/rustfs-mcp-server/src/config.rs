@@ -106,9 +106,7 @@ impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         if self.access_key_id.is_none() {
-            anyhow::bail!(
-                "AWS Access Key ID is required. Set via --access-key-id or AWS_ACCESS_KEY_ID environment variable"
-            );
+            anyhow::bail!("AWS Access Key ID is required. Set via --access-key-id or AWS_ACCESS_KEY_ID environment variable");
         }
 
         if self.secret_access_key.is_none() {
@@ -127,12 +125,15 @@ impl Config {
 
     /// Get AWS Secret Access Key (guaranteed to be Some after validation)
     pub fn secret_access_key(&self) -> &str {
-        self.secret_access_key.as_ref().expect("Secret access key should be validated")
+        self.secret_access_key
+            .as_ref()
+            .expect("Secret access key should be validated")
     }
 
     /// Log current configuration (without sensitive data)
     pub fn log_configuration(&self) {
-        let access_key_display = self.access_key_id
+        let access_key_display = self
+            .access_key_id
             .as_ref()
             .map(|key| {
                 if key.len() > 8 {
@@ -143,7 +144,8 @@ impl Config {
             })
             .unwrap_or_else(|| "Not set".to_string());
 
-        let endpoint_display = self.endpoint_url
+        let endpoint_display = self
+            .endpoint_url
             .as_ref()
             .map(|url| format!("Custom endpoint: {url}"))
             .unwrap_or_else(|| "Default AWS endpoints".to_string());

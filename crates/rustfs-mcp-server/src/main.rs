@@ -17,9 +17,9 @@ use clap::Parser;
 use rmcp::ServiceExt;
 use rustfs_mcp_server::{Config, RustfsMcpServer};
 use std::env;
+use tokio::io::{stdin, stdout};
 use tracing::{Level, error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
-use tokio::io::{stdin, stdout};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,8 +60,13 @@ async fn run_server(config: Config) -> Result<()> {
     info!("Starting MCP server with stdio transport");
 
     // Run the server with stdio
-    server.serve((stdin(), stdout())).await.context("Failed to serve MCP server")?
-        .waiting().await.context("Error while waiting for server shutdown")?;
+    server
+        .serve((stdin(), stdout()))
+        .await
+        .context("Failed to serve MCP server")?
+        .waiting()
+        .await
+        .context("Error while waiting for server shutdown")?;
 
     Ok(())
 }
@@ -80,8 +85,7 @@ fn init_tracing(config: &Config) -> Result<()> {
         .with_writer(std::io::stderr) // Force logs to stderr to avoid interfering with MCP protocol on stdout
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .context("Failed to set global tracing subscriber")?;
+    tracing::subscriber::set_global_default(subscriber).context("Failed to set global tracing subscriber")?;
 
     Ok(())
 }
@@ -102,6 +106,8 @@ fn print_usage_help() {
     eprintln!("  rustfs-mcp-server");
     eprintln!();
     eprintln!("  # For local development with RustFS");
-    eprintln!("  rustfs-mcp-server --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000");
+    eprintln!(
+        "  rustfs-mcp-server --access-key-id minioadmin --secret-access-key minioadmin --endpoint-url http://localhost:9000"
+    );
     eprintln!();
 }

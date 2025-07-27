@@ -88,8 +88,8 @@ pub use server::RustfsMcpServer;
 
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
-use tracing::info;
 use tokio::io::{stdin, stdout};
+use tracing::info;
 
 /// Run the MCP server with the provided configuration
 pub async fn run_server_with_config(config: Config) -> Result<()> {
@@ -104,8 +104,13 @@ pub async fn run_server_with_config(config: Config) -> Result<()> {
     info!("Running MCP server with stdio transport");
 
     // Run the server with stdio
-    server.serve((stdin(), stdout())).await.context("Failed to serve MCP server")?
-        .waiting().await.context("Error while waiting for server shutdown")?;
+    server
+        .serve((stdin(), stdout()))
+        .await
+        .context("Failed to serve MCP server")?
+        .waiting()
+        .await
+        .context("Error while waiting for server shutdown")?;
 
     Ok(())
 }
