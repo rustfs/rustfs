@@ -34,11 +34,11 @@ ENVIRONMENT VARIABLES:
 
 EXAMPLES:
   # Using command-line arguments
-  rustfs-mcp-server --access-key-id AKIAIOSFODNN7EXAMPLE --secret-access-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  rustfs-mcp-server --access-key-id your_key --secret-access-key your_secret
 
   # Using environment variables
-  export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-  export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  export AWS_ACCESS_KEY_ID=your_key
+  export AWS_SECRET_ACCESS_KEY=your_secret
   rustfs-mcp-server
 
   # Mixed usage (command-line overrides environment)
@@ -98,12 +98,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parse configuration from command line arguments and environment variables
     pub fn new() -> Self {
         Config::parse()
     }
 
-    /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         if self.access_key_id.is_none() {
             anyhow::bail!("AWS Access Key ID is required. Set via --access-key-id or AWS_ACCESS_KEY_ID environment variable");
@@ -118,19 +116,16 @@ impl Config {
         Ok(())
     }
 
-    /// Get AWS Access Key ID (guaranteed to be Some after validation)
     pub fn access_key_id(&self) -> &str {
         self.access_key_id.as_ref().expect("Access key ID should be validated")
     }
 
-    /// Get AWS Secret Access Key (guaranteed to be Some after validation)
     pub fn secret_access_key(&self) -> &str {
         self.secret_access_key
             .as_ref()
             .expect("Secret access key should be validated")
     }
 
-    /// Log current configuration (without sensitive data)
     pub fn log_configuration(&self) {
         let access_key_display = self
             .access_key_id

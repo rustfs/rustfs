@@ -260,13 +260,11 @@ impl S3Client {
     ) -> Result<UploadResult> {
         info!("Starting file upload: '{}' -> s3://{}/{}", local_path, bucket_name, object_key);
 
-        // Validate and canonicalize file path for security
         let path = Path::new(local_path);
         let canonical_path = path
             .canonicalize()
             .context(format!("Failed to resolve file path: {local_path}"))?;
 
-        // Check if file exists and is readable
         if !canonical_path.exists() {
             anyhow::bail!("File does not exist: {}", local_path);
         }
@@ -275,7 +273,6 @@ impl S3Client {
             anyhow::bail!("Path is not a file: {}", local_path);
         }
 
-        // Get file metadata
         let metadata = tokio::fs::metadata(&canonical_path)
             .await
             .context(format!("Failed to read file metadata: {local_path}"))?;
@@ -283,21 +280,18 @@ impl S3Client {
         let file_size = metadata.len();
         debug!("File size: {file_size} bytes");
 
-        // Auto-detect content type if not provided
         let content_type = options.content_type.unwrap_or_else(|| {
             let detected = mime_guess::from_path(&canonical_path).first_or_octet_stream().to_string();
             debug!("Auto-detected content type: {detected}");
             detected
         });
 
-        // Read file content into memory for better compatibility with RustFS
         let file_content = tokio::fs::read(&canonical_path)
             .await
             .context(format!("Failed to read file content: {local_path}"))?;
 
         let byte_stream = ByteStream::from(file_content);
 
-        // Prepare upload request
         let mut request = self
             .client
             .put_object()
@@ -307,7 +301,6 @@ impl S3Client {
             .content_type(&content_type)
             .content_length(file_size as i64);
 
-        // Add optional parameters
         if let Some(storage_class) = &options.storage_class {
             request = request.storage_class(storage_class.as_str().into());
         }
@@ -332,25 +325,21 @@ impl S3Client {
             request = request.server_side_encryption(sse.as_str().into());
         }
 
-        // Add metadata if provided
         if let Some(metadata_map) = &options.metadata {
             for (key, value) in metadata_map {
                 request = request.metadata(key, value);
             }
         }
 
-        // Execute upload
         debug!("Executing S3 put_object request");
         let response = request
             .send()
             .await
             .context(format!("Failed to upload file to s3://{bucket_name}/{object_key}"))?;
 
-        // Extract response information
         let etag = response.e_tag().unwrap_or("unknown").to_string();
         let version_id = response.version_id().map(|v| v.to_string());
 
-        // Construct result URL (this is a simplified approach)
         let location = format!("s3://{bucket_name}/{object_key}");
 
         let upload_result = UploadResult {
@@ -361,7 +350,7 @@ impl S3Client {
             version_id,
             file_size,
             content_type,
-            upload_id: None, // Only used for multipart uploads
+            upload_id: None,
         };
 
         info!(
@@ -377,7 +366,6 @@ impl S3Client {
 
         let mut request = self.client.get_object().bucket(bucket_name).key(object_key);
 
-        // Apply optional parameters
         if let Some(version_id) = &options.version_id {
             request = request.version_id(version_id);
         }
@@ -387,21 +375,18 @@ impl S3Client {
         }
 
         if let Some(if_modified_since) = &options.if_modified_since {
-            // Parse and set if_modified_since
             request = request.if_modified_since(
                 aws_sdk_s3::primitives::DateTime::from_str(if_modified_since, aws_sdk_s3::primitives::DateTimeFormat::DateTime)
                     .context("Failed to parse if_modified_since date")?,
             );
         }
 
-        // Execute the request
         debug!("Executing S3 get_object request");
         let response = request
             .send()
             .await
             .context(format!("Failed to get object from s3://{bucket_name}/{object_key}"))?;
 
-        // Extract metadata
         let content_type = response.content_type().unwrap_or("application/octet-stream").to_string();
         let content_length = response.content_length().unwrap_or(0) as u64;
         let last_modified = response
@@ -410,8 +395,7 @@ impl S3Client {
         let etag = response.e_tag().map(|e| e.to_string());
         let version_id = response.version_id().map(|v| v.to_string());
 
-        // Read content with size limit
-        let max_size = options.max_content_size.unwrap_or(10 * 1024 * 1024); // Default 10MB limit
+        let max_size = options.max_content_size.unwrap_or(10 * 1024 * 1024);
         let mut content = Vec::new();
         let mut byte_stream = response.body;
         let mut total_read = 0;
@@ -426,11 +410,9 @@ impl S3Client {
 
         debug!("Read {} bytes from object", content.len());
 
-        // Detect file type
         let detected_type = Self::detect_file_type(Some(&content_type), &content);
         debug!("Detected file type: {detected_type:?}");
 
-        // Try to decode as UTF-8 text for text files
         let text_content = match &detected_type {
             DetectedFileType::Text => match std::str::from_utf8(&content) {
                 Ok(text) => Some(text.to_string()),
@@ -464,11 +446,9 @@ impl S3Client {
     }
 
     fn detect_file_type(content_type: Option<&str>, content_bytes: &[u8]) -> DetectedFileType {
-        // 1. Check Content-Type header first for text types
         if let Some(ct) = content_type {
             let ct_lower = ct.to_lowercase();
 
-            // Text types - be comprehensive about what we consider text
             if ct_lower.starts_with("text/")
                 || ct_lower == "application/json"
                 || ct_lower == "application/xml"
@@ -484,11 +464,9 @@ impl S3Client {
                 return DetectedFileType::Text;
             }
 
-            // All other types are considered non-text
             return DetectedFileType::NonText(ct.to_string());
         }
 
-        // 2. Simple magic bytes check for common binary formats
         if content_bytes.len() >= 4 {
             match &content_bytes[0..4] {
                 // PNG: 89 50 4E 47
@@ -542,7 +520,6 @@ impl S3Client {
 
         let mut request = self.client.get_object().bucket(bucket_name).key(object_key);
 
-        // Apply optional parameters
         if let Some(version_id) = &options.version_id {
             request = request.version_id(version_id);
         }
@@ -558,17 +535,14 @@ impl S3Client {
             );
         }
 
-        // Execute the request
         debug!("Executing S3 get_object request for download");
         let response = request
             .send()
             .await
             .context(format!("Failed to get object from s3://{bucket_name}/{object_key}"))?;
 
-        // Create local file
         let local_file_path = Path::new(local_path);
 
-        // Create parent directories if they don't exist
         if let Some(parent) = local_file_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -579,7 +553,6 @@ impl S3Client {
             .await
             .context(format!("Failed to create local file: {local_path}"))?;
 
-        // Stream content from S3 to local file
         let mut byte_stream = response.body;
         let mut total_bytes = 0u64;
 
@@ -590,10 +563,8 @@ impl S3Client {
             total_bytes += bytes_result.len() as u64;
         }
 
-        // Ensure all data is written to disk
         file.flush().await.context("Failed to flush file to disk")?;
 
-        // Get absolute path and file metadata for detailed information
         let absolute_path = local_file_path
             .canonicalize()
             .unwrap_or_else(|_| local_file_path.to_path_buf())
@@ -652,7 +623,6 @@ mod tests {
 
     #[test]
     fn test_detect_file_type_text_content_type() {
-        // Test various text content types
         let test_cases = vec![
             ("text/plain", "Hello world"),
             ("text/html", "<html></html>"),

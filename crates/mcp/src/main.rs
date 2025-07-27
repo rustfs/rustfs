@@ -23,25 +23,20 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command line arguments
     let config = Config::parse();
 
-    // Initialize tracing first
     init_tracing(&config)?;
 
     info!("Starting RustFS MCP Server v{}", env!("CARGO_PKG_VERSION"));
 
-    // Validate configuration
     if let Err(e) = config.validate() {
         error!("Configuration validation failed: {}", e);
         print_usage_help();
         std::process::exit(1);
     }
 
-    // Log current configuration (without sensitive data)
     config.log_configuration();
 
-    // Create and run the server
     if let Err(e) = run_server(config).await {
         error!("Server error: {}", e);
         std::process::exit(1);
@@ -54,12 +49,10 @@ async fn main() -> Result<()> {
 async fn run_server(config: Config) -> Result<()> {
     info!("Initializing RustFS MCP Server");
 
-    // Create the server handler
     let server = RustfsMcpServer::new(config).await?;
 
     info!("Starting MCP server with stdio transport");
 
-    // Run the server with stdio
     server
         .serve((stdin(), stdout()))
         .await

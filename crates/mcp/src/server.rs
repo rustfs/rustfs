@@ -77,9 +77,9 @@ pub struct GetObjectRequest {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub enum GetObjectMode {
     #[serde(rename = "read")]
-    Read, // 直接读取内容返回
+    Read,
     #[serde(rename = "download")]
-    Download, // 下载到本地文件
+    Download,
 }
 
 fn default_operation_mode() -> GetObjectMode {
@@ -87,7 +87,7 @@ fn default_operation_mode() -> GetObjectMode {
 }
 fn default_max_content_size() -> usize {
     1024 * 1024
-} // 1MB
+}
 
 #[derive(Debug, Clone)]
 pub struct RustfsMcpServer {
@@ -133,7 +133,6 @@ impl RustfsMcpServer {
                     result_text.push_str("\n\n");
                 }
 
-                // Add summary information
                 result_text.push_str("---\n");
                 result_text.push_str(&format!("Total buckets: {}\n", buckets.len()));
                 result_text.push_str("Note: Only buckets accessible with the current AWS credentials are shown.");
@@ -164,7 +163,7 @@ impl RustfsMcpServer {
         let options = ListObjectsOptions {
             prefix: req.prefix.clone(),
             delimiter: None,
-            max_keys: Some(1000), // Default limit
+            max_keys: Some(1000),
             ..ListObjectsOptions::default()
         };
 
@@ -192,7 +191,6 @@ impl RustfsMcpServer {
                 }
                 result_text.push_str(":\n\n");
 
-                // Display common prefixes (directories) first
                 if !result.common_prefixes.is_empty() {
                     result_text.push_str("**Directories:**\n");
                     for (index, prefix) in result.common_prefixes.iter().enumerate() {
@@ -201,7 +199,6 @@ impl RustfsMcpServer {
                     result_text.push('\n');
                 }
 
-                // Display objects
                 if !result.objects.is_empty() {
                     result_text.push_str("**Objects:**\n");
                     for (index, obj) in result.objects.iter().enumerate() {
@@ -227,7 +224,6 @@ impl RustfsMcpServer {
                     }
                 }
 
-                // Add pagination info if truncated
                 if result.is_truncated {
                     result_text.push_str("**Note:** Results are truncated. ");
                     if let Some(ref token) = result.next_continuation_token {
@@ -236,7 +232,6 @@ impl RustfsMcpServer {
                     result_text.push('\n');
                 }
 
-                // Add summary information
                 result_text.push_str("---\n");
                 result_text.push_str(&format!(
                     "Total: {} object(s), {} directory/ies",
@@ -357,7 +352,6 @@ impl RustfsMcpServer {
     }
 
     async fn handle_download_mode(&self, req: GetObjectRequest) -> String {
-        // Validate that local_path is provided
         let local_path = match req.local_path {
             Some(ref path) => path,
             None => {
@@ -459,7 +453,6 @@ impl RustfsMcpServer {
             req.local_file_path, req.bucket_name, req.object_key
         );
 
-        // Prepare upload options from request
         let options = UploadFileOptions {
             content_type: req.content_type.clone(),
             storage_class: req.storage_class.clone(),
@@ -489,17 +482,15 @@ impl RustfsMcpServer {
                     result.bucket,
                     result.key,
                     result.file_size,
-                    result.file_size as f64 / 1_048_576.0, // Convert to MB
+                    result.file_size as f64 / 1_048_576.0,
                     result.content_type,
                     result.etag
                 );
 
-                // Add version ID if available (for versioned buckets)
                 if let Some(ref version_id) = result.version_id {
                     result_text.push_str(&format!("**Version ID:** {version_id}\n"));
                 }
 
-                // Add upload summary
                 result_text.push_str("\n---\n");
                 result_text.push_str("**Upload Summary:**\n");
                 result_text.push_str(&format!("• Source: {}\n", req.local_file_path));
@@ -612,7 +603,7 @@ mod tests {
         assert!(request.version_id.is_none());
         assert_eq!(request.mode, GetObjectMode::Read);
         assert!(request.local_path.is_none());
-        assert_eq!(request.max_content_size, 1024 * 1024); // 1MB
+        assert_eq!(request.max_content_size, 1024 * 1024);
     }
 
     #[test]
@@ -639,7 +630,6 @@ mod tests {
 
     #[test]
     fn test_get_object_request_serde_with_defaults() {
-        // Test that defaults work with serde
         let json = r#"{
             "bucket_name": "test-bucket",
             "object_key": "test-key"
@@ -649,9 +639,9 @@ mod tests {
         assert_eq!(request.bucket_name, "test-bucket");
         assert_eq!(request.object_key, "test-key");
         assert!(request.version_id.is_none());
-        assert_eq!(request.mode, GetObjectMode::Read); // Should use default
-        assert!(request.local_path.is_none()); // Should be None by default
-        assert_eq!(request.max_content_size, 1024 * 1024); // Should use default
+        assert_eq!(request.mode, GetObjectMode::Read);
+        assert!(request.local_path.is_none());
+        assert_eq!(request.max_content_size, 1024 * 1024);
     }
 
     #[test]
@@ -662,7 +652,6 @@ mod tests {
 
     #[test]
     fn test_get_object_mode_serialization() {
-        // Test GetObjectMode serialization
         let read_mode = GetObjectMode::Read;
         let download_mode = GetObjectMode::Download;
 
@@ -672,7 +661,6 @@ mod tests {
         assert_eq!(read_json, r#""read""#);
         assert_eq!(download_json, r#""download""#);
 
-        // Test deserialization
         let read_mode_deser: GetObjectMode = serde_json::from_str(r#""read""#).unwrap();
         let download_mode_deser: GetObjectMode = serde_json::from_str(r#""download""#).unwrap();
 
