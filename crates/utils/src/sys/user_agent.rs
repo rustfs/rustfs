@@ -88,7 +88,7 @@ impl UserAgent {
             Some(version) => version,
             None => "Windows NT Unknown".to_string(),
         };
-        format!("Windows NT {}", version)
+        format!("Windows NT {version}")
     }
 
     #[cfg(not(windows))]

@@ -34,17 +34,12 @@ use crate::client::{
     api_s3_datatypes::{
         CompleteMultipartUpload, CompleteMultipartUploadResult, CompletePart, InitiateMultipartUploadResult, ObjectPart,
     },
-    constants::{ABS_MIN_PART_SIZE, ISO8601_DATEFORMAT, MAX_PART_SIZE, MAX_SINGLE_PUT_OBJECT_SIZE},
+    constants::{ISO8601_DATEFORMAT, MAX_PART_SIZE, MAX_SINGLE_PUT_OBJECT_SIZE},
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
-use crate::{
-    checksum::ChecksumMode,
-    disk::DiskAPI,
-    store_api::{GetObjectReader, StorageAPI},
-};
+use crate::{checksum::ChecksumMode, disk::DiskAPI, store_api::StorageAPI};
 use rustfs_utils::{crypto::base64_encode, path::trim_etag};
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
-use s3s::{Body, dto::StreamingBlob};
 
 impl TransitionClient {
     pub async fn put_object_multipart(

@@ -18,7 +18,7 @@ use std::{
     pin::Pin,
     sync::LazyLock,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::time::interval;
 
@@ -114,20 +114,24 @@ pub fn is_http_status_retryable(http_statuscode: &http::StatusCode) -> bool {
 }
 
 pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
-    /*if err == Err::Canceled) || err == Err::DeadlineExceeded) {
-        return ctx.Err() == nil;
+    /*if err == Err::Canceled || err == Err::DeadlineExceeded {
+        return err() == nil;
     }
-    let ue = err.(*url.Error);
-    if ue.is_ok() {
-        let e = ue.Unwrap();
-        switch e.(type) {
-        case x509.UnknownAuthorityError:
-            return false;
-        }
-        switch e.Error() {
-        case "http: server gave HTTP response to HTTPS client":
-            return false;
-        }
+    let uerr = err.(*url.Error);
+    if uerr.is_ok() {
+        let e = uerr.unwrap();
+        return match e.type {
+            x509.UnknownAuthorityError => {
+                false
+            }
+            _ => true,
+        };
+        return match e.error() {
+            "http: server gave HTTP response to HTTPS client" => {
+                false
+            }
+            _ => rue,
+        };
     }
     true*/
     todo!();
