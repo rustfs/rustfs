@@ -22,8 +22,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KVS};
-use std::collections::HashMap;
-use tracing::{error, info};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, error, info};
 
 /// Registry for managing target factories
 pub struct TargetRegistry {
@@ -75,107 +75,186 @@ impl TargetRegistry {
     }
 
     /// Creates all targets from a configuration
+    /// Create all notification targets from system configuration and environment variables.
+    /// This method processes the creation of each target concurrently as follows:
+    /// 1. Iterate through all registered target types (e.g. webhooks, mqtt).
+    /// 2. For each type, resolve its configuration in the configuration file and environment variables.
+    /// 3. Identify all target instance IDs that need to be created.
+    /// 4. Combine the default configuration, file configuration, and environment variable configuration for each instance.
+    /// 5. If the instance is enabled, create an asynchronous task for it to instantiate.
+    /// 6. Concurrency executes all creation tasks and collects results.
     pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn Target + Send + Sync>>, TargetError> {
-        let mut new_map: HashMap<String, HashMap<String, KVS>> = HashMap::new();
-        // 1. 预先收集所有环境变量
+        // 预先收集所有环境变量，避免在循环中重复获取
         let all_env: Vec<(String, String)> = std::env::vars().collect();
-        // 2. 创建异步任务集合
+        // 用于并发执行目标创建的异步任务集合
         let mut tasks = FuturesUnordered::new();
 
-        for target_type in self.factories.keys() {
-            let section = format!("{}{}", NOTIFY_ROUTE_PREFIX, target_type).to_lowercase();
-            let mut sec_cfg = config.0.get(&section).cloned().unwrap_or_default();
-            // 确保默认段存在并克隆
-            let default_cfg = sec_cfg.entry(DEFAULT_DELIMITER.to_string()).or_insert_with(KVS::new).clone();
-            info!(
-                "Processing target type: {} Config: {:?} ,default config:{:?}",
-                target_type, sec_cfg, default_cfg
-            );
-            // 3. 筛选当前类型相关的环境变量覆盖
-            let env_pref =
-                format!("{}{}{}{}{}", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type, DEFAULT_DELIMITER, ENABLE_KEY).to_uppercase();
-            info!("Collected environment variables for {}: env_pref: {} ", target_type, env_pref.clone(),);
-            let mut overrides: HashMap<Option<String>, HashMap<String, String>> = HashMap::new();
-            for (k, v) in &all_env {
-                // 检查环境变量是否以目标类型前缀开头
-                if let Some(rest) = k.strip_prefix(&env_pref) {
-                    info!("Processing environment variable: {}", rest);
-                    let parts: Vec<&str> = rest.trim_start_matches(DEFAULT_DELIMITER).split(DEFAULT_DELIMITER).collect();
-                    let (field, id) = if parts.len() > 1 {
-                        info!(
-                            "Processing environment variable field: {},id: {}",
-                            parts[0].to_lowercase(),
-                            parts[1].to_lowercase(),
-                        );
-                        (parts[0].to_lowercase(), Some(parts[1].to_string()))
-                    } else {
-                        (parts[0].to_lowercase(), None)
-                    };
-                    overrides.entry(id.clone()).or_default().insert(field, v.clone());
-                }
-            }
-            info!("Collected environment overrides for {}: {:?}", target_type, overrides);
-            // 4. 合并所有实例 ID
-            let mut ids: Vec<String> = sec_cfg.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
-            for id in overrides.keys().filter_map(|x| x.clone()) {
-                if !ids.contains(&id) {
-                    ids.push(id);
+        // 1. 遍历所有注册的工厂，按目标类型处理
+        for (target_type, factory) in &self.factories {
+            tracing::Span::current().record("target_type", &target_type.as_str());
+            info!("开始处理目标类型...");
+
+            // 2. 准备配置来源
+            // 2.1. 获取文件中的配置段，例如 `notify.webhook`
+            let section_name = format!("{}{}", NOTIFY_ROUTE_PREFIX, target_type);
+            let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
+            // 2.2. 获取该类型的默认配置
+            let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
+            debug!(?default_cfg, "获取到默认配置");
+
+            // 3. 从环境变量中解析实例 ID 和配置覆盖项
+            let mut instance_ids_from_env = HashSet::new();
+            // 3.1. 实例发现：基于 `..._ENABLE_INSTANCEID` 格式
+            let enable_prefix = format!("{}{}{}_{}_", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type, ENABLE_KEY).to_uppercase();
+            for (key, value) in &all_env {
+                if value.eq_ignore_ascii_case(ENABLE_ON)
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("1")
+                    || value.eq_ignore_ascii_case("yes")
+                {
+                    if let Some(id) = key.strip_prefix(&enable_prefix) {
+                        if !id.is_empty() {
+                            instance_ids_from_env.insert(id.to_lowercase());
+                        }
+                    }
                 }
             }
 
-            // 5. 为每个实例合并配置并创建异步任务
-            for id in ids {
-                let mut merged = default_cfg.clone();
-                if let Some(cfg) = sec_cfg.get(&id) {
-                    merged.extend(cfg.clone());
-                }
-                if let Some(gens) = overrides.get(&None) {
-                    for (f, val) in gens {
-                        merged.insert(f.clone(), val.clone());
+            // 3.2. 解析所有相关的环境变量配置 例如 `RUSTFS_NOTIFY_WEBHOOK_`
+            // 3.2.1. 构建环境变量前缀，例如 `RUSTFS_NOTIFY_WEBHOOK_`
+            let env_prefix = format!("{}{}{}_", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type).to_uppercase();
+            // 3.2.2. `env_overrides` 用于存储从环境变量解析出的配置，格式为：{实例 ID -> {字段 -> 值}}
+            let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for (key, value) in &all_env {
+                if let Some(rest) = key.strip_prefix(&env_prefix) {
+                    // 使用 rsplitn 从右侧分割，以正确提取末尾的 INSTANCE_ID
+                    // 格式：<FIELD_NAME>_<INSTANCE_ID> 或 <FIELD_NAME>
+                    let mut parts = rest.rsplitn(2, '_');
+
+                    // 从右边开始的第一部分是 INSTANCE_ID
+                    let instance_id_part = parts.next().unwrap_or(DEFAULT_DELIMITER);
+                    // 剩余部分是 FIELD_NAME
+                    let field_name_part = parts.next();
+
+                    let (field_name, instance_id) = match field_name_part {
+                        // Case 1: 格式为 <FIELD_NAME>_<INSTANCE_ID>
+                        // e.g., rest = "ENDPOINT_PRIMARY" -> field_name="ENDPOINT", instance_id="PRIMARY"
+                        Some(field) => (field.to_lowercase(), instance_id_part.to_lowercase()),
+                        // Case 2: 格式为 <FIELD_NAME> (无 INSTANCE_ID)
+                        // e.g., rest = "ENABLE" -> field_name="ENABLE", instance_id="" (通用配置)
+                        None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
+                    };
+
+                    if !field_name.is_empty() {
+                        debug!(
+                            instance_id = %if instance_id.is_empty() { DEFAULT_DELIMITER } else { &instance_id },
+                            %field_name,
+                            %value,
+                            "解析到环境变量"
+                        );
+                        env_overrides
+                            .entry(instance_id)
+                            .or_default()
+                            .insert(field_name, value.clone());
                     }
                 }
-                if let Some(spec) = overrides.get(&Some(id.clone())) {
-                    for (f, val) in spec {
-                        merged.insert(f.clone(), val.clone());
-                    }
+            }
+            debug!(?env_overrides, "完成环境变量解析");
+
+            // 4. 确定所有需要处理的实例 ID
+            let mut all_instance_ids: HashSet<String> =
+                file_configs.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
+            all_instance_ids.extend(instance_ids_from_env);
+            debug!(?all_instance_ids, "确定所有实例 ID");
+
+            // 5. 为每个实例合并配置并创建任务
+            for id in all_instance_ids {
+                // 5.1. 合并配置，优先级：环境变量 > 文件实例配置 > 文件默认配置
+                let mut merged_config = default_cfg.clone();
+                // 应用文件中的实例特定配置
+                if let Some(file_instance_cfg) = file_configs.get(&id) {
+                    merged_config.extend(file_instance_cfg.clone());
                 }
-                info!("Merged config for {}/{}: {:?}", target_type, id, merged);
-                let enabled = merged
+                // 应用实例特定的环境变量配置
+                if let Some(env_instance_cfg) = env_overrides.get(&id) {
+                    // 修复类型不匹配：将 HashMap<String, String> 转为 KVS
+                    let mut kvs_from_env = KVS::new();
+                    for (k, v) in env_instance_cfg {
+                        kvs_from_env.insert(k.clone(), v.clone());
+                    }
+                    merged_config.extend(kvs_from_env);
+                }
+                debug!(instance_id = %id, ?merged_config, "完成配置合并");
+
+                // 5.2. 检查实例是否启用
+                let enabled = merged_config
                     .lookup(ENABLE_KEY)
-                    .map(|v| v.eq_ignore_ascii_case(ENABLE_ON))
+                    .map(|v| {
+                        v.eq_ignore_ascii_case(ENABLE_ON)
+                            || v.eq_ignore_ascii_case("true")
+                            || v.eq_ignore_ascii_case("1")
+                            || v.eq_ignore_ascii_case("yes")
+                    })
                     .unwrap_or(false);
-                info!("Enabled: {}/{},{}", target_type, id, enabled);
-                // 将 merged 移动进闭包，并在 new_map 中 clone
-                let ttype = target_type.clone();
-                let tid = id.clone();
-                let mv = merged;
-                new_map.entry(section.clone()).or_default().insert(tid.clone(), mv.clone());
 
                 if enabled {
-                    info!("Creating target {}/{}", target_type, id);
+                    info!(instance_id = %id, "目标已启用，准备创建任务");
+                    // 5.3. 为启用的实例创建异步任务
+                    let ttype = target_type.clone();
+                    let tid = id.clone();
                     tasks.push(async move {
-                        let res = self.create_target(&ttype, tid.clone(), &mv).await;
-                        (ttype, tid, res)
+                        let result = factory.create_target(tid.clone(), &merged_config).await;
+                        (ttype, tid, result, merged_config)
                     });
                 } else {
-                    info!("Skipping disabled target {}/{}", target_type, id);
+                    info!(instance_id = %id, "跳过已禁用的目标，将从最终配置中移除");
+                    // 从最终配置中移除禁用的目标
+                    final_config.0.entry(section_name.clone()).or_default().remove(&id);
                 }
             }
         }
 
-        // 6. 并发收集创建结果
-        let mut results = Vec::new();
-        while let Some((tpe, id, res)) = tasks.next().await {
-            match res {
-                Ok(t) => {
-                    info!("Successfully created target {}/{}", tpe, id);
-                    results.push(t)
+        // 6. 并发执行所有创建任务并收集结果
+        let mut successful_targets = Vec::new();
+        let mut successful_configs = Vec::new();
+        while let Some((tpe, id, result, final_config)) = tasks.next().await {
+            match result {
+                Ok(target) => {
+                    info!(target_type = %tpe, instance_id = %id, "成功创建目标");
+                    successful_targets.push(target);
+                    successful_configs.push((tpe, id, final_config));
                 }
-                Err(e) => error!("Failed to create a target {}/{}: {}", tpe, id, e),
+                Err(e) => {
+                    error!(target_type = %tpe, instance_id = %id, error = %e, "创建目标失败");
+                }
             }
         }
-        info!("Finished creating targets. Total: {}, Successful: {}", results.len(), results.len());
-        // 7. （可选）写回 new_map 到系统配置
-        Ok(results)
+
+        // 7. 聚合新配置并写回系统配置
+        if !successful_configs.is_empty() {
+            info!("准备将 {} 个成功创建的目标配置更新到系统配置中...", successful_configs.len());
+            let mut new_config = config.clone();
+            for (target_type, id, kvs) in successful_configs {
+                let section_name = format!("{}{}", NOTIFY_ROUTE_PREFIX, target_type).to_lowercase();
+                new_config.0.entry(section_name).or_default().insert(id, kvs);
+            }
+
+            let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+                return Err(TargetError::ServerNotInitialized);
+            };
+
+            match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
+                Ok(_) => {
+                    info!("成功将新配置保存到系统。")
+                }
+                Err(e) => {
+                    error!("保存新配置失败：{}", e);
+                    return Err(TargetError::SaveConfig(e.to_string()));
+                }
+            }
+        }
+
+        info!(count = successful_targets.len(), "所有目标处理完成");
+        Ok(successful_targets)
     }
 }

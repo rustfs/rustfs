@@ -94,7 +94,8 @@ async-recursion = "1.1.1"
 async-trait = "0.1.88"
 async-compression = { version = "0.4.0" }
 atomic_enum = "0.3.0"
-aws-sdk-s3 = "1.96.0"
+aws-config = { version = "1.8.3" }
+aws-sdk-s3 = "1.100.0"
 axum = "0.8.4"
 axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
@@ -217,6 +218,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.141", features = ["raw_value"] }
 serde-xml-rs = "0.8.1"
 serde_urlencoded = "0.7.1"
+serial_test = "3.2.0"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 siphasher = "1.0.1"

@@ -130,12 +130,6 @@ impl NotificationSystem {
         let targets: Vec<Box<dyn Target + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
-        if targets.len() > 0 {
-            info!("{} notification targets were enabled", targets.iter().filter(|t| t.is_enabled()).count());
-            return Err(NotificationError::Target(crate::error::TargetError::Unknown(
-                "No targets enabled".to_string(),
-            )));
-        }
 
         // Initiate event stream processing for each storage enabled target
         let mut cancellers = HashMap::new();
@@ -216,10 +210,10 @@ impl NotificationSystem {
             return Ok(());
         }
 
-        if let Err(e) = rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
-            error!("Failed to save config: {}", e);
-            return Err(NotificationError::SaveConfig(e.to_string()));
-        }
+        // if let Err(e) = rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
+        //     error!("Failed to save config: {}", e);
+        //     return Err(NotificationError::SaveConfig(e.to_string()));
+        // }
 
         info!("Configuration updated. Reloading system...");
         self.reload_config(new_config).await
@@ -329,7 +323,6 @@ impl NotificationSystem {
         metrics: Arc<NotificationMetrics>,
         semaphore: Arc<Semaphore>,
     ) -> mpsc::Sender<()> {
-        // Event Stream Processing Using Batch Version
         stream::start_event_stream_with_batching(store, target, metrics, semaphore)
     }
 
@@ -354,6 +347,7 @@ impl NotificationSystem {
         self.update_config(new_config.clone()).await;
 
         // Create a new target from configuration
+        // This function will now be responsible for merging env, creating and persisting the final configuration.
         let targets: Vec<Box<dyn Target + Send + Sync>> = self
             .registry
             .create_targets_from_config(&new_config)

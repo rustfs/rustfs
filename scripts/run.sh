@@ -89,13 +89,17 @@ export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
 # notify
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE="true" # 是否启用 webhook 通知
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # 是否启用 webhook 通知
 export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # webhook 通知地址
 export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
 
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="true" # 是否启用 webhook 通知
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # 是否启用 webhook 通知
 export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # webhook 通知地址
 export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
+
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # 是否启用 webhook 通知
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # webhook 通知地址
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
 
 
 export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
