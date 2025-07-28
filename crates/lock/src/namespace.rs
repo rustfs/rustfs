@@ -511,6 +511,6 @@ mod tests {
 
         // Since we're using separate LocalClient instances, they don't share state
         // so this test demonstrates the consistency check
-        assert!(response.success || !response.success); // Either all succeed or rollback happens
+        assert!(response.success); // Either all succeed or rollback happens
     }
 }
