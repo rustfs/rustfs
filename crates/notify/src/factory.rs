@@ -93,7 +93,7 @@ impl TargetFactory for WebhookTargetFactory {
         Ok(Box::new(target))
     }
 
-    fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError> {
+    fn validate_config(&self, _id: &str, config: &KVS) -> Result<(), TargetError> {
         // Validation also uses the merged `config` KVS directly.
         let endpoint = config
             .lookup(WEBHOOK_ENDPOINT)
@@ -174,7 +174,7 @@ impl TargetFactory for MQTTTargetFactory {
         Ok(Box::new(target))
     }
 
-    fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError> {
+    fn validate_config(&self, _id: &str, config: &KVS) -> Result<(), TargetError> {
         let broker = config
             .lookup(MQTT_BROKER)
             .ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
