@@ -4056,11 +4056,9 @@ impl StorageAPI for SetDisks {
                 return to_object_err(err, vec![bucket, object]);
             }
         }*/
-        //let traceFn = GLOBAL_LifecycleSys.trace(fi.to_object_info(bucket, object, opts.Versioned || opts.VersionSuspended));
 
         let dest_obj = gen_transition_objname(bucket);
         if let Err(err) = dest_obj {
-            //traceFn(ILMTransition, nil, err)
             return Err(to_object_err(err, vec![]));
         }
         let dest_obj = dest_obj.unwrap();
@@ -4068,8 +4066,6 @@ impl StorageAPI for SetDisks {
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
-        //let h = HeaderMap::new();
-        //let reader = ReaderImpl::ObjectBody(GetObjectReader {stream: StreamingBlob::wrap(tokio_util::io::ReaderStream::new(pr)), object_info: oi});
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
             stream: Box::new(pr),
             object_info: oi,
@@ -4106,9 +4102,7 @@ impl StorageAPI for SetDisks {
                 m
             })
             .await;
-        //pr.CloseWithError(err);
         if let Err(err) = rv {
-            //traceFn(ILMTransition, nil, err)
             return Err(StorageError::Io(err));
         }
         let rv = rv.unwrap();
@@ -4172,7 +4166,6 @@ impl StorageAPI for SetDisks {
             //if err != nil {
             //    return set_restore_header_fn(&mut oi, Some(toObjectErr(err, bucket, object)));
             //}
-            //defer gr.Close()
             let hash_reader = HashReader::new(gr, gr.obj_info.size, "", "", gr.obj_info.size);
             let p_reader = PutObjReader::new(StreamingBlob::from(Box::pin(hash_reader)), hash_reader.size());
             if let Err(err) = self.put_object(bucket, object, &mut p_reader, &ropts).await {

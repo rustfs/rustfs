@@ -33,6 +33,7 @@ members = [
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
     "crates/signer", # client signer
+    "crates/checksums", # client checksums
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
@@ -84,6 +85,7 @@ rustfs-utils = { path = "crates/utils", version = "0.0.5" }
 rustfs-rio = { path = "crates/rio", version = "0.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
+rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
@@ -215,7 +217,6 @@ s3s = { version = "0.12.0-minio-preview.2" }
 shadow-rs = { version = "1.2.0", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.141", features = ["raw_value"] }
-serde-xml-rs = "0.8.1"
 serde_urlencoded = "0.7.1"
 sha1 = "0.10.6"
 sha2 = "0.10.9"

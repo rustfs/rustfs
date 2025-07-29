@@ -346,8 +346,12 @@ impl ExpiryState {
     }
 
     pub async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>) {
+        //let cancel_token =
+        //    get_background_services_cancel_token().ok_or_else(|| Error::other("Background services not initialized"))?;
+
         loop {
             select! {
+                //_ = cancel_token.cancelled() => {
                 _ = tokio::signal::ctrl_c() => {
                     info!("got ctrl+c, exits");
                     break;
@@ -811,8 +815,8 @@ impl LifecycleOps for ObjectInfo {
             num_versions: self.num_versions,
             delete_marker: self.delete_marker,
             successor_mod_time: self.successor_mod_time,
-            //restore_ongoing:    self.restore_ongoing,
-            //restore_expires:    self.restore_expires,
+            restore_ongoing: self.restore_ongoing,
+            restore_expires: self.restore_expires,
             transition_status: self.transitioned_object.status.clone(),
             ..Default::default()
         }
