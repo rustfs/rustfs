@@ -50,7 +50,7 @@ serde.workspace = true
 time.workspace = true
 bytesize.workspace = true
 serde_json.workspace = true
-serde-xml-rs.workspace = true
+quick-xml.workspace = true
 s3s.workspace = true
 http.workspace = true
 url.workspace = true
@@ -66,6 +66,7 @@ rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }
 path-clean = { workspace = true }
@@ -98,6 +99,7 @@ rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-signer.workspace = true
+rustfs-checksums.workspace = true
 futures-util.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]

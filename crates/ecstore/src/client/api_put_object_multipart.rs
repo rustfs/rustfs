@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
@@ -19,20 +18,14 @@
 #![allow(clippy::all)]
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderName, StatusCode};
 use s3s::S3ErrorCode;
-use std::io::Read;
-use std::{collections::HashMap, sync::Arc};
-use time::{OffsetDateTime, format_description};
-use tokio_util::sync::CancellationToken;
+use std::collections::HashMap;
+use time::OffsetDateTime;
 use tracing::warn;
-use tracing::{error, info};
-use url::form_urlencoded::Serializer;
 use uuid::Uuid;
 
-use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
-use s3s::{Body, dto::StreamingBlob};
-//use crate::disk::{Reader, BufferReader};
+use crate::checksum::ChecksumMode;
 use crate::client::{
     api_error_response::{
         err_entity_too_large, err_entity_too_small, err_invalid_argument, http_resp_to_error_response, to_error_response,
@@ -42,15 +35,11 @@ use crate::client::{
     api_s3_datatypes::{
         CompleteMultipartUpload, CompleteMultipartUploadResult, CompletePart, InitiateMultipartUploadResult, ObjectPart,
     },
-    constants::{ABS_MIN_PART_SIZE, ISO8601_DATEFORMAT, MAX_PART_SIZE, MAX_SINGLE_PUT_OBJECT_SIZE},
+    constants::{ISO8601_DATEFORMAT, MAX_PART_SIZE, MAX_SINGLE_PUT_OBJECT_SIZE},
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
-use crate::{
-    checksum::ChecksumMode,
-    disk::DiskAPI,
-    store_api::{GetObjectReader, StorageAPI},
-};
 use rustfs_utils::{crypto::base64_encode, path::trim_etag};
+use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 
 impl TransitionClient {
     pub async fn put_object_multipart(
@@ -133,7 +122,8 @@ impl TransitionClient {
             //}
             if hash_sums.len() == 0 {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
@@ -236,7 +226,12 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
         //if resp.is_none() {
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                &resp,
+                vec![],
+                bucket_name,
+                object_name,
+            )));
         }
         //}
         let initiate_multipart_upload_result = InitiateMultipartUploadResult::default();
@@ -293,7 +288,7 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                resp,
+                &resp,
                 vec![],
                 &p.bucket_name.clone(),
                 &p.object_name,

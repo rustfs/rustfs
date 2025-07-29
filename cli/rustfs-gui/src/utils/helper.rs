@@ -371,7 +371,7 @@ impl ServiceManager {
                 StdCommand::new("taskkill")
                     .arg("/F")
                     .arg("/PID")
-                    .arg(&service_pid.to_string())
+                    .arg(service_pid.to_string())
                     .output()?;
             }
 

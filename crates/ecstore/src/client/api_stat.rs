@@ -59,7 +59,7 @@ impl TransitionClient {
 
         if let Ok(resp) = resp {
             let b = resp.body().bytes().expect("err").to_vec();
-            let resperr = http_resp_to_error_response(resp, b, bucket_name, "");
+            let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
             /*if to_error_response(resperr).code == "NoSuchBucket" {
                 return Ok(false);
             }
