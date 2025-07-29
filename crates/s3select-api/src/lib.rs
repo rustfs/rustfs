@@ -21,6 +21,9 @@ pub mod object_store;
 pub mod query;
 pub mod server;
 
+#[cfg(test)]
+mod test;
+
 pub type QueryResult<T> = Result<T, QueryError>;
 
 #[derive(Debug, Snafu)]
@@ -88,5 +91,84 @@ impl Display for ResolvedTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { table } = self;
         write!(f, "{table}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::DataFusionError;
+    use datafusion::sql::sqlparser::parser::ParserError;
+
+    #[test]
+    fn test_query_error_display() {
+        let err = QueryError::NotImplemented {
+            err: "feature X".to_string(),
+        };
+        assert_eq!(err.to_string(), "This feature is not implemented: feature X");
+
+        let err = QueryError::MultiStatement {
+            num: 2,
+            sql: "SELECT 1; SELECT 2;".to_string(),
+        };
+        assert_eq!(err.to_string(), "Multi-statement not allow, found num:2, sql:SELECT 1; SELECT 2;");
+
+        let err = QueryError::Cancel;
+        assert_eq!(err.to_string(), "The query has been canceled");
+
+        let err = QueryError::FunctionNotExists {
+            name: "my_func".to_string(),
+        };
+        assert_eq!(err.to_string(), "Udf not exists, name:my_func.");
+
+        let err = QueryError::StoreError {
+            e: "connection failed".to_string(),
+        };
+        assert_eq!(err.to_string(), "Store Error, e:connection failed.");
+    }
+
+    #[test]
+    fn test_query_error_from_datafusion_error() {
+        let df_error = DataFusionError::Plan("invalid plan".to_string());
+        let query_error: QueryError = df_error.into();
+
+        match query_error {
+            QueryError::Datafusion { source, .. } => {
+                assert!(source.to_string().contains("invalid plan"));
+            }
+            _ => panic!("Expected Datafusion error"),
+        }
+    }
+
+    #[test]
+    fn test_query_error_from_parser_error() {
+        let parser_error = ParserError::ParserError("syntax error".to_string());
+        let query_error = QueryError::Parser { source: parser_error };
+
+        assert!(query_error.to_string().contains("syntax error"));
+    }
+
+    #[test]
+    fn test_resolved_table() {
+        let table = ResolvedTable {
+            table: "my_table".to_string(),
+        };
+
+        assert_eq!(table.table(), "my_table");
+        assert_eq!(table.to_string(), "my_table");
+    }
+
+    #[test]
+    fn test_resolved_table_clone_and_eq() {
+        let table1 = ResolvedTable {
+            table: "table1".to_string(),
+        };
+        let table2 = table1.clone();
+        let table3 = ResolvedTable {
+            table: "table2".to_string(),
+        };
+
+        assert_eq!(table1, table2);
+        assert_ne!(table1, table3);
     }
 }

@@ -1690,6 +1690,15 @@ impl DiskAPI for LocalDisk {
                 };
                 out.write_obj(&meta).await?;
                 objs_returned += 1;
+            } else {
+                let fpath =
+                    self.get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
+
+                if let Ok(meta) = tokio::fs::metadata(fpath).await
+                    && meta.is_file()
+                {
+                    return Err(DiskError::FileNotFound);
+                }
             }
         }
 
