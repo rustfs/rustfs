@@ -1,0 +1,60 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-kms"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "Key Management Service (KMS) for RustFS, providing secure key storage, rotation, and access control."
+keywords = ["kms", "cryptography", "vault", "security", "rustfs"]
+categories = ["web-programming", "cryptography", "authentication"]
+documentation = "https://docs.rs/rustfs-kms/latest/rustfs_kms/"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+once_cell.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+base64.workspace = true
+url = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+rustfs-common.workspace = true
+rustfs-crypto.workspace = true
+rand.workspace = true
+
+vaultrs = { version = "0.7.4", optional = true }
+
+[dev-dependencies]
+test-case.workspace = true
+tokio-test.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+chrono = { workspace = true }
+urlencoding = { workspace = true }
+
+[features]
+default = ["vault"]
+vault = ["dep:vaultrs"]
