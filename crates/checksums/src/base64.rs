@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #![allow(unused_must_use)]
+#![allow(clippy::all)]
 
 use base64_simd::STANDARD;
 use std::error::Error;
