@@ -11,8 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
+#![allow(dead_code)]
 
 use base64_simd::STANDARD;
 use std::error::Error;
