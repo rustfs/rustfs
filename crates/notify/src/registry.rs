@@ -23,7 +23,7 @@ use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KVS};
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Registry for managing target factories
 pub struct TargetRegistry {
@@ -88,7 +88,7 @@ impl TargetRegistry {
         let all_env: Vec<(String, String)> = std::env::vars().collect();
         // 用于并发执行目标创建的异步任务集合
         let mut tasks = FuturesUnordered::new();
-
+        let mut final_config = config.clone(); // 克隆一份配置，用于聚合最终结果
         // 1. 遍历所有注册的工厂，按目标类型处理
         for (target_type, factory) in &self.factories {
             tracing::Span::current().record("target_type", &target_type.as_str());
@@ -101,6 +101,10 @@ impl TargetRegistry {
             // 2.2. 获取该类型的默认配置
             let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
             debug!(?default_cfg, "获取到默认配置");
+
+            // *** 优化点 1: 获取当前目标类型的所有合法字段 ***
+            let valid_fields = factory.get_valid_fields();
+            debug!(?valid_fields, "获取到合法的配置字段");
 
             // 3. 从环境变量中解析实例 ID 和配置覆盖项
             let mut instance_ids_from_env = HashSet::new();
@@ -125,6 +129,10 @@ impl TargetRegistry {
             let env_prefix = format!("{}{}{}_", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type).to_uppercase();
             // 3.2.2. `env_overrides` 用于存储从环境变量解析出的配置，格式为：{实例 ID -> {字段 -> 值}}
             let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+            let env_valid_fields = factory.get_valid_env_fields();
+            debug!(?valid_fields, "获取到合法的 ENV 配置字段");
+
             for (key, value) in &all_env {
                 if let Some(rest) = key.strip_prefix(&env_prefix) {
                     // 使用 rsplitn 从右侧分割，以正确提取末尾的 INSTANCE_ID
@@ -145,7 +153,8 @@ impl TargetRegistry {
                         None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
                     };
 
-                    if !field_name.is_empty() {
+                    // *** 优化点 2: 验证解析出的 field_name 是否合法 ***
+                    if !field_name.is_empty() && valid_fields.contains(&field_name) {
                         debug!(
                             instance_id = %if instance_id.is_empty() { DEFAULT_DELIMITER } else { &instance_id },
                             %field_name,
@@ -156,6 +165,13 @@ impl TargetRegistry {
                             .entry(instance_id)
                             .or_default()
                             .insert(field_name, value.clone());
+                    } else {
+                        // 忽略不合法的字段名
+                        warn!(
+                            field_name = %field_name,
+                            "忽略非法的环境变量字段，未在目标类型 {} 的合法字段列表中找到",
+                            target_type
+                        );
                     }
                 }
             }

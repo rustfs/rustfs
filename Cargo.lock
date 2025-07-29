@@ -8100,8 +8100,6 @@ name = "rustfs-config"
 version = "0.0.5"
 dependencies = [
  "const-str",
- "serde",
- "serde_json",
 ]
 
 [[package]]

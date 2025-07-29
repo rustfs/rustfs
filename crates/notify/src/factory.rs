@@ -14,20 +14,19 @@
 
 use crate::{
     error::TargetError,
-    target::{mqtt::MQTTArgs, webhook::WebhookArgs, Target},
+    target::{Target, mqtt::MQTTArgs, webhook::WebhookArgs},
 };
 use async_trait::async_trait;
 use rumqttc::QoS;
 use rustfs_config::notify::{
-    DEFAULT_DIR, DEFAULT_LIMIT, ENV_MQTT_BROKER, ENV_MQTT_ENABLE, ENV_MQTT_KEEP_ALIVE_INTERVAL, ENV_MQTT_PASSWORD, ENV_MQTT_QOS,
-    ENV_MQTT_QUEUE_DIR, ENV_MQTT_QUEUE_LIMIT, ENV_MQTT_RECONNECT_INTERVAL, ENV_MQTT_TOPIC, ENV_MQTT_USERNAME,
-    ENV_WEBHOOK_AUTH_TOKEN, ENV_WEBHOOK_CLIENT_CERT, ENV_WEBHOOK_CLIENT_KEY, ENV_WEBHOOK_ENABLE, ENV_WEBHOOK_ENDPOINT,
-    ENV_WEBHOOK_QUEUE_DIR, ENV_WEBHOOK_QUEUE_LIMIT, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
-    MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN,
-    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    DEFAULT_DIR, DEFAULT_LIMIT, ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL,
+    MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME,
+    NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
+    WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENV_WORD_DELIMITER_DASH};
-use rustfs_ecstore::config::{ENABLE_KEY, ENABLE_ON, KVS};
+use rustfs_ecstore::config::KVS;
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, warn};
 use url::Url;
@@ -35,6 +34,7 @@ use url::Url;
 /// Helper function to get values from environment variables or KVS configurations.
 ///
 /// It will give priority to reading from environment variables such as `BASE_ENV_KEY_ID` and fall back to the KVS configuration if it fails.
+#[allow(dead_code)]
 fn get_config_value(id: &str, base_env_key: &str, config_key: &str, config: &KVS) -> Option<String> {
     let env_key = if id != DEFAULT_DELIMITER {
         format!(
@@ -61,6 +61,14 @@ pub trait TargetFactory: Send + Sync {
 
     /// Validates target configuration
     fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError>;
+
+    /// Returns a set of valid configuration field names for this target type.
+    /// This is used to filter environment variables.
+    fn get_valid_fields(&self) -> HashSet<String>;
+
+    /// Returns a set of valid configuration env field names for this target type.
+    /// This is used to filter environment variables.
+    fn get_valid_env_fields(&self) -> HashSet<String>;
 }
 
 /// Factory for creating Webhook targets
@@ -118,6 +126,14 @@ impl TargetFactory for WebhookTargetFactory {
         }
 
         Ok(())
+    }
+
+    fn get_valid_fields(&self) -> HashSet<String> {
+        NOTIFY_WEBHOOK_KEYS.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn get_valid_env_fields(&self) -> HashSet<String> {
+        ENV_NOTIFY_WEBHOOK_KEYS.iter().map(|s| s.to_string()).collect()
     }
 }
 
@@ -214,5 +230,13 @@ impl TargetFactory for MQTTTargetFactory {
         }
 
         Ok(())
+    }
+
+    fn get_valid_fields(&self) -> HashSet<String> {
+        NOTIFY_MQTT_KEYS.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn get_valid_env_fields(&self) -> HashSet<String> {
+        ENV_NOTIFY_MQTT_KEYS.iter().map(|s| s.to_string()).collect()
     }
 }
