@@ -24,6 +24,7 @@ members = [
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
     "crates/iam", # Identity and Access Management
+    "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
     "crates/madmin", # Management dashboard and admin API interface
     "crates/notify", # Notification system for events
@@ -85,6 +86,7 @@ rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
+rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }

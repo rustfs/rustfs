@@ -71,6 +71,7 @@ use tracing::{error, info, warn};
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
+pub mod kms;
 pub mod policies;
 pub mod pools;
 pub mod rebalance;
