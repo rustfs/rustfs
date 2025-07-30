@@ -24,34 +24,11 @@ use rustfs_config::notify::{
     NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_config::{DEFAULT_DELIMITER, ENV_WORD_DELIMITER_DASH};
 use rustfs_ecstore::config::KVS;
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, warn};
 use url::Url;
-
-/// Helper function to get values from environment variables or KVS configurations.
-///
-/// It will give priority to reading from environment variables such as `BASE_ENV_KEY_ID` and fall back to the KVS configuration if it fails.
-#[allow(dead_code)]
-fn get_config_value(id: &str, base_env_key: &str, config_key: &str, config: &KVS) -> Option<String> {
-    let env_key = if id != DEFAULT_DELIMITER {
-        format!(
-            "{}{}{}",
-            base_env_key,
-            DEFAULT_DELIMITER,
-            id.to_uppercase().replace(ENV_WORD_DELIMITER_DASH, DEFAULT_DELIMITER)
-        )
-    } else {
-        base_env_key.to_string()
-    };
-
-    match std::env::var(&env_key) {
-        Ok(val) => Some(val),
-        Err(_) => config.lookup(config_key),
-    }
-}
 
 /// Trait for creating targets from configuration
 #[async_trait]

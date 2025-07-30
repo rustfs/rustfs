@@ -143,21 +143,21 @@ pub const DEFAULT_LOG_DIR: &str = "logs";
 /// This is the default log rotation size for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: 100 MB
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_SIZE_MB
 pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: hour, eg: day,hour,minute,second
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
 pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
 /// It is used to keep the logs of the application.
 /// Default value: 30
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_KEEP_FILES
+/// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 
 #[cfg(test)]
