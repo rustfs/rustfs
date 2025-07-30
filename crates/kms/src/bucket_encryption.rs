@@ -29,6 +29,9 @@ pub enum BucketEncryptionAlgorithm {
     /// ChaCha20-Poly1305
     #[serde(rename = "CHACHA20_POLY1305")]
     ChaCha20Poly1305,
+    /// AWS KMS encryption
+    #[serde(rename = "aws:kms")]
+    AwsKms,
 }
 
 impl Default for BucketEncryptionAlgorithm {
@@ -42,6 +45,7 @@ impl std::fmt::Display for BucketEncryptionAlgorithm {
         match self {
             Self::Aes256 => write!(f, "AES256"),
             Self::ChaCha20Poly1305 => write!(f, "CHACHA20_POLY1305"),
+            Self::AwsKms => write!(f, "aws:kms"),
         }
     }
 }

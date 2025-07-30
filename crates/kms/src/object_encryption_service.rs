@@ -188,13 +188,24 @@ mod tests {
         let service = ObjectEncryptionService::new(kms_manager);
 
         let test_data = b"Hello, World! This is test data for encryption.";
-        let reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(std::io::Cursor::new(test_data.to_vec()));
+        let reader = Box::new(std::io::Cursor::new(test_data.to_vec())) as Box<dyn AsyncRead + Send + Unpin>;
 
         // Encrypt
         let (encrypted_reader, metadata) = service
-            .encrypt_object("test-bucket", "test-key", reader, "AES256", None, None)
+            .encrypt_object::<std::io::Cursor<Vec<u8>>>("test-bucket", "test-key", reader, "AES256", None, None)
             .await
             .unwrap();
+
+        // Convert EncryptionMetadata to HashMap for decrypt_object
+        let mut metadata_map = std::collections::HashMap::new();
+        metadata_map.insert("x-amz-server-side-encryption".to_string(), metadata.algorithm.clone());
+        metadata_map.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
+        metadata_map.insert("x-amz-server-side-encryption-context".to_string(), 
+            serde_json::to_string(&metadata.encryption_context).unwrap_or_default());
+        metadata_map.insert("x-amz-iv".to_string(), base64::encode(&metadata.iv));
+        if let Some(tag) = &metadata.tag {
+            metadata_map.insert("x-amz-tag".to_string(), base64::encode(tag));
+        }
 
         // Decrypt
         let decrypted_reader = service
@@ -205,7 +216,7 @@ mod tests {
                 "AES256",
                 None,
                 None,
-                metadata,
+                metadata_map,
             )
             .await
             .unwrap();
