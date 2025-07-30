@@ -88,6 +88,7 @@ rustfs-signer = { path = "crates/signer", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
+anyhow = "1.0.98"
 arc-swap = "1.7.1"
 argon2 = { version = "0.5.3", features = ["std"] }
 atoi = "2.0.0"
@@ -112,7 +113,7 @@ cfg-if = "1.0.1"
 crc-fast = "1.3.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.41", features = ["derive", "env"] }
+clap = { version = "4.5.42", features = ["derive", "env"] }
 const-str = { version = "0.6.4", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -275,7 +276,7 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
-anyhow = "1.0.98"
+
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rust-i18n"]
