@@ -144,7 +144,7 @@ impl ObjectAttributes {
         self.version_id = h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap().to_string();
 
         let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-        let mut response = match serde_xml_rs::from_str::<ObjectAttributesResponse>(&String::from_utf8(b).unwrap()) {
+        let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));
@@ -226,7 +226,7 @@ impl TransitionClient {
         if resp.status() != http::StatusCode::OK {
             let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
             let err_body = String::from_utf8(b).unwrap();
-            let mut er = match serde_xml_rs::from_str::<AccessControlPolicy>(&err_body) {
+            let mut er = match quick_xml::de::from_str::<AccessControlPolicy>(&err_body) {
                 Ok(result) => result,
                 Err(err) => {
                     return Err(std::io::Error::other(err.to_string()));

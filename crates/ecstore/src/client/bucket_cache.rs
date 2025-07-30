@@ -177,7 +177,7 @@ impl TransitionClient {
 async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str) -> Result<String, std::io::Error> {
     //if resp != nil {
     if resp.status() != StatusCode::OK {
-        let err_resp = http_resp_to_error_response(resp, vec![], bucket_name, "");
+        let err_resp = http_resp_to_error_response(&resp, vec![], bucket_name, "");
         match err_resp.code {
                 S3ErrorCode::NotImplemented => {
                     match err_resp.server.as_str() {
@@ -208,7 +208,7 @@ async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket
     //}
 
     let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-    let Document(location_constraint) = serde_xml_rs::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
+    let Document(location_constraint) = quick_xml::de::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
 
     let mut location = location_constraint;
     if location == "" {

@@ -125,7 +125,7 @@ impl TransitionClient {
         version_id: &str,
         restore_req: &RestoreRequest,
     ) -> Result<(), std::io::Error> {
-        let restore_request = match serde_xml_rs::to_string(restore_req) {
+        let restore_request = match quick_xml::se::to_string(restore_req) {
             Ok(buf) => buf,
             Err(e) => {
                 return Err(std::io::Error::other(e));
@@ -165,7 +165,7 @@ impl TransitionClient {
 
         let b = resp.body().bytes().expect("err").to_vec();
         if resp.status() != http::StatusCode::ACCEPTED && resp.status() != http::StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, b, bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, b, bucket_name, "")));
         }
         Ok(())
     }
