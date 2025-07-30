@@ -1,4 +1,3 @@
-#![allow(clippy::map_entry)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::map_entry)]
+
 use crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
-use crate::config::GLOBAL_StorageClass;
+use crate::config::GLOBAL_STORAGE_CLASS;
 use crate::config::storageclass;
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
@@ -1139,7 +1140,7 @@ impl StorageAPI for ECStore {
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
-            if let Some(sc) = GLOBAL_StorageClass.get() {
+            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 let sc_parity = sc
                     .get_parity_for_sc(storageclass::CLASS_STANDARD)
                     .or(Some(self.pools[0].default_parity_count));

@@ -12,11 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_FILENAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB,
-    DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME, DEFAULT_SINK_FILE_LOG_FILE, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
-    SERVICE_VERSION, USE_STDOUT,
+use rustfs_config::observability::{
+    DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY, DEFAULT_SINKS_FILE_BUFFER_SIZE, DEFAULT_SINKS_FILE_FLUSH_INTERVAL_MS,
+    DEFAULT_SINKS_FILE_FLUSH_THRESHOLD, DEFAULT_SINKS_KAFKA_BATCH_SIZE, DEFAULT_SINKS_KAFKA_BATCH_TIMEOUT_MS,
+    DEFAULT_SINKS_KAFKA_BROKERS, DEFAULT_SINKS_KAFKA_TOPIC, DEFAULT_SINKS_WEBHOOK_AUTH_TOKEN, DEFAULT_SINKS_WEBHOOK_ENDPOINT,
+    DEFAULT_SINKS_WEBHOOK_MAX_RETRIES, DEFAULT_SINKS_WEBHOOK_RETRY_DELAY_MS, ENV_AUDIT_LOGGER_QUEUE_CAPACITY, ENV_OBS_ENDPOINT,
+    ENV_OBS_ENVIRONMENT, ENV_OBS_LOCAL_LOGGING_ENABLED, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES,
+    ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOGGER_LEVEL, ENV_OBS_METER_INTERVAL, ENV_OBS_SAMPLE_RATIO,
+    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_SINKS_FILE_BUFFER_SIZE, ENV_SINKS_FILE_FLUSH_INTERVAL_MS,
+    ENV_SINKS_FILE_FLUSH_THRESHOLD, ENV_SINKS_FILE_PATH, ENV_SINKS_KAFKA_BATCH_SIZE, ENV_SINKS_KAFKA_BATCH_TIMEOUT_MS,
+    ENV_SINKS_KAFKA_BROKERS, ENV_SINKS_KAFKA_TOPIC, ENV_SINKS_WEBHOOK_AUTH_TOKEN, ENV_SINKS_WEBHOOK_ENDPOINT,
+    ENV_SINKS_WEBHOOK_MAX_RETRIES, ENV_SINKS_WEBHOOK_RETRY_DELAY_MS,
 };
+use rustfs_config::observability::{ENV_OBS_LOG_DIRECTORY, ENV_OBS_USE_STDOUT};
+use rustfs_config::{
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
+    DEFAULT_OBS_LOG_FILENAME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+};
+use rustfs_utils::dirs::get_log_directory_to_string;
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -52,14 +65,14 @@ impl OtelConfig {
     pub fn extract_otel_config_from_env(endpoint: Option<String>) -> OtelConfig {
         let endpoint = if let Some(endpoint) = endpoint {
             if endpoint.is_empty() {
-                env::var("RUSTFS_OBS_ENDPOINT").unwrap_or_else(|_| "".to_string())
+                env::var(ENV_OBS_ENDPOINT).unwrap_or_else(|_| "".to_string())
             } else {
                 endpoint
             }
         } else {
-            env::var("RUSTFS_OBS_ENDPOINT").unwrap_or_else(|_| "".to_string())
+            env::var(ENV_OBS_ENDPOINT).unwrap_or_else(|_| "".to_string())
         };
-        let mut use_stdout = env::var("RUSTFS_OBS_USE_STDOUT")
+        let mut use_stdout = env::var(ENV_OBS_USE_STDOUT)
             .ok()
             .and_then(|v| v.parse().ok())
             .or(Some(USE_STDOUT));
@@ -70,51 +83,48 @@ impl OtelConfig {
         OtelConfig {
             endpoint,
             use_stdout,
-            sample_ratio: env::var("RUSTFS_OBS_SAMPLE_RATIO")
+            sample_ratio: env::var(ENV_OBS_SAMPLE_RATIO)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(SAMPLE_RATIO)),
-            meter_interval: env::var("RUSTFS_OBS_METER_INTERVAL")
+            meter_interval: env::var(ENV_OBS_METER_INTERVAL)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(METER_INTERVAL)),
-            service_name: env::var("RUSTFS_OBS_SERVICE_NAME")
+            service_name: env::var(ENV_OBS_SERVICE_NAME)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(APP_NAME.to_string())),
-            service_version: env::var("RUSTFS_OBS_SERVICE_VERSION")
+            service_version: env::var(ENV_OBS_SERVICE_VERSION)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(SERVICE_VERSION.to_string())),
-            environment: env::var("RUSTFS_OBS_ENVIRONMENT")
+            environment: env::var(ENV_OBS_ENVIRONMENT)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(ENVIRONMENT.to_string())),
-            logger_level: env::var("RUSTFS_OBS_LOGGER_LEVEL")
+            logger_level: env::var(ENV_OBS_LOGGER_LEVEL)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_LEVEL.to_string())),
-            local_logging_enabled: env::var("RUSTFS_OBS_LOCAL_LOGGING_ENABLED")
+            local_logging_enabled: env::var(ENV_OBS_LOCAL_LOGGING_ENABLED)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(false)),
-            log_directory: env::var("RUSTFS_OBS_LOG_DIRECTORY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_DIR.to_string())),
-            log_filename: env::var("RUSTFS_OBS_LOG_FILENAME")
+            log_directory: Some(get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY)),
+            log_filename: env::var(ENV_OBS_LOG_FILENAME)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_OBS_LOG_FILENAME.to_string())),
-            log_rotation_size_mb: env::var("RUSTFS_OBS_LOG_ROTATION_SIZE_MB")
+            log_rotation_size_mb: env::var(ENV_OBS_LOG_ROTATION_SIZE_MB)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
-            log_rotation_time: env::var("RUSTFS_OBS_LOG_ROTATION_TIME")
+            log_rotation_time: env::var(ENV_OBS_LOG_ROTATION_TIME)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_ROTATION_TIME.to_string())), // Default to "Day"
-            log_keep_files: env::var("RUSTFS_OBS_LOG_KEEP_FILES")
+            log_keep_files: env::var(ENV_OBS_LOG_KEEP_FILES)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
@@ -154,16 +164,22 @@ impl KafkaSinkConfig {
 impl Default for KafkaSinkConfig {
     fn default() -> Self {
         Self {
-            brokers: env::var("RUSTFS_SINKS_KAFKA_BROKERS")
+            brokers: env::var(ENV_SINKS_KAFKA_BROKERS)
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "localhost:9092".to_string()),
-            topic: env::var("RUSTFS_SINKS_KAFKA_TOPIC")
+                .unwrap_or_else(|| DEFAULT_SINKS_KAFKA_BROKERS.to_string()),
+            topic: env::var(ENV_SINKS_KAFKA_TOPIC)
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "rustfs_sink".to_string()),
-            batch_size: Some(100),
-            batch_timeout_ms: Some(1000),
+                .unwrap_or_else(|| DEFAULT_SINKS_KAFKA_TOPIC.to_string()),
+            batch_size: env::var(ENV_SINKS_KAFKA_BATCH_SIZE)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_SINKS_KAFKA_BATCH_SIZE)),
+            batch_timeout_ms: env::var(ENV_SINKS_KAFKA_BATCH_TIMEOUT_MS)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_SINKS_KAFKA_BATCH_TIMEOUT_MS)),
         }
     }
 }
@@ -186,16 +202,22 @@ impl WebhookSinkConfig {
 impl Default for WebhookSinkConfig {
     fn default() -> Self {
         Self {
-            endpoint: env::var("RUSTFS_SINKS_WEBHOOK_ENDPOINT")
+            endpoint: env::var(ENV_SINKS_WEBHOOK_ENDPOINT)
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "http://localhost:8080".to_string()),
-            auth_token: env::var("RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN")
+                .unwrap_or_else(|| DEFAULT_SINKS_WEBHOOK_ENDPOINT.to_string()),
+            auth_token: env::var(ENV_SINKS_WEBHOOK_AUTH_TOKEN)
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "rustfs_webhook_token".to_string()),
-            max_retries: Some(3),
-            retry_delay_ms: Some(100),
+                .unwrap_or_else(|| DEFAULT_SINKS_WEBHOOK_AUTH_TOKEN.to_string()),
+            max_retries: env::var(ENV_SINKS_WEBHOOK_MAX_RETRIES)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_SINKS_WEBHOOK_MAX_RETRIES)),
+            retry_delay_ms: env::var(ENV_SINKS_WEBHOOK_RETRY_DELAY_MS)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_SINKS_WEBHOOK_RETRY_DELAY_MS)),
         }
     }
 }
@@ -210,18 +232,6 @@ pub struct FileSinkConfig {
 }
 
 impl FileSinkConfig {
-    pub fn get_default_log_path() -> String {
-        let temp_dir = env::temp_dir().join(DEFAULT_LOG_FILENAME);
-        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-            eprintln!("Failed to create log directory: {e}");
-            return DEFAULT_LOG_DIR.to_string();
-        }
-        temp_dir
-            .join(DEFAULT_SINK_FILE_LOG_FILE)
-            .to_str()
-            .unwrap_or(DEFAULT_LOG_DIR)
-            .to_string()
-    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -230,22 +240,19 @@ impl FileSinkConfig {
 impl Default for FileSinkConfig {
     fn default() -> Self {
         Self {
-            path: env::var("RUSTFS_SINKS_FILE_PATH")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(Self::get_default_log_path),
-            buffer_size: env::var("RUSTFS_SINKS_FILE_BUFFER_SIZE")
+            path: get_log_directory_to_string(ENV_SINKS_FILE_PATH),
+            buffer_size: env::var(ENV_SINKS_FILE_BUFFER_SIZE)
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(8192)),
-            flush_interval_ms: env::var("RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS")
+                .or(Some(DEFAULT_SINKS_FILE_BUFFER_SIZE)),
+            flush_interval_ms: env::var(ENV_SINKS_FILE_FLUSH_INTERVAL_MS)
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(1000)),
-            flush_threshold: env::var("RUSTFS_SINKS_FILE_FLUSH_THRESHOLD")
+                .or(Some(DEFAULT_SINKS_FILE_FLUSH_INTERVAL_MS)),
+            flush_threshold: env::var(ENV_SINKS_FILE_FLUSH_THRESHOLD)
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(100)),
+                .or(Some(DEFAULT_SINKS_FILE_FLUSH_THRESHOLD)),
         }
     }
 }
@@ -280,7 +287,10 @@ pub struct LoggerConfig {
 impl LoggerConfig {
     pub fn new() -> Self {
         Self {
-            queue_capacity: Some(10000),
+            queue_capacity: env::var(ENV_AUDIT_LOGGER_QUEUE_CAPACITY)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY)),
         }
     }
 }

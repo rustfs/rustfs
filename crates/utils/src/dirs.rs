@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_config::{DEFAULT_LOG_DIR, DEFAULT_LOG_FILENAME};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Get the absolute path to the current project
@@ -55,6 +57,72 @@ pub fn get_project_root() -> Result<PathBuf, String> {
 
     // If all methods fail, return an error
     Err("The project root directory cannot be obtained. Please check the running environment and project structure.".to_string())
+}
+
+/// Get the log directory as a string
+/// This function will try to find a writable log directory in the following order:
+pub fn get_log_directory_to_string(key: &str) -> String {
+    get_log_directory(key).to_string_lossy().to_string()
+}
+
+/// Get the log directory
+/// This function will try to find a writable log directory in the following order:
+pub fn get_log_directory(key: &str) -> PathBuf {
+    // Environment variables are specified
+    if let Ok(log_dir) = env::var(key) {
+        let path = PathBuf::from(log_dir);
+        if ensure_directory_writable(&path) {
+            return path;
+        }
+    }
+
+    // System temporary directory
+    if let Ok(mut temp_dir) = env::temp_dir().canonicalize() {
+        temp_dir.push(DEFAULT_LOG_FILENAME);
+        temp_dir.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&temp_dir) {
+            return temp_dir;
+        }
+    }
+
+    // User home directory
+    if let Ok(home_dir) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
+        let mut path = PathBuf::from(home_dir);
+        path.push(format!(".{DEFAULT_LOG_FILENAME}"));
+        path.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&path) {
+            return path;
+        }
+    }
+
+    // Current working directory
+    if let Ok(current_dir) = env::current_dir() {
+        let mut path = current_dir;
+        path.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&path) {
+            return path;
+        }
+    }
+
+    // Relative path
+    PathBuf::from(DEFAULT_LOG_DIR)
+}
+
+fn ensure_directory_writable(path: &PathBuf) -> bool {
+    // Try creating a catalog
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+
+    // Check write permissions
+    let test_file = path.join(".write_test");
+    match fs::write(&test_file, "test") {
+        Ok(_) => {
+            let _ = fs::remove_file(&test_file);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

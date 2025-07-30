@@ -65,7 +65,7 @@ pub struct Opt {
     pub secret_key: String,
 
     /// Enable console server
-    #[arg(long, default_value_t = true, env = "RUSTFS_CONSOLE_ENABLE")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ENABLE, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.

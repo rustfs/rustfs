@@ -14,7 +14,6 @@
 
 use crate::{AppConfig, SinkConfig, UnifiedLogEntry};
 use async_trait::async_trait;
-use rustfs_config::DEFAULT_SINK_FILE_LOG_FILE;
 use std::sync::Arc;
 
 #[cfg(feature = "file")]
@@ -47,8 +46,12 @@ pub async fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
                         sinks.push(Arc::new(kafka::KafkaSink::new(
                             producer,
                             kafka_config.topic.clone(),
-                            kafka_config.batch_size.unwrap_or(100),
-                            kafka_config.batch_timeout_ms.unwrap_or(1000),
+                            kafka_config
+                                .batch_size
+                                .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_KAFKA_BATCH_SIZE),
+                            kafka_config
+                                .batch_timeout_ms
+                                .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_KAFKA_BATCH_TIMEOUT_MS),
                         )));
                         tracing::info!("Kafka sink created for topic: {}", kafka_config.topic);
                     }
@@ -57,25 +60,35 @@ pub async fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
                     }
                 }
             }
+
             #[cfg(feature = "webhook")]
             SinkConfig::Webhook(webhook_config) => {
                 sinks.push(Arc::new(webhook::WebhookSink::new(
                     webhook_config.endpoint.clone(),
                     webhook_config.auth_token.clone(),
-                    webhook_config.max_retries.unwrap_or(3),
-                    webhook_config.retry_delay_ms.unwrap_or(100),
+                    webhook_config
+                        .max_retries
+                        .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_WEBHOOK_MAX_RETRIES),
+                    webhook_config
+                        .retry_delay_ms
+                        .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_WEBHOOK_RETRY_DELAY_MS),
                 )));
                 tracing::info!("Webhook sink created for endpoint: {}", webhook_config.endpoint);
             }
-
             #[cfg(feature = "file")]
             SinkConfig::File(file_config) => {
                 tracing::debug!("FileSink: Using path: {}", file_config.path);
                 match file::FileSink::new(
-                    format!("{}/{}", file_config.path.clone(), DEFAULT_SINK_FILE_LOG_FILE),
-                    file_config.buffer_size.unwrap_or(8192),
-                    file_config.flush_interval_ms.unwrap_or(1000),
-                    file_config.flush_threshold.unwrap_or(100),
+                    format!("{}/{}", file_config.path.clone(), rustfs_config::DEFAULT_SINK_FILE_LOG_FILE),
+                    file_config
+                        .buffer_size
+                        .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_FILE_BUFFER_SIZE),
+                    file_config
+                        .flush_interval_ms
+                        .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_FILE_FLUSH_INTERVAL_MS),
+                    file_config
+                        .flush_threshold
+                        .unwrap_or(rustfs_config::observability::DEFAULT_SINKS_FILE_FLUSH_THRESHOLD),
                 )
                 .await
                 {

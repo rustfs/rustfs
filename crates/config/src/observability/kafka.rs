@@ -12,39 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
+// RUSTFS_SINKS_KAFKA_BROKERS
+pub const ENV_SINKS_KAFKA_BROKERS: &str = "RUSTFS_SINKS_KAFKA_BROKERS";
+pub const ENV_SINKS_KAFKA_TOPIC: &str = "RUSTFS_SINKS_KAFKA_TOPIC";
+// batch_size
+pub const ENV_SINKS_KAFKA_BATCH_SIZE: &str = "RUSTFS_SINKS_KAFKA_BATCH_SIZE";
+// batch_timeout_ms
+pub const ENV_SINKS_KAFKA_BATCH_TIMEOUT_MS: &str = "RUSTFS_SINKS_KAFKA_BATCH_TIMEOUT_MS";
 
-/// Kafka sink configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KafkaSink {
-    pub brokers: String,
-    pub topic: String,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: Option<usize>,
-    #[serde(default = "default_batch_timeout_ms")]
-    pub batch_timeout_ms: Option<u64>,
-}
-
-impl KafkaSink {
-    pub fn new() -> Self {
-        Self {
-            brokers: "localhost:9092".to_string(),
-            topic: "rustfs".to_string(),
-            batch_size: default_batch_size(),
-            batch_timeout_ms: default_batch_timeout_ms(),
-        }
-    }
-}
-
-impl Default for KafkaSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn default_batch_size() -> Option<usize> {
-    Some(100)
-}
-fn default_batch_timeout_ms() -> Option<u64> {
-    Some(1000)
-}
+// brokers
+pub const DEFAULT_SINKS_KAFKA_BROKERS: &str = "localhost:9092";
+pub const DEFAULT_SINKS_KAFKA_TOPIC: &str = "rustfs-sinks";
+pub const DEFAULT_SINKS_KAFKA_BATCH_SIZE: usize = 100;
+pub const DEFAULT_SINKS_KAFKA_BATCH_TIMEOUT_MS: u64 = 1000;

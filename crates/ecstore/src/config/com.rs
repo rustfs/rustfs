@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{Config, GLOBAL_StorageClass, storageclass};
+use crate::config::{Config, GLOBAL_STORAGE_CLASS, storageclass};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
-use lazy_static::lazy_static;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tracing::{error, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
@@ -29,14 +29,13 @@ const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
-lazy_static! {
-    static ref CONFIG_BUCKET: String = format!("{}{}{}", RUSTFS_META_BUCKET, SLASH_SEPARATOR, CONFIG_PREFIX);
-    static ref SubSystemsDynamic: HashSet<String> = {
-        let mut h = HashSet::new();
-        h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
-        h
-    };
-}
+static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
+
+static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let mut h = HashSet::new();
+    h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
+    h
+});
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
@@ -197,7 +196,7 @@ pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {
 }
 
 async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> Result<()> {
-    for key in SubSystemsDynamic.iter() {
+    for key in SUB_SYSTEMS_DYNAMIC.iter() {
         apply_dynamic_config_for_sub_sys(cfg, api.clone(), key).await?;
     }
 
@@ -212,9 +211,9 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {
                 Ok(res) => {
-                    if i == 0 && GLOBAL_StorageClass.get().is_none() {
-                        if let Err(r) = GLOBAL_StorageClass.set(res) {
-                            error!("GLOBAL_StorageClass.set failed {:?}", r);
+                    if i == 0 && GLOBAL_STORAGE_CLASS.get().is_none() {
+                        if let Err(r) = GLOBAL_STORAGE_CLASS.set(res) {
+                            error!("GLOBAL_STORAGE_CLASS.set failed {:?}", r);
                         }
                     }
                 }
