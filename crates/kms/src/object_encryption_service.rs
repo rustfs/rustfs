@@ -1,15 +1,12 @@
 use crate::{
-    cipher::{ObjectCipher, AesGcmCipher, ChaCha20Poly1305Cipher},
+    cipher::{AesGcmCipher, ChaCha20Poly1305Cipher, ObjectCipher},
     error::EncryptionResult,
     manager::KmsManager,
-    object_encryption::EncryptionAlgorithm,
-    security::{SecretKey, SecretVec},
-    types::{EncryptionMetadata, DecryptionInput},
+    types::EncryptionMetadata,
 };
-use async_trait::async_trait;
+use base64::Engine;
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use bytes::Bytes;
 
 /// Service for encrypting and decrypting S3 objects
 pub struct ObjectEncryptionService {
@@ -36,22 +33,16 @@ impl ObjectEncryptionService {
         reader.read_to_end(&mut data).await?;
 
         // Generate data encryption key
-        let context = encryption_context.unwrap_or_else(|| {
-            format!("bucket={}&key={}", bucket, key)
-        });
-        
-        let request = crate::types::GenerateKeyRequest::new(
-            kms_key_id.clone().unwrap_or_default().to_string(),
-            "AES_256".to_string()
-        ).with_length(32);
-        
-        let data_key_result = self.kms_manager
-            .generate_data_key(&request, None)
-            .await?;
-        
-        let data_key = data_key_result.plaintext.ok_or_else(|| {
-            crate::error::EncryptionError::metadata_error("No plaintext key in data key result")
-        })?;
+        let _context = encryption_context.unwrap_or_else(|| format!("bucket={bucket}&key={key}"));
+
+        let request = crate::types::GenerateKeyRequest::new(kms_key_id.unwrap_or_default().to_string(), "AES_256".to_string())
+            .with_length(32);
+
+        let data_key_result = self.kms_manager.generate_data_key(&request, None).await?;
+
+        let data_key = data_key_result
+            .plaintext
+            .ok_or_else(|| crate::error::EncryptionError::metadata_error("No plaintext key in data key result"))?;
         let encrypted_data_key = data_key_result.ciphertext;
 
         // Create cipher based on algorithm
@@ -66,15 +57,15 @@ impl ObjectEncryptionService {
             "AES256" => {
                 let mut iv = vec![0u8; 12]; // AES-GCM uses 12-byte IV
                 use rand::RngCore;
-                rand::thread_rng().fill_bytes(&mut iv);
+                rand::rng().fill_bytes(&mut iv);
                 iv
-            },
+            }
             "ChaCha20Poly1305" => {
                 let mut iv = vec![0u8; 12]; // ChaCha20Poly1305 uses 12-byte nonce
                 use rand::RngCore;
-                rand::thread_rng().fill_bytes(&mut iv);
+                rand::rng().fill_bytes(&mut iv);
                 iv
-            },
+            }
             _ => return Err(crate::error::EncryptionError::unsupported_algorithm(algorithm)),
         };
         let aad = b"";
@@ -90,15 +81,17 @@ impl ObjectEncryptionService {
             encryption_context: std::collections::HashMap::new(),
             encrypted_at: chrono::Utc::now(),
             original_size: data.len() as u64,
+            encrypted_data_key,
         };
-        
+
         // Create encrypted reader
         let encrypted_reader: Box<dyn AsyncRead + Send + Sync + Unpin> = Box::new(std::io::Cursor::new(ciphertext));
-        
+
         Ok((encrypted_reader, metadata))
     }
 
     /// Decrypt object data stream
+    #[allow(clippy::too_many_arguments)]
     pub async fn decrypt_object<S>(
         &self,
         bucket: &str,
@@ -120,28 +113,28 @@ impl ObjectEncryptionService {
         let encrypted_data_key = metadata
             .get("x-amz-server-side-encryption-key")
             .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing encryption key"))?;
-        
-        let encrypted_key_bytes = base64::decode(encrypted_data_key)
-            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid base64 key: {}", e)))?;
+
+        let encrypted_key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encrypted_data_key)
+            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid base64 key: {e}")))?;
 
         // Decrypt data key using KMS
-        let context = encryption_context.unwrap_or_else(|| {
-            format!("bucket={}&key={}", bucket, key)
-        });
-        
+        let context = encryption_context.unwrap_or_else(|| format!("bucket={bucket}&key={key}"));
+
         let mut context_map = std::collections::HashMap::new();
         context_map.insert("context".to_string(), context);
-        
+
         let decrypt_request = crate::types::DecryptRequest {
             ciphertext: encrypted_key_bytes,
             encryption_context: context_map,
             grant_tokens: Vec::new(),
         };
-        
-        let data_key: Vec<u8> = self.kms_manager
+
+        let data_key: Vec<u8> = self
+            .kms_manager
             .decrypt(&decrypt_request, None)
             .await
-            .map_err(|e| crate::error::EncryptionError::KmsError(e))?;
+            .map_err(crate::error::EncryptionError::KmsError)?;
 
         // Create cipher based on algorithm
         let cipher: Box<dyn ObjectCipher> = match algorithm {
@@ -151,19 +144,25 @@ impl ObjectEncryptionService {
         };
 
         // Extract encryption parameters from metadata
-        let iv_str = metadata.get("iv")
+        let iv_str = metadata
+            .get("iv")
             .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing IV in metadata"))?;
-        let tag_str = metadata.get("tag")
+        let tag_str = metadata
+            .get("tag")
             .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing tag in metadata"))?;
-        
-        let iv = base64::decode(iv_str)
-            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid IV: {}", e)))?;
-        let tag = base64::decode(tag_str)
-            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid tag: {}", e)))?;
-        let aad_str = metadata.get("aad")
+
+        let iv = base64::engine::general_purpose::STANDARD
+            .decode(iv_str)
+            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid IV: {e}")))?;
+        let tag = base64::engine::general_purpose::STANDARD
+            .decode(tag_str)
+            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid tag: {e}")))?;
+        let aad_str = metadata
+            .get("aad")
             .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing AAD in metadata"))?;
-        let aad = base64::decode(aad_str)
-            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid AAD: {}", e)))?;
+        let aad = base64::engine::general_purpose::STANDARD
+            .decode(aad_str)
+            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid AAD: {e}")))?;
 
         // Decrypt the data
         let decrypted_data = cipher.decrypt(&encrypted_data, &iv, &tag, &aad)?;
@@ -183,8 +182,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypt_decrypt_roundtrip() {
-        let config = KmsConfig::default();
-        let kms_manager = KmsManager::new(config).await.unwrap();
+        let mut config = KmsConfig::default();
+        config.kms_type = crate::config::KmsType::Local;
+        config.default_key_id = Some("default".to_string());
+        let kms_manager = KmsManager::new(config.clone()).await.expect("Failed to create KMS manager");
+
+        // Create default key if it doesn't exist
+        if kms_manager.describe_key("default", None).await.is_err() {
+            kms_manager
+                .create_key("default", "AES_256", None)
+                .await
+                .expect("Failed to create default key");
+        }
+
+        // Create service
         let service = ObjectEncryptionService::new(kms_manager);
 
         let test_data = b"Hello, World! This is test data for encryption.";
@@ -192,40 +203,44 @@ mod tests {
 
         // Encrypt
         let (encrypted_reader, metadata) = service
-            .encrypt_object::<std::io::Cursor<Vec<u8>>>("test-bucket", "test-key", reader, "AES256", None, None)
+            .encrypt_object::<std::io::Cursor<Vec<u8>>>("test-bucket", "default", reader, "AES256", Some("default"), None)
             .await
-            .unwrap();
+            .expect("Failed to encrypt object");
 
         // Convert EncryptionMetadata to HashMap for decrypt_object
         let mut metadata_map = std::collections::HashMap::new();
         metadata_map.insert("x-amz-server-side-encryption".to_string(), metadata.algorithm.clone());
         metadata_map.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
-        metadata_map.insert("x-amz-server-side-encryption-context".to_string(), 
-            serde_json::to_string(&metadata.encryption_context).unwrap_or_default());
-        metadata_map.insert("x-amz-iv".to_string(), base64::encode(&metadata.iv));
+        metadata_map.insert(
+            "x-amz-server-side-encryption-context".to_string(),
+            serde_json::to_string(&metadata.encryption_context).unwrap_or_default(),
+        );
+        metadata_map.insert("iv".to_string(), base64::engine::general_purpose::STANDARD.encode(&metadata.iv));
         if let Some(tag) = &metadata.tag {
-            metadata_map.insert("x-amz-tag".to_string(), base64::encode(tag));
+            metadata_map.insert("tag".to_string(), base64::engine::general_purpose::STANDARD.encode(tag));
         }
+        // Add AAD for testing
+        metadata_map.insert("aad".to_string(), base64::engine::general_purpose::STANDARD.encode(b""));
+        // Use the actual encrypted data key from encrypt_object
+        metadata_map.insert(
+            "x-amz-server-side-encryption-key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
+        );
 
         // Decrypt
         let decrypted_reader = service
-            .decrypt_object(
-                "test-bucket",
-                "test-key",
-                encrypted_reader,
-                "AES256",
-                None,
-                None,
-                metadata_map,
-            )
+            .decrypt_object("test-bucket", "default", encrypted_reader, "AES256", Some("default"), None, metadata_map)
             .await
-            .unwrap();
+            .expect("Failed to decrypt object");
 
         // Verify
         let mut decrypted_data = Vec::new();
         let mut reader = decrypted_reader;
-        reader.read_to_end(&mut decrypted_data).await.unwrap();
-        
+        reader
+            .read_to_end(&mut decrypted_data)
+            .await
+            .expect("Failed to read decrypted data");
+
         assert_eq!(decrypted_data, test_data);
     }
 }

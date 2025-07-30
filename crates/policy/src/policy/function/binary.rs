@@ -14,19 +14,59 @@
 
 use std::collections::HashMap;
 
+use base64_simd as base64;
 use serde::{Deserialize, Serialize};
 
 use super::func::InnerFunc;
 
 pub type BinaryFunc = InnerFunc<BinaryFuncValue>;
 
-// todo implement it
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(transparent)]
 pub struct BinaryFuncValue(String);
 
 impl BinaryFunc {
-    pub fn evaluate(&self, _values: &HashMap<String, Vec<String>>) -> bool {
-        todo!()
+    /// Evaluate binary function against provided values
+    /// Binary functions typically perform base64 decoding and comparison
+    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
+        let func_values = &self.0;
+
+        // Iterate through all function values
+        for func_kv in func_values {
+            let func_value = &func_kv.values.0;
+
+            // Try to decode the function value as base64
+            if let Ok(decoded_bytes) = base64::STANDARD.decode_to_vec(func_value) {
+                if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                    // Check if any of the provided values match the decoded string
+                    for value_list in values.values() {
+                        for value in value_list {
+                            if value == &decoded_str {
+                                return true;
+                            }
+                            // Also try base64 decoding the input values
+                            if let Ok(input_decoded) = base64::STANDARD.decode_to_vec(value) {
+                                if let Ok(input_str) = String::from_utf8(input_decoded) {
+                                    if input_str == decoded_str {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: direct string comparison
+            for value_list in values.values() {
+                for value in value_list {
+                    if value == func_value {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 }

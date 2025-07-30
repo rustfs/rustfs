@@ -18,8 +18,8 @@ use crate::{
     config::{KmsConfig, KmsType},
     error::{KmsError, Result},
     types::{
-        DataKey, DecryptRequest, EncryptRequest, EncryptResponse, GenerateKeyRequest, KeyInfo, ListKeysRequest, ListKeysResponse,
-        MasterKey, OperationContext,
+        DataKey, DecryptRequest, EncryptRequest, EncryptResponse, GenerateKeyRequest, HealthStatus, KeyInfo, ListKeysRequest,
+        ListKeysResponse, MasterKey, OperationContext,
     },
 };
 use async_trait::async_trait;
@@ -119,6 +119,7 @@ pub trait KmsClient: Send + Sync + Debug {
     /// Encrypt object metadata
     ///
     /// Encrypts object metadata using the specified master key.
+    #[allow(dead_code)]
     async fn encrypt_object_metadata(
         &self,
         master_key_id: &str,
@@ -129,12 +130,14 @@ pub trait KmsClient: Send + Sync + Debug {
     /// Decrypt object metadata
     ///
     /// Decrypts object metadata.
+    #[allow(dead_code)]
     async fn decrypt_object_metadata(&self, encrypted_metadata: &[u8], context: Option<&OperationContext>) -> Result<Vec<u8>>;
 
     /// Generate a data key with encryption context
     ///
     /// Generates a new data encryption key with additional encryption context.
     /// The context is used for additional authentication and access control.
+    #[allow(dead_code)]
     async fn generate_data_key_with_context(
         &self,
         master_key_id: &str,
@@ -147,6 +150,7 @@ pub trait KmsClient: Send + Sync + Debug {
     ///
     /// Decrypts data using the provided encryption context for validation.
     /// The context must match the one used during encryption.
+    #[allow(dead_code)]
     async fn decrypt_with_context(
         &self,
         ciphertext: &[u8],
@@ -413,6 +417,30 @@ impl KmsManager {
     /// Perform health check
     pub async fn health_check(&self) -> Result<()> {
         self.client.health_check().await
+    }
+
+    /// Perform enhanced health check with encryption status
+    pub async fn health_check_with_encryption_status(&self) -> Result<HealthStatus> {
+        // Check basic KMS health
+        let kms_healthy = self.client.health_check().await.is_ok();
+
+        // Test encryption/decryption capability
+        let encryption_working = self.test_encryption_capability().await;
+
+        Ok(HealthStatus {
+            kms_healthy,
+            encryption_working,
+            backend_type: self.client.backend_info().backend_type.clone(),
+        })
+    }
+
+    /// Test basic encryption/decryption capability
+    async fn test_encryption_capability(&self) -> bool {
+        // Try to generate a data key to test encryption capability
+        let request = GenerateKeyRequest::new("health-check-key".to_string(), "AES_256".to_string());
+        let test_result = self.client.generate_data_key(&request, None).await;
+
+        test_result.is_ok()
     }
 
     /// Get backend information

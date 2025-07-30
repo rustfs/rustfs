@@ -210,54 +210,32 @@ pub enum EncryptionError {
 impl From<EncryptionError> for KmsError {
     fn from(err: EncryptionError) -> Self {
         match err {
-            EncryptionError::UnsupportedAlgorithm { algorithm } => {
-                KmsError::CryptographicError {
-                    operation: format!("Unsupported encryption algorithm: {}", algorithm),
-                }
-            }
-            EncryptionError::InvalidKeySize { expected, actual } => {
-                KmsError::InvalidInput {
-                    message: format!("Invalid key size: expected {}, got {}", expected, actual),
-                }
-            }
-            EncryptionError::InvalidIvSize { expected, actual } => {
-                KmsError::InvalidInput {
-                    message: format!("Invalid IV size: expected {}, got {}", expected, actual),
-                }
-            }
-            EncryptionError::MetadataError { message } => {
-                KmsError::InvalidInput { message }
-            }
-            EncryptionError::ConfigurationError { message } => {
-                KmsError::ConfigurationError { message }
-            }
-            EncryptionError::CipherError { operation, reason } => {
-                KmsError::CryptographicError {
-                    operation: format!("{} operation failed: {}", operation, reason),
-                }
-            }
-            EncryptionError::AuthenticationFailed => {
-                KmsError::CryptographicError {
-                    operation: "Authentication tag verification failed".to_string(),
-                }
-            }
-            EncryptionError::KeyDerivationFailed { reason } => {
-                KmsError::CryptographicError {
-                    operation: format!("Key derivation failed: {}", reason),
-                }
-            }
+            EncryptionError::UnsupportedAlgorithm { algorithm } => KmsError::CryptographicError {
+                operation: format!("Unsupported encryption algorithm: {algorithm}"),
+            },
+            EncryptionError::InvalidKeySize { expected, actual } => KmsError::InvalidInput {
+                message: format!("Invalid key size: expected {expected}, got {actual}"),
+            },
+            EncryptionError::InvalidIvSize { expected, actual } => KmsError::InvalidInput {
+                message: format!("Invalid IV size: expected {expected}, got {actual}"),
+            },
+            EncryptionError::MetadataError { message } => KmsError::InvalidInput { message },
+            EncryptionError::ConfigurationError { message } => KmsError::ConfigurationError { message },
+            EncryptionError::CipherError { operation, reason } => KmsError::CryptographicError {
+                operation: format!("{operation} operation failed: {reason}"),
+            },
+            EncryptionError::AuthenticationFailed => KmsError::CryptographicError {
+                operation: "Authentication tag verification failed".to_string(),
+            },
+            EncryptionError::KeyDerivationFailed { reason } => KmsError::CryptographicError {
+                operation: format!("Key derivation failed: {reason}"),
+            },
             EncryptionError::KmsError(kms_err) => kms_err,
-            EncryptionError::SerializationError(json_err) => {
-                KmsError::SerializationError(json_err)
-            }
-            EncryptionError::Base64Error(decode_err) => {
-                KmsError::Base64Error(decode_err)
-            }
-            EncryptionError::IoError(io_err) => {
-                KmsError::InternalError {
-                    message: format!("IO error: {}", io_err),
-                }
-            }
+            EncryptionError::SerializationError(json_err) => KmsError::SerializationError(json_err),
+            EncryptionError::Base64Error(decode_err) => KmsError::Base64Error(decode_err),
+            EncryptionError::IoError(io_err) => KmsError::InternalError {
+                message: format!("IO error: {io_err}"),
+            },
         }
     }
 }
@@ -282,16 +260,12 @@ impl EncryptionError {
 
     /// Create a metadata error
     pub fn metadata_error(message: impl Into<String>) -> Self {
-        Self::MetadataError {
-            message: message.into(),
-        }
+        Self::MetadataError { message: message.into() }
     }
 
     /// Create a configuration error
     pub fn configuration_error(message: impl Into<String>) -> Self {
-        Self::ConfigurationError {
-            message: message.into(),
-        }
+        Self::ConfigurationError { message: message.into() }
     }
 
     /// Create a cipher error
@@ -304,9 +278,7 @@ impl EncryptionError {
 
     /// Create a key derivation error
     pub fn key_derivation_failed(reason: impl Into<String>) -> Self {
-        Self::KeyDerivationFailed {
-            reason: reason.into(),
-        }
+        Self::KeyDerivationFailed { reason: reason.into() }
     }
 
     /// Check if the error is retryable

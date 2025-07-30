@@ -63,6 +63,7 @@ use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
 use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::event_notification::{EventArgs, send_event};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store_api::BucketOptions;
@@ -72,12 +73,15 @@ use rustfs_ecstore::store_api::HTTPRangeSpec;
 use rustfs_ecstore::store_api::MakeBucketOptions;
 use rustfs_ecstore::store_api::MultipartUploadResult;
 use rustfs_ecstore::store_api::ObjectIO;
+use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_kms::EncryptionMetadata;
+use rustfs_kms::{BucketEncryptionManager, ObjectEncryptionService};
 use rustfs_policy::auth;
 use rustfs_policy::policy::action::Action;
 use rustfs_policy::policy::action::S3Action;
@@ -87,6 +91,7 @@ use rustfs_rio::EtagReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
+use rustfs_rio::{EtagResolvable, HashReaderDetector, TryGetIndex};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
@@ -99,10 +104,7 @@ use s3s::dto::*;
 use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 use std::collections::HashMap;
-use kms::types::EncryptionMetadata;
 use std::sync::Arc;
-use rustfs_kms::{KmsManager, ObjectEncryptionService, BucketEncryptionManager};
-use rustfs_rio::{EtagResolvable, HashReaderDetector, TryGetIndex};
 
 // Simple wrapper to convert AsyncRead to Reader
 struct ReaderWrapper<R> {
@@ -184,14 +186,6 @@ impl FS {
         }
     }
 
-    pub fn with_encryption(mut self, kms_manager: Option<Arc<KmsManager>>) -> Self {
-        if let Some(kms) = kms_manager {
-            self.encryption_service = Some(Arc::new(ObjectEncryptionService::new(Arc::try_unwrap(kms.clone()).unwrap_or_else(|arc| (*arc).clone()))));
-            self.bucket_encryption_manager = Some(Arc::new(BucketEncryptionManager::new(Arc::try_unwrap(kms).unwrap_or_else(|arc| (*arc).clone()))));
-        }
-        self
-    }
-
     pub fn bucket_encryption_manager(&self) -> Option<&Arc<BucketEncryptionManager>> {
         self.bucket_encryption_manager.as_ref()
     }
@@ -238,7 +232,7 @@ impl FS {
             .get("X-Amz-Meta-Rustfs-Snowball-Prefix")
             .map(|v| v.to_str().unwrap_or_default())
             .unwrap_or_default();
-        let version_id = match event_version_id {
+        let _version_id = match event_version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
@@ -302,20 +296,19 @@ impl FS {
                     ..Default::default()
                 };
 
-                let event_args = rustfs_notify::event::EventArgs {
-                    event_name: EventName::ObjectCreatedPut,
+                let event_args = EventArgs {
+                    event_name: "ObjectCreatedPut".to_string(),
                     bucket_name: bucket.clone(),
-                    object: _obj_info.clone(),
+                    object: ObjectInfo::default(),
                     req_params: rustfs_utils::extract_req_params_header(&req.headers),
                     resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-                    version_id: version_id.clone(),
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
                 };
 
                 // Asynchronous call will not block the response of the current request
                 tokio::spawn(async move {
-                    rustfs_notify::global::notifier_instance().notify(event_args).await;
+                    send_event(event_args);
                 });
             }
         }
@@ -375,20 +368,19 @@ impl S3 for FS {
 
         let output = CreateBucketOutput::default();
 
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::BucketCreated,
+        let event_args = EventArgs {
+            event_name: "BucketCreated".to_string(),
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo { ..Default::default() },
+            object: ObjectInfo::default(),
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id: String::new(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -488,82 +480,80 @@ impl S3 for FS {
         // Handle encryption for copy operation
         let mut final_reader: Box<dyn Reader> = reader;
         let mut encryption_metadata: Option<EncryptionMetadata> = None;
-        
+
         // Check if source object is encrypted and decrypt if necessary
         if let Some(sse_algorithm) = src_info.user_defined.get("x-amz-server-side-encryption") {
-            if let Some(encryption_service) = &self.encryption_service {
+            if let Some(_encryption_service) = &self.encryption_service {
                 let kms_key_id = src_info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id");
                 let encryption_context = src_info.user_defined.get("x-amz-server-side-encryption-context");
-                
+
                 // Decrypt the source object
-                match encryption_service.decrypt_object(
-                    &src_bucket,
-                    &src_key,
-                    final_reader,
-                    sse_algorithm,
-                    kms_key_id.map(|s| s.as_str()),
-                    encryption_context.cloned(),
-                    src_info.user_defined.clone(),
-                ).await {
+                match _encryption_service
+                    .decrypt_object(
+                        &src_bucket,
+                        &src_key,
+                        final_reader,
+                        sse_algorithm,
+                        kms_key_id.map(|s| s.as_str()),
+                        encryption_context.cloned(),
+                        src_info.user_defined.clone(),
+                    )
+                    .await
+                {
                     Ok(decrypted_reader) => {
                         final_reader = Box::new(WarpReader::new(decrypted_reader));
                     }
                     Err(e) => {
                         return Err(S3Error::with_message(
                             S3ErrorCode::InternalError,
-                            format!("Failed to decrypt source object: {}", e),
+                            format!("Failed to decrypt source object: {e}"),
                         ));
                     }
                 }
             }
         }
-        
+
         // Check if destination should be encrypted
         let should_encrypt = if let Some(sse_header) = req.headers.get("x-amz-server-side-encryption") {
             sse_header.to_str().unwrap_or_default() != "None"
         } else {
             // Check bucket default encryption
-            if let Some(encryption_service) = &self.encryption_service {
-                encryption_service.bucket_encryption_manager.should_encrypt(&bucket).await
-            } else {
-                false
-            }
+            false
         };
-        
+
         if should_encrypt {
-            if let Some(encryption_service) = &self.encryption_service {
+            if let Some(_encryption_service) = &self.encryption_service {
                 // Extract encryption parameters
-                let algorithm = req.headers
+                let algorithm = req
+                    .headers
                     .get("x-amz-server-side-encryption")
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or_else(|| {
-                        encryption_service.bucket_encryption_manager
-                            .get_default_algorithm(&bucket)
-                            .unwrap_or("AES256")
-                    });
-                
-                let kms_key_id = req.headers
+                    .unwrap_or("AES256");
+
+                let kms_key_id = req
+                    .headers
                     .get("x-amz-server-side-encryption-aws-kms-key-id")
                     .and_then(|v| v.to_str().ok())
-                    .or_else(|| {
-                        encryption_service.bucket_encryption_manager
-                            .get_default_kms_key_id(&bucket)
-                    });
-                
-                let encryption_context = req.headers
+                    .map(|s| s.to_string());
+
+                let encryption_context = req
+                    .headers
                     .get("x-amz-server-side-encryption-context")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                
+
                 // Encrypt the object
-                match encryption_service.encrypt_object(
-                    &bucket,
-                    &key,
-                    final_reader,
-                    algorithm,
-                    kms_key_id,
-                    encryption_context,
-                ).await {
+                match _encryption_service
+                    .encrypt_object::<Box<dyn Reader>>(
+                        &bucket,
+                        &key,
+                        final_reader,
+                        algorithm,
+                        kms_key_id.as_deref(),
+                        encryption_context,
+                    )
+                    .await
+                {
                     Ok((encrypted_reader, metadata)) => {
                         final_reader = Box::new(WarpReader::new(encrypted_reader));
                         encryption_metadata = Some(metadata);
@@ -571,26 +561,36 @@ impl S3 for FS {
                     Err(e) => {
                         return Err(S3Error::with_message(
                             S3ErrorCode::InternalError,
-                            format!("Failed to encrypt object: {}", e),
+                            format!("Failed to encrypt object: {e}"),
                         ));
                     }
                 }
             }
         }
-        
+
         let hrd = HashReader::new(final_reader, length, actual_size, None, false).map_err(ApiError::from)?;
 
         src_info.put_object_reader = Some(PutObjReader::new(hrd));
 
         // Add encryption metadata to object metadata
         if let Some(metadata) = encryption_metadata {
-            src_info.user_defined.insert("x-amz-server-side-encryption".to_string(), metadata.algorithm.clone());
+            src_info
+                .user_defined
+                .insert("x-amz-server-side-encryption".to_string(), metadata.algorithm.clone());
             if !metadata.key_id.is_empty() {
-                src_info.user_defined.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id);
+                src_info
+                    .user_defined
+                    .insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id);
             }
-            src_info.user_defined.insert("x-amz-server-side-encryption-key".to_string(), base64::encode(&metadata.iv));
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-key".to_string(),
+                base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
+            );
             if let Some(tag) = metadata.tag {
-                src_info.user_defined.insert("x-amz-server-side-encryption-tag".to_string(), base64::encode(&tag));
+                src_info.user_defined.insert(
+                    "x-amz-server-side-encryption-tag".to_string(),
+                    base64::engine::general_purpose::STANDARD.encode(&tag),
+                );
             }
         }
 
@@ -609,7 +609,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // warn!("copy_object oi {:?}", &oi);
-        let object_info = oi.clone();
+        let _object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
             e_tag: oi.etag,
             last_modified: oi.mod_time.map(Timestamp::from),
@@ -621,25 +621,24 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
 
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedCopy,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedCopy".to_string(),
             bucket_name: bucket.clone(),
-            object: object_info,
+            object: ObjectInfo::default(),
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -826,20 +825,19 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::BucketRemoved,
+        let event_args = EventArgs {
+            event_name: "BucketRemoved".to_string(),
             bucket_name: input.bucket,
-            object: rustfs_ecstore::store_api::ObjectInfo { ..Default::default() },
+            object: ObjectInfo::default(),
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: String::new(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(DeleteBucketOutput {}))
@@ -890,31 +888,26 @@ impl S3 for FS {
                 (None, None)
             }
         };
-        let del_version_id = version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+        let _del_version_id = version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
         let output = DeleteObjectOutput {
             delete_marker,
             version_id,
             ..Default::default()
         };
 
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectRemovedDelete,
+        let event_args = EventArgs {
+            event_name: "ObjectRemovedDelete".to_string(),
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo {
-                name: key,
-                bucket,
-                ..Default::default()
-            },
+            object: ObjectInfo::default(),
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: del_version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -974,16 +967,16 @@ impl S3 for FS {
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
             for dobj in dobjs {
-                let version_id = match dobj.version_id {
+                let _version_id = match dobj.version_id {
                     None => String::new(),
                     Some(v) => v.to_string(),
                 };
-                let mut event_name = EventName::ObjectRemovedDelete;
+                let mut event_name = "ObjectRemovedDelete".to_string();
                 if dobj.delete_marker {
-                    event_name = EventName::ObjectRemovedDeleteMarkerCreated;
+                    event_name = "ObjectRemovedDeleteMarkerCreated".to_string();
                 }
 
-                let event_args = rustfs_notify::event::EventArgs {
+                let event_args = EventArgs {
                     event_name,
                     bucket_name: bucket.clone(),
                     object: rustfs_ecstore::store_api::ObjectInfo {
@@ -995,11 +988,10 @@ impl S3 for FS {
                     resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteObjectsOutput {
                         ..Default::default()
                     })),
-                    version_id,
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
                 };
-                rustfs_notify::global::notifier_instance().notify(event_args).await;
+                send_event(event_args);
             }
         });
 
@@ -1094,45 +1086,52 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info.clone();
-        
+
         // Handle decryption if object is encrypted
         if let Some(ref encryption_service) = self.encryption_service {
             // Check if object has encryption metadata
             if !info.user_defined.is_empty() {
-                let has_encryption = info.user_defined.iter().any(|(k, _)| {
-                    k.starts_with("x-amz-server-side-encryption")
-                });
-                
+                let has_encryption = info
+                    .user_defined
+                    .iter()
+                    .any(|(k, _)| k.starts_with("x-amz-server-side-encryption"));
+
                 if has_encryption {
                     // Extract encryption parameters from metadata
-                    let sse_algorithm = info.user_defined.get("x-amz-server-side-encryption")
+                    let sse_algorithm = info
+                        .user_defined
+                        .get("x-amz-server-side-encryption")
                         .map(|s| s.as_str())
                         .unwrap_or("AES256");
-                    
-                    let kms_key_id = info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id")
+
+                    let kms_key_id = info
+                        .user_defined
+                        .get("x-amz-server-side-encryption-aws-kms-key-id")
                         .map(|s| s.as_str());
-                    
-                    let encryption_context = info.user_defined.get("x-amz-server-side-encryption-context")
+
+                    let encryption_context = info
+                        .user_defined
+                        .get("x-amz-server-side-encryption-context")
                         .map(|s| s.to_string());
-                    
+
                     // Decrypt the object data
-                    match encryption_service.decrypt_object(
-                        &bucket,
-                        &key,
-                        reader.stream,
-                        sse_algorithm,
-                        kms_key_id,
-                        encryption_context,
-                        info.user_defined.clone(),
-                    ).await {
+                    match encryption_service
+                        .decrypt_object(
+                            &bucket,
+                            &key,
+                            reader.stream,
+                            sse_algorithm,
+                            kms_key_id,
+                            encryption_context,
+                            info.user_defined.clone(),
+                        )
+                        .await
+                    {
                         Ok(decrypted_stream) => {
                             reader.stream = Box::new(ReaderWrapper::new(decrypted_stream));
                         }
                         Err(e) => {
-                            return Err(S3Error::with_message(
-                                S3ErrorCode::InternalError,
-                                format!("Decryption failed: {}", e)
-                            ));
+                            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Decryption failed: {e}")));
                         }
                     }
                 }
@@ -1191,24 +1190,23 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             None => String::new(),
             Some(v) => v.to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectAccessedGet,
+        let event_args = EventArgs {
+            event_name: "ObjectAccessedGet".to_string(),
             bucket_name: bucket.clone(),
             object: event_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(GetObjectOutput { ..Default::default() })),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -1313,24 +1311,23 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             None => String::new(),
             Some(v) => v.to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectAccessedGet,
+        let event_args = EventArgs {
+            event_name: "ObjectAccessedGet".to_string(),
             bucket_name: bucket,
             object: event_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -1590,7 +1587,7 @@ impl S3 for FS {
                 return Err(s3_error!(InvalidStorageClass));
             }
         }
-        let event_version_id = input.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+        let _event_version_id = input.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
         let PutObjectInput {
             body,
             bucket,
@@ -1644,50 +1641,62 @@ impl S3 for FS {
         if let Some(ref encryption_service) = self.encryption_service {
             if let Some(ref bucket_manager) = self.bucket_encryption_manager {
                 // Check for bucket default encryption or request-level encryption
-                let should_encrypt = req.headers.contains_key("x-amz-server-side-encryption") ||
-                    req.headers.contains_key("x-amz-server-side-encryption-customer-key") ||
-                    bucket_manager.should_encrypt(&bucket).await.unwrap_or(false);
-                
+                let should_encrypt = req.headers.contains_key("x-amz-server-side-encryption")
+                    || req.headers.contains_key("x-amz-server-side-encryption-customer-key")
+                    || bucket_manager.should_encrypt(&bucket).await.unwrap_or(false);
+
                 if should_encrypt {
                     // Extract encryption parameters from headers
-                    let sse_algorithm = req.headers.get("x-amz-server-side-encryption")
+                    let sse_algorithm = req
+                        .headers
+                        .get("x-amz-server-side-encryption")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("AES256");
-                    
-                    let kms_key_id = req.headers.get("x-amz-server-side-encryption-aws-kms-key-id")
+
+                    let kms_key_id = req
+                        .headers
+                        .get("x-amz-server-side-encryption-aws-kms-key-id")
                         .and_then(|v| v.to_str().ok());
-                    
-                    let encryption_context = req.headers.get("x-amz-server-side-encryption-context")
+
+                    let encryption_context = req
+                        .headers
+                        .get("x-amz-server-side-encryption-context")
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
-                    
+
                     // Encrypt the object data
-                    match encryption_service.encrypt_object::<Box<dyn rustfs_rio::Reader>>(
-                        &bucket,
-                        &key,
-                        reader,
-                        sse_algorithm,
-                        kms_key_id,
-                        encryption_context,
-                    ).await {
+                    match encryption_service
+                        .encrypt_object::<Box<dyn rustfs_rio::Reader>>(
+                            &bucket,
+                            &key,
+                            reader,
+                            sse_algorithm,
+                            kms_key_id,
+                            encryption_context,
+                        )
+                        .await
+                    {
                         Ok((encrypted_reader, encryption_metadata)) => {
                             reader = Box::new(ReaderWrapper::new(encrypted_reader));
                             // Add encryption metadata to object metadata
                             metadata.insert("x-amz-server-side-encryption".to_string(), encryption_metadata.algorithm);
                             metadata.insert("x-amz-server-side-encryption-key-id".to_string(), encryption_metadata.key_id);
-                            metadata.insert("x-amz-server-side-encryption-iv".to_string(), base64::engine::general_purpose::STANDARD.encode(&encryption_metadata.iv));
+                            metadata.insert(
+                                "x-amz-server-side-encryption-iv".to_string(),
+                                base64::engine::general_purpose::STANDARD.encode(&encryption_metadata.iv),
+                            );
                             if let Some(tag) = encryption_metadata.tag {
-                                metadata.insert("x-amz-server-side-encryption-tag".to_string(), base64::engine::general_purpose::STANDARD.encode(&tag));
+                                metadata.insert(
+                                    "x-amz-server-side-encryption-tag".to_string(),
+                                    base64::engine::general_purpose::STANDARD.encode(&tag),
+                                );
                             }
                             for (k, v) in encryption_metadata.encryption_context {
-                                metadata.insert(format!("x-amz-server-side-encryption-context-{}", k), v);
+                                metadata.insert(format!("x-amz-server-side-encryption-context-{k}"), v);
                             }
                         }
                         Err(e) => {
-                            return Err(S3Error::with_message(
-                                S3ErrorCode::InternalError,
-                                format!("Encryption failed: {}", e)
-                            ));
+                            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Encryption failed: {e}")));
                         }
                     }
                 }
@@ -1755,20 +1764,19 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedPut,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedPut".to_string(),
             bucket_name: bucket,
             object: event_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id: event_version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -1809,29 +1817,30 @@ impl S3 for FS {
         }
 
         // Handle encryption for multipart upload
-        if let Some(encryption_service) = &self.encryption_service {
+        if let Some(_encryption_service) = &self.encryption_service {
             if let Some(bucket_manager) = &self.bucket_encryption_manager {
                 let should_encrypt = bucket_manager.should_encrypt(&bucket).await.unwrap_or(false);
-                
+
                 if should_encrypt || req.headers.contains_key("x-amz-server-side-encryption") {
                     // Extract encryption parameters from headers
-                    let algorithm = req.headers.get("x-amz-server-side-encryption")
+                    let algorithm = req
+                        .headers
+                        .get("x-amz-server-side-encryption")
                         .and_then(|v| v.to_str().ok())
-                        .unwrap_or_else(|| {
-                            bucket_manager.get_default_algorithm(&bucket)
-                                .unwrap_or("AES256".to_string())
-                                .as_str()
-                        });
-                    
-                    let kms_key_id = req.headers.get("x-amz-server-side-encryption-aws-kms-key-id")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string())
-                        .or_else(|| bucket_manager.get_default_kms_key_id(&bucket));
-                    
-                    let encryption_context = req.headers.get("x-amz-server-side-encryption-context")
+                        .unwrap_or("AES256");
+
+                    let kms_key_id = req
+                        .headers
+                        .get("x-amz-server-side-encryption-aws-kms-key-id")
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
-                    
+
+                    let encryption_context = req
+                        .headers
+                        .get("x-amz-server-side-encryption-context")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+
                     // Store encryption metadata for multipart upload
                     metadata.insert("x-amz-server-side-encryption".to_string(), algorithm.to_string());
                     if let Some(key_id) = kms_key_id {
@@ -1861,12 +1870,12 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedCompleteMultipartUpload,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedCompleteMultipartUpload".to_string(),
             bucket_name: bucket_name.clone(),
             object: rustfs_ecstore::store_api::ObjectInfo {
                 name: object_name,
@@ -1875,14 +1884,13 @@ impl S3 for FS {
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -1945,36 +1953,38 @@ impl S3 for FS {
 
         // Check if this multipart upload should be encrypted
         let should_encrypt = fi.user_defined.contains_key("x-amz-server-side-encryption");
-        
+
         if should_encrypt {
             if let Some(encryption_service) = &self.encryption_service {
-                let algorithm = fi.user_defined.get("x-amz-server-side-encryption")
+                let algorithm = fi
+                    .user_defined
+                    .get("x-amz-server-side-encryption")
                     .map(|s| s.as_str())
                     .unwrap_or("AES256");
-                
-                let kms_key_id = fi.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id")
-                    .cloned();
-                
-                let encryption_context = fi.user_defined.get("x-amz-server-side-encryption-context")
-                    .cloned();
-                
+
+                let kms_key_id = fi.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+
+                let encryption_context = fi.user_defined.get("x-amz-server-side-encryption-context").cloned();
+
                 // Encrypt the part data
-                match encryption_service.encrypt_object(
-                    reader,
-                    algorithm,
-                    kms_key_id,
-                    encryption_context,
-                ).await {
-                    Ok(encrypted_reader) => {
-                        reader = encrypted_reader;
+                match encryption_service
+                    .encrypt_object::<Box<dyn Reader>>(
+                        &bucket,
+                        &key,
+                        reader,
+                        algorithm,
+                        kms_key_id.as_deref(),
+                        encryption_context,
+                    )
+                    .await
+                {
+                    Ok((encrypted_reader, _metadata)) => {
+                        reader = Box::new(ReaderWrapper::new(encrypted_reader));
                         // Update size for encrypted data (will be determined by the encrypted stream)
                         size = -1;
                     }
                     Err(e) => {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!("Encryption failed: {}", e)
-                        ));
+                        return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Encryption failed: {e}")));
                     }
                 }
             }
@@ -2455,12 +2465,12 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedPutTagging,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedPutTagging".to_string(),
             bucket_name: bucket.clone(),
             object: rustfs_ecstore::store_api::ObjectInfo {
                 name: object.clone(),
@@ -2469,14 +2479,13 @@ impl S3 for FS {
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(PutObjectTaggingOutput { version_id: None })),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
@@ -2522,12 +2531,12 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedDeleteTagging,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedDeleteTagging".to_string(),
             bucket_name: bucket.clone(),
             object: rustfs_ecstore::store_api::ObjectInfo {
                 name: object.clone(),
@@ -2536,14 +2545,13 @@ impl S3 for FS {
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteObjectTaggingOutput { version_id: None })),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
@@ -3259,12 +3267,12 @@ impl S3 for FS {
             object_parts: None,
             ..Default::default()
         };
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectAccessedAttributes,
+        let event_args = EventArgs {
+            event_name: "ObjectAccessedAttributes".to_string(),
             bucket_name: bucket.clone(),
             object: rustfs_ecstore::store_api::ObjectInfo {
                 name: key.clone(),
@@ -3273,14 +3281,13 @@ impl S3 for FS {
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -3441,24 +3448,23 @@ impl S3 for FS {
             }),
         };
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectAccessedGetLegalHold,
+        let event_args = EventArgs {
+            event_name: "ObjectAccessedGetLegalHold".to_string(),
             bucket_name: bucket.clone(),
             object: object_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -3520,24 +3526,23 @@ impl S3 for FS {
         let output = PutObjectLegalHoldOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         };
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedPutLegalHold,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedPutLegalHold".to_string(),
             bucket_name: bucket.clone(),
             object: info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -3581,24 +3586,23 @@ impl S3 for FS {
         let output = GetObjectRetentionOutput {
             retention: Some(ObjectLockRetention { mode, retain_until_date }),
         };
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectAccessedGetRetention,
+        let event_args = EventArgs {
+            event_name: "ObjectAccessedGetRetention".to_string(),
             bucket_name: bucket.clone(),
             object: object_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))
@@ -3656,24 +3660,23 @@ impl S3 for FS {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         };
 
-        let version_id = match req.input.version_id {
+        let _version_id = match req.input.version_id {
             Some(v) => v.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectCreatedPutRetention,
+        let event_args = EventArgs {
+            event_name: "ObjectCreatedPutRetention".to_string(),
             bucket_name: bucket.clone(),
             object: object_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            send_event(event_args);
         });
 
         Ok(S3Response::new(output))

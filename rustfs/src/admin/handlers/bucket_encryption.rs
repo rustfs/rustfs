@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Bucket encryption configuration handlers
-//! 
+//!
 //! This module provides complete implementation for S3 bucket encryption management:
 //! - PUT /bucket/{bucket}/encryption - Set bucket encryption configuration
 //! - GET /bucket/{bucket}/encryption - Get bucket encryption configuration  
@@ -27,7 +27,7 @@ use crate::{
     auth::{check_key_valid, get_session_token},
     storage::ecfs::FS,
 };
-use rustfs_kms::{BucketEncryptionConfig, BucketEncryptionAlgorithm};
+use rustfs_kms::{BucketEncryptionAlgorithm, BucketEncryptionConfig};
 
 use http::StatusCode;
 use matchit::Params;
@@ -50,15 +50,12 @@ pub struct ApplyServerSideEncryptionByDefault {
     #[serde(rename = "KMSMasterKeyID", skip_serializing_if = "Option::is_none")]
     pub kms_master_key_id: Option<String>,
 }
+use chrono;
 use rustfs_policy::auth::Credentials;
-use s3s::{
-    Body, S3Request, S3Response, S3Result, S3Error, S3ErrorCode,
-};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::{Deserialize, Serialize};
 use serde_urlencoded;
 use tracing::{info, warn};
-use chrono;
-
 
 /// Request structure for setting bucket encryption
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,13 +111,13 @@ pub struct PutBucketEncryptionHandler {
 impl Operation for PutBucketEncryptionHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Extract bucket name from path parameters
-        let bucket_name = params.get("bucket").ok_or_else(|| {
-            S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name")
-        })?;
+        let bucket_name = params
+            .get("bucket")
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name"))?;
 
         // Parse credentials from query parameters
         let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
@@ -136,7 +133,7 @@ impl Operation for PutBucketEncryptionHandler {
         };
 
         let request: PutBucketEncryptionRequest = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::MalformedXML, format!("Invalid JSON: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::MalformedXML, format!("Invalid JSON: {e}")))?;
 
         // Create bucket encryption configuration
         let config = BucketEncryptionConfig {
@@ -151,15 +148,22 @@ impl Operation for PutBucketEncryptionHandler {
 
         // Store the bucket encryption configuration using the manager
         if let Some(manager) = self.fs.bucket_encryption_manager() {
-            manager.set_bucket_encryption(bucket_name, config.clone()).await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to store encryption config: {}", e)))?;
+            manager
+                .set_bucket_encryption(bucket_name, config.clone())
+                .await
+                .map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to store encryption config: {e}"))
+                })?;
         } else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Bucket encryption manager not available",
+            ));
         }
 
         info!("Setting bucket encryption for bucket: {}", bucket_name);
         info!("Encryption config: {:?}", config);
-        
+
         let response = serde_json::json!({
             "message": "Bucket encryption configuration updated successfully",
             "bucket": bucket_name,
@@ -179,37 +183,43 @@ pub struct GetBucketEncryptionHandler {
 impl Operation for GetBucketEncryptionHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Extract bucket name from path parameters
-        let bucket_name = params.get("bucket").ok_or_else(|| {
-            S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name")
-        })?;
+        let bucket_name = params
+            .get("bucket")
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name"))?;
 
         // Parse credentials from query parameters
         let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         info!("Getting bucket encryption for bucket: {}", bucket_name);
-        
+
         // Retrieve the bucket encryption configuration using the manager
         if let Some(manager) = self.fs.bucket_encryption_manager() {
             match manager.get_bucket_encryption(bucket_name).await {
                 Ok(Some(config)) => {
                     let response: GetBucketEncryptionResponse = config.into();
-                    let response_json = serde_json::to_string(&response)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("JSON serialization error: {}", e)))?;
+                    let response_json = serde_json::to_string(&response).map_err(|e| {
+                        S3Error::with_message(S3ErrorCode::InternalError, format!("JSON serialization error: {e}"))
+                    })?;
                     Ok(S3Response::new((StatusCode::OK, Body::from(response_json.into_bytes()))))
                 }
-                Ok(None) => {
-                    Err(S3Error::with_message(S3ErrorCode::NoSuchBucketPolicy, "No encryption configuration found for bucket"))
-                }
-                Err(e) => {
-                    Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to retrieve encryption config: {}", e)))
-                }
+                Ok(None) => Err(S3Error::with_message(
+                    S3ErrorCode::NoSuchBucketPolicy,
+                    "No encryption configuration found for bucket",
+                )),
+                Err(e) => Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("Failed to retrieve encryption config: {e}"),
+                )),
             }
         } else {
-            Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"))
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Bucket encryption manager not available",
+            ))
         }
     }
 }
@@ -223,31 +233,33 @@ pub struct DeleteBucketEncryptionHandler {
 impl Operation for DeleteBucketEncryptionHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Extract bucket name from path parameters
-        let bucket_name = params.get("bucket").ok_or_else(|| {
-            S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name")
-        })?;
+        let bucket_name = params
+            .get("bucket")
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name"))?;
 
         // Parse credentials from query parameters
         let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         info!("Deleting bucket encryption for bucket: {}", bucket_name);
-        
+
         // Delete the bucket encryption configuration using the manager
         if let Some(manager) = self.fs.bucket_encryption_manager() {
             match manager.delete_bucket_encryption(bucket_name).await {
-                Ok(()) => {
-                    Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty())))
-                }
-                Err(e) => {
-                    Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to delete encryption config: {}", e)))
-                }
+                Ok(()) => Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty()))),
+                Err(e) => Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("Failed to delete encryption config: {e}"),
+                )),
             }
         } else {
-            Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"))
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Bucket encryption manager not available",
+            ))
         }
     }
 }
@@ -262,13 +274,13 @@ impl Operation for ListBucketEncryptionsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Parse credentials from query parameters
         let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         info!("Listing all bucket encryption configurations");
-        
+
         // List all bucket encryption configurations using the manager
         if let Some(manager) = self.fs.bucket_encryption_manager() {
             match manager.list_bucket_encryptions().await {
@@ -278,12 +290,16 @@ impl Operation for ListBucketEncryptionsHandler {
                     });
                     Ok(S3Response::new((StatusCode::OK, Body::from(response.to_string().into_bytes()))))
                 }
-                Err(e) => {
-                    Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to list encryption configs: {}", e)))
-                }
+                Err(e) => Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("Failed to list encryption configs: {e}"),
+                )),
             }
         } else {
-            Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"))
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Bucket encryption manager not available",
+            ))
         }
     }
 }

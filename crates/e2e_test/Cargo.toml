@@ -42,3 +42,6 @@ serial_test = { workspace = true }
 aws-sdk-s3.workspace = true
 aws-config = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { version = "0.11", features = ["json"] }
+base64 = "0.22.0"
+md-5 = "0.10.6"

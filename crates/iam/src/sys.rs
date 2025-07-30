@@ -18,13 +18,17 @@ use crate::error::is_err_no_such_temp_account;
 use crate::error::{Error, Result};
 use crate::manager::IamCache;
 use crate::manager::extract_jwt_claims;
+
 use crate::manager::get_default_policyes;
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::extract_claims;
+use rustfs_ecstore::event_notification::EventArgs;
+use rustfs_ecstore::event_notification::send_event;
 use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
@@ -105,7 +109,20 @@ impl<T: Store> IamSys<T> {
         self.store.delete_policy(name, notify).await?;
 
         if notify {
-            // TODO: implement notification
+            let _policy_name = name.to_string();
+            tokio::spawn(async move {
+                // Send policy deletion notification
+                let event_args = EventArgs {
+                    event_name: "Everything".to_string(),
+                    bucket_name: String::new(),
+                    object: ObjectInfo::default(),
+                    req_params: std::collections::HashMap::new(),
+                    resp_elements: std::collections::HashMap::new(),
+                    host: String::new(),
+                    user_agent: String::new(),
+                };
+                send_event(event_args);
+            });
         }
 
         Ok(())
@@ -142,9 +159,24 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
-        self.store.set_policy(name, policy).await
+        let result = self.store.set_policy(name, policy).await?;
 
-        // TODO: notification
+        // Send policy set notification
+        let _policy_name = name.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn get_role_policy(&self, arn_str: &str) -> Result<(ARN, String)> {
@@ -159,9 +191,27 @@ impl<T: Store> IamSys<T> {
         Ok((arn, policy.clone()))
     }
 
-    pub async fn delete_user(&self, name: &str, _notify: bool) -> Result<()> {
-        self.store.delete_user(name, UserType::Reg).await
-        // TODO: notification
+    pub async fn delete_user(&self, name: &str, notify: bool) -> Result<()> {
+        self.store.delete_user(name, UserType::Reg).await?;
+
+        if notify {
+            let _user_name = name.to_string();
+            tokio::spawn(async move {
+                let event_args = EventArgs {
+                    event_name: "Everything".to_string(),
+                    bucket_name: String::new(),
+                    object: ObjectInfo::default(),
+                    req_params: std::collections::HashMap::new(),
+                    resp_elements: std::collections::HashMap::new(),
+
+                    host: String::new(),
+                    user_agent: String::new(),
+                };
+                send_event(event_args);
+            });
+        }
+
+        Ok(())
     }
 
     pub async fn current_policies(&self, name: &str) -> String {
@@ -177,8 +227,24 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_temp_user(&self, name: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
-        self.store.set_temp_user(name, cred, policy_name).await
-        // TODO: notification
+        let result = self.store.set_temp_user(name, cred, policy_name).await?;
+
+        // Send temp user creation notification
+        let _user_name = name.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn is_temp_user(&self, name: &str) -> Result<(bool, String)> {
@@ -208,8 +274,24 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_user_status(&self, name: &str, status: rustfs_madmin::AccountStatus) -> Result<OffsetDateTime> {
-        self.store.set_user_status(name, status).await
-        // TODO: notification
+        let result = self.store.set_user_status(name, status).await?;
+
+        // Send user status change notification
+        let _user_name = name.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn new_service_account(
@@ -294,14 +376,43 @@ impl<T: Store> IamSys<T> {
 
         let create_at = self.store.add_service_account(cred.clone()).await?;
 
+        // Send service account creation notification
+        let _service_account_name = cred.access_key.clone();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
         Ok((cred, create_at))
-        // TODO: notification
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
-        self.store.update_service_account(name, opts).await
+        let result = self.store.update_service_account(name, opts).await?;
 
-        // TODO: notification
+        // Send service account update notification
+        let _service_account_name = name.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn list_service_accounts(&self, access_key: &str) -> Result<Vec<Credentials>> {
@@ -424,7 +535,7 @@ impl<T: Store> IamSys<T> {
         extract_jwt_claims(&u)
     }
 
-    pub async fn delete_service_account(&self, access_key: &str, _notify: bool) -> Result<()> {
+    pub async fn delete_service_account(&self, access_key: &str, notify: bool) -> Result<()> {
         let Some(u) = self.store.get_user(access_key).await else {
             return Ok(());
         };
@@ -433,9 +544,25 @@ impl<T: Store> IamSys<T> {
             return Ok(());
         }
 
-        self.store.delete_user(access_key, UserType::Svc).await
+        self.store.delete_user(access_key, UserType::Svc).await?;
 
-        // TODO: notification
+        if notify {
+            let _service_account_key = access_key.to_string();
+            tokio::spawn(async move {
+                let event_args = EventArgs {
+                    event_name: "Everything".to_string(),
+                    bucket_name: String::new(),
+                    object: ObjectInfo::default(),
+                    req_params: std::collections::HashMap::new(),
+                    resp_elements: std::collections::HashMap::new(),
+                    host: String::new(),
+                    user_agent: String::new(),
+                };
+                send_event(event_args);
+            });
+        }
+
+        Ok(())
     }
 
     pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
@@ -451,8 +578,24 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
-        self.store.add_user(access_key, args).await
-        // TODO: notification
+        let result = self.store.add_user(access_key, args).await?;
+
+        // Send user creation notification
+        let _user_access_key = access_key.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn set_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
@@ -495,18 +638,66 @@ impl<T: Store> IamSys<T> {
         if contains_reserved_chars(group) {
             return Err(IamError::GroupNameContainsReservedChars);
         }
-        self.store.add_users_to_group(group, users).await
-        // TODO: notification
+        let result = self.store.add_users_to_group(group, users).await?;
+
+        // Send group membership update notification
+        let _group_name = group.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn remove_users_from_group(&self, group: &str, users: Vec<String>) -> Result<OffsetDateTime> {
-        self.store.remove_users_from_group(group, users).await
-        // TODO: notification
+        let result = self.store.remove_users_from_group(group, users).await?;
+
+        // Send group membership update notification
+        let _group_name = group.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn set_group_status(&self, group: &str, enable: bool) -> Result<OffsetDateTime> {
-        self.store.set_group_status(group, enable).await
-        // TODO: notification
+        let result = self.store.set_group_status(group, enable).await?;
+
+        // Send group status update notification
+        let _group_name = group.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
     pub async fn get_group_description(&self, group: &str) -> Result<GroupDesc> {
         self.store.get_group_description(group).await
@@ -517,8 +708,24 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
-        self.store.policy_db_set(name, user_type, is_group, policy).await
-        // TODO: notification
+        let result = self.store.policy_db_set(name, user_type, is_group, policy).await?;
+
+        // Send policy database update notification
+        let _policy_name = name.to_string();
+        tokio::spawn(async move {
+            let event_args = EventArgs {
+                event_name: "Everything".to_string(),
+                bucket_name: String::new(),
+                object: ObjectInfo::default(),
+                req_params: std::collections::HashMap::new(),
+                resp_elements: std::collections::HashMap::new(),
+                host: String::new(),
+                user_agent: String::new(),
+            };
+            send_event(event_args);
+        });
+
+        Ok(result)
     }
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {

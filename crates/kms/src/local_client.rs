@@ -87,7 +87,7 @@ impl LocalKmsClient {
         })?;
 
         let stored_key: StoredKey = if self.config.encrypt_files && self.master_key.is_some() {
-            let decrypted_data = decrypt_data(&data, self.master_key.as_ref().unwrap())
+            let decrypted_data = decrypt_data(&data, self.master_key.as_ref().expect("Master key should be available"))
                 .map_err(|e| KmsError::cryptographic_error(format!("Failed to decrypt key file: {e}")))?;
 
             serde_json::from_slice(&decrypted_data)
@@ -107,7 +107,7 @@ impl LocalKmsClient {
             serde_json::to_vec(stored_key).map_err(|e| KmsError::internal_error(format!("Failed to serialize key: {e}")))?;
 
         let final_data = if self.config.encrypt_files && self.master_key.is_some() {
-            encrypt_data(&data, self.master_key.as_ref().unwrap())
+            encrypt_data(&data, self.master_key.as_ref().expect("Master key should be available"))
                 .map_err(|e| KmsError::cryptographic_error(format!("Failed to encrypt key file: {e}")))?
         } else {
             data

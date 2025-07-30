@@ -15,7 +15,7 @@
 //! Security utilities for memory-safe key handling
 
 use secrecy::{ExposeSecret, Secret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 /// A secure wrapper for cryptographic keys that automatically zeroizes memory on drop
 #[derive(ZeroizeOnDrop)]
@@ -27,9 +27,7 @@ pub struct SecretKey {
 impl SecretKey {
     /// Create a new SecretKey from raw bytes
     pub fn new(key: Vec<u8>) -> Self {
-        Self {
-            inner: Secret::new(key),
-        }
+        Self { inner: Secret::new(key) }
     }
 
     /// Create a SecretKey from a slice
@@ -38,7 +36,7 @@ impl SecretKey {
     }
 
     /// Expose the secret key for cryptographic operations
-    /// 
+    ///
     /// # Security
     /// The exposed reference should be used immediately and not stored
     pub fn expose_secret(&self) -> &[u8] {
@@ -64,9 +62,7 @@ impl Clone for SecretKey {
 
 impl std::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SecretKey")
-            .field("len", &self.len())
-            .finish()
+        f.debug_struct("SecretKey").field("len", &self.len()).finish()
     }
 }
 
@@ -122,9 +118,7 @@ impl SecretVec {
 
 impl std::fmt::Debug for SecretVec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SecretVec")
-            .field("len", &self.len())
-            .finish()
+        f.debug_struct("SecretVec").field("len", &self.len()).finish()
     }
 }
 
@@ -136,7 +130,7 @@ mod tests {
     fn test_secret_key_creation() {
         let key_data = vec![1, 2, 3, 4, 5];
         let secret_key = SecretKey::new(key_data.clone());
-        
+
         assert_eq!(secret_key.len(), 5);
         assert_eq!(secret_key.expose_secret(), &key_data);
         assert!(!secret_key.is_empty());
@@ -146,7 +140,7 @@ mod tests {
     fn test_secret_key_from_slice() {
         let key_data = [1, 2, 3, 4, 5];
         let secret_key = SecretKey::from_slice(&key_data);
-        
+
         assert_eq!(secret_key.len(), 5);
         assert_eq!(secret_key.expose_secret(), &key_data);
     }
@@ -156,21 +150,21 @@ mod tests {
         let key_data = vec![1, 2, 3, 4, 5];
         let secret_key = SecretKey::new(key_data.clone());
         let cloned_key = secret_key.clone();
-        
+
         assert_eq!(secret_key.expose_secret(), cloned_key.expose_secret());
     }
 
     #[test]
     fn test_secret_vec() {
         let mut secret_vec = SecretVec::with_capacity(10);
-        
+
         assert!(secret_vec.is_empty());
         assert_eq!(secret_vec.len(), 0);
-        
+
         secret_vec.push(42);
         assert_eq!(secret_vec.len(), 1);
         assert_eq!(secret_vec.as_slice()[0], 42);
-        
+
         secret_vec.extend_from_slice(&[1, 2, 3]);
         assert_eq!(secret_vec.len(), 4);
         assert_eq!(secret_vec.as_slice(), &[42, 1, 2, 3]);
@@ -179,8 +173,8 @@ mod tests {
     #[test]
     fn test_debug_formatting() {
         let secret_key = SecretKey::new(vec![1, 2, 3, 4, 5]);
-        let debug_str = format!("{:?}", secret_key);
-        
+        let debug_str = format!("{secret_key:?}");
+
         // Should not contain the actual key data
         assert!(!debug_str.contains("1"));
         assert!(!debug_str.contains("2"));

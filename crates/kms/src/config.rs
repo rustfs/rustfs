@@ -78,7 +78,7 @@ impl Default for KmsConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendConfig {
     /// HashiCorp Vault configuration
-    Vault(VaultConfig),
+    Vault(Box<VaultConfig>),
     /// Local KMS configuration
     Local(LocalConfig),
     /// AWS KMS configuration
@@ -177,7 +177,7 @@ pub struct LocalConfig {
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
-            key_dir: PathBuf::from("./kms_keys"),
+            key_dir: std::env::temp_dir().join("kms_keys"),
             master_key: None,
             encrypt_files: true,
         }
@@ -186,6 +186,7 @@ impl Default for LocalConfig {
 
 /// AWS KMS configuration (future implementation)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct AwsConfig {
     /// AWS region
     pub region: String,
@@ -201,6 +202,7 @@ pub struct AwsConfig {
 
 /// Azure Key Vault configuration (future implementation)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct AzureConfig {
     /// Key Vault URL
     pub vault_url: Url,
@@ -214,6 +216,7 @@ pub struct AzureConfig {
 
 /// Google Cloud KMS configuration (future implementation)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GoogleCloudConfig {
     /// GCP project ID
     pub project_id: String,
@@ -230,11 +233,11 @@ impl KmsConfig {
     pub fn vault(address: Url, token: String) -> Self {
         Self {
             kms_type: KmsType::Vault,
-            backend_config: BackendConfig::Vault(VaultConfig {
+            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
                 address,
                 auth_method: VaultAuthMethod::Token { token },
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -323,13 +326,13 @@ impl KmsConfig {
                 let address = std::env::var("RUSTFS_KMS_VAULT_ADDRESS").unwrap_or_else(|_| "http://localhost:8200".to_string());
                 let token = std::env::var("RUSTFS_KMS_VAULT_TOKEN").unwrap_or_else(|_| "dev-token".to_string());
 
-                config.backend_config = BackendConfig::Vault(VaultConfig {
+                config.backend_config = BackendConfig::Vault(Box::new(VaultConfig {
                     address: Url::parse(&address).map_err(|e| format!("Invalid Vault address: {e}"))?,
                     auth_method: VaultAuthMethod::Token { token },
                     namespace: std::env::var("RUSTFS_KMS_VAULT_NAMESPACE").ok(),
                     mount_path: std::env::var("RUSTFS_KMS_VAULT_MOUNT_PATH").unwrap_or_else(|_| "kv".to_string()),
                     ..Default::default()
-                });
+                }));
             }
             KmsType::Local => {
                 let key_dir = std::env::var("RUSTFS_KMS_LOCAL_KEY_DIR").unwrap_or_else(|_| "./kms_keys".to_string());
