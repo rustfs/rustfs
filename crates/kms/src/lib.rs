@@ -19,12 +19,15 @@
 //! supporting multiple backend implementations including HashiCorp Vault through rusty_vault.
 
 mod bucket_encryption;
+mod bucket_encryption_manager;
 mod cipher;
 mod config;
 mod error;
 mod local_client;
 mod manager;
 mod object_encryption;
+mod object_encryption_service;
+mod security;
 mod types;
 
 #[cfg(test)]
@@ -184,13 +187,16 @@ pub async fn shutdown_global_kms() {
 #[cfg(feature = "vault")]
 mod vault_client;
 
-pub use bucket_encryption::{BucketEncryptionAlgorithm, BucketEncryptionConfig, BucketEncryptionManager};
+pub use bucket_encryption::{BucketEncryptionAlgorithm, BucketEncryptionConfig};
+pub use bucket_encryption_manager::BucketEncryptionManager;
 pub use cipher::{AesGcmCipher, ChaCha20Poly1305Cipher, ObjectCipher};
 pub use config::{BackendConfig, KmsConfig, KmsType, LocalConfig, VaultAuthMethod, VaultConfig};
 pub use error::{KmsError, Result};
 pub use local_client::LocalKmsClient;
 pub use manager::KmsManager;
-pub use object_encryption::{EncryptedObjectData, EncryptionAlgorithm, ObjectEncryptionConfig, ObjectEncryptionService};
+pub use object_encryption::{EncryptedObjectData, EncryptionAlgorithm, ObjectEncryptionConfig};
+pub use object_encryption_service::ObjectEncryptionService;
+pub use security::{SecretKey, SecretVec};
 
 // Global KMS functions are already defined in this module and exported automatically
 pub use types::{

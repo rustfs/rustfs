@@ -231,17 +231,17 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     // Bucket encryption endpoints
     r.insert(
         Method::PUT,
-        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption/{bucket}").as_str(),
         AdminOperation(&PutBucketEncryptionHandler {}),
     )?;
     r.insert(
         Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption/{bucket}").as_str(),
         AdminOperation(&GetBucketEncryptionHandler {}),
     )?;
     r.insert(
         Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption/{bucket}").as_str(),
         AdminOperation(&DeleteBucketEncryptionHandler {}),
     )?;
     r.insert(

@@ -41,7 +41,7 @@ pub use writer::*;
 mod http_reader;
 pub use http_reader::*;
 
-pub use compress_index::TryGetIndex;
+pub use compress_index::{TryGetIndex, Index};
 
 mod etag;
 

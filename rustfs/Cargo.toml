@@ -59,6 +59,7 @@ atomic_enum = { workspace = true }
 axum.workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
+base64 = "0.21"
 chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }

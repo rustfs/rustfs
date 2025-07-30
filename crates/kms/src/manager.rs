@@ -184,6 +184,7 @@ pub struct BackendInfo {
 ///
 /// The main entry point for KMS operations. It handles backend selection,
 /// configuration, and provides a unified interface for all KMS operations.
+#[derive(Clone)]
 pub struct KmsManager {
     client: Arc<dyn KmsClient>,
     config: KmsConfig,
