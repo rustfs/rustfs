@@ -378,11 +378,11 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         AdminOperation(&SetNotificationTarget {}),
     )?;
 
-    /// Remove notification target
-    /// This endpoint removes a notification target based on its type and name.
-    /// target-remove?target_type=xxx&target_name=xxx
-    /// * `target_type` - Target type, such as "notify_webhook" or "notify_mqtt".
-    /// * `target_name` - A unique name for a Target, such as "1".
+    // Remove notification target
+    // This endpoint removes a notification target based on its type and name.
+    // target-remove?target_type=xxx&target_name=xxx
+    // * `target_type` - Target type, such as "notify_webhook" or "notify_mqtt".
+    // * `target_name` - A unique name for a Target, such as "1".
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
