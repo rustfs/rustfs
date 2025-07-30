@@ -229,15 +229,15 @@ impl TargetRegistry {
         // 6. Concurrently execute all creation tasks and collect results
         let mut successful_targets = Vec::new();
         let mut successful_configs = Vec::new();
-        while let Some((tpe, id, result, final_config)) = tasks.next().await {
+        while let Some((target_type, id, result, final_config)) = tasks.next().await {
             match result {
                 Ok(target) => {
-                    info!(target_type = %tpe, instance_id = %id, "Create a target successfully");
+                    info!(target_type = %target_type, instance_id = %id, "Create a target successfully");
                     successful_targets.push(target);
-                    successful_configs.push((tpe, id, final_config));
+                    successful_configs.push((target_type, id, final_config));
                 }
                 Err(e) => {
-                    error!(target_type = %tpe, instance_id = %id, error = %e, "Failed to create a target");
+                    error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create a target");
                 }
             }
         }
