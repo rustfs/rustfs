@@ -15,6 +15,7 @@
 //! Object encryption cipher implementations
 
 use crate::error::{EncryptionError, EncryptionResult};
+use crate::security::SecretKey;
 use rustfs_crypto;
 
 /// Trait for object encryption ciphers
@@ -37,7 +38,7 @@ pub trait ObjectCipher: Send + Sync {
 
 /// AES-256-GCM cipher implementation
 pub struct AesGcmCipher {
-    key: Vec<u8>,
+    key: SecretKey,
 }
 
 impl AesGcmCipher {
@@ -50,7 +51,7 @@ impl AesGcmCipher {
             });
         }
 
-        Ok(Self { key: key.to_vec() })
+        Ok(Self { key: SecretKey::from_slice(key) })
     }
 }
 
@@ -71,7 +72,7 @@ impl ObjectCipher for AesGcmCipher {
         }
 
         // Encrypt the data
-        let ciphertext = rustfs_crypto::encrypt_data(plaintext, &self.key).map_err(|e| EncryptionError::cipher_error(
+        let ciphertext = rustfs_crypto::encrypt_data(plaintext, self.key.expose_secret()).map_err(|e| EncryptionError::cipher_error(
              "encrypt",
              format!("Encryption failed: {:?}", e),
          ))?;
@@ -104,7 +105,7 @@ impl ObjectCipher for AesGcmCipher {
         combined.extend_from_slice(tag);
 
         // Decrypt the data
-        let plaintext = rustfs_crypto::decrypt_data(&combined, &self.key).map_err(|e| EncryptionError::cipher_error(
+        let plaintext = rustfs_crypto::decrypt_data(&combined, self.key.expose_secret()).map_err(|e| EncryptionError::cipher_error(
              "decrypt",
              format!("Decryption failed: {:?}", e),
          ))?;
@@ -127,7 +128,7 @@ impl ObjectCipher for AesGcmCipher {
 
 /// ChaCha20-Poly1305 cipher implementation
 pub struct ChaCha20Poly1305Cipher {
-    key: Vec<u8>,
+    key: SecretKey,
 }
 
 impl ChaCha20Poly1305Cipher {
@@ -139,7 +140,7 @@ impl ChaCha20Poly1305Cipher {
                 actual: key.len(),
             });
         }
-        Ok(Self { key: key.to_vec() })
+        Ok(Self { key: SecretKey::from_slice(key) })
     }
 }
 
@@ -152,7 +153,7 @@ impl ObjectCipher for ChaCha20Poly1305Cipher {
             });
         }
 
-        let cipher = rustfs_crypto::ChaCha20Poly1305::new(&self.key)
+        let cipher = rustfs_crypto::ChaCha20Poly1305::new(self.key.expose_secret())
              .map_err(|e| EncryptionError::cipher_error(
                  "encrypt",
                  format!("ChaCha20 cipher creation failed: {}", e),
@@ -175,7 +176,7 @@ impl ObjectCipher for ChaCha20Poly1305Cipher {
             });
         }
 
-        let cipher = rustfs_crypto::ChaCha20Poly1305::new(&self.key)
+        let cipher = rustfs_crypto::ChaCha20Poly1305::new(self.key.expose_secret())
              .map_err(|e| EncryptionError::cipher_error(
                  "decrypt",
                  format!("ChaCha20 cipher creation failed: {}", e),

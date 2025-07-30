@@ -8109,6 +8109,7 @@ dependencies = [
  "atoi",
  "atomic_enum",
  "axum",
+ "base64 0.21.7",
  "bytes",
  "chrono",
  "clap",
@@ -8415,17 +8416,19 @@ version = "0.0.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "once_cell",
  "rand 0.9.2",
  "reqwest",
  "rustfs-common",
  "rustfs-crypto",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",
  "test-case",
- "thiserror 2.0.12",
+ "thiserror 2.0.14",
  "tokio",
  "tokio-test",
  "tracing",
@@ -8434,6 +8437,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "vaultrs",
+ "zeroize",
 ]
 
 [[package]]
@@ -9096,6 +9100,15 @@ dependencies = [
  "generic-array",
  "pkcs8 0.9.0",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
+dependencies = [
  "zeroize",
 ]
 
