@@ -3246,7 +3246,7 @@ impl ObjectIO for SetDisks {
 
         // TODO: remote
 
-        let (rd, wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+        let (rd, wd) = tokio::io::simplex(DEFAULT_READ_BUFFER_SIZE);
 
         let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
 
