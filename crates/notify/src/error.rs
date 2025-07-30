@@ -89,8 +89,8 @@ pub enum TargetError {
     #[error("Failed to save configuration: {0}")]
     SaveConfig(String),
 
-    #[error("Server not initialized")]
-    ServerNotInitialized,
+    #[error("Server not initialized: {0}")]
+    ServerNotInitialized(String),
 }
 
 /// Error types for the notification system

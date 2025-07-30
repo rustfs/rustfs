@@ -15,7 +15,7 @@
 use const_str::concat;
 
 /// Application name
-/// Default value: RustFs
+/// Default value: RustFS
 /// Environment variable: RUSTFS_APP_NAME
 pub const APP_NAME: &str = "RustFS";
 /// Application version

@@ -60,7 +60,7 @@ fn main() -> Result<(), AnyError> {
         .compile_well_known_types(true)
         .bytes(".")
         .emit_rerun_if_changed(false)
-        .compile_protos(proto_files, &[proto_dir.clone().to_string_lossy().into_owned().as_str()])
+        .compile_protos(proto_files, &[proto_dir.to_string_lossy().as_ref()])
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;
 
     // protos/gen/mod.rs

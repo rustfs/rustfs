@@ -165,7 +165,7 @@ impl TargetRegistry {
                         // Ignore illegal field names
                         warn!(
                             field_name = %field_name,
-                            "Ignore environment variable fields, not found in the list of legal fields for target type {}",
+                            "Ignore environment variable fields, not found in the list of valid fields for target type {}",
                             target_type
                         );
                     }
@@ -255,7 +255,9 @@ impl TargetRegistry {
             }
 
             let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-                return Err(TargetError::ServerNotInitialized);
+                return Err(TargetError::ServerNotInitialized(
+                    "Failed to save target configuration: server storage not initialized".to_string(),
+                ));
             };
 
             match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
