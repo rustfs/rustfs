@@ -191,6 +191,10 @@ impl FS {
         self
     }
 
+    pub fn bucket_encryption_manager(&self) -> Option<&Arc<BucketEncryptionManager>> {
+        self.bucket_encryption_manager.as_ref()
+    }
+
     async fn put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let PutObjectInput {
             body,
