@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn test_app_basic_constants() {
         // Test application basic constants
-        assert_eq!(APP_NAME, "RustFs");
+        assert_eq!(APP_NAME, "RustFS");
         assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
 
         assert_eq!(VERSION, "0.0.1");
