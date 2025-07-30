@@ -114,6 +114,6 @@ pub fn parse_bool(value: &str) -> Result<bool, TargetError> {
     match value.to_lowercase().as_str() {
         "true" | "on" | "yes" | "1" => Ok(true),
         "false" | "off" | "no" | "0" => Ok(false),
-        _ => Err(TargetError::ParseError(format!("Unable to parse boolean: {}", value))),
+        _ => Err(TargetError::ParseError(format!("Unable to parse boolean: {value}"))),
     }
 }

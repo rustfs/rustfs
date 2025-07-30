@@ -88,7 +88,7 @@ pub fn get_log_directory(key: &str) -> PathBuf {
     // User home directory
     if let Ok(home_dir) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
         let mut path = PathBuf::from(home_dir);
-        path.push(format!(".{}", DEFAULT_LOG_FILENAME));
+        path.push(format!(".{DEFAULT_LOG_FILENAME}"));
         path.push(DEFAULT_LOG_DIR);
         if ensure_directory_writable(&path) {
             return path;
@@ -110,7 +110,7 @@ pub fn get_log_directory(key: &str) -> PathBuf {
 
 fn ensure_directory_writable(path: &PathBuf) -> bool {
     // Try creating a catalog
-    if let Err(_) = fs::create_dir_all(path) {
+    if fs::create_dir_all(path).is_err() {
         return false;
     }
 

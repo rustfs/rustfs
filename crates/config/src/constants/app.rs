@@ -71,6 +71,16 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
+/// Default console enable
+/// This is the default value for the console server.
+/// It is used to enable or disable the console server.
+/// Default value: true
+/// Environment variable: RUSTFS_CONSOLE_ENABLE
+/// Command line argument: --console-enable
+/// Example: RUSTFS_CONSOLE_ENABLE=true
+/// Example: --console-enable true
+pub const DEFAULT_CONSOLE_ENABLE: bool = true;
+
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
 /// Command line argument: --obs-endpoint
