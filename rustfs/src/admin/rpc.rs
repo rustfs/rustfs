@@ -41,31 +41,31 @@ pub fn register_rpc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<(
     r.insert(
         Method::GET,
         format!("{}{}", RPC_PREFIX, "/read_file_stream").as_str(),
-        AdminOperation(&ReadFile {}),
+        AdminOperation(Box::new(ReadFile {})),
     )?;
 
     r.insert(
         Method::HEAD,
         format!("{}{}", RPC_PREFIX, "/read_file_stream").as_str(),
-        AdminOperation(&ReadFile {}),
+        AdminOperation(Box::new(ReadFile {})),
     )?;
 
     r.insert(
         Method::PUT,
         format!("{}{}", RPC_PREFIX, "/put_file_stream").as_str(),
-        AdminOperation(&PutFile {}),
+        AdminOperation(Box::new(PutFile {})),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", RPC_PREFIX, "/walk_dir").as_str(),
-        AdminOperation(&WalkDir {}),
+        AdminOperation(Box::new(WalkDir {})),
     )?;
 
     r.insert(
         Method::HEAD,
         format!("{}{}", RPC_PREFIX, "/walk_dir").as_str(),
-        AdminOperation(&WalkDir {}),
+        AdminOperation(Box::new(WalkDir {})),
     )?;
 
     Ok(())

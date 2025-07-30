@@ -13,32 +13,24 @@
 // limitations under the License.
 
 //! Bucket encryption configuration handlers
+//! 
+//! This module provides complete implementation for S3 bucket encryption management:
+//! - PUT /bucket/{bucket}/encryption - Set bucket encryption configuration
+//! - GET /bucket/{bucket}/encryption - Get bucket encryption configuration  
+//! - DELETE /bucket/{bucket}/encryption - Delete bucket encryption configuration
+//! - GET /bucket/encryptions - List all bucket encryption configurations
+//!
+//! All handlers are fully implemented and integrated with the FS bucket encryption manager.
 
 use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
+    storage::ecfs::FS,
 };
+use rustfs_kms::{BucketEncryptionConfig, BucketEncryptionAlgorithm};
 
 use http::StatusCode;
 use matchit::Params;
-// Simplified bucket encryption types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BucketEncryptionAlgorithm {
-    AES256,
-    #[serde(rename = "aws:kms")]
-    AwsKms,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BucketEncryptionConfig {
-    pub enabled: bool,
-    pub algorithm: BucketEncryptionAlgorithm,
-    pub kms_key_id: String,
-    pub encrypt_metadata: bool,
-    pub encryption_context: std::collections::HashMap<String, String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BucketEncryptionConfiguration {
@@ -114,7 +106,9 @@ impl From<BucketEncryptionConfig> for GetBucketEncryptionResponse {
 }
 
 /// Handler for PUT /bucket/{bucket}/encryption
-pub struct PutBucketEncryptionHandler {}
+pub struct PutBucketEncryptionHandler {
+    pub fs: std::sync::Arc<FS>,
+}
 
 #[async_trait::async_trait]
 impl Operation for PutBucketEncryptionHandler {
@@ -155,18 +149,31 @@ impl Operation for PutBucketEncryptionHandler {
             updated_at: chrono::Utc::now(),
         };
 
-        // TODO: Implement actual bucket encryption configuration storage
-        // For now, return success response
+        // Store the bucket encryption configuration using the manager
+        if let Some(manager) = self.fs.bucket_encryption_manager() {
+            manager.set_bucket_encryption(bucket_name, config.clone()).await
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to store encryption config: {}", e)))?;
+        } else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"));
+        }
+
         info!("Setting bucket encryption for bucket: {}", bucket_name);
         info!("Encryption config: {:?}", config);
         
-        let response_body = "Bucket encryption configuration set";
-        Ok(S3Response::new((StatusCode::OK, Body::from(response_body.as_bytes().to_vec()))))
+        let response = serde_json::json!({
+            "message": "Bucket encryption configuration updated successfully",
+            "bucket": bucket_name,
+            "config": config
+        });
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(response.to_string()))))
     }
 }
 
 /// Handler for GET /bucket/{bucket}/encryption
-pub struct GetBucketEncryptionHandler {}
+pub struct GetBucketEncryptionHandler {
+    pub fs: std::sync::Arc<FS>,
+}
 
 #[async_trait::async_trait]
 impl Operation for GetBucketEncryptionHandler {
@@ -183,28 +190,34 @@ impl Operation for GetBucketEncryptionHandler {
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // TODO: Implement actual bucket encryption configuration retrieval
-        // For now, return a sample configuration
         info!("Getting bucket encryption for bucket: {}", bucket_name);
         
-        let response = GetBucketEncryptionResponse {
-            enabled: true,
-            algorithm: BucketEncryptionAlgorithm::AES256,
-            kms_key_id: "sample-key-id".to_string(),
-            encrypt_metadata: false,
-            encryption_context: std::collections::HashMap::new(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        let response_json = serde_json::to_string(&response)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to serialize response: {}", e)))?;
-
-        Ok(S3Response::new((StatusCode::OK, Body::from(response_json.into_bytes()))))
+        // Retrieve the bucket encryption configuration using the manager
+        if let Some(manager) = self.fs.bucket_encryption_manager() {
+            match manager.get_bucket_encryption(bucket_name).await {
+                Ok(Some(config)) => {
+                    let response: GetBucketEncryptionResponse = config.into();
+                    let response_json = serde_json::to_string(&response)
+                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("JSON serialization error: {}", e)))?;
+                    Ok(S3Response::new((StatusCode::OK, Body::from(response_json.into_bytes()))))
+                }
+                Ok(None) => {
+                    Err(S3Error::with_message(S3ErrorCode::NoSuchBucketPolicy, "No encryption configuration found for bucket"))
+                }
+                Err(e) => {
+                    Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to retrieve encryption config: {}", e)))
+                }
+            }
+        } else {
+            Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"))
+        }
     }
 }
 
 /// Handler for DELETE /bucket/{bucket}/encryption
-pub struct DeleteBucketEncryptionHandler {}
+pub struct DeleteBucketEncryptionHandler {
+    pub fs: std::sync::Arc<FS>,
+}
 
 #[async_trait::async_trait]
 impl Operation for DeleteBucketEncryptionHandler {
@@ -221,17 +234,28 @@ impl Operation for DeleteBucketEncryptionHandler {
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // TODO: Implement actual bucket encryption configuration deletion
-        // For now, return success response
         info!("Deleting bucket encryption for bucket: {}", bucket_name);
         
-        let response_body = "Bucket encryption configuration deleted";
-        Ok(S3Response::new((StatusCode::OK, Body::from(response_body.as_bytes().to_vec()))))
+        // Delete the bucket encryption configuration using the manager
+        if let Some(manager) = self.fs.bucket_encryption_manager() {
+            match manager.delete_bucket_encryption(bucket_name).await {
+                Ok(()) => {
+                    Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty())))
+                }
+                Err(e) => {
+                    Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to delete encryption config: {}", e)))
+                }
+            }
+        } else {
+            Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"))
+        }
     }
 }
 
 /// Handler for GET /bucket/encryptions (list all bucket encryption configurations)
-pub struct ListBucketEncryptionsHandler {}
+pub struct ListBucketEncryptionsHandler {
+    pub fs: std::sync::Arc<FS>,
+}
 
 #[async_trait::async_trait]
 impl Operation for ListBucketEncryptionsHandler {
@@ -243,14 +267,23 @@ impl Operation for ListBucketEncryptionsHandler {
         // Validate authentication
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // TODO: Implement actual bucket encryption configurations listing
-        // For now, return empty list
         info!("Listing all bucket encryption configurations");
         
-        let response: std::collections::HashMap<String, GetBucketEncryptionResponse> = std::collections::HashMap::new();
-        let response_json = serde_json::to_string(&response)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to serialize response: {}", e)))?;
-
-        Ok(S3Response::new((StatusCode::OK, Body::from(response_json.into_bytes()))))
+        // List all bucket encryption configurations using the manager
+        if let Some(manager) = self.fs.bucket_encryption_manager() {
+            match manager.list_bucket_encryptions().await {
+                Ok(configs) => {
+                    let response = serde_json::json!({
+                        "bucket_encryptions": configs
+                    });
+                    Ok(S3Response::new((StatusCode::OK, Body::from(response.to_string().into_bytes()))))
+                }
+                Err(e) => {
+                    Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to list encryption configs: {}", e)))
+                }
+            }
+        } else {
+            Err(S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not available"))
+        }
     }
 }
