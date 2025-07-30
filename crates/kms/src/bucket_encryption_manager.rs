@@ -139,6 +139,14 @@ impl BucketEncryptionManager {
             BucketEncryptionAlgorithm::ChaCha20Poly1305 => {
                 // ChaCha20Poly1305 doesn't require KMS key
             }
+            BucketEncryptionAlgorithm::AwsKms => {
+                // AWS KMS requires a valid KMS key ID
+                if config.kms_key_id.is_empty() {
+                    return Err(crate::error::EncryptionError::configuration_error(
+                        "KMS key ID is required for AWS KMS encryption"
+                    ));
+                }
+            }
         }
 
 
@@ -160,7 +168,7 @@ mod tests {
 
         let bucket_name = "test-bucket";
         let encryption_config = BucketEncryptionManager::create_default_config(
-            BucketEncryptionAlgorithm::AES256,
+            BucketEncryptionAlgorithm::Aes256,
             None,
         );
 
@@ -197,7 +205,7 @@ mod tests {
 
         // Valid AES256 config
         let valid_config = BucketEncryptionManager::create_default_config(
-            BucketEncryptionAlgorithm::AES256,
+            BucketEncryptionAlgorithm::Aes256,
             None,
         );
         assert!(manager.validate_config(&valid_config).await.is_ok());

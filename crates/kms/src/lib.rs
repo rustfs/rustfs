@@ -189,7 +189,7 @@ mod vault_client;
 
 pub use bucket_encryption::{BucketEncryptionAlgorithm, BucketEncryptionConfig};
 pub use bucket_encryption_manager::BucketEncryptionManager;
-pub use cipher::{AesGcmCipher, ChaCha20Poly1305Cipher, ObjectCipher};
+pub use cipher::{AesGcmCipher, ChaCha20Poly1305Cipher, ObjectCipher, StreamingCipher};
 pub use config::{BackendConfig, KmsConfig, KmsType, LocalConfig, VaultAuthMethod, VaultConfig};
 pub use error::{KmsError, Result};
 pub use local_client::LocalKmsClient;

@@ -17,6 +17,10 @@
 use crate::error::{EncryptionError, EncryptionResult};
 use crate::security::SecretKey;
 use rustfs_crypto;
+use std::io::{Result as IoResult};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
 
 /// Trait for object encryption ciphers
 pub trait ObjectCipher: Send + Sync {
@@ -123,6 +127,117 @@ impl ObjectCipher for AesGcmCipher {
 
     fn iv_size(&self) -> usize {
         12 // 96 bits
+    }
+}
+
+/// Streaming cipher for encrypting data streams
+pub struct StreamingCipher<R> {
+    reader: R,
+    cipher: Box<dyn ObjectCipher>,
+    iv: Vec<u8>,
+    buffer: Vec<u8>,
+    encrypted_buffer: Vec<u8>,
+    buffer_pos: usize,
+    chunk_size: usize,
+    finished: bool,
+}
+
+impl<R> StreamingCipher<R>
+where
+    R: AsyncRead + Unpin,
+{
+    /// Create a new streaming cipher
+    pub fn new(reader: R, cipher: Box<dyn ObjectCipher>, iv: Vec<u8>) -> Self {
+        Self {
+            reader,
+            cipher,
+            iv,
+            buffer: Vec::new(),
+            encrypted_buffer: Vec::new(),
+            buffer_pos: 0,
+            chunk_size: 8192, // 8KB chunks
+            finished: false,
+        }
+    }
+
+    /// Set the chunk size for streaming encryption
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
+}
+
+impl<R> AsyncRead for StreamingCipher<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<IoResult<()>> {
+        let this = self.get_mut();
+        
+        // If we have encrypted data in buffer, return it first
+        if this.buffer_pos < this.encrypted_buffer.len() {
+            let remaining = this.encrypted_buffer.len() - this.buffer_pos;
+            let to_copy = std::cmp::min(remaining, buf.remaining());
+            
+            buf.put_slice(&this.encrypted_buffer[this.buffer_pos..this.buffer_pos + to_copy]);
+            this.buffer_pos += to_copy;
+            
+            return Poll::Ready(Ok(()));
+        }
+
+        // If we're finished and no more data in buffer, return EOF
+        if this.finished {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Read more data from the underlying reader
+        this.buffer.clear();
+        let chunk_size = this.chunk_size;
+        this.buffer.resize(chunk_size, 0);
+        
+        let mut read_buf = ReadBuf::new(&mut this.buffer);
+        
+        match Pin::new(&mut this.reader).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let bytes_read = read_buf.filled().len();
+                
+                if bytes_read == 0 {
+                    this.finished = true;
+                    return Poll::Ready(Ok(()));
+                }
+
+                // Encrypt the chunk
+                this.buffer.truncate(bytes_read);
+                
+                match this.cipher.encrypt(&this.buffer, &this.iv, &[]) {
+                    Ok((ciphertext, tag)) => {
+                        this.encrypted_buffer.clear();
+                        this.encrypted_buffer.extend_from_slice(&ciphertext);
+                        this.encrypted_buffer.extend_from_slice(&tag);
+                        this.buffer_pos = 0;
+                        
+                        // Return encrypted data
+                        let to_copy = std::cmp::min(this.encrypted_buffer.len(), buf.remaining());
+                        buf.put_slice(&this.encrypted_buffer[..to_copy]);
+                        this.buffer_pos = to_copy;
+                        
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(_) => {
+                        Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Encryption failed",
+                        )))
+                    }
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -274,5 +389,39 @@ mod tests {
         let key = vec![0u8; 16]; // Invalid key size
         let result = ChaCha20Poly1305Cipher::new(&key);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_cipher() {
+        use tokio::io::AsyncReadExt;
+        
+        let key = vec![0u8; 32];
+        let cipher = Box::new(AesGcmCipher::new(&key).unwrap()) as Box<dyn ObjectCipher>;
+        let iv = vec![0u8; 12];
+        let data = b"Hello, streaming encryption!";
+        
+        let cursor = std::io::Cursor::new(data.to_vec());
+        let mut streaming_cipher = StreamingCipher::new(cursor, cipher, iv).with_chunk_size(10);
+        
+        let mut encrypted_data = Vec::new();
+        streaming_cipher.read_to_end(&mut encrypted_data).await.unwrap();
+        
+        // The encrypted data should be different from the original
+        assert_ne!(encrypted_data, data);
+        assert!(!encrypted_data.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_cipher_creation() {
+        let key = vec![0u8; 32];
+        let cipher = Box::new(AesGcmCipher::new(&key).unwrap()) as Box<dyn ObjectCipher>;
+        let iv = vec![0u8; 12];
+        let data = b"test data";
+        
+        let cursor = std::io::Cursor::new(data.to_vec());
+        let streaming_cipher = StreamingCipher::new(cursor, cipher, iv).with_chunk_size(1024);
+        
+        // Just test that we can create the streaming cipher
+        assert_eq!(streaming_cipher.chunk_size, 1024);
     }
 }
