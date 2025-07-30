@@ -214,9 +214,10 @@ impl TargetRegistry {
                     // 5.3. Create asynchronous tasks for enabled instances
                     let target_type_clone = target_type.clone();
                     let tid = id.clone();
+                    let merged_config_arc = std::sync::Arc::new(merged_config);
                     tasks.push(async move {
-                        let result = factory.create_target(tid.clone(), &merged_config).await;
-                        (target_type_clone, tid, result, merged_config)
+                        let result = factory.create_target(tid.clone(), &merged_config_arc).await;
+                        (target_type_clone, tid, result, std::sync::Arc::clone(&merged_config_arc))
                     });
                 } else {
                     info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
@@ -251,7 +252,7 @@ impl TargetRegistry {
             let mut new_config = config.clone();
             for (target_type, id, kvs) in successful_configs {
                 let section_name = format!("{NOTIFY_ROUTE_PREFIX}{target_type}").to_lowercase();
-                new_config.0.entry(section_name).or_default().insert(id, kvs);
+                new_config.0.entry(section_name).or_default().insert(id, (*kvs).clone());
             }
 
             let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
