@@ -129,10 +129,6 @@ impl TargetRegistry {
             let env_prefix = format!("{}{}{}_", ENV_PREFIX, NOTIFY_ROUTE_PREFIX, target_type).to_uppercase();
             // 3.2.2. `env_overrides` 用于存储从环境变量解析出的配置，格式为：{实例 ID -> {字段 -> 值}}
             let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
-
-            let env_valid_fields = factory.get_valid_env_fields();
-            debug!(?valid_fields, "获取到合法的 ENV 配置字段");
-
             for (key, value) in &all_env {
                 if let Some(rest) = key.strip_prefix(&env_prefix) {
                     // 使用 rsplitn 从右侧分割，以正确提取末尾的 INSTANCE_ID
