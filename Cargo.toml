@@ -38,6 +38,7 @@ members = [
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
     "crates/ahm",
+    "crates/mcp", # MCP server for S3 operations
 ]
 resolver = "2"
 
@@ -87,6 +88,7 @@ rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
+rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 anyhow = "1.0.98"
 arc-swap = "1.7.1"
@@ -208,6 +210,7 @@ rfd = { version = "0.15.4", default-features = false, features = [
     "xdg-portal",
     "tokio",
 ] }
+rmcp = { version = "0.3.1" }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rsa = "0.9.8"
@@ -219,13 +222,14 @@ rustls = { version = "0.23.31" }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-minio-preview.2" }
-shadow-rs = { version = "1.2.0", default-features = false }
+schemars = "1.0.4"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.141", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
+shadow-rs = { version = "1.2.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"
