@@ -99,6 +99,61 @@ pub trait KmsClient: Send + Sync + Debug {
     /// available for decryption but new operations will use the new version.
     async fn rotate_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<MasterKey>;
 
+    /// Generate a data key for object encryption
+    ///
+    /// Generates a new data encryption key specifically for object encryption.
+    /// Returns both plaintext and encrypted versions of the key.
+    async fn generate_object_data_key(
+        &self,
+        master_key_id: &str,
+        key_spec: &str,
+        context: Option<&OperationContext>,
+    ) -> Result<DataKey>;
+
+    /// Decrypt an object data key
+    ///
+    /// Decrypts an encrypted data key for object decryption.
+    /// Returns the plaintext data key.
+    async fn decrypt_object_data_key(&self, encrypted_key: &[u8], context: Option<&OperationContext>) -> Result<Vec<u8>>;
+
+    /// Encrypt object metadata
+    ///
+    /// Encrypts object metadata using the specified master key.
+    async fn encrypt_object_metadata(
+        &self,
+        master_key_id: &str,
+        metadata: &[u8],
+        context: Option<&OperationContext>,
+    ) -> Result<Vec<u8>>;
+
+    /// Decrypt object metadata
+    ///
+    /// Decrypts object metadata.
+    async fn decrypt_object_metadata(&self, encrypted_metadata: &[u8], context: Option<&OperationContext>) -> Result<Vec<u8>>;
+
+    /// Generate a data key with encryption context
+    ///
+    /// Generates a new data encryption key with additional encryption context.
+    /// The context is used for additional authentication and access control.
+    async fn generate_data_key_with_context(
+        &self,
+        master_key_id: &str,
+        key_spec: &str,
+        encryption_context: &std::collections::HashMap<String, String>,
+        operation_context: Option<&OperationContext>,
+    ) -> Result<DataKey>;
+
+    /// Decrypt data with encryption context
+    ///
+    /// Decrypts data using the provided encryption context for validation.
+    /// The context must match the one used during encryption.
+    async fn decrypt_with_context(
+        &self,
+        ciphertext: &[u8],
+        encryption_context: &std::collections::HashMap<String, String>,
+        operation_context: Option<&OperationContext>,
+    ) -> Result<Vec<u8>>;
+
     /// Health check
     ///
     /// Performs a health check on the KMS backend to ensure it's operational.

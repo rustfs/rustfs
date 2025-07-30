@@ -17,8 +17,19 @@ mod encdec;
 mod error;
 mod jwt;
 
+#[cfg(feature = "crypto")]
+pub mod aes;
+#[cfg(feature = "crypto")]
+mod chacha20;
+
 pub use encdec::decrypt::decrypt_data;
 pub use encdec::encrypt::encrypt_data;
 pub use error::Error;
+pub use error::Error as CryptoError;
 pub use jwt::decode::decode as jwt_decode;
 pub use jwt::encode::encode as jwt_encode;
+
+#[cfg(feature = "crypto")]
+pub use aes::{Aes256Gcm, generate_aes256_key};
+#[cfg(feature = "crypto")]
+pub use chacha20::{ChaCha20Poly1305, generate_chacha20_key};

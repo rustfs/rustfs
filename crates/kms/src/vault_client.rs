@@ -409,6 +409,116 @@ impl KmsClient for VaultKmsClient {
         }
     }
 
+    async fn generate_object_data_key(
+        &self,
+        master_key_id: &str,
+        _key_spec: &str,
+        _context: Option<&OperationContext>,
+    ) -> Result<DataKey> {
+        debug!("Generating object data key for master key: {}", master_key_id);
+
+        // Use the existing generate_data_key method
+        let request = GenerateKeyRequest {
+            master_key_id: master_key_id.to_string(),
+            key_spec: "AES_256".to_string(),
+            key_length: Some(32), // 32 bytes for AES-256
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+
+        self.generate_data_key(&request, _context).await
+    }
+
+    async fn decrypt_object_data_key(&self, encrypted_key: &[u8], _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+        debug!("Decrypting object data key");
+
+        // Use the existing decrypt method
+        let request = DecryptRequest {
+            ciphertext: encrypted_key.to_vec(),
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+
+        self.decrypt(&request, _context).await
+    }
+
+    async fn encrypt_object_metadata(
+        &self,
+        master_key_id: &str,
+        metadata: &[u8],
+        _context: Option<&OperationContext>,
+    ) -> Result<Vec<u8>> {
+        debug!("Encrypting object metadata with key: {}", master_key_id);
+
+        // Use the existing encrypt method
+        let request = EncryptRequest {
+            key_id: master_key_id.to_string(),
+            plaintext: metadata.to_vec(),
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+
+        let response = self.encrypt(&request, _context).await?;
+        Ok(response.ciphertext)
+    }
+
+    async fn decrypt_object_metadata(&self, encrypted_metadata: &[u8], _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+        debug!("Decrypting object metadata");
+
+        // Use the existing decrypt method
+        let request = DecryptRequest {
+            ciphertext: encrypted_metadata.to_vec(),
+            encryption_context: HashMap::new(),
+            grant_tokens: Vec::new(),
+        };
+
+        self.decrypt(&request, _context).await
+    }
+
+    async fn generate_data_key_with_context(
+        &self,
+        master_key_id: &str,
+        key_spec: &str,
+        context: &std::collections::HashMap<String, String>,
+        _operation_context: Option<&OperationContext>,
+    ) -> Result<DataKey> {
+        debug!("Generating data key with context for master key: {} using Vault", master_key_id);
+
+        // Use Vault's transit engine to generate a data key with encryption context
+        let operation_context = OperationContext {
+            operation_id: uuid::Uuid::new_v4(),
+            principal: "system".to_string(),
+            source_ip: None,
+            user_agent: None,
+            additional_context: context.clone(),
+        };
+
+        let data_key = self
+            .generate_object_data_key(master_key_id, key_spec, Some(&operation_context))
+            .await?;
+        Ok(data_key)
+    }
+
+    async fn decrypt_with_context(
+        &self,
+        ciphertext: &[u8],
+        context: &std::collections::HashMap<String, String>,
+        _operation_context: Option<&OperationContext>,
+    ) -> Result<Vec<u8>> {
+        debug!("Decrypting data with context using Vault");
+
+        // Use Vault's transit engine to decrypt with encryption context
+        let operation_context = OperationContext {
+            operation_id: uuid::Uuid::new_v4(),
+            principal: "system".to_string(),
+            source_ip: None,
+            user_agent: None,
+            additional_context: context.clone(),
+        };
+
+        self.decrypt_object_data_key(ciphertext, Some(&operation_context)).await
+    }
+
     fn backend_info(&self) -> BackendInfo {
         BackendInfo {
             backend_type: "vault".to_string(),

@@ -14,6 +14,8 @@
 
 //! Local file-based KMS client for development and testing
 
+use uuid::Uuid;
+
 use crate::{
     config::LocalConfig,
     error::{KmsError, Result},
@@ -28,7 +30,7 @@ use rustfs_crypto::{decrypt_data, encrypt_data};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 use tokio::fs;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Local file-based KMS client
 #[derive(Debug)]
@@ -199,6 +201,63 @@ impl KmsClient for LocalKmsClient {
         let plaintext = self.decrypt_with_master_key(&request.ciphertext)?;
 
         Ok(plaintext)
+    }
+
+    async fn generate_object_data_key(
+        &self,
+        master_key_id: &str,
+        _key_spec: &str,
+        _context: Option<&OperationContext>,
+    ) -> Result<DataKey> {
+        debug!("Generating object data key for master key: {}", master_key_id);
+
+        // Verify master key exists
+        let _master_key = self.load_key(master_key_id).await?;
+
+        // Generate a new data encryption key (32 bytes for AES-256)
+        let plaintext_key = self.generate_random_key(32);
+
+        // Encrypt the key with the master key
+        let encrypted_key = self.encrypt_with_master_key(&plaintext_key)?;
+
+        let data_key = DataKey::new(master_key_id.to_string(), 1, Some(plaintext_key), encrypted_key);
+
+        Ok(data_key)
+    }
+
+    async fn decrypt_object_data_key(&self, encrypted_key: &[u8], _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+        debug!("Decrypting object data key");
+
+        // Decrypt the key with master key
+        let plaintext_key = self.decrypt_with_master_key(encrypted_key)?;
+
+        Ok(plaintext_key)
+    }
+
+    async fn encrypt_object_metadata(
+        &self,
+        master_key_id: &str,
+        metadata: &[u8],
+        _context: Option<&OperationContext>,
+    ) -> Result<Vec<u8>> {
+        debug!("Encrypting object metadata with key: {}", master_key_id);
+
+        // Verify master key exists
+        let _master_key = self.load_key(master_key_id).await?;
+
+        // Encrypt metadata with master key
+        let encrypted_metadata = self.encrypt_with_master_key(metadata)?;
+
+        Ok(encrypted_metadata)
+    }
+
+    async fn decrypt_object_metadata(&self, encrypted_metadata: &[u8], _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+        debug!("Decrypting object metadata");
+
+        // Decrypt metadata with master key
+        let plaintext_metadata = self.decrypt_with_master_key(encrypted_metadata)?;
+
+        Ok(plaintext_metadata)
     }
 
     async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
@@ -404,6 +463,60 @@ impl KmsClient for LocalKmsClient {
             .map_err(|e| KmsError::internal_error(format!("Cannot access key directory: {e}")))?;
 
         Ok(())
+    }
+
+    async fn generate_data_key_with_context(
+        &self,
+        master_key_id: &str,
+        key_spec: &str,
+        context: &std::collections::HashMap<String, String>,
+        _operation_context: Option<&OperationContext>,
+    ) -> Result<DataKey> {
+        debug!("Generating data key with context for master key: {}", master_key_id);
+
+        // For local implementation, we'll use the existing generate_object_data_key
+        // and add context validation
+        if context.is_empty() {
+            warn!("Empty encryption context provided");
+        }
+
+        let operation_context = OperationContext {
+            operation_id: Uuid::new_v4(),
+            principal: "system".to_string(),
+            source_ip: None,
+            user_agent: None,
+            additional_context: context.clone(),
+        };
+
+        let data_key = self
+            .generate_object_data_key(master_key_id, key_spec, Some(&operation_context))
+            .await?;
+        Ok(data_key)
+    }
+
+    async fn decrypt_with_context(
+        &self,
+        ciphertext: &[u8],
+        context: &std::collections::HashMap<String, String>,
+        _operation_context: Option<&OperationContext>,
+    ) -> Result<Vec<u8>> {
+        debug!("Decrypting data with context");
+
+        // For local implementation, context is mainly for auditing
+        if context.is_empty() {
+            warn!("Empty encryption context provided for decryption");
+        }
+
+        // Use the existing decrypt_object_data_key method
+        let operation_context = OperationContext {
+            operation_id: Uuid::new_v4(),
+            principal: "system".to_string(),
+            source_ip: None,
+            user_agent: None,
+            additional_context: context.clone(),
+        };
+
+        self.decrypt_object_data_key(ciphertext, Some(&operation_context)).await
     }
 
     fn backend_info(&self) -> BackendInfo {
