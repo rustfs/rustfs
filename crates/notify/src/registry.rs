@@ -84,8 +84,8 @@ impl TargetRegistry {
     /// 5. If the instance is enabled, create an asynchronous task for it to instantiate.
     /// 6. Concurrency executes all creation tasks and collects results.
     pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn Target + Send + Sync>>, TargetError> {
-        // Collect all environment variables upfront to avoid duplicate acquisitions in the loop
-        let all_env: Vec<(String, String)> = std::env::vars().collect();
+        // Collect only environment variables with the relevant prefix to reduce memory usage
+        let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
         // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
         let mut final_config = config.clone(); // Clone a configuration for aggregating the final result
@@ -269,7 +269,7 @@ impl TargetRegistry {
             }
         }
 
-        info!(count = successful_targets.len(), "All target processing is completed");
+        info!(count = successful_targets.len(), "All target processing completed");
         Ok(successful_targets)
     }
 }
