@@ -19,9 +19,9 @@ use crate::{
     target::Target,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use rustfs_config::notify::{ENABLE_KEY, ENABLE_ON, NOTIFY_ROUTE_PREFIX};
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
-use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KVS};
+use rustfs_ecstore::config::{Config, KVS};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::notify::{COMMENT_KEY, ENABLE_KEY};
+
 // MQTT Keys
 pub const MQTT_BROKER: &str = "broker";
 pub const MQTT_TOPIC: &str = "topic";
@@ -25,7 +27,7 @@ pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
 
 /// A list of all valid configuration keys for an MQTT target.
 pub const NOTIFY_MQTT_KEYS: &[&str] = &[
-    "enable", // "enable" is a common key
+    ENABLE_KEY, // "enable" is a common key
     MQTT_BROKER,
     MQTT_TOPIC,
     MQTT_QOS,
@@ -35,6 +37,7 @@ pub const NOTIFY_MQTT_KEYS: &[&str] = &[
     MQTT_KEEP_ALIVE_INTERVAL,
     MQTT_QUEUE_DIR,
     MQTT_QUEUE_LIMIT,
+    COMMENT_KEY,
 ];
 
 // MQTT Environment Variables

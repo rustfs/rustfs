@@ -27,7 +27,15 @@ pub const DEFAULT_TARGET: &str = "1";
 
 pub const NOTIFY_PREFIX: &str = "notify";
 
-pub const NOTIFY_ROUTE_PREFIX: &str = "notify_";
+pub const NOTIFY_ROUTE_PREFIX: &str = const_str::concat!(NOTIFY_PREFIX, "_");
+
+/// Standard config keys and values.
+pub const ENABLE_KEY: &str = "enable";
+pub const COMMENT_KEY: &str = "comment";
+
+/// Enable values
+pub const ENABLE_ON: &str = "on";
+pub const ENABLE_OFF: &str = "off";
 
 #[allow(dead_code)]
 pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS];
