@@ -15,3 +15,6 @@
 mod lock;
 mod node_interact_test;
 mod sql;
+mod http_api_test;
+mod storage_test;
+mod auth_integration_test;
