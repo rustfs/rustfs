@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #[cfg(test)]
-mod tests {
+mod kms_tests {
     use crate::config::{VaultAuthMethod, VaultConfig};
     use crate::manager::KmsClient;
     use crate::types::*;
@@ -29,7 +29,7 @@ mod tests {
         let token = std::env::var("VAULT_TOKEN").expect("VAULT_TOKEN environment variable must be set for testing");
 
         VaultConfig {
-            address: Url::parse("http://localhost:8200").unwrap(),
+            address: Url::parse("http://localhost:8200").expect("Valid URL should parse successfully"),
             auth_method: VaultAuthMethod::Token { token },
             namespace: None,
             mount_path: "transit".to_string(),
@@ -39,6 +39,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires a running Vault instance"]
     async fn test_vault_client_creation() {
         let config = create_test_vault_config();
         let result = VaultKmsClient::new(config).await;
@@ -55,6 +56,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires a running Vault instance"]
     async fn test_vault_key_operations() {
         let config = create_test_vault_config();
         let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
@@ -88,6 +90,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires a running Vault instance"]
     async fn test_vault_encrypt_decrypt() {
         let config = create_test_vault_config();
         let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
@@ -139,6 +142,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires a running Vault instance"]
     async fn test_vault_data_key_generation() {
         let config = create_test_vault_config();
         let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
@@ -172,7 +176,7 @@ mod tests {
         assert!(data_key.plaintext.is_some());
         assert!(!data_key.ciphertext.is_empty());
 
-        let plaintext_key = data_key.plaintext.unwrap();
+        let plaintext_key = data_key.plaintext.expect("Data key plaintext should be present");
         assert_eq!(plaintext_key.len(), 32); // AES_256 key length
 
         println!("✓ Data key generated successfully:");
@@ -182,6 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires a running Vault instance"]
     async fn test_vault_error_handling() {
         let config = create_test_vault_config();
         let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
@@ -196,7 +201,10 @@ mod tests {
 
         let result = client.decrypt(&decrypt_request, None).await;
         assert!(result.is_err(), "Expected error for invalid ciphertext format");
-        println!("✓ Error handling works: {}", result.unwrap_err());
+        println!(
+            "✓ Error handling works: {}",
+            result.expect_err("Expected error for invalid ciphertext format")
+        );
 
         // Test decryption with invalid ciphertext
         println!("Testing error handling with invalid ciphertext...");
@@ -208,10 +216,11 @@ mod tests {
 
         let result = client.decrypt(&decrypt_request, None).await;
         assert!(result.is_err(), "Expected error for invalid ciphertext");
-        println!("✓ Error handling works: {}", result.unwrap_err());
+        println!("✓ Error handling works: {}", result.expect_err("Expected error for invalid ciphertext"));
     }
 
     #[tokio::test]
+    #[ignore = "Requires a running Vault instance"]
     async fn test_vault_integration_full() {
         println!("\n=== Full Vault Integration Test ===");
 
@@ -242,7 +251,14 @@ mod tests {
             .generate_data_key(&generate_request, None)
             .await
             .expect("Failed to generate data key");
-        println!("   ✓ Data key generated, length: {} bytes", data_key.plaintext.as_ref().unwrap().len());
+        println!(
+            "   ✓ Data key generated, length: {} bytes",
+            data_key
+                .plaintext
+                .as_ref()
+                .expect("Data key plaintext should be present")
+                .len()
+        );
 
         // 3. Encrypt with master key
         println!("\n3. Encrypting with master key...");

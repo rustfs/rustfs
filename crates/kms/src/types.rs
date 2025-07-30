@@ -432,6 +432,8 @@ pub struct EncryptionMetadata {
     pub encrypted_at: chrono::DateTime<chrono::Utc>,
     /// Size of original data
     pub original_size: u64,
+    /// Encrypted data key
+    pub encrypted_data_key: Vec<u8>,
 }
 
 /// Result of encryption operation
@@ -456,4 +458,15 @@ pub struct DecryptionInput {
     pub encrypted_data_key: Vec<u8>,
     /// Expected encryption context (for validation)
     pub expected_context: Option<HashMap<String, String>>,
+}
+
+/// Health status information for KMS
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthStatus {
+    /// Whether the KMS backend is healthy
+    pub kms_healthy: bool,
+    /// Whether encryption/decryption operations are working
+    pub encryption_working: bool,
+    /// Backend type (e.g., "vault", "local")
+    pub backend_type: String,
 }

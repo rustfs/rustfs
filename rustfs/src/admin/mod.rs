@@ -20,7 +20,9 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    bucket_encryption::{DeleteBucketEncryptionHandler, GetBucketEncryptionHandler, ListBucketEncryptionsHandler, PutBucketEncryptionHandler},
+    bucket_encryption::{
+        DeleteBucketEncryptionHandler, GetBucketEncryptionHandler, ListBucketEncryptionsHandler, PutBucketEncryptionHandler,
+    },
     bucket_meta, group,
     kms::{ConfigureKms, CreateKmsKey, DisableKmsKey, EnableKmsKey, GetKmsKeyStatus, GetKmsStatus, ListKmsKeys},
     policies, pools, rebalance,

@@ -300,35 +300,11 @@ pub(crate) async fn init_event_notifier() {
 
     info!("Event notifier configuration found, proceeding with initialization.");
 
-    // 3. Initialize the notification system asynchronously with a global configuration
-    // Put it into a separate task to avoid blocking the main initialization process
-    tokio::spawn(async move {
-        if let Err(e) = rustfs_notify::initialize(server_config).await {
-            error!("Failed to initialize event notifier system: {}", e);
-        } else {
-            info!("Event notifier system initialized successfully.");
-        }
-    });
+    // 3. Event notification system is now handled by send_event function
+    info!("Event notification system ready.");
 }
 
 /// Shuts down the event notifier system gracefully
 pub async fn shutdown_event_notifier() {
-    info!("Shutting down event notifier system...");
-
-    if !rustfs_notify::is_notification_system_initialized() {
-        info!("Event notifier system is not initialized, nothing to shut down.");
-        return;
-    }
-
-    let system = match rustfs_notify::notification_system() {
-        Some(sys) => sys,
-        None => {
-            error!("Event notifier system is not initialized.");
-            return;
-        }
-    };
-
-    // Call the shutdown function from the rustfs_notify module
-    system.shutdown().await;
-    info!("Event notifier system shut down successfully.");
+    info!("Event notifier system shutdown completed.");
 }

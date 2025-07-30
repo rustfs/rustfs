@@ -47,6 +47,10 @@ chrono = { workspace = true, features = ["serde"] }
 zeroize = { version = "1.6", features = ["derive"] }
 secrecy = "0.8"
 bytes = "1.5"
+dashmap = "5.5"
+parking_lot = "0.12"
+num_cpus = "1.16"
+rayon.workspace = true
 
 vaultrs = { version = "0.7.4", optional = true }
 

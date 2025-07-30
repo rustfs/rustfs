@@ -20,13 +20,16 @@
 
 mod bucket_encryption;
 mod bucket_encryption_manager;
+mod cache;
 mod cipher;
 mod config;
 mod error;
 mod local_client;
 mod manager;
+mod monitoring;
 mod object_encryption;
 mod object_encryption_service;
+mod parallel;
 mod security;
 mod types;
 
@@ -165,6 +168,30 @@ pub async fn is_kms_healthy() -> bool {
     }
 }
 
+/// Get detailed health status of the global KMS manager
+///
+/// This function performs an enhanced health check that includes encryption
+/// capability testing and provides detailed status information.
+///
+/// # Returns
+///
+/// Returns `Some(HealthStatus)` if the KMS is initialized, `None` otherwise.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// if let Some(status) = rustfs_kms::get_kms_health_status().await {
+///     println!("KMS Health: {}, Encryption Working: {}",
+///              status.kms_healthy, status.encryption_working);
+/// }
+/// ```
+pub async fn get_kms_health_status() -> Option<HealthStatus> {
+    match get_global_kms() {
+        Some(kms) => kms.health_check_with_encryption_status().await.ok(),
+        None => None,
+    }
+}
+
 /// Shutdown the global KMS manager
 ///
 /// This function should be called during application shutdown to properly
@@ -189,20 +216,26 @@ mod vault_client;
 
 pub use bucket_encryption::{BucketEncryptionAlgorithm, BucketEncryptionConfig};
 pub use bucket_encryption_manager::BucketEncryptionManager;
+pub use cache::{CacheConfig, CacheStats, CachedBucketConfig, CachedDataKey, KmsCacheManager};
 pub use cipher::{AesGcmCipher, ChaCha20Poly1305Cipher, ObjectCipher, StreamingCipher};
 pub use config::{BackendConfig, KmsConfig, KmsType, LocalConfig, VaultAuthMethod, VaultConfig};
 pub use error::{KmsError, Result};
 pub use local_client::LocalKmsClient;
 pub use manager::KmsManager;
+pub use monitoring::{
+    AuditLogEntry, KmsMonitor, KmsOperation, MonitoringConfig, MonitoringReport, OperationMetrics, OperationStatus,
+    OperationTimer,
+};
 pub use object_encryption::{EncryptedObjectData, EncryptionAlgorithm, ObjectEncryptionConfig};
 pub use object_encryption_service::ObjectEncryptionService;
+pub use parallel::{AsyncIoOptimizer, ConnectionPool, ParallelConfig, ParallelProcessor, PooledConnection};
 pub use security::{SecretKey, SecretVec};
 
 // Global KMS functions are already defined in this module and exported automatically
 pub use types::{
     DataKey, DecryptRequest, DecryptionInput, EncryptRequest, EncryptResponse, EncryptedObjectMetadata, EncryptionMetadata,
-    EncryptionResult, GenerateKeyRequest, KeyInfo, KeyStatus, ListKeysRequest, ListKeysResponse, MasterKey, ObjectDataKeyRequest,
-    ObjectEncryptionContext, ObjectMetadataRequest,
+    EncryptionResult, GenerateKeyRequest, HealthStatus, KeyInfo, KeyStatus, ListKeysRequest, ListKeysResponse, MasterKey,
+    ObjectDataKeyRequest, ObjectEncryptionContext, ObjectMetadataRequest,
 };
 
 #[cfg(feature = "vault")]

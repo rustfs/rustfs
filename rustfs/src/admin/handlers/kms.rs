@@ -206,7 +206,7 @@ impl Operation for ConfigureKms {
                     KmsErrorResponse {
                         code: "InvalidRequest".to_string(),
                         message: "Failed to read request body".to_string(),
-                        description: format!("Error: {}", e),
+                        description: format!("Error: {e}"),
                     },
                 ));
             }
@@ -221,7 +221,7 @@ impl Operation for ConfigureKms {
                     KmsErrorResponse {
                         code: "InvalidRequest".to_string(),
                         message: "Invalid JSON format".to_string(),
-                        description: format!("Error: {}", err),
+                        description: format!("Error: {err}"),
                     },
                 ));
             }
@@ -267,7 +267,7 @@ impl Operation for ConfigureKms {
                 KmsConfig {
                     kms_type: KmsType::Vault,
                     default_key_id: None,
-                    backend_config: rustfs_kms::BackendConfig::Vault(rustfs_kms::VaultConfig {
+                    backend_config: rustfs_kms::BackendConfig::Vault(Box::new(rustfs_kms::VaultConfig {
                         address: match vault_address.parse() {
                             Ok(url) => url,
                             Err(e) => {
@@ -276,7 +276,7 @@ impl Operation for ConfigureKms {
                                     KmsErrorResponse {
                                         code: "InvalidConfiguration".to_string(),
                                         message: "Invalid vault address format".to_string(),
-                                        description: format!("Error parsing URL: {}", e),
+                                        description: format!("Error parsing URL: {e}"),
                                     },
                                 ));
                             }
@@ -286,7 +286,7 @@ impl Operation for ConfigureKms {
                         mount_path: config_request.vault_mount_path.unwrap_or_else(|| "transit".to_string()),
                         tls_config: None,
                         headers: std::collections::HashMap::new(),
-                    }),
+                    })),
                     timeout_secs: config_request.vault_timeout_seconds.unwrap_or(30),
                     retry_attempts: 3,
                     enable_audit: true,
@@ -336,7 +336,7 @@ impl Operation for ConfigureKms {
                         KmsErrorResponse {
                             code: "ConfigurationFailed".to_string(),
                             message: "Failed to configure global KMS".to_string(),
-                            description: format!("Error: {}", err),
+                            description: format!("Error: {err}"),
                         },
                     ))
                 }
@@ -348,7 +348,7 @@ impl Operation for ConfigureKms {
                     KmsErrorResponse {
                         code: "InvalidConfiguration".to_string(),
                         message: "Failed to create KMS manager".to_string(),
-                        description: format!("Error: {}", err),
+                        description: format!("Error: {err}"),
                     },
                 ))
             }

@@ -16,8 +16,8 @@
 
 use crate::error::{EncryptionError, EncryptionResult};
 use crate::security::SecretKey;
-use rustfs_crypto;
-use std::io::{Result as IoResult};
+use rustfs_crypto::{self, Aes256Gcm};
+use std::io::Result as IoResult;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -55,7 +55,9 @@ impl AesGcmCipher {
             });
         }
 
-        Ok(Self { key: SecretKey::from_slice(key) })
+        Ok(Self {
+            key: SecretKey::from_slice(key),
+        })
     }
 }
 
@@ -75,23 +77,14 @@ impl ObjectCipher for AesGcmCipher {
             });
         }
 
-        // Encrypt the data
-        let ciphertext = rustfs_crypto::encrypt_data(plaintext, self.key.expose_secret()).map_err(|e| EncryptionError::cipher_error(
-             "encrypt",
-             format!("Encryption failed: {:?}", e),
-         ))?;
+        // Create AES-256-GCM cipher
+        let cipher = Aes256Gcm::new(self.key.expose_secret())
+            .map_err(|e| EncryptionError::cipher_error("encrypt", format!("AES-GCM cipher creation failed: {e}")))?;
 
-        // For AEAD ciphers, the tag is typically appended to the ciphertext
-        // Here we assume the last 16 bytes are the authentication tag
-        let (encrypted_data, tag) = if ciphertext.len() >= 16 {
-            let split_point = ciphertext.len() - 16;
-            (ciphertext[..split_point].to_vec(), ciphertext[split_point..].to_vec())
-        } else {
-            return Err(EncryptionError::cipher_error(
-                 "encrypt",
-                 "Invalid ciphertext length",
-             ));
-        };
+        // Encrypt the data
+        let (encrypted_data, tag) = cipher
+            .encrypt(plaintext, iv)
+            .map_err(|e| EncryptionError::cipher_error("encrypt", format!("AES-GCM encryption failed: {e}")))?;
 
         Ok((encrypted_data, tag))
     }
@@ -104,15 +97,14 @@ impl ObjectCipher for AesGcmCipher {
             });
         }
 
-        // Combine ciphertext and tag for decryption
-        let mut combined = ciphertext.to_vec();
-        combined.extend_from_slice(tag);
+        // Create AES-256-GCM cipher
+        let cipher = Aes256Gcm::new(self.key.expose_secret())
+            .map_err(|e| EncryptionError::cipher_error("decrypt", format!("AES-GCM cipher creation failed: {e}")))?;
 
         // Decrypt the data
-        let plaintext = rustfs_crypto::decrypt_data(&combined, self.key.expose_secret()).map_err(|e| EncryptionError::cipher_error(
-             "decrypt",
-             format!("Decryption failed: {:?}", e),
-         ))?;
+        let plaintext = cipher
+            .decrypt(ciphertext, iv, tag)
+            .map_err(|e| EncryptionError::cipher_error("decrypt", format!("AES-GCM decryption failed: {e}")))?;
 
         Ok(plaintext)
     }
@@ -171,21 +163,17 @@ impl<R> AsyncRead for StreamingCipher<R>
 where
     R: AsyncRead + Unpin,
 {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<IoResult<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<IoResult<()>> {
         let this = self.get_mut();
-        
+
         // If we have encrypted data in buffer, return it first
         if this.buffer_pos < this.encrypted_buffer.len() {
             let remaining = this.encrypted_buffer.len() - this.buffer_pos;
             let to_copy = std::cmp::min(remaining, buf.remaining());
-            
+
             buf.put_slice(&this.encrypted_buffer[this.buffer_pos..this.buffer_pos + to_copy]);
             this.buffer_pos += to_copy;
-            
+
             return Poll::Ready(Ok(()));
         }
 
@@ -198,13 +186,13 @@ where
         this.buffer.clear();
         let chunk_size = this.chunk_size;
         this.buffer.resize(chunk_size, 0);
-        
+
         let mut read_buf = ReadBuf::new(&mut this.buffer);
-        
+
         match Pin::new(&mut this.reader).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let bytes_read = read_buf.filled().len();
-                
+
                 if bytes_read == 0 {
                     this.finished = true;
                     return Poll::Ready(Ok(()));
@@ -212,27 +200,22 @@ where
 
                 // Encrypt the chunk
                 this.buffer.truncate(bytes_read);
-                
+
                 match this.cipher.encrypt(&this.buffer, &this.iv, &[]) {
                     Ok((ciphertext, tag)) => {
                         this.encrypted_buffer.clear();
                         this.encrypted_buffer.extend_from_slice(&ciphertext);
                         this.encrypted_buffer.extend_from_slice(&tag);
                         this.buffer_pos = 0;
-                        
+
                         // Return encrypted data
                         let to_copy = std::cmp::min(this.encrypted_buffer.len(), buf.remaining());
                         buf.put_slice(&this.encrypted_buffer[..to_copy]);
                         this.buffer_pos = to_copy;
-                        
+
                         Poll::Ready(Ok(()))
                     }
-                    Err(_) => {
-                        Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Encryption failed",
-                        )))
-                    }
+                    Err(_) => Poll::Ready(Err(std::io::Error::other("Encryption failed"))),
                 }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -255,7 +238,9 @@ impl ChaCha20Poly1305Cipher {
                 actual: key.len(),
             });
         }
-        Ok(Self { key: SecretKey::from_slice(key) })
+        Ok(Self {
+            key: SecretKey::from_slice(key),
+        })
     }
 }
 
@@ -269,16 +254,10 @@ impl ObjectCipher for ChaCha20Poly1305Cipher {
         }
 
         let cipher = rustfs_crypto::ChaCha20Poly1305::new(self.key.expose_secret())
-             .map_err(|e| EncryptionError::cipher_error(
-                 "encrypt",
-                 format!("ChaCha20 cipher creation failed: {}", e),
-             ))?;
-         let (ciphertext, tag) = cipher
-             .encrypt(plaintext, iv)
-             .map_err(|e| EncryptionError::cipher_error(
-                 "encrypt",
-                 format!("ChaCha20 encryption failed: {}", e),
-             ))?;
+            .map_err(|e| EncryptionError::cipher_error("encrypt", format!("ChaCha20 cipher creation failed: {e}")))?;
+        let (ciphertext, tag) = cipher
+            .encrypt(plaintext, iv)
+            .map_err(|e| EncryptionError::cipher_error("encrypt", format!("ChaCha20 encryption failed: {e}")))?;
 
         Ok((ciphertext, tag))
     }
@@ -292,16 +271,10 @@ impl ObjectCipher for ChaCha20Poly1305Cipher {
         }
 
         let cipher = rustfs_crypto::ChaCha20Poly1305::new(self.key.expose_secret())
-             .map_err(|e| EncryptionError::cipher_error(
-                 "decrypt",
-                 format!("ChaCha20 cipher creation failed: {}", e),
-             ))?;
-         let plaintext = cipher
-             .decrypt(ciphertext, iv, tag)
-             .map_err(|e| EncryptionError::cipher_error(
-                 "decrypt",
-                 format!("ChaCha20 decryption failed: {}", e),
-             ))?;
+            .map_err(|e| EncryptionError::cipher_error("decrypt", format!("ChaCha20 cipher creation failed: {e}")))?;
+        let plaintext = cipher
+            .decrypt(ciphertext, iv, tag)
+            .map_err(|e| EncryptionError::cipher_error("decrypt", format!("ChaCha20 decryption failed: {e}")))?;
 
         Ok(plaintext)
     }
@@ -323,28 +296,32 @@ impl ObjectCipher for ChaCha20Poly1305Cipher {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_aes_gcm_cipher() {
-        let key = vec![0u8; 32]; // 256-bit key
-        let cipher = AesGcmCipher::new(&key).unwrap();
+    #[tokio::test]
+    async fn test_aes_gcm_cipher() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c, 0x2b, 0x7e, 0x15,
+            0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+        ]; // 256-bit key
+        let cipher = AesGcmCipher::new(&key).expect("Failed to create AES-GCM cipher");
+
         let plaintext = b"Hello, World!";
-        let iv = vec![0u8; 12];
+        let iv = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b]; // 96-bit IV for GCM
         let aad = b"additional data";
 
-        // Test encryption
-        let (ciphertext, tag) = cipher.encrypt(plaintext, &iv, aad).unwrap();
+        // Encrypt
+        let (ciphertext, tag) = cipher.encrypt(plaintext, &iv, aad).expect("Encryption failed");
         assert!(!ciphertext.is_empty());
-        assert_eq!(tag.len(), 16);
+        assert_eq!(tag.len(), 16); // GCM tag is 128 bits
 
-        // Test decryption
-        let decrypted = cipher.decrypt(&ciphertext, &iv, &tag, aad).unwrap();
+        // Decrypt
+        let decrypted = cipher.decrypt(&ciphertext, &iv, &tag, aad).expect("Decryption failed");
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_aes_gcm_cipher_properties() {
         let key = vec![0u8; 32];
-        let cipher = AesGcmCipher::new(&key).unwrap();
+        let cipher = AesGcmCipher::new(&key).expect("Failed to create AES-GCM cipher");
         assert_eq!(cipher.algorithm(), "AES-256-GCM");
         assert_eq!(cipher.key_size(), 32);
         assert_eq!(cipher.iv_size(), 12);
@@ -360,7 +337,7 @@ mod tests {
     #[test]
     fn test_chacha20_cipher_properties() {
         let key = vec![0u8; 32];
-        let cipher = ChaCha20Poly1305Cipher::new(&key).unwrap();
+        let cipher = ChaCha20Poly1305Cipher::new(&key).expect("Failed to create ChaCha20-Poly1305 cipher");
         assert_eq!(cipher.algorithm(), "ChaCha20-Poly1305");
         assert_eq!(cipher.key_size(), 32);
         assert_eq!(cipher.iv_size(), 12);
@@ -369,18 +346,18 @@ mod tests {
     #[test]
     fn test_chacha20_cipher() {
         let key = vec![0u8; 32]; // 256-bit key
-        let cipher = ChaCha20Poly1305Cipher::new(&key).unwrap();
+        let cipher = ChaCha20Poly1305Cipher::new(&key).expect("Failed to create ChaCha20-Poly1305 cipher");
         let plaintext = b"Hello, ChaCha20!";
         let nonce = vec![0u8; 12];
         let aad = b"additional data";
 
         // Test encryption
-        let (ciphertext, tag) = cipher.encrypt(plaintext, &nonce, aad).unwrap();
+        let (ciphertext, tag) = cipher.encrypt(plaintext, &nonce, aad).expect("Encryption failed");
         assert!(!ciphertext.is_empty());
         assert_eq!(tag.len(), 16);
 
         // Test decryption
-        let decrypted = cipher.decrypt(&ciphertext, &nonce, &tag, aad).unwrap();
+        let decrypted = cipher.decrypt(&ciphertext, &nonce, &tag, aad).expect("Decryption failed");
         assert_eq!(decrypted, plaintext);
     }
 
@@ -394,18 +371,21 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_cipher() {
         use tokio::io::AsyncReadExt;
-        
+
         let key = vec![0u8; 32];
-        let cipher = Box::new(AesGcmCipher::new(&key).unwrap()) as Box<dyn ObjectCipher>;
+        let cipher = Box::new(AesGcmCipher::new(&key).expect("Failed to create AES-GCM cipher")) as Box<dyn ObjectCipher>;
         let iv = vec![0u8; 12];
         let data = b"Hello, streaming encryption!";
-        
+
         let cursor = std::io::Cursor::new(data.to_vec());
         let mut streaming_cipher = StreamingCipher::new(cursor, cipher, iv).with_chunk_size(10);
-        
+
         let mut encrypted_data = Vec::new();
-        streaming_cipher.read_to_end(&mut encrypted_data).await.unwrap();
-        
+        streaming_cipher
+            .read_to_end(&mut encrypted_data)
+            .await
+            .expect("Failed to read encrypted data");
+
         // The encrypted data should be different from the original
         assert_ne!(encrypted_data, data);
         assert!(!encrypted_data.is_empty());
@@ -414,13 +394,13 @@ mod tests {
     #[test]
     fn test_streaming_cipher_creation() {
         let key = vec![0u8; 32];
-        let cipher = Box::new(AesGcmCipher::new(&key).unwrap()) as Box<dyn ObjectCipher>;
+        let cipher = Box::new(AesGcmCipher::new(&key).expect("Failed to create AES-GCM cipher")) as Box<dyn ObjectCipher>;
         let iv = vec![0u8; 12];
         let data = b"test data";
-        
+
         let cursor = std::io::Cursor::new(data.to_vec());
         let streaming_cipher = StreamingCipher::new(cursor, cipher, iv).with_chunk_size(1024);
-        
+
         // Just test that we can create the streaming cipher
         assert_eq!(streaming_cipher.chunk_size, 1024);
     }
