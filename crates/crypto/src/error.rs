@@ -38,4 +38,29 @@ pub enum Error {
 
     #[error("jwt err: {0}")]
     ErrJwt(#[from] jsonwebtoken::errors::Error),
+
+    // Object encryption specific errors
+    #[error("Invalid key length: expected {expected}, got {actual}")]
+    InvalidKeyLength { expected: usize, actual: usize },
+
+    #[error("Invalid nonce length: expected {expected}, got {actual}")]
+    InvalidNonceLength { expected: usize, actual: usize },
+
+    #[error("Invalid tag length: expected {expected}, got {actual}")]
+    InvalidTagLength { expected: usize, actual: usize },
+
+    #[error("Encryption failed: {0}")]
+    EncryptionFailed(String),
+
+    #[error("Decryption failed: {0}")]
+    DecryptionFailed(String),
+
+    #[error("Unsupported encryption algorithm: {0}")]
+    UnsupportedAlgorithm(String),
+
+    #[error("Invalid object metadata")]
+    InvalidObjectMetadata,
+
+    #[error("Key derivation failed: {0}")]
+    KeyDerivationFailed(String),
 }

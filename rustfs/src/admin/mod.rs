@@ -20,6 +20,7 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
+    bucket_encryption::{DeleteBucketEncryptionHandler, GetBucketEncryptionHandler, ListBucketEncryptionsHandler, PutBucketEncryptionHandler},
     GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
     event::{
         GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
@@ -225,6 +226,28 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
         AdminOperation(&ConfigureKms {}),
+    )?;
+
+    // Bucket encryption endpoints
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption").as_str(),
+        AdminOperation(&PutBucketEncryptionHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption").as_str(),
+        AdminOperation(&GetBucketEncryptionHandler {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption").as_str(),
+        AdminOperation(&DeleteBucketEncryptionHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryptions").as_str(),
+        AdminOperation(&ListBucketEncryptionsHandler {}),
     )?;
 
     r.insert(

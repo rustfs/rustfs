@@ -323,3 +323,137 @@ impl OperationContext {
         self
     }
 }
+
+/// Object encryption context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectEncryptionContext {
+    /// Bucket name
+    pub bucket: String,
+    /// Object key
+    pub object_key: String,
+    /// Content type
+    pub content_type: Option<String>,
+    /// Object size
+    pub size: Option<u64>,
+    /// Additional encryption context
+    pub encryption_context: HashMap<String, String>,
+}
+
+impl ObjectEncryptionContext {
+    /// Create a new object encryption context
+    pub fn new(bucket: String, object_key: String) -> Self {
+        Self {
+            bucket,
+            object_key,
+            content_type: None,
+            size: None,
+            encryption_context: HashMap::new(),
+        }
+    }
+
+    /// Set content type
+    pub fn with_content_type(mut self, content_type: String) -> Self {
+        self.content_type = Some(content_type);
+        self
+    }
+
+    /// Set object size
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    /// Add encryption context
+    pub fn with_encryption_context(mut self, key: String, value: String) -> Self {
+        self.encryption_context.insert(key, value);
+        self
+    }
+}
+
+/// Object data key request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectDataKeyRequest {
+    /// Master key ID
+    pub master_key_id: String,
+    /// Key specification (e.g., "AES_256")
+    pub key_spec: String,
+    /// Object encryption context
+    pub object_context: ObjectEncryptionContext,
+    /// Additional encryption context
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Object metadata encryption request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectMetadataRequest {
+    /// Master key ID
+    pub master_key_id: String,
+    /// Metadata to encrypt/decrypt
+    pub metadata: Vec<u8>,
+    /// Object encryption context
+    pub object_context: ObjectEncryptionContext,
+    /// Additional encryption context
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Encrypted object metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedObjectMetadata {
+    /// Encrypted metadata
+    pub ciphertext: Vec<u8>,
+    /// Key ID used for encryption
+    pub key_id: String,
+    /// Encryption algorithm
+    pub algorithm: String,
+    /// Initialization vector
+    pub iv: Vec<u8>,
+    /// Authentication tag
+    pub tag: Vec<u8>,
+    /// Encryption context
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Encryption metadata for objects
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionMetadata {
+    /// Encryption algorithm used
+    pub algorithm: String,
+    /// Key ID used for encryption
+    pub key_id: String,
+    /// Key version
+    pub key_version: u32,
+    /// Initialization vector
+    pub iv: Vec<u8>,
+    /// Authentication tag (for AEAD ciphers)
+    pub tag: Option<Vec<u8>>,
+    /// Encryption context
+    pub encryption_context: HashMap<String, String>,
+    /// Timestamp when encrypted
+    pub encrypted_at: chrono::DateTime<chrono::Utc>,
+    /// Size of original data
+    pub original_size: u64,
+}
+
+/// Result of encryption operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionResult {
+    /// Encrypted data
+    pub ciphertext: Vec<u8>,
+    /// Encryption metadata
+    pub metadata: EncryptionMetadata,
+    /// Data key used (encrypted)
+    pub encrypted_data_key: Vec<u8>,
+}
+
+/// Input for decryption operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecryptionInput {
+    /// Encrypted data
+    pub ciphertext: Vec<u8>,
+    /// Encryption metadata
+    pub metadata: EncryptionMetadata,
+    /// Encrypted data key
+    pub encrypted_data_key: Vec<u8>,
+    /// Expected encryption context (for validation)
+    pub expected_context: Option<HashMap<String, String>>,
+}

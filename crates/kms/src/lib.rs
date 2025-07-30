@@ -18,10 +18,13 @@
 //! This crate provides a Key Management Service (KMS) abstraction for RustFS,
 //! supporting multiple backend implementations including HashiCorp Vault through rusty_vault.
 
+mod bucket_encryption;
+mod cipher;
 mod config;
 mod error;
 mod local_client;
 mod manager;
+mod object_encryption;
 mod types;
 
 #[cfg(test)]
@@ -181,15 +184,19 @@ pub async fn shutdown_global_kms() {
 #[cfg(feature = "vault")]
 mod vault_client;
 
+pub use bucket_encryption::{BucketEncryptionAlgorithm, BucketEncryptionConfig, BucketEncryptionManager};
+pub use cipher::{AesGcmCipher, ChaCha20Poly1305Cipher, ObjectCipher};
 pub use config::{BackendConfig, KmsConfig, KmsType, LocalConfig, VaultAuthMethod, VaultConfig};
 pub use error::{KmsError, Result};
 pub use local_client::LocalKmsClient;
 pub use manager::KmsManager;
+pub use object_encryption::{EncryptedObjectData, EncryptionAlgorithm, ObjectEncryptionConfig, ObjectEncryptionService};
 
 // Global KMS functions are already defined in this module and exported automatically
 pub use types::{
-    DataKey, DecryptRequest, EncryptRequest, EncryptResponse, GenerateKeyRequest, KeyInfo, KeyStatus, ListKeysRequest,
-    ListKeysResponse, MasterKey,
+    DataKey, DecryptRequest, DecryptionInput, EncryptRequest, EncryptResponse, EncryptedObjectMetadata, EncryptionMetadata,
+    EncryptionResult, GenerateKeyRequest, KeyInfo, KeyStatus, ListKeysRequest, ListKeysResponse, MasterKey, ObjectDataKeyRequest,
+    ObjectEncryptionContext, ObjectMetadataRequest,
 };
 
 #[cfg(feature = "vault")]

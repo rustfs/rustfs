@@ -43,6 +43,7 @@ reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 rustfs-common.workspace = true
 rustfs-crypto.workspace = true
 rand.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 
 vaultrs = { version = "0.7.4", optional = true }
 
