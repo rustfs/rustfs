@@ -30,7 +30,7 @@ use crate::global::GLOBAL_MRFState;
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::heal::data_usage_cache::DataUsageCache;
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
-use crate::store_api::ObjectToDelete;
+use crate::store_api::{ObjectInfoOrErr, ObjectToDelete, WalkOptions};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
@@ -4479,6 +4479,17 @@ impl StorageAPI for SetDisks {
         _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: tokio::sync::broadcast::Receiver<bool>,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
         unimplemented!()
     }
 

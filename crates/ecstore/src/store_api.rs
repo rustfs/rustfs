@@ -870,6 +870,31 @@ pub struct ListObjectVersionsInfo {
     pub prefixes: Vec<String>,
 }
 
+type WalkFilter = fn(&FileInfo) -> bool;
+
+#[derive(Clone, Default)]
+pub struct WalkOptions {
+    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
+    pub marker: Option<String>,               // set to skip until this object
+    pub latest_only: bool,                    // returns only latest versions for all matching objects
+    pub ask_disks: String,                    // dictates how many disks are being listed
+    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
+    pub limit: usize,                         // maximum number of items, 0 means no limit
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum WalkVersionsSortOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug)]
+pub struct ObjectInfoOrErr {
+    pub item: Option<ObjectInfo>,
+    pub err: Option<Error>,
+}
+
 #[async_trait::async_trait]
 pub trait ObjectIO: Send + Sync + 'static {
     // GetObjectNInfo FIXME:
@@ -921,7 +946,15 @@ pub trait StorageAPI: ObjectIO {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo>;
-    // Walk TODO:
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: tokio::sync::broadcast::Receiver<bool>,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()>;
 
     // GetObjectNInfo ObjectIO
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;

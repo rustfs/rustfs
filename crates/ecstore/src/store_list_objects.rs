@@ -23,13 +23,15 @@ use crate::error::{
 };
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
-use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
+use crate::store_api::{
+    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions, WalkVersionsSortOrder,
+};
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
-    FileInfo, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
+    MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
@@ -695,7 +697,7 @@ impl ECStore {
     }
 
     #[allow(unused_assignments)]
-    pub async fn walk(
+    pub async fn walk_internal(
         self: Arc<Self>,
         rx: B_Receiver<bool>,
         bucket: &str,
@@ -934,31 +936,6 @@ impl ECStore {
 
         Ok(())
     }
-}
-
-type WalkFilter = fn(&FileInfo) -> bool;
-
-#[derive(Clone, Default)]
-pub struct WalkOptions {
-    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
-    pub marker: Option<String>,               // set to skip until this object
-    pub latest_only: bool,                    // returns only latest versions for all matching objects
-    pub ask_disks: String,                    // dictates how many disks are being listed
-    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
-    pub limit: usize,                         // maximum number of items, 0 means no limit
-}
-
-#[derive(Clone, Default, PartialEq, Eq)]
-pub enum WalkVersionsSortOrder {
-    #[default]
-    Ascending,
-    Descending,
-}
-
-#[derive(Debug)]
-pub struct ObjectInfoOrErr {
-    pub item: Option<ObjectInfo>,
-    pub err: Option<Error>,
 }
 
 async fn gather_results(

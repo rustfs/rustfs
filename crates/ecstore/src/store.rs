@@ -38,7 +38,7 @@ use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
-use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
+use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
@@ -1498,6 +1498,17 @@ impl StorageAPI for ECStore {
     ) -> Result<ListObjectVersionsInfo> {
         self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: tokio::sync::broadcast::Receiver<bool>,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 
     #[tracing::instrument(skip(self))]

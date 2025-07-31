@@ -35,3 +35,5 @@ pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 pub const AMZ_DECODED_CONTENT_LENGTH: &str = "X-Amz-Decoded-Content-Length";
 
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
+
+pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";

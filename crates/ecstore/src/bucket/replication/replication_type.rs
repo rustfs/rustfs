@@ -12,14 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::replication::replication_resyncer::MustReplicateOptions;
+use crate::bucket::replication::replication_resyncer::ReplicationConfig;
+use crate::bucket::replication::replication_resyncer::must_replicate;
+use crate::store_api::ObjectInfo;
+use crate::store_api::ObjectOptions;
+
 use super::datatypes::{StatusType, VersionPurgeStatusType};
 use regex::Regex;
+
+use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::RUSTFS_REPLICATION_RESET_STATUS;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 use time::OffsetDateTime;
+
+const REPLICATION_RESET: &str = "replication-reset";
 
 /// Type - replication type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -389,6 +400,65 @@ pub struct ResyncTargetDecision {
     pub reset_before_date: Option<OffsetDateTime>,
 }
 
+fn target_reset_header(arn: &str) -> String {
+    format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}-{arn}")
+}
+
+impl ResyncTargetDecision {
+    pub fn resync_target(
+        oi: &ObjectInfo,
+        arn: &str,
+        reset_id: &str,
+        reset_before_date: Option<OffsetDateTime>,
+        status: StatusType,
+    ) -> Self {
+        let rs = oi
+            .user_defined
+            .get(target_reset_header(arn).as_str())
+            .or(oi.user_defined.get(RUSTFS_REPLICATION_RESET_STATUS))
+            .map(|s| s.to_string());
+
+        let mut dec = Self::default();
+
+        let mod_time = oi.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+
+        if rs.is_none() {
+            let reset_before_date = reset_before_date.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            if !reset_id.is_empty() && mod_time < reset_before_date {
+                dec.replicate = true;
+                return dec;
+            }
+
+            dec.replicate = status == StatusType::Empty;
+
+            return dec;
+        }
+
+        if reset_id.is_empty() || reset_before_date.is_none() {
+            return dec;
+        }
+
+        let rs = rs.unwrap();
+        let reset_before_date = reset_before_date.unwrap();
+
+        let parts: Vec<&str> = rs.splitn(2, ';').collect();
+
+        if parts.len() != 2 {
+            return dec;
+        }
+
+        let new_reset = parts[0] == reset_id;
+
+        if !new_reset && status == StatusType::Completed {
+            return dec;
+        }
+
+        dec.replicate = new_reset && mod_time < reset_before_date;
+
+        dec
+    }
+}
+
 /// ResyncDecision is a struct representing a map with target's individual resync decisions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResyncDecision {
@@ -471,6 +541,77 @@ impl ReplicateObjectInfo {
             version_id: self.version_id.clone(),
             retry_count: self.retry_count as i32,
             size: self.size,
+        }
+    }
+
+    pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, r_cfg: &ReplicationConfig) -> Self {
+        let mut oi = oi.clone();
+        let mut user_defined = oi.user_defined.clone();
+
+        if let Some(rc) = r_cfg.config.as_ref()
+            && !rc.role.is_empty()
+        {
+            if !oi.replication_status.is_empty() {
+                oi.replication_status_internal = format!("{}={};", rc.role, oi.replication_status.as_str());
+            }
+
+            if !oi.replication_status.is_empty() {
+                oi.replication_status_internal = format!("{}={};", rc.role, oi.replication_status.as_str());
+            }
+
+            let keys_to_update: Vec<_> = user_defined
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}").as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            for (k, v) in keys_to_update {
+                user_defined.remove(&k);
+                user_defined.insert(target_reset_header(rc.role.as_str()), v);
+            }
+        }
+
+        if oi.delete_marker || !oi.replication_status.is_empty() {
+            todo!()
+        } else {
+            must_replicate(
+                oi.bucket.as_str(),
+                &oi.name,
+                MustReplicateOptions::new(
+                    &user_defined,
+                    oi.user_tags.clone(),
+                    StatusType::Empty,
+                    ReplicationType::Heal,
+                    ObjectOptions::default(),
+                ),
+            )
+            .await;
+        };
+
+        Self {
+            name: oi.name.clone(),
+            size: oi.size,
+            actual_size: oi.actual_size,
+            bucket: oi.bucket.clone(),
+            version_id: oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            etag: oi.etag.unwrap_or_default(),
+            mod_time: oi.mod_time,
+            replication_status: oi.replication_status,
+            replication_status_internal: oi.replication_status_internal.clone(),
+            delete_marker: oi.delete_marker,
+            version_purge_status_internal: oi.version_purge_status_internal.clone(),
+            version_purge_status: oi.version_purge_status,
+            replication_state: ReplicationState::default(),
+            op_type: ReplicationType::Heal,
+            dsc: ReplicateDecision::default(),
+            existing_obj_resync: ResyncDecision::default(),
+            target_statuses: HashMap::new(),
+            target_purge_statuses: HashMap::new(),
+            replication_timestamp: None,
+            ssec: false,
+            user_tags: HashMap::new(),
+            checksum: None,
+            retry_count: 0,
         }
     }
 }

@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
+use crate::store_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -454,6 +455,17 @@ impl StorageAPI for Sets {
         _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: tokio::sync::broadcast::Receiver<bool>,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
         unimplemented!()
     }
 

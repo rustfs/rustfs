@@ -793,7 +793,7 @@ impl ScannerItem {
         );
 
         // Create a mutable clone if you need to modify fields
-        let mut oi = oi.clone();
+        let oi = oi.clone();
 
         let versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
         if versioned {
@@ -816,7 +816,7 @@ impl ScannerItem {
         (false, oi.size)
     }
 
-    pub async fn heal_replication(&mut self, oi: &ObjectInfo, size_s: &mut SizeSummary) {
+    pub async fn heal_replication(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) {
         if oi.version_id.is_none() {
             error!(
                 "heal_replication: no version_id or replication config {} {} {}",

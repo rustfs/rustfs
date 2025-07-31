@@ -1,12 +1,14 @@
-use crate::bucket::bucket_target_sys::BucketTargetSys;
+use crate::bucket::bucket_target_sys::{BucketTargetSys, GLOBAL_BUCKET_TARGET_SYS};
 use crate::bucket::metadata_sys;
-use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _, ReplicationType, StatusType};
+use crate::bucket::replication::{
+    ObjectOpts, ReplicationConfigurationExt as _, ReplicationType, ResyncTargetDecision, StatusType, VersionPurgeStatusType,
+};
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
-use crate::store_api::ObjectInfo;
+use crate::store_api::{ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 use byteorder::ByteOrder;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING};
@@ -24,6 +26,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 use super::replication_type::{ReplicateDecision, ReplicateTargetDecision, ResyncDecision};
+use regex::Regex;
+
+// SSEC encryption header constants
+const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
+const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
+const SSEC_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
 
 const REPLICATION_DIR: &str = ".replication";
 const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -31,6 +39,7 @@ const RESYNC_META_FORMAT: u16 = 1;
 const RESYNC_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
+#[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
     pub bucket: String,
     pub arn: String,
@@ -259,9 +268,25 @@ impl ReplicationResyncer {
         }
     }
 
-    async fn resync_bucket<S: StorageAPI>(&mut self, cancel_token: CancellationToken, api: Arc<S>, heal: bool, opts: ResyncOpts) {
+    async fn resync_bucket_mark_status<S: StorageAPI>(&self, status: ResyncStatusType, opts: ResyncOpts, storage: Arc<S>) {
+        if let Err(err) = self.mark_status(status, opts.clone(), storage.clone()).await {
+            error!("Failed to mark resync status: {}", err);
+        }
+        if let Err(err) = self.worker_tx.send(()).await {
+            error!("Failed to send worker message: {}", err);
+        }
+        // TODO: Metrics
+    }
+
+    async fn resync_bucket<S: StorageAPI>(
+        &mut self,
+        mut cancel_token: tokio::sync::broadcast::Receiver<bool>,
+        storage: Arc<S>,
+        heal: bool,
+        opts: ResyncOpts,
+    ) {
         tokio::select! {
-            _ = cancel_token.cancelled() => {
+            _ = cancel_token.recv() => {
                 return;
             }
             _ = self.worker_rx.recv() => {}
@@ -271,6 +296,8 @@ impl ReplicationResyncer {
             Ok(cfg) => cfg,
             Err(err) => {
                 error!("Failed to get replication config: {}", err);
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                    .await;
                 return;
             }
         };
@@ -279,9 +306,119 @@ impl ReplicationResyncer {
             Ok(targets) => targets,
             Err(err) => {
                 warn!("Failed to list bucket targets: {}", err);
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                    .await;
                 return;
             }
         };
+
+        let _r_cfg = ReplicationConfig::new(cfg.clone(), Some(targets));
+
+        let target_arns = if let Some(cfg) = cfg {
+            cfg.filter_target_arns(&ObjectOpts {
+                op_type: ReplicationType::Resync,
+                target_arn: opts.arn.clone(),
+                ..Default::default()
+            })
+        } else {
+            vec![]
+        };
+
+        if target_arns.len() != 1 {
+            error!(
+                "replication resync failed for {} - arn specified {} is missing in the replication config",
+                opts.bucket, opts.arn
+            );
+            self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                .await;
+            return;
+        }
+
+        let Some(_target_client) = BucketTargetSys::get()
+            .get_remote_target_client(&opts.bucket, &target_arns[0])
+            .await
+        else {
+            error!(
+                "replication resync failed for {} - arn specified {} is missing in the bucket targets",
+                opts.bucket, opts.arn
+            );
+            self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                .await;
+            return;
+        };
+
+        if !heal {
+            if let Err(e) = self
+                .mark_status(ResyncStatusType::ResyncStarted, opts.clone(), storage.clone())
+                .await
+            {
+                error!("Failed to mark resync status: {}", e);
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+        if let Err(err) = storage
+            .clone()
+            .walk(cancel_token.resubscribe(), &opts.bucket, "", tx.clone(), WalkOptions::default())
+            .await
+        {
+            error!("Failed to walk bucket {}: {}", opts.bucket, err);
+            self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                .await;
+            return;
+        }
+
+        let status = {
+            self.status_map
+                .read()
+                .await
+                .get(&opts.bucket)
+                .and_then(|status| status.targets_map.get(&opts.arn))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let mut last_checkpoint = if status.resync_status == ResyncStatusType::ResyncStarted
+            || status.resync_status == ResyncStatusType::ResyncFailed
+        {
+            Some(status.object)
+        } else {
+            None
+        };
+
+        while let Some(res) = rx.recv().await {
+            if let Some(err) = res.err {
+                error!("Failed to get object info: {}", err);
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                    .await;
+                return;
+            }
+
+            if self.resync_cancel_rx.try_recv().is_ok() {
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
+                    .await;
+                return;
+            }
+
+            if cancel_token.try_recv().is_ok() {
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                    .await;
+                return;
+            }
+
+            let Some(object) = res.item else {
+                continue;
+            };
+
+            if heal
+                && let Some(checkpoint) = &last_checkpoint
+                && &object.name != checkpoint
+            {
+                continue;
+            }
+            last_checkpoint = None;
+        }
 
         todo!()
     }
@@ -321,17 +458,15 @@ async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfig
     Ok(config)
 }
 
-struct ReplicationConfig {
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationConfig {
     pub config: Option<ReplicationConfiguration>,
     pub remotes: Option<BucketTargets>,
 }
 
 impl ReplicationConfig {
-    pub fn new() -> Self {
-        Self {
-            config: None,
-            remotes: None,
-        }
+    pub fn new(config: Option<ReplicationConfiguration>, remotes: Option<BucketTargets>) -> Self {
+        Self { config, remotes }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -342,10 +477,12 @@ impl ReplicationConfig {
         self.config.as_ref().is_some_and(|config| config.replicate(obj))
     }
 
-    pub fn resync(&self, oi: ObjectInfo, dsc: &mut ReplicateDecision, status: HashMap<String, StatusType>) -> ResyncDecision {
+    pub async fn resync(&self, oi: ObjectInfo, dsc: ReplicateDecision, status: &HashMap<String, StatusType>) -> ResyncDecision {
         if self.is_empty() {
             return ResyncDecision::default();
         }
+
+        let mut dsc = dsc;
 
         if oi.delete_marker {
             let opts = ObjectOpts {
@@ -379,26 +516,55 @@ impl ReplicationConfig {
         let mut user_defined = oi.user_defined.clone();
         user_defined.remove(AMZ_BUCKET_REPLICATION_STATUS);
 
-        let mut opts = ObjectOpts {
-            name: oi.name.clone(),
-            version_id: oi.version_id,
-            ..Default::default()
-        };
+        let dsc = must_replicate(
+            oi.bucket.as_str(),
+            &oi.name,
+            MustReplicateOptions::new(
+                &user_defined,
+                oi.user_tags.clone(),
+                StatusType::Empty,
+                ReplicationType::ExistingObject,
+                ObjectOptions::default(),
+            ),
+        )
+        .await;
 
-        todo!()
+        self.resync_internal(oi, dsc, status)
     }
 
-    fn resync_internal(
-        &self,
-        oi: ObjectInfo,
-        dsc: &mut ReplicateDecision,
-        status: HashMap<String, StatusType>,
-    ) -> ResyncDecision {
-        todo!()
+    fn resync_internal(&self, oi: ObjectInfo, dsc: ReplicateDecision, status: &HashMap<String, StatusType>) -> ResyncDecision {
+        let Some(remotes) = self.remotes.as_ref() else {
+            return ResyncDecision::default();
+        };
+
+        if remotes.is_empty() {
+            return ResyncDecision::default();
+        }
+
+        let mut resync_decision = ResyncDecision::default();
+
+        for target in remotes.targets.iter() {
+            if let Some(decision) = dsc.targets_map.get(&target.arn)
+                && decision.replicate
+            {
+                resync_decision.targets.insert(
+                    decision.arn.clone(),
+                    ResyncTargetDecision::resync_target(
+                        &oi,
+                        &target.arn,
+                        &target.reset_id,
+                        target.reset_before_date,
+                        status.get(&decision.arn).unwrap_or(&StatusType::Empty).clone(),
+                    ),
+                );
+            }
+        }
+
+        resync_decision
     }
 }
 
-struct MustReplicateOptions {
+pub struct MustReplicateOptions {
     meta: HashMap<String, String>,
     status: StatusType,
     op_type: ReplicationType,
@@ -406,6 +572,30 @@ struct MustReplicateOptions {
 }
 
 impl MustReplicateOptions {
+    pub fn new(
+        meta: &HashMap<String, String>,
+        user_tags: String,
+        status: StatusType,
+        op_type: ReplicationType,
+        opts: ObjectOptions,
+    ) -> Self {
+        let mut meta = meta.clone();
+        if !user_tags.is_empty() {
+            meta.insert(AMZ_OBJECT_TAGGING.to_string(), user_tags);
+        }
+
+        Self {
+            meta,
+            status,
+            op_type,
+            replication_request: opts.replication_request,
+        }
+    }
+
+    pub fn from_object_info(oi: &ObjectInfo, op_type: ReplicationType, opts: ObjectOptions) -> Self {
+        Self::new(&oi.user_defined, oi.user_tags.clone(), oi.replication_status.clone(), op_type, opts)
+    }
+
     pub fn replication_status(&self) -> StatusType {
         if let Some(rs) = self.meta.get(AMZ_BUCKET_REPLICATION_STATUS) {
             return StatusType::from(rs.as_str());
@@ -414,18 +604,153 @@ impl MustReplicateOptions {
     }
 
     pub fn is_existing_object_replication(&self) -> bool {
-        self.op_type == ReplicationType::ExistingObjectReplication
+        self.op_type == ReplicationType::ExistingObject
     }
 
     pub fn is_metadata_replication(&self) -> bool {
-        self.op_type == ReplicationType::MetadataReplication
+        self.op_type == ReplicationType::Metadata
     }
 }
 
-async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
-    let Some(store) = new_object_layer_fn() else {
-        return ReplicateDecision::default();
+// pub async fn check_replicate_delete(
+//     bucket: &str,
+//     dobj: ObjectToDelete,
+//     oi: &ObjectInfo,
+//     del_opts: ObjectOptions,
+//     err: Option<String>,
+// ) -> ReplicateDecision {
+//     if oi.delete_marker {
+//         todo!()
+//     }
+// }
+
+/// Returns whether object version is a delete marker and if object qualifies for replication
+pub async fn check_replicate_delete(
+    bucket: &str,
+    dobj: &ObjectToDelete,
+    oi: &ObjectInfo,
+    del_opts: &ObjectOptions,
+    gerr: Option<&Error>,
+) -> ReplicateDecision {
+    let rcfg = match get_replication_config(bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            warn!("No replication config found for bucket: {}", bucket);
+            return ReplicateDecision::default();
+        }
+        Err(err) => {
+            error!("Failed to get replication config for bucket {}: {}", bucket, err);
+            return ReplicateDecision::default();
+        }
     };
+
+    // If incoming request is a replication request, it does not need to be re-replicated.
+    if del_opts.replication_request {
+        return ReplicateDecision::default();
+    }
+
+    // Skip replication if this object's prefix is excluded from being versioned.
+    if !del_opts.versioned {
+        return ReplicateDecision::default();
+    }
+
+    let opts = ObjectOpts {
+        name: dobj.object_name.clone(),
+        ssec: is_ssec_encrypted(&oi.user_defined),
+        user_tags: oi.user_tags.clone(),
+        delete_marker: oi.delete_marker,
+        version_id: dobj.version_id,
+        op_type: ReplicationType::Delete,
+        ..Default::default()
+    };
+
+    let tgt_arns = rcfg.filter_target_arns(&opts);
+    let mut dsc = ReplicateDecision::new();
+
+    if tgt_arns.is_empty() {
+        return dsc;
+    }
+
+    for tgt_arn in tgt_arns {
+        let mut opts = opts.clone();
+        opts.target_arn = tgt_arn.clone();
+        let replicate = rcfg.replicate(&opts);
+        let sync = false; // Default sync value
+
+        // When incoming delete is removal of a delete marker (a.k.a versioned delete),
+        // GetObjectInfo returns extra information even though it returns errFileNotFound
+        if let Some(_gerr) = gerr {
+            let valid_repl_status = matches!(
+                oi.target_replication_status(&tgt_arn),
+                StatusType::Pending | StatusType::Completed | StatusType::Failed
+            );
+
+            if oi.delete_marker && (valid_repl_status || replicate) {
+                dsc.set(ReplicateTargetDecision::new(tgt_arn, replicate, sync));
+                continue;
+            }
+
+            // Can be the case that other cluster is down and duplicate `mc rm --vid`
+            // is issued - this still needs to be replicated back to the other target
+            if oi.version_purge_status != VersionPurgeStatusType::default() {
+                let replicate = oi.version_purge_status == VersionPurgeStatusType::Pending
+                    || oi.version_purge_status == VersionPurgeStatusType::Failed;
+                dsc.set(ReplicateTargetDecision::new(tgt_arn, replicate, sync));
+            }
+            continue;
+        }
+
+        let tgt = GLOBAL_BUCKET_TARGET_SYS
+            .get()
+            .expect("GLOBAL_BUCKET_TARGET_SYS not initialized")
+            .get_remote_target_client(bucket, &tgt_arn)
+            .await;
+        // The target online status should not be used here while deciding
+        // whether to replicate deletes as the target could be temporarily down
+        let tgt_dsc = if let Some(tgt) = tgt {
+            ReplicateTargetDecision::new(tgt_arn, replicate, tgt.replicate_sync)
+        } else {
+            ReplicateTargetDecision::new(tgt_arn, false, false)
+        };
+        dsc.set(tgt_dsc);
+    }
+
+    dsc
+}
+
+/// Check if the user-defined metadata contains SSEC encryption headers
+fn is_ssec_encrypted(user_defined: &std::collections::HashMap<String, String>) -> bool {
+    user_defined.contains_key(SSEC_ALGORITHM_HEADER)
+        || user_defined.contains_key(SSEC_KEY_HEADER)
+        || user_defined.contains_key(SSEC_KEY_MD5_HEADER)
+}
+
+/// Extension trait for ObjectInfo to add replication-related methods
+trait ObjectInfoExt {
+    fn target_replication_status(&self, arn: &str) -> StatusType;
+}
+
+impl ObjectInfoExt for ObjectInfo {
+    /// Returns replication status of a target
+    fn target_replication_status(&self, arn: &str) -> StatusType {
+        lazy_static::lazy_static! {
+            static ref REPL_STATUS_REGEX: Regex = Regex::new(r"([^=].*?)=([^,].*?);").unwrap();
+        }
+
+        let captures = REPL_STATUS_REGEX.captures_iter(&self.replication_status_internal);
+        for cap in captures {
+            if cap.len() == 3 && &cap[1] == arn {
+                return StatusType::from(&cap[2]);
+            }
+        }
+        StatusType::default()
+    }
+}
+
+pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
+    if new_object_layer_fn().is_none() {
+        return ReplicateDecision::default();
+    }
 
     if !BucketVersioningSys::prefix_enabled(bucket, object).await {
         return ReplicateDecision::default();
@@ -469,9 +794,19 @@ async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions)
         return ReplicateDecision::default();
     }
 
+    let mut dsc = ReplicateDecision::default();
+
     for arn in arns {
-        BucketTargetSys::get().get_remote_target_client(&arn).await.map(|target| {
+        let cli = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await;
+
+        let mut sopts = opts.clone();
+        sopts.target_arn = arn.clone();
+
+        let replicate = cfg.replicate(&sopts);
+        let synchronous = if let Some(cli) = cli { cli.replicate_sync } else { false };
+
+        dsc.set(ReplicateTargetDecision::new(arn, replicate, synchronous));
     }
 
-    todo!()
+    dsc
 }

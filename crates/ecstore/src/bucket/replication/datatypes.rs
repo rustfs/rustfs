@@ -44,6 +44,9 @@ impl StatusType {
             StatusType::Empty => "",
         }
     }
+    pub fn is_empty(&self) -> bool {
+        matches!(self, StatusType::Empty)
+    }
 }
 
 impl fmt::Display for StatusType {

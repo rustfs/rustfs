@@ -107,7 +107,7 @@ pub struct BucketTarget {
     pub disable_proxy: bool,
 
     #[serde(rename = "resetBeforeDate")]
-    pub reset_before_date: String,
+    pub reset_before_date: Option<OffsetDateTime>,
     pub reset_id: String,
     #[serde(rename = "totalDowntime")]
     pub total_downtime: Duration,

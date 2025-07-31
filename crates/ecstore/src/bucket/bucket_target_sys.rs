@@ -27,6 +27,8 @@ use tracing::error;
 use url::Url;
 
 use crate::bucket::metadata::BucketMetadata;
+
+use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
@@ -175,6 +177,7 @@ pub struct BucketTargetSys {
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     pub hc_client: Arc<HttpClient>,
     pub a_mutex: Arc<Mutex<HashMap<String, ArnErrs>>>,
+    pub arn_errs_map: Arc<RwLock<HashMap<String, ArnErrs>>>,
 }
 
 impl BucketTargetSys {
@@ -189,6 +192,7 @@ impl BucketTargetSys {
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             hc_client: Arc::new(HttpClient::new()),
             a_mutex: Arc::new(Mutex::new(HashMap::new())),
+            arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -412,21 +416,74 @@ impl BucketTargetSys {
         Ok(())
     }
 
-    pub fn get_remote_target_client(&self, target: &BucketTarget) -> Result<TargetClient, BucketTargetError> {
-        todo!()
-        // Ok(TargetClient {
-        //     endpoint: target.endpoint.clone(),
-        //     credentials: target.credentials.clone(),
-        //     bucket: target.target_bucket.clone(),
-        //     storage_class: target.storage_class.clone(),
-        //     disable_proxy: target.disable_proxy,
-        //     arn: target.arn.clone(),
-        //     reset_id: target.reset_id.clone(),
-        //     secure: target.secure,
-        //     health_check_duration: target.health_check_duration,
-        //     replicate_sync: target.replication_sync,
-        //     client: HttpClient::new(), // TODO: use a s3 client
-        // })
+    pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
+        let mut arn_errs = self.arn_errs_map.write().await;
+        arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
+            bucket: bucket.to_string(),
+            update_in_progress: true,
+            count: 1,
+        });
+    }
+
+    pub async fn mark_refresh_done(&self, bucket: &str, arn: &str) {
+        let mut arn_errs = self.arn_errs_map.write().await;
+        arn_errs.get_mut(arn).map(|err| {
+            err.update_in_progress = false;
+            err.bucket = bucket.to_string();
+        });
+    }
+
+    pub async fn is_reloading_target(&self, _bucket: &str, arn: &str) -> bool {
+        let arn_errs = self.arn_errs_map.read().await;
+        arn_errs.get(arn).map(|err| err.update_in_progress).unwrap_or(false)
+    }
+
+    pub async fn inc_arn_errs(&self, _bucket: &str, arn: &str) {
+        let mut arn_errs = self.arn_errs_map.write().await;
+        arn_errs.get_mut(arn).map(|err| {
+            err.count += 1;
+        });
+    }
+
+    pub async fn get_remote_target_client(&self, bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
+        let (cli, last_refresh) = {
+            self.arn_remotes_map
+                .read()
+                .await
+                .get(arn)
+                .map(|target| (target.client.clone(), Some(target.last_refresh)))
+                .unwrap_or((None, None))
+        };
+
+        if let Some(cli) = cli {
+            return Some(cli.clone());
+        }
+
+        // TODO: spawn a task to reload the target
+        if self.is_reloading_target(bucket, arn).await {
+            return None;
+        }
+
+        if let Some(last_refresh) = last_refresh {
+            let now = OffsetDateTime::now_utc();
+            if now - last_refresh > Duration::from_secs(60 * 5) {
+                return None;
+            }
+        }
+
+        match get_bucket_targets_config(bucket).await {
+            Ok(bucket_targets) => {
+                self.mark_refresh_in_progress(bucket, arn).await;
+                self.update_all_targets(bucket, Some(&bucket_targets)).await;
+                self.mark_refresh_done(bucket, arn).await;
+            }
+            Err(e) => {
+                error!("get bucket targets config error:{}", e);
+            }
+        };
+
+        self.inc_arn_errs(bucket, arn).await;
+        None
     }
 
     pub fn get_remote_target_client_internal(&self, target: &BucketTarget) -> Result<TargetClient, BucketTargetError> {
