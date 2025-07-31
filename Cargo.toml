@@ -17,6 +17,7 @@ members = [
     "rustfs", # Core file system implementation
     "cli/rustfs-gui", # Graphical user interface client
     "crates/appauth", # Application authentication and authorization
+    "crates/audit-logger", # Audit logging system for file operations
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
     "crates/crypto", # Cryptography and security features
@@ -37,7 +38,7 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
-    "crates/ahm",
+    "crates/ahm", # Asynchronous Hash Map for concurrent data structures
     "crates/mcp", # MCP server for S3 operations
 ]
 resolver = "2"
@@ -59,15 +60,11 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = "warn"
 
-[patch.crates-io]
-rustfs-utils = { path = "crates/utils" }
-rustfs-filemeta = { path = "crates/filemeta" }
-rustfs-rio = { path = "crates/rio" }
-
 [workspace.dependencies]
 rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
+rustfs-audit-logger = { path = "crates/audit-logger", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
