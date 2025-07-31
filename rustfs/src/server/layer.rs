@@ -116,7 +116,9 @@ mod tests {
             Box::pin(async {
                 Ok(Response::builder()
                     .status(StatusCode::OK)
-                    .body(HybridBody::Rest { rest_body: "test".to_string() })
+                    .body(HybridBody::Rest {
+                        rest_body: "test".to_string(),
+                    })
                     .unwrap())
             })
         }
@@ -129,37 +131,35 @@ mod tests {
     fn test_redirect_layer_creation() {
         let layer = RedirectLayer;
         let mock_service = MockService;
-        
+
         let _service = layer.layer(mock_service);
-        
+
         // Just verify the service is created successfully
         assert!(true);
     }
 
     #[test]
     fn test_redirect_service_creation() {
-        let _service = RedirectService {
-            inner: MockService,
-        };
-        
+        let _service = RedirectService { inner: MockService };
+
         // Test that the service can be created
         assert!(true);
     }
 
     // Testing redirect logic without full HTTP setup
     // Full integration tests would require proper hyper setup
-    
+
     #[test]
     fn test_redirect_logic_conditions() {
         // Test the redirect condition logic without full HTTP setup
-        
+
         // Test path trimming logic
         let path1 = "/".trim_end_matches('/');
         let path2 = "/rustfs/".trim_end_matches('/');
         let path3 = "/index.html".trim_end_matches('/');
-        
+
         assert!(path1.is_empty() || path1 == "/rustfs" || path1 == "/index.html");
-        assert!(path2.is_empty() || path2 == "/rustfs" || path2 == "/index.html");  
+        assert!(path2.is_empty() || path2 == "/rustfs" || path2 == "/index.html");
         assert!(path3.is_empty() || path3 == "/rustfs" || path3 == "/index.html");
     }
 
@@ -169,7 +169,7 @@ mod tests {
         let mozilla_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
         let curl_ua = "curl/7.68.0";
         let safari_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
-        
+
         assert!(mozilla_ua.contains("Mozilla"));
         assert!(!curl_ua.contains("Mozilla"));
         assert!(safari_ua.contains("Mozilla"));
@@ -180,20 +180,22 @@ mod tests {
         // Test which paths should trigger redirects
         let valid_paths = ["", "/rustfs", "/index.html"];
         let invalid_paths = ["/api/v1/buckets", "/rustfs/admin", "/other"];
-        
+
         for path in valid_paths {
             let trimmed = path.trim_end_matches('/');
             assert!(
                 trimmed.is_empty() || trimmed == "/rustfs" || trimmed == "/index.html",
-                "Path {} should trigger redirect", path
+                "Path {} should trigger redirect",
+                path
             );
         }
-        
+
         for path in invalid_paths {
             let trimmed = path.trim_end_matches('/');
             assert!(
                 !(trimmed.is_empty() || trimmed == "/rustfs" || trimmed == "/index.html"),
-                "Path {} should not trigger redirect", path
+                "Path {} should not trigger redirect",
+                path
             );
         }
     }

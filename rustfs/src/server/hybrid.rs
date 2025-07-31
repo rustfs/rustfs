@@ -234,9 +234,9 @@ mod tests {
     fn test_hybrid_service_creation() {
         let rest_service = MockRestService;
         let grpc_service = MockGrpcService;
-        
+
         let _hybrid_service = hybrid(rest_service, grpc_service);
-        
+
         // Test that the hybrid service can be created
         assert!(true);
     }
@@ -247,7 +247,7 @@ mod tests {
             rest: MockRestService,
             grpc: MockGrpcService,
         };
-        
+
         // Test that the hybrid service can be created directly
         assert!(true);
     }
@@ -255,11 +255,11 @@ mod tests {
     #[test]
     fn test_hybrid_body_rest_default() {
         let body: HybridBody<String, Vec<u8>> = HybridBody::default();
-        
+
         match body {
             HybridBody::Rest { rest_body } => {
                 assert_eq!(rest_body, String::default());
-            },
+            }
             HybridBody::Grpc { .. } => {
                 panic!("Default should create Rest variant");
             }
@@ -272,11 +272,11 @@ mod tests {
         let rest_body: HybridBody<String, Vec<u8>> = HybridBody::Rest {
             rest_body: "test rest".to_string(),
         };
-        
+
         match rest_body {
             HybridBody::Rest { rest_body } => {
                 assert_eq!(rest_body, "test rest");
-            },
+            }
             _ => panic!("Should be Rest variant"),
         }
 
@@ -284,11 +284,11 @@ mod tests {
         let grpc_body: HybridBody<String, Vec<u8>> = HybridBody::Grpc {
             grpc_body: b"test grpc".to_vec(),
         };
-        
+
         match grpc_body {
             HybridBody::Grpc { grpc_body } => {
                 assert_eq!(grpc_body, b"test grpc".to_vec());
-            },
+            }
             _ => panic!("Should be Grpc variant"),
         }
     }
@@ -300,7 +300,7 @@ mod tests {
         let grpc_content_type_with_encoding = "application/grpc+proto";
         let json_content_type = "application/json";
         let form_content_type = "application/x-www-form-urlencoded";
-        
+
         // The actual implementation would check for "application/grpc" prefix
         assert!(grpc_content_type.starts_with("application/grpc"));
         assert!(grpc_content_type_with_encoding.starts_with("application/grpc"));
@@ -315,7 +315,7 @@ mod tests {
         let post_method = Method::POST;
         let put_method = Method::PUT;
         let delete_method = Method::DELETE;
-        
+
         // gRPC typically uses POST
         assert_eq!(post_method, Method::POST);
         // REST can use various methods
@@ -326,7 +326,7 @@ mod tests {
     // Note: Testing the actual Service implementation would require complex setup
     // with proper HTTP requests and async runtime. The hybrid service routes
     // requests to either REST or gRPC services based on content-type headers.
-    // 
+    //
     // For full integration testing, consider:
     // 1. Setting up test HTTP clients
     // 2. Creating proper Request<Incoming> instances
