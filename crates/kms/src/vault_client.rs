@@ -117,11 +117,19 @@ impl VaultKmsClient {
             .await
             .map_err(|e| KmsError::internal_error(format!("Failed to encrypt data: {e}")))?;
 
+        // Format ciphertext with key_id prefix to match encrypt() method format
+        let key_id_bytes = key_name.as_bytes();
+        let key_id_len = key_id_bytes.len() as u32;
+        let mut final_ciphertext = Vec::new();
+        final_ciphertext.extend_from_slice(&key_id_len.to_be_bytes());
+        final_ciphertext.extend_from_slice(key_id_bytes);
+        final_ciphertext.extend_from_slice(&response.ciphertext.into_bytes());
+
         Ok(DataKey {
             key_id: key_name.to_string(),
             version: 1,
             plaintext: Some(data_key),
-            ciphertext: response.ciphertext.into_bytes(),
+            ciphertext: final_ciphertext,
             metadata: HashMap::new(),
             created_at: SystemTime::now(),
         })

@@ -103,6 +103,7 @@ use s3s::S3Result;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::{S3Request, S3Response};
+use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -173,21 +174,19 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 #[derive(Clone)]
 pub struct FS {
     // pub store: ECStore,
-    encryption_service: Option<Arc<ObjectEncryptionService>>,
-    bucket_encryption_manager: Option<Arc<BucketEncryptionManager>>,
 }
 
 impl FS {
     pub fn new() -> Self {
-        // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
-        Self {
-            encryption_service: None,
-            bucket_encryption_manager: None,
-        }
+        Self {}
     }
 
-    pub fn bucket_encryption_manager(&self) -> Option<&Arc<BucketEncryptionManager>> {
-        self.bucket_encryption_manager.as_ref()
+    pub fn bucket_encryption_manager(&self) -> Option<Arc<BucketEncryptionManager>> {
+        rustfs_kms::get_global_bucket_encryption_manager()
+    }
+
+    pub fn encryption_service(&self) -> Option<Arc<ObjectEncryptionService>> {
+        rustfs_kms::get_global_encryption_service()
     }
 
     async fn put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
@@ -483,32 +482,32 @@ impl S3 for FS {
 
         // Check if source object is encrypted and decrypt if necessary
         if let Some(sse_algorithm) = src_info.user_defined.get("x-amz-server-side-encryption") {
-            if let Some(_encryption_service) = &self.encryption_service {
-                let kms_key_id = src_info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id");
-                let encryption_context = src_info.user_defined.get("x-amz-server-side-encryption-context");
+            let encryption_service = self.encryption_service()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+            let kms_key_id = src_info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id");
+            let encryption_context = src_info.user_defined.get("x-amz-server-side-encryption-context");
 
-                // Decrypt the source object
-                match _encryption_service
-                    .decrypt_object(
-                        &src_bucket,
-                        &src_key,
-                        final_reader,
-                        sse_algorithm,
-                        kms_key_id.map(|s| s.as_str()),
-                        encryption_context.cloned(),
-                        src_info.user_defined.clone(),
-                    )
-                    .await
-                {
-                    Ok(decrypted_reader) => {
-                        final_reader = Box::new(WarpReader::new(decrypted_reader));
-                    }
-                    Err(e) => {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!("Failed to decrypt source object: {e}"),
-                        ));
-                    }
+            // Decrypt the source object
+            match encryption_service
+                .decrypt_object(
+                    &src_bucket,
+                    &src_key,
+                    final_reader,
+                    sse_algorithm,
+                    kms_key_id.map(|s| s.as_str()),
+                    encryption_context.cloned(),
+                    src_info.user_defined.clone(),
+                )
+                .await
+            {
+                Ok(decrypted_reader) => {
+                    final_reader = Box::new(WarpReader::new(decrypted_reader));
+                }
+                Err(e) => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        format!("Failed to decrypt source object: {e}"),
+                    ));
                 }
             }
         }
@@ -522,47 +521,86 @@ impl S3 for FS {
         };
 
         if should_encrypt {
-            if let Some(_encryption_service) = &self.encryption_service {
-                // Extract encryption parameters
-                let algorithm = req
-                    .headers
-                    .get("x-amz-server-side-encryption")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("AES256");
+            let encryption_service = self.encryption_service()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+            // Extract encryption parameters
+            let algorithm = req
+                .headers
+                .get("x-amz-server-side-encryption")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("AES256");
+            
+            // Map aws:kms to AES256 for actual encryption
+            let actual_algorithm = if algorithm == "aws:kms" {
+                "AES256"
+            } else {
+                algorithm
+            };
 
-                let kms_key_id = req
-                    .headers
-                    .get("x-amz-server-side-encryption-aws-kms-key-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+            let kms_key_id = req
+                .headers
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
 
-                let encryption_context = req
-                    .headers
-                    .get("x-amz-server-side-encryption-context")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+            let encryption_context = req
+                .headers
+                .get("x-amz-server-side-encryption-context")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
 
-                // Encrypt the object
-                match _encryption_service
-                    .encrypt_object::<Box<dyn Reader>>(
-                        &bucket,
-                        &key,
-                        final_reader,
-                        algorithm,
-                        kms_key_id.as_deref(),
-                        encryption_context,
-                    )
-                    .await
-                {
-                    Ok((encrypted_reader, metadata)) => {
-                        final_reader = Box::new(WarpReader::new(encrypted_reader));
-                        encryption_metadata = Some(metadata);
-                    }
-                    Err(e) => {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InternalError,
-                            format!("Failed to encrypt object: {e}"),
-                        ));
+            // Encrypt the object
+            match encryption_service
+                .encrypt_object::<Box<dyn Reader>>(
+                    &bucket,
+                    &key,
+                    final_reader,
+                    actual_algorithm,
+                    kms_key_id.as_deref(),
+                    encryption_context,
+                )
+                .await
+            {
+                Ok((encrypted_reader, metadata)) => {
+                    final_reader = Box::new(WarpReader::new(encrypted_reader));
+                    encryption_metadata = Some(metadata);
+                }
+                Err(e) => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        format!("Failed to encrypt object: {e}"),
+                    ));
+                }
+            }
+        } else {
+            // Check bucket default encryption
+            if let Some(bucket_manager) = self.bucket_encryption_manager() {
+                if bucket_manager.should_encrypt(&bucket).await.unwrap_or(false) {
+                    let encryption_service = self.encryption_service()
+                        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+
+                    // Use bucket default encryption
+                    match encryption_service
+                        .encrypt_object::<Box<dyn Reader>>(
+                            &bucket,
+                            &key,
+                            final_reader,
+                            "AES256",
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok((encrypted_reader, metadata)) => {
+                            final_reader = Box::new(WarpReader::new(encrypted_reader));
+                            encryption_metadata = Some(metadata);
+                        }
+                        Err(e) => {
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("Failed to encrypt object: {e}"),
+                            ));
+                        }
                     }
                 }
             }
@@ -584,6 +622,10 @@ impl S3 for FS {
             }
             src_info.user_defined.insert(
                 "x-amz-server-side-encryption-key".to_string(),
+                base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
+            );
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-iv".to_string(),
                 base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
             );
             if let Some(tag) = metadata.tag {
@@ -1088,52 +1130,50 @@ impl S3 for FS {
         let info = reader.object_info.clone();
 
         // Handle decryption if object is encrypted
-        if let Some(ref encryption_service) = self.encryption_service {
-            // Check if object has encryption metadata
-            if !info.user_defined.is_empty() {
-                let has_encryption = info
-                    .user_defined
-                    .iter()
-                    .any(|(k, _)| k.starts_with("x-amz-server-side-encryption"));
+        let has_encryption = !info.user_defined.is_empty() &&
+            info.user_defined
+                .iter()
+                .any(|(k, _)| k.starts_with("x-amz-server-side-encryption"));
 
-                if has_encryption {
-                    // Extract encryption parameters from metadata
-                    let sse_algorithm = info
-                        .user_defined
-                        .get("x-amz-server-side-encryption")
-                        .map(|s| s.as_str())
-                        .unwrap_or("AES256");
+        if has_encryption {
+            let encryption_service = self.encryption_service()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+            
+            // Extract encryption parameters from metadata
+            let sse_algorithm = info
+                .user_defined
+                .get("x-amz-server-side-encryption")
+                .map(|s| s.as_str())
+                .unwrap_or("AES256");
 
-                    let kms_key_id = info
-                        .user_defined
-                        .get("x-amz-server-side-encryption-aws-kms-key-id")
-                        .map(|s| s.as_str());
+            let kms_key_id = info
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(|s| s.as_str());
 
-                    let encryption_context = info
-                        .user_defined
-                        .get("x-amz-server-side-encryption-context")
-                        .map(|s| s.to_string());
+            let encryption_context = info
+                .user_defined
+                .get("x-amz-server-side-encryption-context")
+                .map(|s| s.to_string());
 
-                    // Decrypt the object data
-                    match encryption_service
-                        .decrypt_object(
-                            &bucket,
-                            &key,
-                            reader.stream,
-                            sse_algorithm,
-                            kms_key_id,
-                            encryption_context,
-                            info.user_defined.clone(),
-                        )
-                        .await
-                    {
-                        Ok(decrypted_stream) => {
-                            reader.stream = Box::new(ReaderWrapper::new(decrypted_stream));
-                        }
-                        Err(e) => {
-                            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Decryption failed: {e}")));
-                        }
-                    }
+            // Decrypt the object data
+            match encryption_service
+                .decrypt_object(
+                    &bucket,
+                    &key,
+                    reader.stream,
+                    sse_algorithm,
+                    kms_key_id,
+                    encryption_context,
+                    info.user_defined.clone(),
+                )
+                .await
+            {
+                Ok(decrypted_stream) => {
+                    reader.stream = Box::new(ReaderWrapper::new(decrypted_stream));
+                }
+                Err(e) => {
+                    return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Decryption failed: {e}")));
                 }
             }
         }
@@ -1638,41 +1678,98 @@ impl S3 for FS {
         let actual_size = size;
 
         // Handle encryption if enabled
-        if let Some(ref encryption_service) = self.encryption_service {
-            if let Some(ref bucket_manager) = self.bucket_encryption_manager {
-                // Check for bucket default encryption or request-level encryption
-                let should_encrypt = req.headers.contains_key("x-amz-server-side-encryption")
-                    || req.headers.contains_key("x-amz-server-side-encryption-customer-key")
-                    || bucket_manager.should_encrypt(&bucket).await.unwrap_or(false);
+        let should_encrypt = req.headers.contains_key("x-amz-server-side-encryption")
+            || req.headers.contains_key("x-amz-server-side-encryption-customer-key");
 
-                if should_encrypt {
-                    // Extract encryption parameters from headers
-                    let sse_algorithm = req
-                        .headers
-                        .get("x-amz-server-side-encryption")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("AES256");
+        if should_encrypt {
+            let encryption_service = self.encryption_service()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+            let bucket_manager = self.bucket_encryption_manager()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Bucket encryption manager not initialized"))?;
 
-                    let kms_key_id = req
-                        .headers
-                        .get("x-amz-server-side-encryption-aws-kms-key-id")
-                        .and_then(|v| v.to_str().ok());
+            let should_encrypt_bucket = bucket_manager.should_encrypt(&bucket).await.unwrap_or(false);
+            if should_encrypt || should_encrypt_bucket {
+                // Extract encryption parameters from headers
+                let sse_algorithm = req
+                    .headers
+                    .get("x-amz-server-side-encryption")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("AES256");
+                
+                // Map aws:kms to AES256 for actual encryption
+                let actual_algorithm = if sse_algorithm == "aws:kms" {
+                    "AES256"
+                } else {
+                    sse_algorithm
+                };
 
-                    let encryption_context = req
-                        .headers
-                        .get("x-amz-server-side-encryption-context")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+                let kms_key_id = req
+                    .headers
+                    .get("x-amz-server-side-encryption-aws-kms-key-id")
+                    .and_then(|v| v.to_str().ok());
 
-                    // Encrypt the object data
+                let encryption_context = req
+                    .headers
+                    .get("x-amz-server-side-encryption-context")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                // Encrypt the object data
+                match encryption_service
+                    .encrypt_object::<Box<dyn rustfs_rio::Reader>>(
+                        &bucket,
+                        &key,
+                        reader,
+                        actual_algorithm,
+                        kms_key_id,
+                        encryption_context,
+                    )
+                    .await
+                {
+                    Ok((encrypted_reader, encryption_metadata)) => {
+                        reader = Box::new(ReaderWrapper::new(encrypted_reader));
+                        // Add encryption metadata to object metadata
+                        metadata.insert("x-amz-server-side-encryption".to_string(), encryption_metadata.algorithm);
+                        metadata.insert("x-amz-server-side-encryption-key-id".to_string(), encryption_metadata.key_id);
+                        metadata.insert(
+                            "x-amz-server-side-encryption-key".to_string(),
+                            base64::engine::general_purpose::STANDARD.encode(&encryption_metadata.encrypted_data_key),
+                        );
+                        metadata.insert(
+                            "x-amz-server-side-encryption-iv".to_string(),
+                            base64::engine::general_purpose::STANDARD.encode(&encryption_metadata.iv),
+                        );
+                        if let Some(tag) = encryption_metadata.tag {
+                            metadata.insert(
+                                "x-amz-server-side-encryption-tag".to_string(),
+                                base64::engine::general_purpose::STANDARD.encode(&tag),
+                            );
+                        }
+                        for (k, v) in encryption_metadata.encryption_context {
+                            metadata.insert(format!("x-amz-server-side-encryption-context-{k}"), v);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Encryption failed: {e}")));
+                    }
+                }
+            }
+        } else {
+            // Check bucket default encryption
+            if let Some(bucket_manager) = self.bucket_encryption_manager() {
+                if bucket_manager.should_encrypt(&bucket).await.unwrap_or(false) {
+                    let encryption_service = self.encryption_service()
+                        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+
+                    // Use bucket default encryption
                     match encryption_service
                         .encrypt_object::<Box<dyn rustfs_rio::Reader>>(
                             &bucket,
                             &key,
                             reader,
-                            sse_algorithm,
-                            kms_key_id,
-                            encryption_context,
+                            "AES256",
+                            None,
+                            None,
                         )
                         .await
                     {
@@ -1681,6 +1778,10 @@ impl S3 for FS {
                             // Add encryption metadata to object metadata
                             metadata.insert("x-amz-server-side-encryption".to_string(), encryption_metadata.algorithm);
                             metadata.insert("x-amz-server-side-encryption-key-id".to_string(), encryption_metadata.key_id);
+                            metadata.insert(
+                                "x-amz-server-side-encryption-key".to_string(),
+                                base64::engine::general_purpose::STANDARD.encode(&encryption_metadata.encrypted_data_key),
+                            );
                             metadata.insert(
                                 "x-amz-server-side-encryption-iv".to_string(),
                                 base64::engine::general_purpose::STANDARD.encode(&encryption_metadata.iv),
@@ -1817,38 +1918,86 @@ impl S3 for FS {
         }
 
         // Handle encryption for multipart upload
-        if let Some(_encryption_service) = &self.encryption_service {
-            if let Some(bucket_manager) = &self.bucket_encryption_manager {
-                let should_encrypt = bucket_manager.should_encrypt(&bucket).await.unwrap_or(false);
+        let should_encrypt = req.headers.contains_key("x-amz-server-side-encryption");
+        let bucket_has_default_encryption = if let Some(bucket_manager) = self.bucket_encryption_manager() {
+            bucket_manager.should_encrypt(&bucket).await.unwrap_or(false)
+        } else {
+            false
+        };
 
-                if should_encrypt || req.headers.contains_key("x-amz-server-side-encryption") {
-                    // Extract encryption parameters from headers
-                    let algorithm = req
-                        .headers
-                        .get("x-amz-server-side-encryption")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("AES256");
+        if should_encrypt || bucket_has_default_encryption {
+            let _ = self.encryption_service()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Encryption service not initialized"))?;
+            
+            // Extract encryption parameters from headers
+            let algorithm = req
+                .headers
+                .get("x-amz-server-side-encryption")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("AES256");
 
-                    let kms_key_id = req
-                        .headers
-                        .get("x-amz-server-side-encryption-aws-kms-key-id")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+            let kms_key_id = req
+                .headers
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
 
-                    let encryption_context = req
-                        .headers
-                        .get("x-amz-server-side-encryption-context")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+            let encryption_context = req
+                .headers
+                .get("x-amz-server-side-encryption-context")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
 
-                    // Store encryption metadata for multipart upload
-                    metadata.insert("x-amz-server-side-encryption".to_string(), algorithm.to_string());
-                    if let Some(key_id) = kms_key_id {
-                        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), key_id);
+            // Generate data encryption key for multipart upload
+            if let Some(encryption_service) = self.encryption_service() {
+                let actual_key_id = kms_key_id.as_deref().unwrap_or_else(|| {
+                    use rustfs_kms::manager::KmsManager;
+                    "rustfs-default-key"
+                });
+                
+                let encryption_context_str = encryption_context.clone().unwrap_or_else(|| 
+                    format!("bucket={}&key={}", bucket, key));
+                
+                let request = rustfs_kms::GenerateKeyRequest::new(
+                    actual_key_id.to_string(), 
+                    "AES_256".to_string()
+                ).with_length(32);
+                
+                match encryption_service.kms_manager().generate_data_key(&request, None).await {
+                    Ok(data_key_result) => {
+                        let data_key = data_key_result.plaintext.unwrap_or_default();
+                        let encrypted_data_key = data_key_result.ciphertext;
+                        
+                        // Store encryption metadata for multipart upload
+                        metadata.insert("x-amz-server-side-encryption".to_string(), algorithm.to_string());
+                        if let Some(key_id) = kms_key_id {
+                            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), key_id);
+                        }
+                        if let Some(context) = encryption_context {
+                            metadata.insert("x-amz-server-side-encryption-context".to_string(), context);
+                        }
+                        
+                        // Store the encrypted data key for later use
+                        metadata.insert("x-amz-server-side-encryption-key".to_string(), 
+                            base64::engine::general_purpose::STANDARD.encode(&encrypted_data_key));
+                        
+                        // Initialize IV and tag (will be updated per part)
+                        let mut iv = vec![0u8; 12];
+                        rand::thread_rng().fill_bytes(&mut iv);
+                        metadata.insert("x-amz-server-side-encryption-iv".to_string(), 
+                            base64::engine::general_purpose::STANDARD.encode(&iv));
                     }
-                    if let Some(context) = encryption_context {
-                        metadata.insert("x-amz-server-side-encryption-context".to_string(), context);
+                    Err(e) => {
+                        return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to generate data key: {e}")));
                     }
+                }
+            } else {
+                metadata.insert("x-amz-server-side-encryption".to_string(), algorithm.to_string());
+                if let Some(key_id) = kms_key_id {
+                    metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), key_id);
+                }
+                if let Some(context) = encryption_context {
+                    metadata.insert("x-amz-server-side-encryption-context".to_string(), context);
                 }
             }
         }
@@ -1932,7 +2081,7 @@ impl S3 for FS {
 
         // mc cp step 4
 
-        let opts = ObjectOptions::default();
+        let mut opts = ObjectOptions::default();
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1955,7 +2104,7 @@ impl S3 for FS {
         let should_encrypt = fi.user_defined.contains_key("x-amz-server-side-encryption");
 
         if should_encrypt {
-            if let Some(encryption_service) = &self.encryption_service {
+            if let Some(encryption_service) = self.encryption_service() {
                 let algorithm = fi
                     .user_defined
                     .get("x-amz-server-side-encryption")
@@ -1978,10 +2127,12 @@ impl S3 for FS {
                     )
                     .await
                 {
-                    Ok((encrypted_reader, _metadata)) => {
+                    Ok((encrypted_reader, encryption_metadata)) => {
                         reader = Box::new(ReaderWrapper::new(encrypted_reader));
                         // Update size for encrypted data (will be determined by the encrypted stream)
                         size = -1;
+                        
+                        // Encryption metadata is already stored in multipart upload, no need to add here
                     }
                     Err(e) => {
                         return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Encryption failed: {e}")));
@@ -2322,7 +2473,25 @@ impl S3 for FS {
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
-        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // Get multipart upload info to check for encryption metadata
+        let multipart_info = store
+            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        // Check if this multipart upload should be encrypted
+        let should_encrypt = multipart_info.user_defined.contains_key("x-amz-server-side-encryption");
+        
+        let mut opts = ObjectOptions::default();
+        
+        // Preserve encryption metadata if encryption is enabled
+        if should_encrypt {
+            opts.user_defined = multipart_info.user_defined.clone();
+        }
 
         let mut uploaded_parts = Vec::new();
 
@@ -2330,12 +2499,8 @@ impl S3 for FS {
             uploaded_parts.push(CompletePart::from(part));
         }
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
         let obj_info = store
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
+            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
 
@@ -2349,7 +2514,7 @@ impl S3 for FS {
 
         let mt2 = HashMap::new();
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, opts);
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
 
         let dsc = must_replicate(&bucket, &key, &repoptions).await;
 

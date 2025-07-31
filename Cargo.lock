@@ -5854,6 +5854,7 @@ dependencies = [
  "opentelemetry",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.8.5",
  "reqwest 0.12.23",
  "rust-embed",
  "rustfs-ahm",

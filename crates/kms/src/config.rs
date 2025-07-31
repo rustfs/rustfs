@@ -120,7 +120,7 @@ impl Default for VaultConfig {
                 token: "dev-token".to_string(),
             },
             namespace: None,
-            mount_path: "kv".to_string(),
+            mount_path: "transit".to_string(),
             tls_config: None,
             headers: HashMap::new(),
         }

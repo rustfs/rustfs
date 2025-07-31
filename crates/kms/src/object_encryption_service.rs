@@ -4,6 +4,7 @@ use crate::{
     manager::KmsManager,
     types::EncryptionMetadata,
 };
+use tracing::info;
 use base64::Engine;
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -16,6 +17,11 @@ pub struct ObjectEncryptionService {
 impl ObjectEncryptionService {
     pub fn new(kms_manager: KmsManager) -> Self {
         Self { kms_manager }
+    }
+
+    /// Get a reference to the KMS manager
+    pub fn kms_manager(&self) -> &KmsManager {
+        &self.kms_manager
     }
 
     /// Encrypt object data and return encrypted stream with metadata
@@ -32,10 +38,33 @@ impl ObjectEncryptionService {
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await?;
 
+        // Determine the actual key ID to use
+        let actual_key_id = kms_key_id.unwrap_or_else(|| {
+            self.kms_manager.default_key_id().unwrap_or("rustfs-default-key")
+        });
+
+        // Only auto-create keys for SSE-S3 and SSE-KMS
+        let is_sse_s3 = algorithm == "AES256" && kms_key_id.is_none();
+        let is_sse_kms = algorithm == "aws:kms" || kms_key_id.is_some();
+        
+        if is_sse_s3 || is_sse_kms {
+            let key_exists = self.kms_manager.describe_key(actual_key_id, None).await.is_ok();
+            if !key_exists {
+                info!("Key {} not found, attempting to create key for {} encryption", 
+                      actual_key_id, if is_sse_s3 { "SSE-S3" } else { "SSE-KMS" });
+                // Attempt to create key, but don't fail if creation fails (for testing environments)
+                let _ = self.kms_manager.create_key(actual_key_id, "AES_256", None).await
+                    .map_err(|e| {
+                        info!("Failed to create key {}: {:?}, continuing with existing key", actual_key_id, e);
+                        e
+                    });
+            }
+        }
+
         // Generate data encryption key
         let _context = encryption_context.unwrap_or_else(|| format!("bucket={bucket}&key={key}"));
 
-        let request = crate::types::GenerateKeyRequest::new(kms_key_id.unwrap_or_default().to_string(), "AES_256".to_string())
+        let request = crate::types::GenerateKeyRequest::new(actual_key_id.to_string(), "AES_256".to_string())
             .with_length(32);
 
         let data_key_result = self.kms_manager.generate_data_key(&request, None).await?;
@@ -46,15 +75,16 @@ impl ObjectEncryptionService {
         let encrypted_data_key = data_key_result.ciphertext;
 
         // Create cipher based on algorithm
+        // Note: aws:kms uses AES256 for actual encryption, the difference is in key management
         let cipher: Box<dyn ObjectCipher> = match algorithm {
-            "AES256" => Box::new(AesGcmCipher::new(&data_key)?),
+            "AES256" | "aws:kms" => Box::new(AesGcmCipher::new(&data_key)?),
             "ChaCha20Poly1305" => Box::new(ChaCha20Poly1305Cipher::new(&data_key)?),
             _ => return Err(crate::error::EncryptionError::unsupported_algorithm(algorithm)),
         };
 
         // Generate IV and encrypt the data
         let iv = match algorithm {
-            "AES256" => {
+            "AES256" | "aws:kms" => {
                 let mut iv = vec![0u8; 12]; // AES-GCM uses 12-byte IV
                 use rand::RngCore;
                 rand::rng().fill_bytes(&mut iv);
@@ -137,18 +167,19 @@ impl ObjectEncryptionService {
             .map_err(crate::error::EncryptionError::KmsError)?;
 
         // Create cipher based on algorithm
+        // Note: aws:kms uses AES256 for actual encryption, the difference is in key management
         let cipher: Box<dyn ObjectCipher> = match algorithm {
-            "AES256" => Box::new(AesGcmCipher::new(&data_key)?),
+            "AES256" | "aws:kms" => Box::new(AesGcmCipher::new(&data_key)?),
             "ChaCha20Poly1305" => Box::new(ChaCha20Poly1305Cipher::new(&data_key)?),
             _ => return Err(crate::error::EncryptionError::unsupported_algorithm(algorithm)),
         };
 
         // Extract encryption parameters from metadata
         let iv_str = metadata
-            .get("iv")
+            .get("x-amz-server-side-encryption-iv")
             .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing IV in metadata"))?;
         let tag_str = metadata
-            .get("tag")
+            .get("x-amz-server-side-encryption-tag")
             .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing tag in metadata"))?;
 
         let iv = base64::engine::general_purpose::STANDARD
@@ -157,15 +188,12 @@ impl ObjectEncryptionService {
         let tag = base64::engine::general_purpose::STANDARD
             .decode(tag_str)
             .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid tag: {e}")))?;
-        let aad_str = metadata
-            .get("aad")
-            .ok_or_else(|| crate::error::EncryptionError::metadata_error("Missing AAD in metadata"))?;
-        let aad = base64::engine::general_purpose::STANDARD
-            .decode(aad_str)
-            .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid AAD: {e}")))?;
+        
+        // Use empty AAD as default (consistent with encryption)
+        let aad = b"";
 
         // Decrypt the data
-        let decrypted_data = cipher.decrypt(&encrypted_data, &iv, &tag, &aad)?;
+        let decrypted_data = cipher.decrypt(&encrypted_data, &iv, &tag, aad)?;
 
         // Create reader from decrypted data
         let decrypted_reader: Box<dyn AsyncRead + Send + Sync + Unpin> = Box::new(std::io::Cursor::new(decrypted_data));
