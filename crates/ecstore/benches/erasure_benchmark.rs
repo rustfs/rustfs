@@ -43,8 +43,9 @@
 //! - Both encoding and decoding operations
 //! - SIMD optimization for different shard sizes
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use rustfs_ecstore::erasure_coding::{Erasure, calc_shard_size};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use rustfs_ecstore::erasure_coding::{calc_shard_size, Erasure};
+use std::hint::black_box;
 use std::time::Duration;
 
 /// Benchmark configuration structure
