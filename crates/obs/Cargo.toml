@@ -41,7 +41,6 @@ rustfs-utils = { workspace = true, features = ["ip", "path"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 flexi_logger = { workspace = true, features = ["trc", "kv"] }
-lazy_static = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
