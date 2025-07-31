@@ -69,6 +69,7 @@ where
         // if self.readers.len() != self.total_shards {
         //     return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers"));
         // }
+        let num_readers = self.readers.len();
 
         let shard_size = if self.offset + self.shard_size > self.shard_file_size {
             self.shard_file_size - self.offset
@@ -77,49 +78,65 @@ where
         };
 
         if shard_size == 0 {
-            return (vec![None; self.readers.len()], vec![None; self.readers.len()]);
+            return (vec![None; num_readers], vec![None; num_readers]);
         }
 
-        // 使用并发读取所有分片
-        let mut read_futs = Vec::with_capacity(self.readers.len());
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
+        let mut errs = vec![None; num_readers];
 
-        for (i, opt_reader) in self.readers.iter_mut().enumerate() {
-            let future = if let Some(reader) = opt_reader.as_mut() {
-                Box::pin(async move {
-                    let mut buf = vec![0u8; shard_size];
-                    match reader.read(&mut buf).await {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            (i, Ok(buf))
+        let mut next_reader_index = 0;
+
+        let mut reader_iter = self.readers.iter_mut();
+        while next_reader_index < num_readers {
+            let fine_shard_count = shards.iter().filter(|s| s.is_some()).count();
+            if fine_shard_count >= self.data_shards {
+                break;
+            }
+
+            let readers_to_trigger = self.data_shards - fine_shard_count;
+            if next_reader_index + readers_to_trigger > num_readers {
+                break;
+            }
+
+            let mut futures = Vec::with_capacity(readers_to_trigger);
+            for i in next_reader_index..next_reader_index + readers_to_trigger {
+                let future = if let Some(reader) = reader_iter.next().unwrap() {
+                    Box::pin(async move {
+                        let mut buf = vec![0u8; shard_size];
+                        match reader.read(&mut buf).await {
+                            Ok(n) => {
+                                buf.truncate(n);
+                                (i, Ok(buf))
+                            }
+                            Err(e) => (i, Err(Error::from(e))),
                         }
-                        Err(e) => (i, Err(Error::from(e))),
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+                } else {
+                    // reader是None时返回FileNotFound错误
+                    Box::pin(async move { (i, Err(Error::FileNotFound)) })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+                };
+                futures.push(future);
+            }
+
+            let results = join_all(futures).await;
+
+            for (i, shard) in results.into_iter() {
+                match shard {
+                    Ok(data) => {
+                        if !data.is_empty() {
+                            shards[i] = Some(data);
+                        }
                     }
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-            } else {
-                // reader是None时返回FileNotFound错误
-                Box::pin(async move { (i, Err(Error::FileNotFound)) })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-            };
-            read_futs.push(future);
-        }
-
-        let results = join_all(read_futs).await;
-
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; self.readers.len()];
-        let mut errs = vec![None; self.readers.len()];
-
-        for (i, shard) in results.into_iter() {
-            match shard {
-                Ok(data) => {
-                    if !data.is_empty() {
-                        shards[i] = Some(data);
+                    Err(e) => {
+                        // error!("Error reading shard {}: {}", i, e);
+                        errs[i] = Some(e);
                     }
-                }
-                Err(e) => {
-                    // error!("Error reading shard {}: {}", i, e);
-                    errs[i] = Some(e);
                 }
             }
+
+            next_reader_index += readers_to_trigger;
         }
 
         self.offset += shard_size;
@@ -292,5 +309,153 @@ impl Erasure {
         }
 
         (written, ret_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustfs_utils::HashAlgorithm;
+
+    use crate::{disk::error::DiskError, erasure_coding::BitrotWriter};
+
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_parallel_reader_normal() {
+        const BLOCK_SIZE: usize = 64;
+        const NUM_SHARDS: usize = 2;
+        const DATA_SHARDS: usize = 8;
+        const PARITY_SHARDS: usize = 4;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let reader_offset = 0;
+        let mut readers = vec![];
+        for i in 0..(DATA_SHARDS + PARITY_SHARDS) {
+            readers.push(Some(
+                create_reader(SHARD_SIZE, NUM_SHARDS, (i % 256) as u8, &HashAlgorithm::HighwayHash256, false).await,
+            ));
+        }
+
+        let erausre = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new(readers, erausre, reader_offset, NUM_SHARDS * BLOCK_SIZE);
+
+        for _ in 0..NUM_SHARDS {
+            let (bufs, errs) = parallel_reader.read().await;
+
+            bufs.into_iter().enumerate().for_each(|(index, buf)| {
+                if index < DATA_SHARDS {
+                    assert!(buf.is_some());
+                    let buf = buf.unwrap();
+                    assert_eq!(SHARD_SIZE, buf.len());
+                    assert_eq!(index as u8, buf[0]);
+                } else {
+                    assert!(buf.is_none());
+                }
+            });
+
+            assert!(errs.iter().filter(|err| err.is_some()).count() == 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reader_with_offline_disks() {
+        const OFFLINE_DISKS: usize = 2;
+        const NUM_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 8;
+        const PARITY_SHARDS: usize = 4;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let reader_offset = 0;
+        let mut readers = vec![];
+        for i in 0..(DATA_SHARDS + PARITY_SHARDS) {
+            if i < OFFLINE_DISKS {
+                // Two disks are offline
+                readers.push(None);
+            } else {
+                readers.push(Some(
+                    create_reader(SHARD_SIZE, NUM_SHARDS, (i % 256) as u8, &HashAlgorithm::HighwayHash256, false).await,
+                ));
+            }
+        }
+
+        let erausre = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new(readers, erausre, reader_offset, NUM_SHARDS * BLOCK_SIZE);
+
+        for _ in 0..NUM_SHARDS {
+            let (bufs, errs) = parallel_reader.read().await;
+
+            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+            assert_eq!(OFFLINE_DISKS, errs.iter().filter(|err| err.is_some()).count());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reader_with_bitrots() {
+        const BITROT_DISKS: usize = 2;
+        const NUM_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 8;
+        const PARITY_SHARDS: usize = 4;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let reader_offset = 0;
+        let mut readers = vec![];
+        for i in 0..(DATA_SHARDS + PARITY_SHARDS) {
+            readers.push(Some(
+                create_reader(SHARD_SIZE, NUM_SHARDS, (i % 256) as u8, &HashAlgorithm::HighwayHash256, i < BITROT_DISKS).await,
+            ));
+        }
+
+        let erausre = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new(readers, erausre, reader_offset, NUM_SHARDS * BLOCK_SIZE);
+
+        for _ in 0..NUM_SHARDS {
+            let (bufs, errs) = parallel_reader.read().await;
+
+            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+            assert_eq!(
+                BITROT_DISKS,
+                errs.iter()
+                    .filter(|err| {
+                        match err {
+                            Some(DiskError::Io(err)) => {
+                                err.kind() == std::io::ErrorKind::InvalidData && err.to_string().contains("bitrot")
+                            }
+                            _ => false,
+                        }
+                    })
+                    .count()
+            );
+        }
+    }
+
+    async fn create_reader(
+        shard_size: usize,
+        num_shards: usize,
+        value: u8,
+        hash_algo: &HashAlgorithm,
+        bitrot: bool,
+    ) -> BitrotReader<Cursor<Vec<u8>>> {
+        let len = (hash_algo.size() + shard_size) * num_shards;
+        let buf = Cursor::new(vec![0u8; len]);
+
+        let mut writer = BitrotWriter::new(buf, shard_size, hash_algo.clone());
+        for _ in 0..num_shards {
+            writer.write(vec![value; shard_size].as_slice()).await.unwrap();
+        }
+
+        let mut buf = writer.into_inner().into_inner();
+
+        if bitrot {
+            for i in 0..num_shards {
+                // Rot one bit for each shard
+                buf[i * (hash_algo.size() + shard_size)] ^= 1;
+            }
+        }
+
+        let reader_cursor = Cursor::new(buf);
+        BitrotReader::new(reader_cursor, shard_size, hash_algo.clone())
     }
 }
