@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// ILM-related metric descriptors
-use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 pub static ILM_EXPIRY_PENDING_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {

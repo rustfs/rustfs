@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// Cluster health-related metric descriptors
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 pub static HEALTH_DRIVES_OFFLINE_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {

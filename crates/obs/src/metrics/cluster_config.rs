@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// Metric descriptors related to cluster configuration
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 
 use std::sync::LazyLock;
 

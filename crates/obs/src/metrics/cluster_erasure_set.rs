@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// Erasure code set related metric descriptors
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 /// The label for the pool ID

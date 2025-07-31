@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use rustfs_filemeta::{test_data::*, FileMeta};
+use criterion::{Criterion, criterion_group, criterion_main};
+use rustfs_filemeta::{FileMeta, test_data::*};
 use std::hint::black_box;
 
 fn bench_create_real_xlmeta(c: &mut Criterion) {
