@@ -30,7 +30,7 @@ pub const DRIVE_INDEX_LABEL: &str = "drive_index";
 pub const API_LABEL: &str = "api";
 
 /// All drive-related labels
-pub static ALL_DRIVE_LABELS: [&str; 4] = [DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL, DRIVE_INDEX_LABEL];
+pub const ALL_DRIVE_LABELS: [&str; 4] = [DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL, DRIVE_INDEX_LABEL];
 
 pub static DRIVE_USED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(

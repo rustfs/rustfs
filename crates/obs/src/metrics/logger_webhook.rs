@@ -25,7 +25,7 @@ pub const NAME_LABEL: &str = "name";
 pub const ENDPOINT_LABEL: &str = "endpoint";
 
 // The label used by all webhook metrics
-static ALL_WEBHOOK_LABELS: [&str; 2] = [NAME_LABEL, ENDPOINT_LABEL];
+const ALL_WEBHOOK_LABELS: [&str; 2] = [NAME_LABEL, ENDPOINT_LABEL];
 
 pub static WEBHOOK_FAILED_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
