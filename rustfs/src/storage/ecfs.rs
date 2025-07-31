@@ -983,6 +983,7 @@ impl S3 for FS {
             content_type,
             accept_ranges: Some("bytes".to_string()),
             content_range,
+            e_tag: info.etag,
             ..Default::default()
         };
 
