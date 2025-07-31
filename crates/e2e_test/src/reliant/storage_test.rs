@@ -31,10 +31,8 @@ mod tests {
         async fn test_connection(&self) -> Result<bool, Box<dyn std::error::Error>> {
             // Try to connect to the endpoint
             let url = format!("{}/", self.endpoint);
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()?;
-            
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+
             match client.get(&url).send().await {
                 Ok(_) => Ok(true),
                 Err(_) => Ok(false),
@@ -47,7 +45,7 @@ mod tests {
     async fn test_s3_endpoint_connectivity() {
         let endpoint = "http://127.0.0.1:9000";
         let client = MockS3Client::new(endpoint.to_string());
-        
+
         match timeout(Duration::from_secs(10), client.test_connection()).await {
             Ok(Ok(connected)) => {
                 if connected {
@@ -57,11 +55,11 @@ mod tests {
                 }
                 // Test passes if we get a response (connection attempt succeeded)
                 assert!(true);
-            },
+            }
             Ok(Err(e)) => {
                 println!("Connection test failed: {}", e);
                 // Network issues might be expected in test environment
-            },
+            }
             Err(_) => {
                 println!("Connection test timed out");
             }
@@ -71,20 +69,15 @@ mod tests {
     #[test]
     fn test_bucket_name_validation() {
         // Test S3 bucket name validation rules
-        let valid_names = vec![
-            "my-bucket",
-            "my.bucket.name",
-            "mybucket123",
-            "test-bucket-2024",
-        ];
+        let valid_names = vec!["my-bucket", "my.bucket.name", "mybucket123", "test-bucket-2024"];
 
         let invalid_names = vec![
-            "MYBUCKET",      // uppercase
-            "my_bucket",     // underscore
-            "bucket-",       // ends with dash
-            ".bucket",       // starts with dot
-            "bucket.",       // ends with dot
-            "a",             // too short
+            "MYBUCKET",  // uppercase
+            "my_bucket", // underscore
+            "bucket-",   // ends with dash
+            ".bucket",   // starts with dot
+            "bucket.",   // ends with dot
+            "a",         // too short
         ];
 
         for name in valid_names {
@@ -108,9 +101,9 @@ mod tests {
         ];
 
         let invalid_keys = vec![
-            "",              // empty
-            "/leading-slash",    // starts with slash
-            "trailing-slash/",   // ends with slash (for objects)
+            "",                // empty
+            "/leading-slash",  // starts with slash
+            "trailing-slash/", // ends with slash (for objects)
         ];
 
         for key in valid_keys {
@@ -144,19 +137,14 @@ mod tests {
     #[test]
     fn test_compression_format_support() {
         // Test that compression formats are properly supported
-        let supported_formats = vec![
-            ("zip", true),
-            ("tar", true), 
-            ("gz", true),
-            ("bz2", true),
-            ("unknown", false),
-        ];
+        let supported_formats = vec![("zip", true), ("tar", true), ("gz", true), ("bz2", true), ("unknown", false)];
 
         for (format, should_support) in supported_formats {
             let is_supported = is_compression_supported(format);
             assert_eq!(
                 is_supported, should_support,
-                "Format {} support status should be {}", format, should_support
+                "Format {} support status should be {}",
+                format, should_support
             );
         }
     }
@@ -167,24 +155,24 @@ mod tests {
         if name.len() < 3 || name.len() > 63 {
             return false;
         }
-        
+
         // Must start and end with alphanumeric
         let first_char = name.chars().next().unwrap();
         let last_char = name.chars().last().unwrap();
         if !first_char.is_alphanumeric() || !last_char.is_alphanumeric() {
             return false;
         }
-        
+
         // No uppercase letters
         if name.chars().any(|c| c.is_uppercase()) {
             return false;
         }
-        
+
         // No underscores
         if name.contains('_') {
             return false;
         }
-        
+
         true
     }
 
@@ -193,29 +181,29 @@ mod tests {
         if key.is_empty() {
             return false;
         }
-        
+
         if key.starts_with('/') || key.ends_with('/') {
             return false;
         }
-        
+
         true
     }
 
     fn format_storage_size(bytes: u64) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-        
+
         if bytes == 0 {
             return "0 B".to_string();
         }
-        
+
         let mut size = bytes as f64;
         let mut unit_index = 0;
-        
+
         while size >= 1024.0 && unit_index < UNITS.len() - 1 {
             size /= 1024.0;
             unit_index += 1;
         }
-        
+
         if size.fract() == 0.0 {
             format!("{} {}", size as u64, UNITS[unit_index])
         } else {

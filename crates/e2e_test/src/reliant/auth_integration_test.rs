@@ -43,7 +43,7 @@ mod tests {
         }
 
         fn validate_secret_key_format(secret_key: &str) -> bool {
-            // Basic validation for secret key format  
+            // Basic validation for secret key format
             secret_key.len() >= 8 && secret_key.len() <= 40
         }
 
@@ -52,19 +52,17 @@ mod tests {
             !token.is_empty() && token.len() > 10
         }
 
-        async fn test_auth_endpoint(endpoint: &str, access_key: &str, secret_key: &str) -> Result<bool, Box<dyn std::error::Error>> {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?;
+        async fn test_auth_endpoint(
+            endpoint: &str,
+            access_key: &str,
+            secret_key: &str,
+        ) -> Result<bool, Box<dyn std::error::Error>> {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
 
             // Create basic auth header (simplified)
             let auth_header = format!("AWS {}:{}", access_key, secret_key);
-            
-            let response = client
-                .get(endpoint)
-                .header("Authorization", auth_header)
-                .send()
-                .await?;
+
+            let response = client.get(endpoint).header("Authorization", auth_header).send().await?;
 
             // If we get any response (including auth errors), the endpoint is reachable
             Ok(response.status().as_u16() < 500)
@@ -74,19 +72,12 @@ mod tests {
     #[test]
     fn test_credential_format_validation() {
         let helper = AuthTestHelper;
-        
+
         // Test valid access keys
-        let valid_access_keys = vec![
-            "test-key",
-            "AKIAIOSFODNN7EXAMPLE",
-            "my-access-key-123",
-        ];
+        let valid_access_keys = vec!["test-key", "AKIAIOSFODNN7EXAMPLE", "my-access-key-123"];
 
         for key in valid_access_keys {
-            assert!(
-                helper.validate_access_key_format(key),
-                "Access key {} should be valid", key
-            );
+            assert!(helper.validate_access_key_format(key), "Access key {} should be valid", key);
         }
 
         // Test invalid access keys
@@ -98,17 +89,14 @@ mod tests {
         ];
 
         for key in invalid_access_keys {
-            assert!(
-                !helper.validate_access_key_format(&key),
-                "Access key {} should be invalid", key
-            );
+            assert!(!helper.validate_access_key_format(&key), "Access key {} should be invalid", key);
         }
     }
 
     #[test]
     fn test_secret_key_validation() {
         let helper = AuthTestHelper;
-        
+
         // Test valid secret keys
         let valid_secret_keys = vec![
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -117,10 +105,7 @@ mod tests {
         ];
 
         for key in valid_secret_keys {
-            assert!(
-                helper.validate_secret_key_format(&key),
-                "Secret key should be valid"
-            );
+            assert!(helper.validate_secret_key_format(&key), "Secret key should be valid");
         }
 
         // Test invalid secret keys
@@ -131,10 +116,7 @@ mod tests {
         ];
 
         for key in invalid_secret_keys {
-            assert!(
-                !helper.validate_secret_key_format(&key),
-                "Secret key should be invalid"
-            );
+            assert!(!helper.validate_secret_key_format(&key), "Secret key should be invalid");
         }
     }
 
@@ -150,40 +132,34 @@ mod tests {
         ];
 
         for token in valid_tokens {
-            assert!(
-                helper.is_session_token_format_valid(token),
-                "Session token should be valid"
-            );
+            assert!(helper.is_session_token_format_valid(token), "Session token should be valid");
         }
 
         // Test invalid session tokens
         let invalid_tokens = vec![
-            "",         // empty
-            "short",    // too short
+            "",      // empty
+            "short", // too short
         ];
 
         for token in invalid_tokens {
-            assert!(
-                !helper.is_session_token_format_valid(token),
-                "Session token should be invalid"
-            );
+            assert!(!helper.is_session_token_format_valid(token), "Session token should be invalid");
         }
     }
 
     #[test]
     fn test_credential_structures() {
         let helper = AuthTestHelper;
-        
+
         // Test regular credentials
         let creds = helper.create_test_credentials();
         assert!(creds.contains_key("access_key"));
         assert!(creds.contains_key("secret_key"));
         assert!(creds.contains_key("session_token"));
-        
+
         let access_key = creds.get("access_key").unwrap();
         let secret_key = creds.get("secret_key").unwrap();
         let session_token = creds.get("session_token").unwrap();
-        
+
         assert!(helper.validate_access_key_format(access_key));
         assert!(helper.validate_secret_key_format(secret_key));
         assert!(session_token.is_empty()); // Regular creds don't have session token
@@ -199,14 +175,11 @@ mod tests {
     async fn test_auth_endpoint_reachability() {
         let helper = AuthTestHelper;
         let creds = helper.create_test_credentials();
-        
+
         let access_key = creds.get("access_key").unwrap();
         let secret_key = creds.get("secret_key").unwrap();
-        
-        let endpoints = vec![
-            "http://127.0.0.1:9000/",
-            "http://127.0.0.1:9000/rustfs/admin/info",
-        ];
+
+        let endpoints = vec!["http://127.0.0.1:9000/", "http://127.0.0.1:9000/rustfs/admin/info"];
 
         for endpoint in endpoints {
             match helper.test_auth_endpoint(endpoint, access_key, secret_key).await {
@@ -214,7 +187,7 @@ mod tests {
                     println!("Endpoint {} reachable: {}", endpoint, reachable);
                     // Test passes if we can determine reachability
                     assert!(true);
-                },
+                }
                 Err(e) => {
                     println!("Failed to test endpoint {}: {}", endpoint, e);
                     // Network errors might be expected in test environment
@@ -223,19 +196,19 @@ mod tests {
         }
     }
 
-    #[test] 
+    #[test]
     fn test_authorization_header_format() {
         // Test AWS Signature V4 header format creation
         let access_key = "AKIAIOSFODNN7EXAMPLE";
         let secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-        
+
         // Simplified auth header format (real implementation would use proper signing)
         let auth_header = format!("AWS {}:{}", access_key, secret_key);
-        
+
         assert!(auth_header.starts_with("AWS "));
         assert!(auth_header.contains(access_key));
         assert!(auth_header.contains(":"));
-        
+
         // Test different auth header formats
         let auth_v4_header = format!("AWS4-HMAC-SHA256 Credential={}/20230101/us-east-1/s3/aws4_request", access_key);
         assert!(auth_v4_header.starts_with("AWS4-HMAC-SHA256"));
@@ -277,7 +250,7 @@ mod tests {
         assert!(path.starts_with('/'));
         assert!(!query.is_empty());
         assert!(!headers.is_empty());
-        
+
         // Test that all required headers are present
         let required_headers = vec!["host", "x-amz-date"];
         for required in required_headers {

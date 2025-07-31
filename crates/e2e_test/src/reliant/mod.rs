@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth_integration_test;
+mod http_api_test;
 mod lock;
 mod node_interact_test;
 mod sql;
-mod http_api_test;
 mod storage_test;
-mod auth_integration_test;

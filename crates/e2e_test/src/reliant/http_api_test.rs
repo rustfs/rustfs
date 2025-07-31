@@ -27,10 +27,8 @@ mod tests {
 
     // Helper function to make HTTP request
     async fn make_http_request(url: &str) -> Result<reqwest::Response, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-        
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+
         client.get(url).send().await
     }
 
@@ -38,7 +36,7 @@ mod tests {
     #[ignore] // Requires running RustFS server
     async fn test_server_health_check() {
         let port = 9000; // Default RustFS port
-        
+
         // Check if server is running
         if !is_server_running(port).await {
             println!("RustFS server not running on port {}, skipping test", port);
@@ -54,11 +52,11 @@ mod tests {
                 println!("Server responded with status: {}", resp.status());
                 // Server should respond (might be redirect or auth required)
                 assert!(resp.status().is_success() || resp.status().is_redirection() || resp.status().is_client_error());
-            },
+            }
             Ok(Err(e)) => {
                 println!("HTTP request failed: {}", e);
                 // This might be expected if auth is required
-            },
+            }
             Err(_) => {
                 panic!("Request timed out");
             }
@@ -69,7 +67,7 @@ mod tests {
     #[ignore] // Requires running RustFS server
     async fn test_browser_redirect() {
         let port = 9000;
-        
+
         if !is_server_running(port).await {
             println!("RustFS server not running, skipping test");
             return;
@@ -99,7 +97,7 @@ mod tests {
                 }
                 // Accept various responses as different server states are possible
                 assert!(true);
-            },
+            }
             Err(_) => {
                 // Network error might be expected in test environment
                 println!("Network error during redirect test");
@@ -111,18 +109,14 @@ mod tests {
     #[ignore] // Requires running RustFS server
     async fn test_api_endpoint_connectivity() {
         let port = 9000;
-        
+
         if !is_server_running(port).await {
             println!("RustFS server not running, skipping test");
             return;
         }
 
         // Test common API endpoints
-        let endpoints = vec![
-            "/rustfs/admin/info",
-            "/rustfs/admin/metrics", 
-            "/rustfs/admin/server-info",
-        ];
+        let endpoints = vec!["/rustfs/admin/info", "/rustfs/admin/metrics", "/rustfs/admin/server-info"];
 
         for endpoint in endpoints {
             let url = format!("http://127.0.0.1:{}{}", port, endpoint);
@@ -132,16 +126,12 @@ mod tests {
                 Ok(Ok(resp)) => {
                     println!("Endpoint {} responded with status: {}", endpoint, resp.status());
                     // Admin endpoints might require auth, so accept auth errors
-                    assert!(
-                        resp.status().is_success() || 
-                        resp.status().is_client_error() || 
-                        resp.status().is_redirection()
-                    );
-                },
+                    assert!(resp.status().is_success() || resp.status().is_client_error() || resp.status().is_redirection());
+                }
                 Ok(Err(e)) => {
                     println!("Request to {} failed: {}", endpoint, e);
                     // Network errors might be expected
-                },
+                }
                 Err(_) => {
                     println!("Request to {} timed out", endpoint);
                 }
@@ -152,12 +142,12 @@ mod tests {
     #[test]
     fn test_integration_test_helpers() {
         // Test our helper functions work correctly
-        
+
         // Test URL formatting
         let port = 9000;
         let url = format!("http://127.0.0.1:{}/", port);
         assert_eq!(url, "http://127.0.0.1:9000/");
-        
+
         // Test endpoint path construction
         let endpoint = "/rustfs/admin/info";
         let full_url = format!("http://127.0.0.1:{}{}", port, endpoint);
