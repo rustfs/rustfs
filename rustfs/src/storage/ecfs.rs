@@ -3173,16 +3173,16 @@ mod tests {
     #[test]
     fn test_fs_creation() {
         let _fs = FS::new();
-        
+
         // Verify that FS struct can be created successfully
         // Since it's currently empty, we just verify it doesn't panic
         assert!(true);
     }
 
-    #[test] 
+    #[test]
     fn test_fs_debug_implementation() {
         let fs = FS::new();
-        
+
         // Test that Debug trait is properly implemented
         let debug_str = format!("{:?}", fs);
         assert!(debug_str.contains("FS"));
@@ -3191,10 +3191,10 @@ mod tests {
     #[test]
     fn test_fs_clone_implementation() {
         let fs = FS::new();
-        
+
         // Test that Clone trait is properly implemented
         let cloned_fs = fs.clone();
-        
+
         // Both should be equivalent (since FS is currently empty)
         assert_eq!(format!("{:?}", fs), format!("{:?}", cloned_fs));
     }
@@ -3210,19 +3210,19 @@ mod tests {
     // Note: Most S3 API methods require complex setup with global state, storage backend,
     // and various dependencies that make unit testing challenging. For comprehensive testing
     // of S3 operations, integration tests would be more appropriate.
-    
+
     #[test]
     fn test_s3_error_scenarios() {
         // Test that we can create expected S3 errors for common validation cases
-        
+
         // Test incomplete body error
         let incomplete_body_error = s3_error!(IncompleteBody);
         assert_eq!(incomplete_body_error.code(), &S3ErrorCode::IncompleteBody);
-        
-        // Test invalid argument error  
+
+        // Test invalid argument error
         let invalid_arg_error = s3_error!(InvalidArgument, "test message");
         assert_eq!(invalid_arg_error.code(), &S3ErrorCode::InvalidArgument);
-        
+
         // Test internal error
         let internal_error = S3Error::with_message(S3ErrorCode::InternalError, "test".to_string());
         assert_eq!(internal_error.code(), &S3ErrorCode::InternalError);
@@ -3233,10 +3233,10 @@ mod tests {
         // Test that compression format detection works for common file extensions
         let zip_format = CompressionFormat::from_extension("zip");
         assert_eq!(zip_format.extension(), "zip");
-        
+
         let tar_format = CompressionFormat::from_extension("tar");
         assert_eq!(tar_format.extension(), "tar");
-        
+
         let gz_format = CompressionFormat::from_extension("gz");
         assert_eq!(gz_format.extension(), "gz");
     }
@@ -3246,7 +3246,7 @@ mod tests {
     // Removing this test as it requires too much S3 infrastructure setup.
 
     // Note: Testing actual S3 operations like put_object, get_object, etc. requires:
-    // 1. Initialized storage backend (ECStore)  
+    // 1. Initialized storage backend (ECStore)
     // 2. Global configuration setup
     // 3. Valid credentials and authorization
     // 4. Bucket and object metadata systems
