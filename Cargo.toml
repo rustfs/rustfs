@@ -224,7 +224,7 @@ serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
-shadow-rs = { version = "1.2.0", default-features = false }
+shadow-rs = { version = "1.2.1", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"
@@ -244,7 +244,7 @@ time = { version = "0.3.41", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.47.0", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.47.1", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
