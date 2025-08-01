@@ -479,7 +479,7 @@ mod tests {
         let is_valid_error = msg.contains("invalid access key is temp and expired")
             || msg.contains("invalid token")
             || msg.contains("action cred not init");
-        assert!(is_valid_error, "Unexpected error message: '{}'", msg);
+        assert!(is_valid_error, "Unexpected error message: '{msg}'");
     }
 
     #[test]
