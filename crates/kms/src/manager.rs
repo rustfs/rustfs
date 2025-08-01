@@ -204,7 +204,7 @@ impl KmsManager {
         // Perform initial health check
         if let Err(e) = client.health_check().await {
             warn!("KMS health check failed during initialization: {}", e);
-            panic!("KMS health check failed during initialization: {}", e);
+            panic!("KMS health check failed during initialization: {e}");
         }
 
         info!("KMS manager initialized with backend: {:?}", config.kms_type);

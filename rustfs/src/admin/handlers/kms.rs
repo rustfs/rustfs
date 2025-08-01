@@ -321,20 +321,17 @@ impl Operation for ConfigureKms {
         match rustfs_kms::KmsManager::new(kms_config).await {
             Ok(kms_manager) => {
                 let kms_manager = std::sync::Arc::new(kms_manager);
-                
+
                 // Configure global KMS
                 match rustfs_kms::configure_global_kms(kms_manager.clone()) {
                     Ok(()) => {
                         info!("Successfully configured KMS with type: {}", config_request.kms_type);
-                        
+
                         // Initialize bucket encryption manager and encryption service
-                        let bucket_manager = std::sync::Arc::new(
-                            rustfs_kms::BucketEncryptionManager::new()
-                        );
-                        let encryption_service = std::sync::Arc::new(
-                            rustfs_kms::ObjectEncryptionService::new((*kms_manager).clone())
-                        );
-                        
+                        let bucket_manager = std::sync::Arc::new(rustfs_kms::BucketEncryptionManager::new());
+                        let encryption_service =
+                            std::sync::Arc::new(rustfs_kms::ObjectEncryptionService::new((*kms_manager).clone()));
+
                         // Initialize global instances
                         if let Err(err) = rustfs_kms::init_global_bucket_encryption_manager(bucket_manager) {
                             error!("Failed to initialize bucket encryption manager: {}", err);
@@ -347,7 +344,7 @@ impl Operation for ConfigureKms {
                                 },
                             ));
                         }
-                        
+
                         if let Err(err) = rustfs_kms::init_global_encryption_service(encryption_service) {
                             error!("Failed to initialize encryption service: {}", err);
                             return Ok(kms_error_response(
@@ -359,7 +356,7 @@ impl Operation for ConfigureKms {
                                 },
                             ));
                         }
-                        
+
                         let response = ConfigureKmsResponse {
                             success: true,
                             message: "KMS configured successfully".to_string(),
