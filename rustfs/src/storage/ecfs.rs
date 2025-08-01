@@ -3176,7 +3176,7 @@ mod tests {
 
         // Verify that FS struct can be created successfully
         // Since it's currently empty, we just verify it doesn't panic
-        assert!(true);
+        // The test passes if we reach this point without panicking
     }
 
     #[test]
@@ -3184,7 +3184,7 @@ mod tests {
         let fs = FS::new();
 
         // Test that Debug trait is properly implemented
-        let debug_str = format!("{:?}", fs);
+        let debug_str = format!("{fs:?}");
         assert!(debug_str.contains("FS"));
     }
 
@@ -3196,7 +3196,7 @@ mod tests {
         let cloned_fs = fs.clone();
 
         // Both should be equivalent (since FS is currently empty)
-        assert_eq!(format!("{:?}", fs), format!("{:?}", cloned_fs));
+        assert_eq!(format!("{fs:?}"), format!("{cloned_fs:?}"));
     }
 
     #[test]
