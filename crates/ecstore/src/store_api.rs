@@ -400,6 +400,7 @@ pub struct ObjectInfo {
     pub replication_status: replication::StatusType,
     pub version_purge_status_internal: String,
     pub version_purge_status: replication::VersionPurgeStatusType,
+    pub replication_decision: String,
     pub checksum: Vec<u8>,
 }
 
@@ -434,6 +435,7 @@ impl Clone for ObjectInfo {
             replication_status: self.replication_status.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
+            replication_decision: self.replication_decision.clone(),
             checksum: Default::default(),
         }
     }

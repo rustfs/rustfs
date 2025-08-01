@@ -37,3 +37,8 @@ pub const AMZ_DECODED_CONTENT_LENGTH: &str = "X-Amz-Decoded-Content-Length";
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
 pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
+
+// SSEC encryption header constants
+pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
+pub const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
+pub const SSEC_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";

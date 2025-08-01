@@ -123,6 +123,10 @@ impl VersionPurgeStatusType {
     pub fn is_pending(&self) -> bool {
         matches!(self, VersionPurgeStatusType::Pending | VersionPurgeStatusType::Failed)
     }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, VersionPurgeStatusType::Empty)
+    }
 }
 
 impl fmt::Display for VersionPurgeStatusType {

@@ -1,18 +1,25 @@
-use crate::bucket::bucket_target_sys::{BucketTargetSys, GLOBAL_BUCKET_TARGET_SYS};
+use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata_sys;
 use crate::bucket::replication::{
-    ObjectOpts, ReplicationConfigurationExt as _, ReplicationType, ResyncTargetDecision, StatusType, VersionPurgeStatusType,
+    ObjectOpts, REPLICATION_RESET, ReplicateObjectInfo, ReplicationConfigurationExt as _, ReplicationState, ReplicationType,
+    ResyncTargetDecision, StatusType, VersionPurgeStatusType, replication_statuses_map, target_reset_header,
+    version_purge_statuses_map,
 };
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
-use crate::store_api::{ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
+use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 use byteorder::ByteOrder;
-use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING};
+use futures::future::join_all;
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER,
+    SSEC_KEY_MD5_HEADER,
+};
 use rustfs_utils::path::path_join_buf;
+use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,11 +34,6 @@ use tracing::{error, warn};
 
 use super::replication_type::{ReplicateDecision, ReplicateTargetDecision, ResyncDecision};
 use regex::Regex;
-
-// SSEC encryption header constants
-const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
-const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
-const SSEC_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
 
 const REPLICATION_DIR: &str = ".replication";
 const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -312,7 +314,7 @@ impl ReplicationResyncer {
             }
         };
 
-        let _r_cfg = ReplicationConfig::new(cfg.clone(), Some(targets));
+        let rcfg = ReplicationConfig::new(cfg.clone(), Some(targets));
 
         let target_arns = if let Some(cfg) = cfg {
             cfg.filter_target_arns(&ObjectOpts {
@@ -387,6 +389,48 @@ impl ReplicationResyncer {
             None
         };
 
+        let mut worker_txs = Vec::new();
+
+        let mut futures = Vec::new();
+
+        for _ in 0..RESYNC_WORKER_COUNT {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ReplicateObjectInfo>(100);
+            worker_txs.push(tx);
+
+            let mut cancel_token = cancel_token.resubscribe();
+
+            let f = tokio::spawn(async move {
+                while let Some(mut roi) = rx.recv().await {
+                    if cancel_token.try_recv().is_ok() {
+                        return;
+                    }
+
+                    if roi.delete_marker || !roi.version_purge_status.is_empty() {
+                        let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
+                            (None, roi.version_id)
+                        } else {
+                            (roi.version_id, None)
+                        };
+
+                        let doi = DeletedObjectReplicationInfo {
+                            delete_object: DeletedObject {
+                                object_name: roi.name,
+                                version_id,
+                                ..Default::default()
+                            },
+                            bucket: roi.bucket,
+                            event_type: "delete".to_string(),
+                            op_type: ReplicationType::ExistingObject,
+                        };
+                    }
+
+                    todo!()
+                }
+            });
+
+            futures.push(f);
+        }
+
         while let Some(res) = rx.recv().await {
             if let Some(err) = res.err {
                 error!("Failed to get object info: {}", err);
@@ -418,9 +462,134 @@ impl ReplicationResyncer {
                 continue;
             }
             last_checkpoint = None;
+
+            let roi = get_heal_replicate_object_info(&object, &rcfg).await;
+            if !roi.existing_obj_resync.must_resync() {
+                continue;
+            }
+
+            if self.resync_cancel_rx.try_recv().is_ok() {
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
+                    .await;
+                return;
+            }
+
+            if cancel_token.try_recv().is_ok() {
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                    .await;
+                return;
+            }
+
+            let worker_idx = sip_hash(&roi.name, RESYNC_WORKER_COUNT, &DEFAULT_SIP_HASH_KEY) as usize;
+
+            if let Err(err) = worker_txs[worker_idx].send(roi).await {
+                error!("Failed to send object info to worker: {}", err);
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                    .await;
+                return;
+            }
         }
 
-        todo!()
+        for worker_tx in worker_txs {
+            drop(worker_tx);
+        }
+
+        join_all(futures).await;
+
+        self.resync_bucket_mark_status(ResyncStatusType::ResyncCompleted, opts.clone(), storage.clone())
+            .await;
+    }
+}
+
+pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
+    let mut oi = oi.clone();
+    let mut user_defined = oi.user_defined.clone();
+
+    if let Some(rc) = rcfg.config.as_ref()
+        && !rc.role.is_empty()
+    {
+        if !oi.replication_status.is_empty() {
+            oi.replication_status_internal = format!("{}={};", rc.role, oi.replication_status.as_str());
+        }
+
+        if !oi.replication_status.is_empty() {
+            oi.replication_status_internal = format!("{}={};", rc.role, oi.replication_status.as_str());
+        }
+
+        let keys_to_update: Vec<_> = user_defined
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}").as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (k, v) in keys_to_update {
+            user_defined.remove(&k);
+            user_defined.insert(target_reset_header(rc.role.as_str()), v);
+        }
+    }
+
+    let dsc = if oi.delete_marker || !oi.replication_status.is_empty() {
+        check_replicate_delete(
+            oi.bucket.as_str(),
+            &ObjectToDelete {
+                object_name: oi.name.clone(),
+                version_id: oi.version_id,
+            },
+            &oi,
+            &ObjectOptions {
+                versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+                version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    } else {
+        must_replicate(
+            oi.bucket.as_str(),
+            &oi.name,
+            MustReplicateOptions::new(
+                &user_defined,
+                oi.user_tags.clone(),
+                StatusType::Empty,
+                ReplicationType::Heal,
+                ObjectOptions::default(),
+            ),
+        )
+        .await
+    };
+
+    let target_statuses = replication_statuses_map(&oi.replication_status_internal);
+    let target_purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal);
+    let existing_obj_resync = rcfg.resync(oi.clone(), dsc.clone(), &target_statuses).await;
+    let mut replication_state = oi.replication_state();
+    replication_state.replicate_decision_str = dsc.to_string();
+    let actual_size = oi.get_actual_size().unwrap_or_default();
+
+    ReplicateObjectInfo {
+        name: oi.name.clone(),
+        size: oi.size,
+        actual_size,
+        bucket: oi.bucket.clone(),
+        version_id: oi.version_id,
+        etag: oi.etag.clone(),
+        mod_time: oi.mod_time,
+        replication_status: oi.replication_status,
+        replication_status_internal: oi.replication_status_internal.clone(),
+        delete_marker: oi.delete_marker,
+        version_purge_status_internal: oi.version_purge_status_internal.clone(),
+        version_purge_status: oi.version_purge_status,
+        replication_state,
+        op_type: ReplicationType::Heal,
+        dsc,
+        existing_obj_resync,
+        target_statuses,
+        target_purge_statuses,
+        replication_timestamp: None,
+        ssec: false, // TODO: add ssec support
+        user_tags: oi.user_tags.clone(),
+        checksum: None,
+        retry_count: 0,
     }
 }
 
@@ -456,6 +625,15 @@ async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfig
         }
     };
     Ok(config)
+}
+
+pub struct DeletedObjectReplicationInfo {
+    pub delete_object: DeletedObject,
+    pub bucket: String,
+    pub event_type: String,
+    pub op_type: ReplicationType,
+    pub reset_id: String,
+    pub target_arn: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -612,18 +790,6 @@ impl MustReplicateOptions {
     }
 }
 
-// pub async fn check_replicate_delete(
-//     bucket: &str,
-//     dobj: ObjectToDelete,
-//     oi: &ObjectInfo,
-//     del_opts: ObjectOptions,
-//     err: Option<String>,
-// ) -> ReplicateDecision {
-//     if oi.delete_marker {
-//         todo!()
-//     }
-// }
-
 /// Returns whether object version is a delete marker and if object qualifies for replication
 pub async fn check_replicate_delete(
     bucket: &str,
@@ -700,11 +866,7 @@ pub async fn check_replicate_delete(
             continue;
         }
 
-        let tgt = GLOBAL_BUCKET_TARGET_SYS
-            .get()
-            .expect("GLOBAL_BUCKET_TARGET_SYS not initialized")
-            .get_remote_target_client(bucket, &tgt_arn)
-            .await;
+        let tgt = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_arn).await;
         // The target online status should not be used here while deciding
         // whether to replicate deletes as the target could be temporarily down
         let tgt_dsc = if let Some(tgt) = tgt {
@@ -726,8 +888,9 @@ fn is_ssec_encrypted(user_defined: &std::collections::HashMap<String, String>) -
 }
 
 /// Extension trait for ObjectInfo to add replication-related methods
-trait ObjectInfoExt {
+pub trait ObjectInfoExt {
     fn target_replication_status(&self, arn: &str) -> StatusType;
+    fn replication_state(&self) -> ReplicationState;
 }
 
 impl ObjectInfoExt for ObjectInfo {
@@ -744,6 +907,32 @@ impl ObjectInfoExt for ObjectInfo {
             }
         }
         StatusType::default()
+    }
+
+    fn replication_state(&self) -> ReplicationState {
+        ReplicationState {
+            replication_status_internal: self.replication_status_internal.clone(),
+            version_purge_status_internal: self.version_purge_status_internal.clone(),
+            replicate_decision_str: self.replication_decision.clone(),
+            targets: replication_statuses_map(&self.replication_status_internal),
+            purge_targets: version_purge_statuses_map(&self.version_purge_status_internal),
+            reset_statuses_map: self
+                .user_defined
+                .iter()
+                .filter_map(|(k, v)| {
+                    if k.starts_with(&format!("{RESERVED_METADATA_PREFIX_LOWER}-{REPLICATION_RESET}")) {
+                        Some((
+                            k.trim_start_matches(&format!("{RESERVED_METADATA_PREFIX_LOWER}-{REPLICATION_RESET}"))
+                                .to_string(),
+                            v.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 }
 

@@ -13,10 +13,14 @@
 // limitations under the License.
 
 use crate::bucket::replication::replication_resyncer::MustReplicateOptions;
+use crate::bucket::replication::replication_resyncer::ObjectInfoExt;
 use crate::bucket::replication::replication_resyncer::ReplicationConfig;
+use crate::bucket::replication::replication_resyncer::check_replicate_delete;
 use crate::bucket::replication::replication_resyncer::must_replicate;
+use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;
+use crate::store_api::ObjectToDelete;
 
 use super::datatypes::{StatusType, VersionPurgeStatusType};
 use regex::Regex;
@@ -29,8 +33,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
-const REPLICATION_RESET: &str = "replication-reset";
+pub const REPLICATION_RESET: &str = "replication-reset";
 
 /// Type - replication type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -109,7 +114,7 @@ pub struct MRFReplicateEntry {
     pub object: String,
 
     #[serde(skip_serializing, skip_deserializing)]
-    pub version_id: String,
+    pub version_id: Option<Uuid>,
 
     #[serde(rename = "retryCount")]
     pub retry_count: i32,
@@ -400,7 +405,7 @@ pub struct ResyncTargetDecision {
     pub reset_before_date: Option<OffsetDateTime>,
 }
 
-fn target_reset_header(arn: &str) -> String {
+pub fn target_reset_header(arn: &str) -> String {
     format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}-{arn}")
 }
 
@@ -496,8 +501,8 @@ pub struct ReplicateObjectInfo {
     pub size: i64,
     pub actual_size: i64,
     pub bucket: String,
-    pub version_id: String,
-    pub etag: String,
+    pub version_id: Option<Uuid>,
+    pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
     pub replication_status: StatusType,
     pub replication_status_internal: String,
@@ -512,7 +517,7 @@ pub struct ReplicateObjectInfo {
     pub target_purge_statuses: HashMap<String, VersionPurgeStatusType>,
     pub replication_timestamp: Option<OffsetDateTime>,
     pub ssec: bool,
-    pub user_tags: HashMap<String, String>,
+    pub user_tags: String,
     pub checksum: Option<String>,
     pub retry_count: u32,
 }
@@ -538,80 +543,37 @@ impl ReplicateObjectInfo {
         MRFReplicateEntry {
             bucket: self.bucket.clone(),
             object: self.name.clone(),
-            version_id: self.version_id.clone(),
+            version_id: self.version_id,
             retry_count: self.retry_count as i32,
             size: self.size,
         }
     }
+}
 
-    pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, r_cfg: &ReplicationConfig) -> Self {
-        let mut oi = oi.clone();
-        let mut user_defined = oi.user_defined.clone();
-
-        if let Some(rc) = r_cfg.config.as_ref()
-            && !rc.role.is_empty()
-        {
-            if !oi.replication_status.is_empty() {
-                oi.replication_status_internal = format!("{}={};", rc.role, oi.replication_status.as_str());
-            }
-
-            if !oi.replication_status.is_empty() {
-                oi.replication_status_internal = format!("{}={};", rc.role, oi.replication_status.as_str());
-            }
-
-            let keys_to_update: Vec<_> = user_defined
-                .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}").as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-
-            for (k, v) in keys_to_update {
-                user_defined.remove(&k);
-                user_defined.insert(target_reset_header(rc.role.as_str()), v);
-            }
+// constructs a replication status map from string representation
+pub fn replication_statuses_map(s: &str) -> HashMap<String, StatusType> {
+    let mut targets = HashMap::new();
+    let rep_stat_matches = REPL_STATUS_REGEX.captures_iter(s).map(|c| c.extract());
+    for (_, [arn, status]) in rep_stat_matches {
+        if arn.is_empty() {
+            continue;
         }
-
-        if oi.delete_marker || !oi.replication_status.is_empty() {
-            todo!()
-        } else {
-            must_replicate(
-                oi.bucket.as_str(),
-                &oi.name,
-                MustReplicateOptions::new(
-                    &user_defined,
-                    oi.user_tags.clone(),
-                    StatusType::Empty,
-                    ReplicationType::Heal,
-                    ObjectOptions::default(),
-                ),
-            )
-            .await;
-        };
-
-        Self {
-            name: oi.name.clone(),
-            size: oi.size,
-            actual_size: oi.actual_size,
-            bucket: oi.bucket.clone(),
-            version_id: oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
-            etag: oi.etag.unwrap_or_default(),
-            mod_time: oi.mod_time,
-            replication_status: oi.replication_status,
-            replication_status_internal: oi.replication_status_internal.clone(),
-            delete_marker: oi.delete_marker,
-            version_purge_status_internal: oi.version_purge_status_internal.clone(),
-            version_purge_status: oi.version_purge_status,
-            replication_state: ReplicationState::default(),
-            op_type: ReplicationType::Heal,
-            dsc: ReplicateDecision::default(),
-            existing_obj_resync: ResyncDecision::default(),
-            target_statuses: HashMap::new(),
-            target_purge_statuses: HashMap::new(),
-            replication_timestamp: None,
-            ssec: false,
-            user_tags: HashMap::new(),
-            checksum: None,
-            retry_count: 0,
-        }
+        let status = StatusType::from(status);
+        targets.insert(arn.to_string(), status);
     }
+    targets
+}
+
+// constructs a version purge status map from string representation
+pub fn version_purge_statuses_map(s: &str) -> HashMap<String, VersionPurgeStatusType> {
+    let mut targets = HashMap::new();
+    let purge_status_matches = REPL_STATUS_REGEX.captures_iter(s).map(|c| c.extract());
+    for (_, [arn, status]) in purge_status_matches {
+        if arn.is_empty() {
+            continue;
+        }
+        let status = VersionPurgeStatusType::from(status);
+        targets.insert(arn.to_string(), status);
+    }
+    targets
 }
