@@ -238,7 +238,7 @@ mod tests {
         let _hybrid_service = hybrid(rest_service, grpc_service);
 
         // Test that the hybrid service can be created
-        assert!(true);
+        // Test passes if we reach this point without panicking
     }
 
     #[test]
@@ -249,7 +249,7 @@ mod tests {
         };
 
         // Test that the hybrid service can be created directly
-        assert!(true);
+        // Test passes if we reach this point without panicking
     }
 
     #[test]

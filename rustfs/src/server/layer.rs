@@ -135,7 +135,7 @@ mod tests {
         let _service = layer.layer(mock_service);
 
         // Just verify the service is created successfully
-        assert!(true);
+        // Test passes if we reach this point without panicking
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
         let _service = RedirectService { inner: MockService };
 
         // Test that the service can be created
-        assert!(true);
+        // Test passes if we reach this point without panicking
     }
 
     // Testing redirect logic without full HTTP setup
@@ -185,8 +185,7 @@ mod tests {
             let trimmed = path.trim_end_matches('/');
             assert!(
                 trimmed.is_empty() || trimmed == "/rustfs" || trimmed == "/index.html",
-                "Path {} should trigger redirect",
-                path
+                "Path {path} should trigger redirect"
             );
         }
 
@@ -194,8 +193,7 @@ mod tests {
             let trimmed = path.trim_end_matches('/');
             assert!(
                 !(trimmed.is_empty() || trimmed == "/rustfs" || trimmed == "/index.html"),
-                "Path {} should not trigger redirect",
-                path
+                "Path {path} should not trigger redirect"
             );
         }
     }
