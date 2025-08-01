@@ -1109,9 +1109,9 @@ mod tests {
             server: BackendInfo::default(),
             policy: BucketPolicy::default(),
         };
-        
+
         assert_eq!(account_info.account_name, "test-account");
-        
+
         // Test JSON serialization (PascalCase rename)
         let json_str = serde_json::to_string(&account_info).unwrap();
         assert!(json_str.contains("AccountName"));
@@ -1121,7 +1121,7 @@ mod tests {
     fn test_account_info_default() {
         // Test that AccountInfo can be created with default values
         let default_info = AccountInfo::default();
-        
+
         assert!(default_info.account_name.is_empty());
     }
 
@@ -1141,12 +1141,12 @@ mod tests {
         let _set_remote_target_handler = SetRemoteTargetHandler {};
         let _list_remote_target_handler = ListRemoteTargetHandler {};
         let _remove_remote_target_handler = RemoveRemoteTargetHandler {};
-        
+
         // Just verify they can be created without panicking
         assert!(true);
     }
 
-    #[test] 
+    #[test]
     fn test_heal_opts_serialization() {
         // Test that HealOpts can be properly deserialized
         let heal_opts_json = json!({
@@ -1158,10 +1158,10 @@ mod tests {
             "updateParity": true,
             "nolock": false
         });
-        
+
         let json_str = serde_json::to_string(&heal_opts_json).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        
+
         assert_eq!(parsed["recursive"], true);
         assert_eq!(parsed["scanMode"], 2);
     }
@@ -1180,11 +1180,11 @@ mod tests {
             pool: Some(1),
             set: Some(0),
         };
-        
+
         let encoded = serde_urlencoded::to_string(&opts).unwrap();
         assert!(encoded.contains("recursive=true"));
         assert!(encoded.contains("remove=true"));
-        
+
         // Test round-trip
         let decoded: HealOpts = serde_urlencoded::from_str(&encoded).unwrap();
         assert_eq!(decoded.recursive, opts.recursive);
@@ -1202,7 +1202,7 @@ mod tests {
     // Note: Testing the actual async handler implementations requires:
     // 1. S3Request setup with proper headers, URI, and credentials
     // 2. Global object store initialization
-    // 3. IAM system initialization  
+    // 3. IAM system initialization
     // 4. Mock or real backend services
     // 5. Authentication and authorization setup
     //
