@@ -16,7 +16,7 @@ use super::BitrotReader;
 use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::io;
 use std::io::ErrorKind;
@@ -84,62 +84,70 @@ where
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
 
-        let mut next_reader_index = 0;
-
-        let mut reader_iter = self.readers.iter_mut();
-        while next_reader_index < num_readers {
-            let fine_shard_count = shards.iter().filter(|s| s.is_some()).count();
-            if fine_shard_count >= self.data_shards {
-                break;
-            }
-
-            let readers_to_trigger = self.data_shards - fine_shard_count;
-            if next_reader_index + readers_to_trigger > num_readers {
-                break;
-            }
-
-            let mut futures = Vec::with_capacity(readers_to_trigger);
-            for i in next_reader_index..next_reader_index + readers_to_trigger {
-                let future = if let Some(reader) = reader_iter.next().unwrap() {
-                    Box::pin(async move {
-                        let mut buf = vec![0u8; shard_size];
-                        match reader.read(&mut buf).await {
-                            Ok(n) => {
-                                buf.truncate(n);
-                                (i, Ok(buf))
-                            }
-                            Err(e) => (i, Err(Error::from(e))),
+        let mut futures = Vec::with_capacity(self.total_shards);
+        let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
+        for (i, reader) in reader_iter.enumerate() {
+            let future = if let Some(reader) = reader {
+                Box::pin(async move {
+                    let mut buf = vec![0u8; shard_size];
+                    match reader.read(&mut buf).await {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            (i, Ok(buf))
                         }
-                    })
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-                } else {
-                    // reader是None时返回FileNotFound错误
-                    Box::pin(async move { (i, Err(Error::FileNotFound)) })
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-                };
-                futures.push(future);
-            }
-
-            let results = join_all(futures).await;
-
-            for (i, shard) in results.into_iter() {
-                match shard {
-                    Ok(data) => {
-                        if !data.is_empty() {
-                            shards[i] = Some(data);
-                        }
+                        Err(e) => (i, Err(Error::from(e))),
                     }
-                    Err(e) => {
-                        // error!("Error reading shard {}: {}", i, e);
-                        errs[i] = Some(e);
-                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+            } else {
+                // reader是None时返回FileNotFound错误
+                Box::pin(async move { (i, Err(Error::FileNotFound)) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+            };
+
+            futures.push(future);
+        }
+
+        if futures.len() >= self.data_shards {
+            let mut fut_iter = futures.into_iter();
+            let mut sets = FuturesUnordered::new();
+            for _ in 0..self.data_shards {
+                if let Some(future) = fut_iter.next() {
+                    sets.push(future);
                 }
             }
 
-            next_reader_index += readers_to_trigger;
-        }
+            let mut running_readers = self.data_shards;
+            let mut next_reader_index = self.data_shards;
+            while let Some((i, result)) = sets.next().await {
+                running_readers -= 1;
+                match result {
+                    Ok(v) => {
+                        shards[i] = Some(v);
+                    }
+                    Err(e) => {
+                        errs[i] = Some(e);
 
-        self.offset += shard_size;
+                        // The number of shards we already got
+                        let fine_shards_count = shards.iter().filter(|s| s.is_some()).count();
+                        // The number of shards we need to decode the block
+                        let need_shards = self.data_shards - fine_shards_count;
+                        // The number of shards we haven't try to read yet
+                        let untriggered_readers = self.total_shards - next_reader_index;
+
+                        if need_shards > running_readers + untriggered_readers {
+                            // We're doomed, just wait for the running readers to finish
+                            continue;
+                        }
+
+                        if let Some(future) = fut_iter.next() {
+                            sets.push(future);
+                            running_readers += 1;
+                            next_reader_index += 1;
+                        }
+                    }
+                }
+            }
+        }
 
         (shards, errs)
     }
