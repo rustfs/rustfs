@@ -4,10 +4,10 @@ use crate::{
     manager::KmsManager,
     types::EncryptionMetadata,
 };
-use tracing::info;
 use base64::Engine;
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tracing::info;
 
 /// Service for encrypting and decrypting S3 objects
 pub struct ObjectEncryptionService {
@@ -39,21 +39,25 @@ impl ObjectEncryptionService {
         reader.read_to_end(&mut data).await?;
 
         // Determine the actual key ID to use
-        let actual_key_id = kms_key_id.unwrap_or_else(|| {
-            self.kms_manager.default_key_id().unwrap_or("rustfs-default-key")
-        });
+        let actual_key_id = kms_key_id.unwrap_or_else(|| self.kms_manager.default_key_id().unwrap_or("rustfs-default-key"));
 
         // Only auto-create keys for SSE-S3 and SSE-KMS
         let is_sse_s3 = algorithm == "AES256" && kms_key_id.is_none();
         let is_sse_kms = algorithm == "aws:kms" || kms_key_id.is_some();
-        
+
         if is_sse_s3 || is_sse_kms {
             let key_exists = self.kms_manager.describe_key(actual_key_id, None).await.is_ok();
             if !key_exists {
-                info!("Key {} not found, attempting to create key for {} encryption", 
-                      actual_key_id, if is_sse_s3 { "SSE-S3" } else { "SSE-KMS" });
+                info!(
+                    "Key {} not found, attempting to create key for {} encryption",
+                    actual_key_id,
+                    if is_sse_s3 { "SSE-S3" } else { "SSE-KMS" }
+                );
                 // Attempt to create key, but don't fail if creation fails (for testing environments)
-                let _ = self.kms_manager.create_key(actual_key_id, "AES_256", None).await
+                let _ = self
+                    .kms_manager
+                    .create_key(actual_key_id, "AES_256", None)
+                    .await
                     .map_err(|e| {
                         info!("Failed to create key {}: {:?}, continuing with existing key", actual_key_id, e);
                         e
@@ -64,8 +68,7 @@ impl ObjectEncryptionService {
         // Generate data encryption key
         let _context = encryption_context.unwrap_or_else(|| format!("bucket={bucket}&key={key}"));
 
-        let request = crate::types::GenerateKeyRequest::new(actual_key_id.to_string(), "AES_256".to_string())
-            .with_length(32);
+        let request = crate::types::GenerateKeyRequest::new(actual_key_id.to_string(), "AES_256".to_string()).with_length(32);
 
         let data_key_result = self.kms_manager.generate_data_key(&request, None).await?;
 
@@ -188,7 +191,7 @@ impl ObjectEncryptionService {
         let tag = base64::engine::general_purpose::STANDARD
             .decode(tag_str)
             .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid tag: {e}")))?;
-        
+
         // Use empty AAD as default (consistent with encryption)
         let aad = b"";
 
@@ -243,12 +246,16 @@ mod tests {
             "x-amz-server-side-encryption-context".to_string(),
             serde_json::to_string(&metadata.encryption_context).unwrap_or_default(),
         );
-        metadata_map.insert("iv".to_string(), base64::engine::general_purpose::STANDARD.encode(&metadata.iv));
+        metadata_map.insert(
+            "x-amz-server-side-encryption-iv".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
+        );
         if let Some(tag) = &metadata.tag {
-            metadata_map.insert("tag".to_string(), base64::engine::general_purpose::STANDARD.encode(tag));
+            metadata_map.insert(
+                "x-amz-server-side-encryption-tag".to_string(),
+                base64::engine::general_purpose::STANDARD.encode(tag),
+            );
         }
-        // Add AAD for testing
-        metadata_map.insert("aad".to_string(), base64::engine::general_purpose::STANDARD.encode(b""));
         // Use the actual encrypted data key from encrypt_object
         metadata_map.insert(
             "x-amz-server-side-encryption-key".to_string(),

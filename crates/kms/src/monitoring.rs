@@ -505,10 +505,10 @@ mod tests {
         assert_eq!(metrics.total_count, 3);
         assert_eq!(metrics.success_count, 2);
         assert_eq!(metrics.failure_count, 1);
-        
+
         let success_rate = metrics.success_rate();
         let failure_rate = metrics.failure_rate();
-        
+
         // Allow small floating point differences
         assert!((success_rate - 66.66666666666667).abs() < 0.01);
         assert!((failure_rate - 33.333333333333336).abs() < 0.01);

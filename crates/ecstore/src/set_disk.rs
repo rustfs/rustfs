@@ -5256,7 +5256,6 @@ impl StorageAPI for SetDisks {
                 return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
             }
 
-
             if (i < uploaded_parts.len() - 1) && !is_min_allowed_part_size(ext_part.actual_size) {
                 error!(
                     "complete_multipart_upload is_min_allowed_part_size err {:?}, part_id={}, bucket={}, object={}",
@@ -5310,7 +5309,6 @@ impl StorageAPI for SetDisks {
 
         // TODO: object_actual_size
         let _ = object_actual_size;
-
 
         for meta in parts_metadatas.iter_mut() {
             if meta.is_valid() {

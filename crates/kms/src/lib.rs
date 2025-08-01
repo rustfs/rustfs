@@ -317,13 +317,13 @@ pub fn init_all_encryption_services(
 /// clean up all encryption-related resources.
 pub fn shutdown_all_encryption_services() {
     shutdown_global_kms();
-    
+
     if let Some(manager_lock) = GLOBAL_BUCKET_ENCRYPTION_MANAGER.get() {
         if let Ok(mut mgr) = manager_lock.write() {
             *mgr = None;
         }
     }
-    
+
     if let Some(service_lock) = GLOBAL_ENCRYPTION_SERVICE.get() {
         if let Ok(mut svc) = service_lock.write() {
             *svc = None;
