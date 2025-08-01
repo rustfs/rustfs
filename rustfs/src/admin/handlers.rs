@@ -1143,7 +1143,7 @@ mod tests {
         let _remove_remote_target_handler = RemoveRemoteTargetHandler {};
 
         // Just verify they can be created without panicking
-        assert!(true);
+        // Test passes if we reach this point without panicking
     }
 
     #[test]
@@ -1181,7 +1181,7 @@ mod tests {
             set: Some(0),
         };
 
-        let encoded = serde_urlencoded::to_string(&opts).unwrap();
+        let encoded = serde_urlencoded::to_string(opts).unwrap();
         assert!(encoded.contains("recursive=true"));
         assert!(encoded.contains("remove=true"));
 
