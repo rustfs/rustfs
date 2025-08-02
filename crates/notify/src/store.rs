@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::error::StoreError;
-use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT, DEFAULT_LIMIT};
+use rustfs_config::DEFAULT_LIMIT;
+use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::sync::{Arc, RwLock};

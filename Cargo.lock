@@ -788,7 +788,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.3.1",
  "http-body 0.4.6",
- "lru 0.12.5",
+ "lru",
  "percent-encoding",
  "regex-lite",
  "sha2 0.10.9",
@@ -1153,50 +1153,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "axum-extra"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45bf463831f5131b7d3c756525b305d40f1185b688565648a92e1392ca35713d"
-dependencies = [
- "axum",
- "axum-core",
- "bytes",
- "futures-util",
- "http 1.3.1",
- "http-body 1.0.1",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "rustversion",
- "serde",
- "tower",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
-name = "axum-server"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "495c05f60d6df0093e8fb6e74aa5846a0ad06abaf96d76166283720bf740f8ab"
-dependencies = [
- "arc-swap",
- "bytes",
- "fs-err",
- "http 1.3.1",
- "http-body 1.0.1",
- "hyper 1.6.0",
- "hyper-util",
- "pin-project-lite",
- "rustls 0.23.31",
- "rustls-pemfile 2.2.0",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls 0.26.2",
- "tower-service",
 ]
 
 [[package]]
@@ -3971,16 +3927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs-err"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88d7be93788013f265201256d58f04936a8079ad5dc898743aa20525f503b683"
-dependencies = [
- "autocfg",
- "tokio",
-]
-
-[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5614,15 +5560,6 @@ name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.4",
-]
-
-[[package]]
-name = "lru"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86ea4e65087ff52f3862caff188d489f1fab49a0cb09e01b2e3f1a617b10aaed"
 dependencies = [
  "hashbrown 0.15.4",
 ]
@@ -7680,9 +7617,9 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78eaea1f52c56d57821be178b2d47e09ff26481a6042e8e042fcb0ced068b470"
+checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.16",
  "libredox",
@@ -8105,8 +8042,6 @@ dependencies = [
  "atoi",
  "atomic_enum",
  "axum",
- "axum-extra",
- "axum-server",
  "bytes",
  "chrono",
  "clap",
@@ -8173,30 +8108,21 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
- "bytes",
  "chrono",
  "futures",
- "lazy_static",
- "once_cell",
- "rmp-serde",
  "rustfs-common",
  "rustfs-ecstore",
  "rustfs-filemeta",
- "rustfs-lock",
  "rustfs-madmin",
- "rustfs-utils",
  "serde",
  "serde_json",
  "serial_test",
  "tempfile",
  "thiserror 2.0.12",
- "time",
  "tokio",
- "tokio-test",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
  "walkdir",
 ]
@@ -8230,19 +8156,12 @@ version = "0.0.5"
 dependencies = [
  "base64-simd",
  "bytes",
- "bytes-utils",
  "crc-fast",
- "hex",
  "http 1.3.1",
- "http-body 1.0.1",
  "md-5",
- "pin-project-lite",
  "pretty_assertions",
  "sha1 0.10.6",
  "sha2 0.10.9",
- "tokio",
- "tracing",
- "tracing-test",
 ]
 
 [[package]]
@@ -8318,7 +8237,6 @@ dependencies = [
  "num_cpus",
  "once_cell",
  "path-absolutize",
- "path-clean",
  "pin-project-lite",
  "quick-xml 0.38.0",
  "rand 0.9.2",
@@ -8436,10 +8354,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "lazy_static",
- "lru 0.16.0",
  "once_cell",
- "rand 0.9.2",
  "rustfs-protos",
  "serde",
  "serde_json",
@@ -8590,7 +8505,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-test",
  "tokio-util",
 ]
 
@@ -8669,12 +8583,9 @@ dependencies = [
  "bytes",
  "http 1.3.1",
  "hyper 1.6.0",
- "rand 0.9.2",
  "rustfs-utils",
  "s3s",
- "serde",
  "serde_urlencoded",
- "tempfile",
  "time",
  "tracing",
 ]
@@ -9230,9 +9141,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.141"
+version = "1.0.142"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30b9eff21ebe718216c6ec64e1d9ac57087aad11efc64e32002bce4a0d4c03d3"
+checksum = "030fedb782600dcbd6f02d479bf0d817ac3bb40d644745b769d6a96bc3afc5a7"
 dependencies = [
  "itoa 1.0.15",
  "memchr",
@@ -10381,19 +10292,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-test"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
-dependencies = [
- "async-stream",
- "bytes",
- "futures-core",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10735,27 +10633,6 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
-]
-
-[[package]]
-name = "tracing-test"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "557b891436fe0d5e0e363427fc7f217abf9ccd510d5136549847bdcbcd011d68"
-dependencies = [
- "tracing-core",
- "tracing-subscriber",
- "tracing-test-macro",
-]
-
-[[package]]
-name = "tracing-test-macro"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
-dependencies = [
- "quote",
- "syn 2.0.104",
 ]
 
 [[package]]
