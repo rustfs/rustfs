@@ -53,21 +53,19 @@ fn main() -> Result<(), AnyError> {
     let flatbuffer_out_dir = project_root_dir.join("generated").join("flatbuffers_generated");
     // let descriptor_set_path = PathBuf::from(env::var(ENV_OUT_DIR).unwrap()).join("proto-descriptor.bin");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .out_dir(proto_out_dir)
         // .file_descriptor_set_path(descriptor_set_path)
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_well_known_types(true)
-        .bytes(["."])
+        .bytes(".")
         .emit_rerun_if_changed(false)
-        .compile_protos(proto_files, &[proto_dir.clone()])
+        .compile_protos(proto_files, &[proto_dir.to_string_lossy().as_ref()])
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;
 
     // protos/gen/mod.rs
     let generated_mod_rs_path = project_root_dir.join("generated").join("proto_gen").join("mod.rs");
-
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
-    writeln!(&mut generated_mod_rs, "pub mod node_service;")?;
     writeln!(
         &mut generated_mod_rs,
         r#"// Copyright 2024 RustFS Team
@@ -84,12 +82,13 @@ fn main() -> Result<(), AnyError> {
     // See the License for the specific language governing permissions and
     // limitations under the License."#
     )?;
+    writeln!(&mut generated_mod_rs, "\n")?;
+    writeln!(&mut generated_mod_rs, "pub mod node_service;")?;
     generated_mod_rs.flush()?;
 
     let generated_mod_rs_path = project_root_dir.join("generated").join("mod.rs");
-
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
-    writeln!(&mut generated_mod_rs, "#![allow(unused_imports)]")?;
+
     writeln!(
         &mut generated_mod_rs,
         r#"// Copyright 2024 RustFS Team
@@ -106,6 +105,9 @@ fn main() -> Result<(), AnyError> {
     // See the License for the specific language governing permissions and
     // limitations under the License."#
     )?;
+    writeln!(&mut generated_mod_rs, "\n")?;
+    writeln!(&mut generated_mod_rs, "#![allow(unused_imports)]")?;
+    writeln!(&mut generated_mod_rs, "\n")?;
     writeln!(&mut generated_mod_rs, "#![allow(clippy::all)]")?;
     writeln!(&mut generated_mod_rs, "pub mod proto_gen;")?;
     generated_mod_rs.flush()?;

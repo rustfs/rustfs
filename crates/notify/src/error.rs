@@ -82,6 +82,15 @@ pub enum TargetError {
 
     #[error("Target is disabled")]
     Disabled,
+
+    #[error("Configuration parsing error: {0}")]
+    ParseError(String),
+
+    #[error("Failed to save configuration: {0}")]
+    SaveConfig(String),
+
+    #[error("Server not initialized: {0}")]
+    ServerNotInitialized(String),
 }
 
 /// Error types for the notification system
@@ -112,7 +121,7 @@ pub enum NotificationError {
     AlreadyInitialized,
 
     #[error("I/O error: {0}")]
-    Io(std::io::Error),
+    Io(io::Error),
 
     #[error("Failed to read configuration: {0}")]
     ReadConfig(String),

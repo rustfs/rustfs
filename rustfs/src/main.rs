@@ -37,8 +37,8 @@ use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
-use rustfs_ecstore::config::GLOBAL_ConfigSys;
-use rustfs_ecstore::config::GLOBAL_ServerConfig;
+use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
+use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
@@ -159,7 +159,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     ecconfig::init();
     // config system configuration
-    GLOBAL_ConfigSys.init(store.clone()).await?;
+    GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
     // Initialize event notifier
     init_event_notifier().await;
@@ -281,7 +281,7 @@ pub(crate) async fn init_event_notifier() {
     info!("Initializing event notifier...");
 
     // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_ServerConfig.get() {
+    let server_config = match GLOBAL_SERVER_CONFIG.get() {
         Some(config) => config.clone(), // Clone the config to pass ownership
         None => {
             error!("Event notifier initialization failed: Global server config not loaded.");

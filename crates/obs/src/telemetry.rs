@@ -29,9 +29,9 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
+use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
-    SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
@@ -293,7 +293,8 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         }
     } else {
         // Obtain the log directory and file name configuration
-        let log_directory = config.log_directory.as_deref().unwrap_or(DEFAULT_LOG_DIR);
+        let default_log_directory = rustfs_utils::dirs::get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY);
+        let log_directory = config.log_directory.as_deref().unwrap_or(default_log_directory.as_str());
         let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
 
         if let Err(e) = fs::create_dir_all(log_directory) {

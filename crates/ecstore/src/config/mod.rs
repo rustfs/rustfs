@@ -21,26 +21,17 @@ pub mod storageclass;
 use crate::error::Result;
 use crate::store::ECStore;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
-use lazy_static::lazy_static;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_config::notify::{COMMENT_KEY, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 
-lazy_static! {
-    pub static ref GLOBAL_StorageClass: OnceLock<storageclass::Config> = OnceLock::new();
-    pub static ref DefaultKVS: OnceLock<HashMap<String, KVS>> = OnceLock::new();
-    pub static ref GLOBAL_ServerConfig: OnceLock<Config> = OnceLock::new();
-    pub static ref GLOBAL_ConfigSys: ConfigSys = ConfigSys::new();
-}
-
-/// Standard config keys and values.
-pub const ENABLE_KEY: &str = "enable";
-pub const COMMENT_KEY: &str = "comment";
-
-/// Enable values
-pub const ENABLE_ON: &str = "on";
-pub const ENABLE_OFF: &str = "off";
+pub static GLOBAL_STORAGE_CLASS: LazyLock<OnceLock<storageclass::Config>> = LazyLock::new(OnceLock::new);
+pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_SERVER_CONFIG: LazyLock<OnceLock<Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
 
 pub const ENV_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 pub const ENV_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
@@ -66,7 +57,7 @@ impl ConfigSys {
 
         lookup_configs(&mut cfg, api).await;
 
-        let _ = GLOBAL_ServerConfig.set(cfg);
+        let _ = GLOBAL_SERVER_CONFIG.set(cfg);
 
         Ok(())
     }
@@ -131,6 +122,28 @@ impl KVS {
 
         keys
     }
+
+    /// Insert or update a pair of key/values in KVS
+    pub fn insert(&mut self, key: String, value: String) {
+        for kv in self.0.iter_mut() {
+            if kv.key == key {
+                kv.value = value.clone();
+                return;
+            }
+        }
+        self.0.push(KV {
+            key,
+            value,
+            hidden_if_empty: false,
+        });
+    }
+
+    /// Merge all entries from another KVS to the current instance
+    pub fn extend(&mut self, other: KVS) {
+        for KV { key, value, .. } in other.0.into_iter() {
+            self.insert(key, value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +172,7 @@ impl Config {
     }
 
     pub fn set_defaults(&mut self) {
-        if let Some(defaults) = DefaultKVS.get() {
+        if let Some(defaults) = DEFAULT_KVS.get() {
             for (k, v) in defaults.iter() {
                 if !self.0.contains_key(k) {
                     let mut default = HashMap::new();
@@ -198,20 +211,17 @@ pub fn register_default_kvs(kvs: HashMap<String, KVS>) {
         p.insert(k, v);
     }
 
-    let _ = DefaultKVS.set(p);
+    let _ = DEFAULT_KVS.set(p);
 }
 
 pub fn init() {
     let mut kvs = HashMap::new();
     // Load storageclass default configuration
-    kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DefaultKVS.clone());
+    kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DEFAULT_KVS.clone());
     // New: Loading default configurations for notify_webhook and notify_mqtt
     // Referring subsystem names through constants to improve the readability and maintainability of the code
-    kvs.insert(
-        rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS.to_owned(),
-        notify::DefaultWebhookKVS.clone(),
-    );
-    kvs.insert(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DefaultMqttKVS.clone());
+    kvs.insert(NOTIFY_WEBHOOK_SUB_SYS.to_owned(), notify::DEFAULT_WEBHOOK_KVS.clone());
+    kvs.insert(NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DEFAULT_MQTT_KVS.clone());
 
     // Register all default configurations
     register_default_kvs(kvs)

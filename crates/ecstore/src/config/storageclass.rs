@@ -15,9 +15,9 @@
 use super::KVS;
 use crate::config::KV;
 use crate::error::{Error, Result};
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::sync::LazyLock;
 use tracing::warn;
 
 /// Default parity count for a given drive count
@@ -62,34 +62,32 @@ pub const DEFAULT_RRS_PARITY: usize = 1;
 
 pub static DEFAULT_INLINE_BLOCK: usize = 128 * 1024;
 
-lazy_static! {
-    pub static ref DefaultKVS: KVS = {
-        let kvs = vec![
-            KV {
-                key: CLASS_STANDARD.to_owned(),
-                value: "".to_owned(),
-                hidden_if_empty: false,
-            },
-            KV {
-                key: CLASS_RRS.to_owned(),
-                value: "EC:1".to_owned(),
-                hidden_if_empty: false,
-            },
-            KV {
-                key: OPTIMIZE.to_owned(),
-                value: "availability".to_owned(),
-                hidden_if_empty: false,
-            },
-            KV {
-                key: INLINE_BLOCK.to_owned(),
-                value: "".to_owned(),
-                hidden_if_empty: true,
-            },
-        ];
+pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
+    let kvs = vec![
+        KV {
+            key: CLASS_STANDARD.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: CLASS_RRS.to_owned(),
+            value: "EC:1".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: OPTIMIZE.to_owned(),
+            value: "availability".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: INLINE_BLOCK.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+    ];
 
-        KVS(kvs)
-    };
-}
+    KVS(kvs)
+});
 
 // StorageClass - holds storage class information
 #[derive(Serialize, Deserialize, Debug, Default)]

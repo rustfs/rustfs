@@ -27,11 +27,12 @@ documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify"] }
+rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path", "sys"] }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
-rustfs-ecstore = { workspace = true }
+futures = { workspace = true }
 form_urlencoded = { workspace = true }
 once_cell = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
@@ -48,8 +49,6 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 url = { workspace = true }
 urlencoding = { workspace = true }
 wildmatch = { workspace = true, features = ["serde"] }
-
-
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
