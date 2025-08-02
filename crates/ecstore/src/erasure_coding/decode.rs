@@ -116,35 +116,24 @@ where
                 }
             }
 
-            let mut running_readers = self.data_shards;
-            let mut next_reader_index = self.data_shards;
+            let mut success = 0;
             while let Some((i, result)) = sets.next().await {
-                running_readers -= 1;
                 match result {
                     Ok(v) => {
                         shards[i] = Some(v);
+                        success += 1;
                     }
                     Err(e) => {
                         errs[i] = Some(e);
 
-                        // The number of shards we already got
-                        let fine_shards_count = shards.iter().filter(|s| s.is_some()).count();
-                        // The number of shards we need to decode the block
-                        let need_shards = self.data_shards - fine_shards_count;
-                        // The number of shards we haven't try to read yet
-                        let untriggered_readers = self.total_shards - next_reader_index;
-
-                        if need_shards > running_readers + untriggered_readers {
-                            // We're doomed, just wait for the running readers to finish
-                            continue;
-                        }
-
                         if let Some(future) = fut_iter.next() {
                             sets.push(future);
-                            running_readers += 1;
-                            next_reader_index += 1;
                         }
                     }
+                }
+
+                if success >= self.data_shards {
+                    break;
                 }
             }
         }
