@@ -126,7 +126,7 @@ mod tests {
             (0, "0 B"),
         ];
 
-        for (bytes, expected) in sizes {
+        for (bytes, _expected) in sizes {
             let formatted = format_storage_size(bytes);
             println!("Formatted size for {} bytes: {}", bytes, formatted);
             // We're not being strict about exact formatting since this is integration test

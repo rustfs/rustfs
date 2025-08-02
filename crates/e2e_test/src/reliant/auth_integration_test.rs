@@ -37,22 +37,23 @@ mod tests {
             creds
         }
 
-        fn validate_access_key_format(access_key: &str) -> bool {
+        fn validate_access_key_format(&self, access_key: &str) -> bool {
             // Basic validation for access key format
             access_key.len() >= 3 && access_key.len() <= 20 && access_key.chars().all(|c| c.is_alphanumeric() || c == '-')
         }
 
-        fn validate_secret_key_format(secret_key: &str) -> bool {
+        fn validate_secret_key_format(&self, secret_key: &str) -> bool {
             // Basic validation for secret key format
             secret_key.len() >= 8 && secret_key.len() <= 40
         }
 
-        fn is_session_token_format_valid(token: &str) -> bool {
+        fn is_session_token_format_valid(&self, token: &str) -> bool {
             // Basic session token format validation
             !token.is_empty() && token.len() > 10
         }
 
         async fn test_auth_endpoint(
+            &self,
             endpoint: &str,
             access_key: &str,
             secret_key: &str,
@@ -172,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Requires running RustFS server
-    async fn test_auth_endpoint_reachability() {
+          async fn test_auth_endpoint_reachability() {
         let helper = AuthTestHelper;
         let creds = helper.create_test_credentials();
 
@@ -225,7 +226,7 @@ mod tests {
             ("rustfs-client/1.0.0", "sdk"),
         ];
 
-        for (ua, expected_type) in user_agents {
+        for (ua, _expected_type) in user_agents {
             let client_type = classify_user_agent(ua);
             println!("User-Agent: {} -> Type: {}", ua, client_type);
             // We're testing that classification doesn't panic and returns something

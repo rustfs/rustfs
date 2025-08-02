@@ -3623,6 +3623,7 @@ dependencies = [
  "bytes",
  "flatbuffers 25.2.10",
  "futures",
+ "reqwest",
  "rmp-serde",
  "rustfs-ecstore",
  "rustfs-filemeta",
