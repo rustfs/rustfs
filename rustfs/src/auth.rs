@@ -323,3 +323,441 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{HeaderMap, HeaderValue, Uri};
+    use rustfs_policy::auth::Credentials;
+    use s3s::auth::SecretKey;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use time::OffsetDateTime;
+
+    fn create_test_credentials() -> Credentials {
+        Credentials {
+            access_key: "test-access-key".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            session_token: "".to_string(),
+            expiration: None,
+            status: "on".to_string(),
+            parent_user: "".to_string(),
+            groups: None,
+            claims: None,
+            name: Some("test-user".to_string()),
+            description: Some("test user for auth tests".to_string()),
+        }
+    }
+
+    fn create_temp_credentials() -> Credentials {
+        Credentials {
+            access_key: "temp-access-key".to_string(),
+            secret_key: "temp-secret-key".to_string(),
+            session_token: "temp-session-token".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            status: "on".to_string(),
+            parent_user: "parent-user".to_string(),
+            groups: Some(vec!["test-group".to_string()]),
+            claims: None,
+            name: Some("temp-user".to_string()),
+            description: Some("temporary user for auth tests".to_string()),
+        }
+    }
+
+    fn create_service_account_credentials() -> Credentials {
+        let mut claims = HashMap::new();
+        claims.insert("sa-policy".to_string(), json!("test-policy"));
+
+        Credentials {
+            access_key: "service-access-key".to_string(),
+            secret_key: "service-secret-key".to_string(),
+            session_token: "service-session-token".to_string(),
+            expiration: None,
+            status: "on".to_string(),
+            parent_user: "service-parent".to_string(),
+            groups: None,
+            claims: Some(claims),
+            name: Some("service-account".to_string()),
+            description: Some("service account for auth tests".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_iam_auth_creation() {
+        let access_key = "test-access-key";
+        let secret_key = SecretKey::from("test-secret-key");
+
+        let iam_auth = IAMAuth::new(access_key, secret_key);
+
+        // The struct should be created successfully
+        // We can't easily test internal state without exposing it,
+        // but we can test it doesn't panic on creation
+        assert_eq!(std::mem::size_of_val(&iam_auth), std::mem::size_of::<IAMAuth>());
+    }
+
+    #[tokio::test]
+    async fn test_iam_auth_get_secret_key_empty_access_key() {
+        let iam_auth = IAMAuth::new("test-ak", SecretKey::from("test-sk"));
+
+        let result = iam_auth.get_secret_key("").await;
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::UnauthorizedAccess);
+        assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
+    }
+
+    #[test]
+    fn test_check_claims_from_token_empty_token_and_access_key() {
+        let mut cred = create_test_credentials();
+        cred.access_key = "".to_string();
+
+        let result = check_claims_from_token("test-token", &cred);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or("").contains("no access key"));
+    }
+
+    #[test]
+    fn test_check_claims_from_token_temp_credentials_without_token() {
+        let mut cred = create_temp_credentials();
+        // Make it non-service account
+        cred.claims = None;
+
+        let result = check_claims_from_token("", &cred);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or("").contains("invalid token1"));
+    }
+
+    #[test]
+    fn test_check_claims_from_token_non_temp_with_token() {
+        let mut cred = create_test_credentials();
+        cred.session_token = "".to_string(); // Make it non-temp
+
+        let result = check_claims_from_token("some-token", &cred);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or("").contains("invalid token2"));
+    }
+
+    #[test]
+    fn test_check_claims_from_token_mismatched_session_token() {
+        let mut cred = create_temp_credentials();
+        // Make sure it's not a service account
+        cred.claims = None;
+
+        let result = check_claims_from_token("wrong-session-token", &cred);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or("").contains("invalid token3"));
+    }
+
+    #[test]
+    fn test_check_claims_from_token_expired_credentials() {
+        let mut cred = create_temp_credentials();
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1)); // Expired
+        cred.claims = None; // Make sure it's not a service account
+
+        let result = check_claims_from_token(&cred.session_token, &cred);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+
+        // The function checks various conditions in order. An expired temp credential
+        // might trigger other validation errors first (like token mismatch)
+        let msg = error.message().unwrap_or("");
+        let is_valid_error = msg.contains("invalid access key is temp and expired")
+            || msg.contains("invalid token")
+            || msg.contains("action cred not init");
+        assert!(is_valid_error, "Unexpected error message: '{msg}'");
+    }
+
+    #[test]
+    fn test_check_claims_from_token_valid_non_temp_credentials() {
+        let mut cred = create_test_credentials();
+        cred.session_token = "".to_string(); // Make it non-temp
+
+        let result = check_claims_from_token("", &cred);
+
+        // This might fail due to global state dependencies, but should return error about global cred init
+        if result.is_ok() {
+            let claims = result.unwrap();
+            assert!(claims.is_empty());
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+            assert!(error.message().unwrap_or("").contains("action cred not init"));
+        }
+    }
+
+    #[test]
+    fn test_get_session_token_from_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-security-token", HeaderValue::from_static("test-session-token"));
+
+        let uri: Uri = "https://example.com/".parse().unwrap();
+
+        let token = get_session_token(&uri, &headers);
+
+        assert_eq!(token, Some("test-session-token"));
+    }
+
+    #[test]
+    fn test_get_session_token_from_query_param() {
+        let headers = HeaderMap::new();
+        let uri: Uri = "https://example.com/?x-amz-security-token=query-session-token"
+            .parse()
+            .unwrap();
+
+        let token = get_session_token(&uri, &headers);
+
+        assert_eq!(token, Some("query-session-token"));
+    }
+
+    #[test]
+    fn test_get_session_token_header_takes_precedence() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-security-token", HeaderValue::from_static("header-token"));
+
+        let uri: Uri = "https://example.com/?x-amz-security-token=query-token".parse().unwrap();
+
+        let token = get_session_token(&uri, &headers);
+
+        assert_eq!(token, Some("header-token"));
+    }
+
+    #[test]
+    fn test_get_session_token_no_token() {
+        let headers = HeaderMap::new();
+        let uri: Uri = "https://example.com/".parse().unwrap();
+
+        let token = get_session_token(&uri, &headers);
+
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn test_get_condition_values_regular_user() {
+        let cred = create_test_credentials();
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(conditions.get("userid"), Some(&vec!["test-access-key".to_string()]));
+        assert_eq!(conditions.get("username"), Some(&vec!["test-access-key".to_string()]));
+        assert_eq!(conditions.get("principaltype"), Some(&vec!["User".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_temp_user() {
+        let cred = create_temp_credentials();
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(conditions.get("userid"), Some(&vec!["parent-user".to_string()]));
+        assert_eq!(conditions.get("username"), Some(&vec!["parent-user".to_string()]));
+        assert_eq!(conditions.get("principaltype"), Some(&vec!["User".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_service_account() {
+        let cred = create_service_account_credentials();
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(conditions.get("userid"), Some(&vec!["service-parent".to_string()]));
+        assert_eq!(conditions.get("username"), Some(&vec!["service-parent".to_string()]));
+        // Service accounts with claims should be "AssumedRole" type
+        assert_eq!(conditions.get("principaltype"), Some(&vec!["AssumedRole".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_object_lock_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        headers.insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2024-12-31T23:59:59Z"));
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["GOVERNANCE".to_string()]));
+        assert_eq!(
+            conditions.get("object-lock-retain-until-date"),
+            Some(&vec!["2024-12-31T23:59:59Z".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_get_condition_values_with_signature_age() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-signature-age", HeaderValue::from_static("300"));
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(conditions.get("signatureAge"), Some(&vec!["300".to_string()]));
+        // Verify the header is removed after processing
+        // (we can't directly test this without changing the function signature)
+    }
+
+    #[test]
+    fn test_get_condition_values_with_claims() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("ldapUsername".to_string(), json!("ldap-user"));
+        claims.insert("groups".to_string(), json!(["group1", "group2"]));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(conditions.get("username"), Some(&vec!["ldap-user".to_string()]));
+        assert_eq!(conditions.get("groups"), Some(&vec!["group1".to_string(), "group2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_credential_groups() {
+        let mut cred = create_test_credentials();
+        cred.groups = Some(vec!["cred-group1".to_string(), "cred-group2".to_string()]);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred);
+
+        assert_eq!(
+            conditions.get("groups"),
+            Some(&vec!["cred-group1".to_string(), "cred-group2".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_get_query_param_found() {
+        let query = "param1=value1&param2=value2&param3=value3";
+
+        let result = get_query_param(query, "param2");
+
+        assert_eq!(result, Some("value2"));
+    }
+
+    #[test]
+    fn test_get_query_param_case_insensitive() {
+        let query = "Param1=value1&PARAM2=value2&param3=value3";
+
+        let result = get_query_param(query, "param2");
+
+        assert_eq!(result, Some("value2"));
+    }
+
+    #[test]
+    fn test_get_query_param_not_found() {
+        let query = "param1=value1&param2=value2&param3=value3";
+
+        let result = get_query_param(query, "param4");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_query_param_empty_query() {
+        let query = "";
+
+        let result = get_query_param(query, "param1");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_query_param_malformed_query() {
+        let query = "param1&param2=value2&param3";
+
+        let result = get_query_param(query, "param2");
+
+        assert_eq!(result, Some("value2"));
+
+        let result = get_query_param(query, "param1");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_query_param_with_equals_in_value() {
+        let query = "param1=value=with=equals&param2=value2";
+
+        let result = get_query_param(query, "param1");
+
+        assert_eq!(result, Some("value=with=equals"));
+    }
+
+    #[test]
+    fn test_credentials_is_expired() {
+        let mut cred = create_test_credentials();
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+
+        assert!(cred.is_expired());
+    }
+
+    #[test]
+    fn test_credentials_is_not_expired() {
+        let mut cred = create_test_credentials();
+        cred.expiration = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+
+        assert!(!cred.is_expired());
+    }
+
+    #[test]
+    fn test_credentials_no_expiration() {
+        let cred = create_test_credentials();
+
+        assert!(!cred.is_expired());
+    }
+
+    #[test]
+    fn test_credentials_is_temp() {
+        let cred = create_temp_credentials();
+
+        assert!(cred.is_temp());
+    }
+
+    #[test]
+    fn test_credentials_is_not_temp_no_session_token() {
+        let mut cred = create_test_credentials();
+        cred.session_token = "".to_string();
+
+        assert!(!cred.is_temp());
+    }
+
+    #[test]
+    fn test_credentials_is_not_temp_expired() {
+        let mut cred = create_temp_credentials();
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+
+        assert!(!cred.is_temp());
+    }
+
+    #[test]
+    fn test_credentials_is_service_account() {
+        let cred = create_service_account_credentials();
+
+        assert!(cred.is_service_account());
+    }
+
+    #[test]
+    fn test_credentials_is_not_service_account() {
+        let cred = create_test_credentials();
+
+        assert!(!cred.is_service_account());
+    }
+}

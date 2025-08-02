@@ -37,4 +37,5 @@ rustfs-common.workspace = true
 flatbuffers = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
-tonic-build = { workspace = true }
+tonic-prost = { workspace = true }
+tonic-prost-build = { workspace = true }

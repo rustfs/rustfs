@@ -36,8 +36,6 @@ pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
-pub const DEFAULT_PORT: u16 = 9000;
-
 lazy_static! {
 static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
 pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();

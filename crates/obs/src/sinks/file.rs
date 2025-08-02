@@ -48,7 +48,7 @@ impl FileSink {
         }
         let file = if file_exists {
             // If the file exists, open it in append mode
-            tracing::debug!("FileSink: File exists, opening in append mode.");
+            tracing::debug!("FileSink: File exists, opening in append mode. Path: {:?}", path);
             OpenOptions::new().append(true).create(true).open(&path).await?
         } else {
             // If the file does not exist, create it

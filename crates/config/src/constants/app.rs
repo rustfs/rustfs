@@ -15,9 +15,9 @@
 use const_str::concat;
 
 /// Application name
-/// Default value: RustFs
+/// Default value: RustFS
 /// Environment variable: RUSTFS_APP_NAME
-pub const APP_NAME: &str = "RustFs";
+pub const APP_NAME: &str = "RustFS";
 /// Application version
 /// Default value: 1.0.0
 /// Environment variable: RUSTFS_VERSION
@@ -70,6 +70,16 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: RUSTFS_SECRET_KEY=rustfsadmin
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+
+/// Default console enable
+/// This is the default value for the console server.
+/// It is used to enable or disable the console server.
+/// Default value: true
+/// Environment variable: RUSTFS_CONSOLE_ENABLE
+/// Command line argument: --console-enable
+/// Example: RUSTFS_CONSOLE_ENABLE=true
+/// Example: --console-enable true
+pub const DEFAULT_CONSOLE_ENABLE: bool = true;
 
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
@@ -126,28 +136,28 @@ pub const DEFAULT_SINK_FILE_LOG_FILE: &str = concat!(DEFAULT_LOG_FILENAME, "-sin
 /// This is the default log directory for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: logs
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
-pub const DEFAULT_LOG_DIR: &str = "/logs";
+/// Environment variable: RUSTFS_LOG_DIRECTORY
+pub const DEFAULT_LOG_DIR: &str = "logs";
 
 /// Default log rotation size mb for rustfs
 /// This is the default log rotation size for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: 100 MB
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_SIZE_MB
 pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: hour, eg: day,hour,minute,second
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
 pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
 /// It is used to keep the logs of the application.
 /// Default value: 30
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_KEEP_FILES
+/// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 
 #[cfg(test)]
@@ -157,7 +167,7 @@ mod tests {
     #[test]
     fn test_app_basic_constants() {
         // Test application basic constants
-        assert_eq!(APP_NAME, "RustFs");
+        assert_eq!(APP_NAME, "RustFS");
         assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
 
         assert_eq!(VERSION, "0.0.1");

@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+#![allow(unused_imports)]
 #![allow(unused_variables)]
 
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
@@ -33,7 +34,7 @@ use crate::store_api::{ListPartsInfo, ObjectToDelete};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{GLOBAL_StorageClass, storageclass},
+    config::{GLOBAL_STORAGE_CLASS, storageclass},
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -626,7 +627,7 @@ impl SetDisks {
                 && !found.etag.is_empty()
                 && part_meta_quorum.get(max_etag).unwrap_or(&0) >= &read_quorum
             {
-                ret[part_idx] = found;
+                ret[part_idx] = found.clone();
             } else {
                 ret[part_idx] = ObjectPartInfo {
                     number: part_numbers[part_idx],
@@ -2011,12 +2012,12 @@ impl SetDisks {
         if errs.iter().any(|err| err.is_some()) {
             let _ =
                 rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    fi.volume.to_string(),                                          // bucket
-                    Some(fi.name.to_string()),                                      // object_prefix
-                    false,                                                          // force_start
-                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal), // priority
-                    Some(self.pool_index),                                          // pool_index
-                    Some(self.set_index),                                           // set_index
+                    fi.volume.to_string(),             // bucket
+                    Some(fi.name.to_string()),         // object_prefix
+                    false,                             // force_start
+                    Some(HealChannelPriority::Normal), // priority
+                    Some(self.pool_index),             // pool_index
+                    Some(self.set_index),              // set_index
                 ))
                 .await;
         }
@@ -2154,7 +2155,7 @@ impl SetDisks {
                                     bucket.to_string(),
                                     Some(object.to_string()),
                                     false,
-                                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+                                    Some(HealChannelPriority::Normal),
                                     Some(pool_index),
                                     Some(set_index),
                                 ),
@@ -2632,7 +2633,7 @@ impl SetDisks {
                                 }
 
                                 let is_inline_buffer = {
-                                    if let Some(sc) = GLOBAL_StorageClass.get() {
+                                    if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                                         sc.should_inline(erasure.shard_file_size(latest_meta.size), false)
                                     } else {
                                         false
@@ -3287,12 +3288,7 @@ impl ObjectIO for SetDisks {
             let paths = vec![object.to_string()];
             let lock_acquired = self
                 .namespace_lock
-                .lock_batch(
-                    &paths,
-                    &self.locker_owner,
-                    std::time::Duration::from_secs(5),
-                    std::time::Duration::from_secs(10),
-                )
+                .lock_batch(&paths, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
                 .await?;
 
             if !lock_acquired {
@@ -3303,7 +3299,7 @@ impl ObjectIO for SetDisks {
         let mut user_defined = opts.user_defined.clone();
 
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_StorageClass.get() {
+            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
@@ -3348,7 +3344,7 @@ impl ObjectIO for SetDisks {
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let is_inline_buffer = {
-            if let Some(sc) = GLOBAL_StorageClass.get() {
+            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
             } else {
                 false
@@ -3919,7 +3915,7 @@ impl StorageAPI for SetDisks {
             bucket.to_string(),
             Some(object.to_string()),
             false,
-            Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+            Some(HealChannelPriority::Normal),
             Some(self.pool_index),
             Some(self.set_index),
         ))
@@ -4729,7 +4725,7 @@ impl StorageAPI for SetDisks {
         }
 
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_StorageClass.get() {
+            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None

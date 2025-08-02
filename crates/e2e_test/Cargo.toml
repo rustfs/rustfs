@@ -38,7 +38,7 @@ url.workspace = true
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
-serial_test = "3.2.0"
-aws-sdk-s3 = "1.99.0"
-aws-config = "1.8.3"
+serial_test = { workspace = true }
+aws-sdk-s3.workspace = true
+aws-config = { workspace = true }
 async-trait = { workspace = true }

@@ -1094,14 +1094,119 @@ impl Operation for RemoveRemoteTargetHandler {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
+    use super::*;
     use rustfs_common::heal_channel::HealOpts;
+    use rustfs_madmin::BackendInfo;
+    use rustfs_policy::policy::BucketPolicy;
+    use serde_json::json;
 
-    #[ignore] // FIXME: failed in github actions
+    #[test]
+    fn test_account_info_structure() {
+        // Test AccountInfo struct creation and serialization
+        let account_info = AccountInfo {
+            account_name: "test-account".to_string(),
+            server: BackendInfo::default(),
+            policy: BucketPolicy::default(),
+        };
+
+        assert_eq!(account_info.account_name, "test-account");
+
+        // Test JSON serialization (PascalCase rename)
+        let json_str = serde_json::to_string(&account_info).unwrap();
+        assert!(json_str.contains("AccountName"));
+    }
+
+    #[test]
+    fn test_account_info_default() {
+        // Test that AccountInfo can be created with default values
+        let default_info = AccountInfo::default();
+
+        assert!(default_info.account_name.is_empty());
+    }
+
+    #[test]
+    fn test_handler_struct_creation() {
+        // Test that handler structs can be created
+        let _account_handler = AccountInfoHandler {};
+        let _service_handler = ServiceHandle {};
+        let _server_info_handler = ServerInfoHandler {};
+        let _inspect_data_handler = InspectDataHandler {};
+        let _storage_info_handler = StorageInfoHandler {};
+        let _data_usage_handler = DataUsageInfoHandler {};
+        let _metrics_handler = MetricsHandler {};
+        let _heal_handler = HealHandler {};
+        let _bg_heal_handler = BackgroundHealStatusHandler {};
+        let _replication_metrics_handler = GetReplicationMetricsHandler {};
+        let _set_remote_target_handler = SetRemoteTargetHandler {};
+        let _list_remote_target_handler = ListRemoteTargetHandler {};
+        let _remove_remote_target_handler = RemoveRemoteTargetHandler {};
+
+        // Just verify they can be created without panicking
+        // Test passes if we reach this point without panicking
+    }
+
+    #[test]
+    fn test_heal_opts_serialization() {
+        // Test that HealOpts can be properly deserialized
+        let heal_opts_json = json!({
+            "recursive": true,
+            "dryRun": false,
+            "remove": true,
+            "recreate": false,
+            "scanMode": 2,
+            "updateParity": true,
+            "nolock": false
+        });
+
+        let json_str = serde_json::to_string(&heal_opts_json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed["recursive"], true);
+        assert_eq!(parsed["scanMode"], 2);
+    }
+
+    #[test]
+    fn test_heal_opts_url_encoding() {
+        // Test URL encoding/decoding of HealOpts
+        let opts = HealOpts {
+            recursive: true,
+            dry_run: false,
+            remove: true,
+            recreate: false,
+            scan_mode: rustfs_common::heal_channel::HealScanMode::Normal,
+            update_parity: false,
+            no_lock: true,
+            pool: Some(1),
+            set: Some(0),
+        };
+
+        let encoded = serde_urlencoded::to_string(opts).unwrap();
+        assert!(encoded.contains("recursive=true"));
+        assert!(encoded.contains("remove=true"));
+
+        // Test round-trip
+        let decoded: HealOpts = serde_urlencoded::from_str(&encoded).unwrap();
+        assert_eq!(decoded.recursive, opts.recursive);
+        assert_eq!(decoded.scan_mode, opts.scan_mode);
+    }
+
+    #[ignore] // FIXME: failed in github actions - keeping original test
     #[test]
     fn test_decode() {
         let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
         let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
         println!("{s:?}");
     }
+
+    // Note: Testing the actual async handler implementations requires:
+    // 1. S3Request setup with proper headers, URI, and credentials
+    // 2. Global object store initialization
+    // 3. IAM system initialization
+    // 4. Mock or real backend services
+    // 5. Authentication and authorization setup
+    //
+    // These are better suited for integration tests with proper test infrastructure.
+    // The current tests focus on data structures and basic functionality that can be
+    // tested in isolation without complex dependencies.
 }

@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rustfs_filemeta::{FileMeta, test_data::*};
+use std::hint::black_box;
 
 fn bench_create_real_xlmeta(c: &mut Criterion) {
     c.bench_function("create_real_xlmeta", |b| b.iter(|| black_box(create_real_xlmeta().unwrap())));

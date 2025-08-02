@@ -36,11 +36,11 @@ webhook = ["dep:reqwest"]
 kafka = ["dep:rdkafka"]
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-config = { workspace = true, features = ["constants", "observability"] }
+rustfs-utils = { workspace = true, features = ["ip", "path"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 flexi_logger = { workspace = true, features = ["trc", "kv"] }
-lazy_static = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
@@ -49,7 +49,6 @@ opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
-rustfs-utils = { workspace = true, features = ["ip"] }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
