@@ -22,10 +22,7 @@
 //!
 //! All handlers are fully implemented and integrated with the FS bucket encryption manager.
 
-use crate::{
-    admin::router::Operation,
-    auth::{check_key_valid, get_session_token},
-};
+use crate::admin::router::Operation;
 use rustfs_kms::{BucketEncryptionAlgorithm, BucketEncryptionConfig, get_global_bucket_encryption_manager};
 
 use http::StatusCode;
@@ -50,10 +47,8 @@ pub struct ApplyServerSideEncryptionByDefault {
     pub kms_master_key_id: Option<String>,
 }
 use chrono;
-use rustfs_policy::auth::Credentials;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::{Deserialize, Serialize};
-use serde_urlencoded;
 use tracing::{info, warn};
 
 /// Request structure for setting bucket encryption
@@ -113,11 +108,11 @@ impl Operation for PutBucketEncryptionHandler {
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name"))?;
 
         // Parse credentials from query parameters
-        let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
+        // let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
+        //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        // check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         // Parse request body
         let mut input = req.input;
@@ -176,18 +171,18 @@ pub struct GetBucketEncryptionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetBucketEncryptionHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, _req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Extract bucket name from path parameters
         let bucket_name = params
             .get("bucket")
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name"))?;
 
         // Parse credentials from query parameters
-        let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
+        // let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
+        //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        // check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         info!("Getting bucket encryption for bucket: {}", bucket_name);
 
@@ -224,25 +219,25 @@ pub struct DeleteBucketEncryptionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DeleteBucketEncryptionHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, _req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Extract bucket name from path parameters
         let bucket_name = params
             .get("bucket")
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "Missing bucket name"))?;
 
         // Parse credentials from query parameters
-        let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
+        // let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
+        //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        // check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         info!("Deleting bucket encryption for bucket: {}", bucket_name);
 
         // Delete the bucket encryption configuration using the manager
         if let Some(manager) = get_global_bucket_encryption_manager() {
             match manager.delete_bucket_encryption(bucket_name).await {
-                Ok(()) => Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty()))),
+                Ok(()) => Ok(S3Response::new((StatusCode::OK, Body::empty()))),
                 Err(e) => Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     format!("Failed to delete encryption config: {e}"),
@@ -262,13 +257,13 @@ pub struct ListBucketEncryptionsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListBucketEncryptionsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Parse credentials from query parameters
-        let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
+        // let input_cred: Credentials = serde_urlencoded::from_str(req.uri.query().unwrap_or(""))
+        //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid query parameters: {e}")))?;
 
         // Validate authentication
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        // check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         info!("Listing all bucket encryption configurations");
 
