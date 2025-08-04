@@ -25,9 +25,8 @@
 use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
-    storage::ecfs::FS,
 };
-use rustfs_kms::{BucketEncryptionAlgorithm, BucketEncryptionConfig};
+use rustfs_kms::{BucketEncryptionAlgorithm, BucketEncryptionConfig, get_global_bucket_encryption_manager};
 
 use http::StatusCode;
 use matchit::Params;
@@ -103,9 +102,7 @@ impl From<BucketEncryptionConfig> for GetBucketEncryptionResponse {
 }
 
 /// Handler for PUT /bucket/{bucket}/encryption
-pub struct PutBucketEncryptionHandler {
-    pub fs: std::sync::Arc<FS>,
-}
+pub struct PutBucketEncryptionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for PutBucketEncryptionHandler {
@@ -147,7 +144,7 @@ impl Operation for PutBucketEncryptionHandler {
         };
 
         // Store the bucket encryption configuration using the manager
-        if let Some(manager) = self.fs.bucket_encryption_manager() {
+        if let Some(manager) = get_global_bucket_encryption_manager() {
             manager
                 .set_bucket_encryption(bucket_name, config.clone())
                 .await
@@ -175,9 +172,7 @@ impl Operation for PutBucketEncryptionHandler {
 }
 
 /// Handler for GET /bucket/{bucket}/encryption
-pub struct GetBucketEncryptionHandler {
-    pub fs: std::sync::Arc<FS>,
-}
+pub struct GetBucketEncryptionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetBucketEncryptionHandler {
@@ -197,7 +192,7 @@ impl Operation for GetBucketEncryptionHandler {
         info!("Getting bucket encryption for bucket: {}", bucket_name);
 
         // Retrieve the bucket encryption configuration using the manager
-        if let Some(manager) = self.fs.bucket_encryption_manager() {
+        if let Some(manager) = get_global_bucket_encryption_manager() {
             match manager.get_bucket_encryption(bucket_name).await {
                 Ok(Some(config)) => {
                     let response: GetBucketEncryptionResponse = config.into();
@@ -225,9 +220,7 @@ impl Operation for GetBucketEncryptionHandler {
 }
 
 /// Handler for DELETE /bucket/{bucket}/encryption
-pub struct DeleteBucketEncryptionHandler {
-    pub fs: std::sync::Arc<FS>,
-}
+pub struct DeleteBucketEncryptionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DeleteBucketEncryptionHandler {
@@ -247,7 +240,7 @@ impl Operation for DeleteBucketEncryptionHandler {
         info!("Deleting bucket encryption for bucket: {}", bucket_name);
 
         // Delete the bucket encryption configuration using the manager
-        if let Some(manager) = self.fs.bucket_encryption_manager() {
+        if let Some(manager) = get_global_bucket_encryption_manager() {
             match manager.delete_bucket_encryption(bucket_name).await {
                 Ok(()) => Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty()))),
                 Err(e) => Err(S3Error::with_message(
@@ -265,9 +258,7 @@ impl Operation for DeleteBucketEncryptionHandler {
 }
 
 /// Handler for GET /bucket/encryptions (list all bucket encryption configurations)
-pub struct ListBucketEncryptionsHandler {
-    pub fs: std::sync::Arc<FS>,
-}
+pub struct ListBucketEncryptionsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListBucketEncryptionsHandler {
@@ -282,7 +273,7 @@ impl Operation for ListBucketEncryptionsHandler {
         info!("Listing all bucket encryption configurations");
 
         // List all bucket encryption configurations using the manager
-        if let Some(manager) = self.fs.bucket_encryption_manager() {
+        if let Some(manager) = get_global_bucket_encryption_manager() {
             match manager.list_bucket_encryptions().await {
                 Ok(configs) => {
                     let response = serde_json::json!({
