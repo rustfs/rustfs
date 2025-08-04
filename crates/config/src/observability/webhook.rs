@@ -12,42 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+// RUSTFS_SINKS_WEBHOOK_ENDPOINT
+pub const ENV_SINKS_WEBHOOK_ENDPOINT: &str = "RUSTFS_SINKS_WEBHOOK_ENDPOINT";
+// RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN
+pub const ENV_SINKS_WEBHOOK_AUTH_TOKEN: &str = "RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN";
+// max_retries
+pub const ENV_SINKS_WEBHOOK_MAX_RETRIES: &str = "RUSTFS_SINKS_WEBHOOK_MAX_RETRIES";
+// retry_delay_ms
+pub const ENV_SINKS_WEBHOOK_RETRY_DELAY_MS: &str = "RUSTFS_SINKS_WEBHOOK_RETRY_DELAY_MS";
 
-/// Webhook sink configuration
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct WebhookSink {
-    pub endpoint: String,
-    pub auth_token: String,
-    pub headers: Option<HashMap<String, String>>,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: Option<usize>,
-    #[serde(default = "default_retry_delay_ms")]
-    pub retry_delay_ms: Option<u64>,
-}
-
-impl WebhookSink {
-    pub fn new() -> Self {
-        Self {
-            endpoint: "".to_string(),
-            auth_token: "".to_string(),
-            headers: Some(HashMap::new()),
-            max_retries: default_max_retries(),
-            retry_delay_ms: default_retry_delay_ms(),
-        }
-    }
-}
-
-impl Default for WebhookSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn default_max_retries() -> Option<usize> {
-    Some(3)
-}
-fn default_retry_delay_ms() -> Option<u64> {
-    Some(100)
-}
+// Default values for webhook sink configuration
+pub const DEFAULT_SINKS_WEBHOOK_ENDPOINT: &str = "http://localhost:8080";
+pub const DEFAULT_SINKS_WEBHOOK_AUTH_TOKEN: &str = "";
+pub const DEFAULT_SINKS_WEBHOOK_MAX_RETRIES: usize = 3;
+pub const DEFAULT_SINKS_WEBHOOK_RETRY_DELAY_MS: u64 = 100;

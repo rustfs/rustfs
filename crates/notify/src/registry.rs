@@ -18,11 +18,12 @@ use crate::{
     factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
     target::Target,
 };
-use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use futures::stream::{FuturesUnordered, StreamExt};
+use rustfs_config::notify::{ENABLE_KEY, ENABLE_ON, NOTIFY_ROUTE_PREFIX};
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
-use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_OFF, ENABLE_ON, KVS};
-use std::collections::HashMap;
-use tracing::{debug, error, info};
+use rustfs_ecstore::config::{Config, KVS};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, error, info, warn};
 
 /// Registry for managing target factories
 pub struct TargetRegistry {
@@ -74,77 +75,204 @@ impl TargetRegistry {
     }
 
     /// Creates all targets from a configuration
+    /// Create all notification targets from system configuration and environment variables.
+    /// This method processes the creation of each target concurrently as follows:
+    /// 1. Iterate through all registered target types (e.g. webhooks, mqtt).
+    /// 2. For each type, resolve its configuration in the configuration file and environment variables.
+    /// 3. Identify all target instance IDs that need to be created.
+    /// 4. Combine the default configuration, file configuration, and environment variable configuration for each instance.
+    /// 5. If the instance is enabled, create an asynchronous task for it to instantiate.
+    /// 6. Concurrency executes all creation tasks and collects results.
     pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn Target + Send + Sync>>, TargetError> {
-        let mut targets: Vec<Box<dyn Target + Send + Sync>> = Vec::new();
+        // Collect only environment variables with the relevant prefix to reduce memory usage
+        let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
+        // A collection of asynchronous tasks for concurrently executing target creation
+        let mut tasks = FuturesUnordered::new();
+        let mut final_config = config.clone(); // Clone a configuration for aggregating the final result
+        // 1. Traverse all registered plants and process them by target type
+        for (target_type, factory) in &self.factories {
+            tracing::Span::current().record("target_type", target_type.as_str());
+            info!("Start working on target types...");
 
-        // Iterate through configuration sections
-        for (section, subsections) in &config.0 {
-            // Only process notification sections
-            if !section.starts_with(NOTIFY_ROUTE_PREFIX) {
-                continue;
+            // 2. Prepare the configuration source
+            // 2.1. Get the configuration segment in the file, e.g. 'notify_webhook'
+            let section_name = format!("{NOTIFY_ROUTE_PREFIX}{target_type}");
+            let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
+            // 2.2. Get the default configuration for that type
+            let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
+            debug!(?default_cfg, "Get the default configuration");
+
+            // *** Optimization point 1: Get all legitimate fields of the current target type ***
+            let valid_fields = factory.get_valid_fields();
+            debug!(?valid_fields, "Get the legitimate configuration fields");
+
+            // 3. Resolve instance IDs and configuration overrides from environment variables
+            let mut instance_ids_from_env = HashSet::new();
+            // 3.1. Instance discovery: Based on the '..._ENABLE_INSTANCEID' format
+            let enable_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}_{ENABLE_KEY}_").to_uppercase();
+            for (key, value) in &all_env {
+                if value.eq_ignore_ascii_case(ENABLE_ON)
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("1")
+                    || value.eq_ignore_ascii_case("yes")
+                {
+                    if let Some(id) = key.strip_prefix(&enable_prefix) {
+                        if !id.is_empty() {
+                            instance_ids_from_env.insert(id.to_lowercase());
+                        }
+                    }
+                }
             }
 
-            // Extract target type from section name
-            let target_type = section.trim_start_matches(NOTIFY_ROUTE_PREFIX);
+            // 3.2. Parse all relevant environment variable configurations
+            // 3.2.1. Build environment variable prefixes such as 'RUSTFS_NOTIFY_WEBHOOK_'
+            let env_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}_").to_uppercase();
+            // 3.2.2. 'env_overrides' is used to store configurations parsed from environment variables in the format: {instance id -> {field -> value}}
+            let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for (key, value) in &all_env {
+                if let Some(rest) = key.strip_prefix(&env_prefix) {
+                    // Use rsplitn to split from the right side to properly extract the INSTANCE_ID at the end
+                    // Format: <FIELD_NAME>_<INSTANCE_ID> or <FIELD_NAME>
+                    let mut parts = rest.rsplitn(2, '_');
 
-            // Iterate through subsections (each representing a target instance)
-            for (target_id, target_config) in subsections {
-                // Skip disabled targets
+                    // The first part from the right is INSTANCE_ID
+                    let instance_id_part = parts.next().unwrap_or(DEFAULT_DELIMITER);
+                    // The remaining part is FIELD_NAME
+                    let field_name_part = parts.next();
 
-                let enable_from_config = target_config.lookup(ENABLE_KEY).unwrap_or_else(|| ENABLE_OFF.to_string());
-                debug!("Target enablement from config: {}/{}: {}", target_type, target_id, enable_from_config);
-                // Check environment variable for target enablement example: RUSTFS_NOTIFY_WEBHOOK_ENABLE|RUSTFS_NOTIFY_WEBHOOK_ENABLE_[TARGET_ID]
-                let env_key = if target_id == DEFAULT_DELIMITER {
-                    // If no specific target ID, use the base target type, example: RUSTFS_NOTIFY_WEBHOOK_ENABLE
-                    format!(
-                        "{}{}{}{}{}",
-                        ENV_PREFIX,
-                        NOTIFY_ROUTE_PREFIX,
-                        target_type.to_uppercase(),
-                        DEFAULT_DELIMITER,
-                        ENABLE_KEY
-                    )
-                } else {
-                    // If specific target ID, append it to the key, example: RUSTFS_NOTIFY_WEBHOOK_ENABLE_[TARGET_ID]
-                    format!(
-                        "{}{}{}{}{}{}{}",
-                        ENV_PREFIX,
-                        NOTIFY_ROUTE_PREFIX,
-                        target_type.to_uppercase(),
-                        DEFAULT_DELIMITER,
-                        ENABLE_KEY,
-                        DEFAULT_DELIMITER,
-                        target_id.to_uppercase()
-                    )
+                    let (field_name, instance_id) = match field_name_part {
+                        // Case 1: The format is <FIELD_NAME>_<INSTANCE_ID>
+                        // e.g., rest = "ENDPOINT_PRIMARY" -> field_name="ENDPOINT", instance_id="PRIMARY"
+                        Some(field) => (field.to_lowercase(), instance_id_part.to_lowercase()),
+                        // Case 2: The format is <FIELD_NAME> (无 INSTANCE_ID)
+                        // e.g., rest = "ENABLE" -> field_name="ENABLE", instance_id="" (Universal configuration `_ DEFAULT_DELIMITER`)
+                        None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
+                    };
+
+                    // *** Optimization point 2: Verify whether the parsed field_name is legal ***
+                    if !field_name.is_empty() && valid_fields.contains(&field_name) {
+                        debug!(
+                            instance_id = %if instance_id.is_empty() { DEFAULT_DELIMITER } else { &instance_id },
+                            %field_name,
+                            %value,
+                            "Parsing to environment variables"
+                        );
+                        env_overrides
+                            .entry(instance_id)
+                            .or_default()
+                            .insert(field_name, value.clone());
+                    } else {
+                        // Ignore illegal field names
+                        warn!(
+                            field_name = %field_name,
+                            "Ignore environment variable fields, not found in the list of valid fields for target type {}",
+                            target_type
+                        );
+                    }
                 }
-                .to_uppercase();
-                debug!("Target env key: {},Target id: {}", env_key, target_id);
-                let enable_from_env = std::env::var(&env_key)
-                    .map(|v| v.eq_ignore_ascii_case(ENABLE_ON) || v.eq_ignore_ascii_case("true"))
+            }
+            debug!(?env_overrides, "Complete the environment variable analysis");
+
+            // 4. Determine all instance IDs that need to be processed
+            let mut all_instance_ids: HashSet<String> =
+                file_configs.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
+            all_instance_ids.extend(instance_ids_from_env);
+            debug!(?all_instance_ids, "Determine all instance IDs");
+
+            // 5. Merge configurations and create tasks for each instance
+            for id in all_instance_ids {
+                // 5.1. Merge configuration, priority: Environment variables > File instance configuration > File default configuration
+                let mut merged_config = default_cfg.clone();
+                // Instance-specific configuration in application files
+                if let Some(file_instance_cfg) = file_configs.get(&id) {
+                    merged_config.extend(file_instance_cfg.clone());
+                }
+                // Application instance-specific environment variable configuration
+                if let Some(env_instance_cfg) = env_overrides.get(&id) {
+                    // Convert HashMap<String, String> to KVS
+                    let mut kvs_from_env = KVS::new();
+                    for (k, v) in env_instance_cfg {
+                        kvs_from_env.insert(k.clone(), v.clone());
+                    }
+                    merged_config.extend(kvs_from_env);
+                }
+                debug!(instance_id = %id, ?merged_config, "Complete configuration merge");
+
+                // 5.2. Check if the instance is enabled
+                let enabled = merged_config
+                    .lookup(ENABLE_KEY)
+                    .map(|v| {
+                        v.eq_ignore_ascii_case(ENABLE_ON)
+                            || v.eq_ignore_ascii_case("true")
+                            || v.eq_ignore_ascii_case("1")
+                            || v.eq_ignore_ascii_case("yes")
+                    })
                     .unwrap_or(false);
-                debug!("Target env value: {},key: {},Target id: {}", enable_from_env, env_key, target_id);
-                debug!(
-                    "Target enablement from env: {}/{}: result: {}",
-                    target_type, target_id, enable_from_config
-                );
-                if enable_from_config != ENABLE_ON && !enable_from_env {
-                    info!("Skipping disabled target: {}/{}", target_type, target_id);
-                    continue;
-                }
-                debug!("create target: {}/{} start", target_type, target_id);
-                // Create target
-                match self.create_target(target_type, target_id.clone(), target_config).await {
-                    Ok(target) => {
-                        info!("Created target: {}/{}", target_type, target_id);
-                        targets.push(target);
-                    }
-                    Err(e) => {
-                        error!("Failed to create target {}/{}: reason: {}", target_type, target_id, e);
-                    }
+
+                if enabled {
+                    info!(instance_id = %id, "Target is enabled, ready to create a task");
+                    // 5.3. Create asynchronous tasks for enabled instances
+                    let target_type_clone = target_type.clone();
+                    let tid = id.clone();
+                    let merged_config_arc = std::sync::Arc::new(merged_config);
+                    tasks.push(async move {
+                        let result = factory.create_target(tid.clone(), &merged_config_arc).await;
+                        (target_type_clone, tid, result, std::sync::Arc::clone(&merged_config_arc))
+                    });
+                } else {
+                    info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
+                    // Remove disabled target from final configuration
+                    final_config.0.entry(section_name.clone()).or_default().remove(&id);
                 }
             }
         }
 
-        Ok(targets)
+        // 6. Concurrently execute all creation tasks and collect results
+        let mut successful_targets = Vec::new();
+        let mut successful_configs = Vec::new();
+        while let Some((target_type, id, result, final_config)) = tasks.next().await {
+            match result {
+                Ok(target) => {
+                    info!(target_type = %target_type, instance_id = %id, "Create a target successfully");
+                    successful_targets.push(target);
+                    successful_configs.push((target_type, id, final_config));
+                }
+                Err(e) => {
+                    error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create a target");
+                }
+            }
+        }
+
+        // 7. Aggregate new configuration and write back to system configuration
+        if !successful_configs.is_empty() {
+            info!(
+                "Prepare to update {} successfully created target configurations to the system configuration...",
+                successful_configs.len()
+            );
+            let mut new_config = config.clone();
+            for (target_type, id, kvs) in successful_configs {
+                let section_name = format!("{NOTIFY_ROUTE_PREFIX}{target_type}").to_lowercase();
+                new_config.0.entry(section_name).or_default().insert(id, (*kvs).clone());
+            }
+
+            let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+                return Err(TargetError::ServerNotInitialized(
+                    "Failed to save target configuration: server storage not initialized".to_string(),
+                ));
+            };
+
+            match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
+                Ok(_) => {
+                    info!("The new configuration was saved to the system successfully.")
+                }
+                Err(e) => {
+                    error!("Failed to save the new configuration: {}", e);
+                    return Err(TargetError::SaveConfig(e.to_string()));
+                }
+            }
+        }
+
+        info!(count = successful_targets.len(), "All target processing completed");
+        Ok(successful_targets)
     }
 }

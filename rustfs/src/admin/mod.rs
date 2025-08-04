@@ -25,6 +25,7 @@ use handlers::{
     sts, tier, user,
 };
 
+use crate::admin::handlers::event::{ListNotificationTargets, RemoveNotificationTarget, SetNotificationTarget};
 use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -363,6 +364,29 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
         AdminOperation(&policies::SetPolicyForUserOrGroup {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-list").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-set").as_str(),
+        AdminOperation(&SetNotificationTarget {}),
+    )?;
+
+    // Remove notification target
+    // This endpoint removes a notification target based on its type and name.
+    // target-remove?target_type=xxx&target_name=xxx
+    // * `target_type` - Target type, such as "notify_webhook" or "notify_mqtt".
+    // * `target_name` - A unique name for a Target, such as "1".
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
+        AdminOperation(&RemoveNotificationTarget {}),
     )?;
 
     Ok(())
