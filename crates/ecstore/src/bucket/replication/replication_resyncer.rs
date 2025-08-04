@@ -1,12 +1,13 @@
-use crate::bucket::bucket_target_sys::BucketTargetSys;
-use crate::bucket::metadata_sys;
+use crate::bucket::bucket_target_sys::{BucketTargetSys, TargetClient};
 use crate::bucket::replication::{
-    ObjectOpts, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateObjectInfo,
-    ReplicationConfigurationExt as _, ReplicationState, ReplicationType, ResyncTargetDecision, StatusType,
-    VersionPurgeStatusType, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    ObjectOpts, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateObjectInfo, ReplicatedInfos,
+    ReplicatedTargetInfo, ReplicationConfigurationExt as _, ReplicationState, ReplicationType, ResyncTargetDecision, StatusType,
+    VersionPurgeStatusType, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::bucket::{metadata_sys, replication};
+use crate::client::api_get_options::GetObjectOptions;
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
@@ -28,9 +29,10 @@ use std::fmt;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
+use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use super::replication_type::{ReplicateDecision, ReplicateTargetDecision, ResyncDecision};
 use regex::Regex;
@@ -136,19 +138,21 @@ static RESYNC_WORKER_COUNT: usize = 10;
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
     pub worker_size: usize,
-    pub resync_cancel_tx: tokio::sync::mpsc::Sender<()>,
-    pub resync_cancel_rx: tokio::sync::mpsc::Receiver<()>,
-    pub worker_tx: tokio::sync::mpsc::Sender<()>,
-    pub worker_rx: tokio::sync::mpsc::Receiver<()>,
+    pub resync_cancel_tx: tokio::sync::broadcast::Sender<()>,
+    pub resync_cancel_rx: tokio::sync::broadcast::Receiver<()>,
+    pub worker_tx: tokio::sync::broadcast::Sender<()>,
+    pub worker_rx: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl ReplicationResyncer {
     pub async fn new() -> Self {
-        let (resync_cancel_tx, resync_cancel_rx) = tokio::sync::mpsc::channel(RESYNC_WORKER_COUNT);
-        let (worker_tx, worker_rx) = tokio::sync::mpsc::channel(RESYNC_WORKER_COUNT);
+        let (resync_cancel_tx, resync_cancel_rx) = tokio::sync::broadcast::channel(RESYNC_WORKER_COUNT);
+        let (worker_tx, worker_rx) = tokio::sync::broadcast::channel(RESYNC_WORKER_COUNT);
 
         for _ in 0..RESYNC_WORKER_COUNT {
-            worker_tx.send(()).await.unwrap();
+            if let Err(err) = worker_tx.send(()) {
+                error!("Failed to send worker message: {}", err);
+            }
         }
 
         Self {
@@ -274,24 +278,27 @@ impl ReplicationResyncer {
         if let Err(err) = self.mark_status(status, opts.clone(), storage.clone()).await {
             error!("Failed to mark resync status: {}", err);
         }
-        if let Err(err) = self.worker_tx.send(()).await {
+        if let Err(err) = self.worker_tx.send(()) {
             error!("Failed to send worker message: {}", err);
         }
         // TODO: Metrics
     }
 
     async fn resync_bucket<S: StorageAPI>(
-        &mut self,
+        self: Arc<Self>,
         mut cancel_token: tokio::sync::broadcast::Receiver<bool>,
         storage: Arc<S>,
         heal: bool,
         opts: ResyncOpts,
     ) {
+        let mut worker_rx = self.worker_rx.resubscribe();
+
         tokio::select! {
             _ = cancel_token.recv() => {
                 return;
             }
-            _ = self.worker_rx.recv() => {}
+
+            _ = worker_rx.recv() => {}
         }
 
         let cfg = match get_replication_config(&opts.bucket).await {
@@ -390,8 +397,20 @@ impl ReplicationResyncer {
         };
 
         let mut worker_txs = Vec::new();
+        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+
+        let opts_clone = opts.clone();
+        let self_clone = self.clone();
 
         let mut futures = Vec::new();
+
+        let results_fut = tokio::spawn(async move {
+            while let Ok(st) = results_rx.recv().await {
+                self_clone.inc_stats(&st, opts_clone.clone()).await;
+            }
+        });
+
+        futures.push(results_fut);
 
         for _ in 0..RESYNC_WORKER_COUNT {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ReplicateObjectInfo>(100);
@@ -399,6 +418,10 @@ impl ReplicationResyncer {
 
             let mut cancel_token = cancel_token.resubscribe();
             let target_client = target_client.clone();
+            let mut resync_cancel_rx = self.resync_cancel_rx.resubscribe();
+            let storage = storage.clone();
+            let results_tx = results_tx.clone();
+            let bucket_name = opts.bucket.clone();
 
             let f = tokio::spawn(async move {
                 while let Some(mut roi) = rx.recv().await {
@@ -427,27 +450,73 @@ impl ReplicationResyncer {
                             op_type: ReplicationType::ExistingObject,
                             ..Default::default()
                         };
-                        replicate_delete(doi, storage).await;
+                        replicate_delete(doi, storage.clone()).await;
                     } else {
                         roi.op_type = ReplicationType::ExistingObject;
                         roi.event_type = REPLICATE_EXISTING.to_string();
-                        replicate_object(roi.clone(), storage).await;
+                        replicate_object(roi.clone(), storage.clone()).await;
                     }
 
-                    let st = TargetReplicationResyncStatus {
+                    let mut st = TargetReplicationResyncStatus {
                         object: roi.name.clone(),
                         bucket: roi.bucket.clone(),
                         ..Default::default()
                     };
 
-                    // target_client.state_object()
+                    let reset_id = target_client.reset_id.clone();
 
-                    todo!()
+                    let (size, err) = if let Err(err) = target_client
+                        .client
+                        .stat_object(
+                            &target_client.bucket,
+                            &roi.name,
+                            &GetObjectOptions {
+                                version_id: roi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        if roi.delete_marker {
+                            st.replicated_count += 1;
+                        } else {
+                            st.failed_count += 1;
+                        }
+                        (0, Some(err))
+                    } else {
+                        st.replicated_count += 1;
+                        st.replicated_size += roi.size;
+                        (roi.size, None)
+                    };
+
+                    info!(
+                        "resynced reset_id:{} object: {}/{}-{} size:{} err:{:?}",
+                        reset_id,
+                        bucket_name,
+                        roi.name,
+                        roi.version_id.unwrap_or_default(),
+                        size,
+                        err,
+                    );
+
+                    if resync_cancel_rx.try_recv().is_ok() {
+                        return;
+                    }
+
+                    if cancel_token.try_recv().is_ok() {
+                        return;
+                    }
+
+                    if let Err(err) = results_tx.send(st) {
+                        error!("Failed to send resync status: {}", err);
+                    }
                 }
             });
 
             futures.push(f);
         }
+
+        let mut resync_cancel_rx = self.resync_cancel_rx.resubscribe();
 
         while let Some(res) = rx.recv().await {
             if let Some(err) = res.err {
@@ -457,7 +526,7 @@ impl ReplicationResyncer {
                 return;
             }
 
-            if self.resync_cancel_rx.try_recv().is_ok() {
+            if resync_cancel_rx.try_recv().is_ok() {
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
@@ -486,7 +555,7 @@ impl ReplicationResyncer {
                 continue;
             }
 
-            if self.resync_cancel_rx.try_recv().is_ok() {
+            if resync_cancel_rx.try_recv().is_ok() {
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
@@ -599,6 +668,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         version_purge_status: oi.version_purge_status,
         replication_state,
         op_type: ReplicationType::Heal,
+        event_type: "".to_string(),
         dsc,
         existing_obj_resync,
         target_statuses,
@@ -1019,7 +1089,89 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     dsc
 }
 
-async fn replicate_delete<S: StorageAPI>(doi: DeletedObjectReplicationInfo, storage: Arc<S>) {
+async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
+    let bucket = dobj.bucket.clone();
+    let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
+        version_id.to_owned()
+    } else {
+        dobj.delete_object.version_id.unwrap_or_default()
+    };
+
+    let rcfg = match get_replication_config(&bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            warn!("No replication config found for bucket: {}", bucket);
+            // TODO: SendEvent
+            return;
+        }
+        Err(err) => {
+            error!("Failed to get replication config for bucket {}: {}", bucket, err);
+            // TODO: SendEvent
+            return;
+        }
+    };
+
+    let dsc = match parse_replicate_decision(&bucket, &dobj.delete_object.replication_state.replicate_decision_str) {
+        Ok(dsc) => dsc,
+        Err(err) => {
+            error!("Failed to parse replicate decision for bucket {}: {}", bucket, err);
+            // TODO: SendEvent
+            return;
+        }
+    };
+
+    //TODO: nslock
+
+    // Initialize replicated infos
+    let rinfos = ReplicatedInfos {
+        replication_timestamp: Some(OffsetDateTime::now_utc()),
+        targets: Vec::with_capacity(dsc.targets_map.len()),
+    };
+
+    let mut join_set = JoinSet::new();
+
+    // Process each target
+    for (_, tgt_entry) in &dsc.targets_map {
+        // Skip targets that should not be replicated
+        if !tgt_entry.replicate {
+            continue;
+        }
+
+        // If dobj.TargetArn is not empty string, this is a case of specific target being re-synced.
+        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+            continue;
+        }
+
+        // Get the remote target client
+        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &tgt_entry.arn).await else {
+            error!("failed to get target for bucket:{} arn:{}", bucket, tgt_entry.arn);
+
+            // TODO: SendEvent
+            continue;
+        };
+
+        let dobj_clone = dobj.clone();
+
+        // Spawn task in the join set
+        join_set.spawn(async move { replicate_delete_to_target(&dobj_clone, tgt_client.clone()).await });
+    }
+
+    // Collect all results
+    let mut targets = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(tgt_info) => targets.push(tgt_info),
+            Err(e) => {
+                error!("Task failed: {}", e);
+                // TODO: SendEvent
+            }
+        }
+    }
+
+    todo!()
+}
+
+async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
     todo!()
 }
 

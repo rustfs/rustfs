@@ -18,6 +18,7 @@ use crate::bucket::replication::replication_resyncer::ReplicationConfig;
 use crate::bucket::replication::replication_resyncer::check_replicate_delete;
 use crate::bucket::replication::replication_resyncer::must_replicate;
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::error::{Error, Result};
 use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;
 use crate::store_api::ObjectToDelete;
@@ -295,6 +296,122 @@ impl ReplicatedTargetInfo {
     }
 }
 
+/// ReplicatedInfos struct contains replication information for multiple targets
+#[derive(Debug, Clone)]
+pub struct ReplicatedInfos {
+    pub replication_timestamp: Option<OffsetDateTime>,
+    pub targets: Vec<ReplicatedTargetInfo>,
+}
+
+impl ReplicatedInfos {
+    /// Returns the total size of completed replications
+    pub fn completed_size(&self) -> i64 {
+        let mut sz = 0i64;
+        for target in &self.targets {
+            if target.is_empty() {
+                continue;
+            }
+            if target.replication_status == StatusType::Completed && target.prev_replication_status != StatusType::Completed {
+                sz += target.size;
+            }
+        }
+        sz
+    }
+
+    /// Returns true if replication was attempted on any of the targets for the object version queued
+    pub fn replication_resynced(&self) -> bool {
+        for target in &self.targets {
+            if target.is_empty() || !target.replication_resynced {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Returns internal representation of replication status for all targets
+    pub fn replication_status_internal(&self) -> String {
+        let mut result = String::new();
+        for target in &self.targets {
+            if target.is_empty() {
+                continue;
+            }
+            result.push_str(&format!("{}={};", target.arn, target.replication_status));
+        }
+        result
+    }
+
+    /// Returns overall replication status across all targets
+    pub fn replication_status(&self) -> StatusType {
+        if self.targets.is_empty() {
+            return StatusType::Empty;
+        }
+
+        let mut completed = 0;
+        for target in &self.targets {
+            match target.replication_status {
+                StatusType::Failed => return StatusType::Failed,
+                StatusType::Completed => completed += 1,
+                _ => {}
+            }
+        }
+
+        if completed == self.targets.len() {
+            StatusType::Completed
+        } else {
+            StatusType::Pending
+        }
+    }
+
+    /// Returns overall version purge status across all targets
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        if self.targets.is_empty() {
+            return VersionPurgeStatusType::Empty;
+        }
+
+        let mut completed = 0;
+        for target in &self.targets {
+            match target.version_purge_status {
+                VersionPurgeStatusType::Failed => return VersionPurgeStatusType::Failed,
+                VersionPurgeStatusType::Complete => completed += 1,
+                _ => {}
+            }
+        }
+
+        if completed == self.targets.len() {
+            VersionPurgeStatusType::Complete
+        } else {
+            VersionPurgeStatusType::Pending
+        }
+    }
+
+    /// Returns internal representation of version purge status for all targets
+    pub fn version_purge_status_internal(&self) -> String {
+        let mut result = String::new();
+        for target in &self.targets {
+            if target.is_empty() || target.version_purge_status.is_empty() {
+                continue;
+            }
+            result.push_str(&format!("{}={};", target.arn, target.version_purge_status));
+        }
+        result
+    }
+
+    /// Returns replication action based on target that actually performed replication
+    pub fn action(&self) -> ReplicationAction {
+        for target in &self.targets {
+            if target.is_empty() {
+                continue;
+            }
+            // rely on replication action from target that actually performed replication now.
+            if target.prev_replication_status != StatusType::Completed {
+                return target.replication_action.clone();
+            }
+        }
+        ReplicationAction::None
+    }
+}
+
 pub fn get_composite_replication_status(targets: &HashMap<String, StatusType>) -> StatusType {
     if targets.is_empty() {
         return StatusType::Empty;
@@ -416,6 +533,65 @@ impl Default for ReplicateDecision {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// parse k-v pairs of target ARN to stringified ReplicateTargetDecision delimited by ',' into a
+// ReplicateDecision struct
+pub fn parse_replicate_decision(_bucket: &str, s: &str) -> Result<ReplicateDecision> {
+    let mut decision = ReplicateDecision::new();
+
+    if s.is_empty() {
+        return Ok(decision);
+    }
+
+    for p in s.split(',') {
+        if p.is_empty() {
+            continue;
+        }
+
+        let slc = p.split('=').collect::<Vec<&str>>();
+        if slc.len() != 2 {
+            return Err(Error::other(format!("invalid replicate decision format: {}", s)));
+        }
+
+        let tgt_str = slc[1].trim_matches('"');
+        let tgt = tgt_str.split(';').collect::<Vec<&str>>();
+        if tgt.len() != 4 {
+            return Err(Error::other(format!("invalid replicate decision format: {}", s)));
+        }
+
+        let tgt = ReplicateTargetDecision {
+            replicate: tgt[0] == "true",
+            synchronous: tgt[1] == "true",
+            arn: tgt[2].to_string(),
+            id: tgt[3].to_string(),
+        };
+        decision.targets_map.insert(slc[0].to_string(), tgt);
+    }
+
+    Ok(decision)
+
+    // r = ReplicateDecision{
+    // 	targetsMap: make(map[string]replicateTargetDecision),
+    // }
+    // if len(s) == 0 {
+    // 	return
+    // }
+    // for _, p := range strings.Split(s, ",") {
+    // 	if p == "" {
+    // 		continue
+    // 	}
+    // 	slc := strings.Split(p, "=")
+    // 	if len(slc) != 2 {
+    // 		return r, errInvalidReplicateDecisionFormat
+    // 	}
+    // 	tgtStr := strings.TrimSuffix(strings.TrimPrefix(slc[1], `"`), `"`)
+    // 	tgt := strings.Split(tgtStr, ";")
+    // 	if len(tgt) != 4 {
+    // 		return r, errInvalidReplicateDecisionFormat
+    // 	}
+    // 	r.targetsMap[slc[0]] = replicateTargetDecision{Replicate: tgt[0] == "true", Synchronous: tgt[1] == "true", Arn: tgt[2], ID: tgt[3]}
+    // }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -30,6 +30,12 @@ use crate::bucket::metadata::BucketMetadata;
 
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
+use crate::client;
+use crate::client::credentials::SignatureType;
+use crate::client::credentials::Static;
+use crate::client::credentials::Value;
+use crate::client::transition_api::Options;
+use crate::client::transition_api::TransitionClient;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
@@ -362,7 +368,7 @@ impl BucketTargetSys {
             });
         }
 
-        let target_client = self.get_remote_target_client_internal(target)?;
+        let target_client = self.get_remote_target_client_internal(target).await?;
 
         // Validate target credentials
         if !self.validate_target_credentials(target).await? {
@@ -486,7 +492,21 @@ impl BucketTargetSys {
         None
     }
 
-    pub fn get_remote_target_client_internal(&self, target: &BucketTarget) -> Result<TargetClient, BucketTargetError> {
+    pub async fn get_remote_target_client_internal(&self, target: &BucketTarget) -> Result<TargetClient, BucketTargetError> {
+        let Some(credentials) = &target.credentials else {
+            return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                bucket: target.target_bucket.clone(),
+            });
+        };
+
+        let creds = client::credentials::Credentials::new(Static(Value {
+            access_key_id: credentials.access_key.clone(),
+            secret_access_key: credentials.secret_key.clone(),
+            session_token: "".to_string(),
+            signer_type: SignatureType::SignatureV4,
+            ..Default::default()
+        }));
+
         Ok(TargetClient {
             endpoint: target.endpoint.clone(),
             credentials: target.credentials.clone(),
@@ -498,7 +518,18 @@ impl BucketTargetSys {
             secure: target.secure,
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
-            client: HttpClient::new(), // TODO: use a s3 client
+            client: Arc::new(
+                TransitionClient::new(
+                    &target.endpoint,
+                    Options {
+                        creds,
+                        secure: target.secure,
+                        region: target.region.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            ),
         })
     }
 
@@ -539,7 +570,7 @@ impl BucketTargetSys {
         if let Some(new_targets) = targets {
             if !new_targets.is_empty() {
                 for target in &new_targets.targets {
-                    if let Ok(client) = self.get_remote_target_client_internal(target) {
+                    if let Ok(client) = self.get_remote_target_client_internal(target).await {
                         arn_remotes_map.insert(
                             target.arn.clone(),
                             ArnTarget {
@@ -565,7 +596,7 @@ impl BucketTargetSys {
         }
 
         for target in config.targets.iter() {
-            let cli = match self.get_remote_target_client_internal(target) {
+            let cli = match self.get_remote_target_client_internal(target).await {
                 Ok(cli) => cli,
                 Err(e) => {
                     error!("set bucket target:{} error:{}", bucket, e);
@@ -598,7 +629,7 @@ pub struct TargetClient {
     pub secure: bool,
     pub health_check_duration: Duration,
     pub replicate_sync: bool,
-    pub client: HttpClient,
+    pub client: Arc<TransitionClient>,
 }
 
 #[derive(Debug)]
@@ -629,6 +660,8 @@ pub enum BucketTargetError {
     BucketRemoteRemoveDisallowed {
         bucket: String,
     },
+
+    Io(std::io::Error),
 }
 
 impl fmt::Display for BucketTargetError {
@@ -662,7 +695,14 @@ impl fmt::Display for BucketTargetError {
             BucketTargetError::BucketRemoteRemoveDisallowed { bucket } => {
                 write!(f, "Remote target removal disallowed for bucket: {bucket}")
             }
+            BucketTargetError::Io(e) => write!(f, "IO error: {e}"),
         }
+    }
+}
+
+impl From<std::io::Error> for BucketTargetError {
+    fn from(e: std::io::Error) -> Self {
+        BucketTargetError::Io(e)
     }
 }
 

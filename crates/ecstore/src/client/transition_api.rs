@@ -87,6 +87,7 @@ pub enum ReaderImpl {
 
 pub type ReadCloser = BufReader<Cursor<Vec<u8>>>;
 
+#[derive(Debug)]
 pub struct TransitionClient {
     pub endpoint_url: Url,
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
