@@ -22,17 +22,16 @@ use std::{
     fmt::Debug,
     future::Future,
     pin::Pin,
-    ptr,
     sync::{
         Arc,
-        atomic::{AtomicPtr, AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::spawn;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 const SLASH_SEPARATOR: &str = "/";
@@ -758,14 +757,14 @@ pub struct Cache<T: Clone + Debug + Send> {
     update_fn: UpdateFn<T>,
     ttl: Duration,
     opts: Opts,
-    val: AtomicPtr<T>,
+    val: Arc<RwLock<Option<T>>>,
     last_update_ms: AtomicU64,
     updating: Arc<Mutex<bool>>,
 }
 
-impl<T: Clone + Debug + Send + 'static> Cache<T> {
+impl<T: Clone + Debug + Send + Sync + 'static> Cache<T> {
     pub fn new(update_fn: UpdateFn<T>, ttl: Duration, opts: Opts) -> Self {
-        let val = AtomicPtr::new(ptr::null_mut());
+        let val = Arc::new(RwLock::new(None));
         Self {
             update_fn,
             ttl,
@@ -776,26 +775,19 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         }
     }
 
-    #[allow(unsafe_code)]
     pub async fn get(self: Arc<Self>) -> std::io::Result<T> {
-        let v_ptr = self.val.load(AtomicOrdering::SeqCst);
-        let v = if v_ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { (*v_ptr).clone() })
-        };
-
+        let val = self.val.read().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
         if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() {
-            if let Some(v) = v {
-                return Ok(v);
+            if let Some(val) = &*val {
+                return Ok(val.clone());
             }
         }
 
-        if self.opts.no_wait && v.is_some() && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
+        if self.opts.no_wait && val.is_some() && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
             if self.updating.try_lock().is_ok() {
                 let this = Arc::clone(&self);
                 spawn(async move {
@@ -803,37 +795,46 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
                 });
             }
 
-            return Ok(v.unwrap());
+            return Ok(val.as_ref().unwrap().clone());
         }
 
-        let _ = self.updating.lock().await;
+        let _guard = self.updating.lock().await;
 
+        // Re-check after acquiring lock
+        let val = self.val.read().await;
         if let Ok(duration) =
             SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst)))
         {
             if duration < self.ttl {
-                return Ok(v.unwrap());
+                if let Some(v) = &*val {
+                    return Ok(v.clone());
+                }
             }
         }
+        drop(val);
 
         match self.update().await {
             Ok(_) => {
-                let v_ptr = self.val.load(AtomicOrdering::SeqCst);
-                let v = if v_ptr.is_null() {
-                    None
-                } else {
-                    Some(unsafe { (*v_ptr).clone() })
-                };
-                Ok(v.unwrap())
+                let val = self.val.read().await;
+                Ok(val.as_ref().unwrap().clone())
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                if self.opts.return_last_good {
+                    let val = self.val.read().await;
+                    if let Some(v) = &*val {
+                        return Ok(v.clone());
+                    }
+                }
+                Err(err)
+            }
         }
     }
 
     async fn update(&self) -> std::io::Result<()> {
         match (self.update_fn)().await {
             Ok(val) => {
-                self.val.store(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                let mut w_val = self.val.write().await;
+                *w_val = Some(val);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
@@ -842,9 +843,11 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
                 Ok(())
             }
             Err(err) => {
-                let v_ptr = self.val.load(AtomicOrdering::SeqCst);
-                if self.opts.return_last_good && !v_ptr.is_null() {
-                    return Ok(());
+                if self.opts.return_last_good {
+                    let val = self.val.read().await;
+                    if val.is_some() {
+                        return Ok(());
+                    }
                 }
 
                 Err(err)
