@@ -170,7 +170,7 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FS {
     // pub store: ECStore,
 }

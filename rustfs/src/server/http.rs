@@ -134,7 +134,7 @@ pub async fn start_http_server(
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route(opt.console_enable, std::sync::Arc::new(store.clone()))?);
+        b.set_route(admin::make_admin_route(opt.console_enable)?);
 
         if !opt.server_domains.is_empty() {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains

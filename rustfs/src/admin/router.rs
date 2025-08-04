@@ -165,7 +165,7 @@ pub trait Operation: Send + Sync + 'static {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>>;
 }
 
-pub struct AdminOperation(pub Box<dyn Operation>);
+pub struct AdminOperation(pub &'static dyn Operation);
 
 #[async_trait::async_trait]
 impl Operation for AdminOperation {

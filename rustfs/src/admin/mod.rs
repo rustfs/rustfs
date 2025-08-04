@@ -41,11 +41,11 @@ use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 
-pub fn make_admin_route(console_enabled: bool, fs: std::sync::Arc<crate::storage::ecfs::FS>) -> std::io::Result<impl S3Route> {
+pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
 
     // 1
-    r.insert(Method::POST, "/", AdminOperation(Box::new(sts::AssumeRoleHandle {})))?;
+    r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
 
     register_rpc_route(&mut r)?;
     register_user_route(&mut r)?;
@@ -53,81 +53,81 @@ pub fn make_admin_route(console_enabled: bool, fs: std::sync::Arc<crate::storage
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/service").as_str(),
-        AdminOperation(Box::new(handlers::ServiceHandle {})),
+        AdminOperation(&handlers::ServiceHandle {}),
     )?;
     // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info").as_str(),
-        AdminOperation(Box::new(handlers::ServerInfoHandler {})),
+        AdminOperation(&handlers::ServerInfoHandler {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/inspect-data").as_str(),
-        AdminOperation(Box::new(handlers::InspectDataHandler {})),
+        AdminOperation(&handlers::InspectDataHandler {}),
     )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/inspect-data").as_str(),
-        AdminOperation(Box::new(handlers::InspectDataHandler {})),
+        AdminOperation(&handlers::InspectDataHandler {}),
     )?;
     // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/storageinfo").as_str(),
-        AdminOperation(Box::new(handlers::StorageInfoHandler {})),
+        AdminOperation(&handlers::StorageInfoHandler {}),
     )?;
     // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/datausageinfo").as_str(),
-        AdminOperation(Box::new(handlers::DataUsageInfoHandler {})),
+        AdminOperation(&handlers::DataUsageInfoHandler {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/metrics").as_str(),
-        AdminOperation(Box::new(handlers::MetricsHandler {})),
+        AdminOperation(&handlers::MetricsHandler {}),
     )?;
 
     // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/list").as_str(),
-        AdminOperation(Box::new(pools::ListPools {})),
+        AdminOperation(&pools::ListPools {}),
     )?;
     // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/status").as_str(),
-        AdminOperation(Box::new(pools::StatusPool {})),
+        AdminOperation(&pools::StatusPool {}),
     )?;
     // todo
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/decommission").as_str(),
-        AdminOperation(Box::new(pools::StartDecommission {})),
+        AdminOperation(&pools::StartDecommission {}),
     )?;
     // todo
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/cancel").as_str(),
-        AdminOperation(Box::new(pools::CancelDecommission {})),
+        AdminOperation(&pools::CancelDecommission {}),
     )?;
 
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/start").as_str(),
-        AdminOperation(Box::new(rebalance::RebalanceStart {})),
+        AdminOperation(&rebalance::RebalanceStart {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/status").as_str(),
-        AdminOperation(Box::new(rebalance::RebalanceStatus {})),
+        AdminOperation(&rebalance::RebalanceStatus {}),
     )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/stop").as_str(),
-        AdminOperation(Box::new(rebalance::RebalanceStop {})),
+        AdminOperation(&rebalance::RebalanceStop {}),
     )?;
 
     // Some APIs are only available in EC mode
@@ -135,99 +135,99 @@ pub fn make_admin_route(console_enabled: bool, fs: std::sync::Arc<crate::storage
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
-        AdminOperation(Box::new(handlers::HealHandler {})),
+        AdminOperation(&handlers::HealHandler {}),
     )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
-        AdminOperation(Box::new(handlers::BackgroundHealStatusHandler {})),
+        AdminOperation(&handlers::BackgroundHealStatusHandler {}),
     )?;
 
     // ?
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
-        AdminOperation(Box::new(tier::ListTiers {})),
+        AdminOperation(&tier::ListTiers {}),
     )?;
     // ?
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
-        AdminOperation(Box::new(tier::GetTierInfo {})),
+        AdminOperation(&tier::GetTierInfo {}),
     )?;
     // ?force=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
-        AdminOperation(Box::new(tier::RemoveTier {})),
+        AdminOperation(&tier::RemoveTier {}),
     )?;
     // ?force=xxx
     // body: AddOrUpdateTierReq
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
-        AdminOperation(Box::new(tier::AddTier {})),
+        AdminOperation(&tier::AddTier {}),
     )?;
     // ?
     // body: AddOrUpdateTierReq
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
-        AdminOperation(Box::new(tier::EditTier {})),
+        AdminOperation(&tier::EditTier {}),
     )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
-        AdminOperation(Box::new(tier::ClearTier {})),
+        AdminOperation(&tier::ClearTier {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/export-bucket-metadata").as_str(),
-        AdminOperation(Box::new(bucket_meta::ExportBucketMetadata {})),
+        AdminOperation(&bucket_meta::ExportBucketMetadata {}),
     )?;
 
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/import-bucket-metadata").as_str(),
-        AdminOperation(Box::new(bucket_meta::ImportBucketMetadata {})),
+        AdminOperation(&bucket_meta::ImportBucketMetadata {}),
     )?;
 
     // KMS management endpoints
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/create").as_str(),
-        AdminOperation(Box::new(CreateKmsKey {})),
+        AdminOperation(&CreateKmsKey {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/status").as_str(),
-        AdminOperation(Box::new(GetKmsKeyStatus {})),
+        AdminOperation(&GetKmsKeyStatus {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/list").as_str(),
-        AdminOperation(Box::new(ListKmsKeys {})),
+        AdminOperation(&ListKmsKeys {}),
     )?;
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/enable").as_str(),
-        AdminOperation(Box::new(EnableKmsKey {})),
+        AdminOperation(&EnableKmsKey {}),
     )?;
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/disable").as_str(),
-        AdminOperation(Box::new(DisableKmsKey {})),
+        AdminOperation(&DisableKmsKey {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
-        AdminOperation(Box::new(GetKmsStatus {})),
+        AdminOperation(&GetKmsStatus {}),
     )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
-        AdminOperation(Box::new(ConfigureKms {})),
+        AdminOperation(&ConfigureKms {}),
     )?;
 
     // Bucket encryption endpoints - COMPLETED
@@ -235,46 +235,46 @@ pub fn make_admin_route(console_enabled: bool, fs: std::sync::Arc<crate::storage
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption/{bucket}").as_str(),
-        AdminOperation(Box::new(PutBucketEncryptionHandler { fs: fs.clone() })),
+        AdminOperation(&PutBucketEncryptionHandler {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption/{bucket}").as_str(),
-        AdminOperation(Box::new(GetBucketEncryptionHandler { fs: fs.clone() })),
+        AdminOperation(&GetBucketEncryptionHandler {}),
     )?;
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryption/{bucket}").as_str(),
-        AdminOperation(Box::new(DeleteBucketEncryptionHandler { fs: fs.clone() })),
+        AdminOperation(&DeleteBucketEncryptionHandler {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/bucket-encryptions").as_str(),
-        AdminOperation(Box::new(ListBucketEncryptionsHandler { fs: fs.clone() })),
+        AdminOperation(&ListBucketEncryptionsHandler {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
-        AdminOperation(Box::new(ListRemoteTargetHandler {})),
+        AdminOperation(&ListRemoteTargetHandler {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
-        AdminOperation(Box::new(GetReplicationMetricsHandler {})),
+        AdminOperation(&GetReplicationMetricsHandler {}),
     )?;
 
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
-        AdminOperation(Box::new(SetRemoteTargetHandler {})),
+        AdminOperation(&SetRemoteTargetHandler {}),
     )?;
 
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
-        AdminOperation(Box::new(RemoveRemoteTargetHandler {})),
+        AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
     Ok(r)
@@ -286,28 +286,28 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
-        AdminOperation(Box::new(handlers::AccountInfoHandler {})),
+        AdminOperation(&handlers::AccountInfoHandler {}),
     )?;
 
     // ?[bucket=xxx]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-users").as_str(),
-        AdminOperation(Box::new(user::ListUsers {})),
+        AdminOperation(&user::ListUsers {}),
     )?;
 
     // ?accessKey=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/user-info").as_str(),
-        AdminOperation(Box::new(user::GetUserInfo {})),
+        AdminOperation(&user::GetUserInfo {}),
     )?;
 
     // ?accessKey=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-user").as_str(),
-        AdminOperation(Box::new(user::RemoveUser {})),
+        AdminOperation(&user::RemoveUser {}),
     )?;
 
     // ?accessKey=xxx
@@ -315,40 +315,40 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-user").as_str(),
-        AdminOperation(Box::new(user::AddUser {})),
+        AdminOperation(&user::AddUser {}),
     )?;
     // ?accessKey=xxx&status=enabled
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
-        AdminOperation(Box::new(user::SetUserStatus {})),
+        AdminOperation(&user::SetUserStatus {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/groups").as_str(),
-        AdminOperation(Box::new(group::ListGroups {})),
+        AdminOperation(&group::ListGroups {}),
     )?;
 
     // ?group=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/group").as_str(),
-        AdminOperation(Box::new(group::GetGroup {})),
+        AdminOperation(&group::GetGroup {}),
     )?;
 
     // ?group=xxx&status=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-group-status").as_str(),
-        AdminOperation(Box::new(group::SetGroupStatus {})),
+        AdminOperation(&group::SetGroupStatus {}),
     )?;
 
     // @body GroupAddRemove
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/update-group-members").as_str(),
-        AdminOperation(Box::new(group::UpdateGroupMembers {})),
+        AdminOperation(&group::UpdateGroupMembers {}),
     )?;
 
     // Service accounts
@@ -357,79 +357,79 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/update-service-account").as_str(),
-        AdminOperation(Box::new(UpdateServiceAccount {})),
+        AdminOperation(&UpdateServiceAccount {}),
     )?;
     // ?accessKey=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-service-account").as_str(),
-        AdminOperation(Box::new(InfoServiceAccount {})),
+        AdminOperation(&InfoServiceAccount {}),
     )?;
 
     // ?[user=xxx]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-service-accounts").as_str(),
-        AdminOperation(Box::new(ListServiceAccount {})),
+        AdminOperation(&ListServiceAccount {}),
     )?;
     // ?accessKey=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/delete-service-accounts").as_str(),
-        AdminOperation(Box::new(DeleteServiceAccount {})),
+        AdminOperation(&DeleteServiceAccount {}),
     )?;
     // @body: AddServiceAccountReq
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-service-accounts").as_str(),
-        AdminOperation(Box::new(AddServiceAccount {})),
+        AdminOperation(&AddServiceAccount {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/export-iam").as_str(),
-        AdminOperation(Box::new(user::ExportIam {})),
+        AdminOperation(&user::ExportIam {}),
     )?;
 
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/import-iam").as_str(),
-        AdminOperation(Box::new(user::ImportIam {})),
+        AdminOperation(&user::ImportIam {}),
     )?;
 
     // list-canned-policies?bucket=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-canned-policies").as_str(),
-        AdminOperation(Box::new(policies::ListCannedPolicies {})),
+        AdminOperation(&policies::ListCannedPolicies {}),
     )?;
 
     // info-canned-policy?name=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-canned-policy").as_str(),
-        AdminOperation(Box::new(policies::InfoCannedPolicy {})),
+        AdminOperation(&policies::InfoCannedPolicy {}),
     )?;
 
     // add-canned-policy?name=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-canned-policy").as_str(),
-        AdminOperation(Box::new(policies::AddCannedPolicy {})),
+        AdminOperation(&policies::AddCannedPolicy {}),
     )?;
 
     // remove-canned-policy?name=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-canned-policy").as_str(),
-        AdminOperation(Box::new(policies::RemoveCannedPolicy {})),
+        AdminOperation(&policies::RemoveCannedPolicy {}),
     )?;
 
     // set-user-or-group-policy?policyName=xxx&userOrGroup=xxx&isGroup=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
-        AdminOperation(Box::new(policies::SetPolicyForUserOrGroup {})),
+        AdminOperation(&policies::SetPolicyForUserOrGroup {}),
     )?;
 
     r.insert(
