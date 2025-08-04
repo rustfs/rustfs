@@ -37,6 +37,26 @@ use uuid::Uuid;
 
 pub const REPLICATION_RESET: &str = "replication-reset";
 
+// ReplicateQueued - replication being queued trail
+pub const REPLICATE_QUEUED: &str = "replicate:queue";
+
+// ReplicateExisting - audit trail for existing objects replication
+pub const REPLICATE_EXISTING: &str = "replicate:existing";
+// ReplicateExistingDelete - audit trail for delete replication triggered for existing delete markers
+pub const REPLICATE_EXISTING_DELETE: &str = "replicate:existing:delete";
+
+// ReplicateMRF - audit trail for replication from Most Recent Failures (MRF) queue
+pub const REPLICATE_MRF: &str = "replicate:mrf";
+// ReplicateIncoming - audit trail of inline replication
+pub const REPLICATE_INCOMING: &str = "replicate:incoming";
+// ReplicateIncomingDelete - audit trail of inline replication of deletes.
+pub const REPLICATE_INCOMING_DELETE: &str = "replicate:incoming:delete";
+
+// ReplicateHeal - audit trail for healing of failed/pending replications
+pub const REPLICATE_HEAL: &str = "replicate:heal";
+// ReplicateHealDelete - audit trail of healing of failed/pending delete replications.
+pub const REPLICATE_HEAL_DELETE: &str = "replicate:heal:delete";
+
 /// Type - replication type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ReplicationType {
@@ -511,6 +531,7 @@ pub struct ReplicateObjectInfo {
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_state: ReplicationState,
     pub op_type: ReplicationType,
+    pub event_type: String,
     pub dsc: ReplicateDecision,
     pub existing_obj_resync: ResyncDecision,
     pub target_statuses: HashMap<String, StatusType>,

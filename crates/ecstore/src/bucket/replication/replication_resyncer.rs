@@ -1,9 +1,9 @@
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata_sys;
 use crate::bucket::replication::{
-    ObjectOpts, REPLICATION_RESET, ReplicateObjectInfo, ReplicationConfigurationExt as _, ReplicationState, ReplicationType,
-    ResyncTargetDecision, StatusType, VersionPurgeStatusType, replication_statuses_map, target_reset_header,
-    version_purge_statuses_map,
+    ObjectOpts, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateObjectInfo,
+    ReplicationConfigurationExt as _, ReplicationState, ReplicationType, ResyncTargetDecision, StatusType,
+    VersionPurgeStatusType, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -336,7 +336,7 @@ impl ReplicationResyncer {
             return;
         }
 
-        let Some(_target_client) = BucketTargetSys::get()
+        let Some(target_client) = BucketTargetSys::get()
             .get_remote_target_client(&opts.bucket, &target_arns[0])
             .await
         else {
@@ -398,6 +398,7 @@ impl ReplicationResyncer {
             worker_txs.push(tx);
 
             let mut cancel_token = cancel_token.resubscribe();
+            let target_client = target_client.clone();
 
             let f = tokio::spawn(async move {
                 while let Some(mut roi) = rx.recv().await {
@@ -414,15 +415,32 @@ impl ReplicationResyncer {
 
                         let doi = DeletedObjectReplicationInfo {
                             delete_object: DeletedObject {
-                                object_name: roi.name,
-                                version_id,
-                                ..Default::default()
+                                object_name: roi.name.clone(),
+                                delete_marker_version_id: dm_version_id.map(|v| v.to_string()),
+                                version_id: version_id.map(|v| v.to_string()),
+                                replication_state: roi.replication_state,
+                                delete_marker: roi.delete_marker,
+                                delete_marker_mtime: roi.mod_time,
                             },
-                            bucket: roi.bucket,
-                            event_type: "delete".to_string(),
+                            bucket: roi.bucket.clone(),
+                            event_type: REPLICATE_EXISTING_DELETE.to_string(),
                             op_type: ReplicationType::ExistingObject,
+                            ..Default::default()
                         };
+                        replicate_delete(doi, storage).await;
+                    } else {
+                        roi.op_type = ReplicationType::ExistingObject;
+                        roi.event_type = REPLICATE_EXISTING.to_string();
+                        replicate_object(roi.clone(), storage).await;
                     }
+
+                    let st = TargetReplicationResyncStatus {
+                        object: roi.name.clone(),
+                        bucket: roi.bucket.clone(),
+                        ..Default::default()
+                    };
+
+                    // target_client.state_object()
 
                     todo!()
                 }
@@ -627,6 +645,7 @@ async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfig
     Ok(config)
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct DeletedObjectReplicationInfo {
     pub delete_object: DeletedObject,
     pub bucket: String,
@@ -998,4 +1017,12 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     }
 
     dsc
+}
+
+async fn replicate_delete<S: StorageAPI>(doi: DeletedObjectReplicationInfo, storage: Arc<S>) {
+    todo!()
+}
+
+async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<S>) {
+    todo!()
 }

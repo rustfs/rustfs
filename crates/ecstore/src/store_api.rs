@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
-use crate::bucket::replication;
+use crate::bucket::replication::{self, ReplicationState};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::error::{Error, Result};
 use crate::heal::heal_ops::HealSequence;
@@ -860,7 +860,7 @@ pub struct DeletedObject {
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication
-    // pub replication_state: ReplicationState,
+    pub replication_state: ReplicationState,
 }
 
 #[derive(Debug, Default, Clone)]
