@@ -8,9 +8,7 @@ use aws_sdk_s3::{
 #[allow(unused_imports)]
 use base64::{Engine, engine::general_purpose::STANDARD};
 #[allow(unused_imports)]
-use md5::Digest;
-#[allow(unused_imports)]
-use md5::Md5;
+use md5::{Digest, Md5};
 
 #[tokio::test]
 #[ignore = "requires running RustFS server at localhost:9000"]
@@ -191,13 +189,16 @@ async fn test_multipart_upload_with_encryption() -> Result<(), Box<dyn std::erro
 
     // Upload parts
     let part_data = vec![b'A'; 5 * 1024 * 1024]; // 5MB part
+    let mut hasher = Md5::new();
+    hasher.update(&part_data);
+    let expected_hash = hasher.finalize();
     let upload_part = client
         .upload_part()
         .bucket(bucket)
         .key("large-object")
         .upload_id(multipart_upload.upload_id().unwrap())
         .part_number(1)
-        .body(ByteStream::from(part_data))
+        .body(ByteStream::from(part_data.clone()))
         .send()
         .await?;
 
@@ -224,6 +225,10 @@ async fn test_multipart_upload_with_encryption() -> Result<(), Box<dyn std::erro
     let response = client.get_object().bucket(bucket).key("large-object").send().await?;
 
     let downloaded_data = response.body.collect().await?.to_vec();
+    let mut downloaded_hasher = Md5::new();
+    downloaded_hasher.update(&downloaded_data);
+    let downloaded_hash = downloaded_hasher.finalize();
+    assert_eq!(downloaded_hash, expected_hash);
     assert_eq!(downloaded_data.len(), 5 * 1024 * 1024);
 
     cleanup_test_context(test_context).await?;
