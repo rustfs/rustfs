@@ -76,6 +76,7 @@ once_cell = { workspace = true }
 opentelemetry = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
+quick-xml = { workspace = true }
 reqwest = { workspace = true }
 rustls.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }

@@ -68,7 +68,6 @@ use tracing::debug;
 use tracing::{error, info, warn};
 // use url::UrlQuery;
 
-pub mod bucket_encryption;
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
