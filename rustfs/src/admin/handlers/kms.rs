@@ -327,24 +327,11 @@ impl Operation for ConfigureKms {
                     Ok(()) => {
                         info!("Successfully configured KMS with type: {}", config_request.kms_type);
 
-                        // Initialize bucket encryption manager and encryption service
-                        let bucket_manager = std::sync::Arc::new(rustfs_kms::BucketEncryptionManager::new());
+                        // Initialize encryption service
                         let encryption_service =
                             std::sync::Arc::new(rustfs_kms::ObjectEncryptionService::new((*kms_manager).clone()));
 
-                        // Initialize global instances
-                        if let Err(err) = rustfs_kms::init_global_bucket_encryption_manager(bucket_manager) {
-                            error!("Failed to initialize bucket encryption manager: {}", err);
-                            return Ok(kms_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                KmsErrorResponse {
-                                    code: "ConfigurationFailed".to_string(),
-                                    message: "Failed to initialize bucket encryption manager".to_string(),
-                                    description: format!("Error: {err}"),
-                                },
-                            ));
-                        }
-
+                        // Initialize global encryption service
                         if let Err(err) = rustfs_kms::init_global_encryption_service(encryption_service) {
                             error!("Failed to initialize encryption service: {}", err);
                             return Ok(kms_error_response(

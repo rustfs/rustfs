@@ -47,12 +47,6 @@ use std::sync::{Arc, RwLock};
 /// Uses RwLock to allow dynamic reconfiguration.
 static GLOBAL_KMS: OnceCell<RwLock<Option<Arc<KmsManager>>>> = OnceCell::new();
 
-/// Global bucket encryption manager instance
-///
-/// This provides bucket-level encryption configuration management
-/// throughout the application lifecycle.
-static GLOBAL_BUCKET_ENCRYPTION_MANAGER: OnceCell<RwLock<Option<Arc<BucketEncryptionManager>>>> = OnceCell::new();
-
 /// Global object encryption service instance
 ///
 /// This provides object-level encryption and decryption services
@@ -226,18 +220,21 @@ pub fn shutdown_global_kms() {
     }
 }
 
-/// Initialize the global bucket encryption manager
-///
-/// This function should be called during application startup to initialize
-/// the bucket encryption manager.
-///
-/// # Arguments
-///
-/// * `manager` - The configured bucket encryption manager instance
-///
-/// # Returns
-///
-/// Returns `Ok(())` if initialization is successful, or an error if already initialized.
+// Initialize the global bucket encryption manager
+//
+// This function should be called during application startup to initialize
+// the bucket encryption manager.
+//
+// # Arguments
+//
+// * `manager` - The configured bucket encryption manager instance
+//
+// # Returns
+//
+// Returns `Ok(())` if initialization is successful, or an error if already initialized.
+//
+// NOTE: This is deprecated in favor of metadata-based bucket encryption
+/*
 pub fn init_global_bucket_encryption_manager(manager: Arc<BucketEncryptionManager>) -> Result<()> {
     let manager_lock = GLOBAL_BUCKET_ENCRYPTION_MANAGER.get_or_init(|| RwLock::new(None));
     let mut mgr = manager_lock.write().map_err(|_| KmsError::InternalError {
@@ -255,6 +252,7 @@ pub fn get_global_bucket_encryption_manager() -> Option<Arc<BucketEncryptionMana
     let mgr = manager_lock.read().ok()?;
     mgr.clone()
 }
+*/
 
 /// Initialize the global object encryption service
 ///
@@ -294,19 +292,19 @@ pub fn get_global_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
 /// # Arguments
 ///
 /// * `kms_manager` - The KMS manager instance
-/// * `bucket_manager` - The bucket encryption manager instance
 /// * `encryption_service` - The object encryption service instance
 ///
 /// # Returns
 ///
 /// Returns `Ok(())` if all initializations are successful.
+///
+/// NOTE: bucket_manager parameter removed as bucket encryption is now metadata-based
 pub fn init_all_encryption_services(
     kms_manager: Arc<KmsManager>,
-    bucket_manager: Arc<BucketEncryptionManager>,
     encryption_service: Arc<ObjectEncryptionService>,
 ) -> Result<()> {
     init_global_kms(kms_manager)?;
-    init_global_bucket_encryption_manager(bucket_manager)?;
+    // init_global_bucket_encryption_manager(bucket_manager)?; // Deprecated
     init_global_encryption_service(encryption_service)?;
     Ok(())
 }
@@ -318,11 +316,14 @@ pub fn init_all_encryption_services(
 pub fn shutdown_all_encryption_services() {
     shutdown_global_kms();
 
+    // Bucket encryption manager shutdown removed as it's now metadata-based
+    /*
     if let Some(manager_lock) = GLOBAL_BUCKET_ENCRYPTION_MANAGER.get() {
         if let Ok(mut mgr) = manager_lock.write() {
             *mgr = None;
         }
     }
+    */
 
     if let Some(service_lock) = GLOBAL_ENCRYPTION_SERVICE.get() {
         if let Ok(mut svc) = service_lock.write() {

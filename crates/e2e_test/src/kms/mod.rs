@@ -6,7 +6,7 @@
 //! - Encryption security testing
 //! - Key management operations
 
-pub mod admin_encryption;
+pub mod bucket_encryption_config;
 pub mod encryption_key_management;
 pub mod encryption_security;
 pub mod s3_encryption;
