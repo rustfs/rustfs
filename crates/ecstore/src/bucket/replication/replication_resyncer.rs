@@ -2,17 +2,20 @@ use crate::bucket::bucket_target_sys::{BucketTargetSys, TargetClient};
 use crate::bucket::replication::{
     ObjectOpts, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateObjectInfo, ReplicatedInfos,
     ReplicatedTargetInfo, ReplicationConfigurationExt as _, ReplicationState, ReplicationType, ResyncTargetDecision, StatusType,
-    VersionPurgeStatusType, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
+    version_purge_statuses_map,
 };
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{metadata_sys, replication};
 use crate::client::api_get_options::GetObjectOptions;
+use crate::client::api_remove::{AdvancedRemoveOptions, RemoveObjectOptions};
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
-use crate::{StorageAPI, new_object_layer_fn};
+use crate::{StorageAPI, new_object_layer_fn, store};
+use aws_sdk_s3::types::ExistingObjectReplication;
 use byteorder::ByteOrder;
 use futures::future::join_all;
 use rustfs_utils::http::{
@@ -21,7 +24,7 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
-use s3s::dto::ReplicationConfiguration;
+use s3s::dto::{ReplicationConfiguration, ReplicationStatus};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -676,7 +679,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         replication_timestamp: None,
         ssec: false, // TODO: add ssec support
         user_tags: oi.user_tags.clone(),
-        checksum: None,
+        checksum: Vec::new(),
         retry_count: 0,
     }
 }
@@ -1092,12 +1095,12 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
 async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
     let bucket = dobj.bucket.clone();
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
-        version_id.to_owned()
+        Some(version_id.to_owned())
     } else {
-        dobj.delete_object.version_id.unwrap_or_default()
+        dobj.delete_object.version_id.clone()
     };
 
-    let rcfg = match get_replication_config(&bucket).await {
+    let _rcfg = match get_replication_config(&bucket).await {
         Ok(Some(config)) => config,
         Ok(None) => {
             warn!("No replication config found for bucket: {}", bucket);
@@ -1123,7 +1126,7 @@ async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, sto
     //TODO: nslock
 
     // Initialize replicated infos
-    let rinfos = ReplicatedInfos {
+    let mut rinfos = ReplicatedInfos {
         replication_timestamp: Some(OffsetDateTime::now_utc()),
         targets: Vec::with_capacity(dsc.targets_map.len()),
     };
@@ -1131,7 +1134,7 @@ async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, sto
     let mut join_set = JoinSet::new();
 
     // Process each target
-    for (_, tgt_entry) in &dsc.targets_map {
+    for (_, tgt_entry) in dsc.targets_map.iter() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
             continue;
@@ -1157,10 +1160,9 @@ async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, sto
     }
 
     // Collect all results
-    let mut targets = Vec::new();
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(tgt_info) => targets.push(tgt_info),
+            Ok(tgt_info) => rinfos.targets.push(tgt_info),
             Err(e) => {
                 error!("Task failed: {}", e);
                 // TODO: SendEvent
@@ -1168,13 +1170,278 @@ async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, sto
         }
     }
 
-    todo!()
+    let (replication_status, prev_status) = if dobj.delete_object.version_id.is_none() {
+        (
+            rinfos.replication_status(),
+            dobj.delete_object.replication_state.composite_replication_status(),
+        )
+    } else {
+        (
+            StatusType::from(rinfos.version_purge_status()),
+            StatusType::from(dobj.delete_object.replication_state.composite_version_purge_status()),
+        )
+    };
+
+    for tgt in rinfos.targets.iter() {
+        if tgt.replication_status != tgt.prev_replication_status {
+            // TODO: update global replication status
+        }
+    }
+
+    let mut drs = get_replication_state(&rinfos, &dobj.delete_object.replication_state, dobj.delete_object.version_id);
+    if replication_status != prev_status {
+        drs.replica_timestamp = Some(OffsetDateTime::now_utc());
+    }
+
+    match storage
+        .delete_object(
+            &bucket,
+            &dobj.delete_object.object_name,
+            ObjectOptions {
+                version_id,
+                mod_time: dobj.delete_object.delete_marker_mtime,
+                delete_replication: Some(drs),
+                versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => {
+            // TODO: send event
+        }
+        Err(e) => {
+            error!("failed to delete object for bucket:{} arn:{} error:{}", bucket, dobj.target_arn, e);
+            // TODO: send event
+        }
+    }
 }
 
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
-    todo!()
+    let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
+        version_id.to_owned()
+    } else {
+        dobj.delete_object.version_id.clone().unwrap_or_default()
+    };
+
+    let mut rinfo = dobj.delete_object.replication_state.target_state(&tgt_client.arn);
+    rinfo.op_type = dobj.op_type;
+    rinfo.endpoint = tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string();
+    rinfo.secure = tgt_client.client.endpoint_url.scheme() == "https";
+
+    if dobj.delete_object.version_id.is_none()
+        && rinfo.prev_replication_status == StatusType::Completed
+        && dobj.op_type != ReplicationType::ExistingObject
+    {
+        rinfo.replication_status = rinfo.prev_replication_status.clone();
+        return rinfo;
+    }
+
+    if dobj.delete_object.version_id.is_some() && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
+        return rinfo;
+    }
+
+    if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+        info!("remote target is offline for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
+
+        if dobj.delete_object.version_id.is_none() {
+            rinfo.replication_status = StatusType::Failed;
+        } else {
+            rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+        }
+        return rinfo;
+    }
+
+    if dobj.delete_object.delete_marker_version_id.is_some() {
+        let _resp = match tgt_client
+            .client
+            .stat_object(
+                &tgt_client.bucket,
+                &dobj.delete_object.object_name,
+                &GetObjectOptions {
+                    version_id: version_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("failed to stat object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
+
+                // TODO: check reponse error
+
+                rinfo.replication_status = StatusType::Failed;
+                rinfo.error = Some(e.to_string());
+
+                return rinfo;
+            }
+        };
+    }
+
+    match tgt_client
+        .client
+        .remove_object(
+            &tgt_client.bucket,
+            &dobj.delete_object.object_name,
+            RemoveObjectOptions {
+                version_id: version_id.clone(),
+                internal: AdvancedRemoveOptions {
+                    replication_delete_marker: dobj.delete_object.delete_marker_version_id.is_some(),
+                    replication_mtime: dobj.delete_object.delete_marker_mtime,
+                    replication_status: ReplicationStatus::from_static(ReplicationStatus::REPLICA),
+                    replication_request: true,
+                    replication_validity_check: false,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        None => {
+            info!("removed object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
+            if dobj.delete_object.version_id.is_none() {
+                rinfo.replication_status = StatusType::Completed;
+            } else {
+                rinfo.version_purge_status = VersionPurgeStatusType::Complete;
+            }
+        }
+        Some(e) => {
+            error!("failed to remove object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
+            rinfo.error = Some(e.to_string());
+            if dobj.delete_object.version_id.is_none() {
+                rinfo.replication_status = StatusType::Failed;
+            } else {
+                rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+            }
+            // TODO: check offline
+        }
+    }
+
+    rinfo
 }
 
 async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<S>) {
+    let bucket = roi.bucket.clone();
+    let object = roi.name.clone();
+
+    let cfg = match get_replication_config(&bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            warn!("No replication config found for bucket: {}", bucket);
+            // TODO: SendEvent
+            return;
+        }
+        Err(err) => {
+            error!("Failed to get replication config for bucket {}: {}", bucket, err);
+            // TODO: SendEvent
+            return;
+        }
+    };
+
+    let tgt_arns = cfg.filter_target_arns(&ObjectOpts {
+        name: object.clone(),
+        user_tags: roi.user_tags.clone(),
+        ssec: roi.ssec,
+        ..Default::default()
+    });
+
+    // TODO: NSLOCK
+
+    let mut join_set = JoinSet::new();
+
+    for arn in tgt_arns {
+        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &arn).await else {
+            error!("failed to get target for bucket:{} arn:{}", bucket, arn);
+            // TODO: SendEvent
+            continue;
+        };
+
+        let roi_clone = roi.clone();
+        let storage_clone = storage.clone();
+        join_set.spawn(async move {
+            if roi.op_type == ReplicationType::Object {
+                roi_clone.replicate_object(storage_clone, tgt_client)
+            } else {
+                roi_clone.replicate_all(storage_clone, tgt_client)
+            }
+        });
+    }
+
+    let mut rinfos = ReplicatedInfos {
+        replication_timestamp: Some(OffsetDateTime::now_utc()),
+        targets: Vec::with_capacity(join_set.len()),
+    };
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(tgt_info) => rinfos.targets.push(tgt_info),
+            Err(e) => {
+                error!("Task failed: {}", e);
+                // TODO: SendEvent
+            }
+        }
+    }
+
+    let replication_status = rinfos.replication_status();
+    let new_replication_internal = rinfos.replication_status_internal();
+    let mut object_info = roi.to_object_info();
+
+    if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
+        let mut popts = ObjectOptions {
+            version_id: roi.version_id.map(|v| v.to_string()),
+            ..Default::default()
+        };
+
+        if let Ok(u) = storage.put_object_metadata(&bucket, &object, &popts).await {
+            object_info = u;
+        }
+
+        // TODO: update stats
+    }
+
+    // TODO: send event
+
+    if rinfos.replication_status() != StatusType::Completed {
+        // TODO: update stats
+        // pool
+    }
+
     todo!()
+}
+
+trait ReplicateObjectInfoExt {
+    fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    fn to_object_info(&self) -> ObjectInfo;
+}
+
+impl ReplicateObjectInfoExt for ReplicateObjectInfo {
+    fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+        todo!()
+    }
+
+    fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+        todo!()
+    }
+
+    fn to_object_info(&self) -> ObjectInfo {
+        ObjectInfo {
+            bucket: self.bucket.clone(),
+            name: self.name.clone(),
+            mod_time: self.mod_time,
+            version_id: self.version_id.clone(),
+            size: self.size,
+            user_tags: self.user_tags.clone(),
+            actual_size: self.actual_size,
+            replication_status_internal: self.replication_status_internal.clone(),
+            replication_status: self.replication_status.clone(),
+            version_purge_status_internal: self.version_purge_status_internal.clone(),
+            version_purge_status: self.version_purge_status.clone(),
+            delete_marker: true,
+            checksum: self.checksum.clone(),
+            ..Default::default()
+        }
+    }
 }

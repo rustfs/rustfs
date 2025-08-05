@@ -46,11 +46,11 @@ pub struct RemoveBucketOptions {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct AdvancedRemoveOptions {
-    replication_delete_marker: bool,
-    replication_status: ReplicationStatus,
-    replication_mtime: OffsetDateTime,
-    replication_request: bool,
-    replication_validity_check: bool,
+    pub replication_delete_marker: bool,
+    pub replication_status: ReplicationStatus,
+    pub replication_mtime: Option<OffsetDateTime>,
+    pub replication_request: bool,
+    pub replication_validity_check: bool,
 }
 
 impl Default for AdvancedRemoveOptions {
@@ -58,7 +58,7 @@ impl Default for AdvancedRemoveOptions {
         Self {
             replication_delete_marker: false,
             replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
-            replication_mtime: OffsetDateTime::now_utc(),
+            replication_mtime: None,
             replication_request: false,
             replication_validity_check: false,
         }
@@ -140,8 +140,7 @@ impl TransitionClient {
     }
 
     pub async fn remove_object(&self, bucket_name: &str, object_name: &str, opts: RemoveObjectOptions) -> Option<std::io::Error> {
-        let res = self.remove_object_inner(bucket_name, object_name, opts).await.expect("err");
-        res.err
+        self.remove_object_inner(bucket_name, object_name, opts).await.err()
     }
 
     pub async fn remove_object_inner(

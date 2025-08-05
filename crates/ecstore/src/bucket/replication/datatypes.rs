@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// StatusType of Replication for x-amz-replication-status header
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
 pub enum StatusType {
     /// Pending - replication is pending.
     Pending,
@@ -64,6 +64,17 @@ impl From<&str> for StatusType {
             "FAILED" => StatusType::Failed,
             "REPLICA" => StatusType::Replica,
             _ => StatusType::Empty,
+        }
+    }
+}
+
+impl From<VersionPurgeStatusType> for StatusType {
+    fn from(status: VersionPurgeStatusType) -> Self {
+        match status {
+            VersionPurgeStatusType::Pending => StatusType::Pending,
+            VersionPurgeStatusType::Complete => StatusType::Completed,
+            VersionPurgeStatusType::Failed => StatusType::Failed,
+            VersionPurgeStatusType::Empty => StatusType::Empty,
         }
     }
 }

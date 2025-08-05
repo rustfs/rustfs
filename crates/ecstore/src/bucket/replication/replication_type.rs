@@ -12,16 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::replication::replication_resyncer::MustReplicateOptions;
-use crate::bucket::replication::replication_resyncer::ObjectInfoExt;
-use crate::bucket::replication::replication_resyncer::ReplicationConfig;
-use crate::bucket::replication::replication_resyncer::check_replicate_delete;
-use crate::bucket::replication::replication_resyncer::must_replicate;
-use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::error::{Error, Result};
 use crate::store_api::ObjectInfo;
-use crate::store_api::ObjectOptions;
-use crate::store_api::ObjectToDelete;
 
 use super::datatypes::{StatusType, VersionPurgeStatusType};
 use regex::Regex;
@@ -405,7 +397,7 @@ impl ReplicatedInfos {
             }
             // rely on replication action from target that actually performed replication now.
             if target.prev_replication_status != StatusType::Completed {
-                return target.replication_action.clone();
+                return target.replication_action;
             }
         }
         ReplicationAction::None
@@ -551,13 +543,13 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> Result<ReplicateDecis
 
         let slc = p.split('=').collect::<Vec<&str>>();
         if slc.len() != 2 {
-            return Err(Error::other(format!("invalid replicate decision format: {}", s)));
+            return Err(Error::other(format!("invalid replicate decision format: {s}")));
         }
 
         let tgt_str = slc[1].trim_matches('"');
         let tgt = tgt_str.split(';').collect::<Vec<&str>>();
         if tgt.len() != 4 {
-            return Err(Error::other(format!("invalid replicate decision format: {}", s)));
+            return Err(Error::other(format!("invalid replicate decision format: {s}")));
         }
 
         let tgt = ReplicateTargetDecision {
@@ -715,7 +707,7 @@ pub struct ReplicateObjectInfo {
     pub replication_timestamp: Option<OffsetDateTime>,
     pub ssec: bool,
     pub user_tags: String,
-    pub checksum: Option<String>,
+    pub checksum: Vec<u8>,
     pub retry_count: u32,
 }
 
@@ -773,4 +765,35 @@ pub fn version_purge_statuses_map(s: &str) -> HashMap<String, VersionPurgeStatus
         targets.insert(arn.to_string(), status);
     }
     targets
+}
+
+pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationState, _vid: Option<String>) -> ReplicationState {
+    let reset_status_map: Vec<(String, String)> = rinfos
+        .targets
+        .iter()
+        .filter(|v| !v.resync_timestamp.is_empty())
+        .map(|t| (target_reset_header(t.arn.as_str()), t.resync_timestamp.clone()))
+        .collect();
+
+    let repl_statuses = rinfos.replication_status_internal();
+    let vpurge_statuses = rinfos.version_purge_status_internal();
+
+    let mut reset_statuses_map = prev_state.reset_statuses_map.clone();
+    for (key, value) in reset_status_map {
+        reset_statuses_map.insert(key, value);
+    }
+
+    ReplicationState {
+        replicate_decision_str: prev_state.replicate_decision_str.clone(),
+        reset_statuses_map,
+        replica_timestamp: prev_state.replica_timestamp,
+        replica_status: prev_state.replica_status.clone(),
+        targets: replication_statuses_map(&repl_statuses),
+        replication_status_internal: repl_statuses,
+        replication_timestamp: rinfos.replication_timestamp,
+        purge_targets: version_purge_statuses_map(&vpurge_statuses),
+        version_purge_status_internal: vpurge_statuses,
+
+        ..Default::default()
+    }
 }

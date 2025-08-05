@@ -306,7 +306,7 @@ pub struct ObjectOptions {
 
     pub replication_request: bool,
     pub delete_marker: bool,
-
+    pub delete_replication: Option<ReplicationState>,
     pub transition: TransitionOptions,
     pub expiration: ExpirationOptions,
     pub lifecycle_audit_event: LcAuditEvent,
