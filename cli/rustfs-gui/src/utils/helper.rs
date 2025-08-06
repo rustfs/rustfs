@@ -246,7 +246,7 @@ impl ServiceManager {
 
     /// Safely parse and validate a port string
     fn parse_and_validate_port(port_str: &str) -> Result<u16, Box<dyn Error>> {
-        let port = port_str.parse::<u16>().map_err(|_| format!("无效的端口号: {}", port_str))?;
+        let port = port_str.parse::<u16>().map_err(|_| format!("无效的端口号: {port_str}"))?;
         Self::validate_port(port)?;
         Ok(port)
     }
@@ -478,7 +478,7 @@ impl ServiceManager {
         let start_time = chrono::Local::now();
 
         // Validate port before proceeding
-        let port = Self::parse_and_validate_port(&config.port).map_err(|e| format!("主服务端口验证失败: {}", e))?;
+        let port = Self::parse_and_validate_port(&config.port).map_err(|e| format!("主服务端口验证失败: {e}"))?;
 
         self.command_tx.send(ServiceCommand::Start(config.clone())).await?;
 
@@ -581,7 +581,7 @@ impl ServiceManager {
         let start_time = chrono::Local::now();
 
         // Validate port before proceeding
-        let port = Self::parse_and_validate_port(&config.port).map_err(|e| format!("主服务端口验证失败: {}", e))?;
+        let port = Self::parse_and_validate_port(&config.port).map_err(|e| format!("主服务端口验证失败: {e}"))?;
 
         self.command_tx.send(ServiceCommand::Restart(config.clone())).await?;
 
