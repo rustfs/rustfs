@@ -220,7 +220,7 @@ impl ServiceManager {
         Ok(executable_path)
     }
 
-    /// Helper function: Extracts the port from the address string
+    /// Helper function: Extracts and validates the port from the address string
     ///
     /// # Example
     /// ```
@@ -229,7 +229,27 @@ impl ServiceManager {
     /// println!("{:?}", port);
     /// ```
     fn extract_port(address: &str) -> Option<u16> {
-        address.split(':').nth(1)?.parse().ok()
+        let port_str = address.split(':').nth(1)?;
+        port_str.parse().ok()
+    }
+
+    /// Validates a port number is within valid range and not reserved
+    fn validate_port(port: u16) -> Result<(), Box<dyn Error>> {
+        if port == 0 {
+            return Err("端口号不能为0".into());
+        }
+        if port < 1024 && !cfg!(windows) {
+            return Err("端口号小于1024需要管理员权限".into());
+        }
+        Ok(())
+    }
+
+    /// Safely parse and validate a port string
+    fn parse_and_validate_port(port_str: &str) -> Result<u16, Box<dyn Error>> {
+        let port = port_str.parse::<u16>()
+            .map_err(|_| format!("无效的端口号: {}", port_str))?;
+        Self::validate_port(port)?;
+        Ok(port)
     }
 
     /// Create a new instance of the service manager
@@ -454,28 +474,17 @@ impl ServiceManager {
     /// ```
     ///
     /// # Errors
-    /// This function returns an error if the service fails to start
-    ///
-    /// # Panics
-    /// This function panics if the port number is invalid
-    ///
-    /// # Safety
-    /// This function is not marked as unsafe
-    ///
-    /// # Performance
-    /// This function is not optimized for performance
-    ///
-    /// # Design
-    /// This function is designed to be simple and easy to use
-    ///
-    /// # Security
-    /// This function does not have any security implications
+    /// This function returns an error if the service fails to start or if port validation fails
     pub async fn start(&self, config: RustFSConfig) -> Result<ServiceOperationResult, Box<dyn Error>> {
         let start_time = chrono::Local::now();
+        
+        // Validate port before proceeding
+        let port = Self::parse_and_validate_port(&config.port)
+            .map_err(|e| format!("主服务端口验证失败: {}", e))?;
+        
         self.command_tx.send(ServiceCommand::Start(config.clone())).await?;
 
         let host = &config.host;
-        let port = config.port.parse::<u16>().expect("无效的端口号");
         // wait for the service to actually start
         let mut retries = 0;
         while retries < 30 {
@@ -569,28 +578,17 @@ impl ServiceManager {
     /// ```
     ///
     /// # Errors
-    /// This function returns an error if the service fails to restart
-    ///
-    /// # Panics
-    /// This function panics if the port number is invalid
-    ///
-    /// # Safety
-    /// This function is not marked as unsafe
-    ///
-    /// # Performance
-    /// This function is not optimized for performance
-    ///
-    /// # Design
-    /// This function is designed to be simple and easy to use
-    ///
-    /// # Security
-    /// This function does not have any security implications
+    /// This function returns an error if the service fails to restart or if port validation fails
     pub async fn restart(&self, config: RustFSConfig) -> Result<ServiceOperationResult, Box<dyn Error>> {
         let start_time = chrono::Local::now();
+        
+        // Validate port before proceeding
+        let port = Self::parse_and_validate_port(&config.port)
+            .map_err(|e| format!("主服务端口验证失败: {}", e))?;
+        
         self.command_tx.send(ServiceCommand::Restart(config.clone())).await?;
 
         let host = &config.host;
-        let port = config.port.parse::<u16>().expect("无效的端口号");
 
         // wait for the service to restart
         let mut retries = 0;
