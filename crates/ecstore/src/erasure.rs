@@ -82,7 +82,8 @@ impl Erasure {
             loop {
                 if total_size > 0 {
                     let new_len = {
-                        let remain = total_size - total;
+                        let remain = total_size.checked_sub(total)
+                            .ok_or_else(|| Error::other("Integer overflow in size calculation"))?;
                         if remain > self.block_size { self.block_size } else { remain }
                     };
 
@@ -101,7 +102,8 @@ impl Erasure {
                             }
                         }
                     };
-                    total += buf.len();
+                    total = total.checked_add(buf.len())
+                        .ok_or_else(|| Error::other("Integer overflow in total size calculation"))?;
                 }
                 let blocks = Arc::new(Box::pin(self.clone().encode_data(&buf)?));
                 let _ = tx.send(blocks).await;
@@ -162,7 +164,12 @@ impl Erasure {
         // debug!("ShardReader {:?}", &reader);
 
         let start_block = offset / self.block_size;
-        let end_block = (offset + length) / self.block_size;
+        let end_block = offset.checked_add(length)
+            .and_then(|sum| Some(sum / self.block_size))
+            .unwrap_or_else(|| {
+                error!("Integer overflow in end_block calculation");
+                return (0, Some(Error::other("Integer overflow in block calculation")));
+            });
 
         // debug!("decode block from {} to {}", start_block, end_block);
 
@@ -173,9 +180,19 @@ impl Erasure {
                 (offset % self.block_size, length)
             } else if block_idx == start_block {
                 let block_offset = offset % self.block_size;
-                (block_offset, self.block_size - block_offset)
+                let remaining = self.block_size.checked_sub(block_offset)
+                    .unwrap_or_else(|| {
+                        error!("Integer overflow in block_offset calculation");
+                        return (bytes_written, Some(Error::other("Integer overflow in block calculation")));
+                    });
+                (block_offset, remaining)
             } else if block_idx == end_block {
-                (0, (offset + length) % self.block_size)
+                let end_offset = offset.checked_add(length)
+                    .unwrap_or_else(|| {
+                        error!("Integer overflow in end_offset calculation");
+                        return (bytes_written, Some(Error::other("Integer overflow in offset calculation")));
+                    });
+                (0, end_offset % self.block_size)
             } else {
                 (0, self.block_size)
             };
@@ -209,7 +226,11 @@ impl Erasure {
                 }
             };
 
-            bytes_written += written_n;
+            bytes_written = bytes_written.checked_add(written_n)
+                .unwrap_or_else(|| {
+                    error!("Integer overflow in bytes_written calculation");
+                    return (bytes_written, Some(Error::other("Integer overflow in written bytes calculation")));
+                });
 
             // debug!("decode {} written_n {}, total_written: {} ", block_idx, written_n, bytes_written);
         }
@@ -241,8 +262,11 @@ impl Erasure {
             .iter()
             .take(data_blocks)
             .filter(|v| v.is_some())
-            .map(|v| v.as_ref().unwrap().len())
-            .sum();
+            .try_fold(0usize, |acc, v| {
+                acc.checked_add(v.as_ref().unwrap().len())
+                    .ok_or_else(|| Error::other("Integer overflow in data_len calculation"))
+            })?;
+            
         if data_len < length {
             return Err(Error::other(format!("write_data_blocks data_len < length {} < {}", data_len, length)));
         }
@@ -258,7 +282,8 @@ impl Erasure {
             let buf = opt_buf.as_ref().unwrap();
 
             if offset >= buf.len() {
-                offset -= buf.len();
+                offset = offset.checked_sub(buf.len())
+                    .ok_or_else(|| Error::other("Integer overflow in offset calculation"))?;
                 continue;
             }
 
@@ -274,7 +299,8 @@ impl Erasure {
                 // debug!("write_data_blocks write buf less len {}", buf.len());
                 writer.write_all(buf).await?;
                 // debug!("write_data_blocks write done len {}", buf.len());
-                total_written += buf.len();
+                total_written = total_written.checked_add(buf.len())
+                    .ok_or_else(|| Error::other("Integer overflow in total_written calculation"))?;
                 break;
             }
 
@@ -282,20 +308,22 @@ impl Erasure {
             let n = buf.len();
 
             // debug!("write_data_blocks write done len {}", n);
-            write -= n;
-            total_written += n;
+            write = write.checked_sub(n)
+                .ok_or_else(|| Error::other("Integer overflow in write calculation"))?;
+            total_written = total_written.checked_add(n)
+                .ok_or_else(|| Error::other("Integer overflow in total_written calculation"))?;
         }
 
         Ok(total_written)
     }
 
     pub fn total_shard_count(&self) -> usize {
-        self.data_shards + self.parity_shards
+        self.data_shards.checked_add(self.parity_shards).unwrap_or(usize::MAX)
     }
 
     #[tracing::instrument(level = "info", skip_all, fields(data_len=data.len()))]
     pub fn encode_data(self: Arc<Self>, data: &[u8]) -> Result<Vec<Bytes>> {
-        let (shard_size, total_size) = self.need_size(data.len());
+        let (shard_size, total_size) = self.need_size(data.len())?;
 
         // 生成一个新的 所需的所有分片数据长度
         let mut data_buffer = BytesMut::with_capacity(total_size);
@@ -334,15 +362,21 @@ impl Erasure {
     }
 
     // 每个分片长度，所需要的总长度
-    fn need_size(&self, data_size: usize) -> (usize, usize) {
-        let shard_size = self.shard_size(data_size);
-        (shard_size, shard_size * (self.total_shard_count()))
+    fn need_size(&self, data_size: usize) -> Result<(usize, usize)> {
+        let shard_size = self.shard_size(data_size)?;
+        let total_size = shard_size.checked_mul(self.total_shard_count())
+            .ok_or_else(|| Error::other("Integer overflow in total size calculation"))?;
+        Ok((shard_size, total_size))
     }
 
     // 算出每个分片大小
-    pub fn shard_size(&self, data_size: usize) -> usize {
-        data_size.div_ceil(self.data_shards)
+    pub fn shard_size(&self, data_size: usize) -> Result<usize> {
+        if self.data_shards == 0 {
+            return Err(Error::other("data_shards cannot be zero"));
+        }
+        Ok(data_size.div_ceil(self.data_shards))
     }
+    
     // returns final erasure size from original size.
     pub fn shard_file_size(&self, total_size: usize) -> usize {
         if total_size == 0 {
@@ -351,22 +385,50 @@ impl Erasure {
 
         let num_shards = total_size / self.block_size;
         let last_block_size = total_size % self.block_size;
+        
+        // Use checked arithmetic to prevent overflow
+        let shard_size = match self.shard_size(self.block_size) {
+            Ok(size) => size,
+            Err(_) => return 0, // Return 0 on error to avoid panic
+        };
+        
+        let base_size = match num_shards.checked_mul(shard_size) {
+            Some(size) => size,
+            None => return 0, // Return 0 on overflow
+        };
+        
+        if last_block_size == 0 {
+            return base_size;
+        }
+        
         let last_shard_size = last_block_size.div_ceil(self.data_shards);
-        num_shards * self.shard_size(self.block_size) + last_shard_size
-
-        // // 因为写入的时候 ec 需要补全，所以最后一个长度应该也是一样的
-        // if last_block_size != 0 {
-        //     num_shards += 1
-        // }
-        // num_shards * self.shard_size(self.block_size)
+        base_size.checked_add(last_shard_size).unwrap_or(0)
     }
 
     // where erasure reading begins.
     pub fn shard_file_offset(&self, start_offset: usize, length: usize, total_length: usize) -> usize {
-        let shard_size = self.shard_size(self.block_size);
+        let shard_size = match self.shard_size(self.block_size) {
+            Ok(size) => size,
+            Err(_) => return 0,
+        };
+        
         let shard_file_size = self.shard_file_size(total_length);
-        let end_shard = (start_offset + length) / self.block_size;
-        let mut till_offset = end_shard * shard_size + shard_size;
+        
+        let end_offset = match start_offset.checked_add(length) {
+            Some(offset) => offset,
+            None => return 0, // Return 0 on overflow
+        };
+        
+        let end_shard = end_offset / self.block_size;
+        
+        let mut till_offset = match end_shard.checked_mul(shard_size) {
+            Some(offset) => match offset.checked_add(shard_size) {
+                Some(final_offset) => final_offset,
+                None => return 0,
+            },
+            None => return 0,
+        };
+        
         if till_offset > shard_file_size {
             till_offset = shard_file_size;
         }
@@ -387,7 +449,11 @@ impl Erasure {
             readers.len(),
             total_length
         );
-        if writers.len() != self.parity_shards + self.data_shards {
+        
+        let expected_writers = self.parity_shards.checked_add(self.data_shards)
+            .ok_or_else(|| Error::other("Integer overflow in shard count calculation"))?;
+            
+        if writers.len() != expected_writers {
             return Err(Error::other("invalid argument"));
         }
         let mut reader = ShardReader::new(readers, self, 0, total_length);
@@ -395,7 +461,8 @@ impl Erasure {
         let start_block = 0;
         let mut end_block = total_length / self.block_size;
         if total_length % self.block_size != 0 {
-            end_block += 1;
+            end_block = end_block.checked_add(1)
+                .ok_or_else(|| Error::other("Integer overflow in end_block calculation"))?;
         }
 
         let mut errs = Vec::new();
@@ -407,7 +474,10 @@ impl Erasure {
             }
 
             let shards = bufs.into_iter().flatten().map(Bytes::from).collect::<Vec<_>>();
-            if shards.len() != self.parity_shards + self.data_shards {
+            let expected_shards = self.parity_shards.checked_add(self.data_shards)
+                .ok_or_else(|| Error::other("Integer overflow in shard count calculation"))?;
+                
+            if shards.len() != expected_shards {
                 return Err(Error::other("can not reconstruct data"));
             }
 
@@ -457,13 +527,22 @@ pub struct ShardReader {
 
 impl ShardReader {
     pub fn new(readers: Vec<Option<BitrotReader>>, ec: &Erasure, offset: usize, total_length: usize) -> Self {
+        let shard_size = match ec.shard_size(ec.block_size) {
+            Ok(size) => size,
+            Err(_) => 0, // Default to 0 on error
+        };
+        
+        let shard_offset = (offset / ec.block_size)
+            .checked_mul(shard_size)
+            .unwrap_or(0); // Default to 0 on overflow
+            
         Self {
             readers,
             data_block_count: ec.data_shards,
             parity_block_count: ec.parity_shards,
-            shard_size: ec.shard_size(ec.block_size),
+            shard_size,
             shard_file_size: ec.shard_file_size(total_length),
-            offset: (offset / ec.block_size) * ec.shard_size(ec.block_size),
+            offset: shard_offset,
         }
     }
 
@@ -472,8 +551,12 @@ impl ShardReader {
         let reader_length = self.readers.len();
         // 需要读取的块长度
         let mut read_length = self.shard_size;
-        if self.offset + read_length > self.shard_file_size {
-            read_length = self.shard_file_size - self.offset
+        
+        let max_readable = self.shard_file_size.checked_sub(self.offset)
+            .unwrap_or(0);
+            
+        if self.offset.checked_add(read_length).is_none() || read_length > max_readable {
+            read_length = max_readable;
         }
 
         if read_length == 0 {
@@ -526,7 +609,8 @@ impl ShardReader {
             return Err(Error::other("shard reader read failed"));
         }
 
-        self.offset += self.shard_size;
+        self.offset = self.offset.checked_add(self.shard_size)
+            .ok_or_else(|| Error::other("Integer overflow in offset calculation"))?;
 
         Ok(ress)
     }
