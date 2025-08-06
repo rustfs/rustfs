@@ -194,38 +194,38 @@ impl LastMinuteLatency {
             self.last_sec = t;
             return;
         }
-        
+
         // Add protection against unbounded loops
         let max_iterations = 60; // Maximum number of seconds we can forward
         let mut iterations = 0;
-        
+
         while self.last_sec != t && iterations < max_iterations {
             let idx = (self.last_sec + 1) % 60;
             self.totals[idx as usize] = AccElem::default();
             self.last_sec += 1;
             iterations += 1;
         }
-        
+
         // If we hit the iteration limit, reset to avoid inconsistent state
         if iterations >= max_iterations && self.last_sec != t {
             self.totals = vec![AccElem::default(); 60];
             self.last_sec = t;
         }
     }
-    
+
     // Add a safe version of get_total with timeout protection
     pub fn get_total_safe(&mut self) -> Result<AccElem, &'static str> {
         let sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "Time went backwards")?
             .as_secs();
-            
+
         // Prevent excessive time jumps that could cause resource exhaustion
         const MAX_TIME_JUMP: u64 = 3600; // 1 hour maximum jump
         if sec > self.last_sec && (sec - self.last_sec) > MAX_TIME_JUMP {
             return Err("Time jump too large - potential resource exhaustion");
         }
-        
+
         self.forward_to(sec);
         let mut res = AccElem::default();
         for elem in self.totals.iter() {
@@ -233,7 +233,6 @@ impl LastMinuteLatency {
         }
         Ok(res)
     }
-
 }
 
 #[cfg(test)]
@@ -918,7 +917,7 @@ fn size_to_tag(size: i64) -> usize {
         _ if size < 1024 * 1024 * 1024 => 4, // sizeLessThan1GiB
         _ => 5,                              // sizeGreaterThan1GiB
     };
-    
+
     // Ensure we don't return an index that's out of bounds
     tag.min(SIZE_LAST_ELEM_MARKER - 1)
 }
