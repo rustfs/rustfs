@@ -604,7 +604,7 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
         .to_offset(offset!(-0:00:00))
         .saturating_add(Duration::days(days as i64));
     let mut hour = 3600;
-    if let Ok(env_ilm_hour) = env::var("_RUSTFS_ILM_HOUR") {
+    if let Ok(env_ilm_hour) = env::var("_RUSTFS_ILM_PROCESS_TIME") {
         if let Ok(num_hour) = env_ilm_hour.parse::<usize>() {
             hour = num_hour;
         }

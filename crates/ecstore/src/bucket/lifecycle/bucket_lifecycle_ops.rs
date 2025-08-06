@@ -587,7 +587,7 @@ impl TransitionState {
 pub async fn init_background_expiry(api: Arc<ECStore>) {
     let mut workers = num_cpus::get() / 2;
     //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_EXPIRATION_WORKERS") {
+    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
             workers = num_expirations;
         }
