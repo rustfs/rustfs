@@ -45,3 +45,4 @@ serde_json.workspace = true
 md-5 = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
