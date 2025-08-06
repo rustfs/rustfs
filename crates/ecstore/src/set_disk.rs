@@ -3461,6 +3461,7 @@ impl ObjectIO for SetDisks {
         let now = OffsetDateTime::now_utc();
 
         for (i, fi) in parts_metadatas.iter_mut().enumerate() {
+            fi.metadata = user_defined.clone();
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
                     fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
@@ -3469,7 +3470,6 @@ impl ObjectIO for SetDisks {
                 fi.set_inline_data();
             }
 
-            fi.metadata = user_defined.clone();
             fi.mod_time = Some(now);
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
