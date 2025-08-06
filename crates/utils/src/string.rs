@@ -354,6 +354,17 @@ pub fn gen_secret_key(length: usize) -> Result<String> {
     Ok(key_str)
 }
 
+/// Tests whether the string s begins with prefix ignoring case
+pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
+    if s.len() < prefix.len() {
+        return false;
+    }
+
+    let s_prefix = &s[..prefix.len()];
+    // Test match with case first, then case-insensitive
+    s_prefix == prefix || s_prefix.to_lowercase() == prefix.to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

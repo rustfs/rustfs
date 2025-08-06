@@ -1,28 +1,35 @@
 use crate::bucket::bucket_target_sys::{BucketTargetSys, TargetClient};
+use crate::bucket::metadata_sys;
+use crate::bucket::replication::ReplicationAction;
 use crate::bucket::replication::{
     ObjectOpts, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateObjectInfo, ReplicatedInfos,
     ReplicatedTargetInfo, ReplicationConfigurationExt as _, ReplicationState, ReplicationType, ResyncTargetDecision, StatusType,
     VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
     version_purge_statuses_map,
 };
+use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::bucket::{metadata_sys, replication};
-use crate::client::api_get_options::GetObjectOptions;
+use crate::client::api_get_options::{AdvancedGetOptions, GetObjectOptions, StatObjectOptions};
+use crate::client::api_put_object::PutObjectOptions;
 use crate::client::api_remove::{AdvancedRemoveOptions, RemoveObjectOptions};
+use crate::client::transition_api::{self, ReaderImpl, TransitionCore};
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
-use crate::{StorageAPI, new_object_layer_fn, store};
-use aws_sdk_s3::types::ExistingObjectReplication;
+use crate::{StorageAPI, new_object_layer_fn};
+
 use byteorder::ByteOrder;
 use futures::future::join_all;
+use http::HeaderMap;
+use rustfs_rio::HashReader;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER,
-    SSEC_KEY_MD5_HEADER,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, RESERVED_METADATA_PREFIX_LOWER,
+    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
 };
 use rustfs_utils::path::path_join_buf;
+use rustfs_utils::string::strings_has_prefix_fold;
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::{ReplicationConfiguration, ReplicationStatus};
 use serde::Deserialize;
@@ -31,6 +38,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
@@ -1362,9 +1370,9 @@ async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<
         let storage_clone = storage.clone();
         join_set.spawn(async move {
             if roi.op_type == ReplicationType::Object {
-                roi_clone.replicate_object(storage_clone, tgt_client)
+                roi_clone.replicate_object(storage_clone, tgt_client).await
             } else {
-                roi_clone.replicate_all(storage_clone, tgt_client)
+                roi_clone.replicate_all(storage_clone, tgt_client).await
             }
         });
     }
@@ -1389,7 +1397,7 @@ async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<
     let mut object_info = roi.to_object_info();
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
-        let mut popts = ObjectOptions {
+        let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
             ..Default::default()
         };
@@ -1401,6 +1409,8 @@ async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<
         // TODO: update stats
     }
 
+    _ = object_info;
+    _ = replication_status;
     // TODO: send event
 
     if rinfos.replication_status() != StatusType::Completed {
@@ -1412,18 +1422,315 @@ async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: Arc<
 }
 
 trait ReplicateObjectInfoExt {
-    fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
-    fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    async fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
+    async fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
     fn to_object_info(&self) -> ObjectInfo;
 }
 
 impl ReplicateObjectInfoExt for ReplicateObjectInfo {
-    fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
-        todo!()
+    async fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+        let bucket = self.bucket.clone();
+        let object = self.name.clone();
+
+        let replication_action = ReplicationAction::All;
+        let mut rinfo = ReplicatedTargetInfo {
+            arn: tgt_client.arn.clone(),
+            size: self.actual_size,
+            replication_action,
+            op_type: self.op_type,
+            replication_status: StatusType::Failed,
+            prev_replication_status: self.target_replication_status(&tgt_client.arn),
+            endpoint: tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string(),
+            secure: tgt_client.client.endpoint_url.scheme() == "https",
+            ..Default::default()
+        };
+
+        if self.target_replication_status(&tgt_client.arn) == StatusType::Completed
+            && !self.existing_obj_resync.is_empty()
+            && self.existing_obj_resync.must_resync_target(&tgt_client.arn)
+        {
+            rinfo.replication_status = StatusType::Completed;
+            rinfo.replication_resynced = true;
+
+            return rinfo;
+        }
+
+        if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+            error!("target is offline for bucket:{} arn:{}", bucket, tgt_client.arn);
+            // TODO: send event
+            return rinfo;
+        }
+
+        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
+        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+
+        let gr = match storage
+            .get_object_reader(
+                &bucket,
+                &object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: self.version_id.map(|v| v.to_string()),
+                    version_suspended,
+                    versioned,
+                    replication_request: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(gr) => gr,
+            Err(e) => {
+                if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                    error!("failed to get object reader for bucket:{} arn:{}", bucket, tgt_client.arn);
+                    // TODO: send event
+                }
+
+                return rinfo;
+            }
+        };
+
+        let object_info = gr.object_info.clone();
+
+        rinfo.prev_replication_status = object_info.target_replication_status(&tgt_client.arn);
+
+        let size = match object_info.get_actual_size() {
+            Ok(size) => size,
+            Err(e) => {
+                error!("failed to get actual size for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                // TODO: send event
+                return rinfo;
+            }
+        };
+
+        if tgt_client.bucket.is_empty() {
+            error!("target bucket is empty for bucket:{} arn:{}", bucket, tgt_client.arn);
+            // TODO: send event
+            return rinfo;
+        }
+
+        rinfo.replication_status = StatusType::Completed;
+        rinfo.replication_resynced = true;
+        rinfo.size = size;
+        rinfo.replication_action = replication_action;
+
+        let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
+            Ok((put_opts, is_mp)) => (put_opts, is_mp),
+            Err(e) => {
+                error!("failed to put replication opts for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                // TODO: send event
+                return rinfo;
+            }
+        };
+
+        // TODO:bandwidth
+
+        if let Some(err) = if is_multipart {
+            replicate_object_with_multipart(
+                &TransitionCore(tgt_client.client.clone()),
+                &bucket,
+                &object,
+                gr.stream,
+                &object_info,
+                put_opts,
+            )
+            .await
+            .err()
+        } else {
+            let reader = ReaderImpl::ObjectBody(gr);
+            tgt_client
+                .client
+                .clone()
+                .put_object(&bucket, &object, reader, size, &put_opts)
+                .await
+                .err()
+        } {
+            rinfo.replication_status = StatusType::Failed;
+            rinfo.error = Some(err.to_string());
+
+            error!("failed to replicate object for bucket:{} object:{} error:{}", bucket, object, err);
+            // TODO: check offline
+            return rinfo;
+        }
+
+        rinfo.replication_status = StatusType::Completed;
+
+        rinfo
     }
 
-    fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
-        todo!()
+    async fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
+        let bucket = self.bucket.clone();
+        let object = self.name.clone();
+
+        let mut replication_action = ReplicationAction::Metadata;
+        let mut rinfo = ReplicatedTargetInfo {
+            arn: tgt_client.arn.clone(),
+            size: self.actual_size,
+            replication_action,
+            op_type: self.op_type,
+            replication_status: StatusType::Failed,
+            prev_replication_status: self.target_replication_status(&tgt_client.arn),
+            endpoint: tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string(),
+            secure: tgt_client.client.endpoint_url.scheme() == "https",
+            ..Default::default()
+        };
+
+        if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+            error!("target is offline for bucket:{} arn:{}", bucket, tgt_client.arn);
+            // TODO: send event
+            return rinfo;
+        }
+
+        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
+        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+
+        let gr = match storage
+            .get_object_reader(
+                &bucket,
+                &object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: self.version_id.map(|v| v.to_string()),
+                    version_suspended,
+                    versioned,
+                    replication_request: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(gr) => gr,
+            Err(e) => {
+                if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                    error!("failed to get object reader for bucket:{} arn:{}", bucket, tgt_client.arn);
+                    // TODO: send event
+                }
+
+                return rinfo;
+            }
+        };
+
+        let object_info = gr.object_info.clone();
+
+        rinfo.prev_replication_status = object_info.target_replication_status(&tgt_client.arn);
+
+        if rinfo.prev_replication_status == StatusType::Completed
+            && !self.existing_obj_resync.is_empty()
+            && self.existing_obj_resync.must_resync_target(&tgt_client.arn)
+        {
+            rinfo.replication_status = StatusType::Completed;
+            rinfo.replication_resynced = true;
+            return rinfo;
+        }
+
+        let size = match object_info.get_actual_size() {
+            Ok(size) => size,
+            Err(e) => {
+                error!("failed to get actual size for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                // TODO: send event
+                return rinfo;
+            }
+        };
+
+        if tgt_client.bucket.is_empty() {
+            error!("target bucket is empty for bucket:{} arn:{}", bucket, tgt_client.arn);
+            // TODO: send event
+            return rinfo;
+        }
+
+        let sopts = StatObjectOptions {
+            version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            internal: AdvancedGetOptions {
+                replication_proxy_request: "false".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS");
+
+        let oi = match tgt_client.client.stat_object(&tgt_client.bucket, &object, &sopts).await {
+            Ok(oi) => {
+                replication_action = get_replication_action(&object_info, &oi, self.op_type);
+                oi
+            }
+            Err(e) => {
+                // TODO: check err
+                // replication_action = ReplicationAction::All;
+                error!("failed to stat object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                // TODO: send event
+                return rinfo;
+            }
+        };
+
+        rinfo.replication_status = StatusType::Completed;
+
+        if replication_action == ReplicationAction::None {
+            if self.op_type == ReplicationType::ExistingObject
+                && object_info.mod_time > oi.mod_time
+                && object_info.version_id.is_none()
+            {
+                info!("skip replicate existing object for bucket:{} arn:{}", bucket, tgt_client.arn);
+                // TODO: send event
+            }
+
+            let st = object_info.target_replication_status(&tgt_client.arn);
+            if st == StatusType::Pending || st == StatusType::Failed || self.op_type == ReplicationType::ExistingObject {
+                info!("skip replicate completed object for bucket:{} arn:{}", bucket, tgt_client.arn);
+                rinfo.replication_status = StatusType::Completed;
+                rinfo.replication_action = replication_action;
+            }
+
+            return rinfo;
+        }
+
+        rinfo.replication_status = StatusType::Completed;
+        rinfo.size = size;
+        rinfo.replication_action = replication_action;
+
+        if replication_action != ReplicationAction::All {
+            // TODO: copy object
+        } else {
+            let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
+                Ok((put_opts, is_mp)) => (put_opts, is_mp),
+                Err(e) => {
+                    error!("failed to put replication opts for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                    // TODO: send event
+                    return rinfo;
+                }
+            };
+            if let Some(err) = if is_multipart {
+                replicate_object_with_multipart(
+                    &TransitionCore(tgt_client.client.clone()),
+                    &bucket,
+                    &object,
+                    gr.stream,
+                    &object_info,
+                    put_opts,
+                )
+                .await
+                .err()
+            } else {
+                let reader = ReaderImpl::ObjectBody(gr);
+                tgt_client
+                    .client
+                    .clone()
+                    .put_object(&bucket, &object, reader, size, &put_opts)
+                    .await
+                    .err()
+            } {
+                rinfo.replication_status = StatusType::Failed;
+                rinfo.error = Some(err.to_string());
+
+                error!("failed to replicate object for bucket:{} object:{} error:{}", bucket, object, err);
+                // TODO: check offline
+                return rinfo;
+            }
+        }
+
+        rinfo
     }
 
     fn to_object_info(&self) -> ObjectInfo {
@@ -1431,7 +1738,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             bucket: self.bucket.clone(),
             name: self.name.clone(),
             mod_time: self.mod_time,
-            version_id: self.version_id.clone(),
+            version_id: self.version_id,
             size: self.size,
             user_tags: self.user_tags.clone(),
             actual_size: self.actual_size,
@@ -1444,4 +1751,146 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         }
     }
+}
+
+fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
+    todo!()
+}
+
+async fn replicate_object_with_multipart(
+    cli: &TransitionCore,
+    bucket: &str,
+    object: &str,
+    reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    object_info: &ObjectInfo,
+    opts: PutObjectOptions,
+) -> std::io::Result<()> {
+    let mut attempts = 1;
+    let mut upload_id = None;
+    loop {
+        match cli.new_multipart_upload(bucket, object, opts.clone()).await {
+            Ok(id) => {
+                upload_id = Some(id);
+                break;
+            }
+            Err(e) => {
+                attempts += 1;
+                if attempts > 3 {
+                    error!("failed to create multipart upload for bucket:{} object:{} error:{}", bucket, object, e);
+                    return Err(e);
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                continue;
+            }
+        };
+    }
+
+    let mut reader = reader;
+    for part_info in object_info.parts.iter() {
+        // 从 reader 中读取这个部分的数据
+        let mut chunk = vec![0u8; part_info.size];
+        AsyncReadExt::read_exact(&mut *reader, &mut chunk).await?;
+
+        // 为这个部分创建新的 reader
+        let cursor = std::io::Cursor::new(chunk);
+        let wrapped_reader = Box::new(rustfs_rio::WarpReader::new(cursor));
+        let _hash_reader = HashReader::new(wrapped_reader, part_info.actual_size, part_info.actual_size, None, false)?;
+
+        // TODO: 实际的多部分上传逻辑
+        // 这里应该上传这个部分到目标
+    }
+
+    todo!()
+}
+
+fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op_type: ReplicationType) -> ReplicationAction {
+    if op_type == ReplicationType::ExistingObject && oi1.mod_time > oi2.mod_time && oi1.version_id.is_none() {
+        return ReplicationAction::None;
+    }
+
+    let size = oi1.get_actual_size().unwrap_or_default();
+
+    if oi1.etag != oi2.etag
+        || oi1.version_id != oi2.version_id
+        || size != oi2.size
+        || oi1.delete_marker != oi2.is_delete_marker
+        || oi1.mod_time != oi2.mod_time
+    {
+        return ReplicationAction::All;
+    }
+
+    if oi1.content_type != oi2.content_type {
+        return ReplicationAction::Metadata;
+    }
+
+    if let Some(content_encoding) = &oi1.content_encoding {
+        if let Some(enc) = oi2
+            .metadata
+            .get(CONTENT_ENCODING)
+            .or_else(|| oi2.metadata.get(CONTENT_ENCODING.to_ascii_lowercase()))
+        {
+            if enc.to_str().unwrap_or_default() != content_encoding {
+                return ReplicationAction::Metadata;
+            }
+        } else {
+            return ReplicationAction::Metadata;
+        }
+    }
+
+    let oi1_tags = decode_tags_to_map(&oi1.user_tags);
+    let oi2_tags = decode_tags_to_map(&oi2.user_tags);
+
+    if (oi2.user_tag_count > 0 && oi1_tags != oi2_tags) || oi2.user_tag_count != oi1_tags.len() {
+        return ReplicationAction::Metadata;
+    }
+
+    // Compare only necessary headers
+    let compare_keys = vec![
+        "Expires",
+        "Cache-Control",
+        "Content-Language",
+        "Content-Disposition",
+        "X-Amz-Object-Lock-Mode",
+        "X-Amz-Object-Lock-Retain-Until-Date",
+        "X-Amz-Object-Lock-Legal-Hold",
+        "X-Amz-Website-Redirect-Location",
+        "X-Amz-Meta-",
+    ];
+
+    // compare metadata on both maps to see if meta is identical
+    let mut compare_meta1 = HashMap::new();
+    for (k, v) in &oi1.user_defined {
+        let mut found = false;
+        for prefix in &compare_keys {
+            if strings_has_prefix_fold(k, prefix) {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            compare_meta1.insert(k.to_lowercase(), v.clone());
+        }
+    }
+
+    let mut compare_meta2 = HashMap::new();
+    for (k, v) in &oi2.metadata {
+        let mut found = false;
+        for prefix in &compare_keys {
+            if strings_has_prefix_fold(k.to_string().as_str(), prefix) {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            compare_meta2.insert(k.to_string().to_lowercase(), v.to_str().unwrap_or_default().to_string());
+        }
+    }
+
+    if compare_meta1 != compare_meta2 {
+        return ReplicationAction::Metadata;
+    }
+
+    ReplicationAction::None
 }

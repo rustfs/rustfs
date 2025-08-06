@@ -33,6 +33,7 @@ pub const X_RUSTFS_DATA_MOV: &str = "X-Rustfs-Internal-data-mov";
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 pub const AMZ_DECODED_CONTENT_LENGTH: &str = "X-Amz-Decoded-Content-Length";
+pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
@@ -42,3 +43,5 @@ pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-St
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
 pub const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
 pub const SSEC_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
+
+pub const CONTENT_ENCODING: &str = "Content-Encoding";

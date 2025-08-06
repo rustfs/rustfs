@@ -804,23 +804,23 @@ pub struct PutObjectPartOptions {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ObjectInfo {
-    pub etag: String,
+    pub etag: Option<String>,
     pub name: String,
-    pub mod_time: OffsetDateTime,
-    pub size: usize,
+    pub mod_time: Option<OffsetDateTime>,
+    pub size: i64,
     pub content_type: Option<String>,
     #[serde(skip)]
     pub metadata: HeaderMap,
     pub user_metadata: HashMap<String, String>,
     pub user_tags: String,
-    pub user_tag_count: i64,
+    pub user_tag_count: usize,
     #[serde(skip)]
     pub owner: Owner,
     //pub grant: Vec<Grant>,
     pub storage_class: String,
     pub is_latest: bool,
     pub is_delete_marker: bool,
-    pub version_id: Uuid,
+    pub version_id: Option<Uuid>,
 
     #[serde(skip, default = "replication_status_default")]
     pub replication_status: ReplicationStatus,
@@ -846,9 +846,9 @@ fn replication_status_default() -> ReplicationStatus {
 impl Default for ObjectInfo {
     fn default() -> Self {
         Self {
-            etag: "".to_string(),
+            etag: None,
             name: "".to_string(),
-            mod_time: OffsetDateTime::now_utc(),
+            mod_time: None,
             size: 0,
             content_type: None,
             metadata: HeaderMap::new(),
@@ -859,7 +859,7 @@ impl Default for ObjectInfo {
             storage_class: "".to_string(),
             is_latest: false,
             is_delete_marker: false,
-            version_id: Uuid::nil(),
+            version_id: None,
             replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
             replication_ready: false,
             expiration: OffsetDateTime::now_utc(),

@@ -131,24 +131,20 @@ impl TransitionClient {
                             ..Default::default()
                         };
                         return Ok(ObjectInfo {
-                            version_id: match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    return Err(std::io::Error::other(e));
-                                }
-                            },
+                            version_id: h
+                                .get(X_AMZ_VERSION_ID)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| Uuid::from_str(s).ok()),
                             is_delete_marker: delete_marker,
                             ..Default::default()
                         });
                         //err_resp
                     }
                     return Ok(ObjectInfo {
-                        version_id: match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Err(std::io::Error::other(e));
-                            }
-                        },
+                        version_id: h
+                            .get(X_AMZ_VERSION_ID)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| Uuid::from_str(s).ok()),
                         is_delete_marker: delete_marker,
                         replication_ready: replication_ready,
                         ..Default::default()
