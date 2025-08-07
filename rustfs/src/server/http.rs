@@ -467,7 +467,7 @@ fn process_connection(
                         "TLS handshake failure details"
                     );
 
-                    return; // End the task
+                    return;
                 }
             }
             debug!("TLS handshake success");

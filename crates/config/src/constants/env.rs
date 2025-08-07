@@ -96,7 +96,6 @@ impl EnableState {
     pub fn get_default() -> Self {
         Self::default()
     }
-    /// Returns the enum variant from a string.
     /// Returns the string representation of the enum.
     pub fn as_str(&self) -> &str {
         match self {
@@ -127,7 +126,6 @@ mod tests {
     use std::str::FromStr;
     #[test]
     fn test_enable_state_display_and_fromstr() {
-        use std::str::FromStr;
         let cases = [
             (EnableState::True, "true"),
             (EnableState::False, "false"),
