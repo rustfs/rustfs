@@ -294,7 +294,7 @@ impl Checksum for Sha256 {
         Self::size()
     }
 }
-
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct Md5 {
     hasher: md5::Md5,
