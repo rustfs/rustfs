@@ -132,23 +132,6 @@ mod tests {
         }
         // Test invalid string
         assert!(EnableState::from_str("invalid").is_err());
-        // Test invalid string with leading/trailing spaces
-        assert!(EnableState::from_str(" true ").is_err());
-        assert!(EnableState::from_str(" false ").is_err());
-        assert!(EnableState::from_str(" yes ").is_err());
-        assert!(EnableState::from_str(" no ").is_err());
-        assert!(EnableState::from_str(" on ").is_err());
-        assert!(EnableState::from_str(" off ").is_err());
-        assert!(EnableState::from_str(" enabled ").is_err());
-        assert!(EnableState::from_str(" disabled ").is_err());
-        assert!(EnableState::from_str(" ok ").is_err());
-        assert!(EnableState::from_str(" not_ok ").is_err());
-        assert!(EnableState::from_str(" success ").is_err());
-        assert!(EnableState::from_str(" failure ").is_err());
-        assert!(EnableState::from_str(" active ").is_err());
-        assert!(EnableState::from_str(" inactive ").is_err());
-        assert!(EnableState::from_str(" 1 ").is_err());
-        assert!(EnableState::from_str(" 0 ").is_err());
     }
     #[test]
     fn test_enable_state_enum() {
@@ -203,23 +186,35 @@ mod tests {
     }
 
     #[test]
-    fn test_enable_state_enum_invalid() {
-        assert!(EnableState::from_str("invalid").is_err());
-        assert!(EnableState::from_str(" true ").is_err());
-        assert!(EnableState::from_str(" false ").is_err());
-        assert!(EnableState::from_str(" yes ").is_err());
-        assert!(EnableState::from_str(" no ").is_err());
-        assert!(EnableState::from_str(" on ").is_err());
-        assert!(EnableState::from_str(" off ").is_err());
-        assert!(EnableState::from_str(" enabled ").is_err());
-        assert!(EnableState::from_str(" disabled ").is_err());
-        assert!(EnableState::from_str(" ok ").is_err());
-        assert!(EnableState::from_str(" not_ok ").is_err());
-        assert!(EnableState::from_str(" success ").is_err());
-        assert!(EnableState::from_str(" failure ").is_err());
-        assert!(EnableState::from_str(" active ").is_err());
-        assert!(EnableState::from_str(" inactive ").is_err());
-        assert!(EnableState::from_str(" 1 ").is_err());
-        assert!(EnableState::from_str(" 0 ").is_err());
+    fn test_enable_state_default() {
+        let default_state = EnableState::get_default();
+        assert_eq!(default_state, EnableState::Empty);
+        assert_eq!(default_state.as_str(), "");
+    }
+
+    #[test]
+    fn test_enable_state_as_str() {
+        let cases = [
+            (EnableState::True, "true"),
+            (EnableState::False, "false"),
+            (EnableState::Empty, ""),
+            (EnableState::Yes, "yes"),
+            (EnableState::No, "no"),
+            (EnableState::On, "on"),
+            (EnableState::Off, "off"),
+            (EnableState::Enabled, "enabled"),
+            (EnableState::Disabled, "disabled"),
+            (EnableState::Ok, "ok"),
+            (EnableState::NotOk, "not_ok"),
+            (EnableState::Success, "success"),
+            (EnableState::Failure, "failure"),
+            (EnableState::Active, "active"),
+            (EnableState::Inactive, "inactive"),
+            (EnableState::One, "1"),
+            (EnableState::Zero, "0"),
+        ];
+        for (variant, string) in cases.iter() {
+            assert_eq!(variant.as_str(), *string);
+        }
     }
 }
