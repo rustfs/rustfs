@@ -341,6 +341,7 @@ impl Operation for RemoveTier {
     }
 }
 
+#[allow(dead_code)]
 pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
