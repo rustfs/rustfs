@@ -18,6 +18,7 @@ rustfs-common = { workspace = true }
 rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-utils = { workspace = true }
+
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -32,6 +33,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }
 rustfs-lock = { workspace = true }
+s3s = { workspace = true }
 
 lazy_static = { workspace = true }
 chrono = { workspace = true }

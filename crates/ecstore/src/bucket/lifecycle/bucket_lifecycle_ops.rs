@@ -516,7 +516,7 @@ impl TransitionState {
                         if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
                             if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
                                 error!("Transition to {} failed for {}/{} version:{} with {}",
-                                    task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.expect("err"), err.to_string());
+                                    task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(), err.to_string());
                             }
                         } else {
                             let mut ts = TierStats {
@@ -743,7 +743,7 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
             ..Default::default()
         },
         //lifecycle_audit_event: lae,
-        version_id: Some(oi.version_id.expect("err").to_string()),
+        version_id: oi.version_id.map(|v| v.to_string()),
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         mod_time: oi.mod_time,
@@ -808,7 +808,7 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.expect("err").to_string(),
+            version_id: self.version_id.map(|v| v.to_string()).unwrap_or_default(),
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,
@@ -874,7 +874,11 @@ pub async fn eval_action_from_lifecycle(
             if lock_enabled && enforce_retention_for_deletion(oi) {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
-                    info!("lifecycle: {} v({}) is locked, not deleting", oi.name, oi.version_id.expect("err"));
+                    info!(
+                        "lifecycle: {} v({}) is locked, not deleting",
+                        oi.name,
+                        oi.version_id.map(|v| v.to_string()).unwrap_or_default()
+                    );
                 } else {
                     info!("lifecycle: {} is locked, not deleting", oi.name);
                 }
@@ -928,7 +932,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     };
 
     if lc_event.action.delete_versioned() {
-        opts.version_id = Some(oi.version_id.expect("err").to_string());
+        opts.version_id = oi.version_id.map(|v| v.to_string());
     }
 
     opts.versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
