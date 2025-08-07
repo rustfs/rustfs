@@ -19,7 +19,7 @@ use crate::{
     target::Target,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use rustfs_config::notify::{ENABLE_KEY, ENABLE_ON, NOTIFY_ROUTE_PREFIX};
+use rustfs_config::notify::{ENABLE_KEY, NOTIFY_ROUTE_PREFIX};
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
 use std::collections::{HashMap, HashSet};
@@ -111,10 +111,10 @@ impl TargetRegistry {
             // 3.1. Instance discovery: Based on the '..._ENABLE_INSTANCEID' format
             let enable_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}_{ENABLE_KEY}_").to_uppercase();
             for (key, value) in &all_env {
-                if value.eq_ignore_ascii_case(ENABLE_ON)
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("1")
-                    || value.eq_ignore_ascii_case("yes")
+                if value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ONE)
+                    || value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ON)
+                    || value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_TRUE)
+                    || value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_YES)
                 {
                     if let Some(id) = key.strip_prefix(&enable_prefix) {
                         if !id.is_empty() {
@@ -202,10 +202,10 @@ impl TargetRegistry {
                 let enabled = merged_config
                     .lookup(ENABLE_KEY)
                     .map(|v| {
-                        v.eq_ignore_ascii_case(ENABLE_ON)
-                            || v.eq_ignore_ascii_case("true")
-                            || v.eq_ignore_ascii_case("1")
-                            || v.eq_ignore_ascii_case("yes")
+                        v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ONE)
+                            || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ON)
+                            || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_TRUE)
+                            || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_YES)
                     })
                     .unwrap_or(false);
 

@@ -61,9 +61,6 @@ pub async fn start_http_server(
     let server_address = server_addr.to_string();
 
     // The listening address and port are obtained from the parameters
-    // let listener = TcpListener::bind(server_address.clone()).await?;
-
-    // The listening address and port are obtained from the parameters
     let listener = {
         let mut server_addr = server_addr;
         let mut socket = socket2::Socket::new(
@@ -310,7 +307,9 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
             server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
             // Log SNI requests
-            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            if rustfs_utils::tls_key_log() {
+                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            }
 
             return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
         }
@@ -333,7 +332,9 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
         // Log SNI requests
-        server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
 
         return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
     }
@@ -431,45 +432,33 @@ fn process_connection(
                 Err(err) => {
                     // Detailed analysis of the reasons why the TLS handshake fails
                     let err_str = err.to_string();
+                    let mut key_failure_type_str: &str = "unknown";
                     if err_str.contains("unexpected EOF") || err_str.contains("handshake eof") {
-                        info!( peer_addr = %peer_addr,"TLS handshake failed with EOF, attempting fallback to HTTP: {}", err);
-
-                        // Try falling back the connection to HTTP mode (this feature is only enabled in specific environments)
-                        #[cfg(feature = "tls_fallback")]
-                        {
-                            // Since the original connection has been consumed, a new connection needs to be accepted
-                            match TcpStream::connect(peer_addr.clone()).await {
-                                Ok(new_socket) => {
-                                    debug!("Successfully reconnected to client for HTTP fallback");
-                                    let stream = TokioIo::new(new_socket);
-                                    let conn = http_server.serve_connection(stream, hybrid_service);
-                                    if let Err(err) = graceful.watch(conn).await {
-                                        handle_connection_error(&*err);
-                                    }
-                                    return;
-                                }
-                                Err(e) => {
-                                    error!("Failed to reconnect for HTTP fallback: {}", e);
-                                }
-                            }
-                        }
+                        warn!(peer_addr = %peer_addr, "TLS handshake failed. If this client needs HTTP, it should connect to the HTTP port instead");
+                        key_failure_type_str = "unexpected_eof";
                     } else if err_str.contains("protocol version") {
                         error!(
                             peer_addr = %peer_addr,
                             "TLS handshake failed due to protocol version mismatch: {}", err
                         );
+                        key_failure_type_str = "protocol_version";
                     } else if err_str.contains("certificate") {
                         error!(
                             peer_addr = %peer_addr,
                             "TLS handshake failed due to certificate issues: {}", err
                         );
+                        key_failure_type_str = "certificate";
                     } else {
                         error!(
                             peer_addr = %peer_addr,
                             "TLS handshake failed: {}", err
                         );
                     }
-
+                    info!(
+                        counter.rustfs_tls_handshake_failures = 1_u64,
+                        key_failure_type = key_failure_type_str,
+                        "TLS handshake failure metric"
+                    );
                     // Record detailed diagnostic information
                     debug!(
                         peer_addr = %peer_addr,
@@ -478,7 +467,7 @@ fn process_connection(
                         "TLS handshake failure details"
                     );
 
-                    return; // End the mission
+                    return; // End the task
                 }
             }
             debug!("TLS handshake success");
