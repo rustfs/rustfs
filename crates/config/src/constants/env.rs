@@ -99,6 +99,37 @@ impl EnableState {
             EnableState::Zero => "0",
         }
     }
+
+    /// is_enabled checks if the state represents an enabled condition.
+    pub fn is_enabled(self) -> bool {
+        matches!(
+            self,
+            EnableState::True
+                | EnableState::Yes
+                | EnableState::On
+                | EnableState::Enabled
+                | EnableState::Ok
+                | EnableState::Success
+                | EnableState::Active
+                | EnableState::One
+        )
+    }
+
+    /// is_disabled checks if the state represents a disabled condition.
+    pub fn is_disabled(self) -> bool {
+        matches!(
+            self,
+            EnableState::False
+                | EnableState::No
+                | EnableState::Off
+                | EnableState::Disabled
+                | EnableState::NotOk
+                | EnableState::Failure
+                | EnableState::Inactive
+                | EnableState::Zero
+                | EnableState::Empty
+        )
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +246,38 @@ mod tests {
         ];
         for (variant, string) in cases.iter() {
             assert_eq!(variant.as_str(), *string);
+        }
+    }
+
+    #[test]
+    fn test_enable_state_is_enabled() {
+        let enabled_states = [
+            EnableState::True,
+            EnableState::Yes,
+            EnableState::On,
+            EnableState::Enabled,
+            EnableState::Ok,
+            EnableState::Success,
+            EnableState::Active,
+            EnableState::One,
+        ];
+        for state in enabled_states.iter() {
+            assert!(state.is_enabled());
+        }
+
+        let disabled_states = [
+            EnableState::False,
+            EnableState::No,
+            EnableState::Off,
+            EnableState::Disabled,
+            EnableState::NotOk,
+            EnableState::Failure,
+            EnableState::Inactive,
+            EnableState::Zero,
+            EnableState::Empty,
+        ];
+        for state in disabled_states.iter() {
+            assert!(state.is_disabled());
         }
     }
 }
