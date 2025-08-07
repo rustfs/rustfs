@@ -33,11 +33,6 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
-[features]
-default = []
-tls_fallback = []
-full = ["tls_fallback"]
-
 [dependencies]
 rustfs-ahm = { workspace = true }
 rustfs-zip = { workspace = true }

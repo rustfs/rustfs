@@ -17,31 +17,21 @@ rustfs-ecstore = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
-rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-bytes = { workspace = true }
-time = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4", "serde"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-url = { workspace = true }
-rustfs-lock = { workspace = true }
-
-lazy_static = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-rmp-serde = { workspace = true }
-tokio-test = { workspace = true }
 serde_json = { workspace = true }
 serial_test = "3.2.0"
-once_cell = { workspace = true }
 tracing-subscriber = { workspace = true }
 walkdir = "2.5.0"
 tempfile = { workspace = true }

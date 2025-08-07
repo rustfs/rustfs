@@ -28,18 +28,11 @@ documentation = "https://docs.rs/rustfs-signer/latest/rustfs_checksum/"
 [dependencies]
 bytes = { workspace = true }
 crc-fast = { workspace = true }
-hex = { workspace = true }
 http = { workspace = true }
-http-body = { workspace = true }
 base64-simd = { workspace = true }
 md-5 = { workspace = true }
-pin-project-lite = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
-bytes-utils = { workspace = true }
 pretty_assertions = { workspace = true }
-tracing-test = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
