@@ -432,22 +432,22 @@ fn process_connection(
                 Err(err) => {
                     // Detailed analysis of the reasons why the TLS handshake fails
                     let err_str = err.to_string();
-                    let mut key_failure_type_str: &str = "unknown";
+                    let mut key_failure_type_str: &str = "UNKNOWN";
                     if err_str.contains("unexpected EOF") || err_str.contains("handshake eof") {
                         warn!(peer_addr = %peer_addr, "TLS handshake failed. If this client needs HTTP, it should connect to the HTTP port instead");
-                        key_failure_type_str = "unexpected_eof";
+                        key_failure_type_str = "UNEXPECTED_EOF";
                     } else if err_str.contains("protocol version") {
                         error!(
                             peer_addr = %peer_addr,
                             "TLS handshake failed due to protocol version mismatch: {}", err
                         );
-                        key_failure_type_str = "protocol_version";
+                        key_failure_type_str = "PROTOCOL_VERSION";
                     } else if err_str.contains("certificate") {
                         error!(
                             peer_addr = %peer_addr,
                             "TLS handshake failed due to certificate issues: {}", err
                         );
-                        key_failure_type_str = "certificate";
+                        key_failure_type_str = "CERTIFICATE";
                     } else {
                         error!(
                             peer_addr = %peer_addr,
