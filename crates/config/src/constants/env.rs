@@ -43,26 +43,7 @@ pub enum EnableState {
 }
 impl std::fmt::Display for EnableState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            EnableState::True => "true",
-            EnableState::False => "false",
-            EnableState::Empty => "",
-            EnableState::Yes => "yes",
-            EnableState::No => "no",
-            EnableState::On => "on",
-            EnableState::Off => "off",
-            EnableState::Enabled => "enabled",
-            EnableState::Disabled => "disabled",
-            EnableState::Ok => "ok",
-            EnableState::NotOk => "not_ok",
-            EnableState::Success => "success",
-            EnableState::Failure => "failure",
-            EnableState::Active => "active",
-            EnableState::Inactive => "inactive",
-            EnableState::One => "1",
-            EnableState::Zero => "0",
-        };
-        write!(f, "{s}")
+        f.write_str(self.as_str())
     }
 }
 impl std::str::FromStr for EnableState {
