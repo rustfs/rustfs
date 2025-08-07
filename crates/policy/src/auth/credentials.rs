@@ -21,6 +21,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use time::macros::offset;
+use regex::Regex;
+use std::sync::OnceLock;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
 const ACCESS_KEY_MAX_LEN: usize = 20;
@@ -30,21 +32,248 @@ const SECRET_KEY_MAX_LEN: usize = 40;
 pub const ACCOUNT_ON: &str = "on";
 pub const ACCOUNT_OFF: &str = "off";
 
-const RESERVED_CHARS: &str = "=,";
+// Access key validation regexes using OnceLock
+static ACCESS_KEY_CHARSET_REGEX: OnceLock<Regex> = OnceLock::new();
+static SECRET_KEY_CHARSET_REGEX: OnceLock<Regex> = OnceLock::new();
+
+// Pattern validation regexes
+static RESERVED_CHARS_REGEX: OnceLock<Regex> = OnceLock::new();
+static SEQUENTIAL_CHARS_REGEX: OnceLock<Regex> = OnceLock::new();
+static SEQUENTIAL_CHARS_4_REGEX: OnceLock<Regex> = OnceLock::new();
+
+// Weak pattern regexes
+static WEAK_ACCESS_PATTERNS_REGEX: OnceLock<Regex> = OnceLock::new();
+static WEAK_SECRET_PATTERNS_REGEX: OnceLock<Regex> = OnceLock::new();
+
+// Complexity validation regexes
+static UPPERCASE_REGEX: OnceLock<Regex> = OnceLock::new();
+static LOWERCASE_REGEX: OnceLock<Regex> = OnceLock::new();
+static DIGIT_REGEX: OnceLock<Regex> = OnceLock::new();
+static SPECIAL_REGEX: OnceLock<Regex> = OnceLock::new();
+
+// Helper functions to get compiled regexes
+fn get_access_key_charset_regex() -> &'static Regex {
+    ACCESS_KEY_CHARSET_REGEX.get_or_init(|| Regex::new(r"^[A-Za-z0-9]+$").unwrap())
+}
+
+fn get_secret_key_charset_regex() -> &'static Regex {
+    SECRET_KEY_CHARSET_REGEX.get_or_init(|| Regex::new(r"^[A-Za-z0-9+/=]+$").unwrap())
+}
+
+fn get_reserved_chars_regex() -> &'static Regex {
+    RESERVED_CHARS_REGEX.get_or_init(|| Regex::new(r"[=,]").unwrap())
+}
+
+fn get_sequential_chars_regex() -> &'static Regex {
+    SEQUENTIAL_CHARS_REGEX.get_or_init(|| Regex::new(r"(abc|bcd|cde|def|efg|fgh|ghi|hij|ijk|jkl|klm|lmn|mno|nop|opq|pqr|qrs|rst|stu|tuv|uvw|vwx|wxy|xyz|012|123|234|345|456|567|678|789)").unwrap())
+}
+
+fn get_sequential_chars_4_regex() -> &'static Regex {
+    SEQUENTIAL_CHARS_4_REGEX.get_or_init(|| Regex::new(r"(abcd|bcde|cdef|defg|efgh|fghi|ghij|hijk|ijkl|jklm|klmn|lmno|mnop|nopq|opqr|pqrs|qrst|rstu|stuv|tuvw|uvwx|vwxy|wxyz|0123|1234|2345|3456|4567|5678|6789)").unwrap())
+}
+
+fn get_weak_access_patterns_regex() -> &'static Regex {
+    WEAK_ACCESS_PATTERNS_REGEX.get_or_init(|| Regex::new(r"(?i)(admin|test|demo|user|guest|root|default|123|abc|password|pass|key|secret)").unwrap())
+}
+
+fn get_weak_secret_patterns_regex() -> &'static Regex {
+    WEAK_SECRET_PATTERNS_REGEX.get_or_init(|| Regex::new(r"(?i)(password|12345678|abcdefgh|qwertyui|asdfghjk|zxcvbnm|admin123|password1|secret123|default|changeme|welcome|letmein)").unwrap())
+}
+
+fn get_uppercase_regex() -> &'static Regex {
+    UPPERCASE_REGEX.get_or_init(|| Regex::new(r"[A-Z]").unwrap())
+}
+
+fn get_lowercase_regex() -> &'static Regex {
+    LOWERCASE_REGEX.get_or_init(|| Regex::new(r"[a-z]").unwrap())
+}
+
+fn get_digit_regex() -> &'static Regex {
+    DIGIT_REGEX.get_or_init(|| Regex::new(r"[0-9]").unwrap())
+}
+
+fn get_special_regex() -> &'static Regex {
+    SPECIAL_REGEX.get_or_init(|| Regex::new(r"[+/=]").unwrap())
+}
+
+// Check for repeated characters using manual iteration (since regex doesn't support backreferences)
+fn has_repeated_chars_manual(s: &str, min_repeat_len: usize) -> bool {
+    if s.len() < min_repeat_len {
+        return false;
+    }
+    
+    let chars: Vec<char> = s.chars().collect();
+    let mut repeat_count = 1;
+    
+    for i in 1..chars.len() {
+        if chars[i] == chars[i-1] {
+            repeat_count += 1;
+            if repeat_count >= min_repeat_len {
+                return true;
+            }
+        } else {
+            repeat_count = 1;
+        }
+    }
+    
+    false
+}
 
 // ContainsReservedChars - returns whether the input string contains reserved characters.
 pub fn contains_reserved_chars(s: &str) -> bool {
-    s.contains(RESERVED_CHARS)
+    get_reserved_chars_regex().is_match(s)
 }
 
-// IsAccessKeyValid - validate access key for right length.
+// Validate character set for access key
+pub fn is_access_key_charset_valid(access_key: &str) -> bool {
+    get_access_key_charset_regex().is_match(access_key)
+}
+
+// Validate character set for secret key
+pub fn is_secret_key_charset_valid(secret_key: &str) -> bool {
+    get_secret_key_charset_regex().is_match(secret_key)
+}
+
+// Comprehensive access key validation
 pub fn is_access_key_valid(access_key: &str) -> bool {
-    access_key.len() >= ACCESS_KEY_MIN_LEN
+    // Check length bounds
+    if access_key.len() < ACCESS_KEY_MIN_LEN || access_key.len() > ACCESS_KEY_MAX_LEN {
+        return false;
+    }
+    
+    // Check for empty or whitespace-only
+    if access_key.trim().is_empty() {
+        return false;
+    }
+    
+    // Check for reserved characters
+    if contains_reserved_chars(access_key) {
+        return false;
+    }
+    
+    // Check character set
+    if !is_access_key_charset_valid(access_key) {
+        return false;
+    }
+    
+    // Check for common weak patterns
+    if is_weak_access_key(access_key) {
+        return false;
+    }
+    
+    true
 }
 
-// IsSecretKeyValid - validate secret key for right length.
+// Comprehensive secret key validation
 pub fn is_secret_key_valid(secret_key: &str) -> bool {
-    secret_key.len() >= SECRET_KEY_MIN_LEN
+    // Check length bounds
+    if secret_key.len() < SECRET_KEY_MIN_LEN || secret_key.len() > SECRET_KEY_MAX_LEN {
+        return false;
+    }
+    
+    // Check for empty or whitespace-only
+    if secret_key.trim().is_empty() {
+        return false;
+    }
+    
+    // Check for reserved characters in inappropriate context
+    if contains_reserved_chars(secret_key) {
+        return false;
+    }
+    
+    // Check character set
+    if !is_secret_key_charset_valid(secret_key) {
+        return false;
+    }
+    
+    // Check for minimum complexity requirements
+    if !meets_secret_key_complexity(secret_key) {
+        return false;
+    }
+    
+    // Check for common weak patterns
+    if is_weak_secret_key(secret_key) {
+        return false;
+    }
+    
+    true
+}
+
+// Check for weak access key patterns
+fn is_weak_access_key(access_key: &str) -> bool {
+    // Check for sequential characters (3+ in a row)
+    if get_sequential_chars_regex().is_match(&access_key.to_lowercase()) {
+        return true;
+    }
+    
+    // Check for repeated characters (3+ in a row)
+    if has_repeated_chars_manual(access_key, 3) {
+        return true;
+    }
+    
+    // Check for common weak patterns
+    get_weak_access_patterns_regex().is_match(access_key)
+}
+
+// Check for weak secret key patterns
+fn is_weak_secret_key(secret_key: &str) -> bool {
+    // Check for sequential characters (4+ in a row)
+    if get_sequential_chars_4_regex().is_match(&secret_key.to_lowercase()) {
+        return true;
+    }
+    
+    // Check for repeated characters (4+ in a row)
+    if has_repeated_chars_manual(secret_key, 4) {
+        return true;
+    }
+    
+    // Check for common weak patterns
+    get_weak_secret_patterns_regex().is_match(secret_key)
+}
+
+// Check secret key complexity requirements
+fn meets_secret_key_complexity(secret_key: &str) -> bool {
+    let has_upper = get_uppercase_regex().is_match(secret_key);
+    let has_lower = get_lowercase_regex().is_match(secret_key);
+    let has_digit = get_digit_regex().is_match(secret_key);
+    let has_special = get_special_regex().is_match(secret_key);
+    
+    // Require at least 2 of the 4 character types for keys >= 12 chars
+    let complexity_count = [has_upper, has_lower, has_digit, has_special]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+    
+    if secret_key.len() >= 12 {
+        complexity_count >= 2
+    } else {
+        complexity_count >= 1
+    }
+}
+
+// Enhanced credential validation
+pub fn validate_credentials(access_key: &str, secret_key: &str) -> Result<()> {
+    // Validate access key
+    if !is_access_key_valid(access_key) {
+        return Err(IamError::InvalidAccessKeyLength);
+    }
+    
+    // Validate secret key
+    if !is_secret_key_valid(secret_key) {
+        return Err(IamError::InvalidSecretKeyLength);
+    }
+    
+    // Check for credential reuse patterns
+    if access_key.to_lowercase() == secret_key.to_lowercase() {
+        return Err(Error::other("Access key and secret key cannot be identical"));
+    }
+    
+    // Check if secret key contains access key
+    if secret_key.to_lowercase().contains(&access_key.to_lowercase()) {
+        return Err(Error::other("Secret key cannot contain access key"));
+    }
+    
+    Ok(())
 }
 
 // #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
@@ -184,7 +413,17 @@ impl Credentials {
             return false;
         }
 
-        self.access_key.len() >= 3 && self.secret_key.len() >= 8 && !self.is_expired()
+        // Use comprehensive validation instead of simple length checks
+        if !is_access_key_valid(&self.access_key) || !is_secret_key_valid(&self.secret_key) {
+            return false;
+        }
+        
+        // Additional validation for credential relationship
+        if validate_credentials(&self.access_key, &self.secret_key).is_err() {
+            return false;
+        }
+
+        !self.is_expired()
     }
 
     pub fn is_owner(&self) -> bool {
@@ -210,13 +449,17 @@ pub fn create_new_credentials_with_metadata(
     claims: &HashMap<String, Value>,
     token_secret: &str,
 ) -> Result<Credentials> {
-    if ak.len() < ACCESS_KEY_MIN_LEN || ak.len() > ACCESS_KEY_MAX_LEN {
+    // Use comprehensive validation instead of simple length checks
+    if !is_access_key_valid(ak) {
         return Err(IamError::InvalidAccessKeyLength);
     }
 
-    if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
-        return Err(IamError::InvalidAccessKeyLength);
+    if !is_secret_key_valid(sk) {
+        return Err(IamError::InvalidSecretKeyLength);
     }
+    
+    // Validate credential relationship
+    validate_credentials(ak, sk)?;
 
     if token_secret.is_empty() {
         return Ok(Credentials {
@@ -350,6 +593,11 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         if value.access_key == "site-replicator-0" && !value.allow_site_replicator_account {
             return Err(IamError::InvalidArgument);
         }
+        
+        // Validate provided credentials if not empty
+        if !value.access_key.is_empty() && !value.secret_key.is_empty() {
+            validate_credentials(&value.access_key, &value.secret_key)?;
+        }
 
         let mut claim = serde_json::json!({
             "parent": value.parent_user
@@ -381,8 +629,11 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         }
 
         if value.secret_key.is_empty() {
-            value.access_key = utils::gen_secret_key(40)?;
+            value.secret_key = utils::gen_secret_key(40)?;  // Fix: was assigning to access_key
         }
+        
+        // Validate generated credentials
+        validate_credentials(&value.access_key, &value.secret_key)?;
 
         claim["accessKey"] = json!(&value.access_key);
 
@@ -421,66 +672,166 @@ impl TryFrom<CredentialsBuilder> for Credentials {
     }
 }
 
-// #[cfg(test)]
-// #[allow(non_snake_case)]
-// mod tests {
-//     use test_case::test_case;
-//     use time::Date;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-//     use super::CredentialHeader;
-//     use super::CredentialHeaderScope;
-//     use crate::service_type::ServiceType;
+    #[test]
+    fn test_access_key_validation() {
+        // Valid access keys
+        assert!(is_access_key_valid("abc123"));
+        assert!(is_access_key_valid("MyAccessKey12345"));
+        assert!(is_access_key_valid("A1B2C3"));
+        
+        // Invalid - too short
+        assert!(!is_access_key_valid("ab"));
+        
+        // Invalid - too long
+        assert!(!is_access_key_valid("a".repeat(21).as_str()));
+        
+        // Invalid - contains reserved characters
+        assert!(!is_access_key_valid("abc=123"));
+        assert!(!is_access_key_valid("abc,123"));
+        
+        // Invalid - weak patterns
+        assert!(!is_access_key_valid("admin"));
+        assert!(!is_access_key_valid("test123"));
+        assert!(!is_access_key_valid("abcd"));
+        assert!(!is_access_key_valid("1234"));
+        
+        // Invalid - empty or whitespace
+        assert!(!is_access_key_valid(""));
+        assert!(!is_access_key_valid("   "));
+    }
 
-//     #[test_case(
-//         "Credential=aaaaaaaaaaaaaaaaaaaa/20241127/us-east-1/s3/aws4_request" =>
-//         CredentialHeader{
-//             access_key: "aaaaaaaaaaaaaaaaaaaa".into(),
-//             scop: CredentialHeaderScope {
-//                 date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
-//                 region: "us-east-1".to_owned(),
-//                 service: ServiceType::S3,
-//                 request: "aws4_request".into(),
-//             }
-//         };
-//         "1")]
-//     #[test_case(
-//         "Credential=aaaaaaaaaaa/aaaaaaaaa/20241127/us-east-1/s3/aws4_request" =>
-//         CredentialHeader{
-//             access_key: "aaaaaaaaaaa/aaaaaaaaa".into(),
-//             scop: CredentialHeaderScope {
-//                 date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
-//                 region: "us-east-1".to_owned(),
-//                 service: ServiceType::S3,
-//                 request: "aws4_request".into(),
-//             }
-//         };
-//         "2")]
-//     #[test_case(
-//         "Credential=aaaaaaaaaaa/aaaaaaaaa/20241127/us-east-1/sts/aws4_request" =>
-//         CredentialHeader{
-//             access_key: "aaaaaaaaaaa/aaaaaaaaa".into(),
-//             scop: CredentialHeaderScope {
-//                 date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
-//                 region: "us-east-1".to_owned(),
-//                 service: ServiceType::STS,
-//                 request: "aws4_request".into(),
-//             }
-//         };
-//         "3")]
-//     fn test_CredentialHeader_from_str_successful(input: &str) -> CredentialHeader {
-//         CredentialHeader::try_from(input).unwrap()
-//     }
+    #[test]
+    fn test_secret_key_validation() {
+        // Valid secret keys
+        assert!(is_secret_key_valid("MySecret123"));
+        assert!(is_secret_key_valid("Abc12345Def"));
+        assert!(is_secret_key_valid("ComplexSecret123+"));
+        
+        // Invalid - too short
+        assert!(!is_secret_key_valid("1234567"));
+        
+        // Invalid - too long
+        assert!(!is_secret_key_valid("a".repeat(41).as_str()));
+        
+        // Invalid - weak patterns
+        assert!(!is_secret_key_valid("password"));
+        assert!(!is_secret_key_valid("12345678"));
+        assert!(!is_secret_key_valid("abcdefgh"));
+        assert!(!is_secret_key_valid("aaaaaaaa"));
+        
+        // Invalid - contains reserved characters
+        assert!(!is_secret_key_valid("secret=123"));
+        assert!(!is_secret_key_valid("secret,123"));
+        
+        // Invalid - empty or whitespace
+        assert!(!is_secret_key_valid(""));
+        assert!(!is_secret_key_valid("   "));
+    }
 
-//     #[test_case("Credential")]
-//     #[test_case("Cred=")]
-//     #[test_case("Credential=abc")]
-//     #[test_case("Credential=a/20241127/us-east-1/s3/aws4_request")]
-//     #[test_case("Credential=aa/20241127/us-east-1/s3/aws4_request")]
-//     #[test_case("Credential=aaaa/20241127/us-east-1/asa/aws4_request")]
-//     #[test_case("Credential=aaaa/20241127/us-east-1/sts/aws4a_request")]
-//     fn test_credential_header_from_str_failed(input: &str) {
-//         if CredentialHeader::try_from(input).is_ok() {
-//             unreachable!()
-//         }
-//     }
-// }
+    #[test]
+    fn test_credential_relationship_validation() {
+        // Valid - different values
+        assert!(validate_credentials("access123", "secretkey456").is_ok());
+        
+        // Invalid - identical
+        assert!(validate_credentials("same123", "same123").is_err());
+        
+        // Invalid - secret contains access key
+        assert!(validate_credentials("abc", "secretabc123").is_err());
+        assert!(validate_credentials("test", "mytestpassword").is_err());
+    }
+
+    #[test]
+    fn test_repeated_chars_detection() {
+        assert!(has_repeated_chars_manual("aaa", 3));
+        assert!(has_repeated_chars_manual("111", 3));
+        assert!(has_repeated_chars_manual("aaabbb", 3));
+        assert!(!has_repeated_chars_manual("aba", 3));
+        assert!(!has_repeated_chars_manual("aa", 3));
+    }
+
+    #[test]
+    fn test_sequential_chars_detection() {
+        // Using regex-based detection
+        assert!(get_sequential_chars_regex().is_match("abc"));
+        assert!(get_sequential_chars_regex().is_match("123"));
+        assert!(get_sequential_chars_regex().is_match("defgh"));
+        assert!(!get_sequential_chars_regex().is_match("ace"));
+        
+        // Test 4+ character sequences
+        assert!(get_sequential_chars_4_regex().is_match("abcd"));
+        assert!(get_sequential_chars_4_regex().is_match("1234"));
+        assert!(!get_sequential_chars_4_regex().is_match("abc"));
+    }
+
+    #[test]
+    fn test_secret_key_complexity() {
+        // Complex enough - mixed case and digits
+        assert!(meets_secret_key_complexity("MySecret123"));
+        
+        // Complex enough - uppercase and special chars
+        assert!(meets_secret_key_complexity("SECRET+KEY"));
+        
+        // Not complex enough - only lowercase
+        assert!(!meets_secret_key_complexity("mysecretkey"));
+        
+        // Short key with some complexity is ok
+        assert!(meets_secret_key_complexity("MyKey1"));
+    }
+
+    #[test]
+    fn test_charset_validation() {
+        // Valid access key charset
+        assert!(is_access_key_charset_valid("ABCabc123"));
+        assert!(!is_access_key_charset_valid("abc@123"));
+        assert!(!is_access_key_charset_valid("abc#123"));
+        
+        // Valid secret key charset
+        assert!(is_secret_key_charset_valid("ABCabc123+/="));
+        assert!(!is_secret_key_charset_valid("abc@123"));
+        assert!(!is_secret_key_charset_valid("abc#123"));
+    }
+
+    #[test]
+    fn test_credentials_is_valid() {
+        // Valid credentials
+        let valid_creds = Credentials {
+            access_key: "ValidKey123".to_string(),
+            secret_key: "ValidSecret456".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        assert!(valid_creds.is_valid());
+        
+        // Invalid - status off
+        let invalid_status = Credentials {
+            access_key: "ValidKey123".to_string(),
+            secret_key: "ValidSecret456".to_string(),
+            status: "off".to_string(),
+            ..Default::default()
+        };
+        assert!(!invalid_status.is_valid());
+        
+        // Invalid - weak access key
+        let weak_access = Credentials {
+            access_key: "admin".to_string(),
+            secret_key: "ValidSecret456".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        assert!(!weak_access.is_valid());
+        
+        // Invalid - identical keys
+        let identical_keys = Credentials {
+            access_key: "SameKey123".to_string(),
+            secret_key: "SameKey123".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        assert!(!identical_keys.is_valid());
+    }
+}
