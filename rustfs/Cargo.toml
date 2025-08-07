@@ -33,6 +33,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+tls_fallback = []
+full = ["tls_fallback"]
+
 [dependencies]
 rustfs-ahm = { workspace = true }
 rustfs-zip = { workspace = true }
@@ -54,8 +59,6 @@ rustfs-s3select-query = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
-axum-extra = { workspace = true }
-axum-server = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
