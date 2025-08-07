@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::{FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, VersionType, merge_file_meta_versions};
+use crate::{merge_file_meta_versions, FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, VersionType};
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -24,8 +24,8 @@ use std::{
     pin::Pin,
     ptr,
     sync::{
-        Arc,
         atomic::{AtomicPtr, AtomicU64, Ordering as AtomicOrdering},
+        Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -795,24 +795,26 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             }
         }
 
-        if self.opts.no_wait && v.is_some() && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
-            if self.updating.try_lock().is_ok() {
-                let this = Arc::clone(&self);
-                spawn(async move {
-                    let _ = this.update().await;
-                });
+        if self.opts.no_wait && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
+            if let Some(value) = v {
+                if self.updating.try_lock().is_ok() {
+                    let this = Arc::clone(&self);
+                    spawn(async move {
+                        let _ = this.update().await;
+                    });
+                }
+                return Ok(value);
             }
-
-            return Ok(v.unwrap());
         }
 
         let _ = self.updating.lock().await;
 
-        if let Ok(duration) =
-            SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst)))
-        {
+        if let (Ok(duration), Some(value)) = (
+            SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst))),
+            v,
+        ) {
             if duration < self.ttl {
-                return Ok(v.unwrap());
+                return Ok(value);
             }
         }
 
