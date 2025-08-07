@@ -954,20 +954,17 @@ impl LocalDisk {
 
             if !dir_stack.is_empty() {
                 if let Some(pop) = dir_stack.pop() {
-                    if pop < name {
-                        //
-                        out.write_obj(&MetaCacheEntry {
-                            name: pop.clone(),
-                            ..Default::default()
-                        })
-                        .await?;
+                    out.write_obj(&MetaCacheEntry {
+                        name: pop.clone(),
+                        ..Default::default()
+                    })
+                    .await?;
 
-                        if opts.recursive {
-                            let mut opts = opts.clone();
-                            opts.filter_prefix = None;
-                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), &opts, out, objs_returned)).await {
-                                error!("scan_dir err {:?}", er);
-                            }
+                    if opts.recursive {
+                        let mut opts = opts.clone();
+                        opts.filter_prefix = None;
+                        if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), &opts, out, objs_returned)).await {
+                            error!("scan_dir err {:?}", er);
                         }
                     }
                 }
