@@ -19,57 +19,228 @@ pub const ENV_WORD_DELIMITER: &str = "_";
 /// Medium-drawn lines separator
 /// This is used to separate words in environment variable names.
 pub const ENV_WORD_DELIMITER_DASH: &str = "-";
-pub const DEFAULT_ENABLE_TRUE: &str = "true";
-pub const DEFAULT_ENABLE_FALSE: &str = "false";
-pub const DEFAULT_ENABLE_EMPTY: &str = "";
 
-pub const DEFAULT_ENABLE_YES: &str = "yes";
-pub const DEFAULT_ENABLE_NO: &str = "no";
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum EnableState {
+    True,
+    False,
+    #[default]
+    Empty,
+    Yes,
+    No,
+    On,
+    Off,
+    Enabled,
+    Disabled,
+    Ok,
+    NotOk,
+    Success,
+    Failure,
+    Active,
+    Inactive,
+    One,
+    Zero,
+}
+impl std::fmt::Display for EnableState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            EnableState::True => "true",
+            EnableState::False => "false",
+            EnableState::Empty => "",
+            EnableState::Yes => "yes",
+            EnableState::No => "no",
+            EnableState::On => "on",
+            EnableState::Off => "off",
+            EnableState::Enabled => "enabled",
+            EnableState::Disabled => "disabled",
+            EnableState::Ok => "ok",
+            EnableState::NotOk => "not_ok",
+            EnableState::Success => "success",
+            EnableState::Failure => "failure",
+            EnableState::Active => "active",
+            EnableState::Inactive => "inactive",
+            EnableState::One => "1",
+            EnableState::Zero => "0",
+        };
+        write!(f, "{s}")
+    }
+}
+impl std::str::FromStr for EnableState {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "true" => Ok(EnableState::True),
+            "false" => Ok(EnableState::False),
+            "" => Ok(EnableState::Empty),
+            "yes" => Ok(EnableState::Yes),
+            "no" => Ok(EnableState::No),
+            "on" => Ok(EnableState::On),
+            "off" => Ok(EnableState::Off),
+            "enabled" => Ok(EnableState::Enabled),
+            "disabled" => Ok(EnableState::Disabled),
+            "ok" => Ok(EnableState::Ok),
+            "not_ok" => Ok(EnableState::NotOk),
+            "success" => Ok(EnableState::Success),
+            "failure" => Ok(EnableState::Failure),
+            "active" => Ok(EnableState::Active),
+            "inactive" => Ok(EnableState::Inactive),
+            "1" => Ok(EnableState::One),
+            "0" => Ok(EnableState::Zero),
+            _ => Err(()),
+        }
+    }
+}
 
-pub const DEFAULT_ENABLE_ON: &str = "on";
-pub const DEFAULT_ENABLE_OFF: &str = "off";
-
-pub const DEFAULT_ENABLED: &str = "enabled";
-pub const DEFAULT_DISABLED: &str = "disabled";
-
-pub const DEFAULT_ENABLE_OK: &str = "ok";
-pub const DEFAULT_ENABLE_NOT_OK: &str = "not_ok";
-
-pub const DEFAULT_ENABLE_SUCCESS: &str = "success";
-pub const DEFAULT_ENABLE_FAILURE: &str = "failure";
-
-pub const DEFAULT_ENABLE_ACTIVE: &str = "active";
-pub const DEFAULT_ENABLE_INACTIVE: &str = "inactive";
-
-pub const DEFAULT_ENABLE_ONE: &str = "1";
-pub const DEFAULT_ENABLE_ZERO: &str = "0";
+impl EnableState {
+    /// Returns the default value for the enum.
+    pub fn get_default() -> Self {
+        Self::default()
+    }
+    /// Returns the enum variant from a string.
+    /// Returns the string representation of the enum.
+    pub fn as_str(&self) -> &str {
+        match self {
+            EnableState::True => "true",
+            EnableState::False => "false",
+            EnableState::Empty => "",
+            EnableState::Yes => "yes",
+            EnableState::No => "no",
+            EnableState::On => "on",
+            EnableState::Off => "off",
+            EnableState::Enabled => "enabled",
+            EnableState::Disabled => "disabled",
+            EnableState::Ok => "ok",
+            EnableState::NotOk => "not_ok",
+            EnableState::Success => "success",
+            EnableState::Failure => "failure",
+            EnableState::Active => "active",
+            EnableState::Inactive => "inactive",
+            EnableState::One => "1",
+            EnableState::Zero => "0",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+    #[test]
+    fn test_enable_state_display_and_fromstr() {
+        use std::str::FromStr;
+        let cases = [
+            (EnableState::True, "true"),
+            (EnableState::False, "false"),
+            (EnableState::Empty, ""),
+            (EnableState::Yes, "yes"),
+            (EnableState::No, "no"),
+            (EnableState::On, "on"),
+            (EnableState::Off, "off"),
+            (EnableState::Enabled, "enabled"),
+            (EnableState::Disabled, "disabled"),
+            (EnableState::Ok, "ok"),
+            (EnableState::NotOk, "not_ok"),
+            (EnableState::Success, "success"),
+            (EnableState::Failure, "failure"),
+            (EnableState::Active, "active"),
+            (EnableState::Inactive, "inactive"),
+            (EnableState::One, "1"),
+            (EnableState::Zero, "0"),
+        ];
+        for (variant, string) in cases.iter() {
+            assert_eq!(&variant.to_string(), string);
+            assert_eq!(EnableState::from_str(string).unwrap(), *variant);
+        }
+        // Test invalid string
+        assert!(EnableState::from_str("invalid").is_err());
+        // Test invalid string with leading/trailing spaces
+        assert!(EnableState::from_str(" true ").is_err());
+        assert!(EnableState::from_str(" false ").is_err());
+        assert!(EnableState::from_str(" yes ").is_err());
+        assert!(EnableState::from_str(" no ").is_err());
+        assert!(EnableState::from_str(" on ").is_err());
+        assert!(EnableState::from_str(" off ").is_err());
+        assert!(EnableState::from_str(" enabled ").is_err());
+        assert!(EnableState::from_str(" disabled ").is_err());
+        assert!(EnableState::from_str(" ok ").is_err());
+        assert!(EnableState::from_str(" not_ok ").is_err());
+        assert!(EnableState::from_str(" success ").is_err());
+        assert!(EnableState::from_str(" failure ").is_err());
+        assert!(EnableState::from_str(" active ").is_err());
+        assert!(EnableState::from_str(" inactive ").is_err());
+        assert!(EnableState::from_str(" 1 ").is_err());
+        assert!(EnableState::from_str(" 0 ").is_err());
+    }
+    #[test]
+    fn test_enable_state_enum() {
+        let cases = [
+            (EnableState::True, "true"),
+            (EnableState::False, "false"),
+            (EnableState::Empty, ""),
+            (EnableState::Yes, "yes"),
+            (EnableState::No, "no"),
+            (EnableState::On, "on"),
+            (EnableState::Off, "off"),
+            (EnableState::Enabled, "enabled"),
+            (EnableState::Disabled, "disabled"),
+            (EnableState::Ok, "ok"),
+            (EnableState::NotOk, "not_ok"),
+            (EnableState::Success, "success"),
+            (EnableState::Failure, "failure"),
+            (EnableState::Active, "active"),
+            (EnableState::Inactive, "inactive"),
+            (EnableState::One, "1"),
+            (EnableState::Zero, "0"),
+        ];
+        for (variant, string) in cases.iter() {
+            assert_eq!(variant.to_string(), *string);
+        }
+    }
 
     #[test]
-    fn test_constants() {
-        assert_eq!(DEFAULT_DELIMITER, "_");
-        assert_eq!(ENV_PREFIX, "RUSTFS_");
-        assert_eq!(ENV_WORD_DELIMITER, "_");
-        assert_eq!(ENV_WORD_DELIMITER_DASH, "-");
-        assert_eq!(DEFAULT_ENABLE_TRUE, "true");
-        assert_eq!(DEFAULT_ENABLE_FALSE, "false");
-        assert_eq!(DEFAULT_ENABLE_EMPTY, "");
-        assert_eq!(DEFAULT_ENABLE_YES, "yes");
-        assert_eq!(DEFAULT_ENABLE_NO, "no");
-        assert_eq!(DEFAULT_ENABLE_ON, "on");
-        assert_eq!(DEFAULT_ENABLE_OFF, "off");
-        assert_eq!(DEFAULT_ENABLED, "enabled");
-        assert_eq!(DEFAULT_DISABLED, "disabled");
-        assert_eq!(DEFAULT_ENABLE_OK, "ok");
-        assert_eq!(DEFAULT_ENABLE_NOT_OK, "not_ok");
-        assert_eq!(DEFAULT_ENABLE_SUCCESS, "success");
-        assert_eq!(DEFAULT_ENABLE_FAILURE, "failure");
-        assert_eq!(DEFAULT_ENABLE_ACTIVE, "active");
-        assert_eq!(DEFAULT_ENABLE_INACTIVE, "inactive");
-        assert_eq!(DEFAULT_ENABLE_ONE, "1");
-        assert_eq!(DEFAULT_ENABLE_ZERO, "0");
+    fn test_enable_state_enum_from_str() {
+        let cases = [
+            ("true", EnableState::True),
+            ("false", EnableState::False),
+            ("", EnableState::Empty),
+            ("yes", EnableState::Yes),
+            ("no", EnableState::No),
+            ("on", EnableState::On),
+            ("off", EnableState::Off),
+            ("enabled", EnableState::Enabled),
+            ("disabled", EnableState::Disabled),
+            ("ok", EnableState::Ok),
+            ("not_ok", EnableState::NotOk),
+            ("success", EnableState::Success),
+            ("failure", EnableState::Failure),
+            ("active", EnableState::Active),
+            ("inactive", EnableState::Inactive),
+            ("1", EnableState::One),
+            ("0", EnableState::Zero),
+        ];
+        for (string, variant) in cases.iter() {
+            assert_eq!(EnableState::from_str(string).unwrap(), *variant);
+        }
+    }
+
+    #[test]
+    fn test_enable_state_enum_invalid() {
+        assert!(EnableState::from_str("invalid").is_err());
+        assert!(EnableState::from_str(" true ").is_err());
+        assert!(EnableState::from_str(" false ").is_err());
+        assert!(EnableState::from_str(" yes ").is_err());
+        assert!(EnableState::from_str(" no ").is_err());
+        assert!(EnableState::from_str(" on ").is_err());
+        assert!(EnableState::from_str(" off ").is_err());
+        assert!(EnableState::from_str(" enabled ").is_err());
+        assert!(EnableState::from_str(" disabled ").is_err());
+        assert!(EnableState::from_str(" ok ").is_err());
+        assert!(EnableState::from_str(" not_ok ").is_err());
+        assert!(EnableState::from_str(" success ").is_err());
+        assert!(EnableState::from_str(" failure ").is_err());
+        assert!(EnableState::from_str(" active ").is_err());
+        assert!(EnableState::from_str(" inactive ").is_err());
+        assert!(EnableState::from_str(" 1 ").is_err());
+        assert!(EnableState::from_str(" 0 ").is_err());
     }
 }

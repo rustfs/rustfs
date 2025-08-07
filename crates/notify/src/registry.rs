@@ -111,10 +111,10 @@ impl TargetRegistry {
             // 3.1. Instance discovery: Based on the '..._ENABLE_INSTANCEID' format
             let enable_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}_{ENABLE_KEY}_").to_uppercase();
             for (key, value) in &all_env {
-                if value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ONE)
-                    || value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ON)
-                    || value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_TRUE)
-                    || value.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_YES)
+                if value.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
                 {
                     if let Some(id) = key.strip_prefix(&enable_prefix) {
                         if !id.is_empty() {
@@ -202,10 +202,10 @@ impl TargetRegistry {
                 let enabled = merged_config
                     .lookup(ENABLE_KEY)
                     .map(|v| {
-                        v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ONE)
-                            || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ON)
-                            || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_TRUE)
-                            || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_YES)
+                        v.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
                     })
                     .unwrap_or(false);
 

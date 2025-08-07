@@ -198,10 +198,10 @@ pub fn create_multi_cert_resolver(
 pub fn tls_key_log() -> bool {
     env::var(rustfs_config::ENV_TLS_KEYLOG)
         .map(|v| {
-            v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ONE)
-                || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_ON)
-                || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_TRUE)
-                || v.eq_ignore_ascii_case(rustfs_config::DEFAULT_ENABLE_YES)
+            v.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
+                || v.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
+                || v.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
+                || v.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
         })
         .unwrap_or(false)
 }
