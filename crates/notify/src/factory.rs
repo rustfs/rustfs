@@ -14,7 +14,7 @@
 
 use crate::{
     error::TargetError,
-    target::{mqtt::MQTTArgs, webhook::WebhookArgs, Target},
+    target::{Target, mqtt::MQTTArgs, webhook::WebhookArgs},
 };
 use async_trait::async_trait;
 use rumqttc::QoS;

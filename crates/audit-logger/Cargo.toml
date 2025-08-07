@@ -26,6 +26,7 @@ keywords = ["audit", "logging", "file-operations", "system-events", "RustFS"]
 categories = ["web-programming", "development-tools::profiling", "asynchronous", "api-bindings", "development-tools::debugging"]
 
 [dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -33,6 +34,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-core = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
+url = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+figment = { version = "0.10", features = ["json", "env"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,34 @@
+{
+  "console": {
+    "enabled": true
+  },
+  "logger_webhook": {
+    "default": {
+      "enabled": true,
+      "endpoint": "http://localhost:3000/logs",
+      "auth_token": "secret-token-for-logs",
+      "batch_size": 5,
+      "queue_size": 1000,
+      "max_retry": 3,
+      "retry_interval": "2s"
+    }
+  },
+  "audit_webhook": {
+    "splunk": {
+      "enabled": true,
+      "endpoint": "http://localhost:3000/audit",
+      "auth_token": "secret-token-for-audit",
+      "batch_size": 10
+    }
+  },
+  "audit_kafka": {
+    "default": {
+      "enabled": false,
+      "brokers": [
+        "kafka1:9092",
+        "kafka2:9092"
+      ],
+      "topic": "minio-audit-events"
+    }
+  }
+}
