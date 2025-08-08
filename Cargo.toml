@@ -275,7 +275,7 @@ zstd = "0.13.3"
 
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "rustfs-audit-logger"]
+ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "rustfs-audit-logger", "tokio-test"]
 
 [profile.wasm-dev]
 inherits = "dev"
