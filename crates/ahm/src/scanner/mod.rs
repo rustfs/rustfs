@@ -14,6 +14,7 @@
 
 pub mod data_scanner;
 pub mod histogram;
+pub mod lifecycle;
 pub mod metrics;
 
 pub use data_scanner::Scanner;
