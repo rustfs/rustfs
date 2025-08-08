@@ -953,9 +953,8 @@ impl LocalDisk {
             let name = path_join_buf(&[current, entry]);
 
             if !dir_stack.is_empty() {
-                if let Some(pop) = dir_stack.pop() {
+                if let Some(pop) = dir_stack.last().cloned() {
                     if pop < name {
-                        //
                         out.write_obj(&MetaCacheEntry {
                             name: pop.clone(),
                             ..Default::default()
@@ -969,6 +968,7 @@ impl LocalDisk {
                                 error!("scan_dir err {:?}", er);
                             }
                         }
+                        dir_stack.pop();
                     }
                 }
             }

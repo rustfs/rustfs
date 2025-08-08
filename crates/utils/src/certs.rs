@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
-use std::{fs, io};
+use std::{env, fs, io};
 use tracing::{debug, warn};
 
 /// Load public certificate from file.
@@ -192,6 +192,18 @@ pub fn create_multi_cert_resolver(
         cert_resolver: resolver,
         default_cert,
     })
+}
+
+/// Checks if TLS key logging is enabled.
+pub fn tls_key_log() -> bool {
+    env::var(rustfs_config::ENV_TLS_KEYLOG)
+        .map(|v| {
+            v.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
+                || v.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
+                || v.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
+                || v.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -3461,6 +3461,7 @@ impl ObjectIO for SetDisks {
         let now = OffsetDateTime::now_utc();
 
         for (i, fi) in parts_metadatas.iter_mut().enumerate() {
+            fi.metadata = user_defined.clone();
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
                     fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
@@ -3469,7 +3470,6 @@ impl ObjectIO for SetDisks {
                 fi.set_inline_data();
             }
 
-            fi.metadata = user_defined.clone();
             fi.mod_time = Some(now);
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -3837,7 +3837,90 @@ impl StorageAPI for SetDisks {
 
             return Ok(ObjectInfo::default());
         }
-        unimplemented!()
+
+        // Create a single object deletion request
+        let mut vr = FileInfo {
+            name: object.to_string(),
+            version_id: opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+            ..Default::default()
+        };
+
+        // Handle versioning
+        let (suspended, versioned) = (opts.version_suspended, opts.versioned);
+        if opts.version_id.is_none() && (suspended || versioned) {
+            vr.mod_time = Some(OffsetDateTime::now_utc());
+            vr.deleted = true;
+            if versioned {
+                vr.version_id = Some(Uuid::new_v4());
+            }
+        }
+
+        let vers = vec![FileInfoVersions {
+            name: vr.name.clone(),
+            versions: vec![vr.clone()],
+            ..Default::default()
+        }];
+
+        let disks = self.disks.read().await;
+        let disks = disks.clone();
+        let write_quorum = disks.len() / 2 + 1;
+
+        let mut futures = Vec::with_capacity(disks.len());
+        let mut errs = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            let vers = vers.clone();
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.delete_versions(bucket, vers, DeleteOptions::default()).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+
+        for result in results {
+            match result {
+                Ok(disk_errs) => {
+                    // Handle errors from disk operations
+                    for err in disk_errs.iter().flatten() {
+                        warn!("delete_object disk error: {:?}", err);
+                    }
+                    errs.push(None);
+                }
+                Err(e) => {
+                    errs.push(Some(e));
+                }
+            }
+        }
+
+        // Check write quorum
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(to_object_err(err.into(), vec![bucket, object]));
+        }
+
+        // Create result ObjectInfo
+        let result_info = if vr.deleted {
+            ObjectInfo {
+                bucket: bucket.to_string(),
+                name: object.to_string(),
+                delete_marker: true,
+                mod_time: vr.mod_time,
+                version_id: vr.version_id,
+                ..Default::default()
+            }
+        } else {
+            ObjectInfo {
+                bucket: bucket.to_string(),
+                name: object.to_string(),
+                version_id: vr.version_id,
+                ..Default::default()
+            }
+        };
+
+        Ok(result_info)
     }
 
     #[tracing::instrument(skip(self))]

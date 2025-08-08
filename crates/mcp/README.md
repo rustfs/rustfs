@@ -98,7 +98,9 @@ rustfs-mcp --log-level debug --region us-west-2
 ```
 
 ### Integration with chat client
+
 #### Option 1: Using Command Line Arguments
+
 ```json
 {
   "mcpServers": {
@@ -116,6 +118,7 @@ rustfs-mcp --log-level debug --region us-west-2
 ```
 
 #### Option 2: Using Environment Variables
+
 ```json
 {
   "mcpServers": {
@@ -130,26 +133,84 @@ rustfs-mcp --log-level debug --region us-west-2
   }
 }
 ```
+
+### Using MCP with Docker
+
+#### Docker image build
+
+Using MCP with docker will simply the usage of rustfs mcp. Building the docker image with below command:
+
+```
+docker build -f Dockerfile -t rustfs/rustfs-mcp ../../
+```
+
+Alternatively, if you want to build the image from the rustfs codebase root directory,run the command:
+
+```
+docker build -f crates/mcp/Dockerfile -t rustfs/rustfs-mcp .
+```
+
+#### IDE Configuration
+
+Adding the following content in IDE MCP settings:
+
+```
+{
+  "mcpServers": {
+    "rustfs-mcp": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-e",
+        "AWS_ACCESS_KEY_ID",
+        "-e",
+        "AWS_SECRET_ACCESS_KEY",
+        "-e",
+        "AWS_REGION",
+        "-e",
+        "AWS_ENDPOINT_URL",
+        "rustfs/rustfs-mcp"
+      ],
+      "env": {
+        "AWS_ACCESS_KEY_ID": "rustfs_access_key",
+        "AWS_SECRET_ACCESS_KEY": "rustfs_secret_key",
+        "AWS_REGION": "cn-east-1",
+        "AWS_ENDPOINT_URL": "rustfs_instance_url"
+      }
+    }
+  }
+}
+```
+
+If success, MCP configure page will show the [available tools](#️-available-tools).
+
 ## 🛠️ Available Tools
 
 The MCP server exposes the following tools that AI assistants can use:
 
 ### `list_buckets`
+
 List all S3 buckets accessible with the configured credentials.
 
 **Parameters:** None
 
 ### `list_objects`
+
 List objects in an S3 bucket with optional prefix filtering.
 
 **Parameters:**
+
 - `bucket_name` (string): Name of the S3 bucket
 - `prefix` (string, optional): Prefix to filter objects
 
 ### `upload_file`
+
 Upload a local file to S3 with automatic MIME type detection.
 
 **Parameters:**
+
 - `local_file_path` (string): Path to the local file
 - `bucket_name` (string): Target S3 bucket
 - `object_key` (string): S3 object key (destination path)
@@ -158,9 +219,11 @@ Upload a local file to S3 with automatic MIME type detection.
 - `cache_control` (string, optional): Cache control header
 
 ### `get_object`
+
 Retrieve an object from S3 with two operation modes: read content directly or download to a file.
 
 **Parameters:**
+
 - `bucket_name` (string): Source S3 bucket
 - `object_key` (string): S3 object key
 - `version_id` (string, optional): Version ID for versioned objects

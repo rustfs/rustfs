@@ -53,7 +53,6 @@ use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
 // use serde_json::to_vec;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -65,6 +64,7 @@ use tokio::sync::mpsc::{self};
 use tokio::time::interval;
 use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::debug;
 use tracing::{error, info, warn};
 // use url::UrlQuery;
 
@@ -81,6 +81,7 @@ pub mod trace;
 pub mod user;
 use urlencoding::decode;
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {

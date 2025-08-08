@@ -17,7 +17,7 @@ pub mod fileinfo;
 mod filemeta;
 mod filemeta_inline;
 pub mod headers;
-mod metacache;
+pub mod metacache;
 
 pub mod test_data;
 
