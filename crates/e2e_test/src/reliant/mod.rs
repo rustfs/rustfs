@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod lifecycle;
 mod lock;
 mod node_interact_test;
 mod sql;

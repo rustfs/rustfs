@@ -14,7 +14,6 @@
 
 // Ensure the correct path for parse_license is imported
 use crate::admin;
-// use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
 use crate::auth::IAMAuth;
 use crate::config;
 use crate::server::hybrid::hybrid;
@@ -43,8 +42,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
@@ -62,9 +59,6 @@ pub async fn start_http_server(
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
-
-    // The listening address and port are obtained from the parameters
-    // let listener = TcpListener::bind(server_address.clone()).await?;
 
     // The listening address and port are obtained from the parameters
     let listener = {
@@ -172,6 +166,7 @@ pub async fn start_http_server(
     tokio::spawn(async move {
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
+            use tokio::signal::unix::{SignalKind, signal};
             // Unix platform specific code
             let sigterm_inner = signal(SignalKind::terminate()).expect("Failed to create SIGTERM signal handler");
             let sigint_inner = signal(SignalKind::interrupt()).expect("Failed to create SIGINT signal handler");
@@ -292,32 +287,55 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 
     debug!("Found TLS directory, checking for certificates");
 
-    // 1. Try to load all certificates from the directory (multi-cert support)
+    // Make sure to use a modern encryption suite
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
         if !cert_key_pairs.is_empty() {
-            debug!("Found {} certificates, creating multi-cert resolver", cert_key_pairs.len());
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
+
+            // Create an SNI-enabled certificate resolver
+            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+
+            // Configure the server to enable SNI support
             let mut server_config = ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(Arc::new(rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?));
+                .with_cert_resolver(Arc::new(resolver));
+
+            // Configure ALPN protocol priority
             server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+
+            // Log SNI requests
+            if rustfs_utils::tls_key_log() {
+                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            }
+
             return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
         }
     }
 
-    // 2. Fallback to legacy single certificate mode
+    // 2. Revert to the traditional single-certificate mode
     let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
     let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
     if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
         debug!("Found legacy single TLS certificate, starting with HTTPS");
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
         let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+
         let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+
+        // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
+
         return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
     }
 
@@ -398,6 +416,10 @@ fn process_connection(
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
         if let Some(acceptor) = tls_acceptor {
             debug!("TLS handshake start");
+            let peer_addr = socket
+                .peer_addr()
+                .ok()
+                .map_or_else(|| "unknown".to_string(), |addr| addr.to_string());
             match acceptor.accept(socket).await {
                 Ok(tls_socket) => {
                     debug!("TLS handshake successful");
@@ -408,8 +430,44 @@ fn process_connection(
                     }
                 }
                 Err(err) => {
-                    error!(?err, "TLS handshake failed");
-                    return; // Failed to end the task directly
+                    // Detailed analysis of the reasons why the TLS handshake fails
+                    let err_str = err.to_string();
+                    let mut key_failure_type_str: &str = "UNKNOWN";
+                    if err_str.contains("unexpected EOF") || err_str.contains("handshake eof") {
+                        warn!(peer_addr = %peer_addr, "TLS handshake failed. If this client needs HTTP, it should connect to the HTTP port instead");
+                        key_failure_type_str = "UNEXPECTED_EOF";
+                    } else if err_str.contains("protocol version") {
+                        error!(
+                            peer_addr = %peer_addr,
+                            "TLS handshake failed due to protocol version mismatch: {}", err
+                        );
+                        key_failure_type_str = "PROTOCOL_VERSION";
+                    } else if err_str.contains("certificate") {
+                        error!(
+                            peer_addr = %peer_addr,
+                            "TLS handshake failed due to certificate issues: {}", err
+                        );
+                        key_failure_type_str = "CERTIFICATE";
+                    } else {
+                        error!(
+                            peer_addr = %peer_addr,
+                            "TLS handshake failed: {}", err
+                        );
+                    }
+                    info!(
+                        counter.rustfs_tls_handshake_failures = 1_u64,
+                        key_failure_type = key_failure_type_str,
+                        "TLS handshake failure metric"
+                    );
+                    // Record detailed diagnostic information
+                    debug!(
+                        peer_addr = %peer_addr,
+                        error_type = %std::any::type_name_of_val(&err),
+                        error_details = %err,
+                        "TLS handshake failure details"
+                    );
+
+                    return;
                 }
             }
             debug!("TLS handshake success");

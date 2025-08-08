@@ -30,15 +30,16 @@ use tracing::{debug, error, info, warn};
 
 use super::metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics};
 use crate::heal::HealManager;
+use crate::scanner::lifecycle::ScannerItem;
 use crate::{
     HealRequest,
     error::{Error, Result},
     get_ahm_services_cancel_token,
 };
-use rustfs_common::{
-    data_usage::DataUsageInfo,
-    metrics::{Metric, Metrics, globalMetrics},
-};
+
+use rustfs_common::data_usage::DataUsageInfo;
+use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
+use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 
@@ -290,7 +291,7 @@ impl Scanner {
 
     /// Get global metrics from common crate
     pub async fn get_global_metrics(&self) -> rustfs_madmin::metrics::ScannerMetrics {
-        globalMetrics.report().await
+        (*globalMetrics).report().await
     }
 
     /// Perform a single scan cycle
@@ -317,7 +318,7 @@ impl Scanner {
             cycle_completed: vec![chrono::Utc::now()],
             started: chrono::Utc::now(),
         };
-        globalMetrics.set_cycle(Some(cycle_info)).await;
+        (*globalMetrics).set_cycle(Some(cycle_info)).await;
 
         self.metrics.set_current_cycle(self.state.read().await.current_cycle);
         self.metrics.increment_total_cycles();
@@ -1160,6 +1161,19 @@ impl Scanner {
     /// This method collects all objects from a disk for a specific bucket.
     /// It returns a map of object names to their metadata for later analysis.
     async fn scan_volume(&self, disk: &DiskStore, bucket: &str) -> Result<HashMap<String, rustfs_filemeta::FileMeta>> {
+        let ecstore = match rustfs_ecstore::new_object_layer_fn() {
+            Some(ecstore) => ecstore,
+            None => {
+                error!("ECStore not available");
+                return Err(Error::Other("ECStore not available".to_string()));
+            }
+        };
+        let bucket_info = ecstore.get_bucket_info(bucket, &Default::default()).await.ok();
+        let versioning_config = bucket_info.map(|bi| Arc::new(VersioningConfig { enabled: bi.versioning }));
+        let lifecycle_config = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket)
+            .await
+            .ok()
+            .map(|(c, _)| Arc::new(c));
         // Start global metrics collection for volume scan
         let stop_fn = Metrics::time(Metric::ScanObject);
 
@@ -1247,6 +1261,15 @@ impl Scanner {
                             }
                         }
                     } else {
+                        // Apply lifecycle actions
+                        if let Some(lifecycle_config) = &lifecycle_config {
+                            let mut scanner_item =
+                                ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
+                            if let Err(e) = scanner_item.apply_actions(&entry.name, entry.clone()).await {
+                                error!("Failed to apply lifecycle actions for {}/{}: {}", bucket, entry.name, e);
+                            }
+                        }
+
                         // Store object metadata for later analysis
                         object_metadata.insert(entry.name.clone(), file_meta.clone());
                     }

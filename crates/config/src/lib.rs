@@ -18,8 +18,8 @@ pub mod constants;
 pub use constants::app::*;
 #[cfg(feature = "constants")]
 pub use constants::env::*;
-#[cfg(feature = "audit")]
-pub mod audit;
+#[cfg(feature = "constants")]
+pub use constants::tls::*;
 #[cfg(feature = "notify")]
 pub mod notify;
 #[cfg(feature = "observability")]
