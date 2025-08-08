@@ -16,7 +16,7 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -36,7 +36,7 @@ on:
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
   pull_request:
-    branches: [main]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"

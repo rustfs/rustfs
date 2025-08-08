@@ -24,6 +24,7 @@ pub const SHA_1_HEADER_NAME: &str = "x-amz-checksum-sha1";
 pub const SHA_256_HEADER_NAME: &str = "x-amz-checksum-sha256";
 pub const CRC_64_NVME_HEADER_NAME: &str = "x-amz-checksum-crc64nvme";
 
+#[allow(dead_code)]
 pub(crate) static MD5_HEADER_NAME: &str = "content-md5";
 
 pub const CHECKSUM_ALGORITHMS_IN_PRIORITY_ORDER: [&str; 5] =

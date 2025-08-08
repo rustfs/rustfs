@@ -54,8 +54,8 @@ pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRet
     }
     if let Some(till_str) = till_str {
         let t = OffsetDateTime::parse(till_str, &format_description::well_known::Iso8601::DEFAULT);
-        if t.is_err() {
-            retain_until_date = Date::from(t.expect("err")); //TODO: utc
+        if let Ok(parsed_time) = t {
+            retain_until_date = Date::from(parsed_time);
         }
     }
     ObjectLockRetention {
