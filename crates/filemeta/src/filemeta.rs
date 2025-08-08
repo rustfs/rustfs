@@ -2363,7 +2363,7 @@ mod test {
         assert!(stats.delete_markers > 0, "应该有删除标记");
 
         // 测试版本合并功能
-        let merged = merge_file_meta_versions(1, false, 0, &[fm.versions.clone()]);
+        let merged = merge_file_meta_versions(1, false, 0, std::slice::from_ref(&fm.versions));
         assert!(!merged.is_empty(), "合并后应该有版本");
     }
 

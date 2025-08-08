@@ -139,8 +139,8 @@ async fn init_format_erasure(
             let idx = i * set_drive_count + j;
             let mut newfm = fm.clone();
             newfm.erasure.this = fm.erasure.sets[i][j];
-            if deployment_id.is_some() {
-                newfm.id = deployment_id.unwrap();
+            if let Some(id) = deployment_id {
+                newfm.id = id;
             }
 
             fms[idx] = Some(newfm);
