@@ -21,7 +21,7 @@ use crate::error::ApiError;
 use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;
-use crate::storage::options::{extract_metadata_from_mime, get_opts};
+use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_opts};
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
@@ -1412,7 +1412,7 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
-        extract_metadata_from_mime(&req.headers, &mut metadata);
+        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, Some(&key));
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
