@@ -133,8 +133,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
             Ok(info) => Ok(Some(info)),
             Err(e) => {
-                error!("Failed to get object meta: {}/{} - {}", bucket, object, e);
-                Err(Error::other(e))
+                // Map ObjectNotFound to None to align with Option return type
+                if matches!(e, rustfs_ecstore::error::StorageError::ObjectNotFound(_, _)) {
+                    debug!("Object meta not found: {}/{}", bucket, object);
+                    Ok(None)
+                } else {
+                    error!("Failed to get object meta: {}/{} - {}", bucket, object, e);
+                    Err(Error::other(e))
+                }
             }
         }
     }
@@ -154,8 +160,13 @@ impl HealStorageAPI for ECStoreHealStorage {
                 }
             },
             Err(e) => {
-                error!("Failed to get object: {}/{} - {}", bucket, object, e);
-                Err(Error::other(e))
+                if matches!(e, rustfs_ecstore::error::StorageError::ObjectNotFound(_, _)) {
+                    debug!("Object data not found: {}/{}", bucket, object);
+                    Ok(None)
+                } else {
+                    error!("Failed to get object: {}/{} - {}", bucket, object, e);
+                    Err(Error::other(e))
+                }
             }
         }
     }
