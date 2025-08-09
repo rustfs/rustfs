@@ -32,29 +32,20 @@ struct UnlockRuntime {
 
 // Global unlock runtime with background worker
 static UNLOCK_RUNTIME: Lazy<UnlockRuntime> = Lazy::new(|| {
-    // Buffered channel to avoid blocking in Drop
-    let (tx, mut rx) = mpsc::channel::<UnlockJob>(1024);
+    // Larger buffer to reduce contention during bursts
+    let (tx, mut rx) = mpsc::channel::<UnlockJob>(8192);
 
     // Spawn background worker when first used; assumes a Tokio runtime is available
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            // Best-effort release across clients; success if any succeeds
+            // Best-effort release across clients; try all, success if any succeeds
             let mut any_ok = false;
             let lock_id = job.lock_id.clone();
-            let futures = job
-                .clients
-                .into_iter()
-                .map(|client| {
-                    let id = lock_id.clone();
-                    async move { client.release(&id).await.unwrap_or(false) }
-                })
-                .collect::<Vec<_>>();
-
-            let results = futures::future::join_all(futures).await;
-            if results.into_iter().any(|s| s) {
-                any_ok = true;
+            for client in job.clients.into_iter() {
+                if client.release(&lock_id).await.unwrap_or(false) {
+                    any_ok = true;
+                }
             }
-
             if !any_ok {
                 tracing::warn!("LockGuard background release failed for {}", lock_id);
             } else {
