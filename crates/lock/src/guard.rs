@@ -106,16 +106,15 @@ impl Drop for LockGuard {
             tracing::warn!("LockGuard channel send failed ({}), spawning fallback unlock task for {}", err, lock_id);
 
             // If runtime is not available, this will panic; but in RustFS we are inside Tokio contexts.
-            let _ = tokio::spawn(async move {
-                let futures = clients
-                    .into_iter()
-                    .map(|client| {
-                        let id = lock_id.clone();
-                        async move { client.release(&id).await.unwrap_or(false) }
-                    })
-                    .collect::<Vec<_>>();
-                let _ = futures::future::join_all(futures).await;
+            let handle = tokio::spawn(async move {
+                let futures_iter = clients.into_iter().map(|client| {
+                    let id = lock_id.clone();
+                    async move { client.release(&id).await.unwrap_or(false) }
+                });
+                let _ = futures::future::join_all(futures_iter).await;
             });
+            // Explicitly drop the JoinHandle to acknowledge detaching the task.
+            std::mem::drop(handle);
         }
     }
 }
