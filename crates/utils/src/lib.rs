@@ -22,6 +22,7 @@ pub mod net;
 #[cfg(feature = "net")]
 pub use net::*;
 
+#[cfg(all(feature = "net", feature = "io"))]
 pub mod retry;
 
 #[cfg(feature = "io")]
