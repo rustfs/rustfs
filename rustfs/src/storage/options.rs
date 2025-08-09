@@ -186,6 +186,15 @@ pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, Str
 
 /// Extracts metadata from headers and returns it as a HashMap.
 pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &mut HashMap<String, String>) {
+    extract_metadata_from_mime_with_object_name(headers, metadata, None);
+}
+
+/// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
+pub fn extract_metadata_from_mime_with_object_name(
+    headers: &HeaderMap<HeaderValue>,
+    metadata: &mut HashMap<String, String>,
+    object_name: Option<&str>,
+) {
     for (k, v) in headers.iter() {
         if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
             if key.is_empty() {
@@ -210,8 +219,40 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
     }
 
     if !metadata.contains_key("content-type") {
-        metadata.insert("content-type".to_owned(), "binary/octet-stream".to_owned());
+        let default_content_type = if let Some(obj_name) = object_name {
+            detect_content_type_from_object_name(obj_name)
+        } else {
+            "binary/octet-stream".to_owned()
+        };
+        metadata.insert("content-type".to_owned(), default_content_type);
     }
+}
+
+/// Detects content type from object name based on file extension.
+pub(crate) fn detect_content_type_from_object_name(object_name: &str) -> String {
+    let lower_name = object_name.to_lowercase();
+
+    // Check for Parquet files specifically
+    if lower_name.ends_with(".parquet") {
+        return "application/vnd.apache.parquet".to_owned();
+    }
+
+    // Special handling for other data formats that mime_guess doesn't know
+    if lower_name.ends_with(".avro") {
+        return "application/avro".to_owned();
+    }
+    if lower_name.ends_with(".orc") {
+        return "application/orc".to_owned();
+    }
+    if lower_name.ends_with(".feather") {
+        return "application/feather".to_owned();
+    }
+    if lower_name.ends_with(".arrow") {
+        return "application/arrow".to_owned();
+    }
+
+    // Use mime_guess for standard file types
+    mime_guess::from_path(object_name).first_or_octet_stream().to_string()
 }
 
 /// List of supported headers.
@@ -645,5 +686,81 @@ mod tests {
         assert_eq!(metadata.get("source"), Some(&"upload".to_string()));
         assert_eq!(metadata.get("cache-control"), Some(&"public".to_string()));
         assert!(!metadata.contains_key("authorization"));
+    }
+
+    #[test]
+    fn test_extract_metadata_from_mime_with_parquet_object_name() {
+        let headers = HeaderMap::new();
+        let mut metadata = HashMap::new();
+
+        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("data/test.parquet"));
+
+        assert_eq!(metadata.get("content-type"), Some(&"application/vnd.apache.parquet".to_string()));
+    }
+
+    #[test]
+    fn test_extract_metadata_from_mime_with_various_data_formats() {
+        let test_cases = vec![
+            ("data.parquet", "application/vnd.apache.parquet"),
+            ("data.PARQUET", "application/vnd.apache.parquet"), // 测试大小写不敏感
+            ("file.avro", "application/avro"),
+            ("file.orc", "application/orc"),
+            ("file.feather", "application/feather"),
+            ("file.arrow", "application/arrow"),
+            ("file.json", "application/json"),
+            ("file.csv", "text/csv"),
+            ("file.txt", "text/plain"),
+            ("file.unknownext", "application/octet-stream"), // 使用真正未知的扩展名
+        ];
+
+        for (filename, expected_content_type) in test_cases {
+            let headers = HeaderMap::new();
+            let mut metadata = HashMap::new();
+
+            extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some(filename));
+
+            assert_eq!(
+                metadata.get("content-type"),
+                Some(&expected_content_type.to_string()),
+                "Failed for filename: {}",
+                filename
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_metadata_from_mime_with_existing_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("custom/type"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("test.parquet"));
+
+        // 应该保留现有的 content-type，不被覆盖
+        assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
+    }
+
+    #[test]
+    fn test_detect_content_type_from_object_name() {
+        // 测试 Parquet 文件（我们的自定义处理）
+        assert_eq!(detect_content_type_from_object_name("test.parquet"), "application/vnd.apache.parquet");
+        assert_eq!(detect_content_type_from_object_name("TEST.PARQUET"), "application/vnd.apache.parquet");
+
+        // 测试其他自定义数据格式
+        assert_eq!(detect_content_type_from_object_name("data.avro"), "application/avro");
+        assert_eq!(detect_content_type_from_object_name("data.orc"), "application/orc");
+        assert_eq!(detect_content_type_from_object_name("data.feather"), "application/feather");
+        assert_eq!(detect_content_type_from_object_name("data.arrow"), "application/arrow");
+
+        // 测试标准格式（mime_guess 处理）
+        assert_eq!(detect_content_type_from_object_name("data.json"), "application/json");
+        assert_eq!(detect_content_type_from_object_name("data.csv"), "text/csv");
+        assert_eq!(detect_content_type_from_object_name("data.txt"), "text/plain");
+
+        // 测试真正未知的格式（使用一个 mime_guess 不认识的扩展名）
+        assert_eq!(detect_content_type_from_object_name("unknown.unknownext"), "application/octet-stream");
+
+        // 测试没有扩展名的文件
+        assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
     }
 }
