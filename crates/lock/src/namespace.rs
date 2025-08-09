@@ -19,6 +19,7 @@ use std::time::Duration;
 use crate::{
     client::LockClient,
     error::{LockError, Result},
+    guard::LockGuard,
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
 
@@ -88,6 +89,34 @@ impl NamespaceLock {
 
         // Two-phase commit for distributed lock acquisition
         self.acquire_lock_with_2pc(request).await
+    }
+
+    /// Acquire a lock and return a RAII guard that will release asynchronously on Drop.
+    /// This is a thin wrapper around `acquire_lock` and will only create a guard when acquisition succeeds.
+    pub async fn acquire_guard(&self, request: &LockRequest) -> Result<Option<LockGuard>> {
+        let resp = self.acquire_lock(request).await?;
+        if resp.success {
+            let guard = LockGuard::new(LockId::new_deterministic(&request.resource), self.clients.clone());
+            Ok(Some(guard))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Convenience: acquire exclusive lock as a guard
+    pub async fn lock_guard(&self, resource: &str, owner: &str, timeout: Duration, ttl: Duration) -> Result<Option<LockGuard>> {
+        let req = LockRequest::new(self.get_resource_key(resource), LockType::Exclusive, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl);
+        self.acquire_guard(&req).await
+    }
+
+    /// Convenience: acquire shared lock as a guard
+    pub async fn rlock_guard(&self, resource: &str, owner: &str, timeout: Duration, ttl: Duration) -> Result<Option<LockGuard>> {
+        let req = LockRequest::new(self.get_resource_key(resource), LockType::Shared, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl);
+        self.acquire_guard(&req).await
     }
 
     /// Two-phase commit lock acquisition: all nodes must succeed or all fail
@@ -418,6 +447,33 @@ mod tests {
         // Test batch unlock
         let result = ns_lock.unlock_batch(&resources, "test_owner").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_guard_acquire_and_drop_release() {
+        let ns_lock = NamespaceLock::with_client(Arc::new(LocalClient::new()));
+
+        // Acquire guard
+        let guard = ns_lock
+            .lock_guard("guard-resource", "owner", Duration::from_millis(100), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(guard.is_some());
+        let lock_id = guard.as_ref().unwrap().lock_id().clone();
+
+        // Drop guard to trigger background release
+        drop(guard);
+
+        // Give background worker a moment to process
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Re-acquire should succeed (previous lock released)
+        let req = LockRequest::new(&lock_id.resource, LockType::Exclusive, "owner").with_ttl(Duration::from_secs(2));
+        let resp = ns_lock.acquire_lock(&req).await.unwrap();
+        assert!(resp.success);
+
+        // Cleanup
+        let _ = ns_lock.release_lock(&LockId::new_deterministic(&lock_id.resource)).await;
     }
 
     #[tokio::test]

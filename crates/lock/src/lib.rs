@@ -27,6 +27,7 @@ pub mod local;
 
 // Core Modules
 pub mod error;
+pub mod guard;
 pub mod types;
 
 // ============================================================================
@@ -39,6 +40,7 @@ pub use crate::{
     client::{LockClient, local::LocalClient, remote::RemoteClient},
     // Error types
     error::{LockError, Result},
+    guard::LockGuard,
     local::LocalLockMap,
     // Main components
     namespace::{NamespaceLock, NamespaceLockManager},
