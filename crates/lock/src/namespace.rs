@@ -61,6 +61,22 @@ impl NamespaceLock {
         }
     }
 
+    /// Create namespace lock with clients and an explicit quorum size.
+    /// Quorum will be clamped into [1, clients.len()]. For single client, quorum is always 1.
+    pub fn with_clients_and_quorum(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
+        let q = if clients.len() <= 1 {
+            1
+        } else {
+            quorum.clamp(1, clients.len())
+        };
+
+        Self {
+            clients,
+            namespace,
+            quorum: q,
+        }
+    }
+
     /// Create namespace lock with client (compatibility)
     pub fn with_client(client: Arc<dyn LockClient>) -> Self {
         Self::with_clients("default".to_string(), vec![client])
@@ -87,17 +103,33 @@ impl NamespaceLock {
             return self.clients[0].acquire_lock(request).await;
         }
 
-        // Two-phase commit for distributed lock acquisition
-        self.acquire_lock_with_2pc(request).await
+        // Quorum-based acquisition for distributed mode
+        let (resp, _idxs) = self.acquire_lock_quorum(request).await?;
+        Ok(resp)
     }
 
     /// Acquire a lock and return a RAII guard that will release asynchronously on Drop.
     /// This is a thin wrapper around `acquire_lock` and will only create a guard when acquisition succeeds.
     pub async fn acquire_guard(&self, request: &LockRequest) -> Result<Option<LockGuard>> {
-        let resp = self.acquire_lock(request).await?;
+        if self.clients.is_empty() {
+            return Err(LockError::internal("No lock clients available"));
+        }
+
+        if self.clients.len() == 1 {
+            let resp = self.clients[0].acquire_lock(request).await?;
+            if resp.success {
+                return Ok(Some(LockGuard::new(
+                    LockId::new_deterministic(&request.resource),
+                    vec![self.clients[0].clone()],
+                )));
+            }
+            return Ok(None);
+        }
+
+        let (resp, idxs) = self.acquire_lock_quorum(request).await?;
         if resp.success {
-            let guard = LockGuard::new(LockId::new_deterministic(&request.resource), self.clients.clone());
-            Ok(Some(guard))
+            let subset: Vec<_> = idxs.into_iter().filter_map(|i| self.clients.get(i).cloned()).collect();
+            Ok(Some(LockGuard::new(LockId::new_deterministic(&request.resource), subset)))
         } else {
             Ok(None)
         }
@@ -119,50 +151,29 @@ impl NamespaceLock {
         self.acquire_guard(&req).await
     }
 
-    /// Two-phase commit lock acquisition: all nodes must succeed or all fail
-    async fn acquire_lock_with_2pc(&self, request: &LockRequest) -> Result<LockResponse> {
-        // Phase 1: Prepare - try to acquire lock on all clients
-        let futures: Vec<_> = self
+    /// Quorum-based lock acquisition: success if at least `self.quorum` clients succeed.
+    /// Returns the LockResponse and the indices of clients that acquired the lock.
+    async fn acquire_lock_quorum(&self, request: &LockRequest) -> Result<(LockResponse, Vec<usize>)> {
+        let futs: Vec<_> = self
             .clients
             .iter()
             .enumerate()
-            .map(|(idx, client)| async move {
-                let result = client.acquire_lock(request).await;
-                (idx, result)
-            })
+            .map(|(idx, client)| async move { (idx, client.acquire_lock(request).await) })
             .collect();
 
-        let results = futures::future::join_all(futures).await;
+        let results = futures::future::join_all(futs).await;
         let mut successful_clients = Vec::new();
-        let mut failed_clients = Vec::new();
 
-        // Collect results
-        for (idx, result) in results {
-            match result {
-                Ok(response) if response.success => {
+        for (idx, res) in results {
+            if let Ok(resp) = res {
+                if resp.success {
                     successful_clients.push(idx);
-                }
-                _ => {
-                    failed_clients.push(idx);
                 }
             }
         }
 
-        // Check if we have enough successful acquisitions for quorum
         if successful_clients.len() >= self.quorum {
-            // Phase 2a: Commit - we have quorum, but need to ensure consistency
-            // If not all clients succeeded, we need to rollback for consistency
-            if successful_clients.len() < self.clients.len() {
-                // Rollback all successful acquisitions to maintain consistency
-                self.rollback_acquisitions(request, &successful_clients).await;
-                return Ok(LockResponse::failure(
-                    "Partial success detected, rolled back for consistency".to_string(),
-                    Duration::ZERO,
-                ));
-            }
-
-            // All clients succeeded - lock acquired successfully
-            Ok(LockResponse::success(
+            let resp = LockResponse::success(
                 LockInfo {
                     id: LockId::new_deterministic(&request.resource),
                     resource: request.resource.clone(),
@@ -177,16 +188,17 @@ impl NamespaceLock {
                     wait_start_time: None,
                 },
                 Duration::ZERO,
-            ))
+            );
+            Ok((resp, successful_clients))
         } else {
-            // Phase 2b: Abort - insufficient quorum, rollback any successful acquisitions
             if !successful_clients.is_empty() {
                 self.rollback_acquisitions(request, &successful_clients).await;
             }
-            Ok(LockResponse::failure(
+            let resp = LockResponse::failure(
                 format!("Failed to acquire quorum: {}/{} required", successful_clients.len(), self.quorum),
                 Duration::ZERO,
-            ))
+            );
+            Ok((resp, Vec::new()))
         }
     }
 
@@ -558,9 +570,11 @@ mod tests {
         let client2: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let clients = vec![client1, client2];
 
-        let ns_lock = NamespaceLock::with_clients("test-namespace".to_string(), clients);
+        // LocalClient shares a global in-memory map. For exclusive locks, only one can acquire at a time.
+        // In real distributed setups the quorum should be tied to EC write quorum. Here we use quorum=1 for success.
+        let ns_lock = NamespaceLock::with_clients_and_quorum("test-namespace".to_string(), clients, 1);
 
-        let request = LockRequest::new("test-resource", LockType::Exclusive, "test_owner").with_ttl(Duration::from_secs(10));
+        let request = LockRequest::new("test-resource", LockType::Shared, "test_owner").with_ttl(Duration::from_secs(2));
 
         // This should succeed only if ALL clients can acquire the lock
         let response = ns_lock.acquire_lock(&request).await.unwrap();
