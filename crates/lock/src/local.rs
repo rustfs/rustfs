@@ -97,13 +97,7 @@ impl LocalLockMap {
                         guard.remove(&k);
                     }
                     let wait = if due.is_empty() {
-                        next_deadline.and_then(|dl| {
-                            if dl > now {
-                                Some(dl - now)
-                            } else {
-                                Some(Duration::from_millis(0))
-                            }
-                        })
+                        next_deadline.map(|dl| if dl > now { dl - now } else { Duration::from_millis(0) })
                     } else {
                         Some(Duration::from_millis(0))
                     };
