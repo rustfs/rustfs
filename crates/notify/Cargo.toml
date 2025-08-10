@@ -26,7 +26,7 @@ categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["notify"] }
+rustfs-config = { workspace = true, features = ["notify", "constants"] }
 rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path", "sys"] }
 async-trait = { workspace = true }
