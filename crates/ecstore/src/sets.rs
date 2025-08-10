@@ -882,11 +882,15 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object)
-            .verify_object_integrity(bucket, object, opts)
-            .await
+        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
+        let mut reader = gor.stream;
+
+        // Stream data to sink instead of reading all into memory to prevent OOM
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+
+        Ok(())
     }
 }
 
