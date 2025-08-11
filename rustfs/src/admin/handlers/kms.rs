@@ -18,6 +18,10 @@ use serde::Serialize;
 use tracing::{error, info, warn};
 
 use super::super::router::Operation;
+use base64::Engine;
+use rustfs_ecstore::global::new_object_layer_fn;
+use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::store_api::{BucketOptions, ObjectOptions, StorageAPI};
 
 // ==================== Request/Response Structures ====================
 
@@ -97,6 +101,62 @@ pub struct ConfigureKmsResponse {
     pub success: bool,
     pub message: String,
     pub kms_type: String,
+}
+
+/// Rewrap request
+#[derive(serde::Deserialize)]
+pub struct RewrapRequest {
+    /// Base64 of ciphertext with RustFS header
+    pub ciphertext_b64: String,
+    /// Optional JSON map for encryption context
+    pub context: Option<StdHashMap<String, String>>,
+}
+
+/// Rewrap response
+#[derive(serde::Serialize)]
+pub struct RewrapResponse {
+    pub ciphertext_b64: String,
+}
+
+/// Batch rewrap request for a bucket/prefix
+#[derive(serde::Deserialize, Default)]
+pub struct BatchRewrapRequest {
+    /// Bucket to scan
+    pub bucket: String,
+    /// Optional prefix filter
+    pub prefix: Option<String>,
+    /// If false, use delimiter "/" to only list one level; default true (recursive)
+    #[serde(default = "default_true")]
+    pub recursive: bool,
+    /// Page size for listing (1..=1000). Default 1000
+    pub page_size: Option<i32>,
+    /// Maximum number of objects to process in this call. If None, process all
+    pub max_objects: Option<usize>,
+    /// If true, don't modify anything, only count what would be rewrapped
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct BatchRewrapResultItem {
+    pub key: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+/// Batch rewrap summary response
+#[derive(serde::Serialize, Default)]
+pub struct BatchRewrapResponse {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub processed: usize,
+    pub rewrapped: usize,
+    pub skipped: usize,
+    pub errors: Vec<BatchRewrapResultItem>,
 }
 
 // ==================== Error Handling ====================
@@ -395,6 +455,10 @@ impl Operation for CreateKmsKey {
             .or_else(|| query_params.get("key"))
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("rustfs-key-{}", uuid::Uuid::new_v4()));
+        let algorithm = query_params
+            .get("algorithm")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "AES-256".to_string());
 
         // Get global KMS instance
         let kms = match rustfs_kms::get_global_kms() {
@@ -413,7 +477,7 @@ impl Operation for CreateKmsKey {
         };
 
         // Create the key
-        match kms.create_key(&key_name, "AES-256", None).await {
+        match kms.create_key(&key_name, &algorithm, None).await {
             Ok(key_info) => {
                 info!("Successfully created KMS key: {}", key_info.key_id);
                 let response = CreateKeyResponse {
@@ -547,6 +611,66 @@ impl Operation for ListKmsKeys {
     }
 }
 
+/// Rotate a KMS key
+/// POST /rustfs/admin/v3/kms/key/rotate
+pub struct RotateKmsKey;
+
+#[async_trait::async_trait]
+impl Operation for RotateKmsKey {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        info!("Processing KMS key rotate request");
+
+        // Extract key name from query parameters
+        let query_params = kms_extract_query_params(req.uri.query().unwrap_or(""));
+        let key_name = match query_params.get("keyName").or_else(|| query_params.get("key")) {
+            Some(name) => name.to_string(),
+            None => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "MissingParameter".to_string(),
+                        message: "Key name is required".to_string(),
+                        description: "keyName parameter must be provided".to_string(),
+                    },
+                ));
+            }
+        };
+
+        // Get global KMS instance
+        let kms = match rustfs_kms::get_global_kms() {
+            Some(kms) => kms,
+            None => {
+                return Ok(kms_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KmsErrorResponse {
+                        code: "KMSNotConfigured".to_string(),
+                        message: "KMS is not configured".to_string(),
+                        description: "Key Management Service is not available".to_string(),
+                    },
+                ));
+            }
+        };
+
+        match kms.rotate_key(&key_name, None).await {
+            Ok(key_info) => {
+                info!("Successfully rotated KMS key: {}", key_name);
+                let response = KeyStatusResponse {
+                    key_id: key_info.key_id.clone(),
+                    key_name: key_info.key_id.clone(),
+                    status: format!("{:?}", key_info.status),
+                    created_at: format_system_time(key_info.created_at),
+                    algorithm: key_info.algorithm.clone(),
+                };
+                Ok(kms_success_response(response))
+            }
+            Err(err) => {
+                error!("Failed to rotate KMS key '{}': {}", key_name, err);
+                Ok(kms_error_response(StatusCode::BAD_REQUEST, KmsErrorResponse::from(err)))
+            }
+        }
+    }
+}
+
 /// Enable KMS key
 /// PUT /rustfs/admin/v3/kms/key/enable
 pub struct EnableKmsKey;
@@ -636,6 +760,19 @@ impl Operation for DisableKmsKey {
             }
         };
 
+        // 对 Vault 后端返回更清晰的提示
+        let backend = kms.backend_info().backend_type;
+        if backend.eq_ignore_ascii_case("vault") {
+            return Ok(kms_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                KmsErrorResponse {
+                    code: "OperationNotSupported".to_string(),
+                    message: "Disable is not supported by Vault transit engine".to_string(),
+                    description: "Vault Transit 不支持显式禁用密钥，如需阻止使用请调整策略或移除密钥".to_string(),
+                },
+            ));
+        }
+
         match kms.disable_key(&key_name, None).await {
             Ok(_) => {
                 info!("Successfully disabled KMS key: {}", key_name);
@@ -672,12 +809,21 @@ impl Operation for GetKmsStatus {
             }
         };
 
-        match kms.health_check().await {
-            Ok(_) => {
+        let backend = kms.backend_info().backend_type;
+        match kms.health_check_with_encryption_status().await {
+            Ok(hs) => {
+                let healthy = hs.kms_healthy && hs.encryption_working;
+                let status = if healthy {
+                    "OK"
+                } else if hs.kms_healthy {
+                    "Degraded"
+                } else {
+                    "Failed"
+                };
                 let response = KmsStatusResponse {
-                    status: "OK".to_string(),
-                    backend: "Local".to_string(), // TODO: Get actual backend type from KMS
-                    healthy: true,
+                    status: status.to_string(),
+                    backend,
+                    healthy,
                 };
                 Ok(kms_success_response(response))
             }
@@ -685,11 +831,306 @@ impl Operation for GetKmsStatus {
                 error!("KMS health check failed: {}", err);
                 let response = KmsStatusResponse {
                     status: "Failed".to_string(),
-                    backend: "Local".to_string(),
+                    backend,
                     healthy: false,
                 };
                 Ok(kms_success_response(response))
             }
         }
+    }
+}
+
+/// Rewrap wrapped data key (or any KMS ciphertext with RustFS header)
+/// POST /rustfs/admin/v3/kms/rewrap
+pub struct RewrapCiphertext;
+
+#[async_trait::async_trait]
+impl Operation for RewrapCiphertext {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let kms = match rustfs_kms::get_global_kms() {
+            Some(kms) => kms,
+            None => {
+                return Ok(kms_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KmsErrorResponse {
+                        code: "KMSNotConfigured".to_string(),
+                        message: "KMS is not configured".to_string(),
+                        description: "Key Management Service is not available".to_string(),
+                    },
+                ));
+            }
+        };
+
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "InvalidRequest".to_string(),
+                        message: "Failed to read body".to_string(),
+                        description: e.to_string(),
+                    },
+                ));
+            }
+        };
+        let payload: RewrapRequest = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "InvalidJSON".to_string(),
+                        message: "Invalid JSON".to_string(),
+                        description: e.to_string(),
+                    },
+                ));
+            }
+        };
+
+        let ciphertext = match base64::engine::general_purpose::STANDARD.decode(payload.ciphertext_b64.as_bytes()) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "InvalidBase64".to_string(),
+                        message: "ciphertext_b64 is invalid".to_string(),
+                        description: e.to_string(),
+                    },
+                ));
+            }
+        };
+        let context = payload.context.unwrap_or_default();
+
+        match kms.rewrap_ciphertext(&ciphertext, &context).await {
+            Ok(new_ct) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(new_ct);
+                Ok(kms_success_response(RewrapResponse { ciphertext_b64: b64 }))
+            }
+            Err(err) => Ok(kms_error_response(StatusCode::BAD_REQUEST, KmsErrorResponse::from(err))),
+        }
+    }
+}
+
+/// Batch rewrap all encrypted objects in a bucket (optionally under a prefix)
+/// POST /rustfs/admin/v3/kms/rewrap-bucket
+pub struct BatchRewrapBucket;
+
+#[async_trait::async_trait]
+impl Operation for BatchRewrapBucket {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let kms = match rustfs_kms::get_global_kms() {
+            Some(kms) => kms,
+            None => {
+                return Ok(kms_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KmsErrorResponse {
+                        code: "KMSNotConfigured".to_string(),
+                        message: "KMS is not configured".to_string(),
+                        description: "Key Management Service is not available".to_string(),
+                    },
+                ));
+            }
+        };
+
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(kms_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                KmsErrorResponse {
+                    code: "StorageNotInitialized".to_string(),
+                    message: "Object storage is not initialized".to_string(),
+                    description: "ECStore is not available".to_string(),
+                },
+            ));
+        };
+
+        // Parse request body
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "InvalidRequest".to_string(),
+                        message: "Failed to read body".to_string(),
+                        description: e.to_string(),
+                    },
+                ));
+            }
+        };
+        let payload: BatchRewrapRequest = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "InvalidJSON".to_string(),
+                        message: "Invalid JSON".to_string(),
+                        description: e.to_string(),
+                    },
+                ));
+            }
+        };
+
+        let bucket = payload.bucket.clone();
+        let prefix = payload.prefix.clone().unwrap_or_default();
+        let recursive = payload.recursive;
+        let page_size = payload.page_size.unwrap_or(1000).clamp(1, 1000);
+        let max_objects = payload.max_objects.unwrap_or(usize::MAX);
+        let dry_run = payload.dry_run;
+
+        // Ensure bucket exists
+        if let Err(e) = <ECStore as StorageAPI>::get_bucket_info(store.as_ref(), &bucket, &BucketOptions::default()).await {
+            return Ok(kms_error_response(
+                StatusCode::BAD_REQUEST,
+                KmsErrorResponse {
+                    code: "NoSuchBucket".to_string(),
+                    message: format!("Bucket '{bucket}' not found"),
+                    description: e.to_string(),
+                },
+            ));
+        }
+
+        let mut processed: usize = 0;
+        let mut rewrapped: usize = 0;
+        let mut skipped: usize = 0;
+        let mut errors: Vec<BatchRewrapResultItem> = Vec::new();
+        let mut continuation: Option<String> = None;
+
+        loop {
+            let delimiter = if recursive { None } else { Some("/".to_string()) };
+            let page = match <ECStore as StorageAPI>::list_objects_v2(
+                store.clone(),
+                &bucket,
+                &prefix,
+                continuation.clone(),
+                delimiter,
+                page_size,
+                false,
+                None,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(kms_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        KmsErrorResponse {
+                            code: "ListFailed".to_string(),
+                            message: "Failed to list objects".to_string(),
+                            description: e.to_string(),
+                        },
+                    ));
+                }
+            };
+
+            for oi in page.objects.into_iter() {
+                if processed >= max_objects {
+                    break;
+                }
+                if oi.is_dir {
+                    continue;
+                }
+
+                processed += 1;
+
+                let mut enc_ctx: StdHashMap<String, String> = StdHashMap::new();
+                for (k, v) in &oi.user_defined {
+                    if let Some(ctx_key) = k.strip_prefix("x-amz-server-side-encryption-context-") {
+                        enc_ctx.insert(ctx_key.to_string(), v.clone());
+                    }
+                }
+                if enc_ctx.is_empty() {
+                    if let Some(json) = oi.user_defined.get("x-amz-server-side-encryption-context") {
+                        if let Ok(map) = serde_json::from_str::<StdHashMap<String, String>>(json) {
+                            enc_ctx.extend(map);
+                        }
+                    }
+                }
+
+                let Some(wrapped_b64) = oi.user_defined.get("x-amz-server-side-encryption-key") else {
+                    skipped += 1;
+                    continue;
+                };
+
+                if dry_run {
+                    // Count as rewrapped candidate, no changes
+                    rewrapped += 1;
+                    continue;
+                }
+
+                let wrapped_bytes = match base64::engine::general_purpose::STANDARD.decode(wrapped_b64.as_bytes()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        errors.push(BatchRewrapResultItem {
+                            key: oi.name.clone(),
+                            status: "base64_error".to_string(),
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                };
+
+                match kms.rewrap_ciphertext(&wrapped_bytes, &enc_ctx).await {
+                    Ok(new_ct) => {
+                        let new_b64 = base64::engine::general_purpose::STANDARD.encode(new_ct);
+                        let mut md = StdHashMap::new();
+                        md.insert("x-amz-server-side-encryption-key".to_string(), new_b64);
+
+                        let popts = ObjectOptions {
+                            version_id: oi.version_id.map(|v| v.to_string()),
+                            eval_metadata: Some(md),
+                            ..Default::default()
+                        };
+
+                        match <ECStore as StorageAPI>::put_object_metadata(store.as_ref(), &bucket, &oi.name, &popts).await {
+                            Ok(_) => {
+                                rewrapped += 1;
+                            }
+                            Err(e) => {
+                                errors.push(BatchRewrapResultItem {
+                                    key: oi.name.clone(),
+                                    status: "update_failed".to_string(),
+                                    error: Some(e.to_string()),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(BatchRewrapResultItem {
+                            key: oi.name.clone(),
+                            status: "rewrap_failed".to_string(),
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            }
+
+            if processed >= max_objects {
+                break;
+            }
+
+            if page.is_truncated {
+                continuation = page.next_continuation_token;
+                if continuation.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let response = BatchRewrapResponse {
+            bucket,
+            prefix: if prefix.is_empty() { None } else { Some(prefix) },
+            processed,
+            rewrapped,
+            skipped,
+            errors,
+        };
+        Ok(kms_success_response(response))
     }
 }

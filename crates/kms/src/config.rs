@@ -330,7 +330,8 @@ impl KmsConfig {
                     address: Url::parse(&address).map_err(|e| format!("Invalid Vault address: {e}"))?,
                     auth_method: VaultAuthMethod::Token { token },
                     namespace: std::env::var("RUSTFS_KMS_VAULT_NAMESPACE").ok(),
-                    mount_path: std::env::var("RUSTFS_KMS_VAULT_MOUNT_PATH").unwrap_or_else(|_| "kv".to_string()),
+                    // Default to transit engine unless explicitly overridden
+                    mount_path: std::env::var("RUSTFS_KMS_VAULT_MOUNT_PATH").unwrap_or_else(|_| "transit".to_string()),
                     ..Default::default()
                 }));
             }

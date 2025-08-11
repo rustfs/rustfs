@@ -65,10 +65,23 @@ impl ObjectEncryptionService {
             }
         }
 
-        // Generate data encryption key
-        let _context = encryption_context.unwrap_or_else(|| format!("bucket={bucket}&key={key}"));
+        // Build encryption context map (prefer explicit JSON, otherwise default bucket/key)
+        let mut ctx_map: HashMap<String, String> = match encryption_context.as_deref() {
+            Some(s) if s.trim_start().starts_with('{') => serde_json::from_str::<HashMap<String, String>>(s).unwrap_or_default(),
+            Some(s) => {
+                let mut m = HashMap::new();
+                m.insert("context".to_string(), s.to_string());
+                m
+            }
+            None => HashMap::new(),
+        };
+        // Always include bucket/key for deterministic AAD
+        ctx_map.entry("bucket".to_string()).or_insert_with(|| bucket.to_string());
+        ctx_map.entry("key".to_string()).or_insert_with(|| key.to_string());
 
-        let request = crate::types::GenerateKeyRequest::new(actual_key_id.to_string(), "AES_256".to_string()).with_length(32);
+        // Generate data encryption key with context
+        let mut request = crate::types::GenerateKeyRequest::new(actual_key_id.to_string(), "AES_256".to_string()).with_length(32);
+        request.encryption_context = ctx_map.clone();
 
         let data_key_result = self.kms_manager.generate_data_key(&request, None).await?;
 
@@ -107,11 +120,11 @@ impl ObjectEncryptionService {
         // Create encryption metadata
         let metadata = crate::types::EncryptionMetadata {
             algorithm: algorithm.to_string(),
-            key_id: kms_key_id.map(|s| s.to_string()).unwrap_or_default(),
+            key_id: actual_key_id.to_string(),
             key_version: 1,
             iv: iv.clone(),
             tag: Some(tag.clone()),
-            encryption_context: std::collections::HashMap::new(),
+            encryption_context: ctx_map.clone(),
             encrypted_at: chrono::Utc::now(),
             original_size: data.len() as u64,
             encrypted_data_key,
@@ -151,11 +164,19 @@ impl ObjectEncryptionService {
             .decode(encrypted_data_key)
             .map_err(|e| crate::error::EncryptionError::metadata_error(format!("Invalid base64 key: {e}")))?;
 
-        // Decrypt data key using KMS
-        let context = encryption_context.unwrap_or_else(|| format!("bucket={bucket}&key={key}"));
-
-        let mut context_map = std::collections::HashMap::new();
-        context_map.insert("context".to_string(), context);
+        // Decrypt data key using KMS with consistent context
+        // Prefer JSON map if provided; otherwise build default map with bucket/key
+        let mut context_map: HashMap<String, String> = match encryption_context.as_deref() {
+            Some(s) if s.trim_start().starts_with('{') => serde_json::from_str::<HashMap<String, String>>(s).unwrap_or_default(),
+            Some(s) => {
+                let mut m = HashMap::new();
+                m.insert("context".to_string(), s.to_string());
+                m
+            }
+            None => HashMap::new(),
+        };
+        context_map.entry("bucket".to_string()).or_insert_with(|| bucket.to_string());
+        context_map.entry("key".to_string()).or_insert_with(|| key.to_string());
 
         let decrypt_request = crate::types::DecryptRequest {
             ciphertext: encrypted_key_bytes,

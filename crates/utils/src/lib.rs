@@ -22,6 +22,7 @@ pub mod net;
 #[cfg(feature = "net")]
 pub use net::*;
 
+// retry uses futures/hyper/tokio; gate it behind net+io to ensure deps exist
 #[cfg(all(feature = "net", feature = "io"))]
 pub mod retry;
 

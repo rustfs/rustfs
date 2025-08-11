@@ -9,6 +9,7 @@
 pub mod bucket_encryption_config;
 pub mod encryption_key_management;
 pub mod encryption_security;
+pub mod rewrap;
 pub mod s3_encryption;
 
 // Re-export commonly used test utilities

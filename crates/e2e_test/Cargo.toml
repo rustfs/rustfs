@@ -25,6 +25,9 @@ workspace = true
 
 [dependencies]
 rustfs-ecstore.workspace = true
+rustfs-signer = { workspace = true }
+http = { workspace = true }
+s3s = { workspace = true }
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true
