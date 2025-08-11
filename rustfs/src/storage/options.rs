@@ -722,8 +722,7 @@ mod tests {
             assert_eq!(
                 metadata.get("content-type"),
                 Some(&expected_content_type.to_string()),
-                "Failed for filename: {}",
-                filename
+                "Failed for filename: {filename}"
             );
         }
     }

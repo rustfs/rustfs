@@ -496,39 +496,32 @@ impl FileMeta {
     }
 
     pub fn add_version_filemata(&mut self, ver: FileMetaVersion) -> Result<()> {
-        let mod_time = ver.get_mod_time().unwrap().nanosecond();
         if !ver.valid() {
             return Err(Error::other("attempted to add invalid version"));
         }
-        let encoded = ver.marshal_msg()?;
 
-        if self.versions.len() + 1 > 100 {
+        if self.versions.len() + 1 >= 100 {
             return Err(Error::other(
                 "You've exceeded the limit on the number of versions you can create on this object",
             ));
         }
 
-        self.versions.push(FileMetaShallowVersion {
-            header: FileMetaVersionHeader {
-                mod_time: Some(OffsetDateTime::from_unix_timestamp(-1)?),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        let mod_time = ver.get_mod_time();
+        let encoded = ver.marshal_msg()?;
+        let new_version = FileMetaShallowVersion {
+            header: ver.header(),
+            meta: encoded,
+        };
 
-        let len = self.versions.len();
-        for (i, existing) in self.versions.iter().enumerate() {
-            if existing.header.mod_time.unwrap().nanosecond() <= mod_time {
-                let vers = self.versions[i..len - 1].to_vec();
-                self.versions[i + 1..].clone_from_slice(vers.as_slice());
-                self.versions[i] = FileMetaShallowVersion {
-                    header: ver.header(),
-                    meta: encoded,
-                };
-                return Ok(());
-            }
-        }
-        Err(Error::other("addVersion: Internal error, unable to add version"))
+        // Find the insertion position: insert before the first element with mod_time >= new mod_time
+        // This maintains descending order by mod_time (newest first)
+        let insert_pos = self
+            .versions
+            .iter()
+            .position(|existing| existing.header.mod_time <= mod_time)
+            .unwrap_or(self.versions.len());
+        self.versions.insert(insert_pos, new_version);
+        Ok(())
     }
 
     // delete_version deletes version, returns data_dir
@@ -554,7 +547,15 @@ impl FileMeta {
 
             match ver.header.version_type {
                 VersionType::Invalid | VersionType::Legacy => return Err(Error::other("invalid file meta version")),
-                VersionType::Delete => return Ok(None),
+                VersionType::Delete => {
+                    self.versions.remove(i);
+                    if fi.deleted && fi.version_id.is_none() {
+                        self.add_version_filemata(ventry)?;
+                        return Ok(None);
+                    }
+
+                    return Ok(None);
+                }
                 VersionType::Object => {
                     let v = self.get_idx(i)?;
 
@@ -600,6 +601,7 @@ impl FileMeta {
 
         if fi.deleted {
             self.add_version_filemata(ventry)?;
+            return Ok(None);
         }
 
         Err(Error::FileVersionNotFound)
@@ -961,7 +963,8 @@ impl FileMetaVersion {
 
     pub fn get_version_id(&self) -> Option<Uuid> {
         match self.version_type {
-            VersionType::Object | VersionType::Delete => self.object.as_ref().map(|v| v.version_id).unwrap_or_default(),
+            VersionType::Object => self.object.as_ref().map(|v| v.version_id).unwrap_or_default(),
+            VersionType::Delete => self.delete_marker.as_ref().map(|v| v.version_id).unwrap_or_default(),
             _ => None,
         }
     }
