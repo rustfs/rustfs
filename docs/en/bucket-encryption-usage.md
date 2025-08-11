@@ -13,11 +13,13 @@ This document describes how to use S3-compatible bucket encryption features in R
 - Uses KMS-managed keys for encryption
 - Provides fine-grained key control and auditing
 - Supports custom KMS keys
+ - DSSE compatibility: accepts aws:kms:dsse and normalizes to aws:kms in responses/HEAD
 
 ### 3. SSE-C (Server-Side Encryption with Customer-Provided Keys)
 - Uses customer-provided keys for encryption
 - Customer has complete control over encryption keys
 - Requires providing the key with each request
+ - Not supported for multipart uploads (use single PUT or COPY)
 
 ## Usage Methods
 
@@ -161,6 +163,15 @@ curl "http://localhost:9000/my-bucket/my-object" \
   -H "x-amz-server-side-encryption-customer-algorithm: AES256" \
   -H "x-amz-server-side-encryption-customer-key: $KEY" \
   -H "x-amz-server-side-encryption-customer-key-MD5: $KEY_MD5"
+
+# COPY with SSE-C source and SSE-KMS destination
+curl -X PUT "http://localhost:9000/my-bucket/copied" \
+    -H "x-amz-copy-source: /my-bucket/my-object" \
+    -H "x-amz-copy-source-server-side-encryption-customer-algorithm: AES256" \
+    -H "x-amz-copy-source-server-side-encryption-customer-key: $KEY" \
+    -H "x-amz-copy-source-server-side-encryption-customer-key-MD5: $KEY_MD5" \
+    -H "x-amz-server-side-encryption: aws:kms" \
+    -H "x-amz-server-side-encryption-aws-kms-key-id: my-default-kms-key"
 ```
 
 ## Bucket Default Encryption Configuration
@@ -301,6 +312,11 @@ client
     .multipart_upload(completed_upload)
     .send()
     .await?;
+
+Notes
+- When a bucket has a default SSE (SSE-S3 or SSE-KMS), CreateMultipartUpload records the intent when the request omits SSE headers.
+- CompleteMultipartUpload returns the appropriate SSE headers (and KMS KeyId if applicable) in the response, aligned with S3/MinIO behavior.
+- Multipart + SSE-C is not supported.
 ```
 
 ## Viewing Object Encryption Information

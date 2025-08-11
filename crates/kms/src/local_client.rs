@@ -122,9 +122,16 @@ impl LocalKmsClient {
 
     /// Generate a random key
     fn generate_random_key(&self, length: usize) -> Vec<u8> {
-        use rand::Rng;
+        // Use rand::random() to fill cryptographic randomness
         let mut key = vec![0u8; length];
-        rand::rng().fill(&mut key[..]);
+        let mut i = 0;
+        while i < length {
+            let chunk: u64 = rand::random();
+            let bytes = chunk.to_ne_bytes();
+            let n = usize::min(8, length - i);
+            key[i..i + n].copy_from_slice(&bytes[..n]);
+            i += n;
+        }
         key
     }
 

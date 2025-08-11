@@ -14,6 +14,8 @@
 - 提供更细粒度的密钥控制和审计
 - 支持自定义 KMS 密钥
 
+兼容说明：请求中若使用 `aws:kms:dsse` 算法将被接受并规范化为 `aws:kms`（响应与对象元数据中都会显示为 `aws:kms`）。
+
 ### 3. SSE-C (Server-Side Encryption with Customer-Provided Keys)
 - 使用客户提供的密钥进行加密
 - 客户完全控制加密密钥
@@ -161,6 +163,12 @@ curl "http://localhost:9000/my-bucket/my-object" \
   -H "x-amz-server-side-encryption-customer-algorithm: AES256" \
   -H "x-amz-server-side-encryption-customer-key: $KEY" \
   -H "x-amz-server-side-encryption-customer-key-MD5: $KEY_MD5"
+
+### SSE-C 限制与注意事项
+- 仅支持单次 PUT/GET 以及 COPY 的“源对象解密”与“目标对象按请求或桶默认策略加密”；不支持多部分上传（Multipart Upload）的 SSE-C。
+- 客户密钥绝不会在服务端持久化；只存储必要的算法与随机向量等元信息。
+- 强烈建议全程使用 HTTPS 以防止明文密钥在网络中泄露。
+- GET/HEAD 访问 SSE-C 对象时，调用方必须提供与写入时相同的客户密钥与 MD5 校验头；否则会返回解密失败错误。
 ```
 
 ## Bucket 默认加密配置
@@ -303,6 +311,58 @@ client
     .await?;
 ```
 
+注意与行为说明：
+- SSE-C：不支持用于多部分上传。若需要对大对象加密，请使用 SSE-S3 或 SSE-KMS。
+- SSE-KMS/SSE-S3：
+  - 如果在 CreateMultipartUpload 请求中显式指定算法，则按请求算法加密并在 CompleteMultipartUpload 的响应中返回相应的 SSE 头：
+    - `x-amz-server-side-encryption: AES256 | aws:kms`
+    - 当为 KMS 时，额外返回 `x-amz-server-side-encryption-aws-kms-key-id`。
+  - 如果未在请求中指定算法但 Bucket 配置了默认加密，则在完成合并并进行最终加密后，同样会在 CompleteMultipartUpload 响应中返回上述 SSE 响应头。
+  - 若客户端在请求中使用 `aws:kms:dsse`，服务端会接受但在响应中规范化为 `aws:kms`。
+
+示例：使用 curl 创建带 SSE-KMS 的多部分上传（片段略），最终完成时会在响应头中看到 `x-amz-server-side-encryption: aws:kms` 与对应的 `x-amz-server-side-encryption-aws-kms-key-id`。
+
+```bash
+# 仅展示创建 MPU 与完成 MPU 的关键头；上传分片步骤从略
+CREATE_XML='{"Bucket":"my-bucket","Key":"large-object"}'
+curl -i -X POST "http://localhost:9000/my-bucket/large-object?uploads" \
+  -H "x-amz-server-side-encryption: aws:kms" \
+  -H "x-amz-server-side-encryption-aws-kms-key-id: my-kms-key-id"
+
+# ... 上传若干分片后，完成 MPU：
+curl -i -X POST "http://localhost:9000/my-bucket/large-object?uploadId=UPLOAD_ID" \
+  -H "Content-Type: application/xml" \
+  --data-binary @complete.xml
+# 响应头将包含：
+# x-amz-server-side-encryption: aws:kms
+# x-amz-server-side-encryption-aws-kms-key-id: my-kms-key-id
+```
+
+## 对象拷贝（COPY）与 SSE
+
+当从一个对象拷贝到另一个对象时：
+- 若源对象使用 SSE-C 加密，必须提供源对象的 SSE-C 头以便解密：
+  - `x-amz-copy-source-server-side-encryption-customer-algorithm`
+  - `x-amz-copy-source-server-side-encryption-customer-key`
+  - `x-amz-copy-source-server-side-encryption-customer-key-MD5`
+- 目标对象的加密由请求头或 Bucket 默认策略决定（SSE-S3 或 SSE-KMS）。
+
+示例：使用 SSE-C 源对象拷贝并将目标以 SSE-KMS 写入。
+
+```bash
+SRC_KEY="MTIzNDU2Nzg5MGFiY2RlZjEyMzQ1Njc4OTBhYmNkZWY="
+SRC_KEY_MD5="$(echo -n "1234567890abcdef1234567890abcdef" | md5 | xxd -r -p | base64)"
+
+curl -i -X PUT "http://localhost:9000/my-bucket/obj-copy" \
+  -H "x-amz-copy-source: /my-bucket/obj-src" \
+  -H "x-amz-copy-source-server-side-encryption-customer-algorithm: AES256" \
+  -H "x-amz-copy-source-server-side-encryption-customer-key: $SRC_KEY" \
+  -H "x-amz-copy-source-server-side-encryption-customer-key-MD5: $SRC_KEY_MD5" \
+  -H "x-amz-server-side-encryption: aws:kms" \
+  -H "x-amz-server-side-encryption-aws-kms-key-id: my-kms-key-id"
+# 响应将回显目标对象的 SSE 头，算法为 aws:kms，且包含 KMS KeyId。
+```
+
 ## 查看对象加密信息
 
 ```rust
@@ -352,6 +412,7 @@ if let Some(key_id) = response.ssekms_key_id() {
 - RustFS 完全兼容 AWS S3 的加密 API
 - 可以使用任何 S3 兼容的客户端库
 - 支持所有标准的 S3 加密头部
+  - 接受 `aws:kms:dsse` 作为请求算法，但在响应与对象元数据中统一显示为 `aws:kms`
 
 ## 故障排除
 

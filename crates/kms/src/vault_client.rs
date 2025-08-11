@@ -13,7 +13,6 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use rand::RngCore;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tokio::time::Duration;
@@ -110,7 +109,14 @@ impl VaultKmsClient {
     async fn generate_and_encrypt_data_key(&self, key_name: &str, key_length: usize) -> Result<DataKey> {
         // Generate random data key
         let mut data_key = vec![0u8; key_length];
-        rand::rng().fill_bytes(&mut data_key);
+        let mut i = 0;
+        while i < key_length {
+            let chunk: u64 = rand::random();
+            let bytes = chunk.to_ne_bytes();
+            let n = usize::min(8, key_length - i);
+            data_key[i..i + n].copy_from_slice(&bytes[..n]);
+            i += n;
+        }
 
         // Encrypt the data key using Transit engine
         let plaintext = general_purpose::STANDARD.encode(&data_key);

@@ -10,10 +10,36 @@
   - 对象数据实际使用 AES-256-GCM 加密；KMS 管理数据密钥（DEK）。
 - 加密上下文（AAD）：RustFS 会构建一个包含至少 bucket 与 key 的 JSON 上下文，将密文与对象身份绑定；也可通过请求头补充自定义上下文。
 
+安全与认证
+- 管理员接口（/rustfs/admin/v3/...）需要 AWS SigV4 签名认证。
+- 请使用与 RustFS 服务端配置匹配的 AK/SK 对请求进行 SigV4 签名（服务名通常为 s3，区域可配置或使用默认）。
+- 未签名或签名不合法会返回 403 AccessDenied。
+
 ## 配置 KMS
 
 接口：
 - POST /rustfs/admin/v3/kms/configure
+
+### 请求体字段说明
+- kms_type: 字符串，必填。可选值：
+  - "vault"：使用 HashiCorp Vault Transit 引擎
+  - "local"：使用内置本地 KMS（开发/测试）
+- vault_address: 字符串，kms_type=vault 时必填。Vault 的 HTTP(S) 地址，例如 https://vault.example.com。
+- vault_token: 字符串，可选。当提供该字段时使用 Token 认证。
+- vault_app_role_id: 字符串，可选。与 vault_app_role_secret_id 一起提供时，使用 AppRole 认证。
+- vault_app_role_secret_id: 字符串，可选。与 vault_app_role_id 一起提供时，使用 AppRole 认证。
+- vault_namespace: 字符串，可选。Vault Enterprise 命名空间，不填表示根命名空间。
+- vault_mount_path: 字符串，可选，默认 "transit"。Transit 引擎的挂载名（不是 KV 引擎路径）。
+- vault_timeout_seconds: 整数，可选，默认 30。与 Vault 的请求超时时间（秒）。
+- default_key_id: 字符串，可选。SSE-KMS 未显式指定密钥时的默认主密钥 ID；未设置时默认回退到 "rustfs-default-key" 并尽力惰性创建。
+
+环境变量映射：
+- RUSTFS_KMS_DEFAULT_KEY_ID → default_key_id
+
+认证选择规则（自动）：
+- 同时存在 vault_app_role_id 与 vault_app_role_secret_id → 使用 AppRole；
+- 否则若存在 vault_token → 使用 Token；
+- 其他情况 → 返回无效配置错误。
 
 请求体（Vault + Token）：
 ```json
@@ -50,6 +76,21 @@
   - OK：KMS 可达，且能生成数据密钥
   - Degraded：KMS 可达，但加解密路径未完全验证
   - Failed：不可达
+  - 说明：初次使用时即使尚无任何密钥，KMS 也会报告可用；Transit 未挂载或 Vault 被封存（sealed）时会报告失败。
+
+响应示例：
+```json
+{
+  "status": "OK",
+  "backend": "vault",
+  "healthy": true,
+  "details": {
+    "engine_type": "transit",
+    "mount_path": "transit",
+    "namespace": null
+  }
+}
+```
 
 ## 密钥管理接口
 
@@ -61,6 +102,76 @@
   - Vault 限制：Transit 不支持禁用，RustFS 会返回 501 并给出说明。
 - 轮换：POST /rustfs/admin/v3/kms/key/rotate?keyName=<id>
 - 重包裹（rewrap）：POST /rustfs/admin/v3/kms/rewrap（请求体：{"ciphertext_b64":"...","context":{...}}）
+
+### 参数与取值说明
+- keyName: 字符串，必填。主密钥 ID（Transit key 名）。建议使用业务相关的可读 ID，例如 "app-default"。
+- algorithm: 字符串，可选，默认 "AES-256"。可选值：
+  - "AES-256"、"AES-128"、"RSA-2048"、"RSA-4096"
+  - 提示：在 Vault Transit 中，实际的 key_type 由引擎配置/默认值决定（通常为 aes256-gcm96）。当前 RustFS 会尽力对齐，但以 Vault 的实际 key 定义为准；algorithm 主要用于元数据和一致性校验。
+
+### 接口细节
+- 创建密钥（key/create）
+  - 成功返回创建的密钥信息；若密钥已存在，可能返回已存在错误或视后端而定。
+  - Vault 后端可由策略限制创建权限；若无权限，请预先由管理员创建。
+  - 方法与路径：POST /rustfs/admin/v3/kms/key/create
+  - 查询参数：
+    - keyName: 字符串，必填
+    - algorithm: 字符串，可选，默认 "AES-256"
+  - 响应字段：
+    - key_id: 字符串，主密钥 ID
+    - key_name: 字符串（同 key_id）
+    - status: 字符串，Active 等
+    - created_at: 字符串，ISO 时间
+  - 成功示例：
+    ```json
+    {"key_id":"app-default","key_name":"app-default","status":"Active","created_at":"2025-08-11T09:30:21Z"}
+    ```
+- 查询状态（key/status）
+  - 读取指定密钥的基本信息与状态；密钥不存在时返回 404。
+  - 方法与路径：GET /rustfs/admin/v3/kms/key/status
+  - 查询参数：
+    - keyName: 字符串，必填
+  - 响应字段：
+    - key_id, key_name, status, created_at, algorithm
+- 列表（key/list）
+  - 返回当前挂载下的所有密钥；当 Vault 下尚无任何密钥时，返回空列表（而不是错误）。
+  - 方法与路径：GET /rustfs/admin/v3/kms/key/list
+  - 响应字段：
+    - keys: 数组，元素为 { key_id, algorithm, status, created_at }
+- 启用（key/enable）
+  - Transit 不支持显式启用/禁用；该操作会确保目标密钥存在（必要时惰性创建）。
+  - 方法与路径：PUT /rustfs/admin/v3/kms/key/enable
+  - 查询参数：
+    - keyName: 字符串，必填
+- 禁用（key/disable）
+  - Transit 不支持禁用，返回 501；可改用策略限制或轮换替代。
+  - 方法与路径：PUT /rustfs/admin/v3/kms/key/disable
+- 轮换（key/rotate）
+  - 将密钥提升到下一版本；已有密文可通过 rewrap 升级到新版本。
+  - 方法与路径：POST /rustfs/admin/v3/kms/key/rotate
+  - 查询参数：
+    - keyName: 字符串，必填
+- 重包裹（rewrap）
+  - 请求体字段：
+    - ciphertext_b64: 字符串，必填。对象元数据中保存的包装 DEK（x-amz-server-side-encryption-key）的 base64 值。
+    - context: 对象，可选。加密上下文（AAD），建议至少包含 bucket 与 key，与写入时一致。
+  - 成功返回新的包装 DEK（base64），保持与旧格式兼容。
+  - 方法与路径：POST /rustfs/admin/v3/kms/rewrap
+  - 响应示例：
+    ```json
+    {"ciphertext_b64":"dmF1bHQ6djI6Li4u"}
+    ```
+
+### 错误返回格式
+管理员接口错误均返回 JSON：
+```json
+{"code":"InvalidConfiguration","message":"Failed to create KMS manager","description":"Error: ..."}
+```
+常见 code：
+- AccessDenied（签名错误或权限不足）
+- InvalidConfiguration（配置参数不合法、缺失或后端不可达）
+- NotFound（key/status 等查询的密钥不存在）
+- NotImplemented（禁用等不被 Transit 支持的操作）
 
 说明
 - RustFS 使用 Vault Transit 引擎进行 KMS 操作（encrypt/decrypt/rewrap、datakey/plaintext）。请确保已启用并挂载 Transit（默认路径 transit）。
@@ -78,6 +189,24 @@ PUT 可选请求头：
 - 指定主密钥：x-amz-server-side-encryption-aws-kms-key-id: <key-id>
 - 自定义加密上下文（JSON）：x-amz-server-side-encryption-context: {"project":"demo","tenant":"t1"}
 
+SSE-C（客户提供密钥）请求头（单次 PUT/GET/COPY 支持）：
+- x-amz-server-side-encryption-customer-algorithm: AES256
+- x-amz-server-side-encryption-customer-key: <Base64-encoded 256-bit key>
+- x-amz-server-side-encryption-customer-key-MD5: <Base64-encoded MD5(key)>
+
+说明
+- SSE-C 需要通过 HTTPS 传输（强烈建议，避免明文密钥泄露）。RustFS 不持久化用户提供的密钥，仅持久化算法与随机 IV；读取时必须再次通过请求头提供相同密钥。
+- 对 COPY：可用 x-amz-copy-source-server-side-encryption-customer-* 头解密源对象，目标端可用 SSE-S3/SSE-KMS 或 SSE-C 重新加密。
+- Multipart（分片上传）：当前不支持 SSE-C；请使用单次 PUT 或 COPY 流程。
+
+约束与取值
+- x-amz-server-side-encryption 可选值：AES256（SSE-S3）、aws:kms（SSE-KMS）。
+- x-amz-server-side-encryption-aws-kms-key-id 建议使用已存在或可惰性创建的主密钥名。
+- x-amz-server-side-encryption-context 为 JSON 文本，建议 UTF-8，无换行；过大上下文会增加元数据存储开销。
+
+DSSE 兼容
+- 接受 aws:kms:dsse 作为 x-amz-server-side-encryption 的值；服务端将其归一化为 aws:kms，并在响应/HEAD 中返回 aws:kms。
+
 密钥选择
 - 若提供 x-amz-server-side-encryption-aws-kms-key-id，则使用该密钥。
 - 否则使用 KMS 配置中的 default_key_id；若未配置，回退到 “rustfs-default-key”，并尽力自动创建（失败不阻断写入流程）。
@@ -92,6 +221,11 @@ PUT 可选请求头：
 - x-amz-server-side-encryption-iv：base64 IV
 - x-amz-server-side-encryption-tag：base64 AEAD 标签（GCM）
 - x-amz-server-side-encryption-context-*：逐项 AAD（例如 …-context-bucket、…-context-key、…-context-project）
+
+桶默认加密与分片行为
+- 若桶配置了默认加密（SSE-S3 或 SSE-KMS），当请求未显式携带 SSE 头时，将使用桶默认加密。
+- 分片上传时：CreateMultipartUpload 会记录加密意图；CompleteMultipartUpload 将在响应中返回相应的 SSE 头（以及 KMS KeyId，如果适用），确保与 MinIO/S3 行为一致。
+- 目前分片 + SSE-C 不支持。
 
 ## curl 示例
 
@@ -139,6 +273,35 @@ curl -sS -X PUT 'http://127.0.0.1:9000/bucket1/secret.txt' \
   --data-binary @./secret.txt
 ```
 
+SSE-C 上传（单次 PUT）：
+```bash
+curl -sS -X PUT 'http://127.0.0.1:9000/bucket1/private.txt' \
+  -H 'x-amz-server-side-encryption-customer-algorithm: AES256' \
+  -H "x-amz-server-side-encryption-customer-key: $(printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' | xxd -r -p | base64)" \
+  -H "x-amz-server-side-encryption-customer-key-MD5: $(printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' | xxd -r -p | md5 | awk '{print $1}' | xxd -r -p | base64)" \
+  --data-binary @./private.txt
+```
+
+SSE-C 读取（GET）：
+```bash
+curl -sS 'http://127.0.0.1:9000/bucket1/private.txt' \
+  -H 'x-amz-server-side-encryption-customer-algorithm: AES256' \
+  -H "x-amz-server-side-encryption-customer-key: <Base64Key>" \
+  -H "x-amz-server-side-encryption-customer-key-MD5: <Base64MD5>" \
+  -o ./private.out
+```
+
+SSE-C 源 + SSE-KMS 目标的 COPY：
+```bash
+curl -sS -X PUT 'http://127.0.0.1:9000/bucket1/copied.txt' \
+  -H 'x-amz-copy-source: /bucket1/private.txt' \
+  -H 'x-amz-copy-source-server-side-encryption-customer-algorithm: AES256' \
+  -H "x-amz-copy-source-server-side-encryption-customer-key: <Base64Key>" \
+  -H "x-amz-copy-source-server-side-encryption-customer-key-MD5: <Base64MD5>" \
+  -H 'x-amz-server-side-encryption: aws:kms' \
+  -H 'x-amz-server-side-encryption-aws-kms-key-id: app-default'
+```
+
 读取（自动解密）：
 ```bash
 curl -sS 'http://127.0.0.1:9000/bucket1/secret.txt' -o ./secret.out
@@ -163,6 +326,11 @@ curl -sS -X POST 'http://127.0.0.1:9000/rustfs/admin/v3/kms/rewrap' \
   - page_size：整数 1..=1000（默认 1000）
   - max_objects：整数（可选，用于限制本次处理的对象数）
   - dry_run：布尔（默认 false）
+
+约束与返回
+- dry_run=true 时不落盘，仅返回统计信息，例如 { matched, would_rewrap, errors }。
+- 实跑返回 { rewrapped, failed, errors }；errors 为数组，元素包含 { key, error }。
+- 建议分批、前缀切片与限额执行，避免一次性处理过大数据集。
 
 说明
 - 重包裹会保留密文格式（包含嵌入的 key_id 头）。
@@ -235,6 +403,13 @@ path "transit/encrypt/app-default"        { capabilities = ["update"] }
 path "transit/decrypt/app-default"        { capabilities = ["update"] }
 path "transit/rewrap/app-default"         { capabilities = ["update"] }
 ```
+
+补充（最小权限与初始化）
+- 初始状态无任何密钥时：
+  - 列表接口会返回空列表；
+  - 首次写入/生成数据密钥时，若策略允许，RustFS 会惰性创建指定的主密钥；
+  - 若策略禁止创建，请管理员预先创建主密钥，或为特定 key 下发 create 权限。
+- Transit 必须已挂载到配置的 vault_mount_path（默认 transit），否则会在状态/首次使用时报错。
 
 
 ## 故障排查
