@@ -26,7 +26,10 @@ use handlers::{
         SetBucketNotification,
     },
     group,
-    kms::{ConfigureKms, CreateKmsKey, DisableKmsKey, EnableKmsKey, GetKmsKeyStatus, GetKmsStatus, ListKmsKeys},
+    kms::{
+        BatchRewrapBucket, ConfigureKms, CreateKmsKey, DisableKmsKey, EnableKmsKey, GetKmsKeyStatus, GetKmsStatus, ListKmsKeys,
+        RewrapCiphertext, RotateKmsKey,
+    },
     policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
@@ -217,6 +220,11 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&DisableKmsKey {}),
     )?;
     r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/rotate").as_str(),
+        AdminOperation(&RotateKmsKey {}),
+    )?;
+    r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
         AdminOperation(&GetKmsStatus {}),
@@ -225,6 +233,16 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
         AdminOperation(&ConfigureKms {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/rewrap").as_str(),
+        AdminOperation(&RewrapCiphertext {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/rewrap-bucket").as_str(),
+        AdminOperation(&BatchRewrapBucket {}),
     )?;
 
     r.insert(

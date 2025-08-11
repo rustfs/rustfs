@@ -534,4 +534,13 @@ impl KmsClient for LocalKmsClient {
             },
         }
     }
+
+    async fn rewrap_ciphertext(
+        &self,
+        ciphertext_with_header: &[u8],
+        _context: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<u8>> {
+        // Local backend does not version keys in a way that requires rewrap; return input as-is.
+        Ok(ciphertext_with_header.to_vec())
+    }
 }

@@ -35,9 +35,12 @@ use crate::{
 use vaultrs::{
     api::transit::{
         KeyType,
-        requests::{DecryptDataRequest as VaultDecryptRequest, EncryptDataRequest as VaultEncryptRequest},
+        requests::{
+            DataKeyType, DecryptDataRequest as VaultDecryptRequest, EncryptDataRequest as VaultEncryptRequest,
+            GenerateDataKeyRequest as VaultGenerateDataKeyRequest, RewrapDataRequest as VaultRewrapDataRequest,
+        },
     },
-    transit::{data, key},
+    transit::{data, generate, key},
 };
 
 /// Vault KMS client implementation using vaultrs library with Transit engine
@@ -134,6 +137,66 @@ impl VaultKmsClient {
             created_at: SystemTime::now(),
         })
     }
+
+    // Canonicalize encryption context (stable JSON with sorted keys) and base64-encode for Vault context
+    fn encode_context(ctx: &HashMap<String, String>) -> Option<String> {
+        if ctx.is_empty() {
+            return None;
+        }
+        // Use BTreeMap to guarantee deterministic key order
+        let mut ordered = std::collections::BTreeMap::new();
+        for (k, v) in ctx.iter() {
+            ordered.insert(k.clone(), v.clone());
+        }
+        match serde_json::to_string(&ordered) {
+            Ok(json) => Some(general_purpose::STANDARD.encode(json.as_bytes())),
+            Err(_) => None,
+        }
+    }
+
+    /// Rewrap a ciphertext to the latest key version, preserving our custom header format
+    #[allow(dead_code)]
+    pub async fn rewrap_ciphertext(&self, ciphertext_with_header: &[u8], enc_ctx: &HashMap<String, String>) -> Result<Vec<u8>> {
+        if ciphertext_with_header.len() < 4 {
+            return Err(KmsError::internal_error("Invalid ciphertext format: too short".to_string()));
+        }
+
+        let key_id_len = u32::from_be_bytes([
+            ciphertext_with_header[0],
+            ciphertext_with_header[1],
+            ciphertext_with_header[2],
+            ciphertext_with_header[3],
+        ]) as usize;
+
+        if ciphertext_with_header.len() < 4 + key_id_len {
+            return Err(KmsError::internal_error("Invalid ciphertext format: insufficient data".to_string()));
+        }
+
+        let key_id = String::from_utf8(ciphertext_with_header[4..4 + key_id_len].to_vec())
+            .map_err(|e| KmsError::internal_error(format!("Invalid key_id in ciphertext: {e}")))?;
+        let vault_ciphertext = &ciphertext_with_header[4 + key_id_len..];
+        let vault_ciphertext = std::str::from_utf8(vault_ciphertext)
+            .map_err(|e| KmsError::internal_error(format!("Invalid ciphertext bytes: {e}")))?;
+
+        let ctx_b64 = Self::encode_context(enc_ctx);
+        let mut builder = VaultRewrapDataRequest::builder();
+        builder.ciphertext(vault_ciphertext);
+        if let Some(c) = ctx_b64.as_deref() {
+            builder.context(c);
+        }
+
+        let resp = data::rewrap(&self.client, &self.mount_path, &key_id, vault_ciphertext, Some(&mut builder))
+            .await
+            .map_err(|e| KmsError::internal_error(format!("Rewrap failed: {e}")))?;
+
+        let key_id_bytes = key_id.as_bytes();
+        let key_id_len = key_id_bytes.len() as u32;
+        let mut final_ciphertext = Vec::new();
+        final_ciphertext.extend_from_slice(&key_id_len.to_be_bytes());
+        final_ciphertext.extend_from_slice(key_id_bytes);
+        final_ciphertext.extend_from_slice(resp.ciphertext.as_bytes());
+        Ok(final_ciphertext)
+    }
 }
 
 impl std::fmt::Debug for VaultKmsClient {
@@ -153,23 +216,85 @@ impl KmsClient for VaultKmsClient {
         // Ensure the master key exists
         self.describe_key(&request.master_key_id, None).await?;
 
-        // Generate data key with specified length (default 32 bytes for AES-256)
-        let key_length = match request.key_spec.as_str() {
-            "AES_256" => 32,
-            "AES_128" => 16,
-            _ => 32, // Default to AES-256
+        // Prefer using Vault transit datakey/plaintext so plaintext and wrapped key are generated atomically
+        // Determine key size in bits (Vault expects bits: 128/256/512). Our request.key_length is bytes when provided.
+        let bits: u16 = if let Some(bytes) = request.key_length {
+            (bytes * 8) as u16
+        } else {
+            match request.key_spec.as_str() {
+                "AES_128" => 128,
+                "AES_256" => 256,
+                _ => 256,
+            }
         };
 
-        self.generate_and_encrypt_data_key(&request.master_key_id, key_length).await
+        let ctx_b64 = Self::encode_context(&request.encryption_context);
+        let mut builder = VaultGenerateDataKeyRequest::builder();
+        builder.bits(bits);
+        if let Some(c) = ctx_b64.as_deref() {
+            builder.context(c);
+        }
+
+        match generate::data_key(
+            &self.client,
+            &self.mount_path,
+            &request.master_key_id,
+            DataKeyType::Plaintext,
+            Some(&mut builder),
+        )
+        .await
+        {
+            Ok(resp) => {
+                // Vault returns plaintext (base64) and ciphertext (string like vault:vN:...)
+                if let Some(pt_b64) = resp.plaintext {
+                    let pt = general_purpose::STANDARD
+                        .decode(pt_b64.as_bytes())
+                        .map_err(|e| KmsError::internal_error(format!("Failed to decode data key plaintext: {e}")))?;
+
+                    // Format ciphertext with key_id prefix for compatibility
+                    let key_id_bytes = request.master_key_id.as_bytes();
+                    let key_id_len = key_id_bytes.len() as u32;
+                    let mut final_ciphertext = Vec::new();
+                    final_ciphertext.extend_from_slice(&key_id_len.to_be_bytes());
+                    final_ciphertext.extend_from_slice(key_id_bytes);
+                    final_ciphertext.extend_from_slice(resp.ciphertext.as_bytes());
+
+                    Ok(DataKey {
+                        key_id: request.master_key_id.clone(),
+                        version: 1,
+                        plaintext: Some(pt),
+                        ciphertext: final_ciphertext,
+                        metadata: HashMap::new(),
+                        created_at: SystemTime::now(),
+                    })
+                } else {
+                    // Policy may deny returning plaintext; fall back to local RNG + encrypt path
+                    let key_length_bytes = (bits / 8) as usize;
+                    self.generate_and_encrypt_data_key(&request.master_key_id, key_length_bytes)
+                        .await
+                }
+            }
+            Err(e) => {
+                warn!("Vault datakey/plaintext generation failed, falling back to RNG+encrypt: {}", e);
+                let key_length_bytes = (bits / 8) as usize;
+                self.generate_and_encrypt_data_key(&request.master_key_id, key_length_bytes)
+                    .await
+            }
+        }
     }
 
     async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
         debug!("Encrypting data with key: {}", request.key_id);
 
         let plaintext = general_purpose::STANDARD.encode(&request.plaintext);
-        let _encrypt_request = VaultEncryptRequest::builder().plaintext(&plaintext).build()?;
 
-        let response = data::encrypt(&self.client, &self.mount_path, &request.key_id, &plaintext, None)
+        let ctx_b64 = Self::encode_context(&request.encryption_context);
+        let mut builder = VaultEncryptRequest::builder();
+        builder.plaintext(&plaintext);
+        if let Some(c) = ctx_b64.as_deref() {
+            builder.context(c);
+        }
+        let response = data::encrypt(&self.client, &self.mount_path, &request.key_id, &plaintext, Some(&mut builder))
             .await
             .map_err(|e| KmsError::internal_error(format!("Encryption failed: {e}")))?;
 
@@ -216,9 +341,13 @@ impl KmsClient for VaultKmsClient {
         let ciphertext = String::from_utf8(vault_ciphertext.to_vec())
             .map_err(|e| KmsError::internal_error(format!("Invalid ciphertext format: {e}")))?;
 
-        let _decrypt_request = VaultDecryptRequest::builder().ciphertext(&ciphertext).build()?;
-
-        let response = data::decrypt(&self.client, &self.mount_path, &key_id, &ciphertext, None)
+        let ctx_b64 = Self::encode_context(&request.encryption_context);
+        let mut builder = VaultDecryptRequest::builder();
+        builder.ciphertext(&ciphertext);
+        if let Some(c) = ctx_b64.as_deref() {
+            builder.context(c);
+        }
+        let response = data::decrypt(&self.client, &self.mount_path, &key_id, &ciphertext, Some(&mut builder))
             .await
             .map_err(|e| KmsError::internal_error(format!("Decryption failed: {e}")))?;
 
@@ -289,11 +418,20 @@ impl KmsClient for VaultKmsClient {
     async fn list_keys(&self, _request: &ListKeysRequest, _context: Option<&OperationContext>) -> Result<ListKeysResponse> {
         debug!("Listing keys in mount: {}", self.mount_path);
 
-        let keys = key::list(&self.client, &self.mount_path)
-            .await
-            .map_err(|e| KmsError::backend_error("vault", format!("Failed to list keys: {e}")))?;
-
-        let key_list = keys.keys;
+        // Vault may return 404 when there are no keys under the transit mount.
+        // Treat that as a normal empty list.
+        let key_list: Vec<String> = match key::list(&self.client, &self.mount_path).await {
+            Ok(keys) => keys.keys,
+            Err(e) => {
+                let es = e.to_string();
+                if es.contains("404") || es.to_lowercase().contains("not found") {
+                    debug!("Transit has no keys yet at '{}' (404), returning empty list", self.mount_path);
+                    Vec::new()
+                } else {
+                    return Err(KmsError::backend_error("vault", format!("Failed to list keys: {e}")));
+                }
+            }
+        };
 
         let key_infos: Vec<KeyInfo> = key_list
             .into_iter()
@@ -312,7 +450,7 @@ impl KmsClient for VaultKmsClient {
             })
             .collect();
 
-        Ok(ListKeysResponse {
+    Ok(ListKeysResponse {
             keys: key_infos,
             truncated: false,
             next_marker: None,
@@ -397,18 +535,7 @@ impl KmsClient for VaultKmsClient {
                     warn!("Vault is sealed");
                     return Err(KmsError::backend_error("vault", "Vault is sealed"));
                 }
-
-                // Check if Transit engine is accessible
-                match key::list(&self.client, &self.mount_path).await {
-                    Ok(_) => {
-                        debug!("Transit engine health check passed");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        warn!("Transit engine health check failed: {}", e);
-                        Err(KmsError::backend_error("vault", format!("Transit engine not accessible: {e}")))
-                    }
-                }
+                Ok(())
             }
             Err(e) => {
                 warn!("Vault health check failed: {}", e);
@@ -544,6 +671,10 @@ impl KmsClient for VaultKmsClient {
                 meta
             },
         }
+    }
+
+    async fn rewrap_ciphertext(&self, ciphertext_with_header: &[u8], context: &HashMap<String, String>) -> Result<Vec<u8>> {
+        self.rewrap_ciphertext(ciphertext_with_header, context).await
     }
 }
 

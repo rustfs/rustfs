@@ -529,6 +529,8 @@ impl S3 for FS {
         let should_encrypt =
             req.headers.contains_key("x-amz-server-side-encryption") || self.bucket_has_encryption(&bucket).await;
 
+        // Track requested SSE algorithm string for metadata persistence
+        let mut requested_sse_algorithm: Option<String> = None;
         if should_encrypt {
             let encryption_service = self
                 .encryption_service()
@@ -588,6 +590,9 @@ impl S3 for FS {
                 }
             };
 
+            // Remember the requested SSE algorithm for response/metadata (e.g., "aws:kms")
+            requested_sse_algorithm = Some(sse_algorithm.clone());
+
             // Map to AES256 for actual encryption
             let actual_algorithm = match sse_algorithm.as_str() {
                 "aws:kms" => "AES256", // KMS uses AES256 for actual encryption
@@ -626,9 +631,11 @@ impl S3 for FS {
 
         // Add encryption metadata to object metadata
         if let Some(metadata) = encryption_metadata {
-            src_info
-                .user_defined
-                .insert("x-amz-server-side-encryption".to_string(), metadata.algorithm.clone());
+            // Persist the requested SSE algorithm (e.g., "aws:kms") for UX compatibility
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption".to_string(),
+                requested_sse_algorithm.clone().unwrap_or_else(|| metadata.algorithm.clone()),
+            );
             if !metadata.key_id.is_empty() {
                 src_info
                     .user_defined
@@ -647,6 +654,12 @@ impl S3 for FS {
                     "x-amz-server-side-encryption-tag".to_string(),
                     base64::engine::general_purpose::STANDARD.encode(&tag),
                 );
+            }
+            // Persist per-field encryption context for future decrypt/rewrap
+            for (k, v) in metadata.encryption_context {
+                src_info
+                    .user_defined
+                    .insert(format!("x-amz-server-side-encryption-context-{k}"), v);
             }
         }
 
@@ -2549,7 +2562,12 @@ impl S3 for FS {
                         // Update object metadata with encryption info
                         let mut metadata = multipart_info.user_defined.clone();
                         metadata.remove("x-amz-multipart-encryption-pending");
-                        metadata.insert("x-amz-server-side-encryption".to_string(), encryption_metadata.algorithm);
+                        // Persist the originally requested algorithm (e.g., "aws:kms") for UX
+                        if let Some(req_alg) = multipart_info.user_defined.get("x-amz-server-side-encryption").cloned() {
+                            metadata.insert("x-amz-server-side-encryption".to_string(), req_alg);
+                        } else {
+                            metadata.insert("x-amz-server-side-encryption".to_string(), encryption_metadata.algorithm.clone());
+                        }
                         if !encryption_metadata.key_id.is_empty() {
                             metadata
                                 .insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), encryption_metadata.key_id);

@@ -23,7 +23,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 /// Abstract KMS client interface
@@ -167,6 +167,12 @@ pub trait KmsClient: Send + Sync + Debug {
     ///
     /// Returns information about the KMS backend (type, version, etc.).
     fn backend_info(&self) -> BackendInfo;
+
+    /// Rewrap a ciphertext to the latest key version (when supported)
+    ///
+    /// The input must be a ciphertext with the RustFS header (key_id length + key_id + backend ciphertext).
+    /// Implementations should preserve the header format.
+    async fn rewrap_ciphertext(&self, ciphertext_with_header: &[u8], context: &HashMap<String, String>) -> Result<Vec<u8>>;
 }
 
 /// Information about a KMS backend
@@ -204,7 +210,7 @@ impl KmsManager {
         // Perform initial health check
         if let Err(e) = client.health_check().await {
             warn!("KMS health check failed during initialization: {}", e);
-            panic!("KMS health check failed during initialization: {e}");
+            return Err(KmsError::ConfigurationError { message: e.to_string() });
         }
 
         info!("KMS manager initialized with backend: {:?}", config.kms_type);
@@ -457,6 +463,11 @@ impl KmsManager {
     /// Get the default key ID from configuration
     pub fn default_key_id(&self) -> Option<&str> {
         self.config.default_key_id.as_deref()
+    }
+
+    /// Rewrap ciphertext to latest key version (delegates to backend)
+    pub async fn rewrap_ciphertext(&self, ciphertext_with_header: &[u8], context: &HashMap<String, String>) -> Result<Vec<u8>> {
+        self.client.rewrap_ciphertext(ciphertext_with_header, context).await
     }
 }
 
