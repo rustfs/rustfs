@@ -183,10 +183,6 @@ async fn run(opt: config::Opt) -> Result<()> {
         Error::other(err)
     })?;
 
-    // init scanner and auto heal with unified cancellation token
-    // let _background_services_cancel_token = create_background_services_cancel_token();
-    // init_data_scanner().await;
-    // init_auto_heal().await;
     let _ = create_ahm_services_cancel_token();
 
     // Initialize heal manager with channel processor
