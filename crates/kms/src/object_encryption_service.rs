@@ -101,16 +101,14 @@ impl ObjectEncryptionService {
         // Generate IV and encrypt the data
         let iv = match algorithm {
             "AES256" | "aws:kms" => {
-                let mut iv = vec![0u8; 12]; // AES-GCM uses 12-byte IV
-                use rand::RngCore;
-                rand::rng().fill_bytes(&mut iv);
-                iv
+                // AES-GCM uses 12-byte IV
+                let iv_arr: [u8; 12] = rand::random();
+                iv_arr.to_vec()
             }
             "ChaCha20Poly1305" => {
-                let mut iv = vec![0u8; 12]; // ChaCha20Poly1305 uses 12-byte nonce
-                use rand::RngCore;
-                rand::rng().fill_bytes(&mut iv);
-                iv
+                // ChaCha20Poly1305 uses 12-byte nonce
+                let iv_arr: [u8; 12] = rand::random();
+                iv_arr.to_vec()
             }
             _ => return Err(crate::error::EncryptionError::unsupported_algorithm(algorithm)),
         };

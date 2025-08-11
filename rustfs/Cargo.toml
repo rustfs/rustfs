@@ -61,6 +61,7 @@ axum.workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
 base64 = "0.21"
+md5 = "0.7"
 chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }

@@ -5852,6 +5852,7 @@ dependencies = [
  "hyper-util",
  "libsystemd",
  "matchit",
+ "md5",
  "mime_guess",
  "once_cell",
  "opentelemetry",
