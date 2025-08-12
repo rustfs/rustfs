@@ -487,12 +487,11 @@ impl S3 for FS {
             // Treat SSE-C specially: IV present but no wrapped key in metadata
             let is_sse_c = (src_info
                 .user_defined
-                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-iv"))
-                .is_some()
+                .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-iv"))
                 && !src_info
                     .user_defined
                     .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-key")))
-                || (src_info.user_defined.get("x-amz-server-side-encryption-iv").is_some()
+                || (src_info.user_defined.contains_key("x-amz-server-side-encryption-iv")
                     && !src_info.user_defined.contains_key("x-amz-server-side-encryption-key"));
 
             if is_sse_c {
@@ -1250,12 +1249,11 @@ impl S3 for FS {
             // Heuristic: SSE-C stores IV but no wrapped key; SSE-KMS/S3 store wrapped key
             let is_sse_c = (info
                 .user_defined
-                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-iv"))
-                .is_some()
+                .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-iv"))
                 && !info
                     .user_defined
                     .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-key")))
-                || (info.user_defined.get("x-amz-server-side-encryption-iv").is_some()
+                || (info.user_defined.contains_key("x-amz-server-side-encryption-iv")
                     && !info.user_defined.contains_key("x-amz-server-side-encryption-key"));
 
             if is_sse_c {
