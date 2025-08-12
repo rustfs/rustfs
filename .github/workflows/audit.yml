@@ -16,13 +16,13 @@ name: Security Audit
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/audit.yml'
   pull_request:
-    branches: [main]
+    branches: [ main ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -69,7 +69,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v4

@@ -88,7 +88,7 @@ jobs:
     name: Typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
@@ -101,7 +101,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -130,7 +130,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
