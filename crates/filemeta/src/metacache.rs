@@ -826,7 +826,11 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
                 } else {
                     Some(unsafe { (*v_ptr).clone() })
                 };
-                if let Some(updated) = v { Ok(updated) } else { Err(std::io::Error::other("cache empty after update")) }
+                if let Some(updated) = v {
+                    Ok(updated)
+                } else {
+                    Err(std::io::Error::other("cache empty after update"))
+                }
             }
             Err(err) => Err(err),
         }

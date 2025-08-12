@@ -146,7 +146,7 @@ mod tests {
         let mut compress_reader = CompressReader::new(etag_reader3, CompressionAlgorithm::Zstd);
         assert_eq!(resolve_etag_generic(&mut compress_reader), Some("compress_wrapped_etag".to_string()));
 
-    // Test 4 removed: EncryptReader no longer present.
+        // Test 4 removed: EncryptReader no longer present.
 
         println!("✅ All ETag extraction methods work correctly!");
         println!("✅ Trait-based approach handles recursive unwrapping!");
@@ -164,7 +164,7 @@ mod tests {
         let base_reader = BufReader::new(Cursor::new(&data[..]));
         let base_reader = Box::new(WarpReader::new(base_reader));
         // Create a complex nested structure that might occur in practice:
-    // Previously: CompressReader<EncryptReader<HashReader<BufReader<Cursor>>>> (EncryptReader removed)
+        // Previously: CompressReader<EncryptReader<HashReader<BufReader<Cursor>>>> (EncryptReader removed)
         let hash_reader = HashReader::new(
             base_reader,
             data.len() as i64,
@@ -173,7 +173,7 @@ mod tests {
             false,
         )
         .unwrap();
-    let mut compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Deflate);
+        let mut compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Deflate);
 
         // Extract ETag using our generic system
         let extracted_etag = resolve_etag_generic(&mut compress_reader);
@@ -186,7 +186,7 @@ mod tests {
         let base_reader2 = BufReader::new(Cursor::new(&data2[..]));
         let base_reader2 = Box::new(WarpReader::new(base_reader2));
         let etag_reader = EtagReader::new(base_reader2, Some("core_etag".to_string()));
-    let mut compress_reader2 = CompressReader::new(etag_reader, CompressionAlgorithm::Zstd);
+        let mut compress_reader2 = CompressReader::new(etag_reader, CompressionAlgorithm::Zstd);
 
         let trait_etag = resolve_etag_generic(&mut compress_reader2);
         println!("📋 Trait-based ETag: {trait_etag:?}");
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(trait_etag, Some("core_etag".to_string()));
 
         println!("✅ Real-world scenario test passed!");
-    println!("   - (EncryptReader removed) Nested structures without encryption still resolve ETag");
+        println!("   - (EncryptReader removed) Nested structures without encryption still resolve ETag");
         println!("   - Trait-based approach works with real reader types");
         println!("   - System handles arbitrary nesting depths with actual implementations");
     }
