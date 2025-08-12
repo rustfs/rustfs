@@ -52,7 +52,7 @@ impl HttpTarget {
         target
     }
 
-    fn start_worker(&self, mut receiver: mpsc::Receiver<Box<dyn Loggable>>) {
+    fn start_worker(&self, mut receiver: mpsc::Receiver<Box<Self>>) {
         let client = self.client.clone();
         let config = self.config.clone();
         let endpoint = self.config.endpoint.clone();
@@ -104,7 +104,7 @@ impl HttpTarget {
         });
     }
 
-    async fn send_batch(client: &Client, endpoint: &url::Url, token: &str, buffer: &mut Vec<Box<dyn Loggable>>, name: &str) {
+    async fn send_batch(client: &Client, endpoint: &url::Url, token: &str, buffer: &mut Vec<Box<Self>>, name: &str) {
         if buffer.is_empty() {
             return;
         }
@@ -149,7 +149,7 @@ impl HttpTarget {
 
 #[async_trait]
 impl Target for HttpTarget {
-    async fn send(&self, entry: Box<dyn Loggable>) -> Result<(), Box<dyn Error + Send>> {
+    async fn send(&self, entry: Box<Self>) -> Result<(), Box<dyn Error + Send>> {
         if self.shutdown_signal.load(Ordering::SeqCst) {
             return Err("Target is shutting down".into());
         }

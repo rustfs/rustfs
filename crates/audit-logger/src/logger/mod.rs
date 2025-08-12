@@ -26,7 +26,7 @@ use std::error::Error;
 #[async_trait]
 pub trait Target: Send + Sync {
     /// 发送单个可日志化条目
-    async fn send(&self, entry: Box<dyn Loggable>) -> Result<(), Box<dyn Error + Send>>;
+    async fn send(&self, entry: Box<Self>) -> Result<(), Box<dyn Error + Send>>;
 
     /// 返回目标的唯一名称
     fn name(&self) -> &str;
