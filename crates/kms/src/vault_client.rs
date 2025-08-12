@@ -456,7 +456,7 @@ impl KmsClient for VaultKmsClient {
             })
             .collect();
 
-    Ok(ListKeysResponse {
+        Ok(ListKeysResponse {
             keys: key_infos,
             truncated: false,
             next_marker: None,
@@ -541,7 +541,19 @@ impl KmsClient for VaultKmsClient {
                     warn!("Vault is sealed");
                     return Err(KmsError::backend_error("vault", "Vault is sealed"));
                 }
-                Ok(())
+                match key::list(&self.client, &self.mount_path).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        let es = e.to_string();
+                        if es.contains("404") || es.to_lowercase().contains("not found") {
+                            debug!("Vault transit list keys returned 404 (no keys yet), treating as healthy");
+                            Ok(())
+                        } else {
+                            warn!("Vault list keys failed during health_check: {}", es);
+                            Err(KmsError::backend_error("vault", format!("Vault list keys failed: {es}")))
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!("Vault health check failed: {}", e);

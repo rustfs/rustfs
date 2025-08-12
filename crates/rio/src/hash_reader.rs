@@ -309,7 +309,7 @@ impl TryGetIndex for HashReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DecryptReader, WarpReader, encrypt_reader};
+    use crate::WarpReader;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -446,41 +446,9 @@ mod tests {
         rand::rng().fill_bytes(&mut key);
         rand::rng().fill_bytes(&mut nonce);
 
-        let is_encrypt = true;
+        let is_encrypt = false; // streaming encrypt reader removed
 
-        if is_encrypt {
-            // 加密压缩后的数据
-            let encrypt_reader = encrypt_reader::EncryptReader::new(WarpReader::new(Cursor::new(compressed_data)), key, nonce);
-            let mut encrypted_data = Vec::new();
-            let mut encrypt_reader = encrypt_reader;
-            encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
-
-            println!("Encrypted size: {}", encrypted_data.len());
-
-            // 解密数据
-            let decrypt_reader = DecryptReader::new(WarpReader::new(Cursor::new(encrypted_data)), key, nonce);
-            let mut decrypt_reader = decrypt_reader;
-            let mut decrypted_data = Vec::new();
-            decrypt_reader.read_to_end(&mut decrypted_data).await.unwrap();
-
-            if is_compress {
-                // 如果使用了压缩，需要解压缩
-                let decompress_reader =
-                    DecompressReader::new(WarpReader::new(Cursor::new(decrypted_data)), CompressionAlgorithm::Gzip);
-                let mut decompress_reader = decompress_reader;
-                let mut final_data = Vec::new();
-                decompress_reader.read_to_end(&mut final_data).await.unwrap();
-
-                println!("Final decompressed size: {}", final_data.len());
-                assert_eq!(final_data.len() as i64, actual_size);
-                assert_eq!(&final_data, &data);
-            } else {
-                // 如果没有压缩，直接比较解密后的数据
-                assert_eq!(decrypted_data.len() as i64, actual_size);
-                assert_eq!(&decrypted_data, &data);
-            }
-            return;
-        }
+        // encryption path removed; proceed without encryption validation
 
         // 如果不加密，直接处理压缩/解压缩
         if is_compress {

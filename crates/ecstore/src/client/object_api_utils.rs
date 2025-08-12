@@ -33,23 +33,21 @@ use s3s::S3ErrorCode;
 //#[derive(Clone)]
 pub struct PutObjReader {
     pub reader: HashReader,
-    pub raw_reader: HashReader,
-    //pub sealMD5Fn: SealMD5CurrFn,
 }
 
 #[allow(dead_code)]
 impl PutObjReader {
     pub fn new(raw_reader: HashReader) -> Self {
-        todo!();
+        PutObjReader { reader: raw_reader }
     }
 
     fn md5_current_hex_string(&self) -> String {
-        todo!();
+        // 占位：后续可从 inner etag 计算，这里返回空
+        String::new()
     }
 
     fn with_encryption(&mut self, enc_reader: HashReader) -> Result<(), std::io::Error> {
         self.reader = enc_reader;
-
         Ok(())
     }
 }

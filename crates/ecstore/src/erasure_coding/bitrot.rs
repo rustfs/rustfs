@@ -141,6 +141,11 @@ where
         }
 
         if self.finished {
+            tracing::debug!(
+                incoming_len = buf.len(),
+                shard_size = self.shard_size,
+                "bitrot write called after finished"
+            );
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot writer already finished"));
         }
 
@@ -151,9 +156,7 @@ where
             ));
         }
 
-        if buf.len() < self.shard_size {
-            self.finished = true;
-        }
+        // 不再因为收到短块就提前标记 finished，允许后续继续追加，防止加密帧导致的误终止。
 
         let hash_algo = &self.hash_algo;
 
@@ -172,11 +175,17 @@ where
 
         self.buf.clear();
 
+        tracing::debug!(written_data_bytes = n, shard_size = self.shard_size, "bitrot writer wrote block");
         Ok(n)
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.inner.shutdown().await
+    }
+
+    /// Mark writer as finished explicitly.
+    pub fn finalize(&mut self) {
+        self.finished = true;
     }
 }
 
@@ -349,6 +358,10 @@ impl BitrotWriterWrapper {
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.bitrot_writer.shutdown().await
+    }
+
+    pub fn finalize(&mut self) {
+        self.bitrot_writer.finalize();
     }
 
     /// Extract the inline buffer data, consuming the wrapper
