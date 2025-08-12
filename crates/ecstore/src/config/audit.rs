@@ -17,7 +17,7 @@ use rustfs_config::audit::{
     WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT,
     WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_SIZE, WEBHOOK_RETRY_INTERVAL,
 };
-use rustfs_config::{DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, ENABLE_OFF};
+use rustfs_config::{DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState};
 use std::sync::LazyLock;
 
 /// Default KVS for audit webhook settings.
@@ -25,7 +25,7 @@ pub const DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
-            value: ENABLE_OFF.to_owned(),
+            value: EnableState::Off.to_string(),
             hidden_if_empty: false,
         },
         KV {

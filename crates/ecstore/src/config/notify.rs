@@ -18,7 +18,7 @@ use rustfs_config::notify::{
     MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
     WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_config::{COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, ENABLE_OFF};
+use rustfs_config::{COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState};
 use std::sync::LazyLock;
 
 /// The default configuration collection of webhooks，
@@ -27,7 +27,7 @@ pub static DEFAULT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
-            value: ENABLE_OFF.to_owned(),
+            value: EnableState::Off.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -74,7 +74,7 @@ pub static DEFAULT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
-            value: ENABLE_OFF.to_owned(),
+            value: EnableState::Off.to_string(),
             hidden_if_empty: false,
         },
         KV {
