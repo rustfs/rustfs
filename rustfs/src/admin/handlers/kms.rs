@@ -6,6 +6,7 @@
 //! - Key enable/disable operations
 //! - KMS health status checking
 
+use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use std::collections::HashMap as StdHashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1037,21 +1038,26 @@ impl Operation for BatchRewrapBucket {
 
                 processed += 1;
 
+                // Prefer internal sealed context
                 let mut enc_ctx: StdHashMap<String, String> = StdHashMap::new();
-                for (k, v) in &oi.user_defined {
-                    if let Some(ctx_key) = k.strip_prefix("x-amz-server-side-encryption-context-") {
-                        enc_ctx.insert(ctx_key.to_string(), v.clone());
+                if let Some(json) = oi
+                    .user_defined
+                    .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-context"))
+                {
+                    if let Ok(map) = serde_json::from_str::<StdHashMap<String, String>>(json) {
+                        enc_ctx.extend(map);
                     }
                 }
-                if enc_ctx.is_empty() {
-                    if let Some(json) = oi.user_defined.get("x-amz-server-side-encryption-context") {
-                        if let Ok(map) = serde_json::from_str::<StdHashMap<String, String>>(json) {
-                            enc_ctx.extend(map);
-                        }
-                    }
+                // Ensure bucket/key are present to bind AAD
+                if !enc_ctx.contains_key("bucket") {
+                    enc_ctx.insert("bucket".to_string(), bucket.clone());
+                }
+                if !enc_ctx.contains_key("key") {
+                    enc_ctx.insert("key".to_string(), oi.name.clone());
                 }
 
-                let Some(wrapped_b64) = oi.user_defined.get("x-amz-server-side-encryption-key") else {
+                // Read sealed wrapped DEK from internal field
+                let Some(wrapped_b64) = oi.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-key")) else {
                     skipped += 1;
                     continue;
                 };
@@ -1078,7 +1084,7 @@ impl Operation for BatchRewrapBucket {
                     Ok(new_ct) => {
                         let new_b64 = base64::engine::general_purpose::STANDARD.encode(new_ct);
                         let mut md = StdHashMap::new();
-                        md.insert("x-amz-server-side-encryption-key".to_string(), new_b64);
+                        md.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-key"), new_b64);
 
                         let popts = ObjectOptions {
                             version_id: oi.version_id.map(|v| v.to_string()),

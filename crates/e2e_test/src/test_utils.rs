@@ -1,10 +1,10 @@
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{Credentials, Region};
-use reqwest::{Client as HttpClient, Method};
-use std::env;
 use http::Request as HttpRequest;
+use reqwest::{Client as HttpClient, Method};
 use s3s::Body;
+use std::env;
 
 const ADMIN_ACCESS_KEY: &str = "rustfsadmin";
 const ADMIN_SECRET_KEY: &str = "rustfsadmin";
@@ -71,19 +71,9 @@ pub async fn cleanup_admin_test_context(_context: AdminTestContext) -> Result<()
 fn build_sigv4_headers(method: &Method, url: &str) -> Result<http::HeaderMap, Box<dyn std::error::Error + Send + Sync>> {
     let mut builder = HttpRequest::builder().method(method.as_str()).uri(url);
     // Hint signer to use UNSIGNED-PAYLOAD
-    builder = builder.header(
-        "X-Amz-Content-Sha256",
-        rustfs_signer::constants::UNSIGNED_PAYLOAD,
-    );
+    builder = builder.header("X-Amz-Content-Sha256", rustfs_signer::constants::UNSIGNED_PAYLOAD);
     let req = builder.body(Body::empty())?;
-    let signed = rustfs_signer::sign_v4(
-        req,
-        0,
-        ADMIN_ACCESS_KEY,
-        ADMIN_SECRET_KEY,
-        "",
-        DEFAULT_REGION,
-    );
+    let signed = rustfs_signer::sign_v4(req, 0, ADMIN_ACCESS_KEY, ADMIN_SECRET_KEY, "", DEFAULT_REGION);
     Ok(signed.headers().clone())
 }
 

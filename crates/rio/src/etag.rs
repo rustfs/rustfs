@@ -49,7 +49,7 @@ let etag = resolve_etag_generic(&mut reader);
 #[cfg(test)]
 mod tests {
 
-    use crate::{CompressReader, EncryptReader, EtagReader, HashReader};
+    use crate::{CompressReader, EtagReader, HashReader};
     use crate::{WarpReader, resolve_etag_generic};
     use rustfs_utils::compress::CompressionAlgorithm;
     use std::io::Cursor;
@@ -90,32 +90,16 @@ mod tests {
         assert_eq!(resolve_etag_generic(&mut compress_reader), Some("compress_etag".to_string()));
     }
 
-    #[test]
-    fn test_encrypt_reader_delegation() {
-        let data = b"test data for encryption";
-        let reader = BufReader::new(Cursor::new(&data[..]));
-        let reader = Box::new(WarpReader::new(reader));
-        let etag_reader = EtagReader::new(reader, Some("encrypt_etag".to_string()));
-
-        let key = [0u8; 32];
-        let nonce = [0u8; 12];
-        let mut encrypt_reader = EncryptReader::new(etag_reader, key, nonce);
-
-        // Test that EncryptReader delegates to inner EtagReader
-        assert_eq!(resolve_etag_generic(&mut encrypt_reader), Some("encrypt_etag".to_string()));
-    }
+    // Removed encrypt reader delegation test (EncryptReader deprecated).
 
     #[test]
     fn test_complex_nesting() {
         let data = b"test data for complex nesting";
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
-        // Create a complex nested structure: CompressReader<EncryptReader<EtagReader<BufReader<Cursor>>>>
+        // EncryptReader removed: now just CompressReader<EtagReader<...>>
         let etag_reader = EtagReader::new(reader, Some("nested_etag".to_string()));
-        let key = [0u8; 32];
-        let nonce = [0u8; 12];
-        let encrypt_reader = EncryptReader::new(etag_reader, key, nonce);
-        let mut compress_reader = CompressReader::new(encrypt_reader, CompressionAlgorithm::Gzip);
+        let mut compress_reader = CompressReader::new(etag_reader, CompressionAlgorithm::Gzip);
 
         // Test that nested structure can resolve ETag
         assert_eq!(resolve_etag_generic(&mut compress_reader), Some("nested_etag".to_string()));
@@ -162,16 +146,7 @@ mod tests {
         let mut compress_reader = CompressReader::new(etag_reader3, CompressionAlgorithm::Zstd);
         assert_eq!(resolve_etag_generic(&mut compress_reader), Some("compress_wrapped_etag".to_string()));
 
-        // Test 4: Double wrapper - CompressReader<EncryptReader<EtagReader>>
-        let data4 = b"double wrap test";
-        let reader4 = BufReader::new(Cursor::new(&data4[..]));
-        let reader4 = Box::new(WarpReader::new(reader4));
-        let etag_reader4 = EtagReader::new(reader4, Some("double_wrapped_etag".to_string()));
-        let key = [1u8; 32];
-        let nonce = [1u8; 12];
-        let encrypt_reader4 = EncryptReader::new(etag_reader4, key, nonce);
-        let mut compress_reader4 = CompressReader::new(encrypt_reader4, CompressionAlgorithm::Gzip);
-        assert_eq!(resolve_etag_generic(&mut compress_reader4), Some("double_wrapped_etag".to_string()));
+    // Test 4 removed: EncryptReader no longer present.
 
         println!("✅ All ETag extraction methods work correctly!");
         println!("✅ Trait-based approach handles recursive unwrapping!");
@@ -189,7 +164,7 @@ mod tests {
         let base_reader = BufReader::new(Cursor::new(&data[..]));
         let base_reader = Box::new(WarpReader::new(base_reader));
         // Create a complex nested structure that might occur in practice:
-        // CompressReader<EncryptReader<HashReader<BufReader<Cursor>>>>
+    // Previously: CompressReader<EncryptReader<HashReader<BufReader<Cursor>>>> (EncryptReader removed)
         let hash_reader = HashReader::new(
             base_reader,
             data.len() as i64,
@@ -198,10 +173,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let key = [42u8; 32];
-        let nonce = [24u8; 12];
-        let encrypt_reader = EncryptReader::new(hash_reader, key, nonce);
-        let mut compress_reader = CompressReader::new(encrypt_reader, CompressionAlgorithm::Deflate);
+    let mut compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Deflate);
 
         // Extract ETag using our generic system
         let extracted_etag = resolve_etag_generic(&mut compress_reader);
@@ -214,10 +186,7 @@ mod tests {
         let base_reader2 = BufReader::new(Cursor::new(&data2[..]));
         let base_reader2 = Box::new(WarpReader::new(base_reader2));
         let etag_reader = EtagReader::new(base_reader2, Some("core_etag".to_string()));
-        let key2 = [99u8; 32];
-        let nonce2 = [88u8; 12];
-        let encrypt_reader2 = EncryptReader::new(etag_reader, key2, nonce2);
-        let mut compress_reader2 = CompressReader::new(encrypt_reader2, CompressionAlgorithm::Zstd);
+    let mut compress_reader2 = CompressReader::new(etag_reader, CompressionAlgorithm::Zstd);
 
         let trait_etag = resolve_etag_generic(&mut compress_reader2);
         println!("📋 Trait-based ETag: {trait_etag:?}");
@@ -225,8 +194,7 @@ mod tests {
         assert_eq!(trait_etag, Some("core_etag".to_string()));
 
         println!("✅ Real-world scenario test passed!");
-        println!("   - Successfully extracted ETag from nested CompressReader<EncryptReader<HashReader<AsyncRead>>>");
-        println!("   - Successfully extracted ETag from nested CompressReader<EncryptReader<EtagReader<AsyncRead>>>");
+    println!("   - (EncryptReader removed) Nested structures without encryption still resolve ETag");
         println!("   - Trait-based approach works with real reader types");
         println!("   - System handles arbitrary nesting depths with actual implementations");
     }

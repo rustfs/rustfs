@@ -153,7 +153,7 @@
     - keyName: 字符串，必填
 - 重包裹（rewrap）
   - 请求体字段：
-    - ciphertext_b64: 字符串，必填。对象元数据中保存的包装 DEK（x-amz-server-side-encryption-key）的 base64 值。
+    - ciphertext_b64: 字符串，必填。对象元数据中保存的包装 DEK（x-rustfs-internal-sse-key）的 base64 值（内部密封字段）。
     - context: 对象，可选。加密上下文（AAD），建议至少包含 bucket 与 key，与写入时一致。
   - 成功返回新的包装 DEK（base64），保持与旧格式兼容。
   - 方法与路径：POST /rustfs/admin/v3/kms/rewrap
@@ -212,19 +212,18 @@ DSSE 兼容
 - 否则使用 KMS 配置中的 default_key_id；若未配置，回退到 “rustfs-default-key”，并尽力自动创建（失败不阻断写入流程）。
 
 加密上下文（AAD）
-- 若通过 x-amz-server-side-encryption-context 传入 JSON，将与默认上下文合并；RustFS 会以 x-amz-server-side-encryption-context-<k> 的形式逐项写入对象元数据。
+- 若通过 x-amz-server-side-encryption-context 传入 JSON，将与默认上下文合并。RustFS 仅在内部保存最终上下文，不再对外暴露逐项 x-amz-server-side-encryption-context-*。
 - RustFS 始终包含 bucket 与 key 字段，使密文与对象身份绑定。
-- GET 时，RustFS 会从元数据重建上下文并透明解密；客户端无需额外头即可读取。
+- GET 时，RustFS 使用内部保存的密封上下文进行解密；客户端无需额外头即可读取。
 
-持久化的加密元数据（由服务端管理）：
-- x-amz-server-side-encryption-key：base64 的包装 DEK
-- x-amz-server-side-encryption-iv：base64 IV
-- x-amz-server-side-encryption-tag：base64 AEAD 标签（GCM）
-- x-amz-server-side-encryption-context-*：逐项 AAD（例如 …-context-bucket、…-context-key、…-context-project）
+持久化的加密元数据
+- 对外：x-amz-server-side-encryption（AES256|aws:kms）、x-amz-server-side-encryption-aws-kms-key-id（若适用）
+- 内部（隐藏）：x-rustfs-internal-sse-key、x-rustfs-internal-sse-iv、x-rustfs-internal-sse-tag、x-rustfs-internal-sse-context
+  - 以上字段保存密封的 DEK、IV、AEAD 标签与 JSON 上下文；它们不会出现在响应与 HEAD 中。
 
 桶默认加密与分片行为
 - 若桶配置了默认加密（SSE-S3 或 SSE-KMS），当请求未显式携带 SSE 头时，将使用桶默认加密。
-- 分片上传时：CreateMultipartUpload 会记录加密意图；CompleteMultipartUpload 将在响应中返回相应的 SSE 头（以及 KMS KeyId，如果适用），确保与 MinIO/S3 行为一致。
+- 分片上传时：CreateMultipartUpload 会记录加密意图；CompleteMultipartUpload 会写入内部密封元数据，并在响应中返回相应的 SSE 头（以及 KMS KeyId，如果适用），确保与 MinIO/S3 行为一致。
 - 目前分片 + SSE-C 不支持。
 
 ## curl 示例
@@ -418,9 +417,12 @@ path "transit/rewrap/app-default"         { capabilities = ["update"] }
 - datakey/plaintext 被拒：调整 Vault 策略允许对该 key 进行 transit generate。
 - Vault 不支持禁用：可通过策略禁止使用、或轮换/移除密钥替代。
 - rewrap-bucket 返回 errors：逐条查看 key 与 error 字段；可先缩小 prefix 或降低 page_size 重试。
-- GET 失败（解密错误）：检查对象元数据中的 context-* 是否完整、bucket/key 是否存在于上下文，确认 KMS 策略允许带 AAD 的操作。
+- GET 失败（解密错误）：确认对象写入时的内部密封上文（包含 bucket/key）有效；服务端会使用内部密封的 AAD 解密，客户端无需提供额外请求头；另请检查 Vault 策略是否允许携带 AAD 的操作。
 
 ## 规划
 
 - 为 KMS 调用增加有限重试/退避与指标上报。
 - 更丰富的管理端示例与 UX。
+
+开发者扩展阅读
+- 参见《KMS/SSE 内部设计与实现概要》：docs/zh-cn/kms-internal.md

@@ -144,19 +144,18 @@ Key selection
 - Otherwise RustFS uses KMS default_key_id if configured; if none, it falls back to "rustfs-default-key" and will attempt to create it automatically (best-effort).
 
 Encryption context (AAD)
-- If you pass a JSON string in x-amz-server-side-encryption-context, it will be merged with the defaults and stored per-field as x-amz-server-side-encryption-context-<k>.
+- If you pass a JSON string in x-amz-server-side-encryption-context, it will be merged with the defaults. RustFS persists the effective context internally and no longer exposes per-field x-amz-server-side-encryption-context-*.
 - RustFS always includes bucket and key in the context to bind the ciphertext to the object identity.
-- On GET, RustFS reconstructs the context from metadata and decrypts transparently. Clients don’t need to send any special headers to read encrypted objects.
+- On GET, RustFS decrypts using the internally stored sealed context; clients don’t need to send any special headers.
 
-Persisted metadata (managed by RustFS)
-- x-amz-server-side-encryption-key: base64 wrapped DEK
-- x-amz-server-side-encryption-iv: base64 IV
-- x-amz-server-side-encryption-tag: base64 AEAD tag (GCM)
-- x-amz-server-side-encryption-context-*: per-field AAD (e.g., …-context-bucket, …-context-key, …-context-project)
+Persisted metadata
+- Public: x-amz-server-side-encryption (AES256|aws:kms) and x-amz-server-side-encryption-aws-kms-key-id (when applicable)
+- Internal (hidden): x-rustfs-internal-sse-key, x-rustfs-internal-sse-iv, x-rustfs-internal-sse-tag, x-rustfs-internal-sse-context
+  - These fields contain the sealed DEK, IV, AEAD tag, and JSON context. They are filtered out from responses and object HEAD.
 
 Bucket defaults and multipart behavior
 - When a bucket has a default SSE (SSE-S3 or SSE-KMS), RustFS uses it when requests omit SSE headers.
-- For multipart uploads: CreateMultipartUpload records the encryption intent; CompleteMultipartUpload returns proper SSE headers (and KMS KeyId if applicable), aligned with MinIO/S3 behavior.
+- For multipart uploads: CreateMultipartUpload records the encryption intent; CompleteMultipartUpload writes internal sealed metadata and returns proper SSE headers (and KMS KeyId if applicable), aligned with MinIO/S3 behavior.
 - Multipart + SSE-C is currently not supported.
 
 ## Curl Examples
@@ -341,9 +340,12 @@ path "transit/rewrap/app-default"         { capabilities = ["update"] }
 - Access denied on datakey/plaintext: adjust Vault policies to allow transit generate for that key.
 - Disable not supported on Vault: remove/rotate keys or adjust Vault policies instead.
 - rewrap-bucket returns errors: reduce scope (prefix), lower page_size, and inspect { key, error } entries.
-- GET fails (decryption error): verify metadata contains context-* entries, bucket/key present in AAD, and Vault policy allows AAD-bound ops.
+- GET fails (decryption error): ensure the internally sealed context (including bucket/key) is valid; the server decrypts using the sealed AAD and clients do not need extra headers. Also verify Vault policies allow AAD-bound operations.
 
 ## Roadmap
 
 - Bounded retries/backoff and metrics around KMS calls.
 - Richer admin UX and examples.
+
+For developers
+- See "KMS/SSE Internal Design Overview": docs/en/kms-internal.md

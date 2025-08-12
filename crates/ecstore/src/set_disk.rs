@@ -3439,12 +3439,24 @@ impl ObjectIO for SetDisks {
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
+                // Use logical_size (plaintext if known) for pre-allocation to reduce premature short block finish.
+                let prealloc_size = {
+                    let mut v = data.size();
+                    if v < 0 {
+                        if let Some(s) = user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-plain-size")) {
+                            if let Ok(parsed) = s.parse::<i64>() {
+                                v = parsed;
+                            }
+                        }
+                    }
+                    erasure.shard_file_size(v)
+                };
                 let writer = create_bitrot_writer(
                     is_inline_buffer,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
                     &tmp_object,
-                    erasure.shard_file_size(data.size()),
+                    prealloc_size,
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
@@ -3495,6 +3507,15 @@ impl ObjectIO for SetDisks {
             HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
         );
 
+        let mut logical_size = data.size();
+        if logical_size < 0 {
+            if let Some(s) = user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-plain-size")) {
+                if let Ok(parsed) = s.parse::<i64>() {
+                    logical_size = parsed;
+                }
+            }
+        }
+        tracing::debug!(bucket=%bucket, object=%object, declared_data_size=data.size(), logical_size=logical_size, shard_file_size=erasure.shard_file_size(logical_size), "before erasure encode");
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
             Ok((r, w)) => (r, w),
             Err(e) => {
@@ -3502,13 +3523,15 @@ impl ObjectIO for SetDisks {
                 return Err(e.into());
             }
         }; // TODO: 出错，删除临时目录
+        tracing::debug!(bucket=%bucket, object=%object, data_size=data.size(), encoded_total_bytes=w_size, "after erasure encode");
 
         let _ = mem::replace(&mut data.stream, reader);
         // if let Err(err) = close_bitrot_writers(&mut writers).await {
         //     error!("close_bitrot_writers err {:?}", err);
         // }
 
-        if (w_size as i64) < data.size() {
+        if data.size() >= 0 && (w_size as i64) < data.size() {
+            tracing::error!(bucket=%bucket, object=%object, data_size=data.size(), encoded_total_bytes=w_size, "encoded size smaller than declared data.size");
             return Err(Error::other("put_object write size < data.size()"));
         }
 

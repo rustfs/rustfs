@@ -9,6 +9,7 @@
 pub mod bucket_encryption_config;
 pub mod encryption_key_management;
 pub mod encryption_security;
+pub mod full_encryption_flow;
 pub mod rewrap;
 pub mod s3_encryption;
 
