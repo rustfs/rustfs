@@ -310,6 +310,8 @@ pub struct ObjectOptions {
     pub replication_request: bool,
     pub delete_marker: bool,
 
+    pub skip_free_version: bool,
+
     pub transition: TransitionOptions,
     pub expiration: ExpirationOptions,
     pub lifecycle_audit_event: LcAuditEvent,

@@ -156,11 +156,12 @@ pub enum StorageError {
     #[error("Object exists on :{0} as directory {1}")]
     ObjectExistsAsDirectory(String, String),
 
-    // #[error("Storage resources are insufficient for the read operation")]
-    // InsufficientReadQuorum,
+    #[error("Storage resources are insufficient for the read operation: {0}/{1}")]
+    InsufficientReadQuorum(String, String),
 
-    // #[error("Storage resources are insufficient for the write operation")]
-    // InsufficientWriteQuorum,
+    #[error("Storage resources are insufficient for the write operation: {0}/{1}")]
+    InsufficientWriteQuorum(String, String),
+
     #[error("Decommission not started")]
     DecommissionNotStarted,
     #[error("Decommission already running")]
@@ -413,6 +414,8 @@ impl Clone for StorageError {
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
             StorageError::Lock(e) => StorageError::Lock(e.clone()),
+            StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
+            StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
         }
     }
 }
@@ -476,6 +479,8 @@ impl StorageError {
             StorageError::TooManyOpenFiles => 0x36,
             StorageError::NoHealRequired => 0x37,
             StorageError::Lock(_) => 0x38,
+            StorageError::InsufficientReadQuorum(_, _) => 0x39,
+            StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
         }
     }
 
@@ -541,6 +546,8 @@ impl StorageError {
             0x36 => Some(StorageError::TooManyOpenFiles),
             0x37 => Some(StorageError::NoHealRequired),
             0x38 => Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string()))),
+            0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
+            0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
             _ => None,
         }
     }
@@ -751,6 +758,17 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
             let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
             StorageError::PrefixAccessDenied(bucket, object)
+        }
+
+        StorageError::ErasureReadQuorum => {
+            let bucket = params.first().cloned().unwrap_or_default().to_owned();
+            let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
+            StorageError::InsufficientReadQuorum(bucket, object)
+        }
+        StorageError::ErasureWriteQuorum => {
+            let bucket = params.first().cloned().unwrap_or_default().to_owned();
+            let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
+            StorageError::InsufficientWriteQuorum(bucket, object)
         }
 
         _ => err,
