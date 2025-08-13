@@ -23,7 +23,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// that rotates log files daily
 pub fn init_logger() -> WorkerGuard {
     // configuring rolling logs rolling by day
-    let home_dir = dirs::home_dir().expect("无法获取用户目录");
+    let home_dir = dirs::home_dir().expect("Unable to get user directory");
     let rustfs_dir = home_dir.join("rustfs");
     let logs_dir = rustfs_dir.join("logs");
     let file_appender = RollingFileAppender::builder()

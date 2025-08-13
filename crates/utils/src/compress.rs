@@ -289,44 +289,44 @@ mod tests {
             CompressionAlgorithm::Snappy,
         ];
 
-        println!("\n压缩算法基准测试结果:");
+        println!("\nCompression algorithm benchmark results:");
         println!(
             "{:<10} {:<10} {:<15} {:<15} {:<15}",
-            "数据大小", "算法", "压缩时间(ms)", "压缩后大小", "压缩率"
+            "Data Size", "Algorithm", "Compress Time(ms)", "Compressed Size", "Compression Ratio"
         );
 
         for size in sizes {
-            // 生成可压缩的数据（重复的文本模式）
+            // Generate compressible data (repeated text pattern)
             let pattern = b"Hello, this is a test pattern that will be repeated multiple times to create compressible data. ";
-            let data: Vec<u8> = pattern.iter().cycle().take(size).copied().collect();
+            let data = pattern.iter().cycle().take(size).cloned().collect::<Vec<u8>>();
 
             for algo in algorithms {
-                // 压缩测试
+                // Compression test
                 let start = Instant::now();
-                let compressed = compress_block(&data, algo);
-                let compress_time = start.elapsed();
+                let compressed = compress_block(&data, *algo).unwrap();
+                let compression_time = start.elapsed();
 
-                // 解压测试
+                // Decompression test
                 let start = Instant::now();
-                let _decompressed = decompress_block(&compressed, algo).unwrap();
-                let _decompress_time = start.elapsed();
+                let _decompressed = decompress_block(&compressed, *algo).unwrap();
+                let _decompression_time = start.elapsed();
 
-                // 计算压缩率
+                // Calculate compression ratio
                 let compression_ratio = (size as f64 / compressed.len() as f64) as f32;
 
                 println!(
                     "{:<10} {:<10} {:<15.2} {:<15} {:<15.2}x",
                     format!("{}KB", size / 1024),
                     algo.as_str(),
-                    compress_time.as_secs_f64() * 1000.0,
+                    compression_time.as_secs_f64() * 1000.0,
                     compressed.len(),
                     compression_ratio
                 );
 
-                // 验证解压结果
+                // Verify decompression result
                 assert_eq!(_decompressed, data);
             }
-            println!(); // 添加空行分隔不同大小的结果
+            println!(); // Add blank line to separate results of different sizes
         }
     }
 }
