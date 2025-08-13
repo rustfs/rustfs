@@ -26,13 +26,21 @@ RUN ARCH=$(cat /tmp/arch) && \
         echo "Unsupported architecture: $TARGETARCH" && exit 1; \
     fi && \
     if [ "${RELEASE}" = "latest" ]; then \
-        VERSION="latest"; \
+        # For latest, download from GitHub releases using the -latest suffix
+        PACKAGE_NAME="rustfs-linux-${ARCH}-latest.zip"; \
+        # Use GitHub API to get the latest release URL
+        LATEST_RELEASE_URL=$(curl -s https://api.github.com/repos/rustfs/rustfs/releases/latest | grep -o '"browser_download_url": "[^"]*'"${PACKAGE_NAME}"'"' | cut -d'"' -f4 | head -1); \
+        if [ -z "$LATEST_RELEASE_URL" ]; then \
+            echo "Failed to find latest release for ${PACKAGE_NAME}" >&2; \
+            exit 1; \
+        fi; \
+        DOWNLOAD_URL="$LATEST_RELEASE_URL"; \
     else \
+        # For specific versions, construct the GitHub release URL directly
         VERSION="v${RELEASE#v}"; \
+        PACKAGE_NAME="rustfs-linux-${ARCH}-${VERSION}.zip"; \
+        DOWNLOAD_URL="https://github.com/rustfs/rustfs/releases/download/${VERSION}/${PACKAGE_NAME}"; \
     fi && \
-    BASE_URL="https://dl.rustfs.com/artifacts/rustfs/release" && \
-    PACKAGE_NAME="rustfs-linux-${ARCH}-${VERSION}.zip" && \
-    DOWNLOAD_URL="${BASE_URL}/${PACKAGE_NAME}" && \
     echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}" >&2 && \
     curl -f -L "${DOWNLOAD_URL}" -o rustfs.zip && \
     unzip rustfs.zip -d /build && \
