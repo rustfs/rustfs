@@ -788,14 +788,14 @@ impl<T: Clone + Debug + Send + Sync + 'static> Cache<T> {
         }
 
         if self.opts.no_wait && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
-            if let Some(value) = v {
+            if let Some(value) = val.as_ref() {
                 if self.updating.try_lock().is_ok() {
                     let this = Arc::clone(&self);
                     spawn(async move {
                         let _ = this.update().await;
                     });
                 }
-                return Ok(value);
+                return Ok(value.clone());
             }
         }
 
