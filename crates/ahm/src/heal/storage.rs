@@ -133,8 +133,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
             Ok(info) => Ok(Some(info)),
             Err(e) => {
-                error!("Failed to get object meta: {}/{} - {}", bucket, object, e);
-                Err(Error::other(e))
+                // Map ObjectNotFound to None to align with Option return type
+                if matches!(e, rustfs_ecstore::error::StorageError::ObjectNotFound(_, _)) {
+                    debug!("Object meta not found: {}/{}", bucket, object);
+                    Ok(None)
+                } else {
+                    error!("Failed to get object meta: {}/{} - {}", bucket, object, e);
+                    Err(Error::other(e))
+                }
             }
         }
     }
@@ -142,22 +148,47 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn get_object_data(&self, bucket: &str, object: &str) -> Result<Option<Vec<u8>>> {
         debug!("Getting object data: {}/{}", bucket, object);
 
-        match (*self.ecstore)
+        let reader = match (*self.ecstore)
             .get_object_reader(bucket, object, None, Default::default(), &Default::default())
             .await
         {
-            Ok(mut reader) => match reader.read_all().await {
-                Ok(data) => Ok(Some(data)),
-                Err(e) => {
-                    error!("Failed to read object data: {}/{} - {}", bucket, object, e);
-                    Err(Error::other(e))
-                }
-            },
+            Ok(reader) => reader,
             Err(e) => {
                 error!("Failed to get object: {}/{} - {}", bucket, object, e);
-                Err(Error::other(e))
+                return Err(Error::other(e));
+            }
+        };
+
+        // WARNING: Returning Vec<u8> for large objects is dangerous. To avoid OOM, cap the read size.
+        // If needed, refactor callers to stream instead of buffering entire object.
+        const MAX_READ_BYTES: usize = 16 * 1024 * 1024; // 16 MiB cap
+        let mut buf = Vec::with_capacity(1024 * 1024);
+        use tokio::io::AsyncReadExt as _;
+        let mut n_read: usize = 0;
+        let mut stream = reader.stream;
+        loop {
+            // Read in chunks
+            let mut chunk = vec![0u8; 1024 * 1024];
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    n_read += n;
+                    if n_read > MAX_READ_BYTES {
+                        warn!(
+                            "Object data exceeds cap ({} bytes), aborting full read to prevent OOM: {}/{}",
+                            MAX_READ_BYTES, bucket, object
+                        );
+                        return Ok(None);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read object data: {}/{} - {}", bucket, object, e);
+                    return Err(Error::other(e));
+                }
             }
         }
+        Ok(Some(buf))
     }
 
     async fn put_object_data(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
@@ -197,27 +228,34 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<bool> {
         debug!("Verifying object integrity: {}/{}", bucket, object);
 
-        // Try to get object info and data to verify integrity
+        // Check object metadata first
         match self.get_object_meta(bucket, object).await? {
             Some(obj_info) => {
-                // Check if object has valid metadata
                 if obj_info.size < 0 {
                     warn!("Object has invalid size: {}/{}", bucket, object);
                     return Ok(false);
                 }
 
-                // Try to read object data to verify it's accessible
-                match self.get_object_data(bucket, object).await {
-                    Ok(Some(_)) => {
-                        info!("Object integrity check passed: {}/{}", bucket, object);
-                        Ok(true)
+                // Stream-read the object to a sink to avoid loading into memory
+                match (*self.ecstore)
+                    .get_object_reader(bucket, object, None, Default::default(), &Default::default())
+                    .await
+                {
+                    Ok(reader) => {
+                        let mut stream = reader.stream;
+                        match tokio::io::copy(&mut stream, &mut tokio::io::sink()).await {
+                            Ok(_) => {
+                                info!("Object integrity check passed: {}/{}", bucket, object);
+                                Ok(true)
+                            }
+                            Err(e) => {
+                                warn!("Object stream read failed: {}/{} - {}", bucket, object, e);
+                                Ok(false)
+                            }
+                        }
                     }
-                    Ok(None) => {
-                        warn!("Object data not found: {}/{}", bucket, object);
-                        Ok(false)
-                    }
-                    Err(_) => {
-                        warn!("Object data read failed: {}/{}", bucket, object);
+                    Err(e) => {
+                        warn!("Failed to get object reader: {}/{} - {}", bucket, object, e);
                         Ok(false)
                     }
                 }

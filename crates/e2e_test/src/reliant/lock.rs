@@ -41,6 +41,79 @@ fn get_cluster_endpoints() -> Vec<Endpoint> {
 #[tokio::test]
 #[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
+async fn test_guard_drop_releases_exclusive_lock_local() -> Result<(), Box<dyn Error>> {
+    // Single local client; no external server required
+    let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+    let ns_lock = NamespaceLock::with_clients("e2e_guard_local".to_string(), vec![client]);
+
+    // Acquire exclusive guard
+    let g1 = ns_lock
+        .lock_guard("guard_exclusive", "owner1", Duration::from_millis(100), Duration::from_secs(5))
+        .await?;
+    assert!(g1.is_some(), "first guard acquisition should succeed");
+
+    // While g1 is alive, second exclusive acquisition should fail
+    let g2 = ns_lock
+        .lock_guard("guard_exclusive", "owner2", Duration::from_millis(50), Duration::from_secs(5))
+        .await?;
+    assert!(g2.is_none(), "second guard acquisition should fail while first is held");
+
+    // Drop first guard to trigger background release
+    drop(g1);
+    // Give the background unlock worker a short moment to process
+    sleep(Duration::from_millis(80)).await;
+
+    // Now acquisition should succeed
+    let g3 = ns_lock
+        .lock_guard("guard_exclusive", "owner2", Duration::from_millis(100), Duration::from_secs(5))
+        .await?;
+    assert!(g3.is_some(), "acquisition should succeed after guard drop releases the lock");
+    drop(g3);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires running RustFS server at localhost:9000"]
+async fn test_guard_shared_then_write_after_drop() -> Result<(), Box<dyn Error>> {
+    // Two shared read guards should coexist; write should be blocked until they drop
+    let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+    let ns_lock = NamespaceLock::with_clients("e2e_guard_rw".to_string(), vec![client]);
+
+    // Acquire two read guards
+    let r1 = ns_lock
+        .rlock_guard("rw_resource", "reader1", Duration::from_millis(100), Duration::from_secs(5))
+        .await?;
+    let r2 = ns_lock
+        .rlock_guard("rw_resource", "reader2", Duration::from_millis(100), Duration::from_secs(5))
+        .await?;
+    assert!(r1.is_some() && r2.is_some(), "both read guards should be acquired");
+
+    // Attempt write while readers hold the lock should fail
+    let w_fail = ns_lock
+        .lock_guard("rw_resource", "writer", Duration::from_millis(50), Duration::from_secs(5))
+        .await?;
+    assert!(w_fail.is_none(), "write should be blocked when read guards are active");
+
+    // Drop read guards to release
+    drop(r1);
+    drop(r2);
+    sleep(Duration::from_millis(80)).await;
+
+    // Now write should succeed
+    let w_ok = ns_lock
+        .lock_guard("rw_resource", "writer", Duration::from_millis(150), Duration::from_secs(5))
+        .await?;
+    assert!(w_ok.is_some(), "write should succeed after read guards are dropped");
+    drop(w_ok);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     let args = LockRequest {
         lock_id: LockId::new_deterministic("dandan"),

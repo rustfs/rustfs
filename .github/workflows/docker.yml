@@ -36,8 +36,8 @@ permissions:
 on:
   # Automatically triggered when build workflow completes
   workflow_run:
-    workflows: ["Build and Release"]
-    types: [completed]
+    workflows: [ "Build and Release" ]
+    types: [ completed ]
   # Manual trigger with same parameters for consistency
   workflow_dispatch:
     inputs:
@@ -79,7 +79,7 @@ jobs:
       create_latest: ${{ steps.check.outputs.create_latest }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           # For workflow_run events, checkout the specific commit that triggered the workflow
@@ -250,7 +250,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -382,7 +382,7 @@ jobs:
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
-    needs: [build-check, build-docker]
+    needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:

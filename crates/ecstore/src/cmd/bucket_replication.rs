@@ -1897,7 +1897,7 @@ impl ReplicationState {
         } else if !self.replica_status.is_empty() {
             self.replica_status.clone()
         } else {
-            return ReplicationStatusType::Unknown;
+            ReplicationStatusType::Unknown
         }
     }
 

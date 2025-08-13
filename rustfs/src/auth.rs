@@ -490,11 +490,9 @@ mod tests {
         let result = check_claims_from_token("", &cred);
 
         // This might fail due to global state dependencies, but should return error about global cred init
-        if result.is_ok() {
-            let claims = result.unwrap();
+        if let Ok(claims) = result {
             assert!(claims.is_empty());
-        } else {
-            let error = result.unwrap_err();
+        } else if let Err(error) = result {
             assert_eq!(error.code(), &S3ErrorCode::InternalError);
             assert!(error.message().unwrap_or("").contains("action cred not init"));
         }

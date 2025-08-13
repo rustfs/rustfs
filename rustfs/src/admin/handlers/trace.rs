@@ -22,6 +22,7 @@ use tracing::warn;
 
 use crate::admin::router::Operation;
 
+#[allow(dead_code)]
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     let mut st_opts = ServiceTraceOpts::default();
     st_opts
@@ -31,6 +32,7 @@ fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     Ok(st_opts)
 }
 
+#[allow(dead_code)]
 pub struct Trace {}
 
 #[async_trait::async_trait]

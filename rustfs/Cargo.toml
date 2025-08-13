@@ -54,8 +54,6 @@ rustfs-s3select-query = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
-axum-extra = { workspace = true }
-axum-server = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

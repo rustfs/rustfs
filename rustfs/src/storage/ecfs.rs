@@ -21,7 +21,7 @@ use crate::error::ApiError;
 use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;
-use crate::storage::options::{extract_metadata_from_mime, get_opts};
+use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_opts};
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
@@ -1318,7 +1318,7 @@ impl S3 for FS {
         let objects: Vec<ObjectVersion> = object_infos
             .objects
             .iter()
-            .filter(|v| !v.name.is_empty())
+            .filter(|v| !v.name.is_empty() && !v.delete_marker)
             .map(|v| {
                 ObjectVersion {
                     key: Some(v.name.to_owned()),
@@ -1340,6 +1340,19 @@ impl S3 for FS {
             .map(|v| CommonPrefix { prefix: Some(v) })
             .collect();
 
+        let delete_markers = object_infos
+            .objects
+            .iter()
+            .filter(|o| o.delete_marker)
+            .map(|o| DeleteMarkerEntry {
+                key: Some(o.name.clone()),
+                version_id: o.version_id.map(|v| v.to_string()),
+                is_latest: Some(o.is_latest),
+                last_modified: o.mod_time.map(Timestamp::from),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
         let output = ListObjectVersionsOutput {
             // is_truncated: Some(object_infos.is_truncated),
             max_keys: Some(key_count),
@@ -1348,6 +1361,7 @@ impl S3 for FS {
             prefix: Some(prefix),
             common_prefixes: Some(common_prefixes),
             versions: Some(objects),
+            delete_markers: Some(delete_markers),
             ..Default::default()
         };
 
@@ -1412,7 +1426,7 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
-        extract_metadata_from_mime(&req.headers, &mut metadata);
+        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, Some(&key));
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
