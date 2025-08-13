@@ -112,8 +112,12 @@ sysctl = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = "0.6"
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "windows")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
+jemalloc_pprof = { workspace = true }
+pprof = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

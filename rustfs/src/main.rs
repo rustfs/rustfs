@@ -57,9 +57,14 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+// #[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Configure Jemalloc memory analysis parameters
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0";
 
 #[instrument]
 fn print_server_info() {
