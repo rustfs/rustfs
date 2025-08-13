@@ -236,17 +236,17 @@ impl ServiceManager {
     /// Validates a port number is within valid range and not reserved
     fn validate_port(port: u16) -> Result<(), Box<dyn Error>> {
         if port == 0 {
-            return Err("端口号不能为0".into());
+            return Err("Port number cannot be 0".into());
         }
         if port < 1024 && !cfg!(windows) {
-            return Err("端口号小于1024需要管理员权限".into());
+            return Err("Port numbers below 1024 require administrator privileges".into());
         }
         Ok(())
     }
 
     /// Safely parse and validate a port string
     fn parse_and_validate_port(port_str: &str) -> Result<u16, Box<dyn Error>> {
-        let port = port_str.parse::<u16>().map_err(|_| format!("无效的端口号: {port_str}"))?;
+        let port = port_str.parse::<u16>().map_err(|_| format!("Invalid port number: {port_str}"))?;
         Self::validate_port(port)?;
         Ok(port)
     }
