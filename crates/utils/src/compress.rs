@@ -298,17 +298,17 @@ mod tests {
         for size in sizes {
             // Generate compressible data (repeated text pattern)
             let pattern = b"Hello, this is a test pattern that will be repeated multiple times to create compressible data. ";
-            let data = pattern.iter().cycle().take(size).cloned().collect::<Vec<u8>>();
+            let data: Vec<u8> = pattern.iter().cycle().take(size).copied().collect();
 
             for algo in algorithms {
                 // Compression test
                 let start = Instant::now();
-                let compressed = compress_block(&data, *algo).unwrap();
+                let compressed = compress_block(&data, algo);
                 let compression_time = start.elapsed();
 
                 // Decompression test
                 let start = Instant::now();
-                let _decompressed = decompress_block(&compressed, *algo).unwrap();
+                let _decompressed = decompress_block(&compressed, algo).unwrap();
                 let _decompression_time = start.elapsed();
 
                 // Calculate compression ratio
