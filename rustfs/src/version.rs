@@ -231,7 +231,7 @@ mod tests {
         // Test beta.5 -> beta.6
         assert_eq!(increment_pre_release("beta.5"), Some("beta.6".to_string()));
 
-        // Test unparseable case
+        // Test unparsable case
         assert_eq!(increment_pre_release("unknown"), None);
     }
 
