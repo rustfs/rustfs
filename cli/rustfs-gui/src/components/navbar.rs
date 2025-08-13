@@ -36,7 +36,7 @@ pub fn Navbar() -> Element {
 pub struct LoadingSpinnerProps {
     #[props(default = true)]
     loading: bool,
-    #[props(default = "正在处理中...")]
+    #[props(default = "Processing...")]
     text: &'static str,
 }
 

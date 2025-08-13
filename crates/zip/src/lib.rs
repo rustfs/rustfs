@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_format_consistency_with_extensions() {
-        // 测试格式与扩展名的一致性
+        // Test format consistency with extensions
         let consistency_tests = vec![
             (CompressionFormat::Gzip, "gz"),
             (CompressionFormat::Bzip2, "bz2"),
@@ -721,20 +721,20 @@ mod tests {
 
     #[test]
     fn test_compression_format_clone_and_copy() {
-        // 测试 CompressionFormat 是否可以被复制
+        // Test if CompressionFormat can be copied
         let format = CompressionFormat::Gzip;
         let format_copy = format;
 
-        // 验证复制后的值相等
+        // Verify copied values are equal
         assert_eq!(format, format_copy);
 
-        // 验证原值仍然可用
+        // Verify original value is still usable
         assert_eq!(format, CompressionFormat::Gzip);
     }
 
     #[test]
     fn test_compression_format_match_exhaustiveness() {
-        // 测试 match 语句的完整性
+        // Test match statement completeness
         fn handle_format(format: CompressionFormat) -> &'static str {
             match format {
                 CompressionFormat::Gzip => "gzip",
@@ -748,7 +748,7 @@ mod tests {
             }
         }
 
-        // 测试所有变体都有对应的处理
+        // Test all variants have corresponding handlers
         assert_eq!(handle_format(CompressionFormat::Gzip), "gzip");
         assert_eq!(handle_format(CompressionFormat::Bzip2), "bzip2");
         assert_eq!(handle_format(CompressionFormat::Zip), "zip");
@@ -760,10 +760,10 @@ mod tests {
 
     #[test]
     fn test_extension_parsing_performance() {
-        // 测试扩展名解析的性能（简单的性能测试）
+        // Test extension parsing performance (simple performance test)
         let extensions = vec!["gz", "bz2", "zip", "xz", "zlib", "zst", "unknown"];
 
-        // 多次调用以测试性能一致性
+        // Multiple calls to test performance consistency
         for _ in 0..1000 {
             for ext in &extensions {
                 let _format = CompressionFormat::from_extension(ext);
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_format_default_behavior() {
-        // 测试格式的默认行为
+        // Test format default behavior
         let unknown_extensions = vec!["", "txt", "doc", "pdf", "unknown_ext"];
 
         for ext in unknown_extensions {
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_compression_level() {
-        // 测试压缩级别
+        // Test compression level
         let default_level = CompressionLevel::default();
         assert_eq!(default_level, CompressionLevel::Default);
 
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_format_extension() {
-        // 测试格式扩展名获取
+        // Test format extension retrieval
         assert_eq!(CompressionFormat::Gzip.extension(), "gz");
         assert_eq!(CompressionFormat::Bzip2.extension(), "bz2");
         assert_eq!(CompressionFormat::Zip.extension(), "zip");
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn test_format_is_supported() {
-        // 测试格式支持检查
+        // Test format support check
         assert!(CompressionFormat::Gzip.is_supported());
         assert!(CompressionFormat::Bzip2.is_supported());
         assert!(CompressionFormat::Zip.is_supported());
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn test_format_from_path() {
-        // 测试从路径识别格式
+        // Test format recognition from path
         use std::path::Path;
 
         assert_eq!(CompressionFormat::from_path("file.gz"), CompressionFormat::Gzip);
@@ -840,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_encoder_supported_formats() {
-        // 测试支持的格式能够创建编码器
+        // Test supported formats can create encoders
         use std::io::Cursor;
 
         let output = Vec::new();
@@ -853,7 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_encoder_unsupported_formats() {
-        // 测试不支持的格式返回错误
+        // Test unsupported formats return errors
         use std::io::Cursor;
 
         let output1 = Vec::new();
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_decompressor_creation() {
-        // 测试解压缩器创建
+        // Test decompressor creation
         let decompressor = Decompressor::new(CompressionFormat::Gzip);
         assert_eq!(decompressor.format, CompressionFormat::Gzip);
 
@@ -910,7 +910,7 @@ mod tests {
 
     #[test]
     fn test_zip_entry_creation() {
-        // 测试 ZIP 条目信息创建
+        // Test ZIP entry info creation
         let entry = ZipEntry {
             name: "test.txt".to_string(),
             size: 1024,
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_compression_level_variants() {
-        // 测试压缩级别的所有变体
+        // Test all compression level variants
         let levels = vec![
             CompressionLevel::Fastest,
             CompressionLevel::Best,
@@ -938,14 +938,14 @@ mod tests {
         ];
 
         for level in levels {
-            // 验证每个级别都有对应的 Debug 实现
+            // Verify each level has corresponding Debug implementation
             let _debug_str = format!("{level:?}");
         }
     }
 
     #[test]
     fn test_format_comprehensive_coverage() {
-        // 测试格式的全面覆盖
+        // Test comprehensive format coverage
         let all_formats = vec![
             CompressionFormat::Gzip,
             CompressionFormat::Bzip2,
@@ -958,13 +958,13 @@ mod tests {
         ];
 
         for format in all_formats {
-            // 验证每个格式都有扩展名
+            // Verify each format has an extension
             let _ext = format.extension();
 
-            // 验证支持状态检查
+            // Verify support status check
             let _supported = format.is_supported();
 
-            // 验证 Debug 实现
+            // Verify Debug implementation
             let _debug = format!("{format:?}");
         }
     }
@@ -975,7 +975,7 @@ mod tests {
 //     use std::path::Path;
 //     use tokio::fs::File;
 
-//     let input_path = "/Users/weisd/Downloads/wsd.tar.gz"; // 替换为你的压缩文件路径
+//     let input_path = "/Users/weisd/Downloads/wsd.tar.gz"; // Replace with your compressed file path
 
 //     let f = File::open(input_path).await?;
 
@@ -994,8 +994,8 @@ mod tests {
 //     )
 //     .await
 //     {
-//         Ok(_) => println!("解压成功！"),
-//         Err(e) => println!("解压失败：{}", e),
+//         Ok(_) => println!("Decompression successful!"),
+//         Err(e) => println!("Decompression failed: {}", e),
 //     }
 
 //     Ok(())

@@ -53,9 +53,9 @@ pub trait QueryExecution: Send + Sync {
     fn query_type(&self) -> QueryType {
         QueryType::Batch
     }
-    // 开始
+    // Start
     async fn start(&self) -> QueryResult<Output>;
-    // 停止
+    // Stop
     fn cancel(&self) -> QueryResult<()>;
 }
 

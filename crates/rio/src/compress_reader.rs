@@ -443,7 +443,7 @@ mod tests {
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
 
-        // DecompressReader解包
+        // DecompressReader unpacking
         let mut decompress_reader = DecompressReader::new(Cursor::new(compressed.clone()), CompressionAlgorithm::Gzip);
         let mut decompressed = Vec::new();
         decompress_reader.read_to_end(&mut decompressed).await.unwrap();
@@ -460,7 +460,7 @@ mod tests {
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
 
-        // DecompressReader解包
+        // DecompressReader unpacking
         let mut decompress_reader = DecompressReader::new(Cursor::new(compressed.clone()), CompressionAlgorithm::Deflate);
         let mut decompressed = Vec::new();
         decompress_reader.read_to_end(&mut decompressed).await.unwrap();

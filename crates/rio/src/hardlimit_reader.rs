@@ -123,7 +123,7 @@ mod tests {
         let hardlimit = HardLimitReader::new(reader, 3);
         let mut r = hardlimit;
         let mut buf = vec![0u8; 10];
-        // 读取超限，应该返回错误
+        // Reading exceeds limit, should return error
         let err = match read_full(&mut r, &mut buf).await {
             Ok(n) => {
                 println!("Read {n} bytes");

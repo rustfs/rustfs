@@ -1,5 +1,5 @@
 ###########
-# 远程开发，需要 VSCode 安装 Dev Containers, Remote SSH, Remote Explorer
+# Remote development requires VSCode with Dev Containers, Remote SSH, Remote Explorer
 # https://code.visualstudio.com/docs/remote/containers
 ###########
 DOCKER_CLI ?= docker
@@ -126,7 +126,7 @@ docker-buildx-push:
 .PHONY: docker-buildx-version
 docker-buildx-version:
 	@if [ -z "$(VERSION)" ]; then \
-		echo "❌ 错误: 请指定版本, 例如: make docker-buildx-version VERSION=v1.0.0"; \
+		echo "❌ Error: Please specify version, example: make docker-buildx-version VERSION=v1.0.0"; \
 		exit 1; \
 	fi
 	@echo "🏗️ Building multi-architecture production Docker images (version: $(VERSION))..."
@@ -135,7 +135,7 @@ docker-buildx-version:
 .PHONY: docker-buildx-push-version
 docker-buildx-push-version:
 	@if [ -z "$(VERSION)" ]; then \
-		echo "❌ 错误: 请指定版本, 例如: make docker-buildx-push-version VERSION=v1.0.0"; \
+		echo "❌ Error: Please specify version, example: make docker-buildx-push-version VERSION=v1.0.0"; \
 		exit 1; \
 	fi
 	@echo "🚀 Building and pushing multi-architecture production Docker images (version: $(VERSION))..."
@@ -168,11 +168,11 @@ docker-dev-local:
 .PHONY: docker-dev-push
 docker-dev-push:
 	@if [ -z "$(REGISTRY)" ]; then \
-		echo "❌ 错误: 请指定镜像仓库, 例如: make docker-dev-push REGISTRY=ghcr.io/username"; \
+		echo "❌ Error: Please specify registry, example: make docker-dev-push REGISTRY=ghcr.io/username"; \
 		exit 1; \
 	fi
 	@echo "🚀 Building and pushing multi-architecture development Docker images..."
-	@echo "💡 推送到仓库: $(REGISTRY)"
+	@echo "💡 Pushing to registry: $(REGISTRY)"
 	$(DOCKER_CLI) buildx build \
 		--platform linux/amd64,linux/arm64 \
 		--file $(DOCKERFILE_SOURCE) \
@@ -249,7 +249,7 @@ dev-env-restart: dev-env-stop dev-env-start
 .PHONY: docker-inspect-multiarch
 docker-inspect-multiarch:
 	@if [ -z "$(IMAGE)" ]; then \
-		echo "❌ 错误: 请指定镜像, 例如: make docker-inspect-multiarch IMAGE=rustfs/rustfs:latest"; \
+		echo "❌ Error: Please specify image, example: make docker-inspect-multiarch IMAGE=rustfs/rustfs:latest"; \
 		exit 1; \
 	fi
 	@echo "🔍 Inspecting multi-architecture image: $(IMAGE)"
@@ -277,93 +277,93 @@ build-cross-all:
 
 .PHONY: help-build
 help-build:
-	@echo "🔨 RustFS 构建帮助："
+	@echo "🔨 RustFS Build Help:"
 	@echo ""
-	@echo "🚀 本地构建 (推荐使用):"
-	@echo "  make build                               # 构建 RustFS 二进制文件 (默认包含 console)"
-	@echo "  make build-dev                           # 开发模式构建"
-	@echo "  make build-musl                          # 构建 x86_64 musl 版本"
-	@echo "  make build-gnu                           # 构建 x86_64 GNU 版本"
-	@echo "  make build-musl-arm64                    # 构建 aarch64 musl 版本"
-	@echo "  make build-gnu-arm64                     # 构建 aarch64 GNU 版本"
+	@echo "🚀 Local Build (Recommended):"
+	@echo "  make build                               # Build RustFS binary (includes console by default)"
+	@echo "  make build-dev                           # Development mode build"
+	@echo "  make build-musl                          # Build x86_64 musl version"
+	@echo "  make build-gnu                           # Build x86_64 GNU version"
+	@echo "  make build-musl-arm64                    # Build aarch64 musl version"
+	@echo "  make build-gnu-arm64                     # Build aarch64 GNU version"
 	@echo ""
-	@echo "🐳 Docker 构建:"
-	@echo "  make build-docker                        # 使用 Docker 容器构建"
-	@echo "  make build-docker BUILD_OS=ubuntu22.04   # 指定构建系统"
+	@echo "🐳 Docker Build:"
+	@echo "  make build-docker                        # Build using Docker container"
+	@echo "  make build-docker BUILD_OS=ubuntu22.04   # Specify build system"
 	@echo ""
-	@echo "🏗️ 跨架构构建:"
-	@echo "  make build-cross-all                     # 构建所有架构的二进制文件"
+	@echo "🏗️ Cross-architecture Build:"
+	@echo "  make build-cross-all                     # Build binaries for all architectures"
 	@echo ""
-	@echo "🔧 直接使用 build-rustfs.sh 脚本:"
-	@echo "  ./build-rustfs.sh --help                 # 查看脚本帮助"
-	@echo "  ./build-rustfs.sh --no-console           # 构建时跳过 console 资源"
-	@echo "  ./build-rustfs.sh --force-console-update # 强制更新 console 资源"
-	@echo "  ./build-rustfs.sh --dev                  # 开发模式构建"
-	@echo "  ./build-rustfs.sh --sign                 # 签名二进制文件"
-	@echo "  ./build-rustfs.sh --platform x86_64-unknown-linux-gnu   # 指定目标平台"
-	@echo "  ./build-rustfs.sh --skip-verification    # 跳过二进制验证"
+	@echo "🔧 Direct usage of build-rustfs.sh script:"
+	@echo "  ./build-rustfs.sh --help                 # View script help"
+	@echo "  ./build-rustfs.sh --no-console           # Build without console resources"
+	@echo "  ./build-rustfs.sh --force-console-update # Force update console resources"
+	@echo "  ./build-rustfs.sh --dev                  # Development mode build"
+	@echo "  ./build-rustfs.sh --sign                 # Sign binary files"
+	@echo "  ./build-rustfs.sh --platform x86_64-unknown-linux-gnu   # Specify target platform"
+	@echo "  ./build-rustfs.sh --skip-verification    # Skip binary verification"
 	@echo ""
-	@echo "💡 build-rustfs.sh 脚本提供了更多选项、智能检测和二进制验证功能"
+	@echo "💡 build-rustfs.sh script provides more options, smart detection and binary verification"
 
 .PHONY: help-docker
 help-docker:
-	@echo "🐳 Docker 多架构构建帮助："
+	@echo "🐳 Docker Multi-architecture Build Help:"
 	@echo ""
-	@echo "🚀 生产镜像构建 (推荐使用 docker-buildx.sh):"
-	@echo "  make docker-buildx                       # 构建生产多架构镜像（不推送）"
-	@echo "  make docker-buildx-push                  # 构建并推送生产多架构镜像"
-	@echo "  make docker-buildx-version VERSION=v1.0.0        # 构建指定版本"
-	@echo "  make docker-buildx-push-version VERSION=v1.0.0   # 构建并推送指定版本"
+	@echo "🚀 Production Image Build (Recommended to use docker-buildx.sh):"
+	@echo "  make docker-buildx                       # Build production multi-arch image (no push)"
+	@echo "  make docker-buildx-push                  # Build and push production multi-arch image"
+	@echo "  make docker-buildx-version VERSION=v1.0.0        # Build specific version"
+	@echo "  make docker-buildx-push-version VERSION=v1.0.0   # Build and push specific version"
 	@echo ""
-	@echo "🔧 开发/源码镜像构建 (本地开发测试):"
-	@echo "  make docker-dev                          # 构建开发多架构镜像（无法本地加载）"
-	@echo "  make docker-dev-local                    # 构建开发单架构镜像（本地加载）"
-	@echo "  make docker-dev-push REGISTRY=xxx       # 构建并推送开发镜像"
+	@echo "🔧 Development/Source Image Build (Local development testing):"
+	@echo "  make docker-dev                          # Build dev multi-arch image (cannot load locally)"
+	@echo "  make docker-dev-local                    # Build dev single-arch image (local load)"
+	@echo "  make docker-dev-push REGISTRY=xxx       # Build and push dev image"
 	@echo ""
-	@echo "🏗️ 本地生产镜像构建 (替代方案):"
-	@echo "  make docker-buildx-production-local      # 本地构建生产单架构镜像"
+	@echo "🏗️ Local Production Image Build (Alternative):"
+	@echo "  make docker-buildx-production-local      # Build production single-arch image locally"
 	@echo ""
-	@echo "📦 单架构构建 (传统方式):"
-	@echo "  make docker-build-production             # 构建单架构生产镜像"
-	@echo "  make docker-build-source                 # 构建单架构源码镜像"
+	@echo "📦 Single-architecture Build (Traditional way):"
+	@echo "  make docker-build-production             # Build single-arch production image"
+	@echo "  make docker-build-source                 # Build single-arch source image"
 	@echo ""
-	@echo "🚀 开发环境管理:"
-	@echo "  make dev-env-start                       # 启动开发容器环境"
-	@echo "  make dev-env-stop                        # 停止开发容器环境"
-	@echo "  make dev-env-restart                     # 重启开发容器环境"
+	@echo "🚀 Development Environment Management:"
+	@echo "  make dev-env-start                       # Start development container environment"
+	@echo "  make dev-env-stop                        # Stop development container environment"
+	@echo "  make dev-env-restart                     # Restart development container environment"
 	@echo ""
-	@echo "🔧 辅助工具:"
-	@echo "  make build-cross-all                     # 构建所有架构的二进制文件"
-	@echo "  make docker-inspect-multiarch IMAGE=xxx  # 检查镜像的架构支持"
+	@echo "🔧 Auxiliary Tools:"
+	@echo "  make build-cross-all                     # Build binaries for all architectures"
+	@echo "  make docker-inspect-multiarch IMAGE=xxx  # Check image architecture support"
 	@echo ""
-	@echo "📋 环境变量:"
-	@echo "  REGISTRY          镜像仓库地址 (推送时需要)"
-	@echo "  DOCKERHUB_USERNAME    Docker Hub 用户名"
-	@echo "  DOCKERHUB_TOKEN       Docker Hub 访问令牌"
-	@echo "  GITHUB_TOKEN          GitHub 访问令牌"
+	@echo "📋 Environment Variables:"
+	@echo "  REGISTRY          Image registry address (required for push)"
+	@echo "  DOCKERHUB_USERNAME    Docker Hub username"
+	@echo "  DOCKERHUB_TOKEN       Docker Hub access token"
+	@echo "  GITHUB_TOKEN          GitHub access token"
 	@echo ""
-	@echo "💡 建议："
-	@echo "  - 生产用途: 使用 docker-buildx* 命令 (基于预编译二进制)"
-	@echo "  - 本地开发: 使用 docker-dev* 命令 (从源码构建)"
-	@echo "  - 开发环境: 使用 dev-env-* 命令管理开发容器"
+	@echo "💡 Suggestions:"
+	@echo "  - Production use: Use docker-buildx* commands (based on precompiled binaries)"
+	@echo "  - Local development: Use docker-dev* commands (build from source)"
+	@echo "  - Development environment: Use dev-env-* commands to manage dev containers"
 
 .PHONY: help
 help:
-	@echo "🦀 RustFS Makefile 帮助："
+	@echo "🦀 RustFS Makefile Help:"
 	@echo ""
-	@echo "📋 主要命令分类："
-	@echo "  make help-build                          # 显示构建相关帮助"
-	@echo "  make help-docker                         # 显示 Docker 相关帮助"
+	@echo "📋 Main Command Categories:"
+	@echo "  make help-build                          # Show build-related help"
+	@echo "  make help-docker                         # Show Docker-related help"
 	@echo ""
-	@echo "🔧 代码质量："
-	@echo "  make fmt                                 # 格式化代码"
-	@echo "  make clippy                              # 运行 clippy 检查"
-	@echo "  make test                                # 运行测试"
-	@echo "  make pre-commit                          # 运行所有预提交检查"
+	@echo "🔧 Code Quality:"
+	@echo "  make fmt                                 # Format code"
+	@echo "  make clippy                              # Run clippy checks"
+	@echo "  make test                                # Run tests"
+	@echo "  make pre-commit                          # Run all pre-commit checks"
 	@echo ""
-	@echo "🚀 快速开始："
-	@echo "  make build                               # 构建 RustFS 二进制"
-	@echo "  make docker-dev-local                    # 构建开发 Docker 镜像（本地）"
-	@echo "  make dev-env-start                       # 启动开发环境"
+	@echo "🚀 Quick Start:"
+	@echo "  make build                               # Build RustFS binary"
+	@echo "  make docker-dev-local                    # Build development Docker image (local)"
+	@echo "  make dev-env-start                       # Start development environment"
 	@echo ""
-	@echo "💡 更多帮助请使用 'make help-build' 或 'make help-docker'"
+	@echo "💡 For more help use 'make help-build' or 'make help-docker'"
