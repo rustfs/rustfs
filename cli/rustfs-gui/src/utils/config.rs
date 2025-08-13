@@ -139,7 +139,7 @@ impl RustFSConfig {
                 if !stored_config.address.is_empty() && stored_config.address != Self::DEFAULT_ADDRESS_VALUE {
                     config.address = stored_config.address;
                     let (host, port) = Self::extract_host_port(config.address.as_str())
-                        .ok_or_else(|| format!("无法从地址 '{}' 中提取主机和端口", config.address))?;
+                        .ok_or_else(|| format!("Unable to extract host and port from address '{}'", config.address))?;
                     config.host = host.to_string();
                     config.port = port.to_string();
                 }
@@ -538,17 +538,17 @@ mod tests {
             address: "127.0.0.1:9000".to_string(),
             host: "127.0.0.1".to_string(),
             port: "9000".to_string(),
-            access_key: "用户名".to_string(),
-            secret_key: "密码 123".to_string(),
-            domain_name: "测试.com".to_string(),
-            volume_name: "/数据/存储".to_string(),
+            access_key: "username".to_string(),
+            secret_key: "password123".to_string(),
+            domain_name: "test.com".to_string(),
+            volume_name: "/data/storage".to_string(),
             console_address: "127.0.0.1:9001".to_string(),
         };
 
-        assert_eq!(config.access_key, "用户名");
-        assert_eq!(config.secret_key, "密码 123");
-        assert_eq!(config.domain_name, "测试.com");
-        assert_eq!(config.volume_name, "/数据/存储");
+        assert_eq!(config.access_key, "username");
+        assert_eq!(config.secret_key, "password123");
+        assert_eq!(config.domain_name, "test.com");
+        assert_eq!(config.volume_name, "/data/storage");
     }
 
     #[test]

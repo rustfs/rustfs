@@ -223,7 +223,7 @@ mod tests {
         let n = etag_reader.read_to_end(&mut buf).await.unwrap();
         assert_eq!(n, data.len());
         assert_eq!(&buf, data);
-        // 校验通过，etag应等于expected
+        // Verification passed, etag should equal expected
         assert_eq!(etag_reader.try_resolve_etag(), Some(expected));
     }
 
@@ -236,7 +236,7 @@ mod tests {
         let mut etag_reader = EtagReader::new(reader, Some(wrong_checksum));
 
         let mut buf = Vec::new();
-        // 校验失败，应该返回InvalidData错误
+        // Verification failed, should return InvalidData error
         let err = etag_reader.read_to_end(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
