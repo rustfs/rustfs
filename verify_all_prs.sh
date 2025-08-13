@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🔍 验证所有PR分支的CI状态..."
+echo "🔍 Verifying CI status of all PR branches..."
 
 branches=(
     "feature/add-auth-module-tests"
@@ -14,41 +14,41 @@ cd /workspace
 
 for branch in "${branches[@]}"; do
     echo ""
-    echo "🌟 检查分支: $branch"
+    echo "🌟 Checking branch: $branch"
     
     git checkout $branch 2>/dev/null
     
-    echo "📝 检查代码格式..."
+    echo "📝 Checking code format..."
     if cargo fmt --all --check; then
-        echo "✅ 代码格式正确"
+        echo "✅ Code format is correct"
     else
-        echo "❌ 代码格式有问题"
+        echo "❌ Code format has issues"
     fi
     
-    echo "🔧 检查基本编译..."
+    echo "🔧 Checking basic compilation..."
     if cargo check --quiet; then
-        echo "✅ 基本编译通过"
+        echo "✅ Basic compilation passed"
     else
-        echo "❌ 编译失败"
+        echo "❌ Compilation failed"
     fi
     
-    echo "🧪 运行核心测试..."
+    echo "🧪 Running core tests..."
     if timeout 60 cargo test --lib --quiet 2>/dev/null; then
-        echo "✅ 核心测试通过"
+        echo "✅ Core tests passed"
     else
-        echo "⚠️  测试超时或失败（可能是依赖问题）"
+        echo "⚠️  Tests timed out or failed (possibly dependency issues)"
     fi
 done
 
 echo ""
-echo "🎉 所有分支检查完毕！"
+echo "🎉 All branches checked!"
 echo ""
-echo "📋 PR状态总结:"
+echo "📋 PR status summary:"
 echo "- PR #309: feature/add-auth-module-tests"
 echo "- PR #313: feature/add-storage-core-tests"  
 echo "- PR #314: feature/add-admin-handlers-tests"
 echo "- PR #315: feature/add-server-components-tests"
 echo "- PR #316: feature/add-integration-tests"
 echo ""
-echo "✅ 所有冲突已解决，代码已格式化"
-echo "🔗 请检查GitHub上的CI状态"
+echo "✅ All conflicts resolved, code formatted"
+echo "🔗 Please check CI status on GitHub"
