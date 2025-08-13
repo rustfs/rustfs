@@ -158,7 +158,7 @@ pub fn Home() -> Element {
         Meta {
             name: "description",
             // TODO: translate to english
-            content: "RustFS RustFS 用热门安全的 Rust 语言开发，兼容 S3 协议。适用于 AI/ML 及海量数据存储、大数据、互联网、工业和保密存储等全部场景。近乎免费使用。遵循 Apache 2 协议，支持国产保密设备和系统。",
+            content: "RustFS is developed in the popular and secure Rust language, compatible with S3 protocol. Suitable for all scenarios including AI/ML and massive data storage, big data, internet, industrial and secure storage. Nearly free to use. Follows Apache 2 license, supports domestic security devices and systems.",
         }
         div { class: "min-h-screen flex flex-col items-center bg-white",
             div { class: "absolute top-4 right-6 flex space-x-2",

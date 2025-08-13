@@ -87,15 +87,15 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
         logical_plan: &LogicalPlan,
         session: &SessionCtx,
     ) -> QueryResult<Arc<dyn ExecutionPlan>> {
-        // 将扩展的物理计划优化规则注入 df 的 session state
+        // Inject extended physical plan optimization rules into df's session state
         let new_state = SessionStateBuilder::new_from_existing(session.inner().clone())
             .with_physical_optimizer_rules(self.ext_physical_optimizer_rules.clone())
             .build();
 
-        // 通过扩展的物理计划转换规则构造 df 的 Physical Planner
+        // Construct df's Physical Planner with extended physical plan transformation rules
         let planner = DFDefaultPhysicalPlanner::with_extension_planners(self.ext_physical_transform_rules.clone());
 
-        // 执行 df 的物理计划规划及优化
+        // Execute df's physical plan planning and optimization
         planner
             .create_physical_plan(logical_plan, &new_state)
             .await
