@@ -37,9 +37,11 @@ RUN ARCH=$(cat /tmp/arch) && \
         DOWNLOAD_URL="$LATEST_RELEASE_URL"; \
     else \
         # For specific versions, construct the GitHub release URL directly
-        VERSION="v${RELEASE#v}"; \
+        # RELEASE is the GitHub release tag (e.g., "1.0.0-alpha.42")
+        # VERSION is the version in filename (e.g., "v1.0.0-alpha.42")
+        VERSION="v${RELEASE}"; \
         PACKAGE_NAME="rustfs-linux-${ARCH}-${VERSION}.zip"; \
-        DOWNLOAD_URL="https://github.com/rustfs/rustfs/releases/download/${VERSION}/${PACKAGE_NAME}"; \
+        DOWNLOAD_URL="https://github.com/rustfs/rustfs/releases/download/${RELEASE}/${PACKAGE_NAME}"; \
     fi && \
     echo "Downloading ${PACKAGE_NAME} from ${DOWNLOAD_URL}" >&2 && \
     curl -f -L "${DOWNLOAD_URL}" -o rustfs.zip && \
