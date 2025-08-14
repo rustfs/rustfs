@@ -81,7 +81,7 @@ pub enum ServiceCommand {
 ///     success: true,
 ///     start_time: chrono::Local::now(),
 ///     end_time: chrono::Local::now(),
-///     message: "服务启动成功".to_string(),
+///     message: "Service started successfully".to_string(),
 /// };
 ///
 /// println!("{:?}", result);
@@ -175,7 +175,7 @@ impl ServiceManager {
     /// ```
     async fn prepare_service() -> Result<PathBuf, Box<dyn Error>> {
         // get the user directory
-        let home_dir = dirs::home_dir().ok_or("无法获取用户目录")?;
+        let home_dir = dirs::home_dir().ok_or("Unable to get user directory")?;
         let rustfs_dir = home_dir.join("rustfs");
         let bin_dir = rustfs_dir.join("bin");
         let data_dir = rustfs_dir.join("data");
@@ -266,23 +266,23 @@ impl ServiceManager {
                 match cmd {
                     ServiceCommand::Start(config) => {
                         if let Err(e) = Self::start_service(&config).await {
-                            Self::show_error(&format!("启动服务失败：{e}"));
+                            Self::show_error(&format!("Failed to start service: {e}"));
                         }
                     }
                     ServiceCommand::Stop => {
                         if let Err(e) = Self::stop_service().await {
-                            Self::show_error(&format!("停止服务失败：{e}"));
+                            Self::show_error(&format!("Failed to stop service: {e}"));
                         }
                     }
                     ServiceCommand::Restart(config) => {
                         if Self::check_service_status().await.is_some() {
                             if let Err(e) = Self::stop_service().await {
-                                Self::show_error(&format!("重启服务失败：{e}"));
+                                Self::show_error(&format!("Failed to restart service: {e}"));
                                 continue;
                             }
                         }
                         if let Err(e) = Self::start_service(&config).await {
-                            Self::show_error(&format!("重启服务失败：{e}"));
+                            Self::show_error(&format!("Failed to restart service: {e}"));
                         }
                     }
                 }
@@ -314,7 +314,7 @@ impl ServiceManager {
     async fn start_service(config: &RustFSConfig) -> Result<(), Box<dyn Error>> {
         // Check if the service is already running
         if let Some(existing_pid) = Self::check_service_status().await {
-            return Err(format!("服务已经在运行，PID: {existing_pid}").into());
+            return Err(format!("Service is already running, PID: {existing_pid}").into());
         }
 
         // Prepare the service program
@@ -326,16 +326,16 @@ impl ServiceManager {
         }
 
         // Extract the port from the configuration
-        let main_port = Self::extract_port(&config.address).ok_or("无法解析主服务端口")?;
-        let console_port = Self::extract_port(&config.console_address).ok_or("无法解析控制台端口")?;
+        let main_port = Self::extract_port(&config.address).ok_or("Unable to parse main service port")?;
+        let console_port = Self::extract_port(&config.console_address).ok_or("Unable to parse console port")?;
 
-        let host = config.address.split(':').next().ok_or("无法解析主机地址")?;
+        let host = config.address.split(':').next().ok_or("Unable to parse host address")?;
 
         // Check the port
         let ports = vec![main_port, console_port];
         for port in ports {
             if Self::is_port_in_use(host, port).await {
-                return Err(format!("端口 {port} 已被占用").into());
+                return Err(format!("Port {port} is already in use").into());
             }
         }
 
@@ -358,12 +358,12 @@ impl ServiceManager {
 
         // Check if the service started successfully
         if Self::is_port_in_use(host, main_port).await {
-            Self::show_info(&format!("服务启动成功！进程 ID: {process_pid}"));
+            Self::show_info(&format!("Service started successfully! Process ID: {process_pid}"));
 
             Ok(())
         } else {
             child.kill().await?;
-            Err("服务启动失败".into())
+            Err("Service failed to start".into())
         }
     }
 
@@ -397,13 +397,13 @@ impl ServiceManager {
             // Verify that the service is indeed stopped
             tokio::time::sleep(Duration::from_secs(1)).await;
             if Self::check_service_status().await.is_some() {
-                return Err("服务停止失败".into());
+                return Err("Service failed to stop".into());
             }
-            Self::show_info("服务已成功停止");
+            Self::show_info("Service stopped successfully");
 
             Ok(())
         } else {
-            Err("服务未运行".into())
+            Err("Service is not running".into())
         }
     }
 
@@ -430,7 +430,7 @@ impl ServiceManager {
     /// ```
     pub(crate) fn show_error(message: &str) {
         rfd::MessageDialog::new()
-            .set_title("错误")
+            .set_title("Error")
             .set_description(message)
             .set_level(rfd::MessageLevel::Error)
             .show();
@@ -445,7 +445,7 @@ impl ServiceManager {
     /// ```
     pub(crate) fn show_info(message: &str) {
         rfd::MessageDialog::new()
-            .set_title("成功")
+            .set_title("Success")
             .set_description(message)
             .set_level(rfd::MessageLevel::Info)
             .show();
@@ -483,6 +483,7 @@ impl ServiceManager {
         self.command_tx.send(ServiceCommand::Start(config.clone())).await?;
 
         let host = &config.host;
+
         // wait for the service to actually start
         let mut retries = 0;
         while retries < 30 {
@@ -493,14 +494,14 @@ impl ServiceManager {
                     success: true,
                     start_time,
                     end_time,
-                    message: "服务启动成功".to_string(),
+                    message: "Service started successfully".to_string(),
                 });
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             retries += 1;
         }
 
-        Err("服务启动超时".into())
+        Err("Service start timeout".into())
     }
 
     /// Stop the service
@@ -544,14 +545,14 @@ impl ServiceManager {
                     success: true,
                     start_time,
                     end_time,
-                    message: "服务停止成功".to_string(),
+                    message: "Service stopped successfully".to_string(),
                 });
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             retries += 1;
         }
 
-        Err("服务停止超时".into())
+        Err("Service stop timeout".into())
     }
 
     /// Restart the service
@@ -597,8 +598,8 @@ impl ServiceManager {
                     Err(e) => {
                         error!("save config error: {}", e);
                         self.command_tx.send(ServiceCommand::Stop).await?;
-                        Self::show_error("保存配置失败");
-                        return Err("保存配置失败".into());
+                        Self::show_error("Failed to save configuration");
+                        return Err("Failed to save configuration".into());
                     }
                 }
                 let end_time = chrono::Local::now();
@@ -606,13 +607,13 @@ impl ServiceManager {
                     success: true,
                     start_time,
                     end_time,
-                    message: "服务重启成功".to_string(),
+                    message: "Service restarted successfully".to_string(),
                 });
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             retries += 1;
         }
-        Err("服务重启超时".into())
+        Err("Service restart timeout".into())
     }
 }
 
@@ -797,10 +798,10 @@ mod tests {
             success: true,
             start_time: chrono::Local::now(),
             end_time: chrono::Local::now(),
-            message: "操作成功 🎉".to_string(),
+            message: "Operation successful 🎉".to_string(),
         };
 
-        assert_eq!(result.message, "操作成功 🎉");
+        assert_eq!(result.message, "Operation successful 🎉");
         assert!(result.success);
     }
 

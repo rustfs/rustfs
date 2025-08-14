@@ -26,6 +26,6 @@ fi
 echo "Creating log directory if it does not exist..."
 mkdir -p "$current_dir/deploy/logs/notify"
 
-# 启动 webhook 服务器
+# Start webhook server
 echo "Starting webhook server..."
 cargo run --example webhook -p rustfs-notify &
