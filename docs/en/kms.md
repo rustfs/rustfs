@@ -76,6 +76,22 @@ Status and health:
   - Degraded: KMS reachable but encryption path not verified
   - Failed: not reachable
   - Note: Fresh setups with no keys yet still report usable; Transit not mounted or Vault sealed reports failure.
+ - GET /rustfs/admin/v3/kms/config → returns current KMS configuration (sanitized, without secrets). Example:
+   {
+     "kms_type": "Vault",
+     "default_key_id": null,
+     "timeout_secs": 30,
+     "retry_attempts": 3,
+     "enable_audit": true,
+     "audit_log_path": null,
+     "backend": {
+       "type": "vault",
+       "address": "http://localhost:8200",
+       "namespace": null,
+       "mount_path": "transit",
+       "auth_method": "token"
+     }
+   }
 
 ## Key Management APIs
 
@@ -87,6 +103,8 @@ Status and health:
   - Vault limitation: Transit does not support disabling keys; RustFS returns 501 with guidance.
 - Rotate key: POST /rustfs/admin/v3/kms/key/rotate?keyName=<id>
 - Rewrap ciphertext: POST /rustfs/admin/v3/kms/rewrap (body: {"ciphertext_b64":"...","context":{...}})
+ - Delete key: DELETE /rustfs/admin/v3/kms/key/delete?keyName=<id>[&pendingWindowDays=7]
+   - Schedules deletion when the backend supports it; Vault transit performs immediate deletion and does not support cancellation.
 
 Parameters and options
 - keyName: string, required. Master key ID (Transit key name). Use human-readable IDs like "app-default".
