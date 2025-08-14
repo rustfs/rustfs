@@ -11,9 +11,10 @@ use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::api_get_options::{AdvancedGetOptions, GetObjectOptions, StatObjectOptions};
-use crate::client::api_put_object::PutObjectOptions;
+use crate::client::api_put_object::{AdvancedPutOptions, PutObjectOptions};
 use crate::client::api_remove::{AdvancedRemoveOptions, RemoveObjectOptions};
-use crate::client::transition_api::{self, ReaderImpl, TransitionCore};
+use crate::client::api_s3_datatypes::{self, CompletePart};
+use crate::client::transition_api::{self, PutObjectPartOptions, ReaderImpl, TransitionCore};
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
@@ -21,12 +22,14 @@ use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete,
 use crate::{StorageAPI, new_object_layer_fn};
 
 use byteorder::ByteOrder;
+use bytes::Bytes;
 use futures::future::join_all;
-use http::HeaderMap;
+use http::{HeaderMap, header};
 use rustfs_rio::HashReader;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, RESERVED_METADATA_PREFIX_LOWER,
-    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
+    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE, SSEC_ALGORITHM_HEADER,
+    SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, headers,
 };
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
@@ -38,6 +41,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -1753,8 +1757,88 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
     }
 }
 
+// Standard headers that needs to be extracted from User metadata.
+static STANDARD_HEADERS: &[&str] = &[
+    headers::CONTENT_TYPE,
+    headers::CACHE_CONTROL,
+    headers::CONTENT_ENCODING,
+    headers::CONTENT_LANGUAGE,
+    headers::CONTENT_DISPOSITION,
+    headers::AMZ_STORAGE_CLASS,
+    headers::AMZ_OBJECT_TAGGING,
+    headers::AMZ_BUCKET_REPLICATION_STATUS,
+    headers::AMZ_OBJECT_LOCK_MODE,
+    headers::AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+    headers::AMZ_OBJECT_LOCK_LEGAL_HOLD,
+    headers::AMZ_TAG_COUNT,
+    headers::AMZ_SERVER_SIDE_ENCRYPTION,
+];
+
+fn is_standard_header(k: &str) -> bool {
+    STANDARD_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(k))
+}
+
 fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
+    let mut meta = HashMap::new();
+
+    for (k, v) in object_info.user_defined.iter() {
+        if strings_has_prefix_fold(k, RESERVED_METADATA_PREFIX) {
+            continue;
+        }
+
+        if is_standard_header(k) {
+            continue;
+        }
+
+        meta.insert(k.to_string(), v.to_string());
+    }
+
+    let is_multipart = object_info.is_multipart();
+
+    let mut put_op = PutObjectOptions {
+        user_metadata: meta,
+        content_type: object_info.content_type.clone().unwrap_or_default(),
+        content_encoding: object_info.content_encoding.clone().unwrap_or_default(),
+        expires: object_info.expires.clone().unwrap_or(OffsetDateTime::UNIX_EPOCH),
+        storage_class: sc.to_string(),
+        internal: AdvancedPutOptions {
+            source_version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            source_etag: object_info.etag.clone().unwrap_or_default(),
+            source_mtime: object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_request: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    if !object_info.user_tags.is_empty() {
+        let tags = decode_tags_to_map(&object_info.user_tags);
+
+        if !tags.is_empty() {
+            put_op.user_tags = tags;
+            put_op.internal.tagging_timestamp = if let Some(ts) = object_info
+                .user_defined
+                .get(&format!("{}tagging-timestamp", RESERVED_METADATA_PREFIX))
+            {
+                OffsetDateTime::parse(ts, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            };
+        }
+    }
+
+    if let Some(lang) = object_info.user_defined.lookup(headers::CONTENT_LANGUAGE) {
+        put_op.content_language = lang.to_string();
+    }
+
+    if let Some(cd) = object_info.user_defined.lookup(headers::CONTENT_DISPOSITION) {
+        put_op.content_disposition = cd.to_string();
+    }
+
     todo!()
+
+    Ok((put_op, is_multipart))
 }
 
 async fn replicate_object_with_multipart(
@@ -1787,22 +1871,55 @@ async fn replicate_object_with_multipart(
         };
     }
 
+    let mut uploaded_parts = Vec::new();
+
     let mut reader = reader;
     for part_info in object_info.parts.iter() {
-        // 从 reader 中读取这个部分的数据
         let mut chunk = vec![0u8; part_info.size];
         AsyncReadExt::read_exact(&mut *reader, &mut chunk).await?;
 
-        // 为这个部分创建新的 reader
-        let cursor = std::io::Cursor::new(chunk);
-        let wrapped_reader = Box::new(rustfs_rio::WarpReader::new(cursor));
-        let _hash_reader = HashReader::new(wrapped_reader, part_info.actual_size, part_info.actual_size, None, false)?;
+        let object_part = cli
+            .put_object_part(
+                bucket,
+                object,
+                upload_id.as_ref().map(|id| id.as_str()).unwrap_or_default(),
+                part_info.number as i64,
+                ReaderImpl::Body(Bytes::from(chunk)),
+                part_info.actual_size,
+                PutObjectPartOptions { ..Default::default() },
+            )
+            .await?;
 
-        // TODO: 实际的多部分上传逻辑
-        // 这里应该上传这个部分到目标
+        uploaded_parts.push(api_s3_datatypes::CompletePart {
+            part_num: object_part.part_num,
+            etag: object_part.etag.clone(),
+            ..Default::default()
+        });
     }
 
-    todo!()
+    let mut user_metadata = HashMap::new();
+
+    user_metadata.insert(
+        RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE.to_string(),
+        object_info
+            .user_defined
+            .get(&format!("{}actual-size", RESERVED_METADATA_PREFIX))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+
+    cli.complete_multipart_upload(
+        bucket,
+        object,
+        upload_id.as_ref().map(|id| id.as_str()).unwrap_or_default(),
+        &uploaded_parts,
+        PutObjectOptions {
+            user_metadata,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op_type: ReplicationType) -> ReplicationAction {

@@ -389,6 +389,7 @@ pub struct ObjectInfo {
     pub is_latest: bool,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
+    pub expires: Option<OffsetDateTime>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
     pub put_object_reader: Option<PutObjReader>,
@@ -437,6 +438,7 @@ impl Clone for ObjectInfo {
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
             checksum: Default::default(),
+            expires: self.expires,
         }
     }
 }

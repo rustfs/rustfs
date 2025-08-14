@@ -793,6 +793,7 @@ impl TransitionCore {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PutObjectPartOptions {
     pub md5_base64: String,
     pub sha256_hex: String,
