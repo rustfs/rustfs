@@ -16,7 +16,7 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::ObjectOptions;
+use rustfs_ecstore::store_api::{HTTPPreconditions, ObjectOptions};
 use rustfs_utils::path::is_dir_object;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -105,6 +105,20 @@ pub async fn get_opts(
     Ok(opts)
 }
 
+fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) {
+    if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
+        let mut preconditions = HTTPPreconditions::default();
+        if let Some(if_none_match) = headers.get("If-None-Match") {
+            preconditions.if_none_match = Some(if_none_match.to_str().unwrap().to_string());
+        }
+        if let Some(if_match) = headers.get("If-Match") {
+            preconditions.if_match = Some(if_match.to_str().unwrap().to_string());
+        }
+
+        opts.http_preconditions = Some(preconditions);
+    }
+}
+
 /// Creates options for putting an object in a bucket.
 pub async fn put_opts(
     bucket: &str,
@@ -140,6 +154,16 @@ pub async fn put_opts(
     };
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
+
+    fill_conditional_writes_opts_from_header(headers, &mut opts);
+
+    Ok(opts)
+}
+
+pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
+    let mut opts = ObjectOptions::default();
+
+    fill_conditional_writes_opts_from_header(headers, &mut opts);
 
     Ok(opts)
 }
