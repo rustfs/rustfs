@@ -440,6 +440,95 @@ impl Operation for ConfigureKms {
     }
 }
 
+/// Get current KMS configuration (sanitized)
+/// GET /rustfs/admin/v3/kms/config
+pub struct GetKmsConfig;
+
+#[derive(serde::Serialize)]
+struct KmsConfigView {
+    kms_type: String,
+    default_key_id: Option<String>,
+    timeout_secs: u64,
+    retry_attempts: u32,
+    enable_audit: bool,
+    audit_log_path: Option<String>,
+    backend: KmsBackendView,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum KmsBackendView {
+    Vault {
+        address: String,
+        namespace: Option<String>,
+        mount_path: String,
+        auth_method: String,
+    },
+    Local {
+        key_dir: String,
+        encrypt_files: bool,
+        // master_key intentionally omitted
+    },
+    Aws {},
+    Azure {},
+    GoogleCloud {},
+}
+
+#[async_trait::async_trait]
+impl Operation for GetKmsConfig {
+    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(kms) = rustfs_kms::get_global_kms() else {
+            return Ok(kms_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                KmsErrorResponse {
+                    code: "KMSNotConfigured".to_string(),
+                    message: "KMS is not configured".to_string(),
+                    description: "Key Management Service is not available".to_string(),
+                },
+            ));
+        };
+
+        let cfg = kms.config().clone();
+
+        let backend = match cfg.backend_config {
+            rustfs_kms::BackendConfig::Vault(v) => {
+                let auth_method = match &v.auth_method {
+                    rustfs_kms::VaultAuthMethod::Token { .. } => "token",
+                    rustfs_kms::VaultAuthMethod::AppRole { .. } => "approle",
+                    rustfs_kms::VaultAuthMethod::Kubernetes { .. } => "kubernetes",
+                    rustfs_kms::VaultAuthMethod::AwsIam { .. } => "aws_iam",
+                    rustfs_kms::VaultAuthMethod::Cert { .. } => "cert",
+                };
+                KmsBackendView::Vault {
+                    address: v.address.to_string(),
+                    namespace: v.namespace.clone(),
+                    mount_path: v.mount_path.clone(),
+                    auth_method: auth_method.to_string(),
+                }
+            }
+            rustfs_kms::BackendConfig::Local(lc) => KmsBackendView::Local {
+                key_dir: lc.key_dir.display().to_string(),
+                encrypt_files: lc.encrypt_files,
+            },
+            rustfs_kms::BackendConfig::Aws(_) => KmsBackendView::Aws {},
+            rustfs_kms::BackendConfig::Azure(_) => KmsBackendView::Azure {},
+            rustfs_kms::BackendConfig::GoogleCloud(_) => KmsBackendView::GoogleCloud {},
+        };
+
+        let view = KmsConfigView {
+            kms_type: format!("{:?}", cfg.kms_type),
+            default_key_id: cfg.default_key_id.clone(),
+            timeout_secs: cfg.timeout_secs,
+            retry_attempts: cfg.retry_attempts,
+            enable_audit: cfg.enable_audit,
+            audit_log_path: cfg.audit_log_path.map(|p| p.display().to_string()),
+            backend,
+        };
+
+        Ok(kms_success_response(view))
+    }
+}
+
 /// Create a new KMS master key
 /// POST /rustfs/admin/v3/kms/key/create
 pub struct CreateKmsKey;
@@ -1138,5 +1227,65 @@ impl Operation for BatchRewrapBucket {
             errors,
         };
         Ok(kms_success_response(response))
+    }
+}
+
+/// Schedule deletion of a KMS key
+/// DELETE /rustfs/admin/v3/kms/key/delete
+pub struct DeleteKmsKey;
+
+#[async_trait::async_trait]
+impl Operation for DeleteKmsKey {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        info!("Processing KMS key delete request");
+
+        // Extract key name and optional pending window days
+        let query_params = kms_extract_query_params(req.uri.query().unwrap_or(""));
+        let key_name = match query_params.get("keyName").or_else(|| query_params.get("key")) {
+            Some(name) => name.to_string(),
+            None => {
+                return Ok(kms_error_response(
+                    StatusCode::BAD_REQUEST,
+                    KmsErrorResponse {
+                        code: "MissingParameter".to_string(),
+                        message: "Key name is required".to_string(),
+                        description: "keyName parameter must be provided".to_string(),
+                    },
+                ));
+            }
+        };
+
+        // Accept either pendingWindowDays or days; default 7
+        let pending_days: u32 = query_params
+            .get("pendingWindowDays")
+            .or_else(|| query_params.get("days"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|d| d.clamp(1, 365))
+            .unwrap_or(7);
+
+        let kms = match rustfs_kms::get_global_kms() {
+            Some(kms) => kms,
+            None => {
+                return Ok(kms_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KmsErrorResponse {
+                        code: "KMSNotConfigured".to_string(),
+                        message: "KMS is not configured".to_string(),
+                        description: "Key Management Service is not available".to_string(),
+                    },
+                ));
+            }
+        };
+
+        match kms.schedule_key_deletion(&key_name, pending_days, None).await {
+            Ok(_) => {
+                info!("Scheduled deletion for KMS key '{}' in {} days", key_name, pending_days);
+                Ok(S3Response::new((StatusCode::OK, Body::from("delete success".to_string()))))
+            }
+            Err(err) => {
+                error!("Failed to schedule deletion for key '{}': {}", key_name, err);
+                Ok(kms_error_response(StatusCode::BAD_REQUEST, KmsErrorResponse::from(err)))
+            }
+        }
     }
 }

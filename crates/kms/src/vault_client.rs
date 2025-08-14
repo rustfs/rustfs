@@ -37,6 +37,7 @@ use vaultrs::{
         requests::{
             DataKeyType, DecryptDataRequest as VaultDecryptRequest, EncryptDataRequest as VaultEncryptRequest,
             GenerateDataKeyRequest as VaultGenerateDataKeyRequest, RewrapDataRequest as VaultRewrapDataRequest,
+            UpdateKeyConfigurationRequestBuilder,
         },
     },
     transit::{data, generate, key},
@@ -492,12 +493,31 @@ impl KmsClient for VaultKmsClient {
     ) -> Result<()> {
         debug!("Scheduling key deletion: {}", key_id);
 
-        key::delete(&self.client, &self.mount_path, key_id)
-            .await
-            .map_err(|e| KmsError::backend_error("vault", format!("Failed to delete key: {e}")))?;
+        // Ensure key exists first for better error reporting
+        self.describe_key(key_id, None).await?;
 
-        info!("Successfully scheduled key deletion: {}", key_id);
-        Ok(())
+        // Transit requires deletion_allowed=true before DELETE /transit/keys/<name> works.
+        // Try to enable deletion; ignore failure if already enabled or not supported.
+        let mut upd = UpdateKeyConfigurationRequestBuilder::default();
+        upd.deletion_allowed(Some(true));
+        if let Err(e) = key::update(&self.client, &self.mount_path, key_id, Some(&mut upd)).await {
+            // Log and continue; deletion may still be allowed.
+            debug!("Vault transit key config update (deletion_allowed) failed for {}: {}", key_id, e);
+        }
+
+        match key::delete(&self.client, &self.mount_path, key_id).await {
+            Ok(_) => {
+                info!("Successfully scheduled key deletion: {}", key_id);
+                Ok(())
+            }
+            Err(e) => {
+                let es = e.to_string();
+                if es.contains("404") || es.to_lowercase().contains("not found") {
+                    return Err(KmsError::key_not_found(key_id));
+                }
+                Err(KmsError::backend_error("vault", format!("Failed to delete key: {e}")))
+            }
+        }
     }
 
     async fn cancel_key_deletion(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<()> {

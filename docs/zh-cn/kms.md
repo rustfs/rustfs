@@ -77,6 +77,22 @@
   - Degraded：KMS 可达，但加解密路径未完全验证
   - Failed：不可达
   - 说明：初次使用时即使尚无任何密钥，KMS 也会报告可用；Transit 未挂载或 Vault 被封存（sealed）时会报告失败。
+- GET /rustfs/admin/v3/kms/config → 返回当前 KMS 配置（已脱敏，不包含敏感字段）。示例：
+  {
+    "kms_type": "Vault",
+    "default_key_id": null,
+    "timeout_secs": 30,
+    "retry_attempts": 3,
+    "enable_audit": true,
+    "audit_log_path": null,
+    "backend": {
+      "type": "vault",
+      "address": "http://localhost:8200",
+      "namespace": null,
+      "mount_path": "transit",
+      "auth_method": "token"
+    }
+  }
 
 响应示例：
 ```json
@@ -102,6 +118,8 @@
   - Vault 限制：Transit 不支持禁用，RustFS 会返回 501 并给出说明。
 - 轮换：POST /rustfs/admin/v3/kms/key/rotate?keyName=<id>
 - 重包裹（rewrap）：POST /rustfs/admin/v3/kms/rewrap（请求体：{"ciphertext_b64":"...","context":{...}}）
+- 删除：DELETE /rustfs/admin/v3/kms/key/delete?keyName=<id>[&pendingWindowDays=7]
+  - 对支持计划删除的后端将进入等待删除；Vault transit 会立即删除且不支持取消。
 
 ### 参数与取值说明
 - keyName: 字符串，必填。主密钥 ID（Transit key 名）。建议使用业务相关的可读 ID，例如 "app-default"。

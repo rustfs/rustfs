@@ -225,9 +225,19 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RotateKmsKey {}),
     )?;
     r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/delete").as_str(),
+        AdminOperation(&handlers::kms::DeleteKmsKey {}),
+    )?;
+    r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
         AdminOperation(&GetKmsStatus {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/config").as_str(),
+        AdminOperation(&handlers::kms::GetKmsConfig {}),
     )?;
     r.insert(
         Method::POST,
