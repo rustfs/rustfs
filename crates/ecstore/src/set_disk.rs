@@ -3224,8 +3224,10 @@ impl SetDisks {
         let http_preconditions = opts.http_preconditions.unwrap();
         opts.http_preconditions = None;
 
-        // Never claim a lock twice, to avoid deadlock
-        opts.no_lock = !opts.no_lock;
+        // Never claim a lock here, to avoid deadlock
+        // - If no_lock is false, we must have obtained the lock out side of this function
+        // - If no_lock is true, we should not obtain locks
+        opts.no_lock = true;
         let oi = self.get_object_info(bucket, object, &opts).await;
 
         match oi {
