@@ -73,12 +73,14 @@ pub mod event;
 pub mod group;
 pub mod policies;
 pub mod pools;
+pub mod profile;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;
 pub mod tier;
 pub mod trace;
 pub mod user;
+
 use urlencoding::decode;
 
 #[allow(dead_code)]

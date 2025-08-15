@@ -21,3 +21,4 @@ profile.json
 *.zst
 .secrets
 *.go
+*.pb

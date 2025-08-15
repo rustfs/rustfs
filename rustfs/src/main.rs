@@ -24,13 +24,14 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_http_server, wait_for_shutdown};
+use crate::admin::handlers::profile::start_profilers;
+use crate::server::{start_http_server, wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::scanner::data_scanner::ScannerConfig;
 use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services, Scanner,
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
@@ -41,14 +42,14 @@ use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
 use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
-    StorageAPI,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
-    store::ECStore,
     store::init_local_disks,
+    store::ECStore,
     update_erasure_type,
+    StorageAPI,
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
@@ -57,14 +58,77 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-// #[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// Configure Jemalloc memory analysis parameters
+// #[allow(non_upper_case_globals, unsafe_code)]
+// #[unsafe(export_name = "malloc_conf")]
+// pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Configure Jemalloc memory analysis parameters
-#[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0";
+#[cfg(not(target_env = "msvc"))]
+pub async fn check_jemalloc_profiling() {
+    use jemalloc_pprof;
+    use std::env;
+    use tikv_jemalloc_ctl::{config, epoch, stats};
+
+    // Refresh Jemalloc's statistics
+    epoch::advance().expect("Failed to advance epoch");
+
+    // 1. Check malloc_conf
+    match config::malloc_conf::read() {
+        Ok(conf_val) => println!("Jemalloc malloc_conf: {}", conf_val),
+        Err(e) => println!("Failed to read Jemalloc malloc_conf: {}", e),
+    }
+
+    // 2. Check environment variable MALLOC_CONF
+    match env::var("MALLOC_CONF") {
+        Ok(val) => println!("MALLOC_CONF: {}", val),
+        Err(_) => println!("MALLOC_CONF is not set"),
+    }
+
+    // 3. Check if the profiling controller is available
+    if let Some(prof_ctl) = jemalloc_pprof::PROF_CTL.as_ref() {
+        println!("Jemalloc profiling controller is available");
+        let mut prof_ctl = prof_ctl.lock().await;
+        // 4.Check whether profiling is activated
+        if prof_ctl.activated() {
+            println!("Jemalloc profiling is activated");
+            if let Ok(data) = prof_ctl.dump_pprof() {
+                std::fs::write("memory_profile.pb", data).expect("Failed to write a Profiling file");
+                println!("Memory Profiling Data has been generated: memory_profile.pb");
+            }
+        } else {
+            println!("Jemalloc profiling is NOT activated");
+        }
+    } else {
+        println!("Jemalloc profiling controller is NOT available");
+    }
+
+    // Get the memory usage statistics of Jemalloc
+    match stats::allocated::read() {
+        Ok(allocated) => println!("Currently allocated memory: {} bytes", allocated),
+        Err(e) => println!("Failed to read allocated memory stats: {}", e),
+    }
+
+    match stats::resident::read() {
+        Ok(resident) => println!("Currently resident memory: {} bytes", resident),
+        Err(e) => println!("Failed to read resident memory stats: {}", e),
+    }
+    match stats::mapped::read() {
+        Ok(mapped) => println!("Currently mapped memory: {} bytes", mapped),
+        Err(e) => println!("Failed to read mapped memory stats: {}", e),
+    }
+    match stats::metadata::read() {
+        Ok(metadata) => println!("Currently metadata memory: {} bytes", metadata),
+        Err(e) => println!("Failed to read metadata memory stats: {}", e),
+    }
+    match stats::active::read() {
+        Ok(active) => println!("Currently active memory: {} bytes", active),
+        Err(e) => println!("Failed to read active memory stats: {}", e),
+    }
+}
 
 #[instrument]
 fn print_server_info() {
@@ -80,6 +144,11 @@ fn print_server_info() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(not(target_env = "msvc"))]
+    {
+        check_jemalloc_profiling().await;
+        start_profilers();
+    }
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
@@ -201,7 +270,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Async update check (optional)
     tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
+        use crate::update::{check_updates, UpdateCheckError};
 
         match check_updates().await {
             Ok(result) => {

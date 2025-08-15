@@ -129,7 +129,7 @@ where
             return Ok(resp.map_output(|x| x.1));
         }
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 
     // check_access before call

@@ -54,7 +54,7 @@ keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
 
 [workspace.lints.rust]
-unsafe_code = "deny"
+unsafe_code = "allow"
 
 [workspace.lints.clippy]
 all = "warn"
@@ -274,14 +274,13 @@ zstd = "0.13.3"
 # Use tikv-jemallocator as memory allocator and enable performance analysis
 tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 # Used to control and obtain statistics for jemalloc at runtime
-tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profiling"] }
 # The underlying binding of tikv-jemallocator also enables performance analysis
-tikv-jemalloc-sys = { version = "0.6", features = ["profiling"] }
+tikv-jemalloc-sys = { version = "0.6", features = ["profiling", "stats"] }
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rust-i18n", "rustfs-mcp"]
@@ -307,3 +306,6 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = true
+opt-level = 3        # The highest optimization
+lto = "fat"          # Enable link-time optimization
+codegen-units = 1    # Reduce parallel units and improve optimization effect

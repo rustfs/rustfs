@@ -45,7 +45,6 @@ export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
-export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
@@ -116,7 +115,10 @@ if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
+# Enable jemalloc for memory profiling
+export MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+
 # Start webhook server
 #cargo run --example webhook -p rustfs-notify &
 # Start main service
-cargo run --bin rustfs
+cargo run --profile profiling --bin rustfs

@@ -26,6 +26,7 @@ use handlers::{
 };
 
 use crate::admin::handlers::event::{ListNotificationTargets, RemoveNotificationTarget, SetNotificationTarget};
+use crate::admin::handlers::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -387,6 +388,18 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/profile/cpu").as_str(),
+        AdminOperation(&TriggerProfileCPU {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/profile/memory").as_str(),
+        AdminOperation(&TriggerProfileMemory {}),
     )?;
 
     Ok(())

@@ -47,6 +47,6 @@ impl Operation for Trace {
             Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
