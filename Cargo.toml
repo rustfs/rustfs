@@ -54,7 +54,7 @@ keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
 
 [workspace.lints.rust]
-unsafe_code = "allow"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
