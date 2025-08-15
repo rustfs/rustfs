@@ -5164,7 +5164,21 @@ impl StorageAPI for SetDisks {
         let disks = disks.clone();
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
+        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
+        let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            if !opts.no_lock {
+                let guard_opt = self
+                    .namespace_lock
+                    .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+                    .await?;
+
+                if guard_opt.is_none() {
+                    return Err(Error::other("can not get lock. please retry".to_string()));
+                }
+                _object_lock_guard = guard_opt;
+            }
+
             if let Some(err) = self.check_write_precondition(bucket, object, opts.clone()).await {
                 return Err(err);
             }
@@ -6016,8 +6030,8 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
             }
             false
         }
-        // Fail the check if we can't obtain the etag of the object
-        None => true,
+        // If we can't obtain the etag of the object, perevent the write only when we have at least one condition
+        None => if_none_match.is_some() || if_match.is_some(),
     }
 }
 
@@ -6470,35 +6484,43 @@ mod tests {
         let if_match = None;
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
-        let oi = ObjectInfo {
-            etag: Some("abc".to_string()),
-            ..Default::default()
-        };
         let if_none_match = Some("*".to_string());
         let if_match = None;
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
-        let oi = ObjectInfo {
-            etag: Some("abc".to_string()),
-            ..Default::default()
-        };
         let if_none_match = None;
         let if_match = Some("def".to_string());
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
-        let oi = ObjectInfo {
-            etag: Some("abc".to_string()),
-            ..Default::default()
-        };
         let if_none_match = None;
         let if_match = Some("*".to_string());
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
+        let if_none_match = Some("def".to_string());
+        let if_match = None;
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = Some("*".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("*".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
         let oi = ObjectInfo {
-            etag: Some("abc".to_string()),
+            etag: None,
             ..Default::default()
         };
-        let if_none_match = Some("def".to_string());
+        let if_none_match = Some("*".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
     }
