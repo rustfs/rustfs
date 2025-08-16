@@ -805,13 +805,16 @@ impl LocalDisk {
     }
 
     #[async_recursion::async_recursion]
-    async fn scan_dir<W: AsyncWrite + Unpin + Send>(
+    async fn scan_dir<W>(
         &self,
         current: &mut String,
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
         let forward = {
             opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
                 let forward = v.trim_start_matches(&*current);
