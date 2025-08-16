@@ -141,7 +141,7 @@ impl RustfsMcpServer {
         info!("Executing delete_bucket tool for bucket: {}", req.bucket_name);
 
         // check if bucket is empty, if not, can not delete bucket directly.
-        let object = match self
+        let object_result = match self
             .s3_client
             .list_objects_v2(&req.bucket_name, ListObjectsOptions::default())
             .await
@@ -153,7 +153,7 @@ impl RustfsMcpServer {
             }
         };
 
-        if !objects.objects.is_empty() {
+        if !object_result.objects.is_empty() {
             error!("Bucket '{}' is not empty", req.bucket_name);
             return format!("Failed to delete bucket '{}': bucket is not empty", req.bucket_name);
         }
