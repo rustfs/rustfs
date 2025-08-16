@@ -151,6 +151,37 @@ impl S3Client {
         Ok(Self { client })
     }
 
+    pub async fn create_bucket(&self, bucket_name: &str) -> Result<BucketInfo> {
+        info!("Creating S3 bucket: {}", bucket_name);
+
+        self.client
+            .create_bucket()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context(format!("Failed to create S3 bucket: {bucket_name}"))?;
+
+        info!("Bucket '{}' created successfully", bucket_name);
+        Ok(BucketInfo {
+            name: bucket_name.to_string(),
+            creation_date: None, // Creation date not returned by create_bucket
+        })
+    }
+
+    pub async fn delete_bucket(&self, bucket_name: &str) -> Result<()> {
+        info!("Deleting S3 bucket: {}", bucket_name);
+        
+        self.client
+            .delete_bucket()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context(format!("Failed to delete S3 bucket: {bucket_name}"))?;
+
+        info!("Bucket '{}' deleted successfully", bucket_name);
+        Ok(())
+    }
+
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         debug!("Listing S3 buckets");
 
