@@ -55,13 +55,13 @@ pub struct UploadFileRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct CreateBucketReqeust{
+pub struct CreateBucketReqeust {
     #[schemars(description = "Name of the S3 bucket to create")]
     pub bucket_name: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct DeleteBucketReqeust{
+pub struct DeleteBucketReqeust {
     #[schemars(description = "Name of the S3 bucket to delete")]
     pub bucket_name: String,
 }
@@ -141,7 +141,11 @@ impl RustfsMcpServer {
         info!("Executing delete_bucket tool for bucket: {}", req.bucket_name);
 
         // check if bucket is empty, if not, can not delete bucket directly.
-        let objects = match self.s3_client.list_objects_v2(&req.bucket_name, ListObjectsOptions::default()).await {
+        let object = match self
+            .s3_client
+            .list_objects_v2(&req.bucket_name, ListObjectsOptions::default())
+            .await
+        {
             Ok(result) => result,
             Err(e) => {
                 error!("Failed to list objects in bucket '{}': {:?}", req.bucket_name, e);

@@ -170,7 +170,6 @@ impl S3Client {
 
     pub async fn delete_bucket(&self, bucket_name: &str) -> Result<()> {
         info!("Deleting S3 bucket: {}", bucket_name);
-        
         self.client
             .delete_bucket()
             .bucket(bucket_name)
