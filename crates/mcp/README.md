@@ -231,6 +231,20 @@ Retrieve an object from S3 with two operation modes: read content directly or do
 - `local_path` (string, optional): Local file path (required when mode is "download")
 - `max_content_size` (number, optional): Maximum content size in bytes for read mode (default: 1MB)
 
+### `create_bucket`
+
+Create a new S3 bucket with the specified name.
+
+**Parameters:**
+
+- `bucket_name` (string): Source S3 bucket.
+
+### `delete_bucket`
+
+Delete the specified S3 bucket. If the bucket is not empty, the deletion will fail. You should delete all objects and objects inside them before calling this method.**WARNING: This operation will permanently delete the bucket and all objects within it!**
+
+- `bucket_name` (string): Source S3 bucket.
+
 ## Architecture
 
 The MCP server is built with a modular architecture:
