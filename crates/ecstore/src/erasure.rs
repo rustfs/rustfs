@@ -169,7 +169,13 @@ impl Erasure {
             .unwrap_or_else(|| {
                 error!("Integer overflow in end_block calculation");
                 return (0, Some(Error::other("Integer overflow in block calculation")));
-            });
+        let end_block = match offset.checked_add(length) {
+            Some(sum) => sum / self.block_size,
+            None => {
+                error!("Integer overflow in end_block calculation");
+                return (0, Some(Error::other("Integer overflow in block calculation")));
+            }
+        };
 
         // debug!("decode block from {} to {}", start_block, end_block);
 
