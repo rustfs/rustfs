@@ -7,21 +7,21 @@ type VersionParseResult = Result<(u32, u32, u32, Option<String>), Box<dyn std::e
 
 #[allow(clippy::const_is_empty)]
 pub fn get_version() -> String {
-    // 获取最新的 tag
+    // Get the latest tag
     if let Ok(latest_tag) = get_latest_tag() {
-        // 检查当前 commit 是否比最新 tag 更新
+        // Check if current commit is newer than the latest tag
         if is_head_newer_than_tag(&latest_tag) {
-            // 如果当前 commit 更新，则提升版本号
+            // If current commit is newer, increment the version number
             if let Ok(new_version) = increment_version(&latest_tag) {
                 return format!("refs/tags/{new_version}");
             }
         }
 
-        // 如果当前 commit 就是最新 tag，或者版本提升失败，返回当前 tag
+        // If current commit is the latest tag, or version increment failed, return current tag
         return format!("refs/tags/{latest_tag}");
     }
 
-    // 如果没有 tag，使用原来的逻辑
+    // If no tag exists, use original logic
     if !build::TAG.is_empty() {
         format!("refs/tags/{}", build::TAG)
     } else if !build::SHORT_COMMIT.is_empty() {
@@ -31,7 +31,7 @@ pub fn get_version() -> String {
     }
 }
 
-/// 获取最新的 git tag
+/// Get the latest git tag
 fn get_latest_tag() -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git").args(["describe", "--tags", "--abbrev=0"]).output()?;
 
@@ -43,7 +43,7 @@ fn get_latest_tag() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-/// 检查当前 HEAD 是否比指定的 tag 更新
+/// Check if current HEAD is newer than specified tag
 fn is_head_newer_than_tag(tag: &str) -> bool {
     let output = Command::new("git")
         .args(["merge-base", "--is-ancestor", tag, "HEAD"])
@@ -55,23 +55,23 @@ fn is_head_newer_than_tag(tag: &str) -> bool {
     }
 }
 
-/// 提升版本号（增加 patch 版本）
+/// Increment version number (increase patch version)
 fn increment_version(version: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // 解析版本号，例如 "1.0.0-alpha.19" -> (1, 0, 0, Some("alpha.19"))
+    // Parse version number, e.g. "1.0.0-alpha.19" -> (1, 0, 0, Some("alpha.19"))
     let (major, minor, patch, pre_release) = parse_version(version)?;
 
-    // 如果有预发布标识符，则增加预发布版本号
+    // If there's a pre-release identifier, increment the pre-release version number
     if let Some(pre) = pre_release {
         if let Some(new_pre) = increment_pre_release(&pre) {
             return Ok(format!("{major}.{minor}.{patch}-{new_pre}"));
         }
     }
 
-    // 否则增加 patch 版本号
+    // Otherwise increment patch version number
     Ok(format!("{major}.{minor}.{}", patch + 1))
 }
 
-/// 解析版本号
+/// Parse version number
 pub fn parse_version(version: &str) -> VersionParseResult {
     let parts: Vec<&str> = version.split('-').collect();
     let base_version = parts[0];
@@ -89,9 +89,9 @@ pub fn parse_version(version: &str) -> VersionParseResult {
     Ok((major, minor, patch, pre_release))
 }
 
-/// 增加预发布版本号
+/// Increment pre-release version number
 fn increment_pre_release(pre_release: &str) -> Option<String> {
-    // 处理形如 "alpha.19" 的预发布版本
+    // Handle pre-release versions like "alpha.19"
     let parts: Vec<&str> = pre_release.split('.').collect();
     if parts.len() == 2 {
         if let Ok(num) = parts[1].parse::<u32>() {
@@ -99,7 +99,7 @@ fn increment_pre_release(pre_release: &str) -> Option<String> {
         }
     }
 
-    // 处理形如 "alpha19" 的预发布版本
+    // Handle pre-release versions like "alpha19"
     if let Some(pos) = pre_release.rfind(|c: char| c.is_alphabetic()) {
         let prefix = &pre_release[..=pos];
         let suffix = &pre_release[pos + 1..];
@@ -208,14 +208,14 @@ mod tests {
 
     #[test]
     fn test_parse_version() {
-        // 测试标准版本解析
+        // Test standard version parsing
         let (major, minor, patch, pre_release) = parse_version("1.0.0").unwrap();
         assert_eq!(major, 1);
         assert_eq!(minor, 0);
         assert_eq!(patch, 0);
         assert_eq!(pre_release, None);
 
-        // 测试预发布版本解析
+        // Test pre-release version parsing
         let (major, minor, patch, pre_release) = parse_version("1.0.0-alpha.19").unwrap();
         assert_eq!(major, 1);
         assert_eq!(minor, 0);
@@ -225,32 +225,32 @@ mod tests {
 
     #[test]
     fn test_increment_pre_release() {
-        // 测试 alpha.19 -> alpha.20
+        // Test alpha.19 -> alpha.20
         assert_eq!(increment_pre_release("alpha.19"), Some("alpha.20".to_string()));
 
-        // 测试 beta.5 -> beta.6
+        // Test beta.5 -> beta.6
         assert_eq!(increment_pre_release("beta.5"), Some("beta.6".to_string()));
 
-        // 测试无法解析的情况
+        // Test unparsable case
         assert_eq!(increment_pre_release("unknown"), None);
     }
 
     #[test]
     fn test_increment_version() {
-        // 测试预发布版本递增
+        // Test pre-release version increment
         assert_eq!(increment_version("1.0.0-alpha.19").unwrap(), "1.0.0-alpha.20");
 
-        // 测试标准版本递增
+        // Test standard version increment
         assert_eq!(increment_version("1.0.0").unwrap(), "1.0.1");
     }
 
     #[test]
     fn test_version_format() {
-        // 测试版本格式是否以 refs/tags/ 开头
+        // Test if version format starts with refs/tags/
         let version = get_version();
         assert!(version.starts_with("refs/tags/") || version.starts_with("@"));
 
-        // 如果是 refs/tags/ 格式，应该包含版本号
+        // If it's refs/tags/ format, should contain version number
         if let Some(version_part) = version.strip_prefix("refs/tags/") {
             assert!(!version_part.is_empty());
         }
@@ -258,14 +258,14 @@ mod tests {
 
     #[test]
     fn test_current_version_output() {
-        // 显示当前版本输出
+        // Display current version output
         let version = get_version();
         println!("Current version: {version}");
 
-        // 验证版本格式
+        // Verify version format
         assert!(version.starts_with("refs/tags/") || version.starts_with("@"));
 
-        // 如果是 refs/tags/ 格式，验证版本号不为空
+        // If it's refs/tags/ format, verify version number is not empty
         if let Some(version_part) = version.strip_prefix("refs/tags/") {
             assert!(!version_part.is_empty());
             println!("Version part: {version_part}");
