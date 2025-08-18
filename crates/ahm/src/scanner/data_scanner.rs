@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::{Path, PathBuf};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -43,6 +44,7 @@ use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_common::data_usage::SizeSummary;
 use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 
 /// Custom scan mode enum for AHM scanner
@@ -1269,18 +1271,17 @@ impl Scanner {
 
                             let mut scanner_item = ScannerItem {
                                 //path: Path::new(&self.root).join(&ent_name).to_string_lossy().to_string(),
-                                bucket.to_string(),
+                                bucket: bucket.to_string(),
                                 prefix: Path::new(&prefix)
                                     .parent()
                                     .unwrap_or(Path::new(""))
                                     .to_string_lossy()
                                     .to_string(),
-                                object_name: entry.name
-                                    .file_name()
+                                object_name: entry.file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                                 lifecycle: Some(lifecycle_config.clone()),
-                                versioning_config.clone(),
+                                versioning: versioning_config.clone(),
                             };
                                 //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
                             let fivs = match entry.clone().file_info_versions(&scanner_item.bucket) {
@@ -1307,7 +1308,6 @@ impl Scanner {
 
                             let mut obj_deleted = false;
                             for info in obj_infos.iter() {
-                                let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
                                 let sz: i64;
                                 (obj_deleted, sz) = scanner_item.apply_actions(info, &mut size_s).await;
 
@@ -1338,12 +1338,10 @@ impl Scanner {
                             for free_version in fivs.free_versions.iter() {
                                 let _obj_info = rustfs_ecstore::store_api::ObjectInfo::from_file_info(
                                     free_version,
-                                    &item.bucket,
-                                    &item.object_path().to_string_lossy(),
+                                    &scanner_item.bucket,
+                                    &scanner_item.object_path().to_string_lossy(),
                                     versioned,
                                 );
-                                let done = ScannerMetrics::time(ScannerMetric::TierObjSweep);
-                                done();
                             }
 
                             // todo: global trace
