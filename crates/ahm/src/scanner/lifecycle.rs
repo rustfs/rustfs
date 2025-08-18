@@ -12,34 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
-use rustfs_utils::path::path_join;
-use rustfs_common::metrics::IlmAction;
+use crate::error::{Error, Result};
 use rustfs_common::data_usage::SizeSummary;
-use rustfs_ecstore::bucket::lifecycle::{lifecycle,
-    lifecycle::Lifecycle,
+use rustfs_common::metrics::IlmAction;
+use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_audit::LcEventSrc,
-    bucket_lifecycle_ops::{
-        apply_lifecycle_action, eval_action_from_lifecycle,
-        GLOBAL_ExpiryState, GLOBAL_TransitionState,
-    }
+    bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState, apply_lifecycle_action, eval_action_from_lifecycle},
+    lifecycle,
+    lifecycle::Lifecycle,
 };
 use rustfs_ecstore::bucket::metadata_sys::get_object_lock_config;
-use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion};
+use rustfs_ecstore::bucket::versioning::VersioningApi;
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
+use rustfs_filemeta::FileInfo;
 use rustfs_filemeta::FileMetaVersion;
 use rustfs_filemeta::metacache::MetaCacheEntry;
-use rustfs_filemeta::FileInfo;
+use rustfs_utils::path::path_join;
 use s3s::dto::BucketLifecycleConfiguration as LifecycleConfig;
 use tracing::info;
-use crate::error::{Error, Result};
 
 static SCANNER_EXCESS_OBJECT_VERSIONS: AtomicU64 = AtomicU64::new(100);
 static SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE: AtomicU64 = AtomicU64::new(1024 * 1024 * 1024 * 1024); // 1 TB
@@ -111,7 +109,8 @@ impl ScannerItem {
         let event = self
             .lifecycle
             .as_ref()
-            .expect("lifecycle err.").clone()
+            .expect("lifecycle err.")
+            .clone()
             .noncurrent_versions_expiration_limit(&lifecycle::ObjectOpts {
                 name: self.object_path().to_string_lossy().to_string(),
                 ..Default::default()

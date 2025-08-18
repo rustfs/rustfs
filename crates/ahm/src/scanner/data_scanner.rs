@@ -38,14 +38,14 @@ use crate::{
     get_ahm_services_cancel_token,
 };
 
-use rustfs_utils::path::path_to_bucket_object_with_base_path;
 use rustfs_common::data_usage::DataUsageInfo;
-use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_common::data_usage::SizeSummary;
-use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
+use rustfs_utils::path::path_to_bucket_object_with_base_path;
 
 /// Custom scan mode enum for AHM scanner
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1267,6 +1267,9 @@ impl Scanner {
                     } else {
                         // Apply lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
+                            let sub_path = entry.path();
+                            let ent_name = Path::new(&folder.name).join(&sub_path);
+
                             let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
                             let mut scanner_item = ScannerItem {
@@ -1277,13 +1280,14 @@ impl Scanner {
                                     .unwrap_or(Path::new(""))
                                     .to_string_lossy()
                                     .to_string(),
-                                object_name: entry.file_name()
+                                object_name: ent_name
+                                    .file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                                 lifecycle: Some(lifecycle_config.clone()),
                                 versioning: versioning_config.clone(),
                             };
-                                //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
+                            //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
                             let fivs = match entry.clone().file_info_versions(&scanner_item.bucket) {
                                 Ok(fivs) => fivs,
                                 Err(err) => {

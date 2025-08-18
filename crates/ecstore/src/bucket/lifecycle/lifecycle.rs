@@ -25,6 +25,7 @@ use s3s::dto::{
 use std::cmp::Ordering;
 use std::env;
 use std::fmt::Display;
+use std::sync::Arc;
 use time::macros::{datetime, offset};
 use time::{self, Duration, OffsetDateTime};
 use tracing::info;
@@ -138,7 +139,7 @@ pub trait Lifecycle {
     async fn eval(&self, obj: &ObjectOpts) -> Event;
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event;
     //fn set_prediction_headers(&self, w: http.ResponseWriter, obj: ObjectOpts);
-    async fn noncurrent_versions_expiration_limit(&self, obj: &ObjectOpts) -> Event;
+    async fn noncurrent_versions_expiration_limit(self: Arc<Self>, obj: &ObjectOpts) -> Event;
 }
 
 #[async_trait::async_trait]
@@ -538,7 +539,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         Event::default()
     }
 
-    async fn noncurrent_versions_expiration_limit(&self, obj: &ObjectOpts) -> Event {
+    async fn noncurrent_versions_expiration_limit(self: Arc<Self>, obj: &ObjectOpts) -> Event {
         if let Some(filter_rules) = self.filter_rules(obj).await {
             for rule in filter_rules.iter() {
                 if let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration {
