@@ -58,6 +58,11 @@ docker_switch_user() {
       exec chroot --userspec=${APP_UID}:${APP_GID} / "$@"
     else
       # Fallback to gosu if chroot is not available
+      # Validate APP_UID and APP_GID are numeric
+      if ! [[ "${APP_UID}" =~ ^[0-9]+$ ]] || ! [[ "${APP_GID}" =~ ^[0-9]+$ ]]; then
+        echo "❌ Error: APP_UID and APP_GID must be numeric values." >&2
+        exit 1
+      fi
       exec gosu ${APP_UID}:${APP_GID} "$@"
     fi
   else
