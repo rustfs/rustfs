@@ -8205,6 +8205,7 @@ name = "rustfs-ecstore"
 version = "0.0.5"
 dependencies = [
  "async-channel",
+ "async-recursion",
  "async-trait",
  "aws-sdk-s3",
  "base64 0.22.1",
