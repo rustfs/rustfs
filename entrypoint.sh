@@ -55,7 +55,7 @@ docker_switch_user() {
   if [ -n "${APP_UID}" ] && [ -n "${APP_GID}" ]; then
     # Use specified UID/GID
     if command -v chroot >/dev/null 2>&1; then
-      exec chroot --userspec=${APP_UID}:${APP_GID} / "$@"
+      chroot --userspec=${APP_UID}:${APP_GID} / "$@" || exec gosu ${APP_UID}:${APP_GID} "$@"
     else
       # Fallback to gosu if chroot is not available
       # Validate APP_UID and APP_GID are numeric
