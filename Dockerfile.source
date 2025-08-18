@@ -38,9 +38,9 @@ RUN apt-get update && apt-get install -y \
 
 # Install cross-compilation tools for ARM64
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        apt-get update && \
-        apt-get install -y gcc-aarch64-linux-gnu && \
-        rm -rf /var/lib/apt/lists/*; \
+    apt-get update && \
+    apt-get install -y gcc-aarch64-linux-gnu && \
+    rm -rf /var/lib/apt/lists/*; \
     fi
 
 # Install protoc
@@ -59,9 +59,9 @@ RUN set -e && \
     PLATFORM="${TARGETPLATFORM:-linux/amd64}" && \
     echo "🎯 Setting up Rust target for platform: $PLATFORM" && \
     case "$PLATFORM" in \
-        "linux/amd64") rustup target add x86_64-unknown-linux-gnu ;; \
-        "linux/arm64") rustup target add aarch64-unknown-linux-gnu ;; \
-        *) echo "❌ Unsupported platform: $PLATFORM" && exit 1 ;; \
+    "linux/amd64") rustup target add x86_64-unknown-linux-gnu ;; \
+    "linux/arm64") rustup target add aarch64-unknown-linux-gnu ;; \
+    *) echo "❌ Unsupported platform: $PLATFORM" && exit 1 ;; \
     esac
 
 # Set up environment for cross-compilation
@@ -87,21 +87,21 @@ RUN cargo run --bin gproto
 
 # Build the actual application with optimizations
 RUN case "$TARGETPLATFORM" in \
-        "linux/amd64") \
-            echo "🔨 Building for amd64..." && \
-            rustup target add x86_64-unknown-linux-gnu && \
-            cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
-            cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
-            ;; \
-        "linux/arm64") \
-            echo "🔨 Building for arm64..." && \
-            rustup target add aarch64-unknown-linux-gnu && \
-            cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
-            cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
-            ;; \
-        *) \
-            echo "❌ Unsupported platform: $TARGETPLATFORM" && exit 1 \
-            ;; \
+    "linux/amd64") \
+    echo "🔨 Building for amd64..." && \
+    rustup target add x86_64-unknown-linux-gnu && \
+    cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
+    cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+    ;; \
+    "linux/arm64") \
+    echo "🔨 Building for arm64..." && \
+    rustup target add aarch64-unknown-linux-gnu && \
+    cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs -j $(nproc) && \
+    cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+    ;; \
+    *) \
+    echo "❌ Unsupported platform: $TARGETPLATFORM" && exit 1 \
+    ;; \
     esac
 
 # Runtime stage - Ubuntu minimal for better compatibility
@@ -123,7 +123,7 @@ RUN groupadd -g 1000 rustfs && \
 WORKDIR /app
 
 # Create data directories
-RUN mkdir -p /data/rustfs{0,1,2,3} && \
+RUN mkdir -p /data/rustfs{0,1,2,3} /logs && \
     chown -R rustfs:rustfs /data /app
 
 # Copy binary from builder stage
@@ -146,7 +146,11 @@ ENV RUSTFS_ACCESS_KEY=rustfsadmin \
     RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE=true \
     RUSTFS_VOLUMES=/data \
-    RUST_LOG=warn
+    RUST_LOG=warn \
+    RUSTFS_USERNAME=rustfs \
+    RUSTFS_GROUPNAME=rustfs \
+    RUSTFS_UID=1000 \
+    RUSTFS_GID=1000
 
 # Volume for data
 VOLUME ["/data"]
