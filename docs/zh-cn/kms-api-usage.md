@@ -56,8 +56,17 @@ curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/configure" \
 
 **描述**: 创建新的 KMS 密钥
 
-**查询参数**:
-- `keyName` (可选): 密钥名称，如果不提供将自动生成
+**请求体（推荐）**:
+```json
+{
+  "keyName": "my-encryption-key",
+  "algorithm": "AES-256"
+}
+```
+
+**兼容的查询参数（旧版）**:
+- `keyName` (可选): 密钥名称
+- `algorithm` (可选): 算法，默认 `AES-256`
 
 **响应**:
 ```json
@@ -71,10 +80,15 @@ curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/configure" \
 
 **示例**:
 ```bash
-# 创建指定名称的密钥
-curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create?keyName=my-encryption-key"
+# 使用 JSON 请求体（推荐）
+curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create" \
+  -H 'Content-Type: application/json' \
+  -d '{"keyName":"my-encryption-key","algorithm":"AES-256"}'
 
-# 创建自动命名的密钥
+# 兼容旧版查询参数
+curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create?keyName=my-encryption-key&algorithm=AES-256"
+
+# 自动命名
 curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create"
 ```
 

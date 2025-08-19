@@ -110,7 +110,13 @@
 
 ## 密钥管理接口
 
-- 创建密钥：POST /rustfs/admin/v3/kms/key/create?keyName=<id>[&algorithm=AES-256]
+- 创建密钥：POST /rustfs/admin/v3/kms/key/create
+  - 推荐：使用 JSON 请求体传参
+    {
+      "keyName": "<id>",
+      "algorithm": "AES-256"
+    }
+  - 兼容：仍支持通过查询参数传参 `?keyName=<id>&algorithm=AES-256`
 - 查询状态：GET /rustfs/admin/v3/kms/key/status?keyName=<id>
 - 列表：GET /rustfs/admin/v3/kms/key/list
 - 启用：PUT /rustfs/admin/v3/kms/key/enable?keyName=<id>
@@ -132,9 +138,12 @@
   - 成功返回创建的密钥信息；若密钥已存在，可能返回已存在错误或视后端而定。
   - Vault 后端可由策略限制创建权限；若无权限，请预先由管理员创建。
   - 方法与路径：POST /rustfs/admin/v3/kms/key/create
-  - 查询参数：
+  - 请求体（推荐）：
     - keyName: 字符串，必填
     - algorithm: 字符串，可选，默认 "AES-256"
+  - 查询参数（兼容旧版本）：
+    - keyName: 字符串
+    - algorithm: 字符串
   - 响应字段：
     - key_id: 字符串，主密钥 ID
     - key_name: 字符串（同 key_id）
