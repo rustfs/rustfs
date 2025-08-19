@@ -3220,8 +3220,10 @@ impl SetDisks {
         Ok(())
     }
 
-    async fn check_write_precondition(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Option<StorageError> {
-        let http_preconditions = opts.http_preconditions.unwrap();
+    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+        let mut opts = opts.clone();
+
+        let http_preconditions = opts.http_preconditions?;
         opts.http_preconditions = None;
 
         // Never claim a lock here, to avoid deadlock
@@ -3373,7 +3375,7 @@ impl ObjectIO for SetDisks {
         }
 
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            if let Some(err) = self.check_write_precondition(bucket, object, opts.clone()).await {
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
             }
         }
@@ -5181,7 +5183,7 @@ impl StorageAPI for SetDisks {
                 _object_lock_guard = guard_opt;
             }
 
-            if let Some(err) = self.check_write_precondition(bucket, object, opts.clone()).await {
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
             }
         }
@@ -6477,7 +6479,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_block_write() {
+    fn test_should_prevent_write() {
         let oi = ObjectInfo {
             etag: Some("abc".to_string()),
             ..Default::default()
