@@ -56,11 +56,16 @@ ARG BUILD_DATE
 ARG VCS_REF
 
 LABEL name="RustFS" \
-      maintainer="RustFS Team" \
-      version="${RELEASE}" \
+      vendor="RustFS Team" \
+      maintainer="RustFS Team <dev@rustfs.com>" \
+      version="v${RELEASE#v}" \
+      release="${RELEASE}" \
       build-date="${BUILD_DATE}" \
       vcs-ref="${VCS_REF}" \
-      description="RustFS - Distributed object storage (S3 compatible)"
+      summary="High-performance distributed object storage system compatible with S3 API" \
+      description="RustFS is a distributed object storage system written in Rust, supporting erasure coding, multi-tenant management, and observability." \
+      url="https://rustfs.com" \
+      license="Apache-2.0"
 
 # Install only runtime requirements: certificates and coreutils (provides chroot --userspec)
 RUN apk add --no-cache ca-certificates coreutils && \
