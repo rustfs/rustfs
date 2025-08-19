@@ -11,10 +11,14 @@ use std::collections::HashMap as StdHashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hyper::StatusCode;
+use http::HeaderMap;
 use matchit::Params;
 use percent_encoding::percent_decode_str as decode;
 use rustfs_kms::KmsError;
-use s3s::{Body, S3Request, S3Response, S3Result};
+use s3s::{
+    Body, S3Request, S3Response, S3Result,
+    header::CONTENT_TYPE,
+};
 use serde::Serialize;
 use tracing::{error, info, warn};
 
@@ -214,7 +218,11 @@ fn kms_extract_query_params(query: &str) -> StdHashMap<String, String> {
 /// Create a successful KMS response
 fn kms_success_response<T: Serialize>(data: T) -> S3Response<(StatusCode, Body)> {
     match serde_json::to_vec(&data) {
-        Ok(json) => S3Response::new((StatusCode::OK, Body::from(json))),
+        Ok(json) => {
+            let mut header = HeaderMap::new();
+            header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            S3Response::with_headers((StatusCode::OK, Body::from(json)), header)
+        }
         Err(_) => S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::empty())),
     }
 }
@@ -222,7 +230,11 @@ fn kms_success_response<T: Serialize>(data: T) -> S3Response<(StatusCode, Body)>
 /// Create an error KMS response
 fn kms_error_response(status: StatusCode, error: KmsErrorResponse) -> S3Response<(StatusCode, Body)> {
     match serde_json::to_vec(&error) {
-        Ok(json) => S3Response::new((status, Body::from(json))),
+        Ok(json) => {
+            let mut header = HeaderMap::new();
+            header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            S3Response::with_headers((status, Body::from(json)), header)
+        }
         Err(_) => S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::empty())),
     }
 }
@@ -479,7 +491,7 @@ impl Operation for GetKmsConfig {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let Some(kms) = rustfs_kms::get_global_kms() else {
             return Ok(kms_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::OK,
                 KmsErrorResponse {
                     code: "KMSNotConfigured".to_string(),
                     message: "KMS is not configured".to_string(),
@@ -556,7 +568,7 @@ impl Operation for CreateKmsKey {
             None => {
                 warn!("KMS not configured");
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -618,7 +630,7 @@ impl Operation for GetKmsKeyStatus {
             None => {
                 warn!("KMS not configured");
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -664,7 +676,7 @@ impl Operation for ListKmsKeys {
             None => {
                 warn!("KMS not configured");
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -731,7 +743,7 @@ impl Operation for RotateKmsKey {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -789,7 +801,7 @@ impl Operation for EnableKmsKey {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -840,7 +852,7 @@ impl Operation for DisableKmsKey {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -889,7 +901,7 @@ impl Operation for GetKmsStatus {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -941,7 +953,7 @@ impl Operation for RewrapCiphertext {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -1015,7 +1027,7 @@ impl Operation for BatchRewrapBucket {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
@@ -1267,7 +1279,7 @@ impl Operation for DeleteKmsKey {
             Some(kms) => kms,
             None => {
                 return Ok(kms_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::OK,
                     KmsErrorResponse {
                         code: "KMSNotConfigured".to_string(),
                         message: "KMS is not configured".to_string(),
