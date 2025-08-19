@@ -1,69 +1,81 @@
 #!/bin/sh
+set -e
 
-# If command starts with an option, prepend rustfs.
-if [ "${1}" != "rustfs" ]; then
-    if [ -n "${1}" ]; then
-        set -- rustfs "$@"
-    fi
+# 1) Normalize command:
+# - No arguments: default to execute rustfs
+# - First argument starts with '-': treat as rustfs arguments, auto-prefix rustfs
+# - First argument is 'rustfs': replace with absolute path to avoid PATH interference
+if [ $# -eq 0 ] || [ "${1#-}" != "$1" ]; then
+  set -- /usr/bin/rustfs "$@"
+elif [ "$1" = "rustfs" ]; then
+  shift
+  set -- /usr/bin/rustfs "$@"
 fi
 
-# Parse RUSTFS_VOLUMES into array (support space, comma, tab as separator)
+# 2) Parse and create local mount directories (ignore http/https), ensure /logs is included
 VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
-# Replace comma and tab with space, then split
-VOLUME_RAW=$(echo "$VOLUME_RAW" | tr ',\t' '  ')
-
-# Only keep local volumes (start with /, not http/https)
+# Convert comma/tab to space
+VOLUME_LIST=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
 LOCAL_VOLUMES=""
-for vol in $VOLUME_RAW; do
-    if [ "$vol" != "${vol#/}" ] && [ "$vol" = "${vol#http://}" ] && [ "$vol" = "${vol#https://}" ]; then
-        LOCAL_VOLUMES="$LOCAL_VOLUMES $vol"
+for vol in $VOLUME_LIST; do
+  case "$vol" in
+    /*)
+      case "$vol" in
+        http://*|https://*) : ;;
+        *) LOCAL_VOLUMES="$LOCAL_VOLUMES $vol" ;;
+      esac
+      ;;
+    *)
+      : # skip non-local paths
+      ;;
+  esac
+done
+# Ensure /logs is included
+case " $LOCAL_VOLUMES " in
+  *" /logs "*) : ;;
+  *) LOCAL_VOLUMES="$LOCAL_VOLUMES /logs" ;;
+esac
+
+echo "Initializing mount directories:$LOCAL_VOLUMES"
+for vol in $LOCAL_VOLUMES; do
+  if [ ! -d "$vol" ]; then
+    echo "  mkdir -p $vol"
+    mkdir -p "$vol"
+    # If target user is specified, try to set directory owner to that user (non-recursive to avoid large disk overhead)
+    if [ -n "$RUSTFS_UID" ] && [ -n "$RUSTFS_GID" ]; then
+      chown "$RUSTFS_UID:$RUSTFS_GID" "$vol" 2>/dev/null || true
+    elif [ -n "$RUSTFS_USERNAME" ] && [ -n "$RUSTFS_GROUPNAME" ]; then
+      chown "$RUSTFS_USERNAME:$RUSTFS_GROUPNAME" "$vol" 2>/dev/null || true
     fi
+  fi
 done
 
-# Always ensure /logs is included
-include_logs=1
-for vol in $LOCAL_VOLUMES; do
-    if [ "$vol" = "/logs" ]; then
-        include_logs=0
-        break
-    fi
-done
-if [ $include_logs -eq 1 ]; then
-    LOCAL_VOLUMES="$LOCAL_VOLUMES /logs"
+# 3) Default credentials warning
+if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rustfsadmin" ]; then
+  echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
 fi
 
-echo "📦 Initializing mount directories: $LOCAL_VOLUMES"
-
-# Create directories if they don't exist
-for vol in $LOCAL_VOLUMES; do
-    if [ ! -d "$vol" ]; then
-        echo "📁 Creating directory: $vol"
-        mkdir -p "$vol"
-    fi
-done
-
-# Warn if default credentials are used
-if [ "$RUSTFS_ACCESS_KEY" = "rustfsadmin" ] || [ "$RUSTFS_SECRET_KEY" = "rustfsadmin" ]; then
-    echo "⚠️  WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY"
-    echo "⚠️  It is strongly recommended to override these values in production!"
-fi
-
-echo "🚀 Starting application: $*"
-
-# Switch user and run the application
+# 4) Start with specified user
 docker_switch_user() {
-    if [ -n "${RUSTFS_USERNAME}" ] && [ -n "${RUSTFS_GROUPNAME}" ]; then
-        if [ -n "${RUSTFS_UID}" ] && [ -n "${RUSTFS_GID}" ]; then
-            chroot --userspec=${RUSTFS_UID}:${RUSTFS_GID} / "$@"
-        else
-            echo "${RUSTFS_USERNAME}:x:1000:1000:${RUSTFS_USERNAME}:/:/sbin/nologin" >>/etc/passwd
-            echo "${RUSTFS_GROUPNAME}:x:1000" >>/etc/group
-            chroot --userspec=${RUSTFS_USERNAME}:${RUSTFS_GROUPNAME} / "$@"
-        fi
+  if [ -n "${RUSTFS_USERNAME}" ] && [ -n "${RUSTFS_GROUPNAME}" ]; then
+    if [ -n "${RUSTFS_UID}" ] && [ -n "${RUSTFS_GID}" ]; then
+      # Execute with numeric UID:GID directly (doesn't depend on user existing in system)
+      exec chroot --userspec="${RUSTFS_UID}:${RUSTFS_GID}" / "$@"
     else
-        exec "$@"
+      # When only names are provided, create minimal passwd/group entries with 1000:1000; deduplicate before writing
+      if ! grep -q "^${RUSTFS_USERNAME}:" /etc/passwd 2>/dev/null; then
+        echo "${RUSTFS_USERNAME}:x:1000:1000:${RUSTFS_USERNAME}:/nonexistent:/sbin/nologin" >> /etc/passwd
+      fi
+      if ! grep -q "^${RUSTFS_GROUPNAME}:" /etc/group 2>/dev/null; then
+        echo "${RUSTFS_GROUPNAME}:x:1000:" >> /etc/group
+      fi
+      exec chroot --userspec="${RUSTFS_USERNAME}:${RUSTFS_GROUPNAME}" / "$@"
     fi
+  else
+    # If no user is specified, keep as root (container has minimal privilege practices that can be configured separately)
+    exec "$@"
+  fi
 }
 
-# Switch to user if applicable
+echo "Starting: $*"
 docker_switch_user "$@"
