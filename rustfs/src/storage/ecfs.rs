@@ -311,7 +311,7 @@ impl S3 for FS {
             .make_bucket(
                 &bucket,
                 &MakeBucketOptions {
-                    force_create: true,
+                    force_create: false, // TODO: force support
                     lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
                     ..Default::default()
                 },
