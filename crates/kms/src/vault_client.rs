@@ -387,17 +387,6 @@ impl KmsClient for VaultKmsClient {
             .map_err(|e| KmsError::internal_error(format!("Failed to create key: {e}")))?;
 
         info!("Successfully created master key: {}", key_id);
-        let key_info = key::read(&self.client, &self.mount_path, key_id).await.map_err(|e| {
-            if e.to_string().contains("404") {
-                KmsError::key_not_found(key_id)
-            } else {
-                KmsError::backend_error("vault", format!("Failed to describe key: {e}"))
-            }
-        })?;
-        match key_info.key_type {
-            KeyType::Aes128Gcm96 => println!("Key created with AES_128 algorithm"),
-            _ => panic!("Unexpected key type"),
-        }
 
         Ok(MasterKey {
             key_id: key_id.to_string(),
