@@ -23,7 +23,7 @@ fmt-check:
 .PHONY: clippy
 clippy:
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --fix --allow-dirty 
+	cargo clippy --fix --allow-dirty
 	cargo clippy --all-targets --all-features -- -D warnings
 
 .PHONY: check
@@ -210,7 +210,9 @@ docker-build-production:
 docker-build-source:
 	@echo "🏗️ Building single-architecture source Docker image..."
 	@echo "💡 Consider using 'make docker-dev-local' for multi-arch support"
-	$(DOCKER_CLI) build -f $(DOCKERFILE_SOURCE) -t rustfs:source .
+	DOCKER_BUILDKIT=1 $(DOCKER_CLI) build \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		-f $(DOCKERFILE_SOURCE) -t rustfs:source .
 
 # ========================================================================================
 # Development Environment

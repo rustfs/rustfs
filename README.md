@@ -81,14 +81,14 @@ To get started with RustFS, follow these steps:
 2. **Docker Quick Start (Option 2)​​**
 
   ```bash
-   # Latest stable release
-   docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:latest
+   # create data and logs directories
+   mkdir -p data logs
 
-   # Development version (main branch)
-   docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:main-latest
+   # using latest alpha version
+   docker run -d -p 9000:9000 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:alpha
 
    # Specific version
-   docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:v1.0.0
+   docker run -d -p 9000:9000 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.45
    ```
 
 3. **Build from Source (Option 3) - Advanced Users**

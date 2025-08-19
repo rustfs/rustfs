@@ -357,7 +357,7 @@ impl S3 for FS {
             .make_bucket(
                 &bucket,
                 &MakeBucketOptions {
-                    force_create: true,
+                    force_create: false, // TODO: force support
                     lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
                     ..Default::default()
                 },
@@ -1389,6 +1389,7 @@ impl S3 for FS {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag,
+            metadata: Some(info.user_defined),
             ..Default::default()
         };
 

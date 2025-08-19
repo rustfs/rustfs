@@ -177,14 +177,16 @@ impl S3PeerSys {
                 let pools = cli.get_pools();
                 let idx = i;
                 if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs.push(errors[j].as_ref());
+                    per_pool_errs.push(errors[j].clone());
                 }
 
-                // TODO: reduceWriteQuorumErrs
+                if let Some(pool_err) =
+                    reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
+                {
+                    return Err(pool_err);
+                }
             }
         }
-
-        // TODO:
 
         Ok(())
     }
@@ -387,7 +389,6 @@ impl PeerS3Client for LocalPeerS3Client {
                         if opts.force_create && matches!(e, Error::VolumeExists) {
                             return Ok(());
                         }
-
                         Err(e)
                     }
                 }
@@ -405,7 +406,9 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
-        // TODO: reduceWriteQuorumErrs
+        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, (local_disks.len() / 2) + 1) {
+            return Err(err);
+        }
 
         Ok(())
     }
