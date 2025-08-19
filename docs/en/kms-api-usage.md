@@ -56,8 +56,17 @@ curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/configure" \
 
 **Description**: Create a new KMS key
 
-**Query Parameters**:
-- `keyName` (optional): Key name, will be auto-generated if not provided
+**Request Body (recommended)**:
+```json
+{
+  "keyName": "my-encryption-key",
+  "algorithm": "AES-256"
+}
+```
+
+**Legacy-compatible Query Parameters**:
+- `keyName` (optional): Key name
+- `algorithm` (optional): Defaults to `AES-256`
 
 **Response**:
 ```json
@@ -71,10 +80,15 @@ curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/configure" \
 
 **Examples**:
 ```bash
-# Create key with specified name
-curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create?keyName=my-encryption-key"
+# JSON body (recommended)
+curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create" \
+  -H 'Content-Type: application/json' \
+  -d '{"keyName":"my-encryption-key","algorithm":"AES-256"}'
 
-# Create key with auto-generated name
+# Query parameters (legacy)
+curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create?keyName=my-encryption-key&algorithm=AES-256"
+
+# Auto-generated name
 curl -X POST "http://localhost:9000/rustfs/admin/v3/kms/key/create"
 ```
 

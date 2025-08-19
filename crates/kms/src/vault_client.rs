@@ -35,9 +35,9 @@ use vaultrs::{
     api::transit::{
         KeyType,
         requests::{
-            DataKeyType, DecryptDataRequest as VaultDecryptRequest, EncryptDataRequest as VaultEncryptRequest,
-            GenerateDataKeyRequest as VaultGenerateDataKeyRequest, RewrapDataRequest as VaultRewrapDataRequest,
-            UpdateKeyConfigurationRequestBuilder,
+            CreateKeyRequestBuilder, DataKeyType, DecryptDataRequest as VaultDecryptRequest,
+            EncryptDataRequest as VaultEncryptRequest, GenerateDataKeyRequest as VaultGenerateDataKeyRequest,
+            RewrapDataRequest as VaultRewrapDataRequest, UpdateKeyConfigurationRequestBuilder,
         },
     },
     transit::{data, generate, key},
@@ -368,13 +368,36 @@ impl KmsClient for VaultKmsClient {
     async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
         debug!("Creating master key: {}", key_id);
 
-        // Key type is determined by Vault's default configuration
+        // Map requested algorithm to Vault Transit KeyType
+        let alg_norm = algorithm.trim().to_ascii_uppercase();
+        let kt = match alg_norm.replace('_', "-").as_str() {
+            "AES-128" | "AES128" | "AES-128-GCM" | "AES-128-GCM96" => KeyType::Aes128Gcm96,
+            "RSA-2048" | "RSA2048" => KeyType::Rsa2048,
+            "RSA-4096" | "RSA4096" => KeyType::Rsa4096,
+            // Default to AES-256-GCM (Vault default) for others including "AES-256"
+            _ => KeyType::Aes256Gcm96,
+        };
 
-        key::create(&self.client, &self.mount_path, key_id, None)
+        // Create key with explicit type when supported
+        let mut req = CreateKeyRequestBuilder::default();
+        req.key_type(kt);
+
+        key::create(&self.client, &self.mount_path, key_id, Some(&mut req))
             .await
             .map_err(|e| KmsError::internal_error(format!("Failed to create key: {e}")))?;
 
         info!("Successfully created master key: {}", key_id);
+        let key_info = key::read(&self.client, &self.mount_path, key_id).await.map_err(|e| {
+            if e.to_string().contains("404") {
+                KmsError::key_not_found(key_id)
+            } else {
+                KmsError::backend_error("vault", format!("Failed to describe key: {e}"))
+            }
+        })?;
+        match key_info.key_type {
+            KeyType::Aes128Gcm96 => println!("Key created with AES_128 algorithm"),
+            _ => panic!("Unexpected key type"),
+        }
 
         Ok(MasterKey {
             key_id: key_id.to_string(),
@@ -440,22 +463,18 @@ impl KmsClient for VaultKmsClient {
             }
         };
 
-        let key_infos: Vec<KeyInfo> = key_list
-            .into_iter()
-            .map(|key_name| KeyInfo {
-                key_id: key_name.clone(),
-                name: key_name,
-                description: None,
-                algorithm: "AES_256".to_string(),
-                usage: KeyUsage::Encrypt,
-                status: KeyStatus::Active,
-                version: 1,
-                metadata: HashMap::new(),
-                created_at: SystemTime::now(),
-                rotated_at: None,
-                created_by: None,
-            })
-            .collect();
+        // For each key, fetch real details from Vault using describe_key.
+        // This ensures algorithm and status reflect actual values.
+        let mut key_infos: Vec<KeyInfo> = Vec::with_capacity(key_list.len());
+        for key_name in key_list {
+            match self.describe_key(&key_name, None).await {
+                Ok(info) => key_infos.push(info),
+                Err(e) => {
+                    // If an individual key cannot be described, log and skip it to avoid failing the entire list.
+                    warn!("Skipping key '{}' during listing due to describe error: {}", key_name, e);
+                }
+            }
+        }
 
         Ok(ListKeysResponse {
             keys: key_infos,

@@ -10,15 +10,12 @@ use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use std::collections::HashMap as StdHashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hyper::StatusCode;
 use http::HeaderMap;
+use hyper::StatusCode;
 use matchit::Params;
 use percent_encoding::percent_decode_str as decode;
 use rustfs_kms::KmsError;
-use s3s::{
-    Body, S3Request, S3Response, S3Result,
-    header::CONTENT_TYPE,
-};
+use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE};
 use serde::Serialize;
 use tracing::{error, info, warn};
 
@@ -85,6 +82,15 @@ pub struct KmsErrorResponse {
     pub message: String,
     #[serde(rename = "description")]
     pub description: String,
+}
+
+/// Create key request (JSON body)
+#[derive(serde::Deserialize, Default)]
+pub struct CreateKeyRequest {
+    #[serde(rename = "keyName")]
+    pub key_name: Option<String>,
+    #[serde(rename = "algorithm")]
+    pub algorithm: Option<String>,
 }
 
 /// KMS configuration request
@@ -550,16 +556,33 @@ impl Operation for CreateKmsKey {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         info!("Processing KMS key creation request");
 
-        // Extract key name from query parameters
+        // Prefer JSON body, fallback to query params for backward compatibility
+        let mut input = req.input;
+        let body_bytes = input.store_all_unlimited().await.unwrap_or_default();
+
+        let body_req: Option<CreateKeyRequest> = if !body_bytes.is_empty() {
+            match serde_json::from_slice::<CreateKeyRequest>(&body_bytes) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("Failed to parse CreateKeyRequest JSON, will fallback to query params: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let query_params = kms_extract_query_params(req.uri.query().unwrap_or(""));
-        let key_name = query_params
-            .get("keyName")
-            .or_else(|| query_params.get("key"))
-            .map(|s| s.to_string())
+        let key_name = body_req
+            .as_ref()
+            .and_then(|r| r.key_name.clone())
+            .or_else(|| query_params.get("keyName").or_else(|| query_params.get("key")).cloned())
             .unwrap_or_else(|| format!("rustfs-key-{}", uuid::Uuid::new_v4()));
-        let algorithm = query_params
-            .get("algorithm")
-            .map(|s| s.to_string())
+
+        let algorithm = body_req
+            .as_ref()
+            .and_then(|r| r.algorithm.clone())
+            .or_else(|| query_params.get("algorithm").cloned())
             .unwrap_or_else(|| "AES-256".to_string());
 
         // Get global KMS instance
@@ -578,7 +601,7 @@ impl Operation for CreateKmsKey {
             }
         };
 
-        // Create the key
+        // Create the key with the requested algorithm (used by backend when applicable)
         match kms.create_key(&key_name, &algorithm, None).await {
             Ok(key_info) => {
                 info!("Successfully created KMS key: {}", key_info.key_id);
@@ -1292,7 +1315,7 @@ impl Operation for DeleteKmsKey {
         match kms.schedule_key_deletion(&key_name, pending_days, None).await {
             Ok(_) => {
                 info!("Scheduled deletion for KMS key '{}' in {} days", key_name, pending_days);
-                Ok(S3Response::new((StatusCode::OK, Body::from("delete success".to_string()))))
+                Ok(kms_success_response("delete success"))
             }
             Err(err) => {
                 error!("Failed to schedule deletion for key '{}': {}", key_name, err);

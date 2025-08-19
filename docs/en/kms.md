@@ -95,7 +95,13 @@ Status and health:
 
 ## Key Management APIs
 
-- Create key: POST /rustfs/admin/v3/kms/key/create?keyName=<id>[&algorithm=AES-256]
+- Create key: POST /rustfs/admin/v3/kms/key/create
+  - Recommended: pass parameters in JSON body
+    {
+      "keyName": "<id>",
+      "algorithm": "AES-256"
+    }
+  - Backward compatible: query params `?keyName=<id>&algorithm=AES-256` still work
 - Key status: GET /rustfs/admin/v3/kms/key/status?keyName=<id>
 - List keys: GET /rustfs/admin/v3/kms/key/list
 - Enable key: PUT /rustfs/admin/v3/kms/key/enable?keyName=<id>
@@ -196,9 +202,12 @@ Parameter sanity
 - Not supported: vault_key_path, vault_auth_method (ignored if present). Set vault_mount_path to your actual Transit mount name when different from transit.
 - If your Vault only has the KV engine (e.g., secret/...), enable the Transit engine first, then configure RustFS.
 
-Create a key:
+Create a key (JSON body recommended):
 ```bash
-curl -sS -X POST 'http://127.0.0.1:9000/rustfs/admin/v3/kms/key/create?keyName=app-default&algorithm=AES-256'
+curl -sS -X POST \
+  'http://127.0.0.1:9000/rustfs/admin/v3/kms/key/create' \
+  -H 'Content-Type: application/json' \
+  -d '{"keyName":"app-default","algorithm":"AES-256"}'
 ```
 
 Rotate a key:
