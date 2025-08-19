@@ -1,104 +1,81 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-APP_USER=rustfs
-APP_GROUP=rustfs
-APP_UID=${PUID:-1000}
-APP_GID=${PGID:-1000}
-
-# Parse RUSTFS_VOLUMES into array (support space, comma, tab as separator)
-VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
-# Replace comma and tab with space, then split
-VOLUME_RAW=$(echo "$VOLUME_RAW" | tr ',\t' '  ')
-read -ra ALL_VOLUMES <<< "$VOLUME_RAW"
-
-# Only keep local volumes (start with /, not http/https)
-LOCAL_VOLUMES=()
-for vol in "${ALL_VOLUMES[@]}"; do
-  if [[ "$vol" =~ ^/ ]] && [[ ! "$vol" =~ ^https?:// ]]; then
-    # Not a URL (http/https), just a local path
-    LOCAL_VOLUMES+=("$vol")
-  fi
-  # If it's a URL (http/https), skip
-  # If it's an empty string, skip
-  # If it's a local path, keep
-  # (We don't support other protocols here)
-done
-
-# Always ensure /logs is included for permission fix
-include_logs=1
-for vol in "${LOCAL_VOLUMES[@]}"; do
-  if [ "$vol" = "/logs" ]; then
-    include_logs=0
-    break
-  fi
-done
-if [ $include_logs -eq 1 ]; then
-  LOCAL_VOLUMES+=("/logs")
+# 1) Normalize command:
+# - No arguments: default to execute rustfs
+# - First argument starts with '-': treat as rustfs arguments, auto-prefix rustfs
+# - First argument is 'rustfs': replace with absolute path to avoid PATH interference
+if [ $# -eq 0 ] || [ "${1#-}" != "$1" ]; then
+  set -- /usr/bin/rustfs "$@"
+elif [ "$1" = "rustfs" ]; then
+  shift
+  set -- /usr/bin/rustfs "$@"
 fi
 
-# Try to update rustfs UID/GID if needed (requires root and shadow tools)
-update_user_group_ids() {
-  local uid="$1"
-  local gid="$2"
-  local user="$3"
-  local group="$4"
-  local updated=0
-  if [ "$(id -u "$user")" != "$uid" ]; then
-    if command -v usermod >/dev/null 2>&1; then
-      echo "🔧 Updating UID of $user to $uid"
-      usermod -u "$uid" "$user"
-      updated=1
+# 2) Parse and create local mount directories (ignore http/https), ensure /logs is included
+VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
+# Convert comma/tab to space
+VOLUME_LIST=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
+LOCAL_VOLUMES=""
+for vol in $VOLUME_LIST; do
+  case "$vol" in
+    /*)
+      case "$vol" in
+        http://*|https://*) : ;;
+        *) LOCAL_VOLUMES="$LOCAL_VOLUMES $vol" ;;
+      esac
+      ;;
+    *)
+      : # skip non-local paths
+      ;;
+  esac
+done
+# Ensure /logs is included
+case " $LOCAL_VOLUMES " in
+  *" /logs "*) : ;;
+  *) LOCAL_VOLUMES="$LOCAL_VOLUMES /logs" ;;
+esac
+
+echo "Initializing mount directories:$LOCAL_VOLUMES"
+for vol in $LOCAL_VOLUMES; do
+  if [ ! -d "$vol" ]; then
+    echo "  mkdir -p $vol"
+    mkdir -p "$vol"
+    # If target user is specified, try to set directory owner to that user (non-recursive to avoid large disk overhead)
+    if [ -n "$RUSTFS_UID" ] && [ -n "$RUSTFS_GID" ]; then
+      chown "$RUSTFS_UID:$RUSTFS_GID" "$vol" 2>/dev/null || true
+    elif [ -n "$RUSTFS_USERNAME" ] && [ -n "$RUSTFS_GROUPNAME" ]; then
+      chown "$RUSTFS_USERNAME:$RUSTFS_GROUPNAME" "$vol" 2>/dev/null || true
     fi
   fi
-  if [ "$(id -g "$group")" != "$gid" ]; then
-    if command -v groupmod >/dev/null 2>&1; then
-      echo "🔧 Updating GID of $group to $gid"
-      groupmod -g "$gid" "$group"
-      updated=1
+done
+
+# 3) Default credentials warning
+if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rustfsadmin" ]; then
+  echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
+fi
+
+# 4) Start with specified user
+docker_switch_user() {
+  if [ -n "${RUSTFS_USERNAME}" ] && [ -n "${RUSTFS_GROUPNAME}" ]; then
+    if [ -n "${RUSTFS_UID}" ] && [ -n "${RUSTFS_GID}" ]; then
+      # Execute with numeric UID:GID directly (doesn't depend on user existing in system)
+      exec chroot --userspec="${RUSTFS_UID}:${RUSTFS_GID}" / "$@"
+    else
+      # When only names are provided, create minimal passwd/group entries with 1000:1000; deduplicate before writing
+      if ! grep -q "^${RUSTFS_USERNAME}:" /etc/passwd 2>/dev/null; then
+        echo "${RUSTFS_USERNAME}:x:1000:1000:${RUSTFS_USERNAME}:/nonexistent:/sbin/nologin" >> /etc/passwd
+      fi
+      if ! grep -q "^${RUSTFS_GROUPNAME}:" /etc/group 2>/dev/null; then
+        echo "${RUSTFS_GROUPNAME}:x:1000:" >> /etc/group
+      fi
+      exec chroot --userspec="${RUSTFS_USERNAME}:${RUSTFS_GROUPNAME}" / "$@"
     fi
+  else
+    # If no user is specified, keep as root (container has minimal privilege practices that can be configured separately)
+    exec "$@"
   fi
-  return $updated
 }
 
-echo "📦 Initializing mount directories: ${LOCAL_VOLUMES[*]}"
-
-for vol in "${LOCAL_VOLUMES[@]}"; do
-  if [ ! -d "$vol" ]; then
-    echo "📁 Creating directory: $vol"
-    mkdir -p "$vol"
-  fi
-
-  # Alpine busybox stat does not support -c, coreutils is required
-  dir_uid=$(stat -c '%u' "$vol")
-  dir_gid=$(stat -c '%g' "$vol")
-
-  if [ "$dir_uid" != "$APP_UID" ] || [ "$dir_gid" != "$APP_GID" ]; then
-    if [[ "$SKIP_CHOWN" != "true" ]]; then
-      # Prefer to update rustfs user/group UID/GID
-      update_user_group_ids "$dir_uid" "$dir_gid" "$APP_USER" "$APP_GROUP" || \
-      {
-        echo "🔧 Fixing ownership for: $vol → $APP_USER:$APP_GROUP"
-        if [[ -n "$CHOWN_RECURSION_DEPTH" ]]; then
-          echo "🔧 Applying ownership fix with recursion depth: $CHOWN_RECURSION_DEPTH"
-          find "$vol" -mindepth 0 -maxdepth "$CHOWN_RECURSION_DEPTH" -exec chown "$APP_USER:$APP_GROUP" {} \;
-        else
-          echo "🔧 Applying ownership fix recursively (full depth)"
-          chown -R "$APP_USER:$APP_GROUP" "$vol"
-        fi
-      }
-    else
-      echo "⚠️ SKIP_CHOWN is enabled. Skipping ownership fix for: $vol"
-    fi
-  fi
-  chmod 700 "$vol"
-done
-
-# Warn if default credentials are used
-if [[ "$RUSTFS_ACCESS_KEY" == "rustfsadmin" || "$RUSTFS_SECRET_KEY" == "rustfsadmin" ]]; then
-  echo "⚠️ WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY"
-  echo "⚠️ It is strongly recommended to override these values in production!"
-fi
-
-echo "🚀 Starting application: $*"
-exec gosu "$APP_USER" "$@"
+echo "Starting: $*"
+docker_switch_user "$@"
