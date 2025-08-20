@@ -16,8 +16,6 @@ use rustfs_config::VERSION;
 use std::env;
 use std::fmt;
 use sysinfo::System;
-#[cfg(test)]
-use tracing::debug;
 
 /// Business Type Enumeration
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +155,7 @@ pub fn get_user_agent(service: ServiceType) -> String {
 mod tests {
     use super::*;
     use rustfs_config::VERSION;
+    use tracing::debug;
     #[test]
     fn test_user_agent_format_basis() {
         let ua = get_user_agent(ServiceType::Basis);
