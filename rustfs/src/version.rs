@@ -1,5 +1,6 @@
 use shadow_rs::shadow;
 use std::process::Command;
+#[cfg(test)]
 use tracing::debug;
 
 shadow!(build);

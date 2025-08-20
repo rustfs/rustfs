@@ -16,6 +16,7 @@ use rustfs_config::VERSION;
 use std::env;
 use std::fmt;
 use sysinfo::System;
+#[cfg(test)]
 use tracing::debug;
 
 /// Business Type Enumeration

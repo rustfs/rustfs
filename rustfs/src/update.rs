@@ -187,7 +187,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async     fn test_get_current_version() {
+    async fn test_get_current_version() {
         let version = get_current_version();
         assert!(!version.is_empty());
         debug!("Current version: {version}");

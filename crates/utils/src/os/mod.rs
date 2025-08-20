@@ -108,7 +108,7 @@ mod tests {
         let path1 = temp_dir1.path().to_str().unwrap();
         let path2 = temp_dir2.path().to_str().unwrap();
 
-        let result = same_disk(path1, path2).unwrap();
+        let _result = same_disk(path1, path2).unwrap();
         // Since both temporary directories are created in the same file system,
         // they should be on the same disk in most cases
         // Test passes if the function doesn't panic - the actual result depends on test environment

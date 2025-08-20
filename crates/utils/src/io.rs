@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
 use tracing::debug;
 
 /// Write all bytes from buf to writer, returning the total number of bytes written.
