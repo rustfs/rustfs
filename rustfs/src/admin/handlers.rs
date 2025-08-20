@@ -852,7 +852,7 @@ impl Operation for SetRemoteTargetHandler {
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 info!("have bucket: {}", bucket);
-                return Ok(S3Response::new((StatusCode::OK, Body::from("fuck".to_string()))));
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "No buckets found".to_string()));
             }
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
