@@ -12,23 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    Event, StoreError,
-    error::TargetError,
-    integration::NotificationMetrics,
-    store::{Key, Store},
-    target::Target,
-};
+use rustfs_targets::store::{Key, Store};
+use rustfs_targets::StoreError;
+use rustfs_targets::Target;
+use rustfs_targets::TargetError;
+
+use crate::{integration::NotificationMetrics, Event};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 /// Streams events from the store to the target
 pub async fn stream_events(
     store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
-    target: &dyn Target,
+    target: &dyn Target<Event>,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
     info!("Starting event stream for target: {}", target.name());
@@ -107,7 +106,7 @@ pub async fn stream_events(
 /// Starts the event streaming process for a target
 pub fn start_event_stream(
     mut store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
-    target: Arc<dyn Target + Send + Sync>,
+    target: Arc<dyn Target<Event> + Send + Sync>,
 ) -> mpsc::Sender<()> {
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
 
@@ -122,7 +121,7 @@ pub fn start_event_stream(
 /// Start event stream with batch processing
 pub fn start_event_stream_with_batching(
     mut store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
-    target: Arc<dyn Target + Send + Sync>,
+    target: Arc<dyn Target<Event> + Send + Sync>,
     metrics: Arc<NotificationMetrics>,
     semaphore: Arc<Semaphore>,
 ) -> mpsc::Sender<()> {
@@ -139,7 +138,7 @@ pub fn start_event_stream_with_batching(
 /// Event stream processing with batch processing
 pub async fn stream_events_with_batching(
     store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
-    target: &dyn Target,
+    target: &dyn Target<Event>,
     mut cancel_rx: mpsc::Receiver<()>,
     metrics: Arc<NotificationMetrics>,
     semaphore: Arc<Semaphore>,
@@ -236,7 +235,7 @@ pub async fn stream_events_with_batching(
 async fn process_batch(
     batch: &mut Vec<Event>,
     batch_keys: &mut Vec<Key>,
-    target: &dyn Target,
+    target: &dyn Target<Event>,
     max_retries: usize,
     base_delay: Duration,
     metrics: &Arc<NotificationMetrics>,

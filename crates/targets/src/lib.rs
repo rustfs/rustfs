@@ -11,3 +11,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+pub mod arn;
+pub mod error;
+mod event_name;
+pub mod store;
+pub mod target;
+
+pub use error::{NotificationError, StoreError, TargetError};
+pub use event_name::EventName;
+use serde::{Deserialize, Serialize};
+pub use target::Target;
+
+/// Represents a log of events for sending to targets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetLog<E> {
+    /// The event name
+    pub event_name: EventName,
+    /// The object key
+    pub key: String,
+    /// The list of events
+    pub records: Vec<E>,
+}

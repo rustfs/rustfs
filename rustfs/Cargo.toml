@@ -52,6 +52,7 @@ rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-protos = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-audit-logger = { workspace = true }
+rustfs-targets = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true

@@ -17,11 +17,13 @@ use rustfs_config::notify::{
     NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 // Using Global Accessories
-use rustfs_config::{DEFAULT_LIMIT, ENABLE_KEY, ENABLE_ON};
+use rustfs_config::EnableState::On;
+use rustfs_config::{DEFAULT_LIMIT, ENABLE_KEY};
 use rustfs_ecstore::config::{Config, KV, KVS};
-use rustfs_notify::arn::TargetID;
-use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
+use rustfs_notify::{init_logger, BucketNotificationConfig, Event, LogLevel, NotificationError};
 use rustfs_notify::{initialize, notification_system};
+use rustfs_targets::arn::TargetID;
+use rustfs_targets::EventName;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -47,7 +49,7 @@ async fn main() -> Result<(), NotificationError> {
     let webhook_kvs_vec = vec![
         KV {
             key: ENABLE_KEY.to_string(),
-            value: ENABLE_ON.to_string(),
+            value: On.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -95,7 +97,7 @@ async fn main() -> Result<(), NotificationError> {
     let mqtt_kvs_vec = vec![
         KV {
             key: ENABLE_KEY.to_string(),
-            value: ENABLE_ON.to_string(),
+            value: On.to_string(),
             hidden_if_empty: false,
         },
         KV {

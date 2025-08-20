@@ -17,6 +17,8 @@
 //! webhook and other audit-related settings.
 pub const AUDIT_WEBHOOK_SUB_SYS: &str = "audit_webhook";
 
+pub const AUDIT_STORE_EXTENSION: &str = ".audit";
+
 pub const WEBHOOK_ENDPOINT: &str = "endpoint";
 pub const WEBHOOK_AUTH_TOKEN: &str = "auth_token";
 pub const WEBHOOK_CLIENT_CERT: &str = "client_cert";

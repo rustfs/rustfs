@@ -26,6 +26,7 @@ keywords = ["audit", "logging", "file-operations", "system-events", "RustFS"]
 categories = ["web-programming", "development-tools::profiling", "asynchronous", "api-bindings", "development-tools::debugging"]
 
 [dependencies]
+rustfs-targets = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }

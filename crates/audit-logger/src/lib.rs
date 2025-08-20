@@ -1,6 +1,5 @@
 mod entry;
 mod logger;
-mod target;
 
 pub use entry::args::Args;
 pub use entry::audit::{ApiDetails, AuditLogEntry};

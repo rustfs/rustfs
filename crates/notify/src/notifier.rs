@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::arn::TargetID;
-use crate::{EventName, error::NotificationError, event::Event, rules::RulesMap, target::Target};
+use crate::{error::NotificationError, event::Event, rules::RulesMap};
 use dashmap::DashMap;
+use rustfs_targets::arn::TargetID;
+use rustfs_targets::target::EntityTarget;
+use rustfs_targets::EventName;
+use rustfs_targets::Target;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
@@ -150,7 +153,15 @@ impl EventNotifier {
                         debug!("Preparing to send event to target: {}", target_name_for_task);
                         // Use cloned data in closures to avoid borrowing conflicts
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = cloned_target_for_task.save(event_clone).await {
+                            let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
+                                object_name: object_key.clone(),
+                                bucket_name: bucket_name.clone(),
+                                event_name,
+                                data: **event_clone.clone(),
+                            });
+                            // Create an EntityTarget from the event
+
+                            if let Err(e) = cloned_target_for_task.save(entity_target).await {
                                 error!("Failed to send event to target {}: {}", target_name_for_task, e);
                             } else {
                                 debug!("Successfully saved event to target {}", target_name_for_task);
@@ -180,7 +191,7 @@ impl EventNotifier {
     #[instrument(skip(self, targets_to_init))]
     pub async fn init_bucket_targets(
         &self,
-        targets_to_init: Vec<Box<dyn Target + Send + Sync>>,
+        targets_to_init: Vec<Box<dyn Target<Event> + Send + Sync>>,
     ) -> Result<(), NotificationError> {
         // Currently active, simpler logic
         let mut target_list_guard = self.target_list.write().await; //Gets a write lock for the TargetList
@@ -189,7 +200,7 @@ impl EventNotifier {
             debug!("init bucket target: {}", target_boxed.name());
             // TargetList::add method expectations Arc<dyn Target + Send + Sync>
             // Therefore, you need to convert Box<dyn Target + Send + Sync> to Arc<dyn Target + Send + Sync>
-            let target_arc: Arc<dyn Target + Send + Sync> = Arc::from(target_boxed);
+            let target_arc: Arc<dyn Target<Event> + Send + Sync> = Arc::from(target_boxed);
             target_list_guard.add(target_arc)?; // Add Arc<dyn Target> to the list
         }
         info!(
@@ -203,7 +214,7 @@ impl EventNotifier {
 
 /// A thread-safe list of targets
 pub struct TargetList {
-    targets: HashMap<TargetID, Arc<dyn Target + Send + Sync>>,
+    targets: HashMap<TargetID, Arc<dyn Target<Event> + Send + Sync>>,
 }
 
 impl Default for TargetList {
@@ -219,7 +230,7 @@ impl TargetList {
     }
 
     /// Adds a target to the list
-    pub fn add(&mut self, target: Arc<dyn Target + Send + Sync>) -> Result<(), NotificationError> {
+    pub fn add(&mut self, target: Arc<dyn Target<Event> + Send + Sync>) -> Result<(), NotificationError> {
         let id = target.id();
         if self.targets.contains_key(&id) {
             // Potentially update or log a warning/error if replacing an existing target.
@@ -231,7 +242,7 @@ impl TargetList {
 
     /// Removes a target by ID. Note: This does not stop its associated event stream.
     /// Stream cancellation should be handled by EventNotifier.
-    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<Arc<dyn Target + Send + Sync>> {
+    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<Arc<dyn Target<Event> + Send + Sync>> {
         if let Some(target_arc) = self.targets.remove(id) {
             if let Err(e) = target_arc.close().await {
                 // Target's own close logic
@@ -258,7 +269,7 @@ impl TargetList {
     }
 
     /// Returns a target by ID
-    pub fn get(&self, id: &TargetID) -> Option<Arc<dyn Target + Send + Sync>> {
+    pub fn get(&self, id: &TargetID) -> Option<Arc<dyn Target<Event> + Send + Sync>> {
         self.targets.get(id).cloned()
     }
 

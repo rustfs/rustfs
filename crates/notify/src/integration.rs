@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::arn::TargetID;
-use crate::store::{Key, Store};
 use crate::{
-    Event, EventName, StoreError, Target, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry,
-    rules::BucketNotificationConfig, stream,
+    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event,
 };
 use rustfs_ecstore::config::{Config, KVS};
+use rustfs_targets::arn::TargetID;
+use rustfs_targets::store::{Key, Store};
+use rustfs_targets::EventName;
+use rustfs_targets::{StoreError, Target};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Notify the system of monitoring indicators
 pub struct NotificationMetrics {
@@ -127,7 +129,7 @@ impl NotificationSystem {
 
         let config = self.config.read().await;
         debug!("Initializing notification system with config: {:?}", *config);
-        let targets: Vec<Box<dyn Target + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
+        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
 
@@ -319,7 +321,7 @@ impl NotificationSystem {
     fn enhanced_start_event_stream(
         &self,
         store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
-        target: Arc<dyn Target + Send + Sync>,
+        target: Arc<dyn Target<Event> + Send + Sync>,
         metrics: Arc<NotificationMetrics>,
         semaphore: Arc<Semaphore>,
     ) -> mpsc::Sender<()> {
@@ -348,7 +350,7 @@ impl NotificationSystem {
 
         // Create a new target from configuration
         // This function will now be responsible for merging env, creating and persisting the final configuration.
-        let targets: Vec<Box<dyn Target + Send + Sync>> = self
+        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self
             .registry
             .create_targets_from_config(&new_config)
             .await

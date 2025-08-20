@@ -18,7 +18,6 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
-pub mod arn;
 pub mod error;
 pub mod event;
 pub mod factory;
@@ -27,20 +26,16 @@ pub mod integration;
 pub mod notifier;
 pub mod registry;
 pub mod rules;
-pub mod store;
 pub mod stream;
-pub mod target;
-
 // Re-exports
-pub use error::{NotificationError, StoreError, TargetError};
-pub use event::{Event, EventArgs, EventLog, EventName};
+pub use error::NotificationError;
+pub use event::{Event, EventArgs};
 pub use global::{initialize, is_notification_system_initialized, notification_system};
 pub use integration::NotificationSystem;
 pub use rules::BucketNotificationConfig;
 use std::io::IsTerminal;
-pub use target::Target;
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, prelude::*, util::SubscriberInitExt, EnvFilter};
 
 /// Initialize the tracing log system
 ///
