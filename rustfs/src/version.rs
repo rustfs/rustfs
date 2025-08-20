@@ -1,7 +1,5 @@
 use shadow_rs::shadow;
 use std::process::Command;
-#[cfg(test)]
-use tracing::debug;
 
 shadow!(build);
 
@@ -207,6 +205,7 @@ fn compare_pre_release(current: &str, latest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::debug;
 
     #[test]
     fn test_parse_version() {
