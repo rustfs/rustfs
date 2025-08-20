@@ -155,12 +155,13 @@ pub fn get_user_agent(service: ServiceType) -> String {
 mod tests {
     use super::*;
     use rustfs_config::VERSION;
+    use tracing::debug;
     #[test]
     fn test_user_agent_format_basis() {
         let ua = get_user_agent(ServiceType::Basis);
         assert!(ua.starts_with("Mozilla/5.0"));
         assert!(ua.contains(&format!("RustFS/{VERSION}").to_string()));
-        println!("User-Agent: {ua}");
+        debug!("Basic User-Agent: {}", ua);
     }
 
     #[test]
@@ -168,7 +169,7 @@ mod tests {
         let ua = get_user_agent(ServiceType::Core);
         assert!(ua.starts_with("Mozilla/5.0"));
         assert!(ua.contains(&format!("RustFS/{VERSION} (core)").to_string()));
-        println!("User-Agent: {ua}");
+        debug!("Core User-Agent: {}", ua);
     }
 
     #[test]
@@ -176,7 +177,7 @@ mod tests {
         let ua = get_user_agent(ServiceType::Event);
         assert!(ua.starts_with("Mozilla/5.0"));
         assert!(ua.contains(&format!("RustFS/{VERSION} (event)").to_string()));
-        println!("User-Agent: {ua}");
+        debug!("Event User-Agent: {}", ua);
     }
 
     #[test]
@@ -184,7 +185,7 @@ mod tests {
         let ua = get_user_agent(ServiceType::Logger);
         assert!(ua.starts_with("Mozilla/5.0"));
         assert!(ua.contains(&format!("RustFS/{VERSION} (logger)").to_string()));
-        println!("User-Agent: {ua}");
+        debug!("Logger User-Agent: {}", ua);
     }
 
     #[test]
@@ -192,7 +193,7 @@ mod tests {
         let ua = get_user_agent(ServiceType::Custom("monitor".to_string()));
         assert!(ua.starts_with("Mozilla/5.0"));
         assert!(ua.contains(&format!("RustFS/{VERSION} (monitor)").to_string()));
-        println!("User-Agent: {ua}");
+        debug!("Monitor User-Agent: {}", ua);
     }
 
     #[test]
@@ -203,9 +204,9 @@ mod tests {
         let ua_logger = get_user_agent(ServiceType::Logger);
         let ua_custom = get_user_agent(ServiceType::Custom("monitor".to_string()));
 
-        println!("Core User-Agent: {ua_core}");
-        println!("Event User-Agent: {ua_event}");
-        println!("Logger User-Agent: {ua_logger}");
-        println!("Custom User-Agent: {ua_custom}");
+        debug!("Core User-Agent: {}", ua_core);
+        debug!("Event User-Agent: {}", ua_event);
+        debug!("Logger User-Agent: {}", ua_logger);
+        debug!("Custom User-Agent: {}", ua_custom);
     }
 }

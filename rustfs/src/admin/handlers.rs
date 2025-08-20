@@ -837,8 +837,8 @@ pub struct SetRemoteTargetHandler {}
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, mut _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         //return Ok(S3Response::new((StatusCode::OK, Body::from("OK".to_string()))));
-        // println!("handle MetricsHandler, params: {:?}", _req.input);
-        info!("SetRemoteTargetHandler params: {:?}", _req.credentials);
+        debug!("Processing SetRemoteTargetHandler request");
+        info!("SetRemoteTargetHandler credentials: {:?}", _req.credentials);
         let queries = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
@@ -846,9 +846,8 @@ impl Operation for SetRemoteTargetHandler {
         };
         let _is_owner = true; // 先按 true 处理，后期根据请求决定
         let body = _req.input.store_all_unlimited().await.unwrap();
-        //println!("body: {}", std::str::from_utf8(&body.clone()).unwrap());
+        debug!("Request body received, size: {} bytes", body.len());
 
-        //println!("bucket is:{}", bucket.clone());
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 info!("have bucket: {}", bucket);
@@ -907,7 +906,7 @@ impl Operation for SetRemoteTargetHandler {
                                 info!("targets is {}", targets.len());
                                 match serde_json::to_vec(&targets) {
                                     Ok(json) => {
-                                        //println!("json is:{:?}", json.clone().to_ascii_lowercase());
+                                        debug!("Serialized targets configuration, size: {} bytes", json.len());
                                         //metadata_sys::GLOBAL_BucketMetadataSys::
                                         //BUCKET_TARGETS_FILE: &str = "bucket-targets.json"
                                         let _ = metadata_sys::update(bucket, "bucket-targets.json", json).await;
@@ -1011,7 +1010,7 @@ impl Operation for ListRemoteTargetHandler {
 
                 return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
             } else {
-                println!("GLOBAL_BUCKET_TARGET_SYS is not initialized");
+                error!("GLOBAL_BUCKET_TARGET_SYS is not initialized");
                 return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "GLOBAL_BUCKET_TARGET_SYS is not initialized".to_string(),
@@ -1019,7 +1018,7 @@ impl Operation for ListRemoteTargetHandler {
             }
         }
 
-        println!("Bucket parameter missing in request");
+        warn!("Bucket parameter is missing in request");
         Ok(S3Response::new((
             StatusCode::BAD_REQUEST,
             Body::from("Bucket parameter is required".to_string()),
@@ -1197,7 +1196,7 @@ mod tests {
     fn test_decode() {
         let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
         let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
-        println!("{s:?}");
+        debug!("Parsed HealOpts: {:?}", s);
     }
 
     // Note: Testing the actual async handler implementations requires:
