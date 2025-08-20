@@ -1,6 +1,3 @@
-# -------------------
-# Build stage
-# -------------------
 FROM alpine:3.22 AS build
 
 ARG TARGETARCH
@@ -9,9 +6,6 @@ ARG RELEASE=latest
 RUN apk add --no-cache ca-certificates curl unzip
 WORKDIR /build
 
-# Download and extract release package matching current TARGETARCH
-# - If RELEASE=latest: take first tag_name from /releases (may include pre-releases)
-# - Otherwise use specified tag (e.g. v0.1.2)
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64)  ARCH_SUBSTR="x86_64-musl"  ;; \
@@ -46,9 +40,6 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-# -------------------
-# Runtime stage
-# -------------------
 FROM alpine:3.22
 
 ARG RELEASE=latest
@@ -67,22 +58,16 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-# Install only runtime requirements: certificates and coreutils (provides chroot --userspec)
-RUN apk add --no-cache ca-certificates coreutils && \
-    addgroup -g 1000 rustfs && \
-    adduser  -u 1000 -G rustfs -s /sbin/nologin -D rustfs
+RUN apk add --no-cache ca-certificates coreutils
 
-# Copy binary and entry script (ensure fixed entrypoint.sh exists in repository)
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
 COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /usr/bin/rustfs /entrypoint.sh && \
     mkdir -p /data /logs && \
-    chown rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
-# Default environment (can be overridden in docker run/compose)
 ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_ACCESS_KEY="rustfsadmin" \
     RUSTFS_SECRET_KEY="rustfsadmin" \
@@ -90,14 +75,11 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
     RUSTFS_OBS_LOG_DIRECTORY="/logs" \
-    RUSTFS_SINKS_FILE_PATH="/logs" \
-    RUSTFS_USERNAME="rustfs" \
-    RUSTFS_GROUPNAME="rustfs" \
-    RUSTFS_UID="1000" \
-    RUSTFS_GID="1000"
+    RUSTFS_SINKS_FILE_PATH="/logs"
 
 EXPOSE 9000
 VOLUME ["/data", "/logs"]
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/usr/bin/rustfs"]
+
+CMD ["rustfs"]
