@@ -55,27 +55,5 @@ if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rus
   echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
 fi
 
-# 4) Start with specified user
-docker_switch_user() {
-  if [ -n "${RUSTFS_USERNAME}" ] && [ -n "${RUSTFS_GROUPNAME}" ]; then
-    if [ -n "${RUSTFS_UID}" ] && [ -n "${RUSTFS_GID}" ]; then
-      # Execute with numeric UID:GID directly (doesn't depend on user existing in system)
-      exec chroot --userspec="${RUSTFS_UID}:${RUSTFS_GID}" / "$@"
-    else
-      # When only names are provided, create minimal passwd/group entries with 1000:1000; deduplicate before writing
-      if ! grep -q "^${RUSTFS_USERNAME}:" /etc/passwd 2>/dev/null; then
-        echo "${RUSTFS_USERNAME}:x:1000:1000:${RUSTFS_USERNAME}:/nonexistent:/sbin/nologin" >> /etc/passwd
-      fi
-      if ! grep -q "^${RUSTFS_GROUPNAME}:" /etc/group 2>/dev/null; then
-        echo "${RUSTFS_GROUPNAME}:x:1000:" >> /etc/group
-      fi
-      exec chroot --userspec="${RUSTFS_USERNAME}:${RUSTFS_GROUPNAME}" / "$@"
-    fi
-  else
-    # If no user is specified, keep as root (container has minimal privilege practices that can be configured separately)
-    exec "$@"
-  fi
-}
-
 echo "Starting: $*"
-docker_switch_user "$@"
+exec "$@"
