@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::debug;
 
 /// Write all bytes from buf to writer, returning the total number of bytes written.
 pub async fn write_all<W: AsyncWrite + Send + Sync + Unpin>(writer: &mut W, buf: &[u8]) -> std::io::Result<usize> {
@@ -130,7 +131,7 @@ mod tests {
             rev[total - n..total].copy_from_slice(&buf[..n]);
 
             count += 1;
-            println!("count: {count}, total: {total}, n: {n}");
+            debug!("Read progress - count: {}, total: {}, bytes read: {}", count, total, n);
         }
         assert_eq!(total, size);
 

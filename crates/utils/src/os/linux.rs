@@ -17,6 +17,7 @@ use nix::sys::statfs::{self, FsType, statfs};
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
+use tracing::debug;
 
 use super::{DiskInfo, IOStats};
 

@@ -728,7 +728,7 @@ impl ReplicationPool {
             // Either already satisfied or worker count changed while waiting for the lock.
             return;
         }
-        println!("2 resize_lrg_workers");
+        debug!("Resizing large workers pool");
 
         let active_workers = Arc::clone(&self.active_lrg_workers);
         let obj_layer = Arc::clone(&self.obj_layer);
@@ -743,7 +743,7 @@ impl ReplicationPool {
 
             tokio::spawn(async move {
                 while let Some(operation) = receiver.recv().await {
-                    println!("resize workers 1");
+                    debug!("Processing replication operation in worker");
                     active_workers_clone.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(info) = operation.as_any().downcast_ref::<ReplicateObjectInfo>() {
