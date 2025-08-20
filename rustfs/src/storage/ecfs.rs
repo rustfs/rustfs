@@ -192,8 +192,8 @@ impl FS {
             let f = match entry {
                 Ok(f) => f,
                 Err(e) => {
-                    println!("Error reading entry: {e}");
-                    return Err(s3_error!(InvalidArgument, "Error reading entry {:?}", e));
+                    error!("Failed to read archive entry: {}", e);
+                    return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
                 }
             };
 
@@ -210,7 +210,7 @@ impl FS {
 
                 let mut size = f.header().size().unwrap_or_default() as i64;
 
-                println!("Extracted: {fpath}, size {size}");
+                debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
                 let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
 
@@ -271,14 +271,14 @@ impl FS {
         //     CompressionFormat::from_extension(&ext),
         //     |entry: tokio_tar::Entry<tokio_tar::Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>| async move {
         //         let path = entry.path().unwrap();
-        //         println!("Extracted: {}", path.display());
+        //         debug!("Extracted: {}", path.display());
         //         Ok(())
         //     },
         // )
         // .await
         // {
-        //     Ok(_) => println!("Decompression successful!"),
-        //     Err(e) => println!("Decompression failed: {}", e),
+        //     Ok(_) => info!("Decompression completed successfully"),
+        //     Err(e) => error!("Decompression failed: {}", e),
         // }
 
         // TODO: etag
@@ -311,7 +311,7 @@ impl S3 for FS {
             .make_bucket(
                 &bucket,
                 &MakeBucketOptions {
-                    force_create: true,
+                    force_create: false, // TODO: force support
                     lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
                     ..Default::default()
                 },
@@ -984,6 +984,7 @@ impl S3 for FS {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag,
+            metadata: Some(info.user_defined),
             ..Default::default()
         };
 

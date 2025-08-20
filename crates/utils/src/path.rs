@@ -279,9 +279,9 @@ mod tests {
     #[test]
     fn test_base_dir_from_prefix() {
         let a = "da/";
-        println!("---- in {a}");
-        let a = base_dir_from_prefix(a);
-        println!("---- out {a}");
+        // Test base_dir_from_prefix function
+        let result = base_dir_from_prefix(a);
+        assert!(!result.is_empty());
     }
 
     #[test]
