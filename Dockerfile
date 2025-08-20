@@ -58,9 +58,7 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-RUN apk add --no-cache ca-certificates coreutils && \
-    addgroup -g 1000 rustfs && \
-    adduser  -u 1000 -G rustfs -s /sbin/nologin -D rustfs
+RUN apk add --no-cache ca-certificates coreutils
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
