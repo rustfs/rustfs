@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(test)]
-use tracing::debug;
 
 /// Write all bytes from buf to writer, returning the total number of bytes written.
 pub async fn write_all<W: AsyncWrite + Send + Sync + Unpin>(writer: &mut W, buf: &[u8]) -> std::io::Result<usize> {
@@ -112,6 +110,7 @@ pub fn uvarint(buf: &[u8]) -> (u64, isize) {
 mod tests {
     use super::*;
     use tokio::io::BufReader;
+    use tracing::debug;
 
     #[tokio::test]
     async fn test_read_full_exact() {
