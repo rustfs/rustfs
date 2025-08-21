@@ -14,8 +14,11 @@
 
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
-use crate::{Event, StoreError, TargetError};
+use crate::{EventName, StoreError, TargetError};
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 pub mod mqtt;
@@ -23,7 +26,10 @@ pub mod webhook;
 
 /// Trait for notification targets
 #[async_trait]
-pub trait Target: Send + Sync + 'static {
+pub trait Target<E>: Send + Sync + 'static
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     /// Returns the ID of the target
     fn id(&self) -> TargetID;
 
@@ -36,7 +42,7 @@ pub trait Target: Send + Sync + 'static {
     async fn is_active(&self) -> Result<bool, TargetError>;
 
     /// Saves an event (either sends it immediately or stores it for later)
-    async fn save(&self, event: Arc<Event>) -> Result<(), TargetError>;
+    async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError>;
 
     /// Sends an event from the store
     async fn send_from_store(&self, key: Key) -> Result<(), TargetError>;
@@ -45,10 +51,10 @@ pub trait Target: Send + Sync + 'static {
     async fn close(&self) -> Result<(), TargetError>;
 
     /// Returns the store associated with the target (if any)
-    fn store(&self) -> Option<&(dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync)>;
+    fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)>;
 
     /// Returns the type of the target
-    fn clone_dyn(&self) -> Box<dyn Target + Send + Sync>;
+    fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync>;
 
     /// Initialize the target, such as establishing a connection, etc.
     async fn init(&self) -> Result<(), TargetError> {
@@ -58,6 +64,17 @@ pub trait Target: Send + Sync + 'static {
 
     /// Check if the target is enabled
     fn is_enabled(&self) -> bool;
+}
+
+#[derive(Debug, Serialize, Clone, Deserialize)]
+pub struct EntityTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize,
+{
+    pub object_name: String,
+    pub bucket_name: String,
+    pub event_name: EventName,
+    pub data: E,
 }
 
 /// The `ChannelTargetType` enum represents the different types of channel Target
@@ -75,7 +92,7 @@ pub trait Target: Send + Sync + 'static {
 ///
 /// example usage:
 /// ```rust
-/// use rustfs_notify::target::ChannelTargetType;
+/// use rustfs_targets::target::ChannelTargetType;
 ///
 /// let target_type = ChannelTargetType::Webhook;
 /// assert_eq!(target_type.as_str(), "webhook");
@@ -101,7 +118,7 @@ impl ChannelTargetType {
 }
 
 impl std::fmt::Display for ChannelTargetType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelTargetType::Webhook => write!(f, "webhook"),
             ChannelTargetType::Kafka => write!(f, "kafka"),
@@ -115,5 +132,30 @@ pub fn parse_bool(value: &str) -> Result<bool, TargetError> {
         "true" | "on" | "yes" | "1" => Ok(true),
         "false" | "off" | "no" | "0" => Ok(false),
         _ => Err(TargetError::ParseError(format!("Unable to parse boolean: {value}"))),
+    }
+}
+
+/// `TargetType` enum represents the type of target in the notification system.
+#[derive(Debug, Clone)]
+pub enum TargetType {
+    AuditLog,
+    NotifyEvent,
+}
+
+impl TargetType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TargetType::AuditLog => "audit_log",
+            TargetType::NotifyEvent => "notify_event",
+        }
+    }
+}
+
+impl std::fmt::Display for TargetType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetType::AuditLog => write!(f, "audit_log"),
+            TargetType::NotifyEvent => write!(f, "notify_event"),
+        }
     }
 }

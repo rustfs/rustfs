@@ -13,18 +13,13 @@
 // limitations under the License.
 
 use crate::store::Key;
-use crate::target::ChannelTargetType;
-use crate::{
-    StoreError, Target,
-    arn::TargetID,
-    error::TargetError,
-    event::{Event, EventLog},
-    store::Store,
-};
+use crate::target::{ChannelTargetType, EntityTarget, TargetType};
+use crate::{StoreError, Target, TargetLog, arn::TargetID, error::TargetError, store::Store};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
-use rustfs_config::notify::STORE_EXTENSION;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{
     path::PathBuf,
@@ -62,6 +57,8 @@ pub struct MQTTArgs {
     pub queue_dir: String,
     /// The maximum number of events to store
     pub queue_limit: u64,
+    /// the target type
+    pub target_type: TargetType,
 }
 
 impl MQTTArgs {
@@ -75,6 +72,10 @@ impl MQTTArgs {
             _ => {
                 return Err(TargetError::Configuration("unknown protocol in broker address".to_string()));
             }
+        }
+
+        if self.topic.is_empty() {
+            return Err(TargetError::Configuration("MQTT topic cannot be empty".to_string()));
         }
 
         if !self.queue_dir.is_empty() {
@@ -100,16 +101,22 @@ struct BgTaskManager {
 }
 
 /// A target that sends events to an MQTT broker
-pub struct MQTTTarget {
+pub struct MQTTTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     id: TargetID,
     args: MQTTArgs,
     client: Arc<Mutex<Option<AsyncClient>>>,
-    store: Option<Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>>,
+    store: Option<Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: Arc<AtomicBool>,
     bg_task_manager: Arc<BgTaskManager>,
 }
 
-impl MQTTTarget {
+impl<E> MQTTTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     /// Creates a new MQTTTarget
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: MQTTArgs) -> Result<Self, TargetError> {
@@ -121,7 +128,12 @@ impl MQTTTarget {
             // Ensure the directory name is valid for filesystem
             let specific_queue_path = base_path.join(unique_dir_name);
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
-            let store = crate::store::QueueStore::<Event>::new(specific_queue_path, args.queue_limit, STORE_EXTENSION);
+            let extension = match args.target_type {
+                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
+                TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
+            };
+
+            let store = crate::store::QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);
             if let Err(e) = store.open() {
                 error!(
                     target_id = %target_id,
@@ -130,7 +142,7 @@ impl MQTTTarget {
                 );
                 return Err(TargetError::Storage(format!("{e}")));
             }
-            Some(Box::new(store) as Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>)
+            Some(Box::new(store) as Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
         };
@@ -237,18 +249,18 @@ impl MQTTTarget {
     }
 
     #[instrument(skip(self, event), fields(target_id = %self.id))]
-    async fn send(&self, event: &Event) -> Result<(), TargetError> {
+    async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
         let client_guard = self.client.lock().await;
         let client = client_guard
             .as_ref()
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
-        let object_name = urlencoding::decode(&event.s3.object.key)
+        let object_name = urlencoding::decode(&event.object_name)
             .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
 
-        let key = format!("{}/{}", event.s3.bucket.name, object_name);
+        let key = format!("{}/{}", event.bucket_name, object_name);
 
-        let log = EventLog {
+        let log = TargetLog {
             event_name: event.event_name,
             key,
             records: vec![event.clone()],
@@ -256,7 +268,6 @@ impl MQTTTarget {
 
         let data = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
 
-        // Vec<u8> Convert to String, only for printing logs
         let data_string = String::from_utf8(data.clone())
             .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {e}")))?;
         debug!("Sending event to mqtt target: {}, event log: {}", self.id, data_string);
@@ -278,7 +289,7 @@ impl MQTTTarget {
         Ok(())
     }
 
-    pub fn clone_target(&self) -> Box<dyn Target + Send + Sync> {
+    pub fn clone_target(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(MQTTTarget {
             id: self.id.clone(),
             args: self.args.clone(),
@@ -444,7 +455,10 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
 }
 
 #[async_trait]
-impl Target for MQTTTarget {
+impl<E> Target<E> for MQTTTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     fn id(&self) -> TargetID {
         self.id.clone()
     }
@@ -476,7 +490,7 @@ impl Target for MQTTTarget {
     }
 
     #[instrument(skip(self, event), fields(target_id = %self.id))]
-    async fn save(&self, event: Arc<Event>) -> Result<(), TargetError> {
+    async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
         if let Some(store) = &self.store {
             debug!(target_id = %self.id, "Event saved to store start");
             // If store is configured, ONLY put the event into the store.
@@ -620,11 +634,11 @@ impl Target for MQTTTarget {
         Ok(())
     }
 
-    fn store(&self) -> Option<&(dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync)> {
+    fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)> {
         self.store.as_deref()
     }
 
-    fn clone_dyn(&self) -> Box<dyn Target + Send + Sync> {
+    fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
         self.clone_target()
     }
 

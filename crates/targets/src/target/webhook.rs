@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::target::ChannelTargetType;
+use crate::target::{ChannelTargetType, EntityTarget, TargetType};
 use crate::{
-    StoreError, Target,
+    StoreError, Target, TargetLog,
     arn::TargetID,
     error::TargetError,
-    event::{Event, EventLog},
     store::{Key, Store},
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_config::notify::STORE_EXTENSION;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::{
     path::PathBuf,
     sync::{
@@ -53,6 +54,8 @@ pub struct WebhookArgs {
     pub client_cert: String,
     /// The client key for TLS (PEM format)
     pub client_key: String,
+    /// the target type
+    pub target_type: TargetType,
 }
 
 impl WebhookArgs {
@@ -84,20 +87,26 @@ impl WebhookArgs {
 }
 
 /// A target that sends events to a webhook
-pub struct WebhookTarget {
+pub struct WebhookTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     id: TargetID,
     args: WebhookArgs,
     http_client: Arc<Client>,
     // Add Send + Sync constraints to ensure thread safety
-    store: Option<Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>>,
+    store: Option<Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
     addr: String,
     cancel_sender: mpsc::Sender<()>,
 }
 
-impl WebhookTarget {
+impl<E> WebhookTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     /// Clones the WebhookTarget, creating a new instance with the same configuration
-    pub fn clone_box(&self) -> Box<dyn Target + Send + Sync> {
+    pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(WebhookTarget {
             id: self.id.clone(),
             args: self.args.clone(),
@@ -144,7 +153,7 @@ impl WebhookTarget {
         let queue_store = if !args.queue_dir.is_empty() {
             let queue_dir =
                 PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
-            let store = crate::store::QueueStore::<Event>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
+            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
@@ -152,7 +161,7 @@ impl WebhookTarget {
             }
 
             // Make sure that the Store trait implemented by QueueStore matches the expected error type
-            Some(Box::new(store) as Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>)
+            Some(Box::new(store) as Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
         };
@@ -203,17 +212,17 @@ impl WebhookTarget {
         Ok(())
     }
 
-    async fn send(&self, event: &Event) -> Result<(), TargetError> {
+    async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
         info!("Webhook Sending event to webhook target: {}", self.id);
-        let object_name = urlencoding::decode(&event.s3.object.key)
+        let object_name = urlencoding::decode(&event.object_name)
             .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
 
-        let key = format!("{}/{}", event.s3.bucket.name, object_name);
+        let key = format!("{}/{}", event.bucket_name, object_name);
 
-        let log = EventLog {
+        let log = TargetLog {
             event_name: event.event_name,
             key,
-            records: vec![event.clone()],
+            records: vec![event.data.clone()],
         };
 
         let data = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
@@ -275,12 +284,14 @@ impl WebhookTarget {
 }
 
 #[async_trait]
-impl Target for WebhookTarget {
+impl<E> Target<E> for WebhookTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
     fn id(&self) -> TargetID {
         self.id.clone()
     }
 
-    // Make sure Future is Send
     async fn is_active(&self) -> Result<bool, TargetError> {
         let socket_addr = lookup_host(&self.addr)
             .await
@@ -305,7 +316,7 @@ impl Target for WebhookTarget {
         }
     }
 
-    async fn save(&self, event: Arc<Event>) -> Result<(), TargetError> {
+    async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
         if let Some(store) = &self.store {
             // Call the store method directly, no longer need to acquire the lock
             store
@@ -379,17 +390,15 @@ impl Target for WebhookTarget {
         Ok(())
     }
 
-    fn store(&self) -> Option<&(dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync)> {
+    fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)> {
         // Returns the reference to the internal store
         self.store.as_deref()
     }
 
-    fn clone_dyn(&self) -> Box<dyn Target + Send + Sync> {
+    fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
         self.clone_box()
     }
 
-    // The existing init method can meet the needs well, but we need to make sure it complies with the Target trait
-    // We can use the existing init method, but adjust the return value to match the trait requirement
     async fn init(&self) -> Result<(), TargetError> {
         // If the target is disabled, return to success directly
         if !self.is_enabled() {

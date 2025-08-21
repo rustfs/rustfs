@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::error::StoreError;
-use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT, DEFAULT_LIMIT};
+use rustfs_config::DEFAULT_LIMIT;
+use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::sync::{Arc, RwLock};
@@ -123,7 +124,10 @@ pub fn parse_key(s: &str) -> Key {
 }
 
 /// Trait for a store that can store and retrieve items of type T
-pub trait Store<T>: Send + Sync {
+pub trait Store<T>: Send + Sync
+where
+    T: Send + Sync + 'static + Clone + Serialize,
+{
     /// The error type for the store
     type Error;
     /// The key type for the store

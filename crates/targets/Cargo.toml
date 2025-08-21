@@ -1,0 +1,31 @@
+[package]
+name = "rustfs-targets"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "Notification target abstraction and implementations for RustFS"
+keywords = ["file-system", "notification", "target", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "filesystem"]
+documentation = "https://docs.rs/rustfs-target/latest/rustfs_target/"
+
+[dependencies]
+rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] }
+rustfs-utils = { workspace = true, features = ["sys"] }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+rumqttc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[lints]
+workspace = true

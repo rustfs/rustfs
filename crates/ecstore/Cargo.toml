@@ -34,7 +34,7 @@ workspace = true
 default = []
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }

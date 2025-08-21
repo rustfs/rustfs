@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    error::TargetError,
-    target::{Target, mqtt::MQTTArgs, webhook::WebhookArgs},
-};
 use async_trait::async_trait;
 use rumqttc::QoS;
 use rustfs_config::notify::{
-    DEFAULT_DIR, DEFAULT_LIMIT, ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL,
-    MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME,
-    NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
-    WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
+    MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
+
+use crate::Event;
+use rustfs_config::{DEFAULT_DIR, DEFAULT_LIMIT};
 use rustfs_ecstore::config::KVS;
+use rustfs_targets::{
+    Target,
+    error::TargetError,
+    target::{mqtt::MQTTArgs, webhook::WebhookArgs},
+};
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -34,7 +37,7 @@ use url::Url;
 #[async_trait]
 pub trait TargetFactory: Send + Sync {
     /// Creates a target from configuration
-    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target + Send + Sync>, TargetError>;
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError>;
 
     /// Validates target configuration
     fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError>;
@@ -53,7 +56,7 @@ pub struct WebhookTargetFactory;
 
 #[async_trait]
 impl TargetFactory for WebhookTargetFactory {
-    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target + Send + Sync>, TargetError> {
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
         // All config values are now read directly from the merged `config` KVS.
         let endpoint = config
             .lookup(WEBHOOK_ENDPOINT)
@@ -72,9 +75,10 @@ impl TargetFactory for WebhookTargetFactory {
                 .unwrap_or(DEFAULT_LIMIT),
             client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
             client_key: config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
+            target_type: rustfs_targets::target::TargetType::NotifyEvent,
         };
 
-        let target = crate::target::webhook::WebhookTarget::new(id, args)?;
+        let target = rustfs_targets::target::webhook::WebhookTarget::new(id, args)?;
         Ok(Box::new(target))
     }
 
@@ -119,7 +123,7 @@ pub struct MQTTTargetFactory;
 
 #[async_trait]
 impl TargetFactory for MQTTTargetFactory {
-    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target + Send + Sync>, TargetError> {
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
         let broker = config
             .lookup(MQTT_BROKER)
             .ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
@@ -161,9 +165,10 @@ impl TargetFactory for MQTTTargetFactory {
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_LIMIT),
+            target_type: rustfs_targets::target::TargetType::NotifyEvent,
         };
 
-        let target = crate::target::mqtt::MQTTTarget::new(id, args)?;
+        let target = rustfs_targets::target::mqtt::MQTTTarget::new(id, args)?;
         Ok(Box::new(target))
     }
 
