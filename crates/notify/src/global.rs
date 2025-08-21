@@ -59,6 +59,14 @@ pub struct Notifier {}
 impl Notifier {
     /// Notify an event asynchronously.
     /// This is the only entry point for all event notifications in the system.
+    /// # Parameter
+    /// - `args`: The event arguments containing details about the event to be notified.
+    ///
+    /// # Return value
+    /// Returns `()`, indicating that the notification has been sent.
+    ///
+    /// # Using
+    /// This function is used to notify events in the system, such as object creation, deletion, or updates.
     #[instrument(skip(self, args))]
     pub async fn notify(&self, args: EventArgs) {
         // Dependency injection or service positioning mode obtain NotificationSystem instance
@@ -88,6 +96,19 @@ impl Notifier {
     }
 
     /// Add notification rules for the specified bucket and load configuration
+    /// # Parameter
+    /// - `bucket_name`: The name of the target bucket.
+    /// - `region`: The area where bucket is located.
+    /// - `event_names`: A list of event names that trigger notifications.
+    /// - `prefix`: The prefix of the object key that triggers notifications.
+    /// - `suffix`: The suffix of the object key that triggers notifications.
+    /// - `target_ids`: A list of target IDs that will receive notifications.
+    ///
+    /// # Return value
+    /// Returns `Result<(), NotificationError>`, Ok on success, and an error on failure
+    ///
+    /// # Using
+    /// This function allows you to dynamically add notification rules for a specific bucket.
     pub async fn add_bucket_notification_rule(
         &self,
         bucket_name: &str,
@@ -125,31 +146,18 @@ impl Notifier {
             .await
     }
 
-    /// Dynamically add notification rules according to event type
-    /// This function allows you to add multiple rules for different event types, prefixes, suffixes, and target IDs.
-    /// # Example:
-    /// ```rust
-    /// use rustfs_notify::{BucketNotificationConfig, EventName, TargetID, notifier_instance, NotificationError};
+    /// Dynamically add notification rules according to different event types.
     ///
-    /// let event_rules = vec![
-    ///     (
-    ///         vec![EventName::ObjectCreatedPut],
-    ///         "images/",
-    ///         ".jpg",
-    ///         vec![TargetID::new("default".to_string(), "webhook".to_string())],
-    ///     ),
-    ///     (
-    ///         vec![EventName::ObjectRemovedDelete],
-    ///         "logs/",
-    ///         ".log",
-    ///         vec![TargetID::new("default".to_string(), "mqtt".to_string())],
-    ///     ),
-    /// ];
+    /// # Parameter
+    /// - `bucket_name`: The name of the target bucket.
+    /// - `region`: The area where bucket is located.
+    /// - `event_rules`: Each rule contains a list of event types, prefixes, suffixes, and target IDs.
     ///
-    /// notifier_instance()
-    ///     .add_event_specific_rules("my-bucket", "us-east-1", &event_rules)
-    ///     .await?;
-    /// ```
+    /// # Return value
+    /// Returns `Result<(), NotificationError>`, Ok on success, and an error on failure.
+    ///
+    /// # Using
+    /// Supports notification rules for adding multiple event types, prefixes, suffixes, and targets to the same bucket in batches.
     pub async fn add_event_specific_rules(
         &self,
         bucket_name: &str,
