@@ -24,6 +24,8 @@ use crate::{
 
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_ecstore::event_notification::{EventArgs, send_event};
+use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::{
@@ -469,6 +471,20 @@ impl Operation for ImportBucketMetadata {
                 let metadata = metadata_sys::get(bucket_name).await.unwrap_or_default();
 
                 bucket_metadatas.insert(bucket_name.to_string(), (*metadata).clone());
+
+                // Send site replication notification
+                let event_args = EventArgs {
+                    event_name: "BucketCreated".to_string(),
+                    bucket_name: bucket_name.to_string(),
+                    object: ObjectInfo::default(),
+                    req_params: HashMap::new(),
+                    resp_elements: HashMap::new(),
+                    host: String::new(),
+                    user_agent: String::new(),
+                };
+                tokio::spawn(async move {
+                    send_event(event_args);
+                });
             }
 
             match conf_name {
@@ -587,12 +603,9 @@ impl Operation for ImportBucketMetadata {
                     metadata.bucket_targets_config_json = content;
                     metadata.bucket_targets_config_updated_at = update_at;
                 }
-
                 _ => {}
             }
         }
-
-        // TODO: site replication notify
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

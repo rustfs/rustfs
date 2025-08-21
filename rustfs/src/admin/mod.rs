@@ -20,7 +20,12 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    bucket_meta, group, policies, pools, rebalance,
+    bucket_meta, group,
+    kms::{
+        BatchRewrapBucket, ConfigureKms, CreateKmsKey, DisableKmsKey, EnableKmsKey, GetKmsKeyStatus, GetKmsStatus, ListKmsKeys,
+        RewrapCiphertext, RotateKmsKey,
+    },
+    policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
@@ -33,7 +38,6 @@ use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
-// const ADMIN_PREFIX: &str = "/minio/admin";
 
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
@@ -185,6 +189,68 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/import-bucket-metadata").as_str(),
         AdminOperation(&bucket_meta::ImportBucketMetadata {}),
+    )?;
+
+    // KMS management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/create").as_str(),
+        AdminOperation(&CreateKmsKey {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/status").as_str(),
+        AdminOperation(&GetKmsKeyStatus {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/list").as_str(),
+        AdminOperation(&ListKmsKeys {}),
+    )?;
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/enable").as_str(),
+        AdminOperation(&EnableKmsKey {}),
+    )?;
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/disable").as_str(),
+        AdminOperation(&DisableKmsKey {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/rotate").as_str(),
+        AdminOperation(&RotateKmsKey {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/delete").as_str(),
+        AdminOperation(&handlers::kms::DeleteKmsKey {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
+        AdminOperation(&GetKmsStatus {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/config").as_str(),
+        AdminOperation(&handlers::kms::GetKmsConfig {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
+        AdminOperation(&ConfigureKms {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/rewrap").as_str(),
+        AdminOperation(&RewrapCiphertext {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/rewrap-bucket").as_str(),
+        AdminOperation(&BatchRewrapBucket {}),
     )?;
 
     r.insert(

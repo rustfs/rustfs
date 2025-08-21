@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::vec;
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{debug, error};
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
@@ -55,6 +55,7 @@ impl<'a> MultiWriter<'a> {
                         }
                     }
                     Err(e) => {
+                        debug!(shard_len=shard.len(), error=?e, "bitrot writer write error");
                         *err = Some(Error::from(e));
                     }
                 }
@@ -133,28 +134,41 @@ impl Erasure {
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
 
         let task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
             let block_size = self.block_size;
-            let mut total = 0;
-            let mut buf = vec![0u8; block_size];
+            let mut total = 0usize;
+            let mut acc: Vec<u8> = Vec::with_capacity(block_size);
+            let mut tmp = vec![0u8; 64 * 1024]; // read granularity 64KB
             loop {
-                match rustfs_utils::read_full(&mut reader, &mut buf).await {
-                    Ok(n) if n > 0 => {
-                        total += n;
-                        let res = self.encode_data(&buf[..n])?;
-                        if let Err(err) = tx.send(res).await {
-                            return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                // Fill accumulator until full block or EOF
+                if acc.len() < block_size {
+                    let need = block_size - acc.len();
+                    let chunk = if need < tmp.len() { &mut tmp[..need] } else { &mut tmp[..] };
+                    let n = reader.read(chunk).await?;
+                    if n == 0 {
+                        // EOF
+                        if !acc.is_empty() {
+                            total += acc.len();
+                            debug!(flush_len = acc.len(), total_bytes = total, "erasure encode final short block");
+                            let res = self.encode_data(&acc)?;
+                            if let Err(err) = tx.send(res).await {
+                                return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                            }
                         }
-                    }
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         break;
                     }
-                    Err(e) => {
-                        return Err(e);
+                    acc.extend_from_slice(&chunk[..n]);
+                }
+                if acc.len() == block_size {
+                    total += acc.len();
+                    debug!(block_bytes = acc.len(), total_bytes = total, "erasure encode full block");
+                    let res = self.encode_data(&acc)?;
+                    if let Err(err) = tx.send(res).await {
+                        return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                     }
+                    acc.clear();
                 }
             }
-
             Ok((reader, total))
         });
 
@@ -167,7 +181,13 @@ impl Erasure {
             writers.write(block).await?;
         }
 
+        // Finalize all writers explicitly after receiving all blocks
+        for w in writers.writers.iter_mut().flatten() {
+            w.finalize();
+        }
+
         let (reader, total) = task.await??;
+        debug!(total_encoded_bytes = total, "erasure encode finished");
         // writers.shutdown().await?;
         Ok((reader, total))
     }

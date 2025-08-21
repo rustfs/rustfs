@@ -63,10 +63,7 @@ impl Operation for SetNotificationTarget {
         let (_cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // 3. Get notification system instance
-        let Some(ns) = rustfs_notify::global::notification_system() else {
-            return Err(s3_error!(InternalError, "notification system not initialized"));
-        };
+        // 3. Notification system is handled by send_event function
 
         // 4. The parsing request body is KVS (Key-Value Store)
         let mut input = req.input;
@@ -93,6 +90,9 @@ impl Operation for SetNotificationTarget {
         );
 
         // 5. Call notification system to set target configuration
+        let Some(ns) = rustfs_notify::global::notification_system() else {
+            return Err(s3_error!(InternalError, "notification system not initialized"));
+        };
         info!("Setting target config for type '{}', name '{}'", &query.target_type, &query.target_name);
         ns.set_target_config(&query.target_type, &query.target_name, kvs)
             .await
