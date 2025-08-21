@@ -73,6 +73,8 @@ pub struct BucketMetrics {
     pub bucket: String,
     /// Total objects in bucket
     pub total_objects: u64,
+    /// Objects processed after throttling
+    pub objects_processed_after_throttle: u64,
     /// Total size of objects in bucket (bytes)
     pub total_size: u64,
     /// Objects with health issues

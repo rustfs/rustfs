@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -70,6 +71,8 @@ pub struct ScannerConfig {
     pub scan_mode: ScanMode,
     /// Whether to enable data usage statistics collection
     pub enable_data_usage_stats: bool,
+    /// Throttling factor for the scanner, checks 1 out of N objects.
+    pub scan_throttling_factor: u64,
 }
 
 impl Default for ScannerConfig {
@@ -82,6 +85,7 @@ impl Default for ScannerConfig {
             enable_metrics: true,
             scan_mode: ScanMode::Normal,
             enable_data_usage_stats: true,
+            scan_throttling_factor: 1024, // Default to checking 1 in 1024 objects
         }
     }
 }
@@ -1250,7 +1254,27 @@ impl Scanner {
             objects_scanned += 1;
             // Check if this is an actual object (not just a directory)
             if entry.is_object() {
-                debug!("Scanned object: {}", entry.name);
+                // Throttle the scan to reduce I/O load.
+                let throttling_factor = self.config.read().await.scan_throttling_factor;
+                if throttling_factor > 0 {
+                    let mut hasher = DefaultHasher::new();
+                    entry.name.hash(&mut hasher);
+                    if hasher.finish() % throttling_factor != 0 {
+                        // Skip this object and move to the next one in the peekable reader.
+                        let _ = reader.next().await;
+                        continue;
+                    }
+                }
+
+                debug!("Scanning object: {}", entry.name);
+
+                // Increment the processed objects metric for this bucket
+                {
+                    let mut bucket_metrics_guard = self.bucket_metrics.lock().await;
+                    if let Some(metrics) = bucket_metrics_guard.get_mut(bucket) {
+                        metrics.objects_processed_after_throttle += 1;
+                    }
+                }
 
                 // Parse object metadata
                 if let Ok(file_meta) = entry.xl_meta() {
@@ -2674,5 +2698,49 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_HEALTHY));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "Please run it manually."]
+    #[serial]
+    async fn test_scanner_throttling() {
+        const TEST_DIR_THROTTLE: &str = "/tmp/rustfs_ahm_test_throttling";
+        let (_, ecstore) = prepare_test_env(Some(TEST_DIR_THROTTLE), Some(9007)).await;
+
+        // Create test bucket and 100 objects
+        let bucket_name = "test-throttle-bucket";
+        ecstore.make_bucket(bucket_name, &Default::default()).await.unwrap();
+
+        for i in 0..100 {
+            let object_name = format!("obj-{}", i);
+            let mut pr = PutObjReader::from_vec(b"throttle test".to_vec());
+            ecstore
+                .put_object(bucket_name, &object_name, &mut pr, &Default::default())
+                .await
+                .unwrap();
+        }
+
+        // Create scanner with throttling enabled
+        let mut scanner_config = ScannerConfig::default();
+        scanner_config.scan_throttling_factor = 10; // Process 1 in 10 objects
+        let scanner = Scanner::new(Some(scanner_config), None);
+
+        // Run a scan cycle
+        scanner.scan_cycle().await.unwrap();
+
+        // Get metrics and verify throttling
+        let metrics = scanner.get_metrics().await;
+        let bucket_metrics = metrics.bucket_metrics.get(bucket_name).expect("Bucket metrics not found");
+
+        // Total objects found by walk_dir should be 100
+        assert_eq!(bucket_metrics.total_objects, 100);
+
+        // Objects actually processed should be around 100 / 10 = 10
+        let processed = bucket_metrics.objects_processed_after_throttle;
+        println!("Throttling test: Total objects = 100, Processed objects = {}", processed);
+        assert!(processed < 20, "Processed objects should be less than 20, but was {}", processed);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_THROTTLE));
     }
 }
