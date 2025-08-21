@@ -615,9 +615,9 @@ impl TransitionClient {
                     .last()
                     .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
                     .unwrap_or(false);
-            let middle_ok = bytes.iter().all(|b| {
-                b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.'
-            });
+            let middle_ok = bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.');
             start_end_ok && middle_ok && bucket_name.len() >= 3 && bucket_name.len() <= 63
         };
         if !is_dns_compatible {
@@ -1080,15 +1080,11 @@ mod tests {
     #[test]
     fn test_target_url_vhost_and_path() {
         let cl_v = mk_client("s3.example.com:9000", false, BucketLookupType::BucketLookupDNS);
-        let url_v = cl_v
-            .make_target_url("test", "obj.txt", "", true, &HashMap::new())
-            .unwrap();
+        let url_v = cl_v.make_target_url("test", "obj.txt", "", true, &HashMap::new()).unwrap();
         assert_eq!(url_v.as_str(), "http://test.s3.example.com:9000/obj.txt");
 
         let cl_p = mk_client("s3.example.com:9000", false, BucketLookupType::BucketLookupPath);
-        let url_p = cl_p
-            .make_target_url("test", "obj.txt", "", false, &HashMap::new())
-            .unwrap();
+        let url_p = cl_p.make_target_url("test", "obj.txt", "", false, &HashMap::new()).unwrap();
         assert_eq!(url_p.as_str(), "http://s3.example.com:9000/test/obj.txt");
     }
 }

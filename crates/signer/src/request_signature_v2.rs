@@ -33,18 +33,29 @@ fn encode_url2path(req: &request::Request<Body>, virtual_host: bool) -> String {
     if virtual_host {
         let host = super::utils::get_host_addr(req);
         // strip port if present
-        let host = match host.split_once(':') { Some((h, _)) => h, None => host.as_str() };
+        let host = match host.split_once(':') {
+            Some((h, _)) => h,
+            None => host.as_str(),
+        };
         // If host has at least 3 labels (bucket + domain + tld), take first label as bucket
         if let Some((bucket, _rest)) = host.split_once('.') {
             if !bucket.is_empty() {
                 // avoid duplicating if path already starts with /bucket/
-                let expected_prefix = format!("/{}", bucket);
+                let expected_prefix = format!("/{bucket}");
                 if !path.starts_with(&expected_prefix) {
                     // Only prefix for bucket-level paths; ensure a single slash separation
                     if path == "/" {
                         path = expected_prefix;
                     } else {
-                        path = format!("{}{}", expected_prefix, if path.starts_with('/') { path.clone() } else { format!("/{}", path) });
+                        path = format!(
+                            "{}{}",
+                            expected_prefix,
+                            if path.starts_with('/') {
+                                path.clone()
+                            } else {
+                                format!("/{path}")
+                            }
+                        );
                     }
                 }
             }
@@ -274,18 +285,13 @@ mod tests {
         } else {
             format!("http://{host}{path}?{query}")
         };
-        let mut req = Request::builder()
-            .uri(uri)
-            .method("GET")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = Request::builder().uri(uri).method("GET").body(Body::empty()).unwrap();
         // minimal headers used by signers
         let h = req.headers_mut();
         h.insert("Content-Md5", "".parse().unwrap());
         h.insert("Content-Type", "".parse().unwrap());
         h.insert("Date", "Thu, 21 Aug 2025 00:00:00 +0000".parse().unwrap());
-        h
-            .insert("host", host.parse().unwrap());
+        h.insert("host", host.parse().unwrap());
         req
     }
 

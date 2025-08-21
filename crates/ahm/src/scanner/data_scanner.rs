@@ -1253,13 +1253,13 @@ impl Scanner {
         // Process the scan results using MetacacheReader
         let mut reader = MetacacheReader::new(std::io::Cursor::new(scan_buffer));
         let mut objects_scanned = 0u64;
-    let mut objects_with_issues = 0u64;
-    let mut object_metadata = HashMap::new();
-    // snapshot throttling/grace config
-    let cfg_snapshot = self.config.read().await.clone();
-    let throttle_n = cfg_snapshot.throttle_every_n_objects.max(1);
-    let throttle_delay = cfg_snapshot.throttle_delay;
-    let skip_recent = cfg_snapshot.skip_recently_modified_within;
+        let mut objects_with_issues = 0u64;
+        let mut object_metadata = HashMap::new();
+        // snapshot throttling/grace config
+        let cfg_snapshot = self.config.read().await.clone();
+        let throttle_n = cfg_snapshot.throttle_every_n_objects.max(1);
+        let throttle_delay = cfg_snapshot.throttle_delay;
+        let skip_recent = cfg_snapshot.skip_recently_modified_within;
 
         // Process each object entry
         while let Ok(Some(mut entry)) = reader.peek().await {
@@ -1271,12 +1271,7 @@ impl Scanner {
                 // Parse object metadata
                 if let Ok(file_meta) = entry.xl_meta() {
                     // Skip recently modified objects to avoid racing with active writes
-                    if let Some(latest_mt) = file_meta
-                        .versions
-                        .iter()
-                        .filter_map(|v| v.header.mod_time)
-                        .max()
-                    {
+                    if let Some(latest_mt) = file_meta.versions.iter().filter_map(|v| v.header.mod_time).max() {
                         let ts_nanos = latest_mt.unix_timestamp_nanos();
                         let latest_st = if ts_nanos >= 0 {
                             std::time::UNIX_EPOCH + Duration::from_nanos(ts_nanos as u64)
@@ -1453,16 +1448,16 @@ impl Scanner {
         );
 
         // Step 2: Identify missing objects and perform EC verification
-    let mut objects_needing_heal = 0u64;
-    let mut objects_with_ec_issues = 0u64;
-    // snapshot config for gating and throttling
-    let cfg_snapshot = self.config.read().await.clone();
-    let skip_recent = cfg_snapshot.skip_recently_modified_within;
-    let throttle_n = cfg_snapshot.throttle_every_n_objects.max(1);
-    let throttle_delay = cfg_snapshot.throttle_delay;
-    let deep_mode = cfg_snapshot.scan_mode == ScanMode::Deep;
-    drop(cfg_snapshot);
-    let mut iter_count: u64 = 0;
+        let mut objects_needing_heal = 0u64;
+        let mut objects_with_ec_issues = 0u64;
+        // snapshot config for gating and throttling
+        let cfg_snapshot = self.config.read().await.clone();
+        let skip_recent = cfg_snapshot.skip_recently_modified_within;
+        let throttle_n = cfg_snapshot.throttle_every_n_objects.max(1);
+        let throttle_delay = cfg_snapshot.throttle_delay;
+        let deep_mode = cfg_snapshot.scan_mode == ScanMode::Deep;
+        // cfg_snapshot is a plain value clone; no guard to explicitly drop here.
+        let mut iter_count: u64 = 0;
 
         for (bucket, objects) in &all_objects {
             // Skip internal RustFS system bucket to avoid lengthy checks on temporary/trash objects
@@ -1529,13 +1524,19 @@ impl Scanner {
                 })();
                 if is_recent {
                     debug!("Skipping missing-objects heal check for recently modified {}/{}", bucket, object_name);
-                    if (iter_count as u32) % throttle_n == 0 { sleep(throttle_delay).await; yield_now().await; }
+                    if (iter_count as u32) % throttle_n == 0 {
+                        sleep(throttle_delay).await;
+                        yield_now().await;
+                    }
                     continue;
                 }
 
                 // Only attempt missing-object heal checks in Deep scan mode
                 if !deep_mode {
-                    if (iter_count as u32) % throttle_n == 0 { sleep(throttle_delay).await; yield_now().await; }
+                    if (iter_count as u32) % throttle_n == 0 {
+                        sleep(throttle_delay).await;
+                        yield_now().await;
+                    }
                     continue;
                 }
 
@@ -1568,7 +1569,10 @@ impl Scanner {
                     };
 
                     if !should_heal {
-                        if (iter_count as u32) % throttle_n == 0 { sleep(throttle_delay).await; yield_now().await; }
+                        if (iter_count as u32) % throttle_n == 0 {
+                            sleep(throttle_delay).await;
+                            yield_now().await;
+                        }
                         continue;
                     }
                     objects_needing_heal += 1;
@@ -1613,7 +1617,10 @@ impl Scanner {
                     }
                 }
 
-                if (iter_count as u32) % throttle_n == 0 { sleep(throttle_delay).await; yield_now().await; }
+                if (iter_count as u32) % throttle_n == 0 {
+                    sleep(throttle_delay).await;
+                    yield_now().await;
+                }
             }
         }
 
