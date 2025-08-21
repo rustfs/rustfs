@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Error returned when parsing event name string fails。
+/// Error returned when parsing event name string fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseEventNameError(String);
 
