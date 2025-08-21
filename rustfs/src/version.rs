@@ -205,6 +205,7 @@ fn compare_pre_release(current: &str, latest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::debug;
 
     #[test]
     fn test_parse_version() {
@@ -260,7 +261,7 @@ mod tests {
     fn test_current_version_output() {
         // Display current version output
         let version = get_version();
-        println!("Current version: {version}");
+        debug!("Current version: {version}");
 
         // Verify version format
         assert!(version.starts_with("refs/tags/") || version.starts_with("@"));
@@ -268,7 +269,7 @@ mod tests {
         // If it's refs/tags/ format, verify version number is not empty
         if let Some(version_part) = version.strip_prefix("refs/tags/") {
             assert!(!version_part.is_empty());
-            println!("Version part: {version_part}");
+            debug!("Version part: {version_part}");
         }
     }
 
