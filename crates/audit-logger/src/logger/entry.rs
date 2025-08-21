@@ -12,19 +12,21 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// 一个可以被序列化和发送的日志条目的 Trait
+///A Trait for a log entry that can be serialized and sent
 pub trait Loggable: Serialize + Send + Sync + 'static {
     fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 }
 
-/// 标准日志条目
+/// Standard log entries
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
@@ -39,7 +41,7 @@ pub struct LogEntry {
 
 impl Loggable for LogEntry {}
 
-/// 审计日志条目
+/// Audit log entry
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEntry {
@@ -79,7 +81,7 @@ pub struct ApiDetails {
     pub time_to_response: String,
 }
 
-// 辅助函数来创建条目
+// Helper functions to create entries
 impl AuditEntry {
     pub fn new(api_name: &str, bucket: &str, object: &str) -> Self {
         AuditEntry {

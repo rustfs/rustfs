@@ -18,7 +18,7 @@ mod event_name;
 pub mod store;
 pub mod target;
 
-pub use error::{NotificationError, StoreError, TargetError};
+pub use error::{StoreError, TargetError};
 pub use event_name::EventName;
 use serde::{Deserialize, Serialize};
 pub use target::Target;

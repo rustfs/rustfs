@@ -14,19 +14,19 @@
 
 use crate::store::Key;
 use crate::target::{ChannelTargetType, EntityTarget, TargetType};
-use crate::{arn::TargetID, error::TargetError, store::Store, StoreError, Target, TargetLog};
+use crate::{StoreError, Target, TargetLog, arn::TargetID, error::TargetError, store::Store};
 use async_trait::async_trait;
-use rumqttc::{mqttbytes::Error as MqttBytesError, ConnectionError};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
-use serde::de::DeserializeOwned;
+use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::{mpsc, Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 use urlencoding;

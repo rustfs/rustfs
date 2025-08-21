@@ -14,11 +14,11 @@
 
 use super::rules_map::RulesMap;
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
+use crate::rules::NotificationConfiguration;
 use crate::rules::pattern_rules;
 use crate::rules::target_id_set;
-use crate::rules::NotificationConfiguration;
-use rustfs_targets::arn::TargetID;
 use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;

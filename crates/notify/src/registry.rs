@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
 use crate::Event;
+use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::target::ChannelTargetType;
 use rustfs_targets::Target;
 use rustfs_targets::TargetError;
+use rustfs_targets::target::ChannelTargetType;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 

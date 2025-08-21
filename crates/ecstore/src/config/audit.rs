@@ -20,6 +20,8 @@ use rustfs_config::audit::{
 use rustfs_config::{DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState};
 use std::sync::LazyLock;
 
+#[allow(dead_code)]
+#[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit webhook settings.
 pub const DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![

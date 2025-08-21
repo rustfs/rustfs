@@ -12,25 +12,25 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#![allow(dead_code)]
+
 pub mod config;
 pub mod dispatch;
 pub mod entry;
 pub mod factory;
-pub mod http_target;
 
-use crate::logger::entry::Loggable;
 use async_trait::async_trait;
 use std::error::Error;
 
-/// 通用日志目标 Trait
+/// General Log Target Trait
 #[async_trait]
 pub trait Target: Send + Sync {
-    /// 发送单个可日志化条目
+    /// Send a single logizable entry
     async fn send(&self, entry: Box<Self>) -> Result<(), Box<dyn Error + Send>>;
 
-    /// 返回目标的唯一名称
+    /// Returns the unique name of the target
     fn name(&self) -> &str;
 
-    /// 优雅地关闭目标，确保所有缓冲的日志都被处理
+    /// Close target gracefully, ensuring all buffered logs are processed
     async fn shutdown(&self);
 }

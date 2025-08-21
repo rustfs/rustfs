@@ -24,9 +24,9 @@ use crate::Event;
 use rustfs_config::{DEFAULT_DIR, DEFAULT_LIMIT};
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
+    Target,
     error::TargetError,
     target::{mqtt::MQTTArgs, webhook::WebhookArgs},
-    Target,
 };
 use std::collections::HashSet;
 use std::time::Duration;

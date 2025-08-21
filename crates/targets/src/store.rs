@@ -124,7 +124,10 @@ pub fn parse_key(s: &str) -> Key {
 }
 
 /// Trait for a store that can store and retrieve items of type T
-pub trait Store<T>: Send + Sync {
+pub trait Store<T>: Send + Sync
+where
+    T: Send + Sync + 'static + Clone + Serialize,
+{
     /// The error type for the store
     type Error;
     /// The key type for the store

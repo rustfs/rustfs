@@ -16,7 +16,7 @@ use crate::{Event, EventArgs, NotificationError, NotificationSystem};
 use once_cell::sync::Lazy;
 use rustfs_ecstore::config::Config;
 use std::sync::{Arc, OnceLock};
-use tracing::instrument;
+use tracing::{error, instrument};
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
 // Create a globally unique Notifier instance
@@ -76,6 +76,7 @@ impl Notifier {
 
         // Check if any subscribers are interested in the event
         if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
+            error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
             return;
         }
 

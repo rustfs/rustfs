@@ -35,7 +35,7 @@ pub use integration::NotificationSystem;
 pub use rules::BucketNotificationConfig;
 use std::io::IsTerminal;
 
-use tracing_subscriber::{fmt, prelude::*, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*, util::SubscriberInitExt};
 
 /// Initialize the tracing log system
 ///

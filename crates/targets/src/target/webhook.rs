@@ -14,21 +14,21 @@
 
 use crate::target::{ChannelTargetType, EntityTarget, TargetType};
 use crate::{
-    arn::TargetID, error::TargetError, store::{Key, Store},
-    StoreError,
-    Target,
-    TargetLog,
+    StoreError, Target, TargetLog,
+    arn::TargetID,
+    error::TargetError,
+    store::{Key, Store},
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_config::notify::STORE_EXTENSION;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };

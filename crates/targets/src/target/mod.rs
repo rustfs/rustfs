@@ -16,10 +16,10 @@ use crate::arn::TargetID;
 use crate::store::{Key, Store};
 use crate::{EventName, StoreError, TargetError};
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use std::sync::Arc;
-use serde::de::DeserializeOwned;
 
 pub mod mqtt;
 pub mod webhook;
@@ -136,13 +136,6 @@ pub fn parse_bool(value: &str) -> Result<bool, TargetError> {
 }
 
 /// `TargetType` enum represents the type of target in the notification system.
-/// It includes two variants:
-/// - `AuditLog`: Represents a target for audit logging.
-/// - `NotifyEvent`: Represents a target for notifying events.
-/// Each variant has an associated string representation that can be used for serialization
-/// or logging purposes.
-/// The `as_str` method returns the string representation of the target type,
-/// and the `Display` implementation allows for easy formatting of the target type as a string.
 #[derive(Debug, Clone)]
 pub enum TargetType {
     AuditLog,

@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_targets::store::{Key, Store};
 use rustfs_targets::StoreError;
 use rustfs_targets::Target;
 use rustfs_targets::TargetError;
+use rustfs_targets::store::{Key, Store};
 
-use crate::{integration::NotificationMetrics, Event};
+use crate::{Event, integration::NotificationMetrics};
+use rustfs_targets::target::EntityTarget;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -120,7 +121,7 @@ pub fn start_event_stream(
 
 /// Start event stream with batch processing
 pub fn start_event_stream_with_batching(
-    mut store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
+    mut store: Box<dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send>,
     target: Arc<dyn Target<Event> + Send + Sync>,
     metrics: Arc<NotificationMetrics>,
     semaphore: Arc<Semaphore>,
@@ -137,7 +138,7 @@ pub fn start_event_stream_with_batching(
 
 /// Event stream processing with batch processing
 pub async fn stream_events_with_batching(
-    store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
+    store: &mut (dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send),
     target: &dyn Target<Event>,
     mut cancel_rx: mpsc::Receiver<()>,
     metrics: Arc<NotificationMetrics>,
@@ -155,7 +156,7 @@ pub async fn stream_events_with_batching(
     const MAX_RETRIES: usize = 5;
     const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch: Vec<EntityTarget<Event>> = Vec::with_capacity(batch_size);
     let mut batch_keys = Vec::with_capacity(batch_size);
     let mut last_flush = Instant::now();
 
@@ -233,7 +234,7 @@ pub async fn stream_events_with_batching(
 
 /// Processing event batches
 async fn process_batch(
-    batch: &mut Vec<Event>,
+    batch: &mut Vec<EntityTarget<Event>>,
     batch_keys: &mut Vec<Key>,
     target: &dyn Target<Event>,
     max_retries: usize,

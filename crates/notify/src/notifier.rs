@@ -14,10 +14,10 @@
 
 use crate::{error::NotificationError, event::Event, rules::RulesMap};
 use dashmap::DashMap;
-use rustfs_targets::arn::TargetID;
-use rustfs_targets::target::EntityTarget;
 use rustfs_targets::EventName;
 use rustfs_targets::Target;
+use rustfs_targets::arn::TargetID;
+use rustfs_targets::target::EntityTarget;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
@@ -124,7 +124,7 @@ impl EventNotifier {
     }
 
     /// Sends an event to the appropriate targets based on the bucket rules
-    #[instrument(skip(self, event))]
+    #[instrument(skip_all)]
     pub async fn send(&self, event: Arc<Event>) {
         let bucket_name = &event.s3.bucket.name;
         let object_key = &event.s3.object.key;
@@ -152,16 +152,15 @@ impl EventNotifier {
                         let target_name_for_task = cloned_target_for_task.name(); // Get the name before generating the task
                         debug!("Preparing to send event to target: {}", target_name_for_task);
                         // Use cloned data in closures to avoid borrowing conflicts
+                        // Create an EntityTarget from the event
+                        let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
+                            object_name: object_key.to_string(),
+                            bucket_name: bucket_name.to_string(),
+                            event_name,
+                            data: event_clone.clone().as_ref().clone(),
+                        });
                         let handle = tokio::spawn(async move {
-                            let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
-                                object_name: object_key.clone(),
-                                bucket_name: bucket_name.clone(),
-                                event_name,
-                                data: **event_clone.clone(),
-                            });
-                            // Create an EntityTarget from the event
-
-                            if let Err(e) = cloned_target_for_task.save(entity_target).await {
+                            if let Err(e) = cloned_target_for_task.save(entity_target.clone()).await {
                                 error!("Failed to send event to target {}: {}", target_name_for_task, e);
                             } else {
                                 debug!("Successfully saved event to target {}", target_name_for_task);

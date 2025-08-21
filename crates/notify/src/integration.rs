@@ -13,20 +13,20 @@
 // limitations under the License.
 
 use crate::{
-    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event,
+    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
 use rustfs_ecstore::config::{Config, KVS};
+use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
-use rustfs_targets::EventName;
+use rustfs_targets::target::EntityTarget;
 use rustfs_targets::{StoreError, Target};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::util::SubscriberInitExt;
 
 /// Notify the system of monitoring indicators
 pub struct NotificationMetrics {
@@ -320,7 +320,7 @@ impl NotificationSystem {
     /// Enhanced event stream startup function, including monitoring and concurrency control
     fn enhanced_start_event_stream(
         &self,
-        store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
+        store: Box<dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send>,
         target: Arc<dyn Target<Event> + Send + Sync>,
         metrics: Arc<NotificationMetrics>,
         semaphore: Arc<Semaphore>,

@@ -12,8 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use rustfs_targets::arn::TargetID;
 use rustfs_targets::TargetError;
+use rustfs_targets::arn::TargetID;
 use std::io;
 use thiserror::Error;
 

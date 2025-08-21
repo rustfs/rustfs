@@ -20,10 +20,10 @@ use rustfs_config::notify::{
 use rustfs_config::EnableState::On;
 use rustfs_config::{DEFAULT_LIMIT, ENABLE_KEY};
 use rustfs_ecstore::config::{Config, KV, KVS};
-use rustfs_notify::{init_logger, BucketNotificationConfig, Event, LogLevel, NotificationError};
+use rustfs_notify::{BucketNotificationConfig, Event, LogLevel, NotificationError, init_logger};
 use rustfs_notify::{initialize, notification_system};
-use rustfs_targets::arn::TargetID;
 use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
