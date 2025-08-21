@@ -2336,7 +2336,17 @@ impl SetDisks {
         };
 
         if !opts.no_lock {
-            // TODO: locker
+            // Acquire a read lock to ensure the object is not being deleted.
+            let guard = self
+                .namespace_lock
+                .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+                .await?;
+            if guard.is_none() {
+                // Could not get lock. Another operation is likely in progress (e.g., deletion).
+                // Skip this heal cycle for this object.
+                warn!("heal_object skipped, could not acquire lock for object: {}/{}", bucket, object);
+                return Ok((result, None)); // Return Ok, not an error.
+            }
         }
 
         let version_id_op = {
@@ -2352,20 +2362,12 @@ impl SetDisks {
         let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
         if DiskError::is_all_not_found(&errs) {
             warn!(
-                "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
-                bucket, object, version_id
+                "heal_object gracefully exiting, object not found after lock acquisition: {}/{}",
+                bucket, object
             );
-            let err = if !version_id.is_empty() {
-                DiskError::FileVersionNotFound
-            } else {
-                DiskError::FileNotFound
-            };
-            // Nothing to do, file is already gone.
-            return Ok((
-                self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
-                    .await,
-                Some(err),
-            ));
+            // After acquiring a lock, if the object is not found, it means it was deleted
+            // before our operation started. This is not a heal failure.
+            return Ok((result, None)); // Return gracefully.
         }
 
         match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count) {
