@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Event, EventArgs, NotificationError, NotificationSystem};
+use crate::{BucketNotificationConfig, Event, EventArgs, NotificationError, NotificationSystem};
 use once_cell::sync::Lazy;
 use rustfs_ecstore::config::Config;
+use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::{error, instrument};
 
@@ -64,7 +66,7 @@ impl Notifier {
             // If the notification system itself cannot be retrieved, it will be returned directly
             Some(sys) => sys,
             None => {
-                tracing::error!("Notification system is not initialized.");
+                error!("Notification system is not initialized.");
                 return;
             }
         };
@@ -83,5 +85,97 @@ impl Notifier {
         // Create an event and send it
         let event = Arc::new(Event::new(args));
         notification_sys.send_event(event).await;
+    }
+
+    /// Add notification rules for the specified bucket and load configuration
+    pub async fn add_bucket_notification_rule(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_names: &[EventName],
+        prefix: &str,
+        suffix: &str,
+        target_ids: &[TargetID],
+    ) -> Result<(), NotificationError> {
+        // Construct pattern, simple splicing of prefixes and suffixes
+        let mut pattern = String::new();
+        if !prefix.is_empty() {
+            pattern.push_str(prefix);
+        }
+        pattern.push('*');
+        if !suffix.is_empty() {
+            pattern.push_str(suffix);
+        }
+
+        // Create BucketNotificationConfig
+        let mut bucket_config = BucketNotificationConfig::new(region);
+        for target_id in target_ids {
+            bucket_config.add_rule(event_names, pattern.clone(), target_id.clone());
+        }
+
+        // Get global NotificationSystem
+        let notification_sys = match notification_system() {
+            Some(sys) => sys,
+            None => return Err(NotificationError::ServerNotInitialized),
+        };
+
+        // Loading configuration
+        notification_sys
+            .load_bucket_notification_config(bucket_name, &bucket_config)
+            .await
+    }
+
+    /// Dynamically add notification rules according to event type
+    /// This function allows you to add multiple rules for different event types, prefixes, suffixes, and target IDs.
+    /// # Example:
+    /// ```rust
+    /// use rustfs_notify::{BucketNotificationConfig, EventName, TargetID, notifier_instance, NotificationError};
+    ///
+    /// let event_rules = vec![
+    ///     (
+    ///         vec![EventName::ObjectCreatedPut],
+    ///         "images/",
+    ///         ".jpg",
+    ///         vec![TargetID::new("default".to_string(), "webhook".to_string())],
+    ///     ),
+    ///     (
+    ///         vec![EventName::ObjectRemovedDelete],
+    ///         "logs/",
+    ///         ".log",
+    ///         vec![TargetID::new("default".to_string(), "mqtt".to_string())],
+    ///     ),
+    /// ];
+    ///
+    /// notifier_instance()
+    ///     .add_event_specific_rules("my-bucket", "us-east-1", &event_rules)
+    ///     .await?;
+    /// ```
+    pub async fn add_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, &str, &str, Vec<TargetID>)],
+    ) -> Result<(), NotificationError> {
+        let mut bucket_config = BucketNotificationConfig::new(region);
+
+        for (event_names, prefix, suffix, target_ids) in event_rules {
+            // Use `new_pattern` to construct a matching pattern
+            let pattern = crate::rules::pattern::new_pattern(Some(prefix), Some(suffix));
+
+            for target_id in target_ids {
+                bucket_config.add_rule(event_names, pattern.clone(), target_id.clone());
+            }
+        }
+
+        // Get global NotificationSystem instance
+        let notification_sys = match notification_system() {
+            Some(sys) => sys,
+            None => return Err(NotificationError::ServerNotInitialized),
+        };
+
+        // Loading configuration
+        notification_sys
+            .load_bucket_notification_config(bucket_name, &bucket_config)
+            .await
     }
 }

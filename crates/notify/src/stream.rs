@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{Event, integration::NotificationMetrics};
 use rustfs_targets::StoreError;
 use rustfs_targets::Target;
 use rustfs_targets::TargetError;
 use rustfs_targets::store::{Key, Store};
-
-use crate::{Event, integration::NotificationMetrics};
 use rustfs_targets::target::EntityTarget;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

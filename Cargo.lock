@@ -8484,7 +8484,6 @@ dependencies = [
  "futures",
  "once_cell",
  "quick-xml 0.38.1",
- "reqwest",
  "rumqttc",
  "rustfs-config",
  "rustfs-ecstore",
@@ -8492,14 +8491,11 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
- "snap",
  "thiserror 2.0.15",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "url",
- "urlencoding",
- "uuid",
  "wildmatch",
 ]
 

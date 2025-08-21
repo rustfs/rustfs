@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod base;
+
+use base::{LogLevel, init_logger};
 use rustfs_config::EnableState::On;
 use rustfs_config::notify::{
     DEFAULT_TARGET, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
@@ -19,7 +22,7 @@ use rustfs_config::notify::{
 };
 use rustfs_config::{DEFAULT_LIMIT, ENABLE_KEY};
 use rustfs_ecstore::config::{Config, KV, KVS};
-use rustfs_notify::{BucketNotificationConfig, Event, LogLevel, NotificationError, init_logger};
+use rustfs_notify::{BucketNotificationConfig, Event, NotificationError};
 use rustfs_notify::{initialize, notification_system};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
@@ -138,6 +141,10 @@ async fn main() -> Result<(), NotificationError> {
 
     // Load the configuration and initialize the system
     *system.config.write().await = config;
+    info!("---> Initializing notification system with Webhook and MQTT targets...");
+    info!("Webhook Endpoint: {}", WEBHOOK_ENDPOINT);
+    info!("MQTT Broker: {}", MQTT_BROKER);
+    info!("system.init config: {:?}", system.config.read().await);
     system.init().await?;
     info!("✅ System initialized with Webhook and MQTT targets.");
 
