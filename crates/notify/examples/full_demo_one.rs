@@ -12,16 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Using Global Accessories
+mod base;
+
+use base::{LogLevel, init_logger};
+use rustfs_config::EnableState::On;
 use rustfs_config::notify::{
-    DEFAULT_LIMIT, DEFAULT_TARGET, ENABLE_KEY, ENABLE_ON, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT,
-    MQTT_TOPIC, MQTT_USERNAME, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT,
-    WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    DEFAULT_TARGET, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
+    NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
+use rustfs_config::{DEFAULT_LIMIT, ENABLE_KEY};
 use rustfs_ecstore::config::{Config, KV, KVS};
-use rustfs_notify::arn::TargetID;
-use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
+use rustfs_notify::{BucketNotificationConfig, Event, NotificationError};
 use rustfs_notify::{initialize, notification_system};
+use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -47,7 +51,7 @@ async fn main() -> Result<(), NotificationError> {
     let webhook_kvs_vec = vec![
         KV {
             key: ENABLE_KEY.to_string(),
-            value: ENABLE_ON.to_string(),
+            value: On.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -95,7 +99,7 @@ async fn main() -> Result<(), NotificationError> {
     let mqtt_kvs_vec = vec![
         KV {
             key: ENABLE_KEY.to_string(),
-            value: ENABLE_ON.to_string(),
+            value: On.to_string(),
             hidden_if_empty: false,
         },
         KV {

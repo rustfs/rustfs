@@ -26,8 +26,42 @@ use s3s::Body;
 const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
-fn encode_url2path(req: &request::Request<Body>, _virtual_host: bool) -> String {
-    req.uri().path().to_string()
+fn encode_url2path(req: &request::Request<Body>, virtual_host: bool) -> String {
+    // In virtual-hosted-style, the canonical resource must include "/{bucket}" prefix
+    // extracted from the Host header: bucket.domain.tld -> "/bucket"
+    let mut path = req.uri().path().to_string();
+    if virtual_host {
+        let host = super::utils::get_host_addr(req);
+        // strip port if present
+        let host = match host.split_once(':') {
+            Some((h, _)) => h,
+            None => host.as_str(),
+        };
+        // If host has at least 3 labels (bucket + domain + tld), take first label as bucket
+        if let Some((bucket, _rest)) = host.split_once('.') {
+            if !bucket.is_empty() {
+                // avoid duplicating if path already starts with /bucket/
+                let expected_prefix = format!("/{bucket}");
+                if !path.starts_with(&expected_prefix) {
+                    // Only prefix for bucket-level paths; ensure a single slash separation
+                    if path == "/" {
+                        path = expected_prefix;
+                    } else {
+                        path = format!(
+                            "{}{}",
+                            expected_prefix,
+                            if path.starts_with('/') {
+                                path.clone()
+                            } else {
+                                format!("/{path}")
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+    path
 }
 
 pub fn pre_sign_v2(
@@ -237,5 +271,41 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Request<Body>
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Request;
+
+    fn mk_req(host: &str, path: &str, query: &str) -> request::Request<Body> {
+        let uri = if query.is_empty() {
+            format!("http://{host}{path}")
+        } else {
+            format!("http://{host}{path}?{query}")
+        };
+        let mut req = Request::builder().uri(uri).method("GET").body(Body::empty()).unwrap();
+        // minimal headers used by signers
+        let h = req.headers_mut();
+        h.insert("Content-Md5", "".parse().unwrap());
+        h.insert("Content-Type", "".parse().unwrap());
+        h.insert("Date", "Thu, 21 Aug 2025 00:00:00 +0000".parse().unwrap());
+        h.insert("host", host.parse().unwrap());
+        req
+    }
+
+    #[test]
+    fn test_encode_url2path_vhost_prefixes_bucket() {
+        let req = mk_req("test.example.com", "/obj.txt", "");
+        let path = encode_url2path(&req, true);
+        assert_eq!(path, "/test/obj.txt");
+    }
+
+    #[test]
+    fn test_encode_url2path_path_style_unchanged() {
+        let req = mk_req("example.com", "/test/obj.txt", "uploads=");
+        let path = encode_url2path(&req, false);
+        assert_eq!(path, "/test/obj.txt");
     }
 }

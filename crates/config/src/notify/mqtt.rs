@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::notify::{COMMENT_KEY, ENABLE_KEY};
+use crate::{COMMENT_KEY, ENABLE_KEY};
 
 // MQTT Keys
 pub const MQTT_BROKER: &str = "broker";

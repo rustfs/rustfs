@@ -25,7 +25,10 @@ use handlers::{
     sts, tier, user,
 };
 
-use crate::admin::handlers::event::{ListNotificationTargets, RemoveNotificationTarget, SetNotificationTarget};
+use crate::admin::handlers::event::{
+    GetBucketNotification, ListNotificationTargets, RemoveBucketNotification, RemoveNotificationTarget, SetBucketNotification,
+    SetNotificationTarget,
+};
 use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -387,6 +390,24 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-set-bucket").as_str(),
+        AdminOperation(&SetBucketNotification {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-get-bucket").as_str(),
+        AdminOperation(&GetBucketNotification {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove-bucket").as_str(),
+        AdminOperation(&RemoveBucketNotification {}),
     )?;
 
     Ok(())
