@@ -86,7 +86,7 @@ impl Notifier {
 
         // Check if any subscribers are interested in the event
         if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
-            error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
+            // error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
             return;
         }
 
