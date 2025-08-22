@@ -116,7 +116,10 @@ impl Drop for LockGuard {
             tracing::warn!(
                 "LockGuard channel send failed ({}), spawning fallback unlock thread for {}",
                 err,
-                lock_id_for_log
+            tracing::warn!(
+                "LockGuard channel send failed ({}), spawning fallback unlock thread for {}",
+                err,
+                lock_id
             );
 
             // Use a short-lived background thread to execute the async releases on its own runtime.
