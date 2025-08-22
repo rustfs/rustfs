@@ -129,7 +129,7 @@ impl Drop for LockGuard {
                     let rt = Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .expect("failed to build fallback unlock runtime");
+                        .expect("Failed to build fallback unlock runtime in LockGuard::drop fallback thread. This indicates resource exhaustion or misconfiguration (e.g., thread limits, Tokio runtime issues). Remediation: check system resource limits, ensure sufficient threads are available, and verify Tokio runtime configuration.");
                     rt.block_on(async move {
                         let futures_iter = clients.into_iter().map(|client| {
                             let id = lock_id.clone();
