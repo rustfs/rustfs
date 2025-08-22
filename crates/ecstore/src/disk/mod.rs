@@ -18,8 +18,10 @@ pub mod error_conv;
 pub mod error_reduce;
 pub mod format;
 pub mod fs;
+pub mod fsync_batcher;
 pub mod local;
 pub mod os;
+pub mod write_buffer_pool;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";

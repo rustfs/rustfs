@@ -3382,11 +3382,16 @@ impl ObjectIO for SetDisks {
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
+        // 优化：根据文件大小决定是否使用内存缓冲
+        // 对于小文件（默认1MB以下），使用内存缓冲可以避免临时文件的开销
+        // 这对于大量小文件写入场景特别有效
         let is_inline_buffer = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
             } else {
-                false
+                // 如果没有配置存储类，根据文件大小判断
+                // 小于1MB的文件使用内存缓冲，减少磁盘I/O
+                erasure.shard_file_size(data.size()) < 1024 * 1024
             }
         };
 

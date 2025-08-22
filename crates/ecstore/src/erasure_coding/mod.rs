@@ -12,10 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod decode;
-pub mod encode;
-pub mod erasure;
-pub mod heal;
+mod decode;
+mod encode;
+mod erasure;
+mod parallel_encoder;
+mod heal;
+
+pub use decode::*;
+pub use encode::*;
+pub use erasure::*;
+pub use parallel_encoder::*;
+pub use heal::*;
 
 mod bitrot;
 pub use bitrot::*;

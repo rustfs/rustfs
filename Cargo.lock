@@ -5869,6 +5869,7 @@ dependencies = [
  "sha2 0.10.9",
  "shadow-rs",
  "smallvec",
+ "sys-info",
  "temp-env",
  "tempfile",
  "thiserror 2.0.15",
@@ -7203,6 +7204,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "sys-info"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b3a0d0aba8bf96a0e1ddfdc352fc53b3df7f39318c71854910c3c4b024ae52c"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

@@ -65,6 +65,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::fsync_batcher::{FsyncBatcher, FsyncBatcherConfig, FsyncMode};  // 引入fsync批处理器
+
 #[derive(Debug)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
@@ -92,7 +94,7 @@ pub enum InternalBuf<'a> {
 pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
-    pub format_info: RwLock<FormatInfo>,
+    pub format_info: Arc<RwLock<FormatInfo>>,
     pub endpoint: Endpoint,
     pub disk_info_cache: Arc<Cache<DiskInfo>>,
     pub scanning: AtomicU32,
@@ -106,6 +108,9 @@ pub struct LocalDisk {
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
+    // 添加fsync批处理器
+    // 这个批处理器会根据配置智能地批量执行fsync操作，减少系统调用开销
+    fsync_batcher: FsyncBatcher,
 }
 
 impl Drop for LocalDisk {
@@ -215,7 +220,7 @@ impl LocalDisk {
             root: root.clone(),
             endpoint: ep.clone(),
             format_path,
-            format_info: RwLock::new(format_info),
+            format_info: Arc::new(RwLock::new(format_info)),
             disk_info_cache: Arc::new(cache),
             scanning: AtomicU32::new(0),
             rotational: Default::default(),
@@ -228,6 +233,13 @@ impl LocalDisk {
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
             exit_signal: None,
+            fsync_batcher: FsyncBatcher::new(FsyncBatcherConfig {
+                mode: FsyncMode::Batch,  // 默认使用批量模式
+                batch_size: 32,  // 批量大小，可根据系统配置调整
+                batch_timeout: Duration::from_millis(100),  // 100ms超时
+                adaptive: true,  // 启用自适应调整
+                max_pending: 1000,  // 最大等待文件数
+            }),
         };
         let (info, _root) = get_disk_info(root).await?;
         disk.major = info.major;
@@ -734,14 +746,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let flags = O_CREATE | O_WRONLY | O_TRUNC;
 
-        let mut f = {
-            if sync {
-                // TODO: support sync
-                self.open_file(file_path, flags, skip_parent).await?
-            } else {
-                self.open_file(file_path, flags, skip_parent).await?
-            }
-        };
+        let mut f = self.open_file(file_path, flags, skip_parent).await?;
 
         match data {
             InternalBuf::Ref(buf) => {
@@ -750,13 +755,29 @@ impl LocalDisk {
             InternalBuf::Owned(buf) => {
                 // Reduce one copy by using the owned buffer directly.
                 // It may be more efficient for larger writes.
-                let mut f = f.into_std().await;
+                let std_file = f.into_std().await;
                 let task = tokio::task::spawn_blocking(move || {
                     use std::io::Write as _;
-                    f.write_all(buf.as_ref()).map_err(to_file_error)
+                    let mut f = std_file;
+                    f.write_all(buf.as_ref()).map_err(to_file_error)?;
+                    Ok::<std::fs::File, Error>(f)  // 返回文件句柄以便后续使用
                 });
-                task.await??;
+                let std_file = task.await??;
+                
+                // 将文件句柄转回tokio::fs::File以支持异步fsync
+                f = tokio::fs::File::from_std(std_file);
             }
+        }
+
+        // 使用批处理器处理fsync
+        // 根据sync参数决定是否需要同步，如果需要则加入批处理队列
+        if sync {
+            // 将文件加入fsync批处理队列
+            // 批处理器会智能地决定何时执行实际的fsync操作
+            self.fsync_batcher
+                .add_file(f, file_path.to_string_lossy().to_string())
+                .await
+                .map_err(to_file_error)?;
         }
 
         Ok(())
