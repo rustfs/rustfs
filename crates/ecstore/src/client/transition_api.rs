@@ -569,7 +569,16 @@ impl TransitionClient {
     }
 
     pub fn is_virtual_host_style_request(&self, url: &Url, bucket_name: &str) -> bool {
-        if bucket_name == "" {
+        // Contract:
+        // - return true if we should use virtual-hosted-style addressing (bucket as subdomain)
+        // Heuristics (aligned with AWS S3/MinIO clients):
+        // - explicit DNS mode => true
+        // - explicit PATH mode => false
+        // - AUTO:
+        //   - bucket must be non-empty and DNS compatible
+        //   - endpoint host must be a DNS name (not an IPv4/IPv6 literal)
+        //   - when using TLS (https), buckets with dots are avoided due to wildcard/cert issues
+        if bucket_name.is_empty() {
             return false;
         }
 
@@ -581,7 +590,46 @@ impl TransitionClient {
             return false;
         }
 
-        false
+        // AUTO
+        let host = match url.host_str() {
+            Some(h) => h,
+            None => return false,
+        };
+
+        // If endpoint is an IP address, do not use virtual host style
+        let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+        if is_ip {
+            return false;
+        }
+
+        // Basic DNS bucket validation: lowercase letters, numbers, dot and hyphen; must start/end alnum
+        let is_dns_compatible = {
+            let bytes = bucket_name.as_bytes();
+            let start_end_ok = bucket_name
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                .unwrap_or(false)
+                && bucket_name
+                    .chars()
+                    .last()
+                    .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    .unwrap_or(false);
+            let middle_ok = bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.');
+            start_end_ok && middle_ok && bucket_name.len() >= 3 && bucket_name.len() <= 63
+        };
+        if !is_dns_compatible {
+            return false;
+        }
+
+        // When using TLS, avoid buckets with dots to prevent cert/SNI mismatch unless a wildcard cert is ensured.
+        if self.secure && bucket_name.contains('.') {
+            return false;
+        }
+
+        true
     }
 
     pub fn cred_context(&self) -> CredContext {
@@ -987,3 +1035,56 @@ impl tower::Service<Request<Body>> for SendRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct Document(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_client(endpoint: &str, secure: bool, lookup: BucketLookupType) -> TransitionClient {
+        let creds = Credentials::new(Static(Default::default()));
+        let opts = Options {
+            creds,
+            secure,
+            bucket_lookup: lookup,
+            ..Default::default()
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { TransitionClient::new(endpoint, opts).await.unwrap() })
+    }
+
+    #[test]
+    fn test_is_virtual_host_auto_http_domain_dns_bucket() {
+        let cl = mk_client("s3.example.com:9000", false, BucketLookupType::BucketLookupAuto);
+        assert!(cl.is_virtual_host_style_request(&cl.endpoint_url(), "test"));
+    }
+
+    #[test]
+    fn test_is_virtual_host_auto_http_ip() {
+        let cl = mk_client("127.0.0.1:9000", false, BucketLookupType::BucketLookupAuto);
+        assert!(!cl.is_virtual_host_style_request(&cl.endpoint_url(), "test"));
+    }
+
+    #[test]
+    fn test_is_virtual_host_auto_https_bucket_with_dot_disallowed() {
+        let cl = mk_client("s3.example.com:443", true, BucketLookupType::BucketLookupAuto);
+        assert!(!cl.is_virtual_host_style_request(&cl.endpoint_url(), "te.st"));
+    }
+
+    #[test]
+    fn test_is_virtual_host_dns_forced() {
+        let cl = mk_client("s3.example.com:9000", false, BucketLookupType::BucketLookupDNS);
+        assert!(cl.is_virtual_host_style_request(&cl.endpoint_url(), "test"));
+    }
+
+    #[test]
+    fn test_target_url_vhost_and_path() {
+        let cl_v = mk_client("s3.example.com:9000", false, BucketLookupType::BucketLookupDNS);
+        let url_v = cl_v.make_target_url("test", "obj.txt", "", true, &HashMap::new()).unwrap();
+        assert_eq!(url_v.as_str(), "http://test.s3.example.com:9000/obj.txt");
+
+        let cl_p = mk_client("s3.example.com:9000", false, BucketLookupType::BucketLookupPath);
+        let url_p = cl_p.make_target_url("test", "obj.txt", "", false, &HashMap::new()).unwrap();
+        assert_eq!(url_p.as_str(), "http://s3.example.com:9000/test/obj.txt");
+    }
+}
