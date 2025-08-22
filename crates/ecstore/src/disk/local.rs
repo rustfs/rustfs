@@ -65,7 +65,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::fsync_batcher::{FsyncBatcher, FsyncBatcherConfig, FsyncMode};  // 引入fsync批处理器
+use super::fsync_batcher::{FsyncBatcher, FsyncBatcherConfig, FsyncMode}; // 引入fsync批处理器
 
 #[derive(Debug)]
 pub struct FormatInfo {
@@ -234,11 +234,11 @@ impl LocalDisk {
             // format_last_check: Mutex::new(format_last_check),
             exit_signal: None,
             fsync_batcher: FsyncBatcher::new(FsyncBatcherConfig {
-                mode: FsyncMode::Batch,  // 默认使用批量模式
-                batch_size: 32,  // 批量大小，可根据系统配置调整
-                batch_timeout: Duration::from_millis(100),  // 100ms超时
-                adaptive: true,  // 启用自适应调整
-                max_pending: 1000,  // 最大等待文件数
+                mode: FsyncMode::Batch,                    // 默认使用批量模式
+                batch_size: 32,                            // 批量大小，可根据系统配置调整
+                batch_timeout: Duration::from_millis(100), // 100ms超时
+                adaptive: true,                            // 启用自适应调整
+                max_pending: 1000,                         // 最大等待文件数
             }),
         };
         let (info, _root) = get_disk_info(root).await?;
@@ -760,10 +760,10 @@ impl LocalDisk {
                     use std::io::Write as _;
                     let mut f = std_file;
                     f.write_all(buf.as_ref()).map_err(to_file_error)?;
-                    Ok::<std::fs::File, Error>(f)  // 返回文件句柄以便后续使用
+                    Ok::<std::fs::File, Error>(f) // 返回文件句柄以便后续使用
                 });
                 let std_file = task.await??;
-                
+
                 // 将文件句柄转回tokio::fs::File以支持异步fsync
                 f = tokio::fs::File::from_std(std_file);
             }

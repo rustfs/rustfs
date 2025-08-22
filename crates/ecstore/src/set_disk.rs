@@ -121,6 +121,24 @@ pub struct SetDisks {
 }
 
 impl SetDisks {
+    /// Select erasure block size dynamically based on object size
+    ///
+    /// Small objects benefit from smaller blocks to reduce padding and memory usage,
+    /// while large objects prefer larger blocks to improve throughput.
+    fn select_block_size(object_size: i64) -> usize {
+        let sz = if object_size < 0 { 0 } else { object_size as usize };
+        if sz <= 64 * 1024 {
+            16 * 1024 // <= 64KB -> 16KB
+        } else if sz <= 1024 * 1024 {
+            64 * 1024 // <= 1MB -> 64KB
+        } else if sz <= 10 * 1024 * 1024 {
+            256 * 1024 // <= 10MB -> 256KB
+        } else if sz <= 100 * 1024 * 1024 {
+            1024 * 1024 // <= 100MB -> 1MB
+        } else {
+            4 * 1024 * 1024 // > 100MB -> 4MB
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         namespace_lock: Arc<rustfs_lock::NamespaceLock>,
@@ -3357,6 +3375,10 @@ impl ObjectIO for SetDisks {
         }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+
+        // Dynamically adjust erasure block size based on incoming object size
+        // Must be set before constructing the Erasure encoder below.
+        fi.erasure.block_size = Self::select_block_size(data.size());
 
         fi.version_id = {
             if let Some(ref vid) = opts.version_id {

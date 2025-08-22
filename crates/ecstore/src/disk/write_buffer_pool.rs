@@ -1,18 +1,17 @@
 // write_buffer_pool.rs - 写入缓冲池模块
-// 
+//
 // 该模块实现了写入缓冲池，用于优化小文件写入和写入合并
 // 通过缓冲和合并相邻的小写入，减少系统调用开销
 // 支持自适应调整缓冲区大小，适配不同配置的机器
 
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use bytes::{Bytes, BytesMut};
-use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{interval, Instant};
+use tokio::time::{Instant, interval};
 use tracing::{debug, warn};
 
 /// 写入缓冲池配置
@@ -40,12 +39,12 @@ pub struct WriteBufferPoolConfig {
 impl Default for WriteBufferPoolConfig {
     fn default() -> Self {
         Self {
-            max_buffer_size: 64 * 1024 * 1024,  // 64MB
-            total_capacity: 256 * 1024 * 1024,  // 256MB总容量
-            flush_interval: Duration::from_millis(100),  // 100ms刷新间隔
+            max_buffer_size: 64 * 1024 * 1024,          // 64MB
+            total_capacity: 256 * 1024 * 1024,          // 256MB总容量
+            flush_interval: Duration::from_millis(100), // 100ms刷新间隔
             combine_window: Duration::from_millis(10),  // 10ms合并窗口
             enable_combining: true,
-            small_file_threshold: 1024 * 1024,  // 1MB为小文件阈值
+            small_file_threshold: 1024 * 1024, // 1MB为小文件阈值
         }
     }
 }
@@ -85,7 +84,7 @@ impl WriteCombiner {
     /// 尝试合并写入请求
     fn try_combine(&mut self, path: &Path, data: Bytes) -> Option<Vec<WriteRequest>> {
         let now = Instant::now();
-        
+
         // 检查是否有待合并的写入
         if let Some(pending) = self.pending_writes.get_mut(path) {
             // 检查时间窗口
@@ -98,17 +97,17 @@ impl WriteCombiner {
                         offset: None,
                         timestamp: now,
                     });
-                    
+
                     // 如果累积了足够多的写入，返回合并后的结果
                     if pending.len() >= 4 {
                         return Some(std::mem::take(pending));
                     }
-                    
+
                     return None;
                 }
             }
         }
-        
+
         // 创建新的待合并列表
         self.pending_writes.insert(
             path.to_path_buf(),
@@ -119,7 +118,7 @@ impl WriteCombiner {
                 timestamp: now,
             }],
         );
-        
+
         None
     }
 
@@ -127,7 +126,7 @@ impl WriteCombiner {
     fn get_expired_writes(&mut self) -> Vec<Vec<WriteRequest>> {
         let now = Instant::now();
         let mut expired = Vec::new();
-        
+
         self.pending_writes.retain(|_, writes| {
             if let Some(first) = writes.first() {
                 if now.duration_since(first.timestamp) >= self.combine_window {
@@ -137,7 +136,7 @@ impl WriteCombiner {
             }
             true
         });
-        
+
         expired
     }
 }
@@ -180,7 +179,7 @@ impl WriteBufferPool {
     /// 写入数据
     pub async fn write(&self, path: PathBuf, data: Bytes) -> Result<(), std::io::Error> {
         let config = self.config.read().await;
-        
+
         // 检查是否是小文件，决定是否使用缓冲
         if data.len() > config.small_file_threshold {
             // 大文件直接写入，不使用缓冲
@@ -221,7 +220,7 @@ impl WriteBufferPool {
         buffer.last_write = Instant::now();
         buffer.write_count += 1;
         buffer.dirty = true;
-        
+
         *current_usage += data.len();
 
         // 检查是否需要刷新
@@ -230,10 +229,10 @@ impl WriteBufferPool {
             let data = buffer.data.split().freeze();
             buffer.dirty = false;
             drop(buffers);
-            
+
             *current_usage -= data.len();
             drop(current_usage);
-            
+
             self.write_direct(&path, data).await?;
         }
 
@@ -269,22 +268,23 @@ impl WriteBufferPool {
         // 按路径分组
         let mut grouped: HashMap<PathBuf, Vec<Bytes>> = HashMap::new();
         for write in writes {
-            grouped.entry(write.path).or_insert_with(Vec::new).push(write.data);
+            grouped.entry(write.path).or_default().push(write.data);
         }
 
         // 并行写入每个文件
         let futures: Vec<_> = grouped
             .into_iter()
             .map(|(path, data_vec)| {
-                let combined_data = data_vec.into_iter().fold(BytesMut::new(), |mut acc, data| {
-                    acc.extend_from_slice(&data);
-                    acc
-                }).freeze();
-                
+                let combined_data = data_vec
+                    .into_iter()
+                    .fold(BytesMut::new(), |mut acc, data| {
+                        acc.extend_from_slice(&data);
+                        acc
+                    })
+                    .freeze();
+
                 let pool = self.clone();
-                async move {
-                    pool.write_direct(&path, combined_data).await
-                }
+                async move { pool.write_direct(&path, combined_data).await }
             })
             .collect();
 
@@ -297,7 +297,7 @@ impl WriteBufferPool {
     pub async fn flush_all(&self) -> Result<(), std::io::Error> {
         let mut buffers = self.buffers.write().await;
         let mut current_usage = self.current_usage.lock().await;
-        
+
         let dirty_buffers: Vec<_> = buffers
             .iter_mut()
             .filter(|(_, state)| state.dirty)
@@ -319,9 +319,7 @@ impl WriteBufferPool {
             .into_iter()
             .map(|(path, data)| {
                 let pool = self.clone();
-                async move {
-                    pool.write_direct(&path, data).await
-                }
+                async move { pool.write_direct(&path, data).await }
             })
             .collect();
 
@@ -338,7 +336,7 @@ impl WriteBufferPool {
 
         loop {
             ticker.tick().await;
-            
+
             if let Err(e) = self.flush_all().await {
                 warn!("Periodic flush failed: {}", e);
             }
@@ -394,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn test_small_file_buffering() {
         let config = WriteBufferPoolConfig {
-            small_file_threshold: 1024,  // 1KB
+            small_file_threshold: 1024, // 1KB
             flush_interval: Duration::from_secs(1),
             ..Default::default()
         };
@@ -431,7 +429,7 @@ mod tests {
 
         // 快速连续写入多个小数据
         for i in 0..4 {
-            let data = Bytes::from(format!("data{}", i));
+            let data = Bytes::from(format!("data{i}"));
             pool.write(path.clone(), data).await.unwrap();
         }
 

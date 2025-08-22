@@ -145,21 +145,29 @@ async fn test_heal_object_basic() {
     create_test_bucket(&ecstore, bucket_name).await;
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
-    // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
+    // ─── 1️⃣ delete xl.meta file to simulate corruption ───────────────────────
     let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-    // find part file at depth 2, e.g. .../<uuid>/part.1
-    let target_part = WalkDir::new(&obj_dir)
-        .min_depth(2)
-        .max_depth(2)
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-        .map(|e| e.into_path())
-        .expect("Failed to locate part file to delete");
+    let xl_meta_path = obj_dir.join("xl.meta");
 
-    std::fs::remove_file(&target_part).expect("failed to delete part file");
-    assert!(!target_part.exists());
-    println!("✅ Deleted shard part file: {target_part:?}");
+    // Check if xl.meta exists (for inline data) or look for part files (for distributed data)
+    let target_file = if xl_meta_path.exists() {
+        println!("Found inline data in xl.meta file");
+        xl_meta_path
+    } else {
+        // Try to find part file at depth 2, e.g. .../<uuid>/part.1
+        WalkDir::new(&obj_dir)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+            .map(|e| e.into_path())
+            .expect("Failed to locate part file or xl.meta to delete")
+    };
+
+    std::fs::remove_file(&target_file).expect("failed to delete file");
+    assert!(!target_file.exists());
+    println!("✅ Deleted file: {target_file:?}");
 
     // Create heal manager with faster interval
     let cfg = HealConfig {
@@ -206,8 +214,8 @@ async fn test_heal_object_basic() {
         Err(e) => info!("Task status not found (likely completed): {}", e),
     }
 
-    // ─── 2️⃣ verify each part file is restored ───────
-    assert!(target_part.exists());
+    // ─── 2️⃣ verify file is restored ───────
+    assert!(target_file.exists());
 
     info!("Heal object basic test passed");
 }
@@ -323,14 +331,23 @@ async fn test_heal_format_with_data() {
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
     let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-    let target_part = WalkDir::new(&obj_dir)
-        .min_depth(2)
-        .max_depth(2)
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-        .map(|e| e.into_path())
-        .expect("Failed to locate part file to delete");
+    let xl_meta_path = obj_dir.join("xl.meta");
+
+    // Check if xl.meta exists (for inline data) or look for part files (for distributed data)
+    let target_file = if xl_meta_path.exists() {
+        println!("Found inline data in xl.meta file");
+        xl_meta_path
+    } else {
+        // Try to find part file at depth 2, e.g. .../<uuid>/part.1
+        WalkDir::new(&obj_dir)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+            .map(|e| e.into_path())
+            .expect("Failed to locate part file or xl.meta to delete")
+    };
 
     // ─── 1️⃣ delete format.json on one disk ──────────────
     let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -351,8 +368,8 @@ async fn test_heal_format_with_data() {
 
     // ─── 2️⃣ verify format.json is restored ───────
     assert!(format_path.exists(), "format.json does not exist on disk after heal");
-    // ─── 3 verify each part file is restored ───────
-    assert!(target_part.exists());
+    // ─── 3 verify file is restored ───────
+    assert!(target_file.exists());
 
     info!("Heal format basic test passed");
 }

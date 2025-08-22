@@ -15,14 +15,10 @@
 mod decode;
 mod encode;
 mod erasure;
-mod parallel_encoder;
 mod heal;
+mod parallel_encoder;
 
-pub use decode::*;
-pub use encode::*;
-pub use erasure::*;
 pub use parallel_encoder::*;
-pub use heal::*;
 
 mod bitrot;
 pub use bitrot::*;

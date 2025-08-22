@@ -134,7 +134,7 @@ impl Erasure {
         // 原来是8，现在增加到64，可以缓存更多的编码块
         // 这对于大文件写入特别有效，可以减少背压导致的性能下降
         // 对于低配机器，这个值可以通过配置调整到较小值（如16-32）
-        let channel_buffer_size = 64;  // 可配置的缓冲区大小
+        let channel_buffer_size = 64; // 可配置的缓冲区大小
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(channel_buffer_size);
 
         let task = tokio::spawn(async move {
