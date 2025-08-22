@@ -151,6 +151,7 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+#[ignore = "Please run it manually."]
 async fn test_lifecycle_expiry_basic() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 

@@ -108,11 +108,17 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
 /// Test helper: Create a test bucket
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
-    (**ecstore)
-        .make_bucket(bucket_name, &Default::default())
-        .await
-        .expect("Failed to create test bucket");
-    info!("Created test bucket: {}", bucket_name);
+    match (**ecstore).make_bucket(bucket_name, &Default::default()).await {
+        Ok(_) => info!("Created test bucket: {}", bucket_name),
+        Err(e) => {
+            // If the bucket already exists from a previous test run in the shared env, ignore.
+            if matches!(e, rustfs_ecstore::error::StorageError::BucketExists(_)) {
+                info!("Bucket already exists, continuing: {}", bucket_name);
+            } else {
+                panic!("Failed to create test bucket: {e:?}");
+            }
+        }
+    }
 }
 
 /// Test helper: Upload test object

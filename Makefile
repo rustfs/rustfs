@@ -34,7 +34,12 @@ check:
 .PHONY: test
 test:
 	@echo "🧪 Running tests..."
-	cargo nextest run --all --exclude e2e_test
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --all --exclude e2e_test; \
+	else \
+		echo "ℹ️ cargo-nextest not found; falling back to 'cargo test'"; \
+		cargo test --workspace --exclude e2e_test -- --nocapture; \
+	fi
 	cargo test --all --doc
 
 .PHONY: pre-commit
