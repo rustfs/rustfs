@@ -25,6 +25,8 @@ use ecstore::{
 use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
 use rustfs_filemeta::{MetacacheReader, VersionType};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::yield_now;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -70,18 +72,27 @@ pub struct ScannerConfig {
     pub scan_mode: ScanMode,
     /// Whether to enable data usage statistics collection
     pub enable_data_usage_stats: bool,
+    /// Skip objects modified within this window to avoid racing with active writes
+    pub skip_recently_modified_within: Duration,
+    /// Throttle: after scanning this many objects, sleep for a short delay to reduce IO contention
+    pub throttle_every_n_objects: u32,
+    /// Throttle delay duration per throttle tick
+    pub throttle_delay: Duration,
 }
 
 impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
-            scan_interval: Duration::from_secs(60),        // 1 minute
-            deep_scan_interval: Duration::from_secs(3600), // 1 hour
-            max_concurrent_scans: 20,
+            scan_interval: Duration::from_secs(3600),       // 1 hour
+            deep_scan_interval: Duration::from_secs(86400), // 1 day
+            max_concurrent_scans: 10,
             enable_healing: true,
             enable_metrics: true,
             scan_mode: ScanMode::Normal,
             enable_data_usage_stats: true,
+            skip_recently_modified_within: Duration::from_secs(600), // 10 minutes
+            throttle_every_n_objects: 200,
+            throttle_delay: Duration::from_millis(2),
         }
     }
 }
@@ -1244,6 +1255,11 @@ impl Scanner {
         let mut objects_scanned = 0u64;
         let mut objects_with_issues = 0u64;
         let mut object_metadata = HashMap::new();
+        // snapshot throttling/grace config
+        let cfg_snapshot = self.config.read().await.clone();
+        let throttle_n = cfg_snapshot.throttle_every_n_objects.max(1);
+        let throttle_delay = cfg_snapshot.throttle_delay;
+        let skip_recent = cfg_snapshot.skip_recently_modified_within;
 
         // Process each object entry
         while let Ok(Some(mut entry)) = reader.peek().await {
@@ -1254,6 +1270,28 @@ impl Scanner {
 
                 // Parse object metadata
                 if let Ok(file_meta) = entry.xl_meta() {
+                    // Skip recently modified objects to avoid racing with active writes
+                    if let Some(latest_mt) = file_meta.versions.iter().filter_map(|v| v.header.mod_time).max() {
+                        let ts_nanos = latest_mt.unix_timestamp_nanos();
+                        let latest_st = if ts_nanos >= 0 {
+                            std::time::UNIX_EPOCH + Duration::from_nanos(ts_nanos as u64)
+                        } else {
+                            std::time::UNIX_EPOCH
+                        };
+                        if let Ok(elapsed) = SystemTime::now().duration_since(latest_st) {
+                            if elapsed < skip_recent {
+                                debug!(
+                                    "Skipping recently modified object {}/{} (elapsed {:?} < {:?})",
+                                    bucket, entry.name, elapsed, skip_recent
+                                );
+                                if (objects_scanned as u32) % throttle_n == 0 {
+                                    sleep(throttle_delay).await;
+                                    yield_now().await;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if file_meta.versions.is_empty() {
                         objects_with_issues += 1;
                         warn!("Object {} has no versions", entry.name);
@@ -1318,6 +1356,12 @@ impl Scanner {
                         }
                     }
                 }
+            }
+
+            // lightweight throttling to reduce IO contention
+            if (objects_scanned as u32) % throttle_n == 0 {
+                sleep(throttle_delay).await;
+                yield_now().await;
             }
         }
 
@@ -1406,6 +1450,14 @@ impl Scanner {
         // Step 2: Identify missing objects and perform EC verification
         let mut objects_needing_heal = 0u64;
         let mut objects_with_ec_issues = 0u64;
+        // snapshot config for gating and throttling
+        let cfg_snapshot = self.config.read().await.clone();
+        let skip_recent = cfg_snapshot.skip_recently_modified_within;
+        let throttle_n = cfg_snapshot.throttle_every_n_objects.max(1);
+        let throttle_delay = cfg_snapshot.throttle_delay;
+        let deep_mode = cfg_snapshot.scan_mode == ScanMode::Deep;
+        // cfg_snapshot is a plain value clone; no guard to explicitly drop here.
+        let mut iter_count: u64 = 0;
 
         for (bucket, objects) in &all_objects {
             // Skip internal RustFS system bucket to avoid lengthy checks on temporary/trash objects
@@ -1413,6 +1465,7 @@ impl Scanner {
                 continue;
             }
             for object_name in objects {
+                iter_count += 1;
                 let key = (bucket.clone(), object_name.clone());
                 let empty_vec = Vec::new();
                 let locations = object_locations.get(&key).unwrap_or(&empty_vec);
@@ -1444,8 +1497,51 @@ impl Scanner {
                     continue;
                 }
 
+                // Skip recently modified objects to avoid racing with writes
+                let is_recent = (|| {
+                    for &disk_idx in locations {
+                        if let Some(bucket_map) = all_disk_objects.get(disk_idx) {
+                            if let Some(file_map) = bucket_map.get(bucket) {
+                                if let Some(fm) = file_map.get(object_name) {
+                                    if let Some(mt) = fm.versions.iter().filter_map(|v| v.header.mod_time).max() {
+                                        let ts_nanos = mt.unix_timestamp_nanos();
+                                        let mt_st = if ts_nanos >= 0 {
+                                            std::time::UNIX_EPOCH + Duration::from_nanos(ts_nanos as u64)
+                                        } else {
+                                            std::time::UNIX_EPOCH
+                                        };
+                                        if let Ok(elapsed) = SystemTime::now().duration_since(mt_st) {
+                                            if elapsed < skip_recent {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                })();
+                if is_recent {
+                    debug!("Skipping missing-objects heal check for recently modified {}/{}", bucket, object_name);
+                    if (iter_count as u32) % throttle_n == 0 {
+                        sleep(throttle_delay).await;
+                        yield_now().await;
+                    }
+                    continue;
+                }
+
+                // Only attempt missing-object heal checks in Deep scan mode
+                if !deep_mode {
+                    if (iter_count as u32) % throttle_n == 0 {
+                        sleep(throttle_delay).await;
+                        yield_now().await;
+                    }
+                    continue;
+                }
+
                 // Check if object is missing from some disks
-                if locations.len() < disks.len() {
+                if !locations.is_empty() && locations.len() < disks.len() {
                     // Before submitting heal, confirm the object still exists logically.
                     let should_heal = if let Some(store) = rustfs_ecstore::new_object_layer_fn() {
                         match store.get_object_info(bucket, object_name, &Default::default()).await {
@@ -1473,6 +1569,10 @@ impl Scanner {
                     };
 
                     if !should_heal {
+                        if (iter_count as u32) % throttle_n == 0 {
+                            sleep(throttle_delay).await;
+                            yield_now().await;
+                        }
                         continue;
                     }
                     objects_needing_heal += 1;
@@ -1515,6 +1615,11 @@ impl Scanner {
                         objects_with_ec_issues += 1;
                         warn!("Object integrity verification failed for object {}/{}: {}", bucket, object_name, e);
                     }
+                }
+
+                if (iter_count as u32) % throttle_n == 0 {
+                    sleep(throttle_delay).await;
+                    yield_now().await;
                 }
             }
         }
