@@ -41,7 +41,7 @@ static UNLOCK_TX: Lazy<mpsc::Sender<UnlockJob>> = Lazy::new(|| {
             let rt = Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build unlock runtime");
+                .expect("failed to build Tokio runtime for background unlock jobs (possible causes: resource exhaustion, thread limit, Tokio misconfiguration)");
 
             rt.block_on(async move {
                 while let Some(job) = rx.recv().await {
