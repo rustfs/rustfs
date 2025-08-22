@@ -112,14 +112,10 @@ impl Drop for LockGuard {
             // Channel full or closed; best-effort fallback using a dedicated thread runtime
             let lock_id = self.lock_id.clone();
             let clients = self.clients.clone();
-            let lock_id_for_log = lock_id.to_string();
             tracing::warn!(
                 "LockGuard channel send failed ({}), spawning fallback unlock thread for {}",
                 err,
-            tracing::warn!(
-                "LockGuard channel send failed ({}), spawning fallback unlock thread for {}",
-                err,
-                lock_id
+                lock_id.clone()
             );
 
             // Use a short-lived background thread to execute the async releases on its own runtime.
