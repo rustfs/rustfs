@@ -18,7 +18,7 @@ use std::{
     pin::Pin,
     sync::LazyLock,
     task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::time::{Interval, MissedTickBehavior, interval};
 
@@ -48,7 +48,7 @@ impl RetryTimer {
             max_sleep,
             jitter,
             random,
-            max_retry: max_retry,
+            max_retry,
             rem: max_retry,
             timer: None,
         }
@@ -175,6 +175,7 @@ mod tests {
     use super::*;
     use futures::{Future, StreamExt};
     use rand::Rng;
+    use std::time::UNIX_EPOCH;
 
     #[tokio::test]
     async fn test_retry() {
