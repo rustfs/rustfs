@@ -822,19 +822,19 @@ mod tests {
     #[test]
     fn test_parse_copy_source_range() {
         // Test complete range: bytes=0-1023
-        let result = parse_copy_source_range("bytes=0-1023").unwrap().unwrap();
+        let result = parse_copy_source_range("bytes=0-1023").unwrap();
         assert!(!result.is_suffix_length);
         assert_eq!(result.start, 0);
         assert_eq!(result.end, 1023);
 
         // Test open-ended range: bytes=500-
-        let result = parse_copy_source_range("bytes=500-").unwrap().unwrap();
+        let result = parse_copy_source_range("bytes=500-").unwrap();
         assert!(!result.is_suffix_length);
         assert_eq!(result.start, 500);
         assert_eq!(result.end, -1);
 
         // Test suffix range: bytes=-500 (last 500 bytes)
-        let result = parse_copy_source_range("bytes=-500").unwrap().unwrap();
+        let result = parse_copy_source_range("bytes=-500").unwrap();
         assert!(result.is_suffix_length);
         assert_eq!(result.start, -500);
         assert_eq!(result.end, -1);
