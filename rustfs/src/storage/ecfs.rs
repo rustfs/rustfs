@@ -1796,13 +1796,13 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        // Get the source object reader again with the correct range
+        // Get the source object reader once with the validated range
         let src_reader = store
             .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
             .map_err(ApiError::from)?;
 
-        // Create a new reader from the source data
+        // Use the same reader for streaming
         let src_stream = src_reader.stream;
 
         // Check if compression is enabled for this multipart upload
