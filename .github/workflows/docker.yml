@@ -58,6 +58,10 @@ on:
         type: boolean
 
 env:
+  CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  TRIGGERING_EVENT: ${{ github.event.workflow_run.event }}
   DOCKERHUB_USERNAME: rustfs
   CARGO_TERM_COLOR: always
   REGISTRY_DOCKERHUB: rustfs/rustfs
@@ -102,27 +106,27 @@ jobs:
 
             # Check if the triggering workflow was successful
             # If the workflow succeeded, it means ALL builds (including Linux x86_64 and aarch64) succeeded
-            if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            if [[ "$CONCLUSION" == "success" ]]; then
               echo "✅ Build workflow succeeded, all builds including Linux are successful"
               should_build=true
               should_push=true
             else
-              echo "❌ Build workflow failed (conclusion: ${{ github.event.workflow_run.conclusion }}), skipping Docker build"
+              echo "❌ Build workflow failed (conclusion: $CONCLUSION), skipping Docker build"
               should_build=false
             fi
 
             # Extract version info from commit message or use commit SHA
             # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
-            short_sha=$(git rev-parse --short "${{ github.event.workflow_run.head_sha }}")
+            short_sha=$(git rev-parse --short "$HEAD_SHA")
 
             # Determine build type based on triggering workflow event and ref
-            triggering_event="${{ github.event.workflow_run.event }}"
-            head_branch="${{ github.event.workflow_run.head_branch }}"
+            triggering_event="$TRIGGERING_EVENT"
+            head_branch="$HEAD_BRANCH"
 
             echo "🔍 Analyzing triggering workflow:"
             echo "   📋 Event: $triggering_event"
             echo "   🌿 Head branch: $head_branch"
-            echo "   📎 Head SHA: ${{ github.event.workflow_run.head_sha }}"
+            echo "   📎 Head SHA: $HEAD_SHA"
 
             # Check if this was triggered by a tag push
             if [[ "$triggering_event" == "push" ]]; then
@@ -174,10 +178,10 @@ jobs:
             fi
 
             echo "🔄 Build triggered by workflow_run:"
-            echo "   📋 Conclusion: ${{ github.event.workflow_run.conclusion }}"
-            echo "   🌿 Branch: ${{ github.event.workflow_run.head_branch }}"
-            echo "   📎 SHA: ${{ github.event.workflow_run.head_sha }}"
-            echo "   🎯 Event: ${{ github.event.workflow_run.event }}"
+            echo "   📋 Conclusion: $CONCLUSION"
+            echo "   🌿 Branch: $HEAD_BRANCH"
+            echo "   📎 SHA: $HEAD_SHA"
+            echo "   🎯 Event: $TRIGGERING_EVENT"
 
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Manual trigger
