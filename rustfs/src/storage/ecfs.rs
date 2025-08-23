@@ -1743,7 +1743,7 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if *etag != if_match.to_string() {
+                if etag != &if_match {
                     return Err(s3_error!(PreconditionFailed));
                 }
             } else {
@@ -1753,7 +1753,7 @@ impl S3 for FS {
 
         if let Some(if_none_match) = copy_source_if_none_match {
             if let Some(ref etag) = src_info.etag {
-                if *etag == if_none_match.to_string() {
+                if etag == &if_none_match {
                     return Err(s3_error!(PreconditionFailed));
                 }
             }
