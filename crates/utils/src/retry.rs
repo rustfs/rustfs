@@ -20,7 +20,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
 };
-use tokio::time::{interval, Interval, MissedTickBehavior};
+use tokio::time::{Interval, MissedTickBehavior, interval};
 
 pub const MAX_RETRY: i64 = 10;
 pub const MAX_JITTER: f64 = 1.0;
@@ -184,7 +184,10 @@ mod tests {
         let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, random);
         println!("retry_timer: {retry_timer:?}");
         while let Some(_) = retry_timer.next().await {
-            println!("\ntime: {:?}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+            println!(
+                "\ntime: {:?}",
+                std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+            );
         }
     }
 }
