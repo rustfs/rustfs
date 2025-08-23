@@ -12,10 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-mod config;
-mod entity;
-mod factory;
-mod global;
-mod notifier;
-mod registry;
-mod system;
+use crate::entity::AuditEntry;
+
+pub struct Notifier {}
+
+impl Notifier {
+    pub async fn log(&self, entry: AuditEntry) {
+        if let Some(system) = audit_logger() {
+            system.log(entry).await;
+        }
+    }
+}

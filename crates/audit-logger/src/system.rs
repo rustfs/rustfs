@@ -12,25 +12,19 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#![allow(dead_code)]
+use crate::entity::AuditEntry;
+use crate::factory::AuditTarget;
+use crate::registry::TargetRegistry;
 
-pub mod config;
-pub mod dispatch;
-pub mod entry;
-pub mod factory;
+pub struct AuditLoggerSystem {
+    registry: TargetRegistry,
+    targets: Vec<Box<dyn AuditTarget + Send + Sync>>,
+    // 其他状态
+}
 
-use async_trait::async_trait;
-use std::error::Error;
-
-/// General Log Target Trait
-#[async_trait]
-pub trait Target: Send + Sync {
-    /// Send a single logizable entry
-    async fn send(&self, entry: Box<Self>) -> Result<(), Box<dyn Error + Send>>;
-
-    /// Returns the unique name of the target
-    fn name(&self) -> &str;
-
-    /// Close target gracefully, ensuring all buffered logs are processed
-    async fn shutdown(&self);
+impl AuditLoggerSystem {
+    pub fn new(config: Config) -> Self { ... }
+    pub async fn init(&self) -> Result<(), AuditLoggerError> { ... }
+    pub async fn reload_config(&self, config: Config) -> Result<(), AuditLoggerError> { ... }
+    pub async fn log(&self, entry: AuditEntry) { ... }
 }

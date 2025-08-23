@@ -12,10 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-mod config;
-mod entity;
-mod factory;
-mod global;
-mod notifier;
-mod registry;
-mod system;
+// src/config.rs
+pub struct ConfigManager {
+    // 负责合并 ENV、系统配置、默认配置
+}
+
+impl ConfigManager {
+    pub fn load() -> Config {
+        // 1. 读取 ENV
+        // 2. 读取系统配置
+        // 3. 合并默认配置
+        // 4. 返回最终配置
+    }
+}

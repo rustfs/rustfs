@@ -11,3 +11,15 @@
 //  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
+
+use std::collections::HashMap;
+use crate::factory::{AuditTarget, AuditTargetFactory};
+
+pub struct TargetRegistry {
+    factories: HashMap<String, Box<dyn AuditTargetFactory>>,
+}
+
+impl TargetRegistry {
+    pub fn register(&mut self, target_type: &str, factory: Box<dyn AuditTargetFactory>) { ... }
+    pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn AuditTarget + Send + Sync>>, AuditLoggerError> { ... }
+}
