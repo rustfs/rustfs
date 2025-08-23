@@ -153,9 +153,13 @@ impl GetObjectReader {
                 // The new implementation supports any offset size by streaming and skipping data
                 match RangedDecompressReader::new(dec_reader, dec_off, dec_length, actual_size_usize) {
                     Ok(ranged_reader) => {
-                        tracing::debug!("Successfully created RangedDecompressReader for offset={}, length={}", dec_off, dec_length);
+                        tracing::debug!(
+                            "Successfully created RangedDecompressReader for offset={}, length={}",
+                            dec_off,
+                            dec_length
+                        );
                         Box::new(ranged_reader)
-                    },
+                    }
                     Err(e) => {
                         // Only fail if the range parameters are fundamentally invalid (e.g., offset >= file size)
                         tracing::error!("RangedDecompressReader failed with invalid range parameters: {}", e);
@@ -1119,13 +1123,18 @@ impl<R: AsyncRead + Unpin + Send + Sync> RangedDecompressReader<R> {
             tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
             return Err(Error::other("Range offset exceeds file size"));
         }
-        
+
         // Adjust length if it extends beyond file end
         let actual_length = std::cmp::min(length as usize, total_size - offset);
-        
-        tracing::debug!("Creating RangedDecompressReader: offset={}, length={}, total_size={}, actual_length={}", 
-                       offset, length, total_size, actual_length);
-        
+
+        tracing::debug!(
+            "Creating RangedDecompressReader: offset={}, length={}, total_size={}, actual_length={}",
+            offset,
+            length,
+            total_size,
+            actual_length
+        );
+
         Ok(Self {
             inner,
             target_offset: offset,
@@ -1173,8 +1182,10 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R>
                             // We haven't reached the target offset yet - this is an error
                             return Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
-                                format!("Unexpected EOF: only read {} bytes, target offset is {}", 
-                                       self.current_offset, self.target_offset),
+                                format!(
+                                    "Unexpected EOF: only read {} bytes, target offset is {}",
+                                    self.current_offset, self.target_offset
+                                ),
                             )));
                         }
                         // Normal EOF after reaching target
@@ -1190,7 +1201,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R>
                         // We're still skipping data
                         let skip_end = std::cmp::min(self.current_offset, self.target_offset);
                         let bytes_to_skip_in_this_read = skip_end - old_offset;
-                        
+
                         if self.current_offset <= self.target_offset {
                             // All data in this read should be skipped
                             tracing::trace!("Skipping {} bytes at offset {}", n, old_offset);
@@ -1201,28 +1212,34 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R>
                             let data_start_in_buffer = bytes_to_skip_in_this_read;
                             let available_data = n - data_start_in_buffer;
                             let bytes_to_return = std::cmp::min(
-                                available_data, 
-                                std::cmp::min(buf.remaining(), self.target_length - self.bytes_returned)
+                                available_data,
+                                std::cmp::min(buf.remaining(), self.target_length - self.bytes_returned),
                             );
-                            
+
                             if bytes_to_return > 0 {
-                                let data_slice = &temp_read_buf.filled()[data_start_in_buffer..data_start_in_buffer + bytes_to_return];
+                                let data_slice =
+                                    &temp_read_buf.filled()[data_start_in_buffer..data_start_in_buffer + bytes_to_return];
                                 buf.put_slice(data_slice);
                                 self.bytes_returned += bytes_to_return;
-                                
-                                tracing::trace!("Skipped {} bytes, returned {} bytes at offset {}", 
-                                              bytes_to_skip_in_this_read, bytes_to_return, old_offset);
+
+                                tracing::trace!(
+                                    "Skipped {} bytes, returned {} bytes at offset {}",
+                                    bytes_to_skip_in_this_read,
+                                    bytes_to_return,
+                                    old_offset
+                                );
                             }
                             return Poll::Ready(Ok(()));
                         }
                     } else {
                         // We're in the data return phase
-                        let bytes_to_return = std::cmp::min(n, std::cmp::min(buf.remaining(), self.target_length - self.bytes_returned));
-                        
+                        let bytes_to_return =
+                            std::cmp::min(n, std::cmp::min(buf.remaining(), self.target_length - self.bytes_returned));
+
                         if bytes_to_return > 0 {
                             buf.put_slice(&temp_read_buf.filled()[..bytes_to_return]);
                             self.bytes_returned += bytes_to_return;
-                            
+
                             tracing::trace!("Returned {} bytes at offset {}", bytes_to_return, old_offset);
                         }
                         return Poll::Ready(Ok(()));

@@ -1763,7 +1763,7 @@ impl S3 for FS {
         // For now, we'll skip these conditions
 
         // Calculate actual range and length
-        // Note: These values are used implicitly through the range specification (rs) 
+        // Note: These values are used implicitly through the range specification (rs)
         // passed to get_object_reader, which handles the offset and length internally
         let (_start_offset, length) = if let Some(ref range_spec) = rs {
             // For range validation, use the actual logical size of the file
@@ -1772,16 +1772,16 @@ impl S3 for FS {
                 Ok((_, true)) => {
                     // For compressed files, use actual uncompressed size for range validation
                     src_info.get_actual_size().unwrap_or(src_info.size)
-                },
+                }
                 _ => {
                     // For non-compressed files, use the stored size
                     src_info.size
                 }
             };
-            
-            range_spec.get_offset_length(validation_size).map_err(|e| {
-                S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {}", e))
-            })?
+
+            range_spec
+                .get_offset_length(validation_size)
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {}", e)))?
         } else {
             (0, src_info.size)
         };
@@ -1804,7 +1804,7 @@ impl S3 for FS {
 
         // Create a new reader from the source data
         let src_stream = src_reader.stream;
-        
+
         // Check if compression is enabled for this multipart upload
         let is_compressible = mp_info
             .user_defined

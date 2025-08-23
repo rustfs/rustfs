@@ -799,7 +799,7 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<Option<HTTPRangeSpec
     }
 
     let range_part = &range_str[6..]; // Remove "bytes=" prefix
-    
+
     if let Some(dash_pos) = range_part.find('-') {
         let start_str = &range_part[..dash_pos];
         let end_str = &range_part[dash_pos + 1..];
@@ -810,22 +810,25 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<Option<HTTPRangeSpec
 
         if start_str.is_empty() {
             // Suffix range: bytes=-500 (last 500 bytes)
-            let length = end_str.parse::<i64>()
+            let length = end_str
+                .parse::<i64>()
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
-            
+
             Ok(Some(HTTPRangeSpec {
                 is_suffix_length: true,
                 start: -length,
                 end: -1,
             }))
         } else {
-            let start = start_str.parse::<i64>()
+            let start = start_str
+                .parse::<i64>()
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
-            
+
             let end = if end_str.is_empty() {
                 -1 // Open-ended range: bytes=500-
             } else {
-                end_str.parse::<i64>()
+                end_str
+                    .parse::<i64>()
                     .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?
             };
 
