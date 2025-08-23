@@ -293,11 +293,11 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
                 .parse::<i64>()
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
 
-            Ok(Some(HTTPRangeSpec {
+            Ok(HTTPRangeSpec {
                 is_suffix_length: true,
                 start: -length,
                 end: -1,
-            }))
+            })
         } else {
             let start = start_str
                 .parse::<i64>()

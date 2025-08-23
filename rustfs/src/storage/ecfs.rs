@@ -1701,7 +1701,7 @@ impl S3 for FS {
 
         // Parse range if provided (format: "bytes=start-end")
         let rs = if let Some(range_str) = copy_source_range {
-            parse_copy_source_range(&range_str)?
+            Some(parse_copy_source_range(&range_str)?)
         } else {
             None
         };
