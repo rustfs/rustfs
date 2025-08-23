@@ -590,46 +590,7 @@ impl TransitionClient {
             return false;
         }
 
-        // AUTO
-        let host = match url.host_str() {
-            Some(h) => h,
-            None => return false,
-        };
-
-        // If endpoint is an IP address, do not use virtual host style
-        let is_ip = host.parse::<std::net::IpAddr>().is_ok();
-        if is_ip {
-            return false;
-        }
-
-        // Basic DNS bucket validation: lowercase letters, numbers, dot and hyphen; must start/end alnum
-        let is_dns_compatible = {
-            let bytes = bucket_name.as_bytes();
-            let start_end_ok = bucket_name
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                .unwrap_or(false)
-                && bucket_name
-                    .chars()
-                    .last()
-                    .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                    .unwrap_or(false);
-            let middle_ok = bytes
-                .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.');
-            start_end_ok && middle_ok && bucket_name.len() >= 3 && bucket_name.len() <= 63
-        };
-        if !is_dns_compatible {
-            return false;
-        }
-
-        // When using TLS, avoid buckets with dots to prevent cert/SNI mismatch unless a wildcard cert is ensured.
-        if self.secure && bucket_name.contains('.') {
-            return false;
-        }
-
-        true
+        false
     }
 
     pub fn cred_context(&self) -> CredContext {
