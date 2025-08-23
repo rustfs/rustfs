@@ -1781,7 +1781,7 @@ impl S3 for FS {
 
             range_spec
                 .get_offset_length(validation_size)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {}", e)))?
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {e}")))?
         } else {
             (0, src_info.size)
         };
