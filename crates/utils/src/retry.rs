@@ -184,7 +184,7 @@ mod tests {
 
         let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, random);
         println!("retry_timer: {retry_timer:?}");
-        while let Some(_) = retry_timer.next().await {
+        while retry_timer.next().await.is_some() {
             println!(
                 "\ntime: {:?}",
                 std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
