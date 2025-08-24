@@ -317,7 +317,7 @@ impl TransitionClient {
         //}
 
         let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, self.random);
-        while let Some(_) = retry_timer.next().await {
+        while retry_timer.next().await.is_some() {
             let req = self.new_request(&method, metadata).await?;
 
             resp = self.doit(req).await?;
