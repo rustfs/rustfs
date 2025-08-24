@@ -1258,7 +1258,7 @@ impl Scanner {
                         objects_with_issues += 1;
                         warn!("Object {} has no versions", entry.name);
 
-                        // 对象元数据损坏，提交元数据heal任务
+                        // 对象元数据损坏，提交元数据 heal 任务
                         let enable_healing = self.config.read().await.enable_healing;
                         if enable_healing {
                             if let Some(heal_manager) = &self.heal_manager {
@@ -1296,7 +1296,7 @@ impl Scanner {
                     objects_with_issues += 1;
                     warn!("Failed to parse metadata for object {}", entry.name);
 
-                    // 对象元数据解析失败，提交元数据heal任务
+                    // 对象元数据解析失败，提交元数据 heal 任务
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
                         if let Some(heal_manager) = &self.heal_manager {

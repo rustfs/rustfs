@@ -31,8 +31,9 @@ const-str = { workspace = true, optional = true }
 workspace = true
 
 [features]
-default = []
+default = ["constants"]
+audit = ["dep:const-str", "constants"]
 constants = ["dep:const-str"]
-notify = ["dep:const-str"]
-observability = []
+notify = ["dep:const-str", "constants"]
+observability = ["constants"]
 

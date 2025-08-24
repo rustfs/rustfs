@@ -1221,7 +1221,7 @@ impl StorageAPI for ECStore {
         }
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
-            let err = err.into();
+            let err = to_object_err(err.into(), vec![bucket]);
             if !is_err_bucket_exists(&err) {
                 let _ = self
                     .delete_bucket(
@@ -1234,7 +1234,6 @@ impl StorageAPI for ECStore {
                     )
                     .await;
             }
-
             return Err(err);
         };
 

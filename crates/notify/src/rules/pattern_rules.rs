@@ -14,7 +14,7 @@
 
 use super::pattern;
 use super::target_id_set::TargetIdSet;
-use crate::arn::TargetID;
+use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

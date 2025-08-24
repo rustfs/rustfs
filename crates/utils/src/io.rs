@@ -110,6 +110,7 @@ pub fn uvarint(buf: &[u8]) -> (u64, isize) {
 mod tests {
     use super::*;
     use tokio::io::BufReader;
+    use tracing::debug;
 
     #[tokio::test]
     async fn test_read_full_exact() {
@@ -130,7 +131,7 @@ mod tests {
             rev[total - n..total].copy_from_slice(&buf[..n]);
 
             count += 1;
-            println!("count: {count}, total: {total}, n: {n}");
+            debug!("Read progress - count: {}, total: {}, bytes read: {}", count, total, n);
         }
         assert_eq!(total, size);
 

@@ -31,6 +31,9 @@ on:
     - cron: '0 0 * * 0' # Weekly on Sunday at midnight UTC
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

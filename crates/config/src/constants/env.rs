@@ -16,6 +16,13 @@ pub const DEFAULT_DELIMITER: &str = "_";
 pub const ENV_PREFIX: &str = "RUSTFS_";
 pub const ENV_WORD_DELIMITER: &str = "_";
 
+pub const DEFAULT_DIR: &str = "/opt/rustfs/events"; // Default directory for event store
+pub const DEFAULT_LIMIT: u64 = 100000; // Default store limit
+
+/// Standard config keys and values.
+pub const ENABLE_KEY: &str = "enable";
+pub const COMMENT_KEY: &str = "comment";
+
 /// Medium-drawn lines separator
 /// This is used to separate words in environment variable names.
 pub const ENV_WORD_DELIMITER_DASH: &str = "-";

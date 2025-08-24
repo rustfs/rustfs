@@ -114,7 +114,7 @@ impl Drop for LockGuard {
                 let _ = futures::future::join_all(futures_iter).await;
             });
             // Explicitly drop the JoinHandle to acknowledge detaching the task.
-            std::mem::drop(handle);
+            drop(handle);
         }
     }
 }
