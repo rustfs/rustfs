@@ -137,8 +137,21 @@ pub async fn start_http_server(
         b.set_route(admin::make_admin_route(opt.console_enable)?);
 
         if !opt.server_domains.is_empty() {
-            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
-            b.set_host(MultiDomain::new(&opt.server_domains).map_err(Error::other)?);
+            MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
+
+            // add the default port number to the given server domains
+            let mut domain_sets = std::collections::HashSet::new();
+            for domain in &opt.server_domains {
+                domain_sets.insert(domain.to_string());
+                if let Some((host, _)) = domain.split_once(':') {
+                    domain_sets.insert(format!("{}:{}", host, server_port));
+                } else {
+                    domain_sets.insert(format!("{}:{}", domain, server_port));
+                }
+            }
+
+            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &domain_sets);
+            b.set_host(MultiDomain::new(domain_sets).map_err(Error::other)?);
         }
 
         b.build()
