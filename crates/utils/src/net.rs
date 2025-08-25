@@ -15,8 +15,6 @@
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
-use hyper::client::conn::http2::Builder;
-use hyper_util::rt::TokioExecutor;
 use std::net::Ipv6Addr;
 use std::sync::LazyLock;
 use std::{
@@ -143,10 +141,6 @@ pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, std::io::Er
 }
 
 pub const DEFAULT_DIAL_TIMEOUT: i64 = 5;
-
-pub fn new_remotetarget_http_transport(_insecure: bool) -> Builder<TokioExecutor> {
-    todo!();
-}
 
 const ALLOWED_CUSTOM_QUERY_PREFIX: &str = "x-";
 
