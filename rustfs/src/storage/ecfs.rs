@@ -21,6 +21,7 @@ use crate::error::ApiError;
 use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;
+use crate::storage::options::get_complete_multipart_upload_opts;
 use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_opts, parse_copy_source_range};
 use bytes::Bytes;
 use chrono::DateTime;
@@ -1982,7 +1983,7 @@ impl S3 for FS {
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
-        let opts = &ObjectOptions::default();
+        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
 
         let mut uploaded_parts = Vec::new();
 

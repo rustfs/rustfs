@@ -61,6 +61,7 @@ use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
+use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
@@ -3218,6 +3219,44 @@ impl SetDisks {
         obj?;
         Ok(())
     }
+
+    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+        let mut opts = opts.clone();
+
+        let http_preconditions = opts.http_preconditions?;
+        opts.http_preconditions = None;
+
+        // Never claim a lock here, to avoid deadlock
+        // - If no_lock is false, we must have obtained the lock out side of this function
+        // - If no_lock is true, we should not obtain locks
+        opts.no_lock = true;
+        let oi = self.get_object_info(bucket, object, &opts).await;
+
+        match oi {
+            Ok(oi) => {
+                if should_prevent_write(&oi, http_preconditions.if_none_match, http_preconditions.if_match) {
+                    return Some(StorageError::PreconditionFailed);
+                }
+            }
+
+            Err(StorageError::VersionNotFound(_, _, _))
+            | Err(StorageError::ObjectNotFound(_, _))
+            | Err(StorageError::ErasureReadQuorum) => {
+                // When the object is not found,
+                // - if If-Match is set, we should return 404 NotFound
+                // - if If-None-Match is set, we should be able to proceed with the request
+                if http_preconditions.if_match.is_some() {
+                    return Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string()));
+                }
+            }
+
+            Err(e) => {
+                return Some(e);
+            }
+        }
+
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -3333,6 +3372,12 @@ impl ObjectIO for SetDisks {
                 return Err(Error::other("can not get lock. please retry".to_string()));
             }
             _object_lock_guard = guard_opt;
+        }
+
+        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
         }
 
         let mut user_defined = opts.user_defined.clone();
@@ -5123,6 +5168,26 @@ impl StorageAPI for SetDisks {
         let disks = disks.clone();
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
+        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
+        let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
+        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            if !opts.no_lock {
+                let guard_opt = self
+                    .namespace_lock
+                    .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+                    .await?;
+
+                if guard_opt.is_none() {
+                    return Err(Error::other("can not get lock. please retry".to_string()));
+                }
+                _object_lock_guard = guard_opt;
+            }
+
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
+        }
+
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
 
         let part_meta_paths = uploaded_parts
@@ -5942,13 +6007,45 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{:x}-{}", hasher.finalize(), parts.len())
 }
 
+pub fn canonicalize_etag(etag: &str) -> String {
+    let re = Regex::new("\"*?([^\"]*?)\"*?$").unwrap();
+    re.replace_all(etag, "$1").to_string()
+}
+
+pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
+    if condition.trim() == "*" {
+        return true;
+    }
+    canonicalize_etag(etag) == canonicalize_etag(condition)
+}
+
+pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
+    match &oi.etag {
+        Some(etag) => {
+            if let Some(if_none_match) = if_none_match {
+                if e_tag_matches(etag, &if_none_match) {
+                    return true;
+                }
+            }
+            if let Some(if_match) = if_match {
+                if !e_tag_matches(etag, &if_match) {
+                    return true;
+                }
+            }
+            false
+        }
+        // If we can't obtain the etag of the object, perevent the write only when we have at least one condition
+        None => if_none_match.is_some() || if_match.is_some(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::error::DiskError;
-    use crate::store_api::CompletePart;
+    use crate::store_api::{CompletePart, ObjectInfo};
     use rustfs_filemeta::ErasureInfo;
     use std::collections::HashMap;
     use time::OffsetDateTime;
@@ -6372,5 +6469,63 @@ mod tests {
         let result2 = SetDisks::shuffle_disks(&disks, &empty_distribution);
         assert_eq!(result2.len(), 3);
         assert!(result2.iter().all(|d| d.is_none()));
+    }
+
+    #[test]
+    fn test_etag_matches() {
+        assert!(e_tag_matches("abc", "abc"));
+        assert!(e_tag_matches("\"abc\"", "abc"));
+        assert!(e_tag_matches("\"abc\"", "*"));
+    }
+
+    #[test]
+    fn test_should_prevent_write() {
+        let oi = ObjectInfo {
+            etag: Some("abc".to_string()),
+            ..Default::default()
+        };
+        let if_none_match = Some("abc".to_string());
+        let if_match = None;
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("*".to_string());
+        let if_match = None;
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
+        let if_match = Some("def".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
+        let if_match = Some("*".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = None;
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = Some("*".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("*".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let oi = ObjectInfo {
+            etag: None,
+            ..Default::default()
+        };
+        let if_none_match = Some("*".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
+        let if_match = None;
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
     }
 }
