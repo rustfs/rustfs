@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
+
 use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, get_session_token};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
-use rustfs_notify::EventName;
+use rustfs_config::{ENABLE_KEY, EnableState};
 use rustfs_notify::rules::{BucketNotificationConfig, PatternRules};
+use rustfs_targets::EventName;
 use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
@@ -75,11 +78,8 @@ impl Operation for SetNotificationTarget {
         let mut kvs_map: HashMap<String, String> = serde_json::from_slice(&body)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
         // If there is an enable key, add an enable key value to "on"
-        if !kvs_map.contains_key(rustfs_ecstore::config::ENABLE_KEY) {
-            kvs_map.insert(
-                rustfs_ecstore::config::ENABLE_KEY.to_string(),
-                rustfs_ecstore::config::ENABLE_ON.to_string(),
-            );
+        if !kvs_map.contains_key(ENABLE_KEY) {
+            kvs_map.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
         }
 
         let kvs = rustfs_ecstore::config::KVS(

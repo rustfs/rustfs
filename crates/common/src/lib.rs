@@ -14,8 +14,11 @@
 
 pub mod bucket_stats;
 // pub mod error;
+pub mod data_usage;
 pub mod globals;
+pub mod heal_channel;
 pub mod last_minute;
+pub mod metrics;
 
 // is ','
 pub static DEFAULT_DELIMITER: u8 = 44;

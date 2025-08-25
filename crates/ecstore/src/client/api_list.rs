@@ -98,12 +98,12 @@ impl TransitionClient {
             )
             .await?;
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, vec![], bucket_name, "")));
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();
         let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-        let mut list_bucket_result = match serde_xml_rs::from_str::<ListBucketV2Result>(&String::from_utf8(b).unwrap()) {
+        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));

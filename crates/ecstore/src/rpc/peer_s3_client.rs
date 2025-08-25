@@ -17,10 +17,6 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
-use crate::heal::heal_commands::{
-    DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET, HealOpts,
-};
-use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -30,6 +26,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::future::join_all;
+use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_protos::node_service_time_out_client;
 use rustfs_protos::proto_gen::node_service::{
@@ -180,14 +177,16 @@ impl S3PeerSys {
                 let pools = cli.get_pools();
                 let idx = i;
                 if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs.push(errors[j].as_ref());
+                    per_pool_errs.push(errors[j].clone());
                 }
 
-                // TODO: reduceWriteQuorumErrs
+                if let Some(pool_err) =
+                    reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
+                {
+                    return Err(pool_err);
+                }
             }
         }
-
-        // TODO:
 
         Ok(())
     }
@@ -390,7 +389,6 @@ impl PeerS3Client for LocalPeerS3Client {
                         if opts.force_create && matches!(e, Error::VolumeExists) {
                             return Ok(());
                         }
-
                         Err(e)
                     }
                 }
@@ -408,7 +406,9 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
-        // TODO: reduceWriteQuorumErrs
+        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, (local_disks.len() / 2) + 1) {
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -449,7 +449,7 @@ impl PeerS3Client for LocalPeerS3Client {
                 op.as_ref().map(|v| BucketInfo {
                     name: v.name.clone(),
                     created: v.created,
-                    versionning: versioned,
+                    versioning: versioned,
                     ..Default::default()
                 })
             })
@@ -542,7 +542,7 @@ impl PeerS3Client for RemotePeerS3Client {
         }
 
         Ok(HealResultItem {
-            heal_item_type: HEAL_ITEM_BUCKET.to_string(),
+            heal_item_type: HealItemType::Bucket.to_string(),
             bucket: bucket.to_string(),
             set_count: 0,
             ..Default::default()
@@ -651,13 +651,13 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let disk = match disk {
                 Some(disk) => disk,
                 None => {
-                    bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
-                    as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                    bs_clone.write().await[index] = DriveState::Offline.to_string();
+                    as_clone.write().await[index] = DriveState::Offline.to_string();
                     return Some(Error::DiskNotFound);
                 }
             };
-            bs_clone.write().await[index] = DRIVE_STATE_OK.to_string();
-            as_clone.write().await[index] = DRIVE_STATE_OK.to_string();
+            bs_clone.write().await[index] = DriveState::Ok.to_string();
+            as_clone.write().await[index] = DriveState::Ok.to_string();
 
             if bucket == RUSTFS_RESERVED_BUCKET {
                 return None;
@@ -667,18 +667,18 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                 Ok(_) => None,
                 Err(err) => match err {
                     Error::DiskNotFound => {
-                        bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
-                        as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                        bs_clone.write().await[index] = DriveState::Offline.to_string();
+                        as_clone.write().await[index] = DriveState::Offline.to_string();
                         Some(err)
                     }
                     Error::VolumeNotFound => {
-                        bs_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
-                        as_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
+                        bs_clone.write().await[index] = DriveState::Missing.to_string();
+                        as_clone.write().await[index] = DriveState::Missing.to_string();
                         Some(err)
                     }
                     _ => {
-                        bs_clone.write().await[index] = DRIVE_STATE_CORRUPT.to_string();
-                        as_clone.write().await[index] = DRIVE_STATE_CORRUPT.to_string();
+                        bs_clone.write().await[index] = DriveState::Corrupt.to_string();
+                        as_clone.write().await[index] = DriveState::Corrupt.to_string();
                         Some(err)
                     }
                 },
@@ -687,7 +687,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     }
     let errs = join_all(futures).await;
     let mut res = HealResultItem {
-        heal_item_type: HEAL_ITEM_BUCKET.to_string(),
+        heal_item_type: HealItemType::Bucket.to_string(),
         bucket: bucket.to_string(),
         disk_count: disks.len(),
         set_count: 0,
@@ -736,11 +736,11 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let as_clone = after_state.clone();
             let errs_clone = errs.to_vec();
             futures.push(async move {
-                if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
+                if bs_clone.read().await[idx] == DriveState::Missing.to_string() {
                     info!("bucket not find, will recreate");
                     match disk.as_ref().unwrap().make_volume(&bucket).await {
                         Ok(_) => {
-                            as_clone.write().await[idx] = DRIVE_STATE_OK.to_string();
+                            as_clone.write().await[idx] = DriveState::Ok.to_string();
                             return None;
                         }
                         Err(err) => {

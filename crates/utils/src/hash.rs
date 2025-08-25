@@ -112,18 +112,18 @@ pub const EMPTY_STRING_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae
 pub const DEFAULT_SIP_HASH_KEY: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 pub fn sip_hash(key: &str, cardinality: usize, id: &[u8; 16]) -> usize {
-    //  你的密钥，必须是 16 字节
+    // Your key, must be 16 bytes
 
-    // 计算字符串的 SipHash 值
+    // Calculate SipHash value of the string
     let result = SipHasher::new_with_key(id).hash(key.as_bytes());
 
-    result as usize % cardinality
+    (result as usize) % cardinality
 }
 
 pub fn crc_hash(key: &str, cardinality: usize) -> usize {
-    let mut hasher = Hasher::new(); // 创建一个新的哈希器
+    let mut hasher = Hasher::new(); // Create a new hasher
 
-    hasher.update(key.as_bytes()); // 更新哈希状态，添加数据
+    hasher.update(key.as_bytes()); // Update hash state, add data
 
     let checksum = hasher.finalize();
 

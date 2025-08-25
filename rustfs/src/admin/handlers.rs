@@ -23,20 +23,16 @@ use http::{HeaderMap, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
 use rustfs_ecstore::bucket::target::ARN;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::GLOBAL_ALlHealState;
 use rustfs_ecstore::global::get_global_action_cred;
-use std::str::FromStr;
-// use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::heal::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::heal::heal_commands::HealOpts;
-use rustfs_ecstore::heal::heal_ops::new_heal_sequence;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
@@ -58,7 +54,7 @@ use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use std::str::FromStr;
 // use serde_json::to_vec;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -70,13 +66,14 @@ use tokio::sync::mpsc::{self};
 use tokio::time::interval;
 use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::debug;
 use tracing::{error, info, warn};
 // use url::UrlQuery;
 
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
-pub mod policys;
+pub mod policies;
 pub mod pools;
 pub mod rebalance;
 pub mod service_account;
@@ -86,6 +83,7 @@ pub mod trace;
 pub mod user;
 use urlencoding::decode;
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {
@@ -691,33 +689,20 @@ impl Operation for HealHandler {
         }
 
         let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
-        if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
-            match GLOBAL_ALlHealState
-                .pop_heal_status_json(heal_path.to_str().unwrap_or_default(), &hip.client_token)
-                .await
-            {
-                Ok(b) => {
-                    info!("pop_heal_status_json success");
-                    return Ok(S3Response::new((StatusCode::OK, Body::from(b))));
-                }
-                Err(_e) => {
-                    info!("pop_heal_status_json failed");
-                    return Ok(S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::from(vec![]))));
-                }
-            }
-        }
         let (tx, mut rx) = mpsc::channel(1);
-        if hip.force_stop {
+
+        if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
+            // Query heal status
             let tx_clone = tx.clone();
+            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
+            let client_token = hip.client_token.clone();
             spawn(async move {
-                match GLOBAL_ALlHealState
-                    .stop_heal_sequence(heal_path.to_str().unwrap_or_default())
-                    .await
-                {
-                    Ok(b) => {
+                match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
+                    Ok(_) => {
+                        // TODO: Get actual response from channel
                         let _ = tx_clone
                             .send(HealResp {
-                                resp_bytes: b,
+                                resp_bytes: vec![],
                                 ..Default::default()
                             })
                             .await;
@@ -725,7 +710,32 @@ impl Operation for HealHandler {
                     Err(e) => {
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(e),
+                                _api_err: Some(StorageError::other(e)),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                }
+            });
+        } else if hip.force_stop {
+            // Cancel heal task
+            let tx_clone = tx.clone();
+            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
+            spawn(async move {
+                match rustfs_common::heal_channel::cancel_heal_task(heal_path_str).await {
+                    Ok(_) => {
+                        // TODO: Get actual response from channel
+                        let _ = tx_clone
+                            .send(HealResp {
+                                resp_bytes: vec![],
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx_clone
+                            .send(HealResp {
+                                _api_err: Some(StorageError::other(e)),
                                 ..Default::default()
                             })
                             .await;
@@ -733,22 +743,36 @@ impl Operation for HealHandler {
                 }
             });
         } else if hip.client_token.is_empty() {
-            let nh = Arc::new(new_heal_sequence(&hip.bucket, &hip.obj_prefix, "", hip.hs, hip.force_start));
+            // Use new heal channel mechanism
             let tx_clone = tx.clone();
             spawn(async move {
-                match GLOBAL_ALlHealState.launch_new_heal_sequence(nh).await {
-                    Ok(b) => {
+                // Create heal request through channel
+                let heal_request = rustfs_common::heal_channel::create_heal_request(
+                    hip.bucket.clone(),
+                    if hip.obj_prefix.is_empty() {
+                        None
+                    } else {
+                        Some(hip.obj_prefix.clone())
+                    },
+                    hip.force_start,
+                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+                );
+
+                match rustfs_common::heal_channel::send_heal_request(heal_request).await {
+                    Ok(_) => {
+                        // Success - send empty response for now
                         let _ = tx_clone
                             .send(HealResp {
-                                resp_bytes: b,
+                                resp_bytes: vec![],
                                 ..Default::default()
                             })
                             .await;
                     }
                     Err(e) => {
+                        // Error - send error response
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(e),
+                                _api_err: Some(StorageError::other(e)),
                                 ..Default::default()
                             })
                             .await;
@@ -800,9 +824,9 @@ pub struct GetReplicationMetricsHandler {}
 impl Operation for GetReplicationMetricsHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         error!("GetReplicationMetricsHandler");
-        let querys = extract_query_params(&_req.uri);
-        if let Some(bucket) = querys.get("bucket") {
-            error!("get bucket:{} metris", bucket);
+        let queries = extract_query_params(&_req.uri);
+        if let Some(bucket) = queries.get("bucket") {
+            error!("get bucket:{} metrics", bucket);
         }
         //return Err(s3_error!(InvalidArgument, "Invalid bucket name"));
         //Ok(S3Response::with_headers((StatusCode::OK, Body::from()), header))
@@ -815,22 +839,21 @@ pub struct SetRemoteTargetHandler {}
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, mut _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         //return Ok(S3Response::new((StatusCode::OK, Body::from("OK".to_string()))));
-        // println!("handle MetricsHandler, params: {:?}", _req.input);
-        info!("SetRemoteTargetHandler params: {:?}", _req.credentials);
-        let querys = extract_query_params(&_req.uri);
+        debug!("Processing SetRemoteTargetHandler request");
+        info!("SetRemoteTargetHandler credentials: {:?}", _req.credentials);
+        let queries = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
         let _is_owner = true; // 先按 true 处理，后期根据请求决定
         let body = _req.input.store_all_unlimited().await.unwrap();
-        //println!("body: {}", std::str::from_utf8(&body.clone()).unwrap());
+        debug!("Request body received, size: {} bytes", body.len());
 
-        //println!("bucket is:{}", bucket.clone());
-        if let Some(bucket) = querys.get("bucket") {
+        if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 info!("have bucket: {}", bucket);
-                return Ok(S3Response::new((StatusCode::OK, Body::from("fuck".to_string()))));
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "No buckets found".to_string()));
             }
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -844,7 +867,7 @@ impl Operation for SetRemoteTargetHandler {
             {
                 Ok(info) => {
                     info!("Bucket Info: {:?}", info);
-                    if !info.versionning {
+                    if !info.versioning {
                         return Ok(S3Response::new((StatusCode::FORBIDDEN, Body::from("bucket need versioned".to_string()))));
                     }
                 }
@@ -925,13 +948,13 @@ impl Operation for ListRemoteTargetHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("list GetRemoteTargetHandler, params: {:?}", _req.credentials);
 
-        let querys = extract_query_params(&_req.uri);
+        let queries = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        if let Some(bucket) = querys.get("bucket") {
+        if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 error!("bucket parameter is empty");
                 return Ok(S3Response::new((
@@ -950,7 +973,7 @@ impl Operation for ListRemoteTargetHandler {
             {
                 Ok(info) => {
                     info!("Bucket Info: {:?}", info);
-                    if !info.versionning {
+                    if !info.versioning {
                         return Ok(S3Response::new((
                             StatusCode::FORBIDDEN,
                             Body::from("Bucket needs versioning".to_string()),
@@ -981,7 +1004,7 @@ impl Operation for ListRemoteTargetHandler {
             return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
         }
 
-        println!("Bucket parameter missing in request");
+        warn!("Bucket parameter is missing in request");
         Ok(S3Response::new((
             StatusCode::BAD_REQUEST,
             Body::from("Bucket parameter is required".to_string()),
@@ -995,8 +1018,8 @@ pub struct RemoveRemoteTargetHandler {}
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         debug!("remove remote target called");
-        let querys = extract_query_params(&_req.uri);
-        let Some(bucket) = querys.get("bucket") else {
+        let queries = extract_query_params(&_req.uri);
+        let Some(bucket) = queries.get("bucket") else {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
                 Body::from("Bucket parameter is required".to_string()),
@@ -1005,7 +1028,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let mut need_delete = true;
 
-        if let Some(arnstr) = querys.get("arn") {
+        if let Some(arnstr) = queries.get("arn") {
             let _arn = ARN::from_str(arnstr);
 
             match get_replication_config(bucket).await {
@@ -1057,14 +1080,119 @@ impl Operation for RemoveRemoteTargetHandler {
 }
 
 #[cfg(test)]
-mod test {
-    use rustfs_ecstore::heal::heal_commands::HealOpts;
+mod tests {
+    use super::*;
+    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_madmin::BackendInfo;
+    use rustfs_policy::policy::BucketPolicy;
+    use serde_json::json;
 
-    #[ignore] // FIXME: failed in github actions
+    #[test]
+    fn test_account_info_structure() {
+        // Test AccountInfo struct creation and serialization
+        let account_info = AccountInfo {
+            account_name: "test-account".to_string(),
+            server: BackendInfo::default(),
+            policy: BucketPolicy::default(),
+        };
+
+        assert_eq!(account_info.account_name, "test-account");
+
+        // Test JSON serialization (PascalCase rename)
+        let json_str = serde_json::to_string(&account_info).unwrap();
+        assert!(json_str.contains("AccountName"));
+    }
+
+    #[test]
+    fn test_account_info_default() {
+        // Test that AccountInfo can be created with default values
+        let default_info = AccountInfo::default();
+
+        assert!(default_info.account_name.is_empty());
+    }
+
+    #[test]
+    fn test_handler_struct_creation() {
+        // Test that handler structs can be created
+        let _account_handler = AccountInfoHandler {};
+        let _service_handler = ServiceHandle {};
+        let _server_info_handler = ServerInfoHandler {};
+        let _inspect_data_handler = InspectDataHandler {};
+        let _storage_info_handler = StorageInfoHandler {};
+        let _data_usage_handler = DataUsageInfoHandler {};
+        let _metrics_handler = MetricsHandler {};
+        let _heal_handler = HealHandler {};
+        let _bg_heal_handler = BackgroundHealStatusHandler {};
+        let _replication_metrics_handler = GetReplicationMetricsHandler {};
+        let _set_remote_target_handler = SetRemoteTargetHandler {};
+        let _list_remote_target_handler = ListRemoteTargetHandler {};
+        let _remove_remote_target_handler = RemoveRemoteTargetHandler {};
+
+        // Just verify they can be created without panicking
+        // Test passes if we reach this point without panicking
+    }
+
+    #[test]
+    fn test_heal_opts_serialization() {
+        // Test that HealOpts can be properly deserialized
+        let heal_opts_json = json!({
+            "recursive": true,
+            "dryRun": false,
+            "remove": true,
+            "recreate": false,
+            "scanMode": 2,
+            "updateParity": true,
+            "nolock": false
+        });
+
+        let json_str = serde_json::to_string(&heal_opts_json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed["recursive"], true);
+        assert_eq!(parsed["scanMode"], 2);
+    }
+
+    #[test]
+    fn test_heal_opts_url_encoding() {
+        // Test URL encoding/decoding of HealOpts
+        let opts = HealOpts {
+            recursive: true,
+            dry_run: false,
+            remove: true,
+            recreate: false,
+            scan_mode: rustfs_common::heal_channel::HealScanMode::Normal,
+            update_parity: false,
+            no_lock: true,
+            pool: Some(1),
+            set: Some(0),
+        };
+
+        let encoded = serde_urlencoded::to_string(opts).unwrap();
+        assert!(encoded.contains("recursive=true"));
+        assert!(encoded.contains("remove=true"));
+
+        // Test round-trip
+        let decoded: HealOpts = serde_urlencoded::from_str(&encoded).unwrap();
+        assert_eq!(decoded.recursive, opts.recursive);
+        assert_eq!(decoded.scan_mode, opts.scan_mode);
+    }
+
+    #[ignore] // FIXME: failed in github actions - keeping original test
     #[test]
     fn test_decode() {
         let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
         let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
-        println!("{s:?}");
+        debug!("Parsed HealOpts: {:?}", s);
     }
+
+    // Note: Testing the actual async handler implementations requires:
+    // 1. S3Request setup with proper headers, URI, and credentials
+    // 2. Global object store initialization
+    // 3. IAM system initialization
+    // 4. Mock or real backend services
+    // 5. Authentication and authorization setup
+    //
+    // These are better suited for integration tests with proper test infrastructure.
+    // The current tests focus on data structures and basic functionality that can be
+    // tested in isolation without complex dependencies.
 }

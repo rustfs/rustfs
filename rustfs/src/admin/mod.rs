@@ -20,11 +20,15 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    bucket_meta, group, policys, pools, rebalance,
+    bucket_meta, group, policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
 
+use crate::admin::handlers::event::{
+    GetBucketNotification, ListNotificationTargets, RemoveBucketNotification, RemoveNotificationTarget, SetBucketNotification,
+    SetNotificationTarget,
+};
 use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -32,6 +36,7 @@ use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
+// const ADMIN_PREFIX: &str = "/minio/admin";
 
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
@@ -333,35 +338,76 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-canned-policies").as_str(),
-        AdminOperation(&policys::ListCannedPolicies {}),
+        AdminOperation(&policies::ListCannedPolicies {}),
     )?;
 
     // info-canned-policy?name=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-canned-policy").as_str(),
-        AdminOperation(&policys::InfoCannedPolicy {}),
+        AdminOperation(&policies::InfoCannedPolicy {}),
     )?;
 
     // add-canned-policy?name=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-canned-policy").as_str(),
-        AdminOperation(&policys::AddCannedPolicy {}),
+        AdminOperation(&policies::AddCannedPolicy {}),
     )?;
 
     // remove-canned-policy?name=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-canned-policy").as_str(),
-        AdminOperation(&policys::RemoveCannedPolicy {}),
+        AdminOperation(&policies::RemoveCannedPolicy {}),
     )?;
 
     // set-user-or-group-policy?policyName=xxx&userOrGroup=xxx&isGroup=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
-        AdminOperation(&policys::SetPolicyForUserOrGroup {}),
+        AdminOperation(&policies::SetPolicyForUserOrGroup {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-list").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-set").as_str(),
+        AdminOperation(&SetNotificationTarget {}),
+    )?;
+
+    // Remove notification target
+    // This endpoint removes a notification target based on its type and name.
+    // target-remove?target_type=xxx&target_name=xxx
+    // * `target_type` - Target type, such as "notify_webhook" or "notify_mqtt".
+    // * `target_name` - A unique name for a Target, such as "1".
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
+        AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-set-bucket").as_str(),
+        AdminOperation(&SetBucketNotification {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-get-bucket").as_str(),
+        AdminOperation(&GetBucketNotification {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove-bucket").as_str(),
+        AdminOperation(&RemoveBucketNotification {}),
     )?;
 
     Ok(())

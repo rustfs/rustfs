@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal::mrf::MRFState;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
     event_notification::EventNotifier,
-    heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
     store::ECStore,
     tier::tier::TierConfigMgr,
 };
@@ -38,8 +36,6 @@ pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
-pub const DEFAULT_PORT: u16 = 9000;
-
 lazy_static! {
 static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
 pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
@@ -51,14 +47,10 @@ pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStor
 pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
 pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
 pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
-pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
-pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
 pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
 pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
 pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();
 //pub static ref GLOBAL_RemoteTargetTransport
-pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
-pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
 static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
 pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
 pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();

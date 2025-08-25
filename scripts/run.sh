@@ -47,25 +47,24 @@ export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
-# HTTPS 证书目录
+# HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
-# 可观测性 相关配置信息
-export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
-#export RUSTFS_OBS_USE_STDOUT=false # 是否使用标准输出
-#export RUSTFS_OBS_SAMPLE_RATIO=2.0 # 采样率，0.0-1.0之间，0.0表示不采样，1.0表示全部采样
-#export RUSTFS_OBS_METER_INTERVAL=1 # 采样间隔，单位为秒
-#export RUSTFS_OBS_SERVICE_NAME=rustfs # 服务名称
-#export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # 服务版本
-export RUSTFS_OBS_ENVIRONMENT=develop # 环境名称
-export RUSTFS_OBS_LOGGER_LEVEL=debug # 日志级别，支持 trace, debug, info, warn, error
-export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # 是否启用本地日志记录
+# Observability related configuration
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector address
+#export RUSTFS_OBS_USE_STDOUT=false # Whether to use standard output
+#export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
+#export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
+#export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
+#export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
+export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
+export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # Whether to enable local logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
-export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
-export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
+export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
+export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
 
-#
-export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs/rustfs.log"
+export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs"
 export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
 export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
 export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
@@ -90,26 +89,34 @@ export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
 # notify
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE="true" # 是否启用 webhook 通知
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # webhook 通知地址
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook notification address
 export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
 
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook notification address
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
 
-export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook notification address
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
+
+
+export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
 
-export RUSTFS_COMPRESSION_ENABLED=true # 是否启用压缩
+export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
 
 #export RUSTFS_REGION="us-east-1"
 
-# 事件消息配置
+# Event message configuration
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
-# 启动 webhook 服务器
+# Start webhook server
 #cargo run --example webhook -p rustfs-notify &
-# 启动主服务
+# Start main service
 cargo run --bin rustfs

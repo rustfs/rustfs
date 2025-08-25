@@ -29,14 +29,16 @@ use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::scanner::data_scanner::ScannerConfig;
-use rustfs_ahm::{Scanner, create_ahm_services_cancel_token, shutdown_ahm_services};
+use rustfs_ahm::{
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+};
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
 use rustfs_ecstore::config as ecconfig;
-use rustfs_ecstore::config::GLOBAL_ConfigSys;
-use rustfs_ecstore::config::GLOBAL_ServerConfig;
+use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
+use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
@@ -52,6 +54,7 @@ use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_utils::net::parse_and_resolve_address;
 use std::io::{Error, Result};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -161,7 +164,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     ecconfig::init();
     // config system configuration
-    GLOBAL_ConfigSys.init(store.clone()).await?;
+    GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
     // init  replication_pool
     init_background_replication(store.clone()).await;
@@ -192,12 +195,13 @@ async fn run(opt: config::Opt) -> Result<()> {
         Error::other(err)
     })?;
 
-    // init scanner and auto heal with unified cancellation token
-    // let _background_services_cancel_token = create_background_services_cancel_token();
-    // init_data_scanner().await;
-    // init_auto_heal().await;
     let _ = create_ahm_services_cancel_token();
-    let scanner = Scanner::new(Some(ScannerConfig::default()));
+
+    // Initialize heal manager with channel processor
+    let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+    let heal_manager = init_heal_manager(heal_storage, None).await?;
+
+    let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
     scanner.start().await?;
     print_server_info();
     // init_bucket_replication_pool().await;
@@ -211,7 +215,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
-                            "🚀 New version available: {} -> {} (current: {})",
+                            "🚀 Version check: New version available: {} -> {} (current: {})",
                             result.current_version, latest.version, result.current_version
                         );
                         if let Some(notes) = &latest.release_notes {
@@ -222,14 +226,14 @@ async fn run(opt: config::Opt) -> Result<()> {
                         }
                     }
                 } else {
-                    debug!("✅ Current version is up to date: {}", result.current_version);
+                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
                 }
             }
             Err(UpdateCheckError::HttpError(e)) => {
-                debug!("Version check network error (this is normal): {}", e);
+                debug!("Version check: network error (this is normal): {}", e);
             }
             Err(e) => {
-                debug!("Version check failed (this is normal): {}", e);
+                debug!("Version check: failed (this is normal): {}", e);
             }
         }
     });
@@ -291,7 +295,7 @@ pub(crate) async fn init_event_notifier() {
     info!("Initializing event notifier...");
 
     // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_ServerConfig.get() {
+    let server_config = match GLOBAL_SERVER_CONFIG.get() {
         Some(config) => config.clone(), // Clone the config to pass ownership
         None => {
             error!("Event notifier initialization failed: Global server config not loaded.");

@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/en/introduction.html">Getting Started</a>
-  · <a href="https://docs.rustfs.com/en/">Docs</a>
+  <a href="https://docs.rustfs.com/introduction.html">Getting Started</a>
+  · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
 </p>
@@ -81,21 +81,52 @@ To get started with RustFS, follow these steps:
 2. **Docker Quick Start (Option 2)​​**
 
   ```bash
-   # Latest stable release
-   docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:latest
+   # create data and logs directories
+   mkdir -p data logs
 
-   # Development version (main branch)
-   docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:main-latest
+   # using latest alpha version
+   docker run -d -p 9000:9000 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:alpha
 
    # Specific version
-   docker run -d -p 9000:9000 -v /data:/data rustfs/rustfs:v1.0.0
+   docker run -d -p 9000:9000 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.45
    ```
 
-   > 💡 **Docker Build Options**: RustFS supports flexible Docker image versions. See our [Docker Build Guide](docs/DOCKER_BUILD_GUIDE.md) for advanced usage and manual build instructions.
+3. **Build from Source (Option 3) - Advanced Users**
 
-3. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
-4. **Create a Bucket**: Use the console to create a new bucket for your objects.
-5. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
+   For developers who want to build RustFS Docker images from source with multi-architecture support:
+
+   ```bash
+   # Build multi-architecture images locally
+   ./docker-buildx.sh --build-arg RELEASE=latest
+
+   # Build and push to registry
+   ./docker-buildx.sh --push
+
+   # Build specific version
+   ./docker-buildx.sh --release v1.0.0 --push
+
+   # Build for custom registry
+   ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
+   ```
+
+   The `docker-buildx.sh` script supports:
+   - **Multi-architecture builds**: `linux/amd64`, `linux/arm64`
+   - **Automatic version detection**: Uses git tags or commit hashes
+   - **Registry flexibility**: Supports Docker Hub, GitHub Container Registry, etc.
+   - **Build optimization**: Includes caching and parallel builds
+
+   You can also use Make targets for convenience:
+
+   ```bash
+   make docker-buildx                    # Build locally
+   make docker-buildx-push               # Build and push
+   make docker-buildx-version VERSION=v1.0.0  # Build specific version
+   make help-docker                      # Show all Docker-related commands
+   ```
+
+4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
+5. **Create a Bucket**: Use the console to create a new bucket for your objects.
+6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
 
 ## Documentation
 

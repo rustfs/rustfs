@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
+use crate::sys::get_claims_from_token_with_secret;
 use crate::{
     cache::{Cache, CacheEntity},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
@@ -26,7 +27,7 @@ use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, Credentials, UserIdentity, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign},
+    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
     format::Format,
     policy::{
         EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
@@ -89,7 +90,7 @@ where
     T: Store,
 {
     pub(crate) async fn new(api: T) -> Arc<Self> {
-        let (sender, reciver) = mpsc::channel::<i64>(100);
+        let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
             api,
@@ -100,11 +101,11 @@ where
             last_timestamp: AtomicI64::new(0),
         });
 
-        sys.clone().init(reciver).await.unwrap();
+        sys.clone().init(receiver).await.unwrap();
         sys
     }
 
-    async fn init(self: Arc<Self>, reciver: Receiver<i64>) -> Result<()> {
+    async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
@@ -117,7 +118,7 @@ where
                 let s = Arc::clone(&self);
                 async move {
                     let ticker = tokio::time::interval(Duration::from_secs(120));
-                    tokio::pin!(ticker, reciver);
+                    tokio::pin!(ticker, receiver);
                     loop {
                         select! {
                             _ = ticker.tick() => {
@@ -126,13 +127,13 @@ where
                                     error!("iam load err {:?}", err);
                                 }
                             },
-                            i = reciver.recv() => {
-                                info!("iam load reciver");
+                            i = receiver.recv() => {
+                                info!("iam load receiver");
                                 match i {
                                     Some(t) => {
                                         let last = s.last_timestamp.load(Ordering::Relaxed);
                                         if last <= t {
-                                            info!("iam load reciver load");
+                                            info!("iam load receiver load");
                                             if let Err(err) =s.clone().load().await{
                                                 error!("iam load err {:?}", err);
                                             }
@@ -813,7 +814,7 @@ where
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::other(format!("need poliy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::other(format!("Required policy not found: {}", IamError::NoSuchPolicy)));
             }
 
             self.api
@@ -986,7 +987,7 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entiry = UserIdentity::from(Credentials {
+        let user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
@@ -994,10 +995,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entiry)?;
+        self.update_user_with_claims(access_key, user_entry)?;
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1103,7 +1104,7 @@ where
             }
         };
 
-        let user_entiry = UserIdentity::from(Credentials {
+        let user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
@@ -1111,10 +1112,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entiry)?;
+        self.update_user_with_claims(access_key, user_entry)?;
 
         Ok(OffsetDateTime::now_utc())
     }

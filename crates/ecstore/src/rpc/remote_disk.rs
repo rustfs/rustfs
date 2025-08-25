@@ -21,8 +21,8 @@ use rustfs_protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
-        ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
+        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+        ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
         StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
@@ -32,26 +32,15 @@ use crate::disk::{
     ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     endpoint::Endpoint,
 };
+use crate::disk::{FileReader, FileWriter};
 use crate::{
     disk::error::{Error, Result},
     rpc::build_auth_headers,
 };
-use crate::{
-    disk::{FileReader, FileWriter},
-    heal::{
-        data_scanner::ShouldSleepFn,
-        data_usage_cache::{DataUsageCache, DataUsageEntry},
-        heal_commands::{HealScanMode, HealingTracker},
-    },
-};
-use rustfs_filemeta::{FileInfo, RawFileInfo};
+use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
-use tokio::{
-    io::AsyncWrite,
-    sync::mpsc::{self, Sender},
-};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio::io::AsyncWrite;
 use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
@@ -791,6 +780,27 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        let request = Request::new(ReadPartsRequest {
+            disk: self.endpoint.to_string(),
+            bucket: bucket.to_string(),
+            paths: paths.to_vec(),
+        });
+
+        let response = client.read_parts(request).await?.into_inner();
+        if !response.success {
+            return Err(response.error.unwrap_or_default().into());
+        }
+
+        let read_parts_resp = rmp_serde::from_slice::<Vec<ObjectPartInfo>>(&response.object_part_infos)?;
+
+        Ok(read_parts_resp)
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         info!("check_parts");
         let file_info = serde_json::to_string(&fi)?;
@@ -905,55 +915,6 @@ impl DiskAPI for RemoteDisk {
         let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
 
         Ok(disk_info)
-    }
-
-    #[tracing::instrument(skip(self, cache, scan_mode, _we_sleep))]
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        _we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache> {
-        info!("ns_scanner");
-        let cache = serde_json::to_string(cache)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-
-        let (tx, rx) = mpsc::channel(10);
-        let in_stream = ReceiverStream::new(rx);
-        let mut response = client.ns_scanner(in_stream).await?.into_inner();
-        let request = NsScannerRequest {
-            disk: self.endpoint.to_string(),
-            cache,
-            scan_mode: scan_mode as u64,
-        };
-        tx.send(request)
-            .await
-            .map_err(|err| Error::other(format!("can not send request, err: {err}")))?;
-
-        loop {
-            match response.next().await {
-                Some(Ok(resp)) => {
-                    if !resp.update.is_empty() {
-                        let data_usage_cache = serde_json::from_str::<DataUsageEntry>(&resp.update)?;
-                        let _ = updates.send(data_usage_cache).await;
-                    } else if !resp.data_usage_cache.is_empty() {
-                        let data_usage_cache = serde_json::from_str::<DataUsageCache>(&resp.data_usage_cache)?;
-                        return Ok(data_usage_cache);
-                    } else {
-                        return Err(Error::other("scan was interrupted"));
-                    }
-                }
-                _ => return Err(Error::other("scan was interrupted")),
-            }
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn healing(&self) -> Option<HealingTracker> {
-        None
     }
 }
 

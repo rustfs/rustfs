@@ -556,19 +556,19 @@ mod tests {
     fn test_index_add() -> io::Result<()> {
         let mut index = Index::new();
 
-        // 测试添加第一个索引
+        // Test adding first index
         index.add(100, 1000)?;
         assert_eq!(index.info.len(), 1);
         assert_eq!(index.info[0].compressed_offset, 100);
         assert_eq!(index.info[0].uncompressed_offset, 1000);
 
-        // 测试添加相同未压缩偏移量的索引
+        // Test adding index with same uncompressed offset
         index.add(200, 1000)?;
         assert_eq!(index.info.len(), 1);
         assert_eq!(index.info[0].compressed_offset, 200);
         assert_eq!(index.info[0].uncompressed_offset, 1000);
 
-        // 测试添加新的索引（确保距离足够大）
+        // Test adding new index (ensure distance is large enough)
         index.add(300, 2000 + MIN_INDEX_DIST)?;
         assert_eq!(index.info.len(), 2);
         assert_eq!(index.info[1].compressed_offset, 300);
@@ -581,14 +581,14 @@ mod tests {
     fn test_index_add_errors() {
         let mut index = Index::new();
 
-        // 添加初始索引
+        // Add initial index
         index.add(100, 1000).unwrap();
 
-        // 测试添加更小的未压缩偏移量
+        // Test adding smaller uncompressed offset
         let err = index.add(200, 500).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-        // 测试添加更小的压缩偏移量
+        // Test adding smaller compressed offset
         let err = index.add(50, 2000).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -599,22 +599,22 @@ mod tests {
         index.total_uncompressed = 1000 + MIN_INDEX_DIST * 3;
         index.total_compressed = 5000;
 
-        // 添加一些测试数据，确保索引间距满足 MIN_INDEX_DIST 要求
+        // Add some test data, ensure index spacing meets MIN_INDEX_DIST requirement
         index.add(100, 1000)?;
         index.add(300, 1000 + MIN_INDEX_DIST)?;
         index.add(500, 1000 + MIN_INDEX_DIST * 2)?;
 
-        // 测试查找存在的偏移量
+        // Test finding existing offset
         let (comp, uncomp) = index.find(1500)?;
         assert_eq!(comp, 100);
         assert_eq!(uncomp, 1000);
 
-        // 测试查找边界值
+        // Test finding boundary value
         let (comp, uncomp) = index.find(1000 + MIN_INDEX_DIST)?;
         assert_eq!(comp, 300);
         assert_eq!(uncomp, 1000 + MIN_INDEX_DIST);
 
-        // 测试查找最后一个索引
+        // Test finding last index
         let (comp, uncomp) = index.find(1000 + MIN_INDEX_DIST * 2)?;
         assert_eq!(comp, 500);
         assert_eq!(uncomp, 1000 + MIN_INDEX_DIST * 2);
@@ -628,16 +628,16 @@ mod tests {
         index.total_uncompressed = 10000;
         index.total_compressed = 5000;
 
-        // 测试未初始化的索引
+        // Test uninitialized index
         let uninit_index = Index::new();
         let err = uninit_index.find(1000).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
 
-        // 测试超出范围的偏移量
+        // Test offset out of range
         let err = index.find(15000).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
 
-        // 测试负数偏移量
+        // Test negative offset
         let err = match index.find(-1000) {
             Ok(_) => panic!("should be error"),
             Err(e) => e,
@@ -650,15 +650,15 @@ mod tests {
         let mut index = Index::new();
         index.est_block_uncomp = MIN_INDEX_DIST;
 
-        // 添加超过最大索引数量的条目，确保间距满足 MIN_INDEX_DIST 要求
+        // Add entries exceeding maximum index count, ensure spacing meets MIN_INDEX_DIST requirement
         for i in 0..MAX_INDEX_ENTRIES + 100 {
             index.add(i as i64 * 100, i as i64 * MIN_INDEX_DIST).unwrap();
         }
 
-        // 手动调用 reduce 方法
+        // Manually call reduce method
         index.reduce();
 
-        // 验证索引数量是否被正确减少
+        // Verify index count has been correctly reduced
         assert!(index.info.len() <= MAX_INDEX_ENTRIES);
     }
 
@@ -666,16 +666,16 @@ mod tests {
     fn test_index_json() -> io::Result<()> {
         let mut index = Index::new();
 
-        // 添加一些测试数据
+        // Add some test data
         index.add(100, 1000)?;
         index.add(300, 2000 + MIN_INDEX_DIST)?;
 
-        // 测试 JSON 序列化
+        // Test JSON serialization
         let json = index.to_json().unwrap();
         let json_str = String::from_utf8(json).unwrap();
 
         println!("json_str: {json_str}");
-        // 验证 JSON 内容
+        // Verify JSON content
 
         assert!(json_str.contains("\"compressed\": 100"));
         assert!(json_str.contains("\"uncompressed\": 1000"));

@@ -424,7 +424,12 @@ impl TransitionClient {
                     };
                 }
                 _ => {
-                    return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+                    return Err(std::io::Error::other(http_resp_to_error_response(
+                        &resp,
+                        vec![],
+                        bucket_name,
+                        object_name,
+                    )));
                 }
             }
             return Err(std::io::Error::other(error_response));

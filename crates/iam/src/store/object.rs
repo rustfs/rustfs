@@ -177,7 +177,12 @@ impl ObjectStore {
                 }
 
                 if let Some(info) = v.item {
-                    let name = info.name.trim_start_matches(&prefix).trim_end_matches(SLASH_SEPARATOR);
+                    let object_name = if cfg!(target_os = "windows") {
+                        info.name.replace('\\', "/")
+                    } else {
+                        info.name
+                    };
+                    let name = object_name.trim_start_matches(&prefix).trim_end_matches(SLASH_SEPARATOR);
                     let _ = sender
                         .send(StringOrErr {
                             item: Some(name.to_owned()),
@@ -662,7 +667,7 @@ impl Store for ObjectStore {
 
         Ok(())
     }
-    async fn load_mapped_policys(
+    async fn load_mapped_policies(
         &self,
         user_type: UserType,
         is_group: bool,

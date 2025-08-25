@@ -24,7 +24,6 @@ use crate::{
         new_disk,
     },
     endpoints::Endpoints,
-    heal::heal_commands::init_healing_tracker,
 };
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
@@ -140,8 +139,8 @@ async fn init_format_erasure(
             let idx = i * set_drive_count + j;
             let mut newfm = fm.clone();
             newfm.erasure.this = fm.erasure.sets[i][j];
-            if deployment_id.is_some() {
-                newfm.id = deployment_id.unwrap();
+            if let Some(id) = deployment_id {
+                newfm.id = id;
             }
 
             fms[idx] = Some(newfm);
@@ -222,7 +221,7 @@ fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
     Ok(())
 }
 
-// load_format_erasure_all 读取所有 foramt.json
+// load_format_erasure_all 读取所有 format.json
 pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<DiskError>>) {
     let mut futures = Vec::with_capacity(disks.len());
     let mut datas = Vec::with_capacity(disks.len());
@@ -288,7 +287,7 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
     let mut futures = Vec::with_capacity(disks.len());
 
     for (i, disk) in disks.iter().enumerate() {
-        futures.push(save_format_file(disk, &formats[i], ""));
+        futures.push(save_format_file(disk, &formats[i]));
     }
 
     let mut errors = Vec::with_capacity(disks.len());
@@ -312,7 +311,7 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
     Ok(())
 }
 
-pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>, heal_id: &str) -> disk::error::Result<()> {
+pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -> disk::error::Result<()> {
     if disk.is_none() {
         return Err(DiskError::DiskNotFound);
     }
@@ -331,10 +330,6 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
         .await?;
 
     disk.set_disk_id(Some(format.erasure.this)).await?;
-    if !heal_id.is_empty() {
-        let mut ht = init_healing_tracker(disk.clone(), heal_id).await?;
-        return ht.save().await;
-    }
 
     Ok(())
 }

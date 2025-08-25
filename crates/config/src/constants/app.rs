@@ -15,9 +15,9 @@
 use const_str::concat;
 
 /// Application name
-/// Default value: RustFs
+/// Default value: RustFS
 /// Environment variable: RUSTFS_APP_NAME
-pub const APP_NAME: &str = "RustFs";
+pub const APP_NAME: &str = "RustFS";
 /// Application version
 /// Default value: 1.0.0
 /// Environment variable: RUSTFS_VERSION
@@ -71,6 +71,16 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
+/// Default console enable
+/// This is the default value for the console server.
+/// It is used to enable or disable the console server.
+/// Default value: true
+/// Environment variable: RUSTFS_CONSOLE_ENABLE
+/// Command line argument: --console-enable
+/// Example: RUSTFS_CONSOLE_ENABLE=true
+/// Example: --console-enable true
+pub const DEFAULT_CONSOLE_ENABLE: bool = true;
+
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
 /// Command line argument: --obs-endpoint
@@ -108,34 +118,46 @@ pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
 /// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
-pub const DEFAULT_LOG_FILENAME: &str = "rustfs.log";
+pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
+
+/// Default OBS log filename for rustfs
+/// This is the default log filename for OBS.
+/// It is used to store the logs of the application.
+/// Default value: rustfs.log
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".log");
+
+/// Default sink file log file for rustfs
+/// This is the default sink file log file for rustfs.
+/// It is used to store the logs of the application.
+/// Default value: rustfs-sink.log
+pub const DEFAULT_SINK_FILE_LOG_FILE: &str = concat!(DEFAULT_LOG_FILENAME, "-sink.log");
 
 /// Default log directory for rustfs
 /// This is the default log directory for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: logs
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
-pub const DEFAULT_LOG_DIR: &str = "deploy/logs";
+/// Environment variable: RUSTFS_LOG_DIRECTORY
+pub const DEFAULT_LOG_DIR: &str = "logs";
 
 /// Default log rotation size mb for rustfs
 /// This is the default log rotation size for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: 100 MB
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_SIZE_MB
 pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: hour, eg: day,hour,minute,second
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
 pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
 /// It is used to keep the logs of the application.
 /// Default value: 30
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_KEEP_FILES
+/// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 
 #[cfg(test)]
@@ -145,7 +167,7 @@ mod tests {
     #[test]
     fn test_app_basic_constants() {
         // Test application basic constants
-        assert_eq!(APP_NAME, "RustFs");
+        assert_eq!(APP_NAME, "RustFS");
         assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
 
         assert_eq!(VERSION, "0.0.1");

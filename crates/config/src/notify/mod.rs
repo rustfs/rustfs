@@ -27,7 +27,7 @@ pub const DEFAULT_TARGET: &str = "1";
 
 pub const NOTIFY_PREFIX: &str = "notify";
 
-pub const NOTIFY_ROUTE_PREFIX: &str = "notify_";
+pub const NOTIFY_ROUTE_PREFIX: &str = const_str::concat!(NOTIFY_PREFIX, "_");
 
 #[allow(dead_code)]
 pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS];

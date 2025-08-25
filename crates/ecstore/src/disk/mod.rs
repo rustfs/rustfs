@@ -30,26 +30,18 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
-use crate::heal::{
-    data_scanner::ShouldSleepFn,
-    data_usage_cache::{DataUsageCache, DataUsageEntry},
-    heal_commands::{HealScanMode, HealingTracker},
-};
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
 use local::LocalDisk;
-use rustfs_filemeta::{FileInfo, RawFileInfo};
+use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::mpsc::Sender,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Disk>;
@@ -332,6 +324,14 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_parts(bucket, paths).await,
+            Disk::Remote(remote_disk) => remote_disk.read_parts(bucket, paths).await,
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await,
@@ -396,28 +396,6 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.disk_info(opts).await,
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self, cache, we_sleep, scan_mode))]
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache> {
-        match self {
-            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
-            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn healing(&self) -> Option<HealingTracker> {
-        match self {
-            Disk::Local(local_disk) => local_disk.healing().await,
-            Disk::Remote(remote_disk) => remote_disk.healing().await,
         }
     }
 }
@@ -513,20 +491,12 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CheckParts
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
     // StatInfoFile
-    // ReadParts
+    async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache>;
-    async fn healing(&self) -> Option<HealingTracker>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

@@ -22,6 +22,10 @@ use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
+use rustfs_common::data_usage::TierStats;
+use rustfs_common::heal_channel::rep_has_active_rules;
+use rustfs_common::metrics::{IlmAction, Metrics};
+use rustfs_utils::path::encode_dir_object;
 use s3s::Body;
 use sha2::{Digest, Sha256};
 use std::any::Any;
@@ -31,6 +35,7 @@ use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
@@ -41,9 +46,10 @@ use xxhash_rust::xxh64;
 //use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
 //use rustfs_notify::{initialize, notification_system};
 use super::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
-use super::lifecycle::{self, ExpirationOptions, IlmAction, Lifecycle, TransitionOptions};
+use super::lifecycle::{self, ExpirationOptions, Lifecycle, TransitionOptions};
 use super::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use super::tier_sweeper::{Jentry, delete_object_from_remote_tier};
+use crate::bucket::object_lock::objectlock_sys::enforce_retention_for_deletion;
 use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::error::Error;
@@ -52,16 +58,11 @@ use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
-use crate::heal::{
-    data_scanner::{apply_expiry_on_non_transitioned_objects, apply_expiry_on_transitioned_object},
-    data_scanner_metric::ScannerMetrics,
-    data_usage_cache::TierStats,
-};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
-use s3s::dto::BucketLifecycleConfiguration;
+use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type TraceFn =
@@ -345,8 +346,12 @@ impl ExpiryState {
     }
 
     pub async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>) {
+        //let cancel_token =
+        //    get_background_services_cancel_token().ok_or_else(|| Error::other("Background services not initialized"))?;
+
         loop {
             select! {
+                //_ = cancel_token.cancelled() => {
                 _ = tokio::signal::ctrl_c() => {
                     info!("got ctrl+c, exits");
                     break;
@@ -511,7 +516,7 @@ impl TransitionState {
                         if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
                             if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
                                 error!("Transition to {} failed for {}/{} version:{} with {}",
-                                    task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.expect("err"), err.to_string());
+                                    task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(), err.to_string());
                             }
                         } else {
                             let mut ts = TierStats {
@@ -631,7 +636,7 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     if !lc.is_none() {
         let event = lc.expect("err").eval(&oi.to_lifecycle_opts()).await;
         match event.action {
-            lifecycle::IlmAction::TransitionAction | lifecycle::IlmAction::TransitionVersionAction => {
+            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                 if oi.delete_marker || oi.is_dir {
                     return;
                 }
@@ -728,7 +733,7 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
 }
 
 pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
-    let time_ilm = ScannerMetrics::time_ilm(lae.event.action);
+    let time_ilm = Metrics::time_ilm(lae.event.action);
 
     let opts = ObjectOptions {
         transition: TransitionOptions {
@@ -738,7 +743,7 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
             ..Default::default()
         },
         //lifecycle_audit_event: lae,
-        version_id: Some(oi.version_id.expect("err").to_string()),
+        version_id: oi.version_id.map(|v| v.to_string()),
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         mod_time: oi.mod_time,
@@ -803,15 +808,15 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.expect("err").to_string(),
+            version_id: self.version_id.map(|v| v.to_string()).unwrap_or_default(),
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,
             num_versions: self.num_versions,
             delete_marker: self.delete_marker,
             successor_mod_time: self.successor_mod_time,
-            //restore_ongoing:    self.restore_ongoing,
-            //restore_expires:    self.restore_expires,
+            restore_ongoing: self.restore_ongoing,
+            restore_expires: self.restore_expires,
             transition_status: self.transitioned_object.status.clone(),
             ..Default::default()
         }
@@ -842,3 +847,165 @@ pub struct RestoreObjectRequest {
 }
 
 const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
+
+pub async fn eval_action_from_lifecycle(
+    lc: &BucketLifecycleConfiguration,
+    lr: Option<DefaultRetention>,
+    rcfg: Option<(ReplicationConfiguration, OffsetDateTime)>,
+    oi: &ObjectInfo,
+) -> lifecycle::Event {
+    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    //if serverDebugLog {
+    info!("lifecycle: Secondary scan: {}", event.action);
+    //}
+
+    let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
+
+    match event.action {
+        lifecycle::IlmAction::DeleteAllVersionsAction | lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => {
+            if lock_enabled {
+                return lifecycle::Event::default();
+            }
+        }
+        lifecycle::IlmAction::DeleteVersionAction | lifecycle::IlmAction::DeleteRestoredVersionAction => {
+            if oi.version_id.is_none() {
+                return lifecycle::Event::default();
+            }
+            if lock_enabled && enforce_retention_for_deletion(oi) {
+                //if serverDebugLog {
+                if oi.version_id.is_some() {
+                    info!(
+                        "lifecycle: {} v({}) is locked, not deleting",
+                        oi.name,
+                        oi.version_id.map(|v| v.to_string()).unwrap_or_default()
+                    );
+                } else {
+                    info!("lifecycle: {} is locked, not deleting", oi.name);
+                }
+                //}
+                return lifecycle::Event::default();
+            }
+            if let Some(rcfg) = rcfg {
+                if rep_has_active_rules(&rcfg.0, &oi.name, true) {
+                    return lifecycle::Event::default();
+                }
+            }
+        }
+        _ => (),
+    }
+
+    event
+}
+
+async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    if oi.delete_marker || oi.is_dir {
+        return false;
+    }
+    GLOBAL_TransitionState.queue_transition_task(oi, event, src).await;
+    true
+}
+
+pub async fn apply_expiry_on_transitioned_object(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    src: &LcEventSrc,
+) -> bool {
+    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src).await {
+        return false;
+    }
+    // let _ = time_ilm(1);
+
+    true
+}
+
+pub async fn apply_expiry_on_non_transitioned_objects(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    _src: &LcEventSrc,
+) -> bool {
+    let mut opts = ObjectOptions {
+        expiration: ExpirationOptions { expire: true },
+        ..Default::default()
+    };
+
+    if lc_event.action.delete_versioned() {
+        opts.version_id = oi.version_id.map(|v| v.to_string());
+    }
+
+    opts.versioned = BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await;
+    opts.version_suspended = BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await;
+
+    if lc_event.action.delete_all() {
+        opts.delete_prefix = true;
+        opts.delete_prefix_object = true;
+    }
+
+    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+
+    let mut dobj = api
+        .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
+        .await
+        .unwrap();
+    if dobj.name.is_empty() {
+        dobj = oi.clone();
+    }
+
+    //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
+    //tags["version-id"] = dobj.version_id;
+
+    let mut event_name = EventName::ObjectRemovedDelete;
+    if oi.delete_marker {
+        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
+    }
+    match lc_event.action {
+        lifecycle::IlmAction::DeleteAllVersionsAction => event_name = EventName::ObjectRemovedDeleteAllVersions,
+        lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => event_name = EventName::ILMDelMarkerExpirationDelete,
+        _ => (),
+    }
+    send_event(EventArgs {
+        event_name: event_name.as_ref().to_string(),
+        bucket_name: dobj.bucket.clone(),
+        object: dobj,
+        user_agent: "Internal: [ILM-Expiry]".to_string(),
+        host: GLOBAL_LocalNodeName.to_string(),
+        ..Default::default()
+    });
+
+    if lc_event.action != lifecycle::IlmAction::NoneAction {
+        // let mut num_versions = 1_u64;
+        // if lc_event.action.delete_all() {
+        //     num_versions = oi.num_versions as u64;
+        // }
+        // let _ = time_ilm(num_versions);
+    }
+
+    true
+}
+
+async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    let mut expiry_state = GLOBAL_ExpiryState.write().await;
+    expiry_state.enqueue_by_days(oi, event, src).await;
+    true
+}
+
+pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    let mut success = false;
+    match event.action {
+        lifecycle::IlmAction::DeleteVersionAction
+        | lifecycle::IlmAction::DeleteAction
+        | lifecycle::IlmAction::DeleteRestoredAction
+        | lifecycle::IlmAction::DeleteRestoredVersionAction
+        | lifecycle::IlmAction::DeleteAllVersionsAction
+        | lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => {
+            success = apply_expiry_rule(event, src, oi).await;
+        }
+        lifecycle::IlmAction::TransitionAction | lifecycle::IlmAction::TransitionVersionAction => {
+            success = apply_transition_rule(event, src, oi).await;
+        }
+        _ => (),
+    }
+    success
+}

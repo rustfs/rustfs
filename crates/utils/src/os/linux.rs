@@ -170,6 +170,7 @@ fn read_stat(file_name: &str) -> std::io::Result<Vec<u64>> {
 #[cfg(test)]
 mod test {
     use super::get_drive_stats;
+    use tracing::debug;
 
     #[ignore] // FIXME: failed in github actions
     #[test]
@@ -177,6 +178,6 @@ mod test {
         let major = 7;
         let minor = 11;
         let s = get_drive_stats(major, minor).unwrap();
-        println!("{s:?}");
+        debug!("Drive stats for major: {}, minor: {} - {:?}", major, minor, s);
     }
 }

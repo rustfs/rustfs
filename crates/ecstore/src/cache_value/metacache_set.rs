@@ -19,7 +19,7 @@ use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_e
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::spawn;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, warn};
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub type PartialFn =
@@ -32,7 +32,7 @@ pub struct ListPathRawOptions {
     pub fallback_disks: Vec<Option<DiskStore>>,
     pub bucket: String,
     pub path: String,
-    pub recursice: bool,
+    pub recursive: bool,
     pub filter_prefix: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
@@ -53,7 +53,7 @@ impl Clone for ListPathRawOptions {
             fallback_disks: self.fallback_disks.clone(),
             bucket: self.bucket.clone(),
             path: self.path.clone(),
-            recursice: self.recursice,
+            recursive: self.recursive,
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
@@ -86,7 +86,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             let wakl_opts = WalkDirOptions {
                 bucket: opts_clone.bucket.clone(),
                 base_dir: opts_clone.path.clone(),
-                recursive: opts_clone.recursice,
+                recursive: opts_clone.recursive,
                 report_notfound: opts_clone.report_not_found,
                 filter_prefix: opts_clone.filter_prefix.clone(),
                 forward_to: opts_clone.forward_to.clone(),
@@ -119,10 +119,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         if let Some(disk) = d.clone() {
                             disk
                         } else {
+                            warn!("list_path_raw: fallback disk is none");
                             break;
                         }
                     }
-                    None => break,
+                    None => {
+                        warn!("list_path_raw: fallback disk is none2");
+                        break;
+                    }
                 };
                 match disk
                     .as_ref()
@@ -130,7 +134,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         WalkDirOptions {
                             bucket: opts_clone.bucket.clone(),
                             base_dir: opts_clone.path.clone(),
-                            recursive: opts_clone.recursice,
+                            recursive: opts_clone.recursive,
                             report_notfound: opts_clone.report_not_found,
                             filter_prefix: opts_clone.filter_prefix.clone(),
                             forward_to: opts_clone.forward_to.clone(),

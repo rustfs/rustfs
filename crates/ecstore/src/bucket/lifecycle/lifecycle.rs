@@ -27,6 +27,7 @@ use std::env;
 use std::fmt::Display;
 use time::macros::{datetime, offset};
 use time::{self, Duration, OffsetDateTime};
+use tracing::info;
 
 use crate::bucket::lifecycle::rule::TransitionOps;
 
@@ -43,49 +44,7 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an retention bucket";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IlmAction {
-    NoneAction = 0,
-    DeleteAction,
-    DeleteVersionAction,
-    TransitionAction,
-    TransitionVersionAction,
-    DeleteRestoredAction,
-    DeleteRestoredVersionAction,
-    DeleteAllVersionsAction,
-    DelMarkerDeleteAllVersionsAction,
-    ActionCount,
-}
-
-impl IlmAction {
-    pub fn delete_restored(&self) -> bool {
-        *self == Self::DeleteRestoredAction || *self == Self::DeleteRestoredVersionAction
-    }
-
-    pub fn delete_versioned(&self) -> bool {
-        *self == Self::DeleteVersionAction || *self == Self::DeleteRestoredVersionAction
-    }
-
-    pub fn delete_all(&self) -> bool {
-        *self == Self::DeleteAllVersionsAction || *self == Self::DelMarkerDeleteAllVersionsAction
-    }
-
-    pub fn delete(&self) -> bool {
-        if self.delete_restored() {
-            return true;
-        }
-        *self == Self::DeleteVersionAction
-            || *self == Self::DeleteAction
-            || *self == Self::DeleteAllVersionsAction
-            || *self == Self::DelMarkerDeleteAllVersionsAction
-    }
-}
-
-impl Display for IlmAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
+pub use rustfs_common::metrics::IlmAction;
 
 #[async_trait::async_trait]
 pub trait RuleValidate {
@@ -174,7 +133,7 @@ pub trait Lifecycle {
     async fn has_transition(&self) -> bool;
     fn has_expiry(&self) -> bool;
     async fn has_active_rules(&self, prefix: &str) -> bool;
-    async fn validate(&self, lr_retention: bool) -> Result<(), std::io::Error>;
+    async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error>;
     async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<LifecycleRule>>;
     async fn eval(&self, obj: &ObjectOpts) -> Event;
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event;
@@ -255,7 +214,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         false
     }
 
-    async fn validate(&self, lr_retention: bool) -> Result<(), std::io::Error> {
+    async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error> {
         if self.rules.len() > 1000 {
             return Err(std::io::Error::other(ERR_LIFECYCLE_TOO_MANY_RULES));
         }
@@ -265,13 +224,15 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         for r in &self.rules {
             r.validate()?;
-            if let Some(expiration) = r.expiration.as_ref() {
-                if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
-                    if lr_retention && (expired_object_delete_marker) {
-                        return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
+            /*if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref() {
+                if let Some(expiration) = r.expiration.as_ref() {
+                    if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                        if object_lock_enabled.as_str() == ObjectLockEnabled::ENABLED && (expired_object_delete_marker) {
+                            return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
+                        }
                     }
-                }
-            }
+                        }
+            }*/
         }
         for (i, _) in self.rules.iter().enumerate() {
             if i == self.rules.len() - 1 {
@@ -319,7 +280,12 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event {
         let mut events = Vec::<Event>::new();
+        info!(
+            "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
+            obj.name, obj.mod_time, now, obj.is_latest, obj.delete_marker
+        );
         if obj.mod_time.expect("err").unix_timestamp() == 0 {
+            info!("eval_inner: mod_time is 0, returning default event");
             return Event::default();
         }
 
@@ -458,7 +424,16 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     }
                 }
 
-                if obj.is_latest && !obj.delete_marker {
+                info!(
+                    "eval_inner: checking expiration condition - is_latest={}, delete_marker={}, version_id={:?}, condition_met={}",
+                    obj.is_latest,
+                    obj.delete_marker,
+                    obj.version_id,
+                    (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker
+                );
+                // Allow expiration for latest objects OR non-versioned objects (empty version_id)
+                if (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker {
+                    info!("eval_inner: entering expiration check");
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
                             let date0 = OffsetDateTime::from(date.clone());
@@ -475,22 +450,29 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 });
                             }
                         } else if let Some(days) = expiration.days {
-                            if days != 0 {
-                                let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.expect("err!"), days);
-                                if now.unix_timestamp() == 0 || now.unix_timestamp() > expected_expiry.unix_timestamp() {
-                                    let mut event = Event {
-                                        action: IlmAction::DeleteAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due: Some(expected_expiry),
-                                        noncurrent_days: 0,
-                                        newer_noncurrent_versions: 0,
-                                        storage_class: "".into(),
-                                    };
-                                    /*if rule.expiration.expect("err!").delete_all.val {
-                                        event.action = IlmAction::DeleteAllVersionsAction
-                                    }*/
-                                    events.push(event);
-                                }
+                            let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.expect("err!"), days);
+                            info!(
+                                "eval_inner: expiration check - days={}, obj_time={:?}, expiry_time={:?}, now={:?}, should_expire={}",
+                                days,
+                                obj.mod_time.expect("err!"),
+                                expected_expiry,
+                                now,
+                                now.unix_timestamp() > expected_expiry.unix_timestamp()
+                            );
+                            if now.unix_timestamp() == 0 || now.unix_timestamp() > expected_expiry.unix_timestamp() {
+                                info!("eval_inner: object should expire, adding DeleteAction");
+                                let mut event = Event {
+                                    action: IlmAction::DeleteAction,
+                                    rule_id: rule.id.clone().expect("err!"),
+                                    due: Some(expected_expiry),
+                                    noncurrent_days: 0,
+                                    newer_noncurrent_versions: 0,
+                                    storage_class: "".into(),
+                                };
+                                /*if rule.expiration.expect("err!").delete_all.val {
+                                    event.action = IlmAction::DeleteAllVersionsAction
+                                }*/
+                                events.push(event);
                             }
                         }
                     }
@@ -638,11 +620,11 @@ impl LifecycleCalculate for Transition {
 
 pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTime {
     if days == 0 {
-        return mod_time;
+        return OffsetDateTime::UNIX_EPOCH; // Return epoch time to ensure immediate expiry
     }
     let t = mod_time
         .to_offset(offset!(-0:00:00))
-        .saturating_add(Duration::days(0 /*days as i64*/)); //debug
+        .saturating_add(Duration::days(days as i64));
     let mut hour = 3600;
     if let Ok(env_ilm_hour) = env::var("_RUSTFS_ILM_HOUR") {
         if let Ok(num_hour) = env_ilm_hour.parse::<usize>() {

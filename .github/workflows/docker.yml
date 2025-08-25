@@ -12,42 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Docker Images Workflow
+#
+# This workflow builds Docker images using pre-built binaries from the build workflow.
+#
+# Trigger Types:
+# 1. workflow_run: Automatically triggered when "Build and Release" workflow completes
+# 2. workflow_dispatch: Manual trigger for standalone Docker builds
+#
+# Key Features:
+# - Only triggers when Linux builds (x86_64 + aarch64) are successful
+# - Independent of macOS/Windows build status
+# - Uses workflow_run event for precise control
+# - Only builds Docker images for releases and prereleases (development builds are skipped)
+
 name: Docker Images
 
+# Permissions needed for workflow_run event and Docker registry access
+permissions:
+  contents: read
+  packages: write
+
 on:
-  push:
-    tags: ["*.*.*"]
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - ".github/**"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - ".github/**"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
+  # Automatically triggered when build workflow completes
+  workflow_run:
+    workflows: [ "Build and Release" ]
+    types: [ completed ]
+  # Manual trigger with same parameters for consistency
   workflow_dispatch:
     inputs:
       push_images:
@@ -56,9 +47,9 @@ on:
         default: true
         type: boolean
       version:
-        description: "Version to build (latest, main-latest, dev-latest, or specific version like v1.0.0 or dev-abc123)"
+        description: "Version to build (latest for stable release, or specific version like v1.0.0, v1.0.0-alpha1)"
         required: false
-        default: "main-latest"
+        default: "latest"
         type: string
       force_rebuild:
         description: "Force rebuild even if binary exists (useful for testing)"
@@ -67,12 +58,18 @@ on:
         type: boolean
 
 env:
+  CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  TRIGGERING_EVENT: ${{ github.event.workflow_run.event }}
+  DOCKERHUB_USERNAME: rustfs
   CARGO_TERM_COLOR: always
   REGISTRY_DOCKERHUB: rustfs/rustfs
   REGISTRY_GHCR: ghcr.io/${{ github.repository }}
+  DOCKER_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  # Docker build strategy check
+  # Check if we should build Docker images
   build-check:
     name: Docker Build Check
     runs-on: ubuntu-latest
@@ -86,9 +83,11 @@ jobs:
       create_latest: ${{ steps.check.outputs.create_latest }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # For workflow_run events, checkout the specific commit that triggered the workflow
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Check build conditions
         id: check
@@ -101,26 +100,103 @@ jobs:
           is_prerelease=false
           create_latest=false
 
-          # Get short SHA for all builds
-          short_sha=$(git rev-parse --short HEAD)
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Triggered by build workflow completion
+            echo "🔗 Triggered by build workflow completion"
 
-          # Always build on workflow_dispatch or when changes detected
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-             [[ "${{ github.event_name }}" == "push" ]] || \
-             [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            should_build=true
-          fi
+            # Check if the triggering workflow was successful
+            # If the workflow succeeded, it means ALL builds (including Linux x86_64 and aarch64) succeeded
+            if [[ "$CONCLUSION" == "success" ]]; then
+              echo "✅ Build workflow succeeded, all builds including Linux are successful"
+              should_build=true
+              should_push=true
+            else
+              echo "❌ Build workflow failed (conclusion: $CONCLUSION), skipping Docker build"
+              should_build=false
+            fi
 
-          # Determine build type and version
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.version }}" ]]; then
-            # Manual trigger with version input
+            # Extract version info from commit message or use commit SHA
+            # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
+            short_sha=$(git rev-parse --short "$HEAD_SHA")
+
+            # Determine build type based on triggering workflow event and ref
+            triggering_event="$TRIGGERING_EVENT"
+            head_branch="$HEAD_BRANCH"
+
+            echo "🔍 Analyzing triggering workflow:"
+            echo "   📋 Event: $triggering_event"
+            echo "   🌿 Head branch: $head_branch"
+            echo "   📎 Head SHA: $HEAD_SHA"
+
+            # Check if this was triggered by a tag push
+            if [[ "$triggering_event" == "push" ]]; then
+              # For tag pushes, head_branch will be like "refs/tags/v1.0.0" or just "v1.0.0"
+              if [[ "$head_branch" == refs/tags/* ]]; then
+                # Extract tag name from refs/tags/TAG_NAME
+                tag_name="${head_branch#refs/tags/}"
+                version="$tag_name"
+              elif [[ "$head_branch" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                # Direct tag name like "v1.0.0" or "1.0.0-alpha.1"
+                version="$head_branch"
+              elif [[ "$head_branch" == "main" ]]; then
+                # Regular branch push to main
+                build_type="development"
+                version="dev-${short_sha}"
+                should_build=false
+                echo "⏭️  Skipping Docker build for development version (main branch push)"
+              else
+                # Other branch push
+                build_type="development"
+                version="dev-${short_sha}"
+                should_build=false
+                echo "⏭️  Skipping Docker build for development version (branch: $head_branch)"
+              fi
+
+              # If we extracted a version (tag), determine release type
+              if [[ -n "$version" ]] && [[ "$version" != "dev-${short_sha}" ]]; then
+                # Remove 'v' prefix if present for consistent version format
+                if [[ "$version" == v* ]]; then
+                  version="${version#v}"
+                fi
+
+                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+                  build_type="prerelease"
+                  is_prerelease=true
+                  echo "🧪 Building Docker image for prerelease: $version"
+                else
+                  build_type="release"
+                  create_latest=true
+                  echo "🚀 Building Docker image for release: $version"
+                fi
+              fi
+            else
+              # Non-push events
+              build_type="development"
+              version="dev-${short_sha}"
+              should_build=false
+              echo "⏭️  Skipping Docker build for development version (event: $triggering_event)"
+            fi
+
+            echo "🔄 Build triggered by workflow_run:"
+            echo "   📋 Conclusion: $CONCLUSION"
+            echo "   🌿 Branch: $HEAD_BRANCH"
+            echo "   📎 SHA: $HEAD_SHA"
+            echo "   🎯 Event: $TRIGGERING_EVENT"
+
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual trigger
             input_version="${{ github.event.inputs.version }}"
             version="${input_version}"
-            force_rebuild="${{ github.event.inputs.force_rebuild }}"
+            should_push="${{ github.event.inputs.push_images }}"
+            should_build=true
+
+            # Get short SHA
+            short_sha=$(git rev-parse --short HEAD)
 
             echo "🎯 Manual Docker build triggered:"
             echo "   📋 Requested version: $input_version"
-            echo "   🔧 Force rebuild: $force_rebuild"
+            echo "   🔧 Force rebuild: ${{ github.event.inputs.force_rebuild }}"
+            echo "   🚀 Push images: $should_push"
 
             case "$input_version" in
               "latest")
@@ -128,68 +204,25 @@ jobs:
                 create_latest=true
                 echo "🚀 Building with latest stable release version"
                 ;;
-              "main-latest")
-                build_type="development"
-                version="main-latest"
-                echo "🛠️  Building with main branch latest development version"
-                ;;
-              "dev-latest")
-                build_type="development"
-                version="dev-latest"
-                echo "🛠️  Building with development latest version"
-                ;;
-              v[0-9]*)
-                build_type="release"
-                create_latest=true
-                echo "📦 Building with specific release version: $input_version"
-                ;;
-              v*alpha*|v*beta*|v*rc*)
+              # Prerelease versions (must match first, more specific)
+              v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
                 echo "🧪 Building with prerelease version: $input_version"
                 ;;
-              dev-[a-f0-9]*)
-                build_type="development"
-                echo "🔧 Building with specific development version: $input_version"
+              # Release versions (match after prereleases, more general)
+              v[0-9]*|[0-9]*.*.*)
+                build_type="release"
+                create_latest=true
+                echo "📦 Building with specific release version: $input_version"
                 ;;
               *)
-                build_type="development"
-                echo "🔧 Building with custom version: $input_version"
-                echo "⚠️  Warning: Custom version format may not follow standard patterns"
+                # Invalid version for Docker build
+                should_build=false
+                echo "❌ Invalid version for Docker build: $input_version"
+                echo "⚠️  Only release versions (latest, v1.0.0, 1.0.0) and prereleases (v1.0.0-alpha1, 1.0.0-beta2) are supported"
                 ;;
             esac
-          elif [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
-            # Tag push - release or prerelease
-            tag_name="${GITHUB_REF#refs/tags/}"
-            version="${tag_name}"
-
-            # Check if this is a prerelease
-            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
-              build_type="prerelease"
-              is_prerelease=true
-              echo "🚀 Docker prerelease build detected: $tag_name"
-            else
-              build_type="release"
-              create_latest=true
-              echo "📦 Docker release build detected: $tag_name"
-            fi
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            # Main branch push - development build
-            build_type="development"
-            version="dev-${short_sha}"
-            echo "🛠️  Docker development build detected"
-          else
-            # Other branches - development build
-            build_type="development"
-            version="dev-${short_sha}"
-            echo "🔧 Docker development build detected"
-          fi
-
-          # Push only on main branch, tags, or manual trigger
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]] || \
-             [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]] || \
-             [[ "${{ github.event.inputs.push_images }}" == "true" ]]; then
-            should_push=true
           fi
 
           echo "should_build=$should_build" >> $GITHUB_OUTPUT
@@ -210,41 +243,24 @@ jobs:
           echo "  - Create latest: $create_latest"
 
   # Build multi-arch Docker images
+  # Strategy: Build images using pre-built binaries from dl.rustfs.com
+  # Supports both release and dev channel binaries based on build context
+  # Only runs when should_build is true (which includes workflow success check)
   build-docker:
     name: Build Docker Images
     needs: build-check
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        variant:
-          - name: production
-            dockerfile: Dockerfile
-            platforms: linux/amd64,linux/arm64
-          - name: alpine
-            dockerfile: .docker/alpine/Dockerfile.prebuild
-            platforms: linux/amd64,linux/arm64
-          - name: alpine-source
-            dockerfile: .docker/alpine/Dockerfile.source
-            platforms: linux/amd64,linux/arm64
-          - name: ubuntu
-            dockerfile: .docker/ubuntu/Dockerfile.prebuild
-            platforms: linux/amd64,linux/arm64
-          - name: ubuntu-source
-            dockerfile: .docker/ubuntu/Dockerfile.source
-            platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          scopes: repository:rustfs/rustfs:pull,push
 
       # - name: Login to GitHub Container Registry
       #   uses: docker/login-action@v3
@@ -266,57 +282,54 @@ jobs:
           VERSION="${{ needs.build-check.outputs.version }}"
           SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
           CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
-          VARIANT="${{ matrix.variant.name }}"
+
+          # Convert version format for Dockerfile compatibility
+          case "$VERSION" in
+            "latest")
+              # For stable latest, use RELEASE=latest + release CHANNEL
+              DOCKER_RELEASE="latest"
+              DOCKER_CHANNEL="release"
+              ;;
+            v*)
+              # For versioned releases (v1.0.0), remove 'v' prefix for Dockerfile
+              DOCKER_RELEASE="${VERSION#v}"
+              DOCKER_CHANNEL="release"
+              ;;
+            *)
+              # For other versions, pass as-is
+              DOCKER_RELEASE="${VERSION}"
+              DOCKER_CHANNEL="release"
+              ;;
+          esac
+
+          echo "docker_release=$DOCKER_RELEASE" >> $GITHUB_OUTPUT
+          echo "docker_channel=$DOCKER_CHANNEL" >> $GITHUB_OUTPUT
+
+          echo "🐳 Docker build parameters:"
+          echo "  - Original version: $VERSION"
+          echo "  - Docker RELEASE: $DOCKER_RELEASE"
+          echo "  - Docker CHANNEL: $DOCKER_CHANNEL"
 
           # Generate tags based on build type
-          TAGS=""
+          # Only support release and prerelease builds (no development builds)
+          TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
 
-          if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development build: dev-${short_sha}-${variant} and dev-${variant}
-            TAGS="${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}-${VARIANT}"
-
-            # Add rolling dev tag for each variant
-            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev-${VARIANT}"
-
-            # Special handling for production variant
-            if [[ "$VARIANT" == "production" ]]; then
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev-${SHORT_SHA}"
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:dev"
-            fi
-          else
-            # Release/Prerelease build: ${version}-${variant}
-            TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}-${VARIANT}"
-
-            # Special handling for production variant - create main version tag
-            if [[ "$VARIANT" == "production" ]]; then
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
+          # Add channel tags for prereleases and latest for stable
+          if [[ "$CREATE_LATEST" == "true" ]]; then
+            # Stable release
+            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
+          elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            # Prerelease channel tags (alpha, beta, rc)
+            if [[ "$VERSION" == *"alpha"* ]]; then
+              CHANNEL="alpha"
+            elif [[ "$VERSION" == *"beta"* ]]; then
+              CHANNEL="beta"
+            elif [[ "$VERSION" == *"rc"* ]]; then
+              CHANNEL="rc"
             fi
 
-            # Add channel tags for prereleases and latest for stable
-            if [[ "$CREATE_LATEST" == "true" ]]; then
-              # Stable release
-              if [[ "$VARIANT" == "production" ]]; then
-                TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
-              else
-                TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest-${VARIANT}"
-              fi
-            elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
-              # Prerelease channel tags (alpha, beta, rc)
-              if [[ "$VERSION" == *"alpha"* ]]; then
-                CHANNEL="alpha"
-              elif [[ "$VERSION" == *"beta"* ]]; then
-                CHANNEL="beta"
-              elif [[ "$VERSION" == *"rc"* ]]; then
-                CHANNEL="rc"
-              fi
-
-              if [[ -n "$CHANNEL" ]]; then
-                if [[ "$VARIANT" == "production" ]]; then
-                  TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
-                else
-                  TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}-${VARIANT}"
-                fi
-              fi
+            if [[ -n "$CHANNEL" ]]; then
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
             fi
           fi
 
@@ -330,7 +343,6 @@ jobs:
           LABELS="$LABELS,org.opencontainers.image.revision=${{ github.sha }}"
           LABELS="$LABELS,org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
           LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          LABELS="$LABELS,org.opencontainers.image.variant=$VARIANT"
           LABELS="$LABELS,org.opencontainers.image.build-type=$BUILD_TYPE"
 
           echo "labels=$LABELS" >> $GITHUB_OUTPUT
@@ -344,20 +356,22 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.variant.dockerfile }}
-          platforms: ${{ matrix.variant.platforms }}
+          file: Dockerfile
+          platforms: ${{ env.DOCKER_PLATFORMS }}
           push: ${{ needs.build-check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
-            type=gha,scope=docker-${{ matrix.variant.name }}
+            type=gha,scope=docker-binary
           cache-to: |
-            type=gha,mode=max,scope=docker-${{ matrix.variant.name }}
+            type=gha,mode=max,scope=docker-binary
           build-args: |
             BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
             VERSION=${{ needs.build-check.outputs.version }}
             BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
             REVISION=${{ github.sha }}
+            RELEASE=${{ steps.meta.outputs.docker_release }}
+            CHANNEL=${{ steps.meta.outputs.docker_channel }}
             BUILDKIT_INLINE_CACHE=1
           # Enable advanced BuildKit features for better performance
           provenance: false
@@ -366,43 +380,13 @@ jobs:
           no-cache: false
           pull: true
 
-  # Create manifest for main production image (only for stable releases)
-  create-manifest:
-    name: Create Manifest
-    needs: [build-check, build-docker]
-    if: needs.build-check.outputs.should_push == 'true' && needs.build-check.outputs.create_latest == 'true' && needs.build-check.outputs.build_type == 'release'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # - name: Login to GitHub Container Registry
-      #   uses: docker/login-action@v3
-      #   with:
-      #     registry: ghcr.io
-      #     username: ${{ github.actor }}
-      #     password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push manifest
-        run: |
-          VERSION="${{ needs.build-check.outputs.version }}"
-
-          echo "🐳 Creating manifest for stable release: $VERSION"
-
-          # Create main image tag (without variant suffix) for stable releases only
-          # Note: The "production" variant already creates the main tags without suffix
-          echo "Manifest creation is handled by the production variant build step"
-          echo "Main tags ${VERSION} and latest are created directly by the production variant"
-
-          echo "✅ Manifest created successfully for stable release"
+  # Note: Manifest creation is no longer needed as we only build one variant
+  # Multi-arch manifests are automatically created by docker/build-push-action
 
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
-    needs: [build-check, build-docker]
+    needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -415,23 +399,23 @@ jobs:
           echo "🐳 Docker build completed successfully!"
           echo "📦 Build type: $BUILD_TYPE"
           echo "🔢 Version: $VERSION"
+          echo "🚀 Strategy: Images using pre-built binaries (release channel only)"
           echo ""
 
           case "$BUILD_TYPE" in
-            "development")
-              echo "🛠️  Development Docker images have been built with dev-${VERSION} tags"
-              echo "⚠️  These are development images - not suitable for production use"
-              ;;
             "release")
-              echo "🚀 Release Docker images have been built with v${VERSION} tags"
-              echo "✅ These images are ready for production use"
+              echo "🚀 Release Docker image has been built with ${VERSION} tags"
+              echo "✅ This image is ready for production use"
               if [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tags have been created for stable release"
+                echo "🏷️  Latest tag has been created for stable release"
               fi
               ;;
             "prerelease")
-              echo "🧪 Prerelease Docker images have been built with v${VERSION} tags"
-              echo "⚠️  These are prerelease images - use with caution"
-              echo "🚫 Latest tags NOT created for prerelease"
+              echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
+              echo "⚠️  This is a prerelease image - use with caution"
+              echo "🚫 Latest tag NOT created for prerelease"
+              ;;
+            *)
+              echo "❌ Unexpected build type: $BUILD_TYPE"
               ;;
           esac

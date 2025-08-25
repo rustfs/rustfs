@@ -496,39 +496,32 @@ impl FileMeta {
     }
 
     pub fn add_version_filemata(&mut self, ver: FileMetaVersion) -> Result<()> {
-        let mod_time = ver.get_mod_time().unwrap().nanosecond();
         if !ver.valid() {
             return Err(Error::other("attempted to add invalid version"));
         }
-        let encoded = ver.marshal_msg()?;
 
-        if self.versions.len() + 1 > 100 {
+        if self.versions.len() + 1 >= 100 {
             return Err(Error::other(
                 "You've exceeded the limit on the number of versions you can create on this object",
             ));
         }
 
-        self.versions.push(FileMetaShallowVersion {
-            header: FileMetaVersionHeader {
-                mod_time: Some(OffsetDateTime::from_unix_timestamp(-1)?),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        let mod_time = ver.get_mod_time();
+        let encoded = ver.marshal_msg()?;
+        let new_version = FileMetaShallowVersion {
+            header: ver.header(),
+            meta: encoded,
+        };
 
-        let len = self.versions.len();
-        for (i, existing) in self.versions.iter().enumerate() {
-            if existing.header.mod_time.unwrap().nanosecond() <= mod_time {
-                let vers = self.versions[i..len - 1].to_vec();
-                self.versions[i + 1..].clone_from_slice(vers.as_slice());
-                self.versions[i] = FileMetaShallowVersion {
-                    header: ver.header(),
-                    meta: encoded,
-                };
-                return Ok(());
-            }
-        }
-        Err(Error::other("addVersion: Internal error, unable to add version"))
+        // Find the insertion position: insert before the first element with mod_time >= new mod_time
+        // This maintains descending order by mod_time (newest first)
+        let insert_pos = self
+            .versions
+            .iter()
+            .position(|existing| existing.header.mod_time <= mod_time)
+            .unwrap_or(self.versions.len());
+        self.versions.insert(insert_pos, new_version);
+        Ok(())
     }
 
     // delete_version deletes version, returns data_dir
@@ -554,7 +547,15 @@ impl FileMeta {
 
             match ver.header.version_type {
                 VersionType::Invalid | VersionType::Legacy => return Err(Error::other("invalid file meta version")),
-                VersionType::Delete => return Ok(None),
+                VersionType::Delete => {
+                    self.versions.remove(i);
+                    if fi.deleted && fi.version_id.is_none() {
+                        self.add_version_filemata(ventry)?;
+                        return Ok(None);
+                    }
+
+                    return Ok(None);
+                }
                 VersionType::Object => {
                     let v = self.get_idx(i)?;
 
@@ -600,6 +601,7 @@ impl FileMeta {
 
         if fi.deleted {
             self.add_version_filemata(ventry)?;
+            return Ok(None);
         }
 
         Err(Error::FileVersionNotFound)
@@ -702,7 +704,7 @@ impl FileMeta {
         })
     }
 
-    pub fn lastest_mod_time(&self) -> Option<OffsetDateTime> {
+    pub fn latest_mod_time(&self) -> Option<OffsetDateTime> {
         if self.versions.is_empty() {
             return None;
         }
@@ -961,7 +963,8 @@ impl FileMetaVersion {
 
     pub fn get_version_id(&self) -> Option<Uuid> {
         match self.version_type {
-            VersionType::Object | VersionType::Delete => self.object.as_ref().map(|v| v.version_id).unwrap_or_default(),
+            VersionType::Object => self.object.as_ref().map(|v| v.version_id).unwrap_or_default(),
+            VersionType::Delete => self.delete_marker.as_ref().map(|v| v.version_id).unwrap_or_default(),
             _ => None,
         }
     }
@@ -1523,8 +1526,7 @@ impl MetaObject {
     }
 
     pub fn uses_data_dir(&self) -> bool {
-        // TODO: when use inlinedata
-        true
+        !self.inlinedata()
     }
 
     pub fn inlinedata(&self) -> bool {
@@ -1762,7 +1764,7 @@ impl MetaDeleteMarker {
 
         //             self.meta_sys = Some(map);
         //         }
-        //         name => return Err(Error::other(format!("not suport field name {name}"))),
+        //         name => return Err(Error::other(format!("not support field name {name}"))),
         //     }
         // }
 
@@ -1962,32 +1964,32 @@ pub fn merge_file_meta_versions(
                 n_versions += 1;
             }
         } else {
-            let mut lastest_count = 0;
+            let mut latest_count = 0;
             for (i, ver) in tops.iter().enumerate() {
                 if ver.header == latest.header {
-                    lastest_count += 1;
+                    latest_count += 1;
                     continue;
                 }
 
                 if i == 0 || ver.header.sorts_before(&latest.header) {
-                    if i == 0 || lastest_count == 0 {
-                        lastest_count = 1;
+                    if i == 0 || latest_count == 0 {
+                        latest_count = 1;
                     } else if !strict && ver.header.matches_not_strict(&latest.header) {
-                        lastest_count += 1;
+                        latest_count += 1;
                     } else {
-                        lastest_count = 1;
+                        latest_count = 1;
                     }
                     latest = ver.clone();
                     continue;
                 }
 
                 // Mismatch, but older.
-                if lastest_count > 0 && !strict && ver.header.matches_not_strict(&latest.header) {
-                    lastest_count += 1;
+                if latest_count > 0 && !strict && ver.header.matches_not_strict(&latest.header) {
+                    latest_count += 1;
                     continue;
                 }
 
-                if lastest_count > 0 && ver.header.version_id == latest.header.version_id {
+                if latest_count > 0 && ver.header.version_id == latest.header.version_id {
                     let mut x: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
                     for a in tops.iter() {
                         if a.header.version_id != ver.header.version_id {
@@ -1999,12 +2001,12 @@ pub fn merge_file_meta_versions(
                         }
                         *x.entry(a_clone.header).or_insert(1) += 1;
                     }
-                    lastest_count = 0;
+                    latest_count = 0;
                     for (k, v) in x.iter() {
-                        if *v < lastest_count {
+                        if *v < latest_count {
                             continue;
                         }
-                        if *v == lastest_count && latest.header.sorts_before(k) {
+                        if *v == latest_count && latest.header.sorts_before(k) {
                             continue;
                         }
                         tops.iter().for_each(|a| {
@@ -2017,12 +2019,12 @@ pub fn merge_file_meta_versions(
                             }
                         });
 
-                        lastest_count = *v;
+                        latest_count = *v;
                     }
                     break;
                 }
             }
-            if lastest_count >= quorum {
+            if latest_count >= quorum {
                 if !latest.header.free_version() {
                     n_versions += 1;
                 }
@@ -2364,7 +2366,7 @@ mod test {
         assert!(stats.delete_markers > 0, "应该有删除标记");
 
         // 测试版本合并功能
-        let merged = merge_file_meta_versions(1, false, 0, &[fm.versions.clone()]);
+        let merged = merge_file_meta_versions(1, false, 0, std::slice::from_ref(&fm.versions));
         assert!(!merged.is_empty(), "合并后应该有版本");
     }
 

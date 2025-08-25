@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::version;
 
@@ -86,7 +86,7 @@ impl VersionChecker {
 
         Self {
             client,
-            version_url: "https://version.rustfs.com".to_string(),
+            version_url: "https://version.rustfs.com/latest.json".to_string(),
             timeout: Duration::from_secs(10),
         }
     }
@@ -139,8 +139,9 @@ impl VersionChecker {
 
         debug!("Retrieved latest version information: {:?}", version_info);
 
-        // Compare versions
-        let update_available = self.is_newer_version(&current_version, &version_info.version)?;
+        // Compare versions using version.rs functions
+        let update_available = version::is_newer_version(&current_version, &version_info.version)
+            .map_err(|e| UpdateCheckError::VersionParseError(e.to_string()))?;
 
         let result = UpdateCheckResult {
             update_available,
@@ -160,74 +161,6 @@ impl VersionChecker {
         }
 
         Ok(result)
-    }
-
-    /// Compare version numbers to determine if there's an update
-    fn is_newer_version(&self, current: &str, latest: &str) -> Result<bool, UpdateCheckError> {
-        // Clean version numbers, remove prefixes like "v", "RELEASE.", etc.
-        let current_clean = self.clean_version(current);
-        let latest_clean = self.clean_version(latest);
-
-        debug!("Version comparison: current='{}' vs latest='{}'", current_clean, latest_clean);
-
-        // If versions are the same, no update is needed
-        if current_clean == latest_clean {
-            return Ok(false);
-        }
-
-        // Try semantic version comparison
-        match self.compare_semantic_versions(&current_clean, &latest_clean) {
-            Ok(is_newer) => Ok(is_newer),
-            Err(_) => {
-                // If semantic version comparison fails, use string comparison
-                warn!("Semantic version comparison failed, using string comparison");
-                Ok(latest_clean > current_clean)
-            }
-        }
-    }
-
-    /// Clean version string
-    fn clean_version(&self, version: &str) -> String {
-        version
-            .trim()
-            .trim_start_matches('v')
-            .trim_start_matches("RELEASE.")
-            .trim_start_matches('@')
-            .to_string()
-    }
-
-    /// Semantic version comparison
-    fn compare_semantic_versions(&self, current: &str, latest: &str) -> Result<bool, UpdateCheckError> {
-        let current_parts = self.parse_version_parts(current)?;
-        let latest_parts = self.parse_version_parts(latest)?;
-
-        // Use tuple comparison for lexicographic ordering
-        Ok(latest_parts > current_parts)
-    }
-
-    /// Parse version parts (major, minor, patch)
-    fn parse_version_parts(&self, version: &str) -> Result<(u32, u32, u32), UpdateCheckError> {
-        let parts: Vec<&str> = version.split('.').collect();
-
-        if parts.len() < 3 {
-            return Err(UpdateCheckError::VersionParseError(format!("Invalid version format: {version}")));
-        }
-
-        let major = parts[0]
-            .parse::<u32>()
-            .map_err(|_| UpdateCheckError::VersionParseError(format!("Cannot parse major version: {}", parts[0])))?;
-
-        let minor = parts[1]
-            .parse::<u32>()
-            .map_err(|_| UpdateCheckError::VersionParseError(format!("Cannot parse minor version: {}", parts[1])))?;
-
-        // Patch version may contain other characters, only take numeric part
-        let patch_str = parts[2].chars().take_while(|c| c.is_numeric()).collect::<String>();
-        let patch = patch_str
-            .parse::<u32>()
-            .map_err(|_| UpdateCheckError::VersionParseError(format!("Cannot parse patch version: {}", parts[2])))?;
-
-        Ok((major, minor, patch))
     }
 }
 
@@ -253,42 +186,11 @@ pub async fn check_updates_with_url(url: String) -> Result<UpdateCheckResult, Up
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_clean_version() {
-        let checker = VersionChecker::new();
-
-        assert_eq!(checker.clean_version("v1.0.0"), "1.0.0");
-        assert_eq!(checker.clean_version("RELEASE.1.0.0"), "1.0.0");
-        assert_eq!(checker.clean_version("@1.0.0"), "1.0.0");
-        assert_eq!(checker.clean_version("1.0.0"), "1.0.0");
-    }
-
-    #[test]
-    fn test_parse_version_parts() {
-        let checker = VersionChecker::new();
-
-        assert_eq!(checker.parse_version_parts("1.0.0").unwrap(), (1, 0, 0));
-        assert_eq!(checker.parse_version_parts("2.1.3").unwrap(), (2, 1, 3));
-        assert_eq!(checker.parse_version_parts("1.0.0-beta").unwrap(), (1, 0, 0));
-    }
-
-    #[test]
-    fn test_version_comparison() {
-        let checker = VersionChecker::new();
-
-        // Test semantic version comparison
-        assert!(checker.is_newer_version("1.0.0", "1.0.1").unwrap());
-        assert!(checker.is_newer_version("1.0.0", "1.1.0").unwrap());
-        assert!(checker.is_newer_version("1.0.0", "2.0.0").unwrap());
-        assert!(!checker.is_newer_version("1.0.1", "1.0.0").unwrap());
-        assert!(!checker.is_newer_version("1.0.0", "1.0.0").unwrap());
-    }
-
     #[tokio::test]
     async fn test_get_current_version() {
         let version = get_current_version();
         assert!(!version.is_empty());
-        println!("Current version: {version}");
+        debug!("Current version: {version}");
     }
 
     #[test]
@@ -311,7 +213,7 @@ mod tests {
             check_time,
         };
 
-        println!("result: {:?}", serde_json::to_string(&result).unwrap());
+        debug!("Update check result: {:?}", serde_json::to_string(&result).unwrap());
 
         // Test fields
         assert!(result.update_available);
@@ -369,7 +271,7 @@ mod tests {
         assert!(!error_result.update_available);
         assert!(error_result.latest_version.is_none());
 
-        println!("✅ UpdateCheckResult tests passed");
+        debug!("UpdateCheckResult tests passed successfully");
     }
 
     #[test]
@@ -418,7 +320,7 @@ mod tests {
 
         // Test JSON serialization/deserialization
         let json_string = serde_json::to_string(&version_info).unwrap();
-        println!("json_string: {json_string}");
+        debug!("Serialized version info: {json_string}");
         assert!(json_string.contains("2.0.0"));
         assert!(json_string.contains("Major release"));
 
@@ -426,6 +328,23 @@ mod tests {
         assert_eq!(deserialized.version, version_info.version);
         assert_eq!(deserialized.release_notes, version_info.release_notes);
 
-        println!("✅ VersionInfo tests passed");
+        debug!("VersionInfo tests passed successfully");
+    }
+
+    #[test]
+    fn test_version_functions_integration() {
+        // Test that version functions from version.rs work correctly
+        assert_eq!(version::clean_version("refs/tags/1.0.0-alpha.17"), "1.0.0-alpha.17");
+        assert_eq!(version::clean_version("v1.0.0"), "1.0.0");
+
+        // Test version comparison
+        assert!(version::is_newer_version("1.0.0", "1.0.1").unwrap());
+        assert!(!version::is_newer_version("1.0.1", "1.0.0").unwrap());
+
+        // Test version parsing using parse_version
+        assert_eq!(version::parse_version("1.0.0").unwrap(), (1, 0, 0, None));
+        assert_eq!(version::parse_version("2.1.3-alpha.1").unwrap(), (2, 1, 3, Some("alpha.1".to_string())));
+
+        debug!("Version functions integration tests passed successfully");
     }
 }

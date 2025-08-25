@@ -65,14 +65,14 @@ pub struct Opt {
     pub secret_key: String,
 
     /// Enable console server
-    #[arg(long, default_value_t = true, env = "RUSTFS_CONSOLE_ENABLE")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ENABLE, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,
 
-    /// tls path for rustfs api and console.
+    /// tls path for rustfs API and console.
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
 
