@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use rustfs_ahm::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealStorageAPI},
@@ -108,17 +122,11 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
 /// Test helper: Create a test bucket
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
-    match (**ecstore).make_bucket(bucket_name, &Default::default()).await {
-        Ok(_) => info!("Created test bucket: {}", bucket_name),
-        Err(e) => {
-            // If the bucket already exists from a previous test run in the shared env, ignore.
-            if matches!(e, rustfs_ecstore::error::StorageError::BucketExists(_)) {
-                info!("Bucket already exists, continuing: {}", bucket_name);
-            } else {
-                panic!("Failed to create test bucket: {e:?}");
-            }
-        }
-    }
+    (**ecstore)
+        .make_bucket(bucket_name, &Default::default())
+        .await
+        .expect("Failed to create test bucket");
+    info!("Created test bucket: {}", bucket_name);
 }
 
 /// Test helper: Upload test object

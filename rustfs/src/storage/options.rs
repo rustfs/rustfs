@@ -16,8 +16,10 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::{HTTPPreconditions, ObjectOptions};
+
+use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
 use rustfs_utils::path::is_dir_object;
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -303,6 +305,61 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-replication-status",
     ]
 });
+
+/// Parse copy source range string in format "bytes=start-end"
+pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
+    if !range_str.starts_with("bytes=") {
+        return Err(s3_error!(InvalidArgument, "Invalid range format"));
+    }
+
+    let range_part = &range_str[6..]; // Remove "bytes=" prefix
+
+    if let Some(dash_pos) = range_part.find('-') {
+        let start_str = &range_part[..dash_pos];
+        let end_str = &range_part[dash_pos + 1..];
+
+        if start_str.is_empty() && end_str.is_empty() {
+            return Err(s3_error!(InvalidArgument, "Invalid range format"));
+        }
+
+        if start_str.is_empty() {
+            // Suffix range: bytes=-500 (last 500 bytes)
+            let length = end_str
+                .parse::<i64>()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: true,
+                start: -length,
+                end: -1,
+            })
+        } else {
+            let start = start_str
+                .parse::<i64>()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
+
+            let end = if end_str.is_empty() {
+                -1 // Open-ended range: bytes=500-
+            } else {
+                end_str
+                    .parse::<i64>()
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?
+            };
+
+            if start < 0 || (end != -1 && end < start) {
+                return Err(s3_error!(InvalidArgument, "Invalid range format"));
+            }
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: false,
+                start,
+                end,
+            })
+        }
+    } else {
+        Err(s3_error!(InvalidArgument, "Invalid range format"))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -795,5 +852,32 @@ mod tests {
 
         // 测试没有扩展名的文件
         assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_parse_copy_source_range() {
+        // Test complete range: bytes=0-1023
+        let result = parse_copy_source_range("bytes=0-1023").unwrap();
+        assert!(!result.is_suffix_length);
+        assert_eq!(result.start, 0);
+        assert_eq!(result.end, 1023);
+
+        // Test open-ended range: bytes=500-
+        let result = parse_copy_source_range("bytes=500-").unwrap();
+        assert!(!result.is_suffix_length);
+        assert_eq!(result.start, 500);
+        assert_eq!(result.end, -1);
+
+        // Test suffix range: bytes=-500 (last 500 bytes)
+        let result = parse_copy_source_range("bytes=-500").unwrap();
+        assert!(result.is_suffix_length);
+        assert_eq!(result.start, -500);
+        assert_eq!(result.end, -1);
+
+        // Test invalid format
+        assert!(parse_copy_source_range("invalid").is_err());
+        assert!(parse_copy_source_range("bytes=").is_err());
+        assert!(parse_copy_source_range("bytes=abc-def").is_err());
+        assert!(parse_copy_source_range("bytes=100-50").is_err()); // start > end
     }
 }
