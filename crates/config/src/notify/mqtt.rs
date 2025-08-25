@@ -27,7 +27,7 @@ pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
 
 /// A list of all valid configuration keys for an MQTT target.
 pub const NOTIFY_MQTT_KEYS: &[&str] = &[
-    ENABLE_KEY, // "enable" is a common key
+    ENABLE_KEY,
     MQTT_BROKER,
     MQTT_TOPIC,
     MQTT_QOS,

@@ -19,12 +19,13 @@ use crate::auth::{check_key_valid, get_session_token};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
-use rustfs_config::{ENABLE_KEY, EnableState};
+use rustfs_config::{EnableState, ENABLE_KEY};
 use rustfs_notify::rules::{BucketNotificationConfig, PatternRules};
 use rustfs_targets::EventName;
 use s3s::header::CONTENT_LENGTH;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -44,18 +45,30 @@ struct BucketQuery {
 }
 
 /// Set (create or update) a notification target
-pub struct SetNotificationTarget {}
+pub struct NotificationTarget {}
 #[async_trait::async_trait]
-impl Operation for SetNotificationTarget {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+impl Operation for NotificationTarget {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // 1. Analyze query parameters
-        let query: TargetQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
-            .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
 
-        let target_type = query.target_type.to_lowercase();
-        if target_type != *NOTIFY_WEBHOOK_SUB_SYS && target_type != *NOTIFY_MQTT_SUB_SYS {
-            return Err(s3_error!(InvalidArgument, "unsupported target type: {}", query.target_type));
+        let target_type: &str = match params.get("target_type") {
+            Ok(target_type) => target_type,
+            Err(error) => {
+                error!("notification target create params target type failed error: {:#?}", error);
+                return Err(s3_error!(InternalError, "notification system not initialized"));
+            }
+        };
+        if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
+            return Err(s3_error!(InvalidArgument, "unsupported target type: {}", target_type));
         }
+
+        let target_name: &str = match params.get("target_name") {
+            Ok(target_name) => target_name,
+            Err(error) => {
+                error!("notification target create params target name failed error: {:#?}", error);
+                return Err(s3_error!(InternalError, "notification target create params failed error"));
+            }
+        };
 
         // 2. Permission verification
         let Some(input_cred) = &req.credentials else {
@@ -94,13 +107,11 @@ impl Operation for SetNotificationTarget {
         );
 
         // 5. Call notification system to set target configuration
-        info!("Setting target config for type '{}', name '{}'", &query.target_type, &query.target_name);
-        ns.set_target_config(&query.target_type, &query.target_name, kvs)
-            .await
-            .map_err(|e| {
-                error!("failed to set target config: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set target config: {e}"))
-            })?;
+        info!("Setting target config for type '{}', name '{}'", target_type, target_name);
+        ns.set_target_config(target_type, target_name, kvs).await.map_err(|e| {
+            error!("failed to set target config: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set target config: {e}"))
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

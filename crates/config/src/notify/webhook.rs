@@ -24,13 +24,14 @@ pub const WEBHOOK_CLIENT_KEY: &str = "client_key";
 
 /// A list of all valid configuration keys for a webhook target.
 pub const NOTIFY_WEBHOOK_KEYS: &[&str] = &[
-    ENABLE_KEY, // "enable" is a common key
+    ENABLE_KEY,
     WEBHOOK_ENDPOINT,
     WEBHOOK_AUTH_TOKEN,
     WEBHOOK_QUEUE_LIMIT,
     WEBHOOK_QUEUE_DIR,
     WEBHOOK_CLIENT_CERT,
     WEBHOOK_CLIENT_KEY,
+    COMMENT_KEY,
     COMMENT_KEY,
 ];
 
