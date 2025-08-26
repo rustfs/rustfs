@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::{Path, PathBuf};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -45,7 +44,6 @@ use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
-use rustfs_utils::path::path_to_bucket_object_with_base_path;
 
 /// Custom scan mode enum for AHM scanner
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1267,7 +1265,7 @@ impl Scanner {
                     } else {
                         // Apply lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
-                            if let Disk::Local(local_disk) = &**disk {
+                            if let Disk::Local(_local_disk) = &**disk {
                                 let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
                                 let mut scanner_item = ScannerItem {
@@ -1279,17 +1277,17 @@ impl Scanner {
                                 //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
                                 let fivs = match entry.clone().file_info_versions(&scanner_item.bucket) {
                                     Ok(fivs) => fivs,
-                                    Err(err) => {
+                                    Err(_err) => {
                                         stop_fn();
-                                        return Err(Error::other("skip this file").into());
+                                        return Err(Error::other("skip this file"));
                                     }
                                 };
                                 let mut size_s = SizeSummary::default();
                                 let obj_infos = match scanner_item.apply_versions_actions(&fivs.versions).await {
                                     Ok(obj_infos) => obj_infos,
-                                    Err(err) => {
+                                    Err(_err) => {
                                         stop_fn();
-                                        return Err(Error::other("skip this file").into());
+                                        return Err(Error::other("skip this file"));
                                     }
                                 };
 
@@ -1299,6 +1297,7 @@ impl Scanner {
                                     false
                                 };
 
+                                #[allow(unused_assignments)]
                                 let mut obj_deleted = false;
                                 for info in obj_infos.iter() {
                                     let sz: i64;

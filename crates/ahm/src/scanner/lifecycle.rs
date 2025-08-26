@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use rustfs_common::data_usage::SizeSummary;
 use rustfs_common::metrics::IlmAction;
 use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_audit::LcEventSrc,
-    bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState, apply_lifecycle_action, eval_action_from_lifecycle},
+    bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_lifecycle_action, eval_action_from_lifecycle},
     lifecycle,
     lifecycle::Lifecycle,
 };
@@ -33,9 +32,6 @@ use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_filemeta::FileInfo;
-use rustfs_filemeta::FileMetaVersion;
-use rustfs_filemeta::metacache::MetaCacheEntry;
-use rustfs_utils::path::path_join;
 use s3s::dto::BucketLifecycleConfiguration as LifecycleConfig;
 use tracing::info;
 
