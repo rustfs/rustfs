@@ -371,12 +371,12 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-list").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/list").as_str(),
         AdminOperation(&ListNotificationTargets {}),
     )?;
 
     r.insert(
-        Method::POST,
+        Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}:{target_name}").as_str(),
         AdminOperation(&NotificationTarget {}),
     )?;
@@ -388,8 +388,14 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     // * `target_name` - A unique name for a Target, such as "1".
     r.insert(
         Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}:{target_name}/reset").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+    // arns
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
     )?;
 
     r.insert(

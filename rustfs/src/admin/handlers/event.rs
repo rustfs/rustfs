@@ -33,14 +33,6 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 #[derive(Debug, Deserialize)]
-struct TargetQuery {
-    #[serde(rename = "targetType")]
-    target_type: String,
-    #[serde(rename = "targetName")]
-    target_name: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct BucketQuery {
     #[serde(rename = "bucketName")]
     bucket_name: String,
@@ -286,14 +278,77 @@ impl Operation for ListNotificationTargets {
     }
 }
 
+/// Get a list of notification targets for all activities
+pub struct ListTargetsArns {}
+#[async_trait::async_trait]
+impl Operation for ListTargetsArns {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        debug!("ListTargetsArns call start request params: {:?}", req.uri.query());
+
+        // 1. Permission verification
+        let Some(input_cred) = &req.credentials else {
+            return Err(s3_error!(InvalidRequest, "credentials not found"));
+        };
+        let (_cred, _owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        // 2. Get notification system instance
+        let Some(ns) = rustfs_notify::global::notification_system() else {
+            return Err(s3_error!(InternalError, "notification system not initialized"));
+        };
+
+        // 3. Get the list of activity targets
+        let active_targets = ns.get_active_targets().await;
+
+        debug!("ListTargetsArns call found {} active targets", active_targets.len());
+
+        let region = match req.region.clone() {
+            Some(region) => region,
+            None => return Err(s3_error!(InvalidRequest, "region not found")),
+        };
+        let mut data_target_arn_list = Vec::new();
+
+        let mut notification_endpoints = Vec::new();
+        for target_id in active_targets.iter() {
+            data_target_arn_list.push(target_id.to_arn(&region).to_string());
+        }
+
+        let response = NotificationEndpointsResponse { notification_endpoints };
+
+        // 4. Serialize and return the result
+        let data = serde_json::to_vec(&data_target_arn_list)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {e}")))?;
+        debug!("ListTargetsArns call end, response data length: {}", data.len(),);
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+    }
+}
+
 /// Delete a specified notification target
 pub struct RemoveNotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveNotificationTarget {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // 1. Analyze query parameters
-        let query: TargetQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
-            .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
+        let target_type: &str = match params.get("target_type") {
+            Some(target_type) => target_type,
+            None => {
+                error!("notification target create params target type failed");
+                return Err(s3_error!(InternalError, "notification system not initialized"));
+            }
+        };
+        if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
+            return Err(s3_error!(InvalidArgument, "unsupported target type: {}", target_type));
+        }
+
+        let target_name: &str = match params.get("target_name") {
+            Some(target_name) => target_name,
+            None => {
+                error!("notification target create params target name failed");
+                return Err(s3_error!(InternalError, "notification target create params failed error"));
+            }
+        };
 
         // 2. Permission verification
         let Some(input_cred) = &req.credentials else {
