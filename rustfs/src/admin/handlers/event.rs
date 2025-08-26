@@ -157,7 +157,7 @@ impl Operation for NotificationTarget {
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing port"))?;
             let addr = format!("{}:{}", host, port);
             if addr.to_socket_addrs().is_err() {
-                return Err(s3_error!(InvalidArgument, "endpoint tcp connect failed"));
+                return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
             }
             if let Some(queue_dir) = queue_dir_val.clone() {
                 if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
@@ -188,8 +188,14 @@ impl Operation for NotificationTarget {
                     return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
                 }
                 if let Some(qos) = qos_val {
-                    if qos == "0" {
-                        return Err(s3_error!(InvalidArgument, "qos should be 1 or 2 if queue_dir is set"));
+                    match qos.parse::<u8>() {
+                        Ok(qos_int) if qos_int == 1 || qos_int == 2 => {}
+                        Ok(0) => {
+                            return Err(s3_error!(InvalidArgument, "qos should be 1 or 2 if queue_dir is set"));
+                        }
+                        _ => {
+                            return Err(s3_error!(InvalidArgument, "qos must be an integer 0, 1, or 2"));
+                        }
                     }
                 }
             }

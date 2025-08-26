@@ -32,7 +32,6 @@ pub const NOTIFY_WEBHOOK_KEYS: &[&str] = &[
     WEBHOOK_CLIENT_CERT,
     WEBHOOK_CLIENT_KEY,
     COMMENT_KEY,
-    COMMENT_KEY,
 ];
 
 // Webhook Environment Variables
