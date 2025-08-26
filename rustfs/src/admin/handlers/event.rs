@@ -19,11 +19,11 @@ use crate::auth::{check_key_valid, get_session_token};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
-use rustfs_config::{EnableState, ENABLE_KEY};
+use rustfs_config::{ENABLE_KEY, EnableState};
 use rustfs_notify::rules::{BucketNotificationConfig, PatternRules};
 use rustfs_targets::EventName;
 use s3s::header::CONTENT_LENGTH;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
@@ -49,30 +49,25 @@ pub struct NotificationTargetBody {
     pub key_values: Vec<KeyValue>,
 }
 
+#[derive(Serialize)]
+struct NotificationEndpoint {
+    account_id: String,
+    service: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct NotificationEndpointsResponse {
+    notification_endpoints: Vec<NotificationEndpoint>,
+}
+
 /// Set (create or update) a notification target
 pub struct NotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for NotificationTarget {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // 1. Analyze query parameters
-        let target_type: &str = match params.get("target_type") {
-            Some(target_type) => target_type,
-            None => {
-                error!("notification target create params target type failed");
-                return Err(s3_error!(InternalError, "notification system not initialized"));
-            }
-        };
-        if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
-            return Err(s3_error!(InvalidArgument, "unsupported target type: {}", target_type));
-        }
-
-        let target_name: &str = match params.get("target_name") {
-            Some(target_name) => target_name,
-            None => {
-                error!("notification target create params target name failed");
-                return Err(s3_error!(InternalError, "notification target create params failed error"));
-            }
-        };
+        let (target_type, target_name) = extract_target_params(&params)?;
 
         // 2. Permission verification
         let Some(input_cred) = &req.credentials else {
@@ -141,6 +136,7 @@ impl Operation for NotificationTarget {
             if kv.key == "qos" {
                 qos_val = Some(kv.value.clone());
             }
+
             kvs_vec.push(rustfs_ecstore::config::KV {
                 key: kv.key.clone(),
                 value: kv.value.clone(),
@@ -167,7 +163,7 @@ impl Operation for NotificationTarget {
                 if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
                     return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
                 }
-                if !Path::new(&queue_dir).exists() {
+                if tokio::fs::metadata(&queue_dir).await.is_err() {
                     return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
                 }
             }
@@ -188,7 +184,7 @@ impl Operation for NotificationTarget {
                 if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
                     return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
                 }
-                if !Path::new(&queue_dir).exists() {
+                if tokio::fs::metadata(&queue_dir).await.is_err() {
                     return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
                 }
                 if let Some(qos) = qos_val {
@@ -220,18 +216,6 @@ impl Operation for NotificationTarget {
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
-}
-
-#[derive(Serialize)]
-struct NotificationEndpoint {
-    account_id: String,
-    service: String,
-    status: String,
-}
-
-#[derive(Serialize)]
-struct NotificationEndpointsResponse {
-    notification_endpoints: Vec<NotificationEndpoint>,
 }
 
 /// Get a list of notification targets for all activities
@@ -308,12 +292,9 @@ impl Operation for ListTargetsArns {
         };
         let mut data_target_arn_list = Vec::new();
 
-        let mut notification_endpoints = Vec::new();
         for target_id in active_targets.iter() {
             data_target_arn_list.push(target_id.to_arn(&region).to_string());
         }
-
-        let response = NotificationEndpointsResponse { notification_endpoints };
 
         // 4. Serialize and return the result
         let data = serde_json::to_vec(&data_target_arn_list)
@@ -329,26 +310,9 @@ impl Operation for ListTargetsArns {
 pub struct RemoveNotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveNotificationTarget {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // 1. Analyze query parameters
-        let target_type: &str = match params.get("target_type") {
-            Some(target_type) => target_type,
-            None => {
-                error!("notification target create params target type failed");
-                return Err(s3_error!(InternalError, "notification system not initialized"));
-            }
-        };
-        if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
-            return Err(s3_error!(InvalidArgument, "unsupported target type: {}", target_type));
-        }
-
-        let target_name: &str = match params.get("target_name") {
-            Some(target_name) => target_name,
-            None => {
-                error!("notification target create params target name failed");
-                return Err(s3_error!(InternalError, "notification target create params failed error"));
-            }
-        };
+        let (target_type, target_name) = extract_target_params(&params)?;
 
         // 2. Permission verification
         let Some(input_cred) = &req.credentials else {
@@ -363,19 +327,33 @@ impl Operation for RemoveNotificationTarget {
         };
 
         // 4. Call notification system to remove target configuration
-        info!("Removing target config for type '{}', name '{}'", &query.target_type, &query.target_name);
-        ns.remove_target_config(&query.target_type, &query.target_name)
-            .await
-            .map_err(|e| {
-                error!("failed to remove target config: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to remove target config: {e}"))
-            })?;
+        info!("Removing target config for type '{}', name '{}'", target_type, target_name);
+        ns.remove_target_config(target_type, target_name).await.map_err(|e| {
+            error!("failed to remove target config: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to remove target config: {e}"))
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
+}
+
+fn extract_param<'a>(params: &'a Params<'_, '_>, key: &str) -> S3Result<&'a str> {
+    params
+        .get(key)
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: '{}'", key))
+}
+
+fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
+    let target_type = extract_param(params, "target_type")?;
+    if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
+        return Err(s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type));
+    }
+
+    let target_name = extract_param(params, "target_name")?;
+    Ok((target_type, target_name))
 }
 
 /// Set notification rules for buckets
