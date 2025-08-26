@@ -547,6 +547,22 @@ impl FileMeta {
             }
         }
 
+        let mut update_version = false;
+        if fi.version_purge_status().is_empty() && (fi.DeleteMarkerReplicationStatus() == "REPLICA" || fi.DeleteMarkerReplicationStatus().Empty()) {
+            update_version = fi.MarkDeleted;
+        } else {
+          // for replication scenario
+          if fi.deleted && fi.version_purge_status() != replication.VersionPurgeComplete {
+            if !fi.VersionPurgeStatus().Empty() || fi.DeleteMarkerReplicationStatus().Empty() {
+              update_version = true
+            }
+          }
+          // object or delete-marker versioned delete is not complete
+          if !fi.version_purge_status().is_empty() && fi.version_purge_status() != replication.VersionPurgeComplete {
+            update_version = true
+          }
+        }
+
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != fi.version_id {
                 continue;
@@ -556,12 +572,14 @@ impl FileMeta {
                 VersionType::Invalid | VersionType::Legacy => return Err(Error::other("invalid file meta version")),
                 VersionType::Delete => return Ok(None),
                 VersionType::Object => {
-                    let v = self.get_idx(i)?;
+                    if update_version && !fi.deleted {
+                        let v = self.get_idx(i)?;
 
-                    self.versions.remove(i);
+                        self.versions.remove(i);
 
-                    let a = v.object.map(|v| v.data_dir).unwrap_or_default();
-                    return Ok(a);
+                        let a = v.object.map(|v| v.data_dir).unwrap_or_default();
+                        return Ok(a);
+                    }
                 }
             }
         }

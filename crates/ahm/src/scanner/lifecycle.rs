@@ -94,12 +94,7 @@ impl ScannerItem {
 
         if self.lifecycle.is_none() {
             for info in fivs.iter() {
-                object_infos.push(ObjectInfo::from_file_info(
-                    info,
-                    &self.bucket,
-                    &self.object_name,
-                    versioned,
-                ));
+                object_infos.push(ObjectInfo::from_file_info(info, &self.bucket, &self.object_name, versioned));
             }
             return Ok(object_infos);
         }
@@ -117,24 +112,14 @@ impl ScannerItem {
         let lim = event.newer_noncurrent_versions;
         if lim == 0 || fivs.len() <= lim + 1 {
             for fi in fivs.iter() {
-                object_infos.push(ObjectInfo::from_file_info(
-                    fi,
-                    &self.bucket,
-                    &self.object_name,
-                    versioned,
-                ));
+                object_infos.push(ObjectInfo::from_file_info(fi, &self.bucket, &self.object_name, versioned));
             }
             return Ok(object_infos);
         }
 
         let overflow_versions = &fivs[lim + 1..];
         for fi in fivs[..lim + 1].iter() {
-            object_infos.push(ObjectInfo::from_file_info(
-                fi,
-                &self.bucket,
-                &self.object_name,
-                versioned,
-            ));
+            object_infos.push(ObjectInfo::from_file_info(fi, &self.bucket, &self.object_name, versioned));
         }
 
         let mut to_del = Vec::<ObjectToDelete>::with_capacity(overflow_versions.len());

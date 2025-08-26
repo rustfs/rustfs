@@ -1268,16 +1268,11 @@ impl Scanner {
                         // Apply lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
                             if let Disk::Local(local_disk) = &**disk {
-                                let ent_name = Path::new(&entry.name);
-
                                 let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
                                 let mut scanner_item = ScannerItem {
                                     bucket: bucket.to_string(),
-                                    object_name: ent_name
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_default(),
+                                    object_name: entry.name.clone(),
                                     lifecycle: Some(lifecycle_config.clone()),
                                     versioning: versioning_config.clone(),
                                 };
@@ -1309,9 +1304,9 @@ impl Scanner {
                                     let sz: i64;
                                     (obj_deleted, sz) = scanner_item.apply_actions(info, &mut size_s).await;
 
-                                    /*if obj_deleted {
+                                    if obj_deleted {
                                         break;
-                                    }*/
+                                    }
 
                                     let actual_sz = match info.get_actual_size() {
                                         Ok(size) => size,
