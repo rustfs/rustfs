@@ -25,10 +25,12 @@ use rustfs_targets::EventName;
 use s3s::header::CONTENT_LENGTH;
 use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
+use std::path::Path;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 #[derive(Debug, Deserialize)]
 struct TargetQuery {
@@ -44,17 +46,27 @@ struct BucketQuery {
     bucket_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct KeyValue {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NotificationTargetBody {
+    pub key_values: Vec<KeyValue>,
+}
+
 /// Set (create or update) a notification target
 pub struct NotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for NotificationTarget {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // 1. Analyze query parameters
-
         let target_type: &str = match params.get("target_type") {
-            Ok(target_type) => target_type,
-            Err(error) => {
-                error!("notification target create params target type failed error: {:#?}", error);
+            Some(target_type) => target_type,
+            None => {
+                error!("notification target create params target type failed");
                 return Err(s3_error!(InternalError, "notification system not initialized"));
             }
         };
@@ -63,9 +75,9 @@ impl Operation for NotificationTarget {
         }
 
         let target_name: &str = match params.get("target_name") {
-            Ok(target_name) => target_name,
-            Err(error) => {
-                error!("notification target create params target name failed error: {:#?}", error);
+            Some(target_name) => target_name,
+            None => {
+                error!("notification target create params target name failed");
                 return Err(s3_error!(InternalError, "notification target create params failed error"));
             }
         };
@@ -95,16 +107,114 @@ impl Operation for NotificationTarget {
             kvs_map.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
         }
 
-        let kvs = rustfs_ecstore::config::KVS(
-            kvs_map
-                .into_iter()
-                .map(|(key, value)| rustfs_ecstore::config::KV {
-                    key,
-                    value,
-                    hidden_if_empty: false, // Set a default value
-                })
-                .collect(),
-        );
+        // 1. Get the allowed key range
+        let allowed_keys: std::collections::HashSet<&str> = match target_type {
+            NOTIFY_WEBHOOK_SUB_SYS => rustfs_config::notify::NOTIFY_WEBHOOK_KEYS.iter().cloned().collect(),
+            NOTIFY_MQTT_SUB_SYS => rustfs_config::notify::NOTIFY_MQTT_KEYS.iter().cloned().collect(),
+            _ => unreachable!(),
+        };
+
+        let notification_body: NotificationTargetBody = serde_json::from_slice(&body)
+            .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
+
+        // 2. Filter and verify keys, and splice target_name
+        let mut kvs_vec = Vec::new();
+        let mut endpoint_val = None;
+        let mut queue_dir_val = None;
+        let mut client_cert_val = None;
+        let mut client_key_val = None;
+        let mut qos_val = None;
+
+        for kv in notification_body.key_values.iter() {
+            if !allowed_keys.contains(kv.key.as_str()) {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "key '{}' not allowed for target type '{}'",
+                    kv.key,
+                    target_type
+                ));
+            }
+            if kv.key == "endpoint" {
+                endpoint_val = Some(kv.value.clone());
+            }
+            if kv.key == "queue_dir" {
+                queue_dir_val = Some(kv.value.clone());
+            }
+            if kv.key == "client_cert" {
+                client_cert_val = Some(kv.value.clone());
+            }
+            if kv.key == "client_key" {
+                client_key_val = Some(kv.value.clone());
+            }
+            if kv.key == "qos" {
+                qos_val = Some(kv.value.clone());
+            }
+            kvs_vec.push(rustfs_ecstore::config::KV {
+                key: kv.key.clone(),
+                value: kv.value.clone(),
+                hidden_if_empty: false,
+            });
+        }
+
+        if target_type == NOTIFY_WEBHOOK_SUB_SYS {
+            let endpoint = endpoint_val
+                .clone()
+                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
+            let url = Url::parse(&endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing host"))?;
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing port"))?;
+            let addr = format!("{}:{}", host, port);
+            if addr.to_socket_addrs().is_err() {
+                return Err(s3_error!(InvalidArgument, "endpoint tcp connect failed"));
+            }
+            if let Some(queue_dir) = queue_dir_val.clone() {
+                if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
+                    return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
+                }
+                if !Path::new(&queue_dir).exists() {
+                    return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
+                }
+            }
+            if (client_cert_val.is_some() && client_key_val.is_none()) || (client_cert_val.is_none() && client_key_val.is_some())
+            {
+                return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
+            }
+        }
+
+        if target_type == NOTIFY_MQTT_SUB_SYS {
+            let endpoint = endpoint_val.ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
+            let url = Url::parse(&endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+            match url.scheme() {
+                "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" => {}
+                _ => return Err(s3_error!(InvalidArgument, "unsupported broker url scheme")),
+            }
+            if let Some(queue_dir) = queue_dir_val {
+                if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
+                    return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
+                }
+                if !Path::new(&queue_dir).exists() {
+                    return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
+                }
+                if let Some(qos) = qos_val {
+                    if qos == "0" {
+                        return Err(s3_error!(InvalidArgument, "qos should be 1 or 2 if queue_dir is set"));
+                    }
+                }
+            }
+        }
+
+        // 3. Add ENABLE_KEY
+        kvs_vec.push(rustfs_ecstore::config::KV {
+            key: ENABLE_KEY.to_string(),
+            value: EnableState::On.to_string(),
+            hidden_if_empty: false,
+        });
+
+        let kvs = rustfs_ecstore::config::KVS(kvs_vec);
 
         // 5. Call notification system to set target configuration
         info!("Setting target config for type '{}', name '{}'", target_type, target_name);
@@ -118,6 +228,18 @@ impl Operation for NotificationTarget {
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
+}
+
+#[derive(Serialize)]
+struct NotificationEndpoint {
+    account_id: String,
+    service: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct NotificationEndpointsResponse {
+    notification_endpoints: Vec<NotificationEndpoint>,
 }
 
 /// Get a list of notification targets for all activities
@@ -142,18 +264,20 @@ impl Operation for ListNotificationTargets {
         // 3. Get the list of activity targets
         let active_targets = ns.get_active_targets().await;
 
-        let region = match req.region.clone() {
-            Some(region) => region,
-            None => return Err(s3_error!(InvalidRequest, "region not found")),
-        };
-        let mut data_target_arn_list = Vec::new();
+        debug!("ListNotificationTargets call found {} active targets", active_targets.len());
+        let mut notification_endpoints = Vec::new();
         for target_id in active_targets.iter() {
-            let target_arn = target_id.to_arn(&region);
-            data_target_arn_list.push(target_arn.to_string());
+            notification_endpoints.push(NotificationEndpoint {
+                account_id: target_id.id.clone(),
+                service: target_id.name.to_string(),
+                status: "online".to_string(),
+            });
         }
 
+        let response = NotificationEndpointsResponse { notification_endpoints };
+
         // 4. Serialize and return the result
-        let data = serde_json::to_vec(&data_target_arn_list)
+        let data = serde_json::to_vec(&response)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {e}")))?;
         debug!("ListNotificationTargets call end, response data length: {}", data.len(),);
         let mut header = HeaderMap::new();

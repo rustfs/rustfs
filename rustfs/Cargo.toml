@@ -103,6 +103,7 @@ tower-http = { workspace = true, features = [
     "cors",
     "catch-panic",
 ] }
+url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
