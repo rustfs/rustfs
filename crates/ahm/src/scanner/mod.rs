@@ -17,5 +17,8 @@ pub mod histogram;
 pub mod lifecycle;
 pub mod metrics;
 
-pub use data_scanner::Scanner;
+#[cfg(test)]
+pub mod performance_test;
+
+pub use data_scanner::{Scanner, ScannerConfig, ScannerState};
 pub use metrics::ScannerMetrics;

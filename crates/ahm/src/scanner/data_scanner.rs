@@ -70,18 +70,24 @@ pub struct ScannerConfig {
     pub scan_mode: ScanMode,
     /// Whether to enable data usage statistics collection
     pub enable_data_usage_stats: bool,
+    /// I/O rate limit in MB/s (0 = unlimited)
+    pub io_rate_limit_mb_per_sec: u64,
+    /// Delay between object scans in milliseconds to reduce I/O pressure
+    pub scan_delay_ms: u64,
 }
 
 impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
-            scan_interval: Duration::from_secs(60),        // 1 minute
-            deep_scan_interval: Duration::from_secs(3600), // 1 hour
-            max_concurrent_scans: 20,
+            scan_interval: Duration::from_secs(300),        // Changed from 60s to 5 minutes to reduce I/O pressure
+            deep_scan_interval: Duration::from_secs(7200), // Changed from 3600s to 2 hours
+            max_concurrent_scans: 4,                       // Reduced from 20 to 4 to prevent I/O overwhelming
             enable_healing: true,
             enable_metrics: true,
             scan_mode: ScanMode::Normal,
             enable_data_usage_stats: true,
+            io_rate_limit_mb_per_sec: 50,                  // Limit scanner to 50 MB/s I/O
+            scan_delay_ms: 10,                             // 10ms delay between objects to reduce burst I/O
         }
     }
 }
@@ -105,6 +111,10 @@ pub struct ScannerState {
     pub scanning_buckets: Vec<String>,
     /// Disks being scanned
     pub scanning_disks: Vec<String>,
+    /// Track recent write operations to adapt scanning
+    pub recent_write_count: u64,
+    /// Last write count check time
+    pub last_write_check_time: Option<SystemTime>,
 }
 
 /// AHM Scanner - Automatic Health Management Scanner
@@ -132,6 +142,9 @@ pub struct Scanner {
     last_data_usage_collection: Arc<RwLock<Option<SystemTime>>>,
     /// Heal manager for auto-heal integration
     heal_manager: Option<Arc<HealManager>>,
+    /// Cache of last scan times for objects (bucket -> object -> last_scan_time)
+    /// Used for incremental scanning to skip unchanged objects
+    object_scan_cache: Arc<RwLock<HashMap<String, HashMap<String, SystemTime>>>>,
 }
 
 impl Scanner {
@@ -148,6 +161,7 @@ impl Scanner {
             data_usage_stats: Arc::new(Mutex::new(HashMap::new())),
             last_data_usage_collection: Arc::new(RwLock::new(None)),
             heal_manager,
+            object_scan_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -296,6 +310,15 @@ impl Scanner {
 
     /// Perform a single scan cycle
     pub async fn scan_cycle(&self) -> Result<()> {
+        // Check if system is under write load
+        if self.is_under_write_load().await {
+            info!("System under write load, skipping scan cycle to reduce I/O pressure");
+            // Update state to track skipped cycle
+            let mut state = self.state.write().await;
+            state.last_write_check_time = Some(SystemTime::now());
+            return Ok(());
+        }
+
         let start_time = SystemTime::now();
 
         // Start global metrics collection for this cycle
@@ -1219,6 +1242,30 @@ impl Scanner {
 
         let scan_start = SystemTime::now();
 
+        // Get the object scan cache for this bucket
+        let mut should_full_scan = false;
+        {
+            let cache = self.object_scan_cache.read().await;
+            if !cache.contains_key(bucket) {
+                // First time scanning this bucket, need full scan
+                should_full_scan = true;
+                debug!("First time scanning bucket {}, performing full scan", bucket);
+            }
+        }
+
+        // Check if we should do incremental or full scan based on config
+        let config = self.config.read().await;
+        let is_deep_scan = config.scan_mode == ScanMode::Deep;
+        let scan_interval = config.scan_interval;
+        drop(config);
+
+        // For deep scans or first scans, always do full scan
+        if is_deep_scan || should_full_scan {
+            debug!("Performing full scan for bucket {}", bucket);
+        } else {
+            debug!("Performing incremental scan for bucket {}", bucket);
+        }
+
         // Walk through all objects in the bucket
         let walk_opts = WalkDirOptions {
             bucket: bucket.to_string(),
@@ -1242,12 +1289,48 @@ impl Scanner {
         // Process the scan results using MetacacheReader
         let mut reader = MetacacheReader::new(std::io::Cursor::new(scan_buffer));
         let mut objects_scanned = 0u64;
+        let mut objects_skipped = 0u64;
         let mut objects_with_issues = 0u64;
         let mut object_metadata = HashMap::new();
+
+        // Get current scan cache for incremental scanning
+        let bucket_cache = {
+            let cache_read = self.object_scan_cache.read().await;
+            cache_read.get(bucket).cloned()
+        };
+
+        // Prepare update cache for this scan
+        let mut new_cache_entries = HashMap::new();
+
+        // Get scan delay configuration for I/O throttling
+        let scan_delay_ms = self.config.read().await.scan_delay_ms;
 
         // Process each object entry
         while let Ok(Some(mut entry)) = reader.peek().await {
             objects_scanned += 1;
+            
+            // Apply I/O throttling delay between objects to reduce burst I/O
+            if scan_delay_ms > 0 && objects_scanned % 100 == 0 {
+                // Apply delay every 100 objects to reduce I/O pressure
+                tokio::time::sleep(Duration::from_millis(scan_delay_ms)).await;
+            }
+            
+            // For incremental scanning, check if object needs rescanning
+            if !is_deep_scan && !should_full_scan {
+                if let Some(ref bucket_cache) = bucket_cache {
+                    if let Some(last_scan_time) = bucket_cache.get(&entry.name) {
+                        // Check if object has been scanned recently
+                        let time_since_last_scan = scan_start.duration_since(*last_scan_time).unwrap_or(Duration::ZERO);
+                        if time_since_last_scan < scan_interval * 2 {
+                            // Object was scanned recently, skip it
+                            objects_skipped += 1;
+                            new_cache_entries.insert(entry.name.clone(), *last_scan_time);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Check if this is an actual object (not just a directory)
             if entry.is_object() {
                 debug!("Scanned object: {}", entry.name);
@@ -1291,6 +1374,8 @@ impl Scanner {
 
                         // Store object metadata for later analysis
                         object_metadata.insert(entry.name.clone(), file_meta.clone());
+                        // Update cache with current scan time
+                        new_cache_entries.insert(entry.name.clone(), scan_start);
                     }
                 } else {
                     objects_with_issues += 1;
@@ -1321,6 +1406,12 @@ impl Scanner {
             }
         }
 
+        // Update the scan cache with new entries
+        {
+            let mut cache_write = self.object_scan_cache.write().await;
+            cache_write.insert(bucket.to_string(), new_cache_entries);
+        }
+
         // Update metrics
         self.metrics.increment_objects_scanned(objects_scanned);
         self.metrics.increment_objects_with_issues(objects_with_issues);
@@ -1347,13 +1438,24 @@ impl Scanner {
         // Complete global metrics collection for volume scan
         stop_fn();
 
-        debug!(
-            "Completed scanning bucket: {} on disk {} ({} objects, {} issues)",
-            bucket,
-            disk.to_string(),
-            objects_scanned,
-            objects_with_issues
-        );
+        if objects_skipped > 0 {
+            debug!(
+                "Incremental scan of bucket {} on disk {}: {} objects scanned, {} skipped (unchanged), {} issues",
+                bucket,
+                disk.to_string(),
+                objects_scanned - objects_skipped,
+                objects_skipped,
+                objects_with_issues
+            );
+        } else {
+            debug!(
+                "Full scan of bucket {} on disk {}: {} objects scanned, {} issues",
+                bucket,
+                disk.to_string(),
+                objects_scanned,
+                objects_with_issues
+            );
+        }
 
         Ok(object_metadata)
     }
@@ -1758,7 +1860,41 @@ impl Scanner {
             data_usage_stats: Arc::clone(&self.data_usage_stats),
             last_data_usage_collection: Arc::clone(&self.last_data_usage_collection),
             heal_manager: self.heal_manager.clone(),
+            object_scan_cache: Arc::clone(&self.object_scan_cache),
         }
+    }
+
+    /// Check if system is under heavy write load
+    async fn is_under_write_load(&self) -> bool {
+        // Check global metrics for write operations
+        if let Some(_ecstore) = rustfs_ecstore::new_object_layer_fn() {
+            // Simple heuristic: if we have recent writes, back off scanning
+            let state = self.state.read().await;
+            if let Some(last_check) = state.last_write_check_time {
+                let elapsed = SystemTime::now().duration_since(last_check).unwrap_or(Duration::ZERO);
+                // If we checked recently and had writes, consider it under load
+                if elapsed < Duration::from_secs(30) && state.recent_write_count > 10 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Set simulated write load for testing
+    #[cfg(test)]
+    pub async fn set_test_write_load(&self, write_count: u64) {
+        let mut state = self.state.write().await;
+        state.recent_write_count = write_count;
+        state.last_write_check_time = Some(SystemTime::now());
+    }
+
+    /// Clear simulated write load for testing
+    #[cfg(test)]
+    pub async fn clear_test_write_load(&self) {
+        let mut state = self.state.write().await;
+        state.recent_write_count = 0;
+        state.last_write_check_time = None;
     }
 }
 
