@@ -44,9 +44,7 @@ static SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE: AtomicU64 = AtomicU64::new(102
 
 #[derive(Clone)]
 pub struct ScannerItem {
-    pub path: String,
     pub bucket: String,
-    //pub prefix: String,
     pub object_name: String,
     pub lifecycle: Option<Arc<LifecycleConfig>>,
     pub versioning: Option<Arc<VersioningConfig>>,
@@ -55,9 +53,7 @@ pub struct ScannerItem {
 impl ScannerItem {
     pub fn new(bucket: String, lifecycle: Option<Arc<LifecycleConfig>>, versioning: Option<Arc<VersioningConfig>>) -> Self {
         Self {
-            path: "".to_string(),
             bucket,
-            //prefix: "".to_string(),
             object_name: "".to_string(),
             lifecycle,
             versioning,
@@ -91,7 +87,7 @@ impl ScannerItem {
         let _vcfg = BucketVersioningSys::get(&self.bucket).await?;
 
         let versioned = match BucketVersioningSys::get(&self.bucket).await {
-            Ok(vcfg) => vcfg.versioned(self.object_path().to_str().unwrap_or_default()),
+            Ok(vcfg) => vcfg.versioned(&self.object_name),
             Err(_) => false,
         };
         let mut object_infos = Vec::with_capacity(fivs.len());
@@ -101,7 +97,7 @@ impl ScannerItem {
                 object_infos.push(ObjectInfo::from_file_info(
                     info,
                     &self.bucket,
-                    &self.object_path().to_string_lossy(),
+                    &self.object_name,
                     versioned,
                 ));
             }
@@ -114,7 +110,7 @@ impl ScannerItem {
             .expect("lifecycle err.")
             .clone()
             .noncurrent_versions_expiration_limit(&lifecycle::ObjectOpts {
-                name: self.object_path().to_string_lossy().to_string(),
+                name: self.object_name.clone(),
                 ..Default::default()
             })
             .await;
@@ -124,7 +120,7 @@ impl ScannerItem {
                 object_infos.push(ObjectInfo::from_file_info(
                     fi,
                     &self.bucket,
-                    &self.object_path().to_string_lossy(),
+                    &self.object_name,
                     versioned,
                 ));
             }
@@ -136,14 +132,14 @@ impl ScannerItem {
             object_infos.push(ObjectInfo::from_file_info(
                 fi,
                 &self.bucket,
-                &self.object_path().to_string_lossy(),
+                &self.object_name,
                 versioned,
             ));
         }
 
         let mut to_del = Vec::<ObjectToDelete>::with_capacity(overflow_versions.len());
         for fi in overflow_versions.iter() {
-            let obj = ObjectInfo::from_file_info(fi, &self.bucket, &self.object_path().to_string_lossy(), versioned);
+            let obj = ObjectInfo::from_file_info(fi, &self.bucket, &self.object_name, versioned);
             if lock_enabled && enforce_retention_for_deletion(&obj) {
                 //if enforce_retention_for_deletion(&obj) {
                 /*if self.debug {
@@ -253,9 +249,5 @@ impl ScannerItem {
 
         apply_lifecycle_action(&lc_evt, &LcEventSrc::Scanner, oi).await;
         (lc_evt.action, new_size)
-    }
-
-    pub fn object_path(&self) -> PathBuf {
-        path_join(&[/*PathBuf::from(self.prefix.clone()), */PathBuf::from(self.object_name.clone())])
     }
 }

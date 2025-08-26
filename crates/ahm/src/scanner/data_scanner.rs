@@ -1273,13 +1273,7 @@ impl Scanner {
                                 let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
                                 let mut scanner_item = ScannerItem {
-                                    path: Path::new(&local_disk.root).join(Path::new(bucket)).join(&ent_name).to_string_lossy().to_string(),
                                     bucket: bucket.to_string(),
-                                    /*prefix: Path::new(&"")
-                                        .parent()
-                                        .unwrap_or(Path::new(""))
-                                        .to_string_lossy()
-                                        .to_string(),*/
                                     object_name: ent_name
                                         .file_name()
                                         .map(|name| name.to_string_lossy().into_owned())
@@ -1305,7 +1299,7 @@ impl Scanner {
                                 };
 
                                 let versioned = if let Some(vcfg) = vcfg.as_ref() {
-                                    vcfg.versioned(scanner_item.object_path().to_str().unwrap_or_default())
+                                    vcfg.versioned(&scanner_item.object_name)
                                 } else {
                                     false
                                 };
@@ -1343,7 +1337,7 @@ impl Scanner {
                                     let _obj_info = rustfs_ecstore::store_api::ObjectInfo::from_file_info(
                                         free_version,
                                         &scanner_item.bucket,
-                                        &scanner_item.object_path().to_string_lossy(),
+                                        &scanner_item.object_name,
                                         versioned,
                                     );
                                 }
