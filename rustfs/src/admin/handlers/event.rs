@@ -70,6 +70,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, Error>>,
 {
+    assert!(max_attempts > 0, "max_attempts must be greater than 0");
     let mut attempts = 0;
     let mut delay = base_delay;
     let mut last_err = None;
@@ -89,12 +90,12 @@ where
                         delay
                     );
                     sleep(delay).await;
-                    delay *= 2;
+                    delay = delay.saturating_mul(2);
                 }
             }
         }
     }
-    Err(last_err.expect("retry_with_backoff: last_err should not be None"))
+    Err(last_err.unwrap_or_else(|| Error::new(ErrorKind::Other, "retry_with_backoff: unknown error")))
 }
 
 async fn retry_metadata(path: &str) -> Result<(), Error> {
