@@ -27,8 +27,11 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::C
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::future::Future;
+use std::io::{Error, ErrorKind};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -59,6 +62,58 @@ struct NotificationEndpoint {
 #[derive(Serialize)]
 struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
+}
+
+async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let mut attempts = 0;
+    let mut delay = base_delay;
+
+    while attempts < max_attempts {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                attempts += 1;
+                if attempts == max_attempts {
+                    return Err(e);
+                }
+                tracing::warn!("Retry attempt {} failed: {}. Retrying in {:?}", attempts, e, delay);
+                sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+
+    Err(Error::new(std::io::ErrorKind::Other, "retry_with_backoff failed"))
+}
+
+async fn retry_metadata(path: &str) -> Result<(), Error> {
+    retry_with_backoff(|| async { tokio::fs::metadata(path).await.map(|_| ()) }, 3, Duration::from_millis(100)).await
+}
+
+async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
+    if !queue_dir.is_empty() && !Path::new(queue_dir).is_absolute() {
+        return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
+    }
+    if !queue_dir.is_empty() {
+        if let Err(e) = retry_metadata(queue_dir).await {
+            match e.kind() {
+                ErrorKind::NotFound => {
+                    return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
+                }
+                ErrorKind::PermissionDenied => {
+                    return Err(s3_error!(InvalidArgument, "queue_dir exists but permission denied"));
+                }
+                _ => {
+                    return Err(s3_error!(InvalidArgument, "failed to access queue_dir: {}", e));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Set (create or update) a notification target
@@ -156,16 +211,15 @@ impl Operation for NotificationTarget {
                 .port_or_known_default()
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing port"))?;
             let addr = format!("{}:{}", host, port);
-            if addr.to_socket_addrs().is_err() {
-                return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
+            // First, try to parse as SocketAddr (IP:port)
+            if addr.parse::<SocketAddr>().is_err() {
+                // If not an IP:port, try DNS resolution
+                if addr.to_socket_addrs().is_err() {
+                    return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
+                }
             }
             if let Some(queue_dir) = queue_dir_val.clone() {
-                if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
-                    return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
-                }
-                if tokio::fs::metadata(&queue_dir).await.is_err() {
-                    return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
-                }
+                validate_queue_dir(&queue_dir).await?;
             }
             if (client_cert_val.is_some() && client_key_val.is_none()) || (client_cert_val.is_none() && client_key_val.is_some())
             {
@@ -181,12 +235,7 @@ impl Operation for NotificationTarget {
                 _ => return Err(s3_error!(InvalidArgument, "unsupported broker url scheme")),
             }
             if let Some(queue_dir) = queue_dir_val {
-                if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
-                    return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
-                }
-                if tokio::fs::metadata(&queue_dir).await.is_err() {
-                    return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
-                }
+                validate_queue_dir(&queue_dir).await?;
                 if let Some(qos) = qos_val {
                     match qos.parse::<u8>() {
                         Ok(qos_int) if qos_int == 1 || qos_int == 2 => {}
