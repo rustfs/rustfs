@@ -12,6 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod app;
-pub(crate) mod env;
-pub(crate) mod tls;
+pub mod app;
+pub mod env;
+pub mod tls;

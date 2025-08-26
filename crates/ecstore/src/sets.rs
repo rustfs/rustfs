@@ -165,7 +165,13 @@ impl Sets {
 
             let lock_clients = create_unique_clients(&set_endpoints).await?;
 
-            let namespace_lock = rustfs_lock::NamespaceLock::with_clients(format!("set-{i}"), lock_clients);
+            // Bind lock quorum to EC write quorum for this set: data_shards (+1 if equal to parity) per default_write_quorum()
+            let mut write_quorum = set_drive_count - parity_count;
+            if write_quorum == parity_count {
+                write_quorum += 1;
+            }
+            let namespace_lock =
+                rustfs_lock::NamespaceLock::with_clients_and_quorum(format!("set-{i}"), lock_clients, write_quorum);
 
             let set_disks = SetDisks::new(
                 Arc::new(namespace_lock),
@@ -876,11 +882,15 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object)
-            .verify_object_integrity(bucket, object, opts)
-            .await
+        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
+        let mut reader = gor.stream;
+
+        // Stream data to sink instead of reading all into memory to prevent OOM
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+
+        Ok(())
     }
 }
 

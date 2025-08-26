@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::target::ChannelTargetType;
-use crate::{
-    error::TargetError,
-    factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
-    target::Target,
-};
+use crate::Event;
+use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
 use futures::stream::{FuturesUnordered, StreamExt};
-use rustfs_config::notify::{ENABLE_KEY, NOTIFY_ROUTE_PREFIX};
-use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
+use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
+use rustfs_targets::Target;
+use rustfs_targets::TargetError;
+use rustfs_targets::target::ChannelTargetType;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
@@ -61,7 +60,7 @@ impl TargetRegistry {
         target_type: &str,
         id: String,
         config: &KVS,
-    ) -> Result<Box<dyn Target + Send + Sync>, TargetError> {
+    ) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
         let factory = self
             .factories
             .get(target_type)
@@ -83,7 +82,10 @@ impl TargetRegistry {
     /// 4. Combine the default configuration, file configuration, and environment variable configuration for each instance.
     /// 5. If the instance is enabled, create an asynchronous task for it to instantiate.
     /// 6. Concurrency executes all creation tasks and collects results.
-    pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn Target + Send + Sync>>, TargetError> {
+    pub async fn create_targets_from_config(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<Box<dyn Target<Event> + Send + Sync>>, TargetError> {
         // Collect only environment variables with the relevant prefix to reduce memory usage
         let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
         // A collection of asynchronous tasks for concurrently executing target creation

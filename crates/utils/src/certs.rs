@@ -196,12 +196,13 @@ pub fn create_multi_cert_resolver(
 
 /// Checks if TLS key logging is enabled.
 pub fn tls_key_log() -> bool {
-    env::var(rustfs_config::ENV_TLS_KEYLOG)
+    env::var("RUSTFS_TLS_KEYLOG")
         .map(|v| {
-            v.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
-                || v.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
-                || v.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
-                || v.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(false)
 }

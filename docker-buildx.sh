@@ -150,11 +150,7 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build latest variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        if [ "$CHANNEL" = "dev" ]; then
-            print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/dev/"
-        else
-            print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/release/"
-        fi
+        print_message $YELLOW "   https://github.com/rustfs/rustfs/releases"
         exit 1
     fi
 
@@ -183,11 +179,7 @@ build_and_push() {
         else
             print_message $RED "❌ Failed to build release variant"
             print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-            if [ "$CHANNEL" = "dev" ]; then
-                print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/dev/"
-            else
-                print_message $YELLOW "   https://dl.rustfs.com/artifacts/rustfs/release/"
-            fi
+            print_message $YELLOW "   https://github.com/rustfs/rustfs/releases"
             exit 1
         fi
     else
@@ -248,7 +240,7 @@ done
 # Main execution
 main() {
     print_message $BLUE "🐳 RustFS Docker Buildx Build Script"
-    print_message $YELLOW "📋 Build Strategy: Uses pre-built binaries from dl.rustfs.com"
+    print_message $YELLOW "📋 Build Strategy: Uses pre-built binaries from GitHub Releases"
     print_message $YELLOW "🚀 Production images only - optimized for distribution"
     echo ""
 

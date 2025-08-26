@@ -16,8 +16,10 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::ObjectOptions;
+
+use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
 use rustfs_utils::path::is_dir_object;
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -105,6 +107,32 @@ pub async fn get_opts(
     Ok(opts)
 }
 
+fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> Result<()> {
+    if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
+        let mut preconditions = HTTPPreconditions::default();
+        if let Some(if_none_match) = headers.get("If-None-Match") {
+            preconditions.if_none_match = Some(
+                if_none_match
+                    .to_str()
+                    .map_err(|_| StorageError::other("Invalid If-None-Match header"))?
+                    .to_string(),
+            );
+        }
+        if let Some(if_match) = headers.get("If-Match") {
+            preconditions.if_match = Some(
+                if_match
+                    .to_str()
+                    .map_err(|_| StorageError::other("Invalid If-Match header"))?
+                    .to_string(),
+            );
+        }
+
+        opts.http_preconditions = Some(preconditions);
+    }
+
+    Ok(())
+}
+
 /// Creates options for putting an object in a bucket.
 pub async fn put_opts(
     bucket: &str,
@@ -141,6 +169,14 @@ pub async fn put_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
+
+    Ok(opts)
+}
+
+pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
+    let mut opts = ObjectOptions::default();
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
 }
 
@@ -186,6 +222,15 @@ pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, Str
 
 /// Extracts metadata from headers and returns it as a HashMap.
 pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &mut HashMap<String, String>) {
+    extract_metadata_from_mime_with_object_name(headers, metadata, None);
+}
+
+/// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
+pub fn extract_metadata_from_mime_with_object_name(
+    headers: &HeaderMap<HeaderValue>,
+    metadata: &mut HashMap<String, String>,
+    object_name: Option<&str>,
+) {
     for (k, v) in headers.iter() {
         if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
             if key.is_empty() {
@@ -210,8 +255,40 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
     }
 
     if !metadata.contains_key("content-type") {
-        metadata.insert("content-type".to_owned(), "binary/octet-stream".to_owned());
+        let default_content_type = if let Some(obj_name) = object_name {
+            detect_content_type_from_object_name(obj_name)
+        } else {
+            "binary/octet-stream".to_owned()
+        };
+        metadata.insert("content-type".to_owned(), default_content_type);
     }
+}
+
+/// Detects content type from object name based on file extension.
+pub(crate) fn detect_content_type_from_object_name(object_name: &str) -> String {
+    let lower_name = object_name.to_lowercase();
+
+    // Check for Parquet files specifically
+    if lower_name.ends_with(".parquet") {
+        return "application/vnd.apache.parquet".to_owned();
+    }
+
+    // Special handling for other data formats that mime_guess doesn't know
+    if lower_name.ends_with(".avro") {
+        return "application/avro".to_owned();
+    }
+    if lower_name.ends_with(".orc") {
+        return "application/orc".to_owned();
+    }
+    if lower_name.ends_with(".feather") {
+        return "application/feather".to_owned();
+    }
+    if lower_name.ends_with(".arrow") {
+        return "application/arrow".to_owned();
+    }
+
+    // Use mime_guess for standard file types
+    mime_guess::from_path(object_name).first_or_octet_stream().to_string()
 }
 
 /// List of supported headers.
@@ -228,6 +305,61 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-replication-status",
     ]
 });
+
+/// Parse copy source range string in format "bytes=start-end"
+pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
+    if !range_str.starts_with("bytes=") {
+        return Err(s3_error!(InvalidArgument, "Invalid range format"));
+    }
+
+    let range_part = &range_str[6..]; // Remove "bytes=" prefix
+
+    if let Some(dash_pos) = range_part.find('-') {
+        let start_str = &range_part[..dash_pos];
+        let end_str = &range_part[dash_pos + 1..];
+
+        if start_str.is_empty() && end_str.is_empty() {
+            return Err(s3_error!(InvalidArgument, "Invalid range format"));
+        }
+
+        if start_str.is_empty() {
+            // Suffix range: bytes=-500 (last 500 bytes)
+            let length = end_str
+                .parse::<i64>()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: true,
+                start: -length,
+                end: -1,
+            })
+        } else {
+            let start = start_str
+                .parse::<i64>()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
+
+            let end = if end_str.is_empty() {
+                -1 // Open-ended range: bytes=500-
+            } else {
+                end_str
+                    .parse::<i64>()
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?
+            };
+
+            if start < 0 || (end != -1 && end < start) {
+                return Err(s3_error!(InvalidArgument, "Invalid range format"));
+            }
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: false,
+                start,
+                end,
+            })
+        }
+    } else {
+        Err(s3_error!(InvalidArgument, "Invalid range format"))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -645,5 +777,107 @@ mod tests {
         assert_eq!(metadata.get("source"), Some(&"upload".to_string()));
         assert_eq!(metadata.get("cache-control"), Some(&"public".to_string()));
         assert!(!metadata.contains_key("authorization"));
+    }
+
+    #[test]
+    fn test_extract_metadata_from_mime_with_parquet_object_name() {
+        let headers = HeaderMap::new();
+        let mut metadata = HashMap::new();
+
+        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("data/test.parquet"));
+
+        assert_eq!(metadata.get("content-type"), Some(&"application/vnd.apache.parquet".to_string()));
+    }
+
+    #[test]
+    fn test_extract_metadata_from_mime_with_various_data_formats() {
+        let test_cases = vec![
+            ("data.parquet", "application/vnd.apache.parquet"),
+            ("data.PARQUET", "application/vnd.apache.parquet"), // 测试大小写不敏感
+            ("file.avro", "application/avro"),
+            ("file.orc", "application/orc"),
+            ("file.feather", "application/feather"),
+            ("file.arrow", "application/arrow"),
+            ("file.json", "application/json"),
+            ("file.csv", "text/csv"),
+            ("file.txt", "text/plain"),
+            ("file.unknownext", "application/octet-stream"), // 使用真正未知的扩展名
+        ];
+
+        for (filename, expected_content_type) in test_cases {
+            let headers = HeaderMap::new();
+            let mut metadata = HashMap::new();
+
+            extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some(filename));
+
+            assert_eq!(
+                metadata.get("content-type"),
+                Some(&expected_content_type.to_string()),
+                "Failed for filename: {filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_metadata_from_mime_with_existing_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("custom/type"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("test.parquet"));
+
+        // 应该保留现有的 content-type，不被覆盖
+        assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
+    }
+
+    #[test]
+    fn test_detect_content_type_from_object_name() {
+        // 测试 Parquet 文件（我们的自定义处理）
+        assert_eq!(detect_content_type_from_object_name("test.parquet"), "application/vnd.apache.parquet");
+        assert_eq!(detect_content_type_from_object_name("TEST.PARQUET"), "application/vnd.apache.parquet");
+
+        // 测试其他自定义数据格式
+        assert_eq!(detect_content_type_from_object_name("data.avro"), "application/avro");
+        assert_eq!(detect_content_type_from_object_name("data.orc"), "application/orc");
+        assert_eq!(detect_content_type_from_object_name("data.feather"), "application/feather");
+        assert_eq!(detect_content_type_from_object_name("data.arrow"), "application/arrow");
+
+        // 测试标准格式（mime_guess 处理）
+        assert_eq!(detect_content_type_from_object_name("data.json"), "application/json");
+        assert_eq!(detect_content_type_from_object_name("data.csv"), "text/csv");
+        assert_eq!(detect_content_type_from_object_name("data.txt"), "text/plain");
+
+        // 测试真正未知的格式（使用一个 mime_guess 不认识的扩展名）
+        assert_eq!(detect_content_type_from_object_name("unknown.unknownext"), "application/octet-stream");
+
+        // 测试没有扩展名的文件
+        assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_parse_copy_source_range() {
+        // Test complete range: bytes=0-1023
+        let result = parse_copy_source_range("bytes=0-1023").unwrap();
+        assert!(!result.is_suffix_length);
+        assert_eq!(result.start, 0);
+        assert_eq!(result.end, 1023);
+
+        // Test open-ended range: bytes=500-
+        let result = parse_copy_source_range("bytes=500-").unwrap();
+        assert!(!result.is_suffix_length);
+        assert_eq!(result.start, 500);
+        assert_eq!(result.end, -1);
+
+        // Test suffix range: bytes=-500 (last 500 bytes)
+        let result = parse_copy_source_range("bytes=-500").unwrap();
+        assert!(result.is_suffix_length);
+        assert_eq!(result.start, -500);
+        assert_eq!(result.end, -1);
+
+        // Test invalid format
+        assert!(parse_copy_source_range("invalid").is_err());
+        assert!(parse_copy_source_range("bytes=").is_err());
+        assert!(parse_copy_source_range("bytes=abc-def").is_err());
+        assert!(parse_copy_source_range("bytes=100-50").is_err()); // start > end
     }
 }

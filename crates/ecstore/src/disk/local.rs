@@ -440,6 +440,7 @@ impl LocalDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
+    #[async_recursion::async_recursion]
     pub async fn delete_file(
         &self,
         base_path: &PathBuf,
@@ -803,13 +804,17 @@ impl LocalDisk {
         Ok(())
     }
 
-    async fn scan_dir<W: AsyncWrite + Unpin>(
+    #[async_recursion::async_recursion]
+    async fn scan_dir<W>(
         &self,
         current: &mut String,
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
         let forward = {
             opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
                 let forward = v.trim_start_matches(&*current);
