@@ -29,8 +29,9 @@ use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Error, ErrorKind};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::Path;
+use tokio::net::lookup_host;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -80,14 +81,13 @@ where
                 if attempts == max_attempts {
                     return Err(e);
                 }
-                tracing::warn!("Retry attempt {} failed: {}. Retrying in {:?}", attempts, e, delay);
+                warn!("Retry attempt {} failed: {}. Retrying in {:?}", attempts, e, delay);
                 sleep(delay).await;
                 delay *= 2;
             }
         }
     }
-
-    Err(Error::new(std::io::ErrorKind::Other, "retry_with_backoff failed"))
+    unreachable!()
 }
 
 async fn retry_metadata(path: &str) -> Result<(), Error> {
@@ -214,15 +214,14 @@ impl Operation for NotificationTarget {
             // First, try to parse as SocketAddr (IP:port)
             if addr.parse::<SocketAddr>().is_err() {
                 // If not an IP:port, try DNS resolution
-                if addr.to_socket_addrs().is_err() {
+                if lookup_host(&addr).await.is_err() {
                     return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
                 }
             }
             if let Some(queue_dir) = queue_dir_val.clone() {
                 validate_queue_dir(&queue_dir).await?;
             }
-            if (client_cert_val.is_some() && client_key_val.is_none()) || (client_cert_val.is_none() && client_key_val.is_some())
-            {
+            if client_cert_val.is_some() ^ client_key_val.is_some() {
                 return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
             }
         }
