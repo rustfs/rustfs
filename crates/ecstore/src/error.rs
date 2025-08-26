@@ -187,6 +187,9 @@ pub enum StorageError {
 
     #[error("Lock error: {0}")]
     Lock(#[from] rustfs_lock::LockError),
+
+    #[error("Precondition failed")]
+    PreconditionFailed,
 }
 
 impl StorageError {
@@ -416,6 +419,7 @@ impl Clone for StorageError {
             StorageError::Lock(e) => StorageError::Lock(e.clone()),
             StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
             StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
+            StorageError::PreconditionFailed => StorageError::PreconditionFailed,
         }
     }
 }
@@ -481,6 +485,7 @@ impl StorageError {
             StorageError::Lock(_) => 0x38,
             StorageError::InsufficientReadQuorum(_, _) => 0x39,
             StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
+            StorageError::PreconditionFailed => 0x3B,
         }
     }
 
@@ -548,6 +553,7 @@ impl StorageError {
             0x38 => Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string()))),
             0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
             0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
+            0x3B => Some(StorageError::PreconditionFailed),
             _ => None,
         }
     }

@@ -304,6 +304,12 @@ impl HTTPRangeSpec {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct HTTPPreconditions {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
@@ -326,6 +332,7 @@ pub struct ObjectOptions {
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,
     pub metadata_chg: bool,
+    pub http_preconditions: Option<HTTPPreconditions>,
 
     pub replication_request: bool,
     pub delete_marker: bool,
