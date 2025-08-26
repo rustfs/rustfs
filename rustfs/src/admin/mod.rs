@@ -21,9 +21,10 @@ pub mod utils;
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
     GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
-    event::ListNotificationTargets,
-    event::{GetBucketNotification, RemoveBucketNotification, SetBucketNotification},
-    event::{NotificationTarget, RemoveNotificationTarget},
+    event::{
+        GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
+        SetBucketNotification,
+    },
     group, policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,

@@ -53,14 +53,14 @@ pub struct NotificationTargetBody {
     pub key_values: Vec<KeyValue>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct NotificationEndpoint {
     account_id: String,
     service: String,
     status: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
@@ -72,22 +72,29 @@ where
 {
     let mut attempts = 0;
     let mut delay = base_delay;
+    let mut last_err = None;
 
     while attempts < max_attempts {
         match operation().await {
             Ok(result) => return Ok(result),
             Err(e) => {
+                last_err = Some(e);
                 attempts += 1;
-                if attempts == max_attempts {
-                    return Err(e);
+                if attempts < max_attempts {
+                    warn!(
+                        "Retry attempt {}/{} failed: {}. Retrying in {:?}",
+                        attempts,
+                        max_attempts,
+                        last_err.as_ref().unwrap(),
+                        delay
+                    );
+                    sleep(delay).await;
+                    delay *= 2;
                 }
-                warn!("Retry attempt {} failed: {}. Retrying in {:?}", attempts, e, delay);
-                sleep(delay).await;
-                delay *= 2;
             }
         }
     }
-    unreachable!()
+    Err(last_err.expect("retry_with_backoff: last_err should not be None"))
 }
 
 async fn retry_metadata(path: &str) -> Result<(), Error> {
@@ -95,10 +102,11 @@ async fn retry_metadata(path: &str) -> Result<(), Error> {
 }
 
 async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
-    if !queue_dir.is_empty() && !Path::new(queue_dir).is_absolute() {
-        return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
-    }
     if !queue_dir.is_empty() {
+        if !Path::new(queue_dir).is_absolute() {
+            return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
+        }
+
         if let Err(e) = retry_metadata(queue_dir).await {
             match e.kind() {
                 ErrorKind::NotFound => {
@@ -112,6 +120,14 @@ async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+fn validate_cert_key_pair(cert: &Option<String>, key: &Option<String>) -> S3Result<()> {
+    if cert.is_some() != key.is_some() {
+        return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
     }
     Ok(())
 }
@@ -221,9 +237,7 @@ impl Operation for NotificationTarget {
             if let Some(queue_dir) = queue_dir_val.clone() {
                 validate_queue_dir(&queue_dir).await?;
             }
-            if client_cert_val.is_some() ^ client_key_val.is_some() {
-                return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
-            }
+            validate_cert_key_pair(&client_cert_val, &client_key_val)?;
         }
 
         if target_type == NOTIFY_MQTT_SUB_SYS {
@@ -307,8 +321,10 @@ impl Operation for ListNotificationTargets {
         let response = NotificationEndpointsResponse { notification_endpoints };
 
         // 4. Serialize and return the result
-        let data = serde_json::to_vec(&response)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {e}")))?;
+        let data = serde_json::to_vec(&response).map_err(|e| {
+            error!("Failed to serialize notification targets response: {:?}", response);
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {e}"))
+        })?;
         debug!("ListNotificationTargets call end, response data length: {}", data.len(),);
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
