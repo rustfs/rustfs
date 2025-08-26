@@ -547,21 +547,11 @@ impl FileMeta {
             }
         }
 
-        let mut update_version = false;
-        if fi.version_purge_status().is_empty() && (fi.DeleteMarkerReplicationStatus() == "REPLICA" || fi.DeleteMarkerReplicationStatus().Empty()) {
-            update_version = fi.MarkDeleted;
-        } else {
-          // for replication scenario
-          if fi.deleted && fi.version_purge_status() != replication.VersionPurgeComplete {
-            if !fi.VersionPurgeStatus().Empty() || fi.DeleteMarkerReplicationStatus().Empty() {
-              update_version = true
-            }
-          }
-          // object or delete-marker versioned delete is not complete
-          if !fi.version_purge_status().is_empty() && fi.version_purge_status() != replication.VersionPurgeComplete {
-            update_version = true
-          }
-        }
+        let update_version = false;
+        /*if fi.version_purge_status().is_empty()
+        {
+            update_version = fi.mark_deleted;
+        }*/
 
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != fi.version_id {
