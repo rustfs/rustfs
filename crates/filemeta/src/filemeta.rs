@@ -588,6 +588,7 @@ impl FileMeta {
                 ver.object.as_mut().unwrap().set_transition(fi);
                 ver.object.as_mut().unwrap().reset_inline_data();
                 self.set_idx(i, ver.clone())?;
+                return Ok(None);
             } else {
                 let vers = self.versions[i + 1..].to_vec();
                 self.versions.extend(vers.iter().cloned());

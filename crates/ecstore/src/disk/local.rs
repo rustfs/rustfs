@@ -2130,10 +2130,6 @@ impl DiskAPI for LocalDisk {
                     return Err(err);
                 }
             }
-        } else {
-            if !(!fi.deleted && (err == errFileNotFound || err == errFileVersionNotFound)) {
-                return Err(err);
-            }
         }
 
         if !meta.versions.is_empty() {
