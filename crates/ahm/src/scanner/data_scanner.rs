@@ -20,7 +20,7 @@ use std::{
 };
 
 use ecstore::{
-    disk::{DiskAPI, DiskStore, WalkDirOptions},
+    disk::{Disk, DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
 use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
@@ -1267,91 +1267,92 @@ impl Scanner {
                     } else {
                         // Apply lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
-                            let sub_path = entry.path();
-                            let ent_name = Path::new(&folder.name).join(&sub_path);
+                            if let Disk::Local(local_disk) = &**disk {
+                                let ent_name = Path::new(&entry.name);
 
-                            let vcfg = BucketVersioningSys::get(bucket).await.ok();
+                                let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
-                            let mut scanner_item = ScannerItem {
-                                //path: Path::new(&self.root).join(&ent_name).to_string_lossy().to_string(),
-                                bucket: bucket.to_string(),
-                                prefix: Path::new(&prefix)
-                                    .parent()
-                                    .unwrap_or(Path::new(""))
-                                    .to_string_lossy()
-                                    .to_string(),
-                                object_name: ent_name
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
-                                lifecycle: Some(lifecycle_config.clone()),
-                                versioning: versioning_config.clone(),
-                            };
-                            //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
-                            let fivs = match entry.clone().file_info_versions(&scanner_item.bucket) {
-                                Ok(fivs) => fivs,
-                                Err(err) => {
-                                    stop_fn();
-                                    return Err(Error::other("skip this file").into());
-                                }
-                            };
-                            let mut size_s = SizeSummary::default();
-                            let obj_infos = match scanner_item.apply_versions_actions(&fivs.versions).await {
-                                Ok(obj_infos) => obj_infos,
-                                Err(err) => {
-                                    stop_fn();
-                                    return Err(Error::other("skip this file").into());
-                                }
-                            };
-
-                            let versioned = if let Some(vcfg) = vcfg.as_ref() {
-                                vcfg.versioned(scanner_item.object_path().to_str().unwrap_or_default())
-                            } else {
-                                false
-                            };
-
-                            let mut obj_deleted = false;
-                            for info in obj_infos.iter() {
-                                let sz: i64;
-                                (obj_deleted, sz) = scanner_item.apply_actions(info, &mut size_s).await;
-
-                                /*if obj_deleted {
-                                    break;
-                                }*/
-
-                                let actual_sz = match info.get_actual_size() {
-                                    Ok(size) => size,
-                                    Err(_) => continue,
+                                let mut scanner_item = ScannerItem {
+                                    path: Path::new(&local_disk.root).join(Path::new(bucket)).join(&ent_name).to_string_lossy().to_string(),
+                                    bucket: bucket.to_string(),
+                                    /*prefix: Path::new(&"")
+                                        .parent()
+                                        .unwrap_or(Path::new(""))
+                                        .to_string_lossy()
+                                        .to_string(),*/
+                                    object_name: ent_name
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_default(),
+                                    lifecycle: Some(lifecycle_config.clone()),
+                                    versioning: versioning_config.clone(),
+                                };
+                                //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
+                                let fivs = match entry.clone().file_info_versions(&scanner_item.bucket) {
+                                    Ok(fivs) => fivs,
+                                    Err(err) => {
+                                        stop_fn();
+                                        return Err(Error::other("skip this file").into());
+                                    }
+                                };
+                                let mut size_s = SizeSummary::default();
+                                let obj_infos = match scanner_item.apply_versions_actions(&fivs.versions).await {
+                                    Ok(obj_infos) => obj_infos,
+                                    Err(err) => {
+                                        stop_fn();
+                                        return Err(Error::other("skip this file").into());
+                                    }
                                 };
 
-                                if info.delete_marker {
-                                    size_s.delete_markers += 1;
+                                let versioned = if let Some(vcfg) = vcfg.as_ref() {
+                                    vcfg.versioned(scanner_item.object_path().to_str().unwrap_or_default())
+                                } else {
+                                    false
+                                };
+
+                                let mut obj_deleted = false;
+                                for info in obj_infos.iter() {
+                                    let sz: i64;
+                                    (obj_deleted, sz) = scanner_item.apply_actions(info, &mut size_s).await;
+
+                                    /*if obj_deleted {
+                                        break;
+                                    }*/
+
+                                    let actual_sz = match info.get_actual_size() {
+                                        Ok(size) => size,
+                                        Err(_) => continue,
+                                    };
+
+                                    if info.delete_marker {
+                                        size_s.delete_markers += 1;
+                                    }
+
+                                    if info.version_id.is_some() && sz == actual_sz {
+                                        size_s.versions += 1;
+                                    }
+
+                                    size_s.total_size += sz as usize;
+
+                                    if info.delete_marker {
+                                        continue;
+                                    }
                                 }
 
-                                if info.version_id.is_some() && sz == actual_sz {
-                                    size_s.versions += 1;
+                                for free_version in fivs.free_versions.iter() {
+                                    let _obj_info = rustfs_ecstore::store_api::ObjectInfo::from_file_info(
+                                        free_version,
+                                        &scanner_item.bucket,
+                                        &scanner_item.object_path().to_string_lossy(),
+                                        versioned,
+                                    );
                                 }
 
-                                size_s.total_size += sz as usize;
-
-                                if info.delete_marker {
-                                    continue;
-                                }
+                                // todo: global trace
+                                /*if obj_deleted {
+                                    return Err(Error::other(ERR_IGNORE_FILE_CONTRIB).into());
+                                }*/
                             }
-
-                            for free_version in fivs.free_versions.iter() {
-                                let _obj_info = rustfs_ecstore::store_api::ObjectInfo::from_file_info(
-                                    free_version,
-                                    &scanner_item.bucket,
-                                    &scanner_item.object_path().to_string_lossy(),
-                                    versioned,
-                                );
-                            }
-
-                            // todo: global trace
-                            /*if obj_deleted {
-                                return Err(Error::other(ERR_IGNORE_FILE_CONTRIB).into());
-                            }*/
                         }
 
                         // Store object metadata for later analysis

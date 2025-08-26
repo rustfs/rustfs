@@ -44,8 +44,9 @@ static SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE: AtomicU64 = AtomicU64::new(102
 
 #[derive(Clone)]
 pub struct ScannerItem {
+    pub path: String,
     pub bucket: String,
-    pub prefix: String,
+    //pub prefix: String,
     pub object_name: String,
     pub lifecycle: Option<Arc<LifecycleConfig>>,
     pub versioning: Option<Arc<VersioningConfig>>,
@@ -54,8 +55,9 @@ pub struct ScannerItem {
 impl ScannerItem {
     pub fn new(bucket: String, lifecycle: Option<Arc<LifecycleConfig>>, versioning: Option<Arc<VersioningConfig>>) -> Self {
         Self {
+            path: "".to_string(),
             bucket,
-            prefix: "".to_string(),
+            //prefix: "".to_string(),
             object_name: "".to_string(),
             lifecycle,
             versioning,
@@ -254,6 +256,6 @@ impl ScannerItem {
     }
 
     pub fn object_path(&self) -> PathBuf {
-        path_join(&[PathBuf::from(self.prefix.clone()), PathBuf::from(self.object_name.clone())])
+        path_join(&[/*PathBuf::from(self.prefix.clone()), */PathBuf::from(self.object_name.clone())])
     }
 }
