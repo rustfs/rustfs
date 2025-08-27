@@ -95,7 +95,7 @@ where
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| Error::new(ErrorKind::Other, "retry_with_backoff: unknown error")))
+    Err(last_err.unwrap_or_else(|| Error::other("retry_with_backoff: unknown error")))
 }
 
 async fn retry_metadata(path: &str) -> Result<(), Error> {
