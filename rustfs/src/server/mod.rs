@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod handlers;
 mod audit;
+mod handlers;
 mod http;
 mod hybrid;
 mod layer;
