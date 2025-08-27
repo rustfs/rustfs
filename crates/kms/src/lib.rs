@@ -16,7 +16,7 @@
 //! # RustFS Key Management Service (KMS)
 //!
 //! This crate provides a Key Management Service (KMS) abstraction for RustFS,
-//! supporting multiple backend implementations including HashiCorp Vault through rusty_vault.
+//! supporting multiple backend implementations including Vault through rusty_vault.
 
 mod bucket_encryption;
 mod bucket_encryption_manager;

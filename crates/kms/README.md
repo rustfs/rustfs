@@ -1,11 +1,11 @@
 # RustFS Key Management Service (KMS)
 
-RustFS KMS 是一个为 RustFS 项目设计的企业级密钥管理服务，提供安全的密钥存储、轮换、审计和访问控制功能。它支持多种后端实现，包括通过 `rusty_vault` 集成 HashiCorp Vault。
+RustFS KMS 是一个为 RustFS 项目设计的企业级密钥管理服务，提供安全的密钥存储、轮换、审计和访问控制功能。它支持多种后端实现，包括通过 `rusty_vault` 集成 Vault。
 
 ## ✨ 功能特性
 
 - 🔐 **统一的密钥管理接口** - 支持多种 KMS 后端的抽象接口
-- 🏦 **HashiCorp Vault 集成** - 通过 `rusty_vault` 支持企业级 Vault 功能
+- 🏦 **Vault 集成** - 通过 `rusty_vault` 支持企业级 Vault 功能
 - 📁 **本地文件系统 KMS** - 用于开发和测试的简单实现
 - 🔄 **密钥轮换** - 支持定期密钥轮换和版本管理
 - 📊 **审计日志** - 完整的操作审计和追踪
@@ -191,7 +191,7 @@ let local_config = KmsConfig::local(PathBuf::from("./keys"));
 let env_config = KmsConfig::from_env()?;
 ```
 
-## 🔧 HashiCorp Vault 集成
+## 🔧 Vault 集成
 
 ### Vault 服务器设置
 
@@ -487,6 +487,6 @@ cargo run --example rustfs_admin_api
 
 - [RustFS 主项目](../../README.md)
 - [MinIO KMS 文档](https://min.io/docs/minio/linux/reference/minio-mc-admin/mc-admin-kms-key.html)
-- [HashiCorp Vault 文档](https://www.vaultproject.io/docs)
+- [Vault 文档](https://www.vaultproject.io/docs)
 - [rusty_vault 项目](https://github.com/Tongsuo-Project/RustyVault)
 - [Rust 异步编程](https://rust-lang.github.io/async-book/) 

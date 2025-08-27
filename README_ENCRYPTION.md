@@ -5,7 +5,7 @@ A comprehensive object encryption system for RustFS that provides transparent, s
 ## 🔐 Features
 
 - **Multiple Encryption Algorithms**: Support for AES-256-GCM and ChaCha20-Poly1305
-- **KMS Integration**: Seamless integration with Key Management Services (Local KMS, HashiCorp Vault)
+- **KMS Integration**: Seamless integration with Key Management Services (Local KMS, Vault)
 - **Bucket-Level Configuration**: Per-bucket encryption policies and settings
 - **Streaming Encryption**: Efficient encryption for large objects with minimal memory usage
 - **Performance Optimizations**: Caching, parallel processing, and connection pooling

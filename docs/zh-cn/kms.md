@@ -22,7 +22,7 @@
 
 ### 请求体字段说明
 - kms_type: 字符串，必填。可选值：
-  - "vault"：使用 HashiCorp Vault Transit 引擎
+  - "vault"：使用 Vault Transit 引擎
   - "local"：使用内置本地 KMS（开发/测试）
 - vault_address: 字符串，kms_type=vault 时必填。Vault 的 HTTP(S) 地址，例如 https://vault.example.com。
 - vault_token: 字符串，可选。当提供该字段时使用 Token 认证。

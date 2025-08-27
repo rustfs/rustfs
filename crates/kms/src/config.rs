@@ -22,7 +22,7 @@ use url::Url;
 /// KMS backend type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KmsType {
-    /// HashiCorp Vault via rusty_vault
+    /// Vault via rusty_vault
     Vault,
     /// Local file-based KMS for development
     Local,
@@ -77,7 +77,7 @@ impl Default for KmsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendConfig {
-    /// HashiCorp Vault configuration
+    /// Vault configuration
     Vault(Box<VaultConfig>),
     /// Local KMS configuration
     Local(LocalConfig),
@@ -95,7 +95,7 @@ impl Default for BackendConfig {
     }
 }
 
-/// HashiCorp Vault configuration
+/// Vault configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
     /// Vault server URL

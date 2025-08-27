@@ -21,7 +21,7 @@ Endpoint:
 
 Request body fields
 - kms_type: string, required. One of:
-  - "vault": HashiCorp Vault Transit engine
+  - "vault": Vault Transit engine
   - "local": built-in local KMS (dev/test)
 - vault_address: string, required when kms_type=vault. Vault HTTP(S) URL.
 - vault_token: string, optional. Use Token auth when provided.
