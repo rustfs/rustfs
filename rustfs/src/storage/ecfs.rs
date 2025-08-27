@@ -30,6 +30,7 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use md5::Digest;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
@@ -517,8 +518,10 @@ impl S3 for FS {
                 }
                 if let Some(md5_hdr) = req.headers.get("x-amz-copy-source-server-side-encryption-customer-key-md5") {
                     if let Ok(md5_b64) = md5_hdr.to_str() {
-                        let sum = md5::compute(&key);
-                        let calc_b64 = base64::engine::general_purpose::STANDARD.encode(sum.0);
+                        let mut hasher = md5::Md5::new();
+                        hasher.update(&key);
+                        let sum = hasher.finalize();
+                        let calc_b64 = base64::engine::general_purpose::STANDARD.encode(sum);
                         if calc_b64 != md5_b64 {
                             return Err(s3_error!(InvalidArgument, "SSE-C source key MD5 mismatch"));
                         }
@@ -1278,8 +1281,10 @@ impl S3 for FS {
                 }
                 if let Some(md5_hdr) = req.headers.get("x-amz-server-side-encryption-customer-key-md5") {
                     if let Ok(md5_b64) = md5_hdr.to_str() {
-                        let sum = md5::compute(&key_bytes);
-                        let calc_b64 = base64::engine::general_purpose::STANDARD.encode(sum.0);
+                        let mut hasher = md5::Md5::new();
+                        hasher.update(&key_bytes);
+                        let sum = hasher.finalize();
+                        let calc_b64 = base64::engine::general_purpose::STANDARD.encode(sum);
                         if calc_b64 != md5_b64 {
                             return Err(s3_error!(InvalidArgument, "SSE-C key MD5 mismatch"));
                         }
@@ -1882,8 +1887,10 @@ impl S3 for FS {
                 }
                 if let Some(md5_hdr) = req.headers.get("x-amz-server-side-encryption-customer-key-md5") {
                     if let Ok(md5_b64) = md5_hdr.to_str() {
-                        let sum = md5::compute(&key_bytes);
-                        let calc_b64 = base64::engine::general_purpose::STANDARD.encode(sum.0);
+                        let mut hasher = md5::Md5::new();
+                        hasher.update(&key_bytes);
+                        let sum = hasher.finalize();
+                        let calc_b64 = base64::engine::general_purpose::STANDARD.encode(sum);
                         if calc_b64 != md5_b64 {
                             return Err(s3_error!(InvalidArgument, "SSE-C key MD5 mismatch"));
                         }
