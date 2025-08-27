@@ -341,9 +341,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypt_decrypt_roundtrip() {
-        let mut config = KmsConfig::default();
-        config.kms_type = crate::config::KmsType::Local;
-        config.default_key_id = Some("default".to_string());
+    // Use a unique temp directory for local KMS to avoid interference across tests/runs
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let mut config = KmsConfig::local(tmp.path().to_path_buf());
+    config.default_key_id = Some("default".to_string());
         let kms_manager = KmsManager::new(config.clone()).await.expect("Failed to create KMS manager");
 
         // Create default key if it doesn't exist
@@ -409,9 +410,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_decrypt_rejects_legacy_public_keys() {
-        let mut config = crate::config::KmsConfig::default();
-        config.kms_type = crate::config::KmsType::Local;
-        config.default_key_id = Some("default".to_string());
+    // Use a unique temp directory for local KMS to avoid interference across tests/runs
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let mut config = crate::config::KmsConfig::local(tmp.path().to_path_buf());
+    config.default_key_id = Some("default".to_string());
         let kms_manager = KmsManager::new(config.clone()).await.expect("Failed to create KMS manager");
 
         if kms_manager.describe_key("default", None).await.is_err() {
