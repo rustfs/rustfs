@@ -12,9 +12,11 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use std::collections::HashSet;
-use async_trait::async_trait;
 use crate::entity::AuditEntry;
+use async_trait::async_trait;
+use rustfs_ecstore::config::KVS;
+use std::collections::HashSet;
+pub type AuditLoggerError = anyhow::Error;
 
 #[async_trait]
 pub trait AuditTargetFactory: Send + Sync {

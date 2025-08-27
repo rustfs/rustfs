@@ -13,6 +13,7 @@
 //  limitations under the License.
 
 use crate::entity::AuditEntry;
+use crate::global::audit_logger;
 
 pub struct Notifier {}
 

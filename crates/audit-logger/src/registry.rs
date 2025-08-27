@@ -12,14 +12,36 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use crate::factory::{AuditLoggerError, AuditTarget, AuditTargetFactory};
 use std::collections::HashMap;
-use crate::factory::{AuditTarget, AuditTargetFactory};
 
 pub struct TargetRegistry {
     factories: HashMap<String, Box<dyn AuditTargetFactory>>,
 }
 
 impl TargetRegistry {
-    pub fn register(&mut self, target_type: &str, factory: Box<dyn AuditTargetFactory>) { ... }
-    pub async fn create_targets_from_config(&self, config: &Config) -> Result<Vec<Box<dyn AuditTarget + Send + Sync>>, AuditLoggerError> { ... }
+    pub fn new() -> Self {
+        Self {
+            factories: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, target_type: &str, factory: Box<dyn AuditTargetFactory>) {
+        self.factories.insert(target_type.to_string(), factory);
+    }
+
+    pub async fn create_targets_from_config(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<Box<dyn AuditTarget + Send + Sync>>, AuditLoggerError> {
+        let mut targets = Vec::new();
+        for target_cfg in &config.targets {
+            if let Some(factory) = self.factories.get(&target_cfg.target_type) {
+                let kvs = serde_json::from_value(target_cfg.params.clone())?;
+                let target = factory.create_target(target_cfg.id.clone(), &kvs).await?;
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    }
 }

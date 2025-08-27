@@ -12,16 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-// src/config.rs
-pub struct ConfigManager {
-    // 负责合并 ENV、系统配置、默认配置
-}
+pub use rustfs_ecstore::config::Config;
+
+pub struct ConfigManager;
 
 impl ConfigManager {
     pub fn load() -> Config {
         // 1. 读取 ENV
-        // 2. 读取系统配置
+        // 2. 读取系统配置文件（如 .rustfs.sys）
         // 3. 合并默认配置
-        // 4. 返回最终配置
+        // 这里只做伪实现，实际应合并多源
+        Config::default()
     }
 }

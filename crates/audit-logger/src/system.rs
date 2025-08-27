@@ -12,19 +12,37 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use crate::config::Config;
 use crate::entity::AuditEntry;
-use crate::factory::AuditTarget;
+use crate::factory::{AuditLoggerError, AuditTarget};
 use crate::registry::TargetRegistry;
 
 pub struct AuditLoggerSystem {
     registry: TargetRegistry,
     targets: Vec<Box<dyn AuditTarget + Send + Sync>>,
-    // 其他状态
 }
 
 impl AuditLoggerSystem {
-    pub fn new(config: Config) -> Self { ... }
-    pub async fn init(&self) -> Result<(), AuditLoggerError> { ... }
-    pub async fn reload_config(&self, config: Config) -> Result<(), AuditLoggerError> { ... }
-    pub async fn log(&self, entry: AuditEntry) { ... }
+    pub fn new(config: Config, registry: TargetRegistry) -> Self {
+        Self {
+            registry,
+            targets: Vec::new(),
+        }
+    }
+
+    pub async fn init(&mut self, config: &Config) -> Result<(), AuditLoggerError> {
+        self.targets = self.registry.create_targets_from_config(config).await?;
+        Ok(())
+    }
+
+    pub async fn reload_config(&mut self, config: &Config) -> Result<(), AuditLoggerError> {
+        self.targets = self.registry.create_targets_from_config(config).await?;
+        Ok(())
+    }
+
+    pub async fn log(&self, entry: AuditEntry) {
+        for target in &self.targets {
+            let _ = target.save(entry.clone()).await;
+        }
+    }
 }

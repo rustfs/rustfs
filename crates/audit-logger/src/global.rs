@@ -12,19 +12,21 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-// src/global.rs
-use once_cell::sync::OnceLock;
-use std::sync::{Arc, OnceLock};
+use crate::config::Config;
 use crate::system::AuditLoggerSystem;
+use std::sync::{Arc, OnceLock};
 
 static AUDIT_LOGGER_SYSTEM: OnceLock<Arc<AuditLoggerSystem>> = OnceLock::new();
 
-pub async fn initialize(config: Config) -> Result<(), AuditLoggerError> {
-    let system = AuditLoggerSystem::new(config);
-    system.init().await?;
+pub async fn initialize(
+    config: Config,
+    registry: crate::registry::TargetRegistry,
+) -> Result<(), crate::factory::AuditLoggerError> {
+    let mut system = AuditLoggerSystem::new(config.clone(), registry);
+    system.init(&config).await?;
     AUDIT_LOGGER_SYSTEM
         .set(Arc::new(system))
-        .map_err(|_| AuditLoggerError::AlreadyInitialized)
+        .map_err(|_| anyhow::anyhow!("AlreadyInitialized"))
 }
 
 pub fn audit_logger() -> Option<Arc<AuditLoggerSystem>> {

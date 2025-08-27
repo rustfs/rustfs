@@ -19,3 +19,6 @@ mod global;
 mod notifier;
 mod registry;
 mod system;
+
+pub use entity::*;
+pub use notifier::Notifier;

@@ -5667,9 +5667,11 @@ dependencies = [
 name = "rustfs-audit-logger"
 version = "0.0.5"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "once_cell",
+ "rustfs-ecstore",
  "rustfs-targets",
  "serde",
  "serde_json",
