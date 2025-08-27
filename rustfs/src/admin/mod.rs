@@ -20,16 +20,15 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    bucket_meta, group, policies, pools, rebalance,
+    GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
+    event::{
+        GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
+        SetBucketNotification,
+    },
+    group, policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
-
-use crate::admin::handlers::event::{
-    GetBucketNotification, ListNotificationTargets, RemoveBucketNotification, RemoveNotificationTarget, SetBucketNotification,
-    SetNotificationTarget,
-};
-use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
@@ -371,14 +370,14 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-list").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/list").as_str(),
         AdminOperation(&ListNotificationTargets {}),
     )?;
 
     r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-set").as_str(),
-        AdminOperation(&SetNotificationTarget {}),
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}").as_str(),
+        AdminOperation(&NotificationTarget {}),
     )?;
 
     // Remove notification target
@@ -388,8 +387,14 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     // * `target_name` - A unique name for a Target, such as "1".
     r.insert(
         Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/reset").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+    // arns
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
     )?;
 
     r.insert(
