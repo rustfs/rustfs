@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-audit-logger"
+name = "rustfs-audit"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,7 +21,7 @@ rust-version.workspace = true
 version.workspace = true
 homepage.workspace = true
 description = "Audit logging system for RustFS, providing detailed logging of file operations and system events."
-documentation = "https://docs.rs/audit-logger/latest/audit_logger/"
+documentation = "https://docs.rs/rustfs-audit/latest/rustfs_audit/"
 keywords = ["audit", "logging", "file-operations", "system-events", "RustFS"]
 categories = ["web-programming", "development-tools::profiling", "asynchronous", "api-bindings", "development-tools::debugging"]
 
@@ -34,12 +34,12 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
-tracing-core = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 url = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 once_cell = { workspace = true }
+futures = { workspace = true }
 
 [lints]
 workspace = true

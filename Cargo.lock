@@ -5580,7 +5580,7 @@ dependencies = [
  "rust-embed",
  "rustfs-ahm",
  "rustfs-appauth",
- "rustfs-audit-logger",
+ "rustfs-audit",
  "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",
@@ -5664,12 +5664,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustfs-audit-logger"
+name = "rustfs-audit"
 version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "once_cell",
  "rustfs-ecstore",
  "rustfs-targets",
@@ -5678,7 +5679,6 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tracing",
- "tracing-core",
  "url",
  "uuid",
 ]

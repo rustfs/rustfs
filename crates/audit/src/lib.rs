@@ -12,15 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::entity::AuditEntry;
-use crate::global::audit_logger;
+mod entity;
+mod error;
+mod global;
+mod registry;
+mod system;
 
-pub struct Notifier {}
-
-impl Notifier {
-    pub async fn log(&self, entry: AuditEntry) {
-        if let Some(system) = audit_logger() {
-            system.log(entry).await;
-        }
-    }
-}
+pub use entity::*;
+pub use error::AuditError;
+pub use global::{audit_logger, initialize, AuditLogger};
+pub use registry::{AuditTargetFactory, TargetRegistry};
+pub use system::AuditSystem;

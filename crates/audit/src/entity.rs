@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// ObjectVersion object version key/versionId
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ObjectVersion {
     #[serde(rename = "objectName")]
     pub object_name: String,
@@ -27,7 +27,7 @@ pub struct ObjectVersion {
 }
 
 /// AuditEntry - audit entry logs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuditEntry {
     pub version: String,
     #[serde(rename = "deploymentid", skip_serializing_if = "Option::is_none")]
@@ -71,7 +71,7 @@ pub struct AuditEntry {
 }
 
 /// API details within the audit entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApiDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
