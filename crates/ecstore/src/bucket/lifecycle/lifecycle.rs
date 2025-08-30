@@ -25,6 +25,7 @@ use s3s::dto::{
 use std::cmp::Ordering;
 use std::env;
 use std::fmt::Display;
+use std::sync::Arc;
 use time::macros::{datetime, offset};
 use time::{self, Duration, OffsetDateTime};
 use tracing::info;
@@ -138,7 +139,7 @@ pub trait Lifecycle {
     async fn eval(&self, obj: &ObjectOpts) -> Event;
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event;
     //fn set_prediction_headers(&self, w: http.ResponseWriter, obj: ObjectOpts);
-    async fn noncurrent_versions_expiration_limit(&self, obj: &ObjectOpts) -> Event;
+    async fn noncurrent_versions_expiration_limit(self: Arc<Self>, obj: &ObjectOpts) -> Event;
 }
 
 #[async_trait::async_trait]
@@ -322,9 +323,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             });
                             break;
                         }
-                    }
 
-                    if let Some(expiration) = rule.expiration.as_ref() {
                         if let Some(days) = expiration.days {
                             let expected_expiry = expected_expiry_time(obj.mod_time.expect("err!"), days /*, date*/);
                             if now.unix_timestamp() == 0 || now.unix_timestamp() > expected_expiry.unix_timestamp() {
@@ -538,7 +537,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         Event::default()
     }
 
-    async fn noncurrent_versions_expiration_limit(&self, obj: &ObjectOpts) -> Event {
+    async fn noncurrent_versions_expiration_limit(self: Arc<Self>, obj: &ObjectOpts) -> Event {
         if let Some(filter_rules) = self.filter_rules(obj).await {
             for rule in filter_rules.iter() {
                 if let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration {
@@ -626,7 +625,7 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
         .to_offset(offset!(-0:00:00))
         .saturating_add(Duration::days(days as i64));
     let mut hour = 3600;
-    if let Ok(env_ilm_hour) = env::var("_RUSTFS_ILM_HOUR") {
+    if let Ok(env_ilm_hour) = env::var("_RUSTFS_ILM_PROCESS_TIME") {
         if let Ok(num_hour) = env_ilm_hour.parse::<usize>() {
             hour = num_hour;
         }

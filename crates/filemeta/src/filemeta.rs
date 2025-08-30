@@ -540,6 +540,15 @@ impl FileMeta {
             }
         }
 
+        let mut update_version = fi.mark_deleted;
+        /*if fi.version_purge_status().is_empty()
+        {
+            update_version = fi.mark_deleted;
+        }*/
+        if fi.transition_status == TRANSITION_COMPLETE {
+            update_version = false;
+        }
+
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != fi.version_id {
                 continue;
@@ -557,12 +566,14 @@ impl FileMeta {
                     return Ok(None);
                 }
                 VersionType::Object => {
-                    let v = self.get_idx(i)?;
+                    if update_version && !fi.deleted {
+                        let v = self.get_idx(i)?;
 
-                    self.versions.remove(i);
+                        self.versions.remove(i);
 
-                    let a = v.object.map(|v| v.data_dir).unwrap_or_default();
-                    return Ok(a);
+                        let a = v.object.map(|v| v.data_dir).unwrap_or_default();
+                        return Ok(a);
+                    }
                 }
             }
         }
@@ -581,6 +592,7 @@ impl FileMeta {
                 ver.object.as_mut().unwrap().set_transition(fi);
                 ver.object.as_mut().unwrap().reset_inline_data();
                 self.set_idx(i, ver.clone())?;
+                return Ok(None);
             } else {
                 let vers = self.versions[i + 1..].to_vec();
                 self.versions.extend(vers.iter().cloned());
