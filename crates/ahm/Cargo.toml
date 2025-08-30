@@ -34,6 +34,10 @@ rustfs-lock = { workspace = true }
 s3s = { workspace = true }
 lazy_static = { workspace = true }
 chrono = { workspace = true }
+rand = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -41,3 +45,21 @@ serial_test = "3.2.0"
 tracing-subscriber = { workspace = true }
 walkdir = "2.5.0"
 tempfile = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+sysinfo = "0.30.8"
+
+[[bench]]
+name = "business_io_impact"
+harness = false
+
+[[bench]]
+name = "scanner_performance"
+harness = false
+
+[[bench]]
+name = "resource_contention"
+harness = false
+
+[[bench]]
+name = "adaptive_scheduling"
+harness = false

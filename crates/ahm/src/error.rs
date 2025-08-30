@@ -46,6 +46,19 @@ pub enum Error {
     #[error("Metrics error: {0}")]
     Metrics(String),
 
+    // 检查点相关
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("IO error: {0}")]
+    IO(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("Invalid checkpoint: {0}")]
+    InvalidCheckpoint(String),
+
     // Heal相关
     #[error("Heal task not found: {task_id}")]
     TaskNotFound { task_id: String },
