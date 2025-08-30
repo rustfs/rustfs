@@ -323,9 +323,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             });
                             break;
                         }
-                    }
 
-                    if let Some(expiration) = rule.expiration.as_ref() {
                         if let Some(days) = expiration.days {
                             let expected_expiry = expected_expiry_time(obj.mod_time.expect("err!"), days /*, date*/);
                             if now.unix_timestamp() == 0 || now.unix_timestamp() > expected_expiry.unix_timestamp() {

@@ -39,7 +39,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info, debug};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -945,12 +945,13 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 
     // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
 
+    //debug!("lc_event.action: {:?}", lc_event.action);
+    //debug!("opts: {:?}", opts);
     let mut dobj = api
         .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
         .await
         .unwrap();
-    debug!("opts: {:?}", opts);
-    debug!("dobj: {:?}", dobj);
+    //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
     }
