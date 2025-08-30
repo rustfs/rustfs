@@ -97,7 +97,7 @@ async-recursion = "1.1.1"
 async-trait = "0.1.89"
 async-compression = { version = "0.4.19" }
 atomic_enum = "0.3.0"
-aws-config = { version = "1.8.5" }
+aws-config = { version = "1.8.6" }
 aws-sdk-s3 = "1.101.0"
 axum = "0.8.4"
 base64-simd = "0.8.0"
@@ -110,7 +110,7 @@ cfg-if = "1.0.3"
 crc-fast = "1.4.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.45", features = ["derive", "env"] }
+clap = { version = "4.5.46", features = ["derive", "env"] }
 const-str = { version = "0.6.4", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.7", features = ["html_reports"] }
@@ -193,7 +193,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
     "json",
     "blocking",
 ] }
-rmcp = { version = "0.6.0" }
+rmcp = { version = "0.6.1" }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rsa = "0.9.8"
@@ -211,10 +211,10 @@ serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
-shadow-rs = { version = "1.2.1", default-features = false }
+shadow-rs = { version = "1.3.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
-snafu = "0.8.7"
+snafu = "0.8.8"
 snap = "1.1.1"
 socket2 = "0.6.0"
 strum = { version = "0.27.2", features = ["derive"] }
@@ -246,7 +246,7 @@ tracing = "0.1.41"
 tracing-core = "0.1.34"
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.31.0"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.7"
 urlencoding = "2.1.3"
