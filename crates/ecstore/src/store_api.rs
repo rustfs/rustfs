@@ -523,7 +523,19 @@ impl ObjectInfo {
             return Ok(actual_size);
         }
 
-        // TODO: IsEncrypted
+        // Encrypted (SSE-C or others) may have stored plaintext size separately.
+        // For SSE-C we set size to ciphertext length and store original length in metadata key sse-plain-size.
+        if let Some(plain) = self
+            .user_defined
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{}", "sse-plain-size"))
+            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-sse-plain-size"))
+        {
+            if let Ok(v) = plain.parse::<i64>() {
+                if v >= 0 {
+                    return Ok(v);
+                }
+            }
+        }
 
         Ok(self.size)
     }

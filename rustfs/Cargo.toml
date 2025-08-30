@@ -43,10 +43,12 @@ rustfs-ecstore = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-iam = { workspace = true }
+rustfs-kms = { workspace = true }
 rustfs-filemeta.workspace = true
 rustfs-rio.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
 rustfs-notify = { workspace = true }
+rand = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-protos = { workspace = true }
@@ -58,6 +60,8 @@ atomic_enum = { workspace = true }
 axum.workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
+md-5 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }
@@ -69,9 +73,11 @@ http.workspace = true
 http-body.workspace = true
 matchit = { workspace = true }
 mime_guess = { workspace = true }
+once_cell = { workspace = true }
 opentelemetry = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
+quick-xml = { workspace = true }
 reqwest = { workspace = true }
 rustls.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }

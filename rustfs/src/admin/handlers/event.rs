@@ -148,7 +148,7 @@ impl Operation for NotificationTarget {
         let (_cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // 3. Get notification system instance
+        // 3. Notification system is handled by send_event function
         let Some(ns) = rustfs_notify::global::notification_system() else {
             return Err(s3_error!(InternalError, "notification system not initialized"));
         };

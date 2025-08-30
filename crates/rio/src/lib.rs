@@ -23,9 +23,6 @@ mod compress_index;
 mod compress_reader;
 pub use compress_reader::{CompressReader, DecompressReader};
 
-mod encrypt_reader;
-pub use encrypt_reader::{DecryptReader, EncryptReader};
-
 mod hardlimit_reader;
 pub use hardlimit_reader::HardLimitReader;
 
@@ -41,7 +38,7 @@ pub use writer::*;
 mod http_reader;
 pub use http_reader::*;
 
-pub use compress_index::TryGetIndex;
+pub use compress_index::{Index, TryGetIndex};
 
 mod etag;
 
@@ -80,4 +77,4 @@ impl Reader for crate::HashReader {}
 impl Reader for crate::HardLimitReader {}
 impl Reader for crate::EtagReader {}
 impl<R> Reader for crate::CompressReader<R> where R: Reader {}
-impl<R> Reader for crate::EncryptReader<R> where R: Reader {}
+// EncryptReader/DecryptReader removed after unifying SSE via ObjectEncryptionService.

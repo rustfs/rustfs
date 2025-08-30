@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod audit;
+mod handlers;
 mod http;
 mod hybrid;
 mod layer;
