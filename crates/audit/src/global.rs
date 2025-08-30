@@ -20,39 +20,39 @@ use rustfs_targets::target::EntityTarget;
 use std::sync::Arc;
 use tracing::error;
 
-// 使用 OnceCell 来安全地实现全局单例。
+// Use OnceCell to securely implement global singleton.
 static AUDIT_SYSTEM: OnceCell<Arc<AuditSystem>> = OnceCell::new();
 
-/// 初始化全局审计系统。
-/// 这个函数应该在应用启动时只调用一次。
+/// Initialize the global audit system.
+/// This function should be called only once when the app starts.
 pub fn initialize(system: AuditSystem) -> Result<(), AuditError> {
     AUDIT_SYSTEM.set(Arc::new(system)).map_err(|_| AuditError::AlreadyInitialized)
 }
 
-/// 返回对全局审计系统的引用。
-/// 如果系统未初始化，则返回 None。
+/// Returns a reference to the global audit system.
+/// If the system is not initialized, None is returned.
 fn audit_system() -> Option<Arc<AuditSystem>> {
     AUDIT_SYSTEM.get().cloned()
 }
 
-/// 全局审计日志记录器。
-/// 这是在整个应用程序中记录审计事件的推荐方式。
+/// Global audit logger.
+/// This is the recommended way to log audit events throughout the application.
 pub struct AuditLogger;
 
 impl AuditLogger {
-    /// 异步记录一条审计事件。
-    /// 如果审计系统未初始化，此操作将无效并记录一条错误。
+    /// An audit event is recorded asynchronously.
+    /// If the audit system is not initialized, this action will be invalid and an error will be logged.
     pub async fn log(&self, entry: Arc<EntityTarget<AuditEntry>>) {
         if let Some(system) = audit_system() {
             system.log(entry.clone()).await;
         } else {
-            // 在生产环境中，你可能不希望每次都打印错误，可以考虑只在启动时警告。
+            // In production, you may not want to print errors every time, consider warning only at startup.
             error!("Audit system not initialized. Audit entry was dropped.");
         }
     }
 }
 
-/// 返回全局 AuditLogger 的一个实例。
+/// Returns an instance of the global AuditLogger.
 pub fn audit_logger() -> AuditLogger {
     AuditLogger
 }

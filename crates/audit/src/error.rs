@@ -14,22 +14,22 @@
 
 use thiserror::Error;
 
-/// `AuditError` 枚举定义了审计系统中可能发生的错误。
+/// The 'AuditError' enumeration defines the errors that can occur in the audit system.
 #[derive(Error, Debug)]
 pub enum AuditError {
-    /// 表示审计系统已经初始化，无法再次初始化。
+    /// Indicates that the audit system has been initialized and cannot be initialized again.
     #[error("Audit system has already been initialized")]
     AlreadyInitialized,
 
-    /// 表示审计系统尚未初始化。
+    /// Indicates that the audit system has not been initialized.
     #[error("Audit system is not initialized")]
     NotInitialized,
 
-    /// 包装了来自 `rustfs-targets` crate 的目标错误。
+    /// Wrapped the target error from the 'rustfs-targets' crate.
     #[error("Target error: {0}")]
     Target(#[from] rustfs_targets::TargetError),
 
-    /// 表示配置错误。
+    /// Indicates a misconfiguration。
     #[error("Configuration error: {0}")]
     Config(String),
 }

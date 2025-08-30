@@ -17,29 +17,29 @@ use rustfs_targets::target::{EntityTarget, Target};
 use std::sync::Arc;
 use tracing::{error, warn};
 
-/// `AuditSystem` 负责管理和分派审计日志到多个目标。
+/// 'AuditSystem' is responsible for managing and distributing audit logs to multiple targets.
 pub struct AuditSystem {
     targets: Vec<Arc<dyn Target<AuditEntry> + Send + Sync>>,
 }
 
 impl AuditSystem {
-    /// 创建一个新的 `AuditSystem` 实例。
+    /// Create a new instance of 'AuditSystem'.
     ///
     /// # Arguments
     ///
-    /// * `targets` - 一个包含所有已配置审计目标的向量。
+    /// * 'targets' - a vector containing all configured audit targets.
     pub fn new(targets: Vec<Arc<dyn Target<AuditEntry> + Send + Sync>>) -> Self {
         Self { targets }
     }
 
-    /// 异步记录一个审计条目。
+    /// Asynchronously record an audit entry.。
     ///
-    /// 此方法会将给定的审计条目分派给所有已配置的目标。
-    /// 它会为每个目标调用 `save` 方法。
+    /// This method assigns the given audit entry to all configured targets.
+    /// It calls the 'save' method for each target.
     ///
     /// # Arguments
     ///
-    /// * `entry` - 要记录的审计条目，包装在 `Arc<EntityTarget<AuditEntry>>` 中。
+    /// * 'entry' - The audit entry to be recorded, wrapped in 'Arc<EntityTarget<AuditEntry>>'.
     pub async fn log(&self, entry: Arc<EntityTarget<AuditEntry>>) {
         if self.targets.is_empty() {
             warn!("No audit targets configured, audit entry will be dropped.");
@@ -58,7 +58,7 @@ impl AuditSystem {
             futures.push(future);
         }
 
-        // 并发执行所有目标的 `save` 操作
+        // Concurrent execution of the 'save' operation for all targets
         futures::future::join_all(futures).await;
     }
 }

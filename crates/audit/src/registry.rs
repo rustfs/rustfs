@@ -24,10 +24,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-/// 用于创建审计目标的工厂的 Trait。
+/// Trait for the plant used to create the audit objective.
 ///
-/// 这个 trait 抽象了 `Target` 实例的创建过程，允许 `TargetRegistry`
-/// 在不知道具体实现细节的情况下，根据提供的参数创建不同类型的目标。
+/// This trait abstracts the creation process of the 'Target' instance, allowing the 'TargetRegistry'
+/// Create different types of targets based on the parameters provided without knowing the specific implementation details.
 #[async_trait]
 pub trait AuditTargetFactory: Send + Sync {
     /// 根据提供的参数创建一个新的审计目标。
@@ -52,31 +52,38 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
         info!(target_id = %id, "Creating new audit target");
         match args {
             TargetArgs::Mqtt(mqtt_args) => {
-                // 确保目标类型正确
+                // Make sure the target type is correct
                 if !matches!(mqtt_args.target_type, TargetType::AuditLog) {
                     return Err(TargetError::Configuration("MQTTArgs provided for a non-audit target type".to_string()));
                 }
                 let target = MQTTTarget::<AuditEntry>::new(id, mqtt_args)?;
                 Ok(Box::new(target))
-            } // 在这里可以为其他目标类型（如 Webhook, Kafka 等）添加更多的分支
+            } // Here you can add more branches for other target types like webhooks, kafka, etc
+            TargetArgs::Webhook(webhook_args) => {
+                if !matches!(webhook_args.target_type, TargetType::AuditLog) {
+                    return Err(TargetError::Configuration("WebhookArgs provided for a non-audit target type".to_string()));
+                }
+                let target = WebhookTarget::<AuditEntry>::new(id, webhook_args)?;
+                Ok(Box::new(target))
+            }
         }
     }
 }
 
-/// 用于不同目标类型的配置参数的枚举。
+/// Enumeration of configuration parameters for different target types.
 ///
-/// 这允许 `AuditTargetFactory` 处理不同类型的目标配置。
+/// This allows the 'AuditTargetFactory' to handle different types of target configurations.
 #[derive(Debug, Clone)]
 pub enum TargetArgs {
     Mqtt(MQTTArgs),
-    // 可以为其他目标类型添加变体，例如：
+    // You can add variations for other target types, such as: Webhook, Kafka, etc.
     Webhook(WebhookArgs),
 }
 
-/// 管理审计目标的注册表。
+/// Registry for managing audit objectives。
 ///
-/// `TargetRegistry` 负责维护一个活动审计目标的集合。它提供了添加、
-/// 检索和分派事件到这些目标的方法。
+/// 'TargetRegistry' is responsible for maintaining a collection of active audit objectives. It provides the ability to add,
+/// A way to retrieve and dispatch events to these destinations.
 #[derive(Clone)]
 pub struct TargetRegistry {
     targets: Arc<RwLock<HashMap<TargetID, Arc<dyn Target<AuditEntry> + Send + Sync>>>>,
@@ -84,11 +91,11 @@ pub struct TargetRegistry {
 }
 
 impl TargetRegistry {
-    /// 创建一个新的 `TargetRegistry` 实例。
+    /// Create a new instance of 'TargetRegistry'.
     ///
     /// # Arguments
     ///
-    /// * `factory` - 一个 `AuditTargetFactory` 的实现，用于创建目标实例。
+    /// * 'factory' - An implementation of 'AuditTargetFactory' to create a target instance.
     pub fn new(factory: Arc<dyn AuditTargetFactory>) -> Self {
         Self {
             targets: Arc::new(RwLock::new(HashMap::new())),
@@ -96,12 +103,12 @@ impl TargetRegistry {
         }
     }
 
-    /// 使用工厂创建一个新的目标并将其添加到注册表中。
+    /// Use the factory to create a new target and add it to the registry.
     ///
     /// # Arguments
     ///
-    /// * `id` - 目标的唯一标识符。
-    /// * `args` - 用于创建目标的配置参数。
+    /// * 'id' - The unique identifier of the target.
+    /// * 'args' - The configuration parameter used to create the target.
     pub async fn add_target(&self, id: String, args: TargetArgs) -> Result<(), TargetError> {
         let target = self.factory.create(id, args).await?;
         let target_id = target.id();
@@ -119,14 +126,14 @@ impl TargetRegistry {
         Ok(())
     }
 
-    /// 将审计事件分派到所有已注册且启用的目标。
+    /// Dispatch audit events to all registered and enabled targets。
     ///
-    /// 此方法会异步地将事件条目发送到每个目标。它会记录任何在分派过程中发生的错误，
-    /// 但不会因为单个目标的失败而停止向其他目标分派。
+    /// This method sends event entries to each target asynchronously. It records any errors that occur during the dispatch process,
+    /// But it doesn't stop dispatching to other targets because of the failure of a single target.
     ///
     /// # Arguments
     ///
-    /// * `entry` - 要记录的审计事件条目。
+    ///* 'entry' - The audit event entry to be logged.
     pub async fn dispatch(&self, entry: Arc<EntityTarget<AuditEntry>>) {
         let targets = self.targets.read().await;
         if targets.is_empty() {
@@ -154,9 +161,9 @@ impl TargetRegistry {
         }
     }
 
-    /// 关闭并清理所有已注册的目标。
+    /// Close and clean up all registered targets。
     ///
-    /// 此方法会迭代所有目标并调用它们的 `close` 方法，以释放资源。
+    /// This method iterates over all targets and calls their 'close' method to free up resources.
     pub async fn close(&self) {
         info!("Closing all registered audit targets.");
         let mut targets = self.targets.write().await;
