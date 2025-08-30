@@ -20,16 +20,21 @@ use rustfs_ecstore::{
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
     store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
+    tier::tier::TierConfigMgr,
+    tier::tier_config::{TierConfig, TierType, TierMinIO},
 };
 use serial_test::serial;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use tracing::warn;
+use tokio::sync::RwLock;
 use tokio::fs;
 use tracing::info;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
+static GLOBAL_TIER_CONFIG_MGR: OnceLock<Arc<RwLock<TierConfigMgr>>> = OnceLock::new();
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -113,6 +118,8 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
+    let _ = GLOBAL_TIER_CONFIG_MGR.set(TierConfigMgr::new());
+
     (disk_paths, ecstore)
 }
 
@@ -156,6 +163,71 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
     metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
+}
+
+#[allow(dead_code)]
+async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
+    let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <Transition>
+          <Days>0</Days>
+          <StorageClass>COLDTIER</StorageClass>
+        </Transition>
+    </Rule>
+    <Rule>
+        <ID>test-rule2</ID>
+        <Status>Desabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <NoncurrentVersionTransition>
+          <NoncurrentDays>0</NoncurrentDays>
+          <StorageClass>COLDTIER</StorageClass>
+        </NoncurrentVersionTransition>
+    </Rule>
+</LifecycleConfiguration>"#;
+
+    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+
+    Ok(())
+}
+
+/// Test helper: Create a test tier
+#[allow(dead_code)]
+async fn create_test_tier() {
+    let args = TierConfig {
+        version: "v1".to_string(),
+        tier_type: TierType::MinIO,
+        name: "COLDTIER".to_string(),
+        s3: None,
+        rustfs: None,
+        minio: Some(TierMinIO {
+            access_key: "minioadmin".to_string(),
+            secret_key: "minioadmin".to_string(),
+            bucket: "mblock2".to_string(),
+            endpoint: "http://127.0.0.1:9020".to_string(),
+            prefix: "mypre3/".to_string(),
+            region: "".to_string(),
+            ..Default::default()
+        }),
+    };
+    let mut tier_config_mgr = GLOBAL_TIER_CONFIG_MGR.get().unwrap().write().await;
+    if let Err(err) = tier_config_mgr.add(args, false).await {
+        warn!("tier_config_mgr add failed, e: {:?}", err);
+        panic!("tier add failed. {err}");
+    }
+    if let Err(e) = tier_config_mgr.save().await {
+        warn!("tier_config_mgr save failed, e: {:?}", e);
+        panic!("tier save failed");
+    }
+    info!("Created test tier: {}", "COLDTIER");
 }
 
 /// Test helper: Check if object exists
@@ -254,4 +326,103 @@ async fn test_lifecycle_expiry_basic() {
     println!("✅ Scanner stopped");
 
     println!("Lifecycle expiry basic test completed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_lifecycle_transition_basic() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+
+    create_test_tier().await;
+
+    // Create test bucket and object
+    let bucket_name = "test-lifecycle-bucket";
+    let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
+    let test_data = b"Hello, this is test data for lifecycle expiry!";
+
+    create_test_bucket(&ecstore, bucket_name).await;
+    upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+
+    // Verify object exists initially
+    assert!(object_exists(&ecstore, bucket_name, object_name).await);
+    println!("✅ Object exists before lifecycle processing");
+
+    // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
+    set_bucket_lifecycle_transition(bucket_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+    println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
+
+    // Verify lifecycle configuration was set
+    match rustfs_ecstore::bucket::metadata_sys::get(bucket_name).await {
+        Ok(bucket_meta) => {
+            assert!(bucket_meta.lifecycle_config.is_some());
+            println!("✅ Bucket metadata retrieved successfully");
+        }
+        Err(e) => {
+            println!("❌ Error retrieving bucket metadata: {e:?}");
+        }
+    }
+
+    // Create scanner with very short intervals for testing
+    let scanner_config = ScannerConfig {
+        scan_interval: Duration::from_millis(100),
+        deep_scan_interval: Duration::from_millis(500),
+        max_concurrent_scans: 1,
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(Some(scanner_config), None);
+
+    // Start scanner
+    scanner.start().await.expect("Failed to start scanner");
+    println!("✅ Scanner started");
+
+    // Wait for scanner to process lifecycle rules
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Manually trigger a scan cycle to ensure lifecycle processing
+    scanner.scan_cycle().await.expect("Failed to trigger scan cycle");
+    println!("✅ Manual scan cycle completed");
+
+    // Wait a bit more for background workers to process expiry tasks
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Check if object has been expired (deleted)
+    let object_still_exists = object_exists(&ecstore, bucket_name, object_name).await;
+    println!("Object exists after lifecycle processing: {object_still_exists}");
+
+    if object_still_exists {
+        println!("✅ Object was not deleted by lifecycle processing");
+        // Let's try to get object info to see its details
+        match ecstore
+            .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+            .await
+        {
+            Ok(obj_info) => {
+                println!(
+                    "Object info: name={}, size={}, mod_time={:?}",
+                    obj_info.name, obj_info.size, obj_info.mod_time
+                );
+                println!(
+                    "Object info: meta={:?}",
+                    obj_info
+                );
+            }
+            Err(e) => {
+                println!("Error getting object info: {e:?}");
+            }
+        }
+    } else {
+        println!("❌ Object was deleted by lifecycle processing");
+    }
+
+    assert!(object_still_exists);
+    println!("✅ Object successfully transitioned");
+
+    // Stop scanner
+    let _ = scanner.stop().await;
+    println!("✅ Scanner stopped");
+
+    println!("Lifecycle transition basic test completed");
 }

@@ -540,11 +540,14 @@ impl FileMeta {
             }
         }
 
-        let update_version = false;
+        let mut update_version = fi.mark_deleted;
         /*if fi.version_purge_status().is_empty()
         {
             update_version = fi.mark_deleted;
         }*/
+        //if fi.transition_status == TRANSITION_COMPLETE {
+            update_version = false;
+        //}
 
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != fi.version_id {
