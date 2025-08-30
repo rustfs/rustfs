@@ -546,7 +546,7 @@ impl FileMeta {
             update_version = fi.mark_deleted;
         }*/
         //if fi.transition_status == TRANSITION_COMPLETE {
-            update_version = false;
+        update_version = false;
         //}
 
         for (i, ver) in self.versions.iter().enumerate() {

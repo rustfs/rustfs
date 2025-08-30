@@ -21,16 +21,16 @@ use rustfs_ecstore::{
     store::ECStore,
     store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier::TierConfigMgr,
-    tier::tier_config::{TierConfig, TierType, TierMinIO},
+    tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
 use serial_test::serial;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tracing::warn;
-use tokio::sync::RwLock;
 use tokio::fs;
+use tokio::sync::RwLock;
 use tracing::info;
+use tracing::warn;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -404,10 +404,7 @@ async fn test_lifecycle_transition_basic() {
                     "Object info: name={}, size={}, mod_time={:?}",
                     obj_info.name, obj_info.size, obj_info.mod_time
                 );
-                println!(
-                    "Object info: meta={:?}",
-                    obj_info
-                );
+                println!("Object info: transitioned_object={:?}", obj_info.transitioned_object);
             }
             Err(e) => {
                 println!("Error getting object info: {e:?}");
