@@ -15,8 +15,8 @@
 use crate::{BucketNotificationConfig, Event, EventArgs, NotificationError, NotificationSystem};
 use once_cell::sync::Lazy;
 use rustfs_ecstore::config::Config;
-use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
+use rustfs_targets::EventName;
 use std::sync::{Arc, OnceLock};
 use tracing::{error, instrument};
 
@@ -185,5 +185,26 @@ impl Notifier {
         notification_sys
             .load_bucket_notification_config(bucket_name, &bucket_config)
             .await
+    }
+
+    /// Clear all notification rules for the specified bucket.
+    /// # Parameter
+    /// - `bucket_name`: The name of the target bucket.
+    /// # Return value
+    /// Returns `Result<(), NotificationError>`, Ok on success, and an error on failure.
+    /// # Using
+    /// This function allows you to clear all notification rules for a specific bucket.
+    /// This is useful when you want to reset the notification configuration for a bucket.
+    ///
+    pub async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
+        // Get global NotificationSystem instance
+        let notification_sys = match notification_system() {
+            Some(sys) => sys,
+            None => return Err(NotificationError::ServerNotInitialized),
+        };
+
+        // Clear configuration
+        notification_sys.remove_bucket_notification_config(bucket_name).await;
+        Ok(())
     }
 }

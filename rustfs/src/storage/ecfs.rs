@@ -27,8 +27,8 @@ use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
-use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
@@ -54,13 +54,13 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
 use rustfs_ecstore::cmd::bucket_replication::get_must_replicate_options;
 use rustfs_ecstore::cmd::bucket_replication::must_replicate;
 use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
-use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
+use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
+use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
 use rustfs_ecstore::compress::is_compressible;
+use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -77,6 +77,7 @@ use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_notify::global::notifier_instance;
 use rustfs_policy::auth;
 use rustfs_policy::policy::action::Action;
 use rustfs_policy::policy::action::S3Action;
@@ -86,16 +87,17 @@ use rustfs_rio::EtagReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
+use rustfs_targets::arn::TargetID;
 use rustfs_targets::EventName;
-use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_zip::CompressionFormat;
-use s3s::S3;
+use s3s::dto::*;
+use s3s::s3_error;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
-use s3s::dto::*;
-use s3s::s3_error;
+use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -103,8 +105,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
@@ -2790,19 +2792,154 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
+        // 1. Verify that the bucket exists
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
         let data = try_!(serialize(&notification_configuration));
-
+        // 2. Persist the new notification configuration
         metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
         // TODO: event notice add rule
+
+        // 3. Clear the old runtime notification rule
+        if let Err(e) = rustfs_notify::global::notifier_instance()
+            .clear_bucket_notification_rules(&bucket)
+            .await
+        {
+            // Even if the cleanup fails, it continues to try to add new rules, but the warning is logged
+            warn!("Failed to clear old notification rules for bucket '{}': {}", bucket, e);
+        }
+
+        // 4. Parse the new configuration and build a list of rules
+        let mut event_rules: Vec<(Vec<EventName>, String, String, Vec<TargetID>)> = Vec::new();
+
+        // 辅助函数：从 Filter 中提取前缀和后缀
+        fn extract_prefix_suffix(filter: &Option<NotificationConfigurationFilter>) -> (String, String) {
+            if let Some(f) = filter {
+                if let Some(k) = &f.key {
+                    if let Some(rules) = &k.filter_rules {
+                        let mut prefix = String::new();
+                        let mut suffix = String::new();
+                        for rule in rules {
+                            if rule.name.unwrap().as_str("prefix") {
+                                prefix = rule.value.clone().unwrap_or_default();
+                            } else if rule.name.eq_ignore_ascii_case("suffix") {
+                                suffix = rule.value.clone().unwrap_or_default();
+                            }
+                        }
+                        return (prefix, suffix);
+                    }
+                }
+            }
+            (String::new(), String::new())
+        }
+
+        // 辅助函数：将事件字符串列表转换为 EventName 枚举列表
+        fn map_events(events: Option<Vec<String>>) -> Vec<EventName> {
+            events
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|e| EventName::from_str(&e).ok())
+                .collect()
+        }
+
+        // 处理 Queue 配置
+        if let Some(qs) = &notification_configuration.queue_configurations {
+            for qc in qs {
+                let events = map_events(qc.events.clone());
+                if events.is_empty() {
+                    continue;
+                }
+                let (prefix, suffix) = extract_prefix_suffix(&qc.filter);
+                if let Some(arn) = &qc.queue_arn {
+                    if let Ok(tid) = TargetID::from_str(arn) {
+                        event_rules.push((events, prefix, suffix, vec![tid]));
+                    } else {
+                        warn!("Invalid Queue ARN '{}' for bucket '{}'", arn, bucket);
+                    }
+                }
+            }
+        }
+
+        // 处理 Topic 配置
+        if let Some(ts) = &notification_configuration.topic_configurations {
+            for tc in ts {
+                let events = map_events(tc.events.clone());
+                if events.is_empty() {
+                    continue;
+                }
+                let (prefix, suffix) = extract_prefix_suffix(&tc.filter);
+                if let Some(arn) = &tc.topic_arn {
+                    if let Ok(tid) = TargetID::from_str(arn) {
+                        event_rules.push((events, prefix, suffix, vec![tid]));
+                    } else {
+                        warn!("Invalid Topic ARN '{}' for bucket '{}'", arn, bucket);
+                    }
+                }
+            }
+        }
+
+        // 处理 Lambda 配置
+        if let Some(ls) = &notification_configuration.lambda_function_configurations {
+            for lc in ls {
+                let events = map_events(lc.events.clone());
+                if events.is_empty() {
+                    continue;
+                }
+                let (prefix, suffix) = extract_prefix_suffix(&lc.filter);
+                if let Some(arn) = &lc.lambda_function_arn {
+                    if let Ok(tid) = TargetID::from_str(arn) {
+                        event_rules.push((events, prefix, suffix, vec![tid]));
+                    } else {
+                        warn!("Invalid Lambda ARN '{}' for bucket '{}'", arn, bucket);
+                    }
+                }
+            }
+        }
+
+        // EventBridge 配置（当前仅记录日志，可按需扩展）
+        if notification_configuration.event_bridge_configuration.is_some() {
+            debug!(
+                "EventBridge configuration is present but not processed into rules for bucket '{}'",
+                bucket
+            );
+        }
+
+        // 5. 如果有有效规则，则批量添加到通知系统
+        if !event_rules.is_empty() {
+            let region = bucket_info.region.as_deref().unwrap_or("us-east-1");
+
+            // 转换为 add_event_specific_rules 所需的引用格式
+            let event_rules_ref: Vec<_> = event_rules
+                .iter()
+                .map(|(events, prefix, suffix, targets)| (events.clone(), prefix.as_str(), suffix.as_str(), targets.clone()))
+                .collect();
+
+            if let Err(e) = notifier_instance()
+                .add_event_specific_rules(&bucket, region, &event_rules_ref)
+                .await
+            {
+                // 添加失败，这是一个严重问题，应记录为错误
+                error!("Failed to add notification rules for bucket '{}': {}", bucket, e);
+                // 根据策略，这里可以考虑返回错误给客户端
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("Failed to apply notification configuration: {}", e),
+                ));
+            } else {
+                debug!("Successfully added {} notification rule(s) for bucket '{}'", event_rules.len(), bucket);
+            }
+        } else {
+            debug!(
+                "No valid notification rules to apply for bucket '{}'. All runtime rules have been cleared.",
+                bucket
+            );
+        }
 
         Ok(S3Response::new(PutBucketNotificationConfigurationOutput::default()))
     }
