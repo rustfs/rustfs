@@ -2818,7 +2818,7 @@ impl S3 for FS {
         // 4. Parse the new configuration and build a list of rules
         let mut event_rules: Vec<(Vec<EventName>, String, String, Vec<TargetID>)> = Vec::new();
 
-        // 辅助函数：从 Filter 中提取前缀和后缀
+        // Auxiliary function: Extracts prefixes and suffixes from the filter
         fn extract_prefix_suffix(filter: &Option<NotificationConfigurationFilter>) -> (String, String) {
             if let Some(f) = filter {
                 if let Some(k) = &f.key {
@@ -2839,7 +2839,7 @@ impl S3 for FS {
             (String::new(), String::new())
         }
 
-        // 辅助函数：将事件字符串列表转换为 EventName 枚举列表
+        // Helper: Convert the list of event strings to an EventName enumeration list
         fn map_events(events: Option<Vec<String>>) -> Vec<EventName> {
             events
                 .unwrap_or_default()
@@ -2848,7 +2848,7 @@ impl S3 for FS {
                 .collect()
         }
 
-        // 处理 Queue 配置
+        // Handle Queue configurations
         if let Some(qs) = &notification_configuration.queue_configurations {
             for qc in qs {
                 let events = map_events(qc.events.clone());
@@ -2866,7 +2866,7 @@ impl S3 for FS {
             }
         }
 
-        // 处理 Topic 配置
+        // Handle topic configuration
         if let Some(ts) = &notification_configuration.topic_configurations {
             for tc in ts {
                 let events = map_events(tc.events.clone());
@@ -2884,7 +2884,7 @@ impl S3 for FS {
             }
         }
 
-        // 处理 Lambda 配置
+        // Handle Lambda configurations
         if let Some(ls) = &notification_configuration.lambda_function_configurations {
             for lc in ls {
                 let events = map_events(lc.events.clone());
@@ -2902,7 +2902,7 @@ impl S3 for FS {
             }
         }
 
-        // EventBridge 配置（当前仅记录日志，可按需扩展）
+        //EventBridge configuration (currently logs only, scalable on demand)
         if notification_configuration.event_bridge_configuration.is_some() {
             debug!(
                 "EventBridge configuration is present but not processed into rules for bucket '{}'",
@@ -2910,11 +2910,11 @@ impl S3 for FS {
             );
         }
 
-        // 5. 如果有有效规则，则批量添加到通知系统
+        // 5. If there are valid rules, add them to the notification system in bulk
         if !event_rules.is_empty() {
             let region = bucket_info.region.as_deref().unwrap_or("us-east-1");
 
-            // 转换为 add_event_specific_rules 所需的引用格式
+            // Conversion to the required reference format for add_event_specific_rules
             let event_rules_ref: Vec<_> = event_rules
                 .iter()
                 .map(|(events, prefix, suffix, targets)| (events.clone(), prefix.as_str(), suffix.as_str(), targets.clone()))
@@ -2924,9 +2924,9 @@ impl S3 for FS {
                 .add_event_specific_rules(&bucket, region, &event_rules_ref)
                 .await
             {
-                // 添加失败，这是一个严重问题，应记录为错误
+                // Add failed, this is a serious issue and should be logged as an error
                 error!("Failed to add notification rules for bucket '{}': {}", bucket, e);
-                // 根据策略，这里可以考虑返回错误给客户端
+                // Depending on the policy, you can consider returning an error to the client here
                 return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     format!("Failed to apply notification configuration: {}", e),
