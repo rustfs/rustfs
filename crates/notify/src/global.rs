@@ -15,8 +15,8 @@
 use crate::{BucketNotificationConfig, Event, EventArgs, NotificationError, NotificationSystem};
 use once_cell::sync::Lazy;
 use rustfs_ecstore::config::Config;
-use rustfs_targets::arn::TargetID;
 use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::{error, instrument};
 
@@ -162,13 +162,13 @@ impl Notifier {
         &self,
         bucket_name: &str,
         region: &str,
-        event_rules: &[(Vec<EventName>, &str, &str, Vec<TargetID>)],
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError> {
         let mut bucket_config = BucketNotificationConfig::new(region);
 
         for (event_names, prefix, suffix, target_ids) in event_rules {
             // Use `new_pattern` to construct a matching pattern
-            let pattern = crate::rules::pattern::new_pattern(Some(prefix), Some(suffix));
+            let pattern = crate::rules::pattern::new_pattern(Some(prefix.as_str()), Some(suffix.as_str()));
 
             for target_id in target_ids {
                 bucket_config.add_rule(event_names, pattern.clone(), target_id.clone());
