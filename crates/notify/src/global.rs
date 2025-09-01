@@ -162,13 +162,13 @@ impl Notifier {
         &self,
         bucket_name: &str,
         region: &str,
-        event_rules: &[(Vec<EventName>, &str, &str, Vec<TargetID>)],
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError> {
         let mut bucket_config = BucketNotificationConfig::new(region);
 
         for (event_names, prefix, suffix, target_ids) in event_rules {
             // Use `new_pattern` to construct a matching pattern
-            let pattern = crate::rules::pattern::new_pattern(Some(prefix), Some(suffix));
+            let pattern = crate::rules::pattern::new_pattern(Some(prefix.as_str()), Some(suffix.as_str()));
 
             for target_id in target_ids {
                 bucket_config.add_rule(event_names, pattern.clone(), target_id.clone());
@@ -185,5 +185,26 @@ impl Notifier {
         notification_sys
             .load_bucket_notification_config(bucket_name, &bucket_config)
             .await
+    }
+
+    /// Clear all notification rules for the specified bucket.
+    /// # Parameter
+    /// - `bucket_name`: The name of the target bucket.
+    /// # Return value
+    /// Returns `Result<(), NotificationError>`, Ok on success, and an error on failure.
+    /// # Using
+    /// This function allows you to clear all notification rules for a specific bucket.
+    /// This is useful when you want to reset the notification configuration for a bucket.
+    ///
+    pub async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
+        // Get global NotificationSystem instance
+        let notification_sys = match notification_system() {
+            Some(sys) => sys,
+            None => return Err(NotificationError::ServerNotInitialized),
+        };
+
+        // Clear configuration
+        notification_sys.remove_bucket_notification_config(bucket_name).await;
+        Ok(())
     }
 }
