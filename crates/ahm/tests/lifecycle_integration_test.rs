@@ -22,6 +22,8 @@ use rustfs_ecstore::{
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier::TierConfigMgr,
     tier::tier_config::{TierConfig, TierMinIO, TierType},
+    tier::tier::TierConfigMgr,
+    tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
 use serial_test::serial;
 use std::sync::Once;
