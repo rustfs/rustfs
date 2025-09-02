@@ -79,7 +79,6 @@ pub async fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
             SinkConfig::File(file_config) => {
                 tracing::debug!("FileSink: Using path: {}", file_config.path);
                 match file::FileSink::new(
-                    //format!("{}/{}", file_config.path.clone(), rustfs_config::DEFAULT_SINK_FILE_LOG_FILE),
                     std::path::Path::new(&file_config.path)
                         .join(rustfs_config::DEFAULT_SINK_FILE_LOG_FILE)
                         .to_string_lossy()
