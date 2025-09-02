@@ -21,8 +21,6 @@ use rustfs_ecstore::{
     store::ECStore,
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier::TierConfigMgr,
-    tier::tier::TierConfigMgr,
-    tier::tier_config::{TierConfig, TierMinIO, TierType},
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
 use serial_test::serial;
