@@ -29,12 +29,6 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
-use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
-use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_s3select_api::query::Context;
-use rustfs_s3select_api::query::Query;
-use rustfs_s3select_query::get_global_db;
-
 // use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
 use futures::StreamExt;
 use http::HeaderMap;
@@ -64,6 +58,7 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::CompletePart;
 use rustfs_ecstore::store_api::DeleteBucketOptions;
@@ -77,6 +72,7 @@ use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_notify::global::notifier_instance;
 use rustfs_policy::auth;
 use rustfs_policy::policy::action::Action;
 use rustfs_policy::policy::action::S3Action;
@@ -86,7 +82,12 @@ use rustfs_rio::EtagReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
+use rustfs_s3select_api::object_store::bytes_stream;
+use rustfs_s3select_api::query::Context;
+use rustfs_s3select_api::query::Query;
+use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
+use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
@@ -262,7 +263,7 @@ impl FS {
 
                 // Asynchronous call will not block the response of the current request
                 tokio::spawn(async move {
-                    rustfs_notify::global::notifier_instance().notify(event_args).await;
+                    notifier_instance().notify(event_args).await;
                 });
             }
         }
@@ -290,6 +291,7 @@ impl FS {
         Ok(S3Response::new(output))
     }
 }
+
 #[async_trait::async_trait]
 impl S3 for FS {
     #[tracing::instrument(
@@ -335,7 +337,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -481,7 +483,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -681,7 +683,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(DeleteBucketOutput {}))
@@ -756,7 +758,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -841,7 +843,7 @@ impl S3 for FS {
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
                 };
-                rustfs_notify::global::notifier_instance().notify(event_args).await;
+                notifier_instance().notify(event_args).await;
             }
         });
 
@@ -961,11 +963,11 @@ impl S3 for FS {
             }
         }
 
-        let mut content_length = info.size as i64;
+        let mut content_length = info.size;
 
         let content_range = if let Some(rs) = rs {
             let total_size = info.get_actual_size().map_err(ApiError::from)?;
-            let (start, length) = rs.get_offset_length(total_size as i64).map_err(ApiError::from)?;
+            let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
             content_length = length;
             Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
         } else {
@@ -1006,7 +1008,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1128,7 +1130,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1512,7 +1514,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1590,7 +1592,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -2147,7 +2149,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
@@ -2214,7 +2216,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
@@ -2791,20 +2793,56 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        //  Verify that the bucket exists
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
+        //  Persist the new notification configuration
         let data = try_!(serialize(&notification_configuration));
-
         metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
-        // TODO: event notice add rule
+        // Determine region (BucketInfo has no region field) -> use global region or default
+        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| req.region.clone().unwrap_or_default());
 
-        Ok(S3Response::new(PutBucketNotificationConfigurationOutput::default()))
+        // Purge old rules and resolve new rules in parallel
+        let clear_rules = notifier_instance().clear_bucket_notification_rules(&bucket);
+        let parse_rules = async {
+            let mut event_rules = Vec::new();
+
+            process_queue_configurations(
+                &mut event_rules,
+                notification_configuration.queue_configurations.clone(),
+                TargetID::from_str,
+            );
+            process_topic_configurations(
+                &mut event_rules,
+                notification_configuration.topic_configurations.clone(),
+                TargetID::from_str,
+            );
+            process_lambda_configurations(
+                &mut event_rules,
+                notification_configuration.lambda_function_configurations.clone(),
+                TargetID::from_str,
+            );
+
+            event_rules
+        };
+
+        let (clear_result, event_rules) = tokio::join!(clear_rules, parse_rules);
+
+        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+
+        // Add a new notification rule
+        notifier_instance()
+            .add_event_specific_rules(&bucket, &region, &event_rules)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
+
+        Ok(S3Response::new(PutBucketNotificationConfigurationOutput {}))
     }
 
     async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
@@ -2951,7 +2989,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3129,7 +3167,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3208,7 +3246,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3269,7 +3307,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3344,10 +3382,88 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
+    }
+}
+
+/// Auxiliary functions: extract prefixes and suffixes
+fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFilter>) -> (String, String) {
+    if let Some(filter) = filter {
+        if let Some(filter_rules) = &filter.key {
+            let mut prefix = String::new();
+            let mut suffix = String::new();
+            if let Some(rules) = &filter_rules.filter_rules {
+                for rule in rules {
+                    if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
+                        match name.as_str() {
+                            "prefix" => prefix = value.clone(),
+                            "suffix" => suffix = value.clone(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return (prefix, suffix);
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Auxiliary functions: Handle configuration
+fn process_queue_configurations<F>(
+    event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
+    configurations: Option<Vec<QueueConfiguration>>,
+    target_id_parser: F,
+) where
+    F: Fn(&str) -> Result<TargetID, TargetIDError>,
+{
+    if let Some(configs) = configurations {
+        for cfg in configs {
+            let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
+            let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
+            let target_ids = vec![target_id_parser(&cfg.queue_arn).ok()].into_iter().flatten().collect();
+            event_rules.push((events, prefix, suffix, target_ids));
+        }
+    }
+}
+
+fn process_topic_configurations<F>(
+    event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
+    configurations: Option<Vec<TopicConfiguration>>,
+    target_id_parser: F,
+) where
+    F: Fn(&str) -> Result<TargetID, TargetIDError>,
+{
+    if let Some(configs) = configurations {
+        for cfg in configs {
+            let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
+            let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
+            let target_ids = vec![target_id_parser(&cfg.topic_arn).ok()].into_iter().flatten().collect();
+            event_rules.push((events, prefix, suffix, target_ids));
+        }
+    }
+}
+
+fn process_lambda_configurations<F>(
+    event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
+    configurations: Option<Vec<LambdaFunctionConfiguration>>,
+    target_id_parser: F,
+) where
+    F: Fn(&str) -> Result<TargetID, TargetIDError>,
+{
+    if let Some(configs) = configurations {
+        for cfg in configs {
+            let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
+            let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
+            let target_ids = vec![target_id_parser(&cfg.lambda_function_arn).ok()]
+                .into_iter()
+                .flatten()
+                .collect();
+            event_rules.push((events, prefix, suffix, target_ids));
+        }
     }
 }
 

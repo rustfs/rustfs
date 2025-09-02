@@ -124,7 +124,7 @@ pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
 /// This is the default log filename for OBS.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".log");
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".");
 
 /// Default sink file log file for rustfs
 /// This is the default sink file log file for rustfs.
