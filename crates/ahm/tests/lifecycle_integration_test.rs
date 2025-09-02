@@ -19,7 +19,7 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI, MakeBucketOptions},
+    store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier::TierConfigMgr,
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
@@ -135,11 +135,14 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
 /// Test helper: Create a test lock bucket
 async fn create_test_lock_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
-        .make_bucket(bucket_name, &MakeBucketOptions {
-            lock_enabled: true,
-            versioning_enabled: true,
-            ..Default::default()
-        })
+        .make_bucket(
+            bucket_name,
+            &MakeBucketOptions {
+                lock_enabled: true,
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to create test bucket");
     info!("Created test bucket: {}", bucket_name);
