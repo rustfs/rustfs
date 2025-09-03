@@ -57,8 +57,8 @@ use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
+use rustfs_ecstore::set_disk::{DEFAULT_READ_BUFFER_SIZE, is_valid_storage_class};
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::CompletePart;
 use rustfs_ecstore::store_api::DeleteBucketOptions;
@@ -1385,8 +1385,7 @@ impl S3 for FS {
         let input = req.input;
 
         if let Some(ref storage_class) = input.storage_class {
-            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
-            if !is_valid {
+            if !is_valid_storage_class(storage_class.as_str()) {
                 return Err(s3_error!(InvalidStorageClass));
             }
         }
@@ -1530,8 +1529,16 @@ impl S3 for FS {
             key,
             tagging,
             version_id,
+            storage_class,
             ..
         } = req.input.clone();
+
+        // Validate storage class if provided
+        if let Some(ref storage_class) = storage_class {
+            if !is_valid_storage_class(storage_class.as_str()) {
+                return Err(s3_error!(InvalidStorageClass));
+            }
+        }
 
         // mc cp step 3
 
@@ -1904,6 +1911,7 @@ impl S3 for FS {
             next_part_number_marker: Some(res.next_part_number_marker.try_into().unwrap()),
             max_parts: Some(res.max_parts.try_into().unwrap()),
             part_number_marker: Some(res.part_number_marker.try_into().unwrap()),
+            storage_class: Some(res.storage_class.into()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
