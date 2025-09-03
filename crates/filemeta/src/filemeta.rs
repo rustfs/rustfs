@@ -112,6 +112,39 @@ impl FileMeta {
         Ok((&buf[8..], major, minor))
     }
 
+    // Returns (meta, inline_data)
+    pub fn is_indexed_meta(buf: &[u8]) -> Result<(&[u8], &[u8])> {
+        let (buf, major, minor) = Self::check_xl2_v1(buf)?;
+        if major != 1 || minor < 3 {
+            return Ok((&[], &[]));
+        }
+
+        let (mut size_buf, buf) = buf.split_at(5);
+
+        // Get meta data, buf = crc + data
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+
+        if buf.len() < bin_len as usize {
+            return Ok((&[], &[]));
+        }
+        let (meta, buf) = buf.split_at(bin_len as usize);
+
+        if buf.len() < 5 {
+            return Err(Error::other("insufficient data for CRC"));
+        }
+        let (mut crc_buf, inline_data) = buf.split_at(5);
+
+        // crc check
+        let crc = rmp::decode::read_u32(&mut crc_buf)?;
+        let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
+
+        if crc != meta_crc {
+            return Err(Error::other("xl file crc check failed"));
+        }
+
+        Ok((meta, inline_data))
+    }
+
     // Fixed u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
         let (mut size_buf, _) = buf.split_at(5);
@@ -289,6 +322,7 @@ impl FileMeta {
 
         let offset = wr.len();
 
+        // xl header
         rmp::encode::write_uint8(&mut wr, XL_HEADER_VERSION)?;
         rmp::encode::write_uint8(&mut wr, XL_META_VERSION)?;
 
