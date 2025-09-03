@@ -1900,6 +1900,10 @@ impl S3 for FS {
                 id: RUSTFS_OWNER.id.clone(),
                 display_name: RUSTFS_OWNER.display_name.clone(),
             }),
+            is_truncated: Some(res.is_truncated),
+            next_part_number_marker: Some(res.next_part_number_marker.try_into().unwrap()),
+            max_parts: Some(res.max_parts.try_into().unwrap()),
+            part_number_marker: Some(res.part_number_marker.try_into().unwrap()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
