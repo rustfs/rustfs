@@ -29,8 +29,8 @@ use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::info;
 use tracing::warn;
+use tracing::{debug, info};
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -278,7 +278,7 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 #[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        println!("oi: {:?}", oi);
+        debug!("oi: {:?}", oi);
         oi.delete_marker
     } else {
         panic!("object_is_delete_marker is error");
@@ -358,8 +358,10 @@ async fn test_lifecycle_expiry_basic() {
     let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object is_delete_marker after lifecycle processing: {check_result}");
 
-    if !check_result {
+    if check_result {
         println!("❌ Object was not deleted by lifecycle processing");
+    } else {
+        println!("✅ Object was successfully deleted by lifecycle processing");
         // Let's try to get object info to see its details
         match ecstore
             .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
@@ -375,11 +377,9 @@ async fn test_lifecycle_expiry_basic() {
                 println!("Error getting object info: {e:?}");
             }
         }
-    } else {
-        println!("✅ Object was successfully deleted by lifecycle processing");
     }
 
-    assert!(check_result);
+    assert!(!check_result);
     println!("✅ Object successfully expired");
 
     // Stop scanner
