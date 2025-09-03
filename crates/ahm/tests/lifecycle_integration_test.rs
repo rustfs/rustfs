@@ -358,8 +358,10 @@ async fn test_lifecycle_expiry_basic() {
     let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object is_delete_marker after lifecycle processing: {check_result}");
 
-    if !check_result {
+    if check_result {
         println!("❌ Object was not deleted by lifecycle processing");
+    } else {
+        println!("✅ Object was successfully deleted by lifecycle processing");
         // Let's try to get object info to see its details
         match ecstore
             .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
@@ -375,11 +377,9 @@ async fn test_lifecycle_expiry_basic() {
                 println!("Error getting object info: {e:?}");
             }
         }
-    } else {
-        println!("✅ Object was successfully deleted by lifecycle processing");
     }
 
-    assert!(check_result);
+    assert!(!check_result);
     println!("✅ Object successfully expired");
 
     // Stop scanner
