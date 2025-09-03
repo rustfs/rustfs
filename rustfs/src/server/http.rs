@@ -144,9 +144,9 @@ pub async fn start_http_server(
             for domain in &opt.server_domains {
                 domain_sets.insert(domain.to_string());
                 if let Some((host, _)) = domain.split_once(':') {
-                    domain_sets.insert(format!("{}:{}", host, server_port));
+                    domain_sets.insert(format!("{host}:{server_port}"));
                 } else {
-                    domain_sets.insert(format!("{}:{}", domain, server_port));
+                    domain_sets.insert(format!("{domain}:{server_port}"));
                 }
             }
 
