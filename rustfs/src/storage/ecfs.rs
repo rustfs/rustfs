@@ -1895,6 +1895,11 @@ impl S3 for FS {
                     })
                     .collect(),
             ),
+            owner: Some(RUSTFS_OWNER.to_owned()),
+            initiator: Some(Initiator {
+                id: RUSTFS_OWNER.id.clone(),
+                display_name: RUSTFS_OWNER.display_name.clone(),
+            }),
             ..Default::default()
         };
         Ok(S3Response::new(output))
