@@ -1908,10 +1908,14 @@ impl S3 for FS {
                 display_name: RUSTFS_OWNER.display_name.clone(),
             }),
             is_truncated: Some(res.is_truncated),
-            next_part_number_marker: Some(res.next_part_number_marker.try_into().unwrap()),
-            max_parts: Some(res.max_parts.try_into().unwrap()),
-            part_number_marker: Some(res.part_number_marker.try_into().unwrap()),
-            storage_class: Some(res.storage_class.into()),
+            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
+            max_parts: res.max_parts.try_into().ok(),
+            part_number_marker: res.part_number_marker.try_into().ok(),
+            storage_class: if res.storage_class.is_empty() {
+                None
+            } else {
+                Some(res.storage_class.into())
+            },
             ..Default::default()
         };
         Ok(S3Response::new(output))
