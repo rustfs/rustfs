@@ -4778,10 +4778,18 @@ impl StorageAPI for SetDisks {
 
         let part_number_marker = part_number_marker.unwrap_or_default();
 
+        // Extract storage class from metadata, default to STANDARD if not found
+        let storage_class = fi
+            .metadata
+            .get(rustfs_filemeta::headers::AMZ_STORAGE_CLASS)
+            .cloned()
+            .unwrap_or_else(|| storageclass::STANDARD.to_string());
+
         let mut ret = ListPartsInfo {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             upload_id: upload_id.to_owned(),
+            storage_class,
             max_parts,
             part_number_marker,
             user_defined: fi.metadata.clone(),
@@ -6039,6 +6047,40 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
     }
 }
 
+/// Validates if the given storage class is supported
+pub fn is_valid_storage_class(storage_class: &str) -> bool {
+    matches!(
+        storage_class,
+        storageclass::STANDARD
+            | storageclass::RRS
+            | storageclass::DEEP_ARCHIVE
+            | storageclass::EXPRESS_ONEZONE
+            | storageclass::GLACIER
+            | storageclass::GLACIER_IR
+            | storageclass::INTELLIGENT_TIERING
+            | storageclass::ONEZONE_IA
+            | storageclass::OUTPOSTS
+            | storageclass::SNOW
+            | storageclass::STANDARD_IA
+    )
+}
+
+/// Returns true if the storage class is a cold storage tier that requires special handling
+pub fn is_cold_storage_class(storage_class: &str) -> bool {
+    matches!(
+        storage_class,
+        storageclass::DEEP_ARCHIVE | storageclass::GLACIER | storageclass::GLACIER_IR
+    )
+}
+
+/// Returns true if the storage class is an infrequent access tier
+pub fn is_infrequent_access_class(storage_class: &str) -> bool {
+    matches!(
+        storage_class,
+        storageclass::ONEZONE_IA | storageclass::STANDARD_IA | storageclass::INTELLIGENT_TIERING
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6527,5 +6569,54 @@ mod tests {
         let if_none_match = None;
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
+    }
+
+    #[test]
+    fn test_is_valid_storage_class() {
+        // Test valid storage classes
+        assert!(is_valid_storage_class(storageclass::STANDARD));
+        assert!(is_valid_storage_class(storageclass::RRS));
+        assert!(is_valid_storage_class(storageclass::DEEP_ARCHIVE));
+        assert!(is_valid_storage_class(storageclass::EXPRESS_ONEZONE));
+        assert!(is_valid_storage_class(storageclass::GLACIER));
+        assert!(is_valid_storage_class(storageclass::GLACIER_IR));
+        assert!(is_valid_storage_class(storageclass::INTELLIGENT_TIERING));
+        assert!(is_valid_storage_class(storageclass::ONEZONE_IA));
+        assert!(is_valid_storage_class(storageclass::OUTPOSTS));
+        assert!(is_valid_storage_class(storageclass::SNOW));
+        assert!(is_valid_storage_class(storageclass::STANDARD_IA));
+
+        // Test invalid storage classes
+        assert!(!is_valid_storage_class("INVALID"));
+        assert!(!is_valid_storage_class(""));
+        assert!(!is_valid_storage_class("standard")); // lowercase
+    }
+
+    #[test]
+    fn test_is_cold_storage_class() {
+        // Test cold storage classes
+        assert!(is_cold_storage_class(storageclass::DEEP_ARCHIVE));
+        assert!(is_cold_storage_class(storageclass::GLACIER));
+        assert!(is_cold_storage_class(storageclass::GLACIER_IR));
+
+        // Test non-cold storage classes
+        assert!(!is_cold_storage_class(storageclass::STANDARD));
+        assert!(!is_cold_storage_class(storageclass::RRS));
+        assert!(!is_cold_storage_class(storageclass::STANDARD_IA));
+        assert!(!is_cold_storage_class(storageclass::EXPRESS_ONEZONE));
+    }
+
+    #[test]
+    fn test_is_infrequent_access_class() {
+        // Test infrequent access classes
+        assert!(is_infrequent_access_class(storageclass::ONEZONE_IA));
+        assert!(is_infrequent_access_class(storageclass::STANDARD_IA));
+        assert!(is_infrequent_access_class(storageclass::INTELLIGENT_TIERING));
+
+        // Test frequent access classes
+        assert!(!is_infrequent_access_class(storageclass::STANDARD));
+        assert!(!is_infrequent_access_class(storageclass::RRS));
+        assert!(!is_infrequent_access_class(storageclass::DEEP_ARCHIVE));
+        assert!(!is_infrequent_access_class(storageclass::EXPRESS_ONEZONE));
     }
 }

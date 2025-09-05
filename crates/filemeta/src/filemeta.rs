@@ -112,6 +112,39 @@ impl FileMeta {
         Ok((&buf[8..], major, minor))
     }
 
+    // Returns (meta, inline_data)
+    pub fn is_indexed_meta(buf: &[u8]) -> Result<(&[u8], &[u8])> {
+        let (buf, major, minor) = Self::check_xl2_v1(buf)?;
+        if major != 1 || minor < 3 {
+            return Ok((&[], &[]));
+        }
+
+        let (mut size_buf, buf) = buf.split_at(5);
+
+        // Get meta data, buf = crc + data
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+
+        if buf.len() < bin_len as usize {
+            return Ok((&[], &[]));
+        }
+        let (meta, buf) = buf.split_at(bin_len as usize);
+
+        if buf.len() < 5 {
+            return Err(Error::other("insufficient data for CRC"));
+        }
+        let (mut crc_buf, inline_data) = buf.split_at(5);
+
+        // crc check
+        let crc = rmp::decode::read_u32(&mut crc_buf)?;
+        let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
+
+        if crc != meta_crc {
+            return Err(Error::other("xl file crc check failed"));
+        }
+
+        Ok((meta, inline_data))
+    }
+
     // Fixed u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
         let (mut size_buf, _) = buf.split_at(5);
@@ -289,6 +322,7 @@ impl FileMeta {
 
         let offset = wr.len();
 
+        // xl header
         rmp::encode::write_uint8(&mut wr, XL_HEADER_VERSION)?;
         rmp::encode::write_uint8(&mut wr, XL_META_VERSION)?;
 
@@ -578,45 +612,61 @@ impl FileMeta {
             }
         }
 
+        let mut found_index = None;
         for (i, version) in self.versions.iter().enumerate() {
-            if version.header.version_type != VersionType::Object || version.header.version_id != fi.version_id {
-                continue;
+            if version.header.version_type == VersionType::Object && version.header.version_id == fi.version_id {
+                found_index = Some(i);
+                break;
             }
+        }
 
-            let mut ver = self.get_idx(i)?;
-
-            if fi.expire_restored {
-                ver.object.as_mut().unwrap().remove_restore_hdrs();
-                let _ = self.set_idx(i, ver.clone());
-            } else if fi.transition_status == TRANSITION_COMPLETE {
-                ver.object.as_mut().unwrap().set_transition(fi);
-                ver.object.as_mut().unwrap().reset_inline_data();
-                self.set_idx(i, ver.clone())?;
-                return Ok(None);
-            } else {
-                let vers = self.versions[i + 1..].to_vec();
-                self.versions.extend(vers.iter().cloned());
-                let (free_version, to_free) = ver.object.as_ref().unwrap().init_free_version(fi);
-                if to_free {
-                    self.add_version_filemata(free_version)?;
-                }
-            }
-
+        let Some(i) = found_index else {
             if fi.deleted {
                 self.add_version_filemata(ventry)?;
-            }
-            if self.shared_data_dir_count(ver.object.as_ref().unwrap().version_id, ver.object.as_ref().unwrap().data_dir) > 0 {
                 return Ok(None);
             }
-            return Ok(ver.object.as_ref().unwrap().data_dir);
+            return Err(Error::FileVersionNotFound);
+        };
+
+        let mut ver = self.get_idx(i)?;
+
+        let Some(obj) = &mut ver.object else {
+            if fi.deleted {
+                self.add_version_filemata(ventry)?;
+                return Ok(None);
+            }
+            return Err(Error::FileVersionNotFound);
+        };
+
+        let obj_version_id = obj.version_id;
+        let obj_data_dir = obj.data_dir;
+
+        if fi.expire_restored {
+            obj.remove_restore_hdrs();
+            self.set_idx(i, ver)?;
+        } else if fi.transition_status == TRANSITION_COMPLETE {
+            obj.set_transition(fi);
+            obj.reset_inline_data();
+            self.set_idx(i, ver)?;
+        } else {
+            self.versions.remove(i);
+
+            let (free_version, to_free) = obj.init_free_version(fi);
+
+            if to_free {
+                self.add_version_filemata(free_version)?;
+            }
         }
 
         if fi.deleted {
             self.add_version_filemata(ventry)?;
+        }
+
+        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
             return Ok(None);
         }
 
-        Err(Error::FileVersionNotFound)
+        Ok(obj_data_dir)
     }
 
     pub fn into_fileinfo(

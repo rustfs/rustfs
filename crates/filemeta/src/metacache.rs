@@ -112,8 +112,8 @@ impl MetaCacheEntry {
             return false;
         }
 
-        match FileMeta::check_xl2_v1(&self.metadata) {
-            Ok((meta, _, _)) => {
+        match FileMeta::is_indexed_meta(&self.metadata) {
+            Ok((meta, _inline_data)) => {
                 if !meta.is_empty() {
                     return FileMeta::is_latest_delete_marker(meta);
                 }
