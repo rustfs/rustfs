@@ -379,7 +379,7 @@ async fn test_lifecycle_expiry_basic() {
         println!("✅ Object was successfully deleted by lifecycle processing");
     }
 
-    assert!(check_result);
+    assert!(!check_result);
     println!("✅ Object successfully expired");
 
     // Stop scanner
@@ -448,11 +448,11 @@ async fn test_lifecycle_expiry_deletemarker() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Check if object has been expired (deleted)
-    //let check_result = object_is_delete_marker(&ecstore, bucket_name, object_name).await;
-    let check_result = object_exists(&ecstore, bucket_name, object_name).await;
+    let check_result = object_is_delete_marker(&ecstore, bucket_name, object_name).await;
+    //let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object exists after lifecycle processing: {check_result}");
 
-    if !check_result {
+    if check_result {
         println!("❌ Object was not deleted by lifecycle processing");
         // Let's try to get object info to see its details
         match ecstore
