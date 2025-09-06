@@ -947,9 +947,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     //debug!("opts: {:?}", opts);
-    let mut dobj = match api
-        .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
-        .await {
+    let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
         Ok(dobj) => dobj,
         Err(e) => {
             error!("delete_object error: {:?}", e);

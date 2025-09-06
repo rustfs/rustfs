@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::{warn, debug, info, error};
+use tracing::info;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();

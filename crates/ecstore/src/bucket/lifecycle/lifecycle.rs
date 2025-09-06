@@ -480,8 +480,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         if let Some(ref transitions) = rule.transitions {
                             let due = transitions[0].next_due(obj);
                             if let Some(due0) = due {
-                                if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp()
-                                {
+                                if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
                                     events.push(Event {
                                         action: IlmAction::TransitionAction,
                                         rule_id: rule.id.clone().expect("err!"),
