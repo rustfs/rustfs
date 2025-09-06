@@ -29,8 +29,7 @@ use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::warn;
-use tracing::{debug, info};
+use tracing::{warn, debug, info, error};
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -259,14 +258,14 @@ async fn create_test_tier() {
     };
     let mut tier_config_mgr = GLOBAL_TIER_CONFIG_MGR.get().unwrap().write().await;
     if let Err(err) = tier_config_mgr.add(args, false).await {
-        warn!("tier_config_mgr add failed, e: {:?}", err);
+        println!("tier_config_mgr add failed, e: {:?}", err);
         panic!("tier add failed. {err}");
     }
     if let Err(e) = tier_config_mgr.save().await {
-        warn!("tier_config_mgr save failed, e: {:?}", e);
+        println!("tier_config_mgr save failed, e: {:?}", e);
         panic!("tier save failed");
     }
-    info!("Created test tier: {}", "COLDTIER");
+    println!("Created test tier: {}", "COLDTIER");
 }
 
 /// Test helper: Check if object exists
@@ -278,9 +277,10 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 #[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        debug!("oi: {:?}", oi);
+        println!("oi: {:?}", oi);
         oi.delete_marker
     } else {
+        println!("object_is_delete_marker is error");
         panic!("object_is_delete_marker is error");
     }
 }
@@ -289,9 +289,10 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
 #[allow(dead_code)]
 async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        info!("oi: {:?}", oi);
+        println!("oi: {:?}", oi);
         !oi.transitioned_object.status.is_empty()
     } else {
+        println!("object_is_transitioned is error");
         panic!("object_is_transitioned is error");
     }
 }
@@ -391,6 +392,7 @@ async fn test_lifecycle_expiry_basic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+//#[ignore]
 async fn test_lifecycle_expiry_deletemarker() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -452,7 +454,7 @@ async fn test_lifecycle_expiry_deletemarker() {
     //let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object exists after lifecycle processing: {check_result}");
 
-    if check_result {
+    if !check_result {
         println!("❌ Object was not deleted by lifecycle processing");
         // Let's try to get object info to see its details
         match ecstore
@@ -485,10 +487,11 @@ async fn test_lifecycle_expiry_deletemarker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+//#[ignore]
 async fn test_lifecycle_transition_basic() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
-    //create_test_tier().await;
+    create_test_tier().await;
 
     // Create test bucket and object
     let bucket_name = "test-lifecycle-bucket";
@@ -496,6 +499,7 @@ async fn test_lifecycle_transition_basic() {
     let test_data = b"Hello, this is test data for lifecycle expiry!";
 
     create_test_bucket(&ecstore, bucket_name).await;
+    //create_test_lock_bucket(&ecstore, bucket_name).await;
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
     // Verify object exists initially
@@ -503,7 +507,7 @@ async fn test_lifecycle_transition_basic() {
     println!("✅ Object exists before lifecycle processing");
 
     // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
-    /*set_bucket_lifecycle_transition(bucket_name)
+    set_bucket_lifecycle_transition(bucket_name)
         .await
         .expect("Failed to set lifecycle configuration");
     println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
@@ -517,7 +521,7 @@ async fn test_lifecycle_transition_basic() {
         Err(e) => {
             println!("❌ Error retrieving bucket metadata: {e:?}");
         }
-    }*/
+    }
 
     // Create scanner with very short intervals for testing
     let scanner_config = ScannerConfig {
@@ -544,8 +548,8 @@ async fn test_lifecycle_transition_basic() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Check if object has been expired (deleted)
-    //let check_result = object_is_transitioned(&ecstore, bucket_name, object_name).await;
-    let check_result = object_exists(&ecstore, bucket_name, object_name).await;
+    let check_result = object_is_transitioned(&ecstore, bucket_name, object_name).await;
+    //let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object exists after lifecycle processing: {check_result}");
 
     if check_result {

@@ -947,10 +947,15 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     //debug!("opts: {:?}", opts);
-    let mut dobj = api
+    let mut dobj = match api
         .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
-        .await
-        .unwrap();
+        .await {
+        Ok(dobj) => dobj,
+        Err(e) => {
+            error!("delete_object error: {:?}", e);
+            return false;
+        }
+    };
     //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();

@@ -402,21 +402,21 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE
                             {
                                 let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
-                                if due.is_some()
-                                    && (now.unix_timestamp() == 0 || now.unix_timestamp() > due.unwrap().unix_timestamp())
-                                {
-                                    events.push(Event {
-                                        action: IlmAction::TransitionVersionAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due,
-                                        storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
-                                            .storage_class
-                                            .clone()
-                                            .unwrap()
-                                            .as_str()
-                                            .to_string(),
-                                        ..Default::default()
-                                    });
+                                if let Some(due0) = due {
+                                    if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
+                                        events.push(Event {
+                                            action: IlmAction::TransitionVersionAction,
+                                            rule_id: rule.id.clone().expect("err!"),
+                                            due,
+                                            storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
+                                                .storage_class
+                                                .clone()
+                                                .unwrap()
+                                                .as_str()
+                                                .to_string(),
+                                            ..Default::default()
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -479,14 +479,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     if obj.transition_status != TRANSITION_COMPLETE {
                         if let Some(ref transitions) = rule.transitions {
                             let due = transitions[0].next_due(obj);
-                            if let Some(due) = due {
-                                if due.unix_timestamp() > 0
-                                    && (now.unix_timestamp() == 0 || now.unix_timestamp() > due.unix_timestamp())
+                            if let Some(due0) = due {
+                                if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp()
                                 {
                                     events.push(Event {
                                         action: IlmAction::TransitionAction,
                                         rule_id: rule.id.clone().expect("err!"),
-                                        due: Some(due),
+                                        due,
                                         storage_class: transitions[0].storage_class.clone().expect("err!").as_str().to_string(),
                                         noncurrent_days: 0,
                                         newer_noncurrent_versions: 0,

@@ -90,8 +90,13 @@
             "name": "Debug executable target/debug/test",
             "type":  "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/deps/lifecycle_integration_test-5eb7590b8f3bea55",
-            "args": [],
+            "program": "${workspaceFolder}/target/debug/deps/lifecycle_integration_test-91c6e6bc43605131",
+            "args": [
+              "--skip",
+              "test_lifecycle_expiry_basic",
+              "--skip",
+              "test_lifecycle_expiry_deletemarker"
+            ],
             "cwd": "${workspaceFolder}",
             //"stopAtEntry": false,
             //"preLaunchTask": "cargo build",
