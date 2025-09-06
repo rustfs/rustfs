@@ -20,7 +20,7 @@ RUN set -eux; \
     fi; \
     echo "Using tag: $TAG (arch pattern: $ARCH_SUBSTR)"; \
     # Find download URL in assets list for this tag that contains arch substring and ends with .zip
-    URL="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" \
+    URL="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases#$TAG" \
            | grep -o "\"browser_download_url\": \"[^\"]*${ARCH_SUBSTR}[^\"]*\\.zip\"" \
            | cut -d'"' -f4 | head -n 1)"; \
     if [ -z "$URL" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
