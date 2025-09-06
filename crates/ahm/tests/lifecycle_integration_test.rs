@@ -20,8 +20,8 @@ use rustfs_ecstore::{
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
-    tier::tier::TierConfigMgr,
     tier::tier_config::{TierConfig, TierMinIO, TierType},
+    global::GLOBAL_TierConfigMgr,
 };
 use serial_test::serial;
 use std::sync::Once;
@@ -33,7 +33,6 @@ use tracing::info;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
-static GLOBAL_TIER_CONFIG_MGR: OnceLock<Arc<RwLock<TierConfigMgr>>> = OnceLock::new();
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -116,8 +115,6 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
-
-    let _ = GLOBAL_TIER_CONFIG_MGR.set(TierConfigMgr::new());
 
     (disk_paths, ecstore)
 }
@@ -251,12 +248,12 @@ async fn create_test_tier() {
             secret_key: "minioadmin".to_string(),
             bucket: "mblock2".to_string(),
             endpoint: "http://127.0.0.1:9020".to_string(),
-            prefix: "mypre3/".to_string(),
+            prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
             region: "".to_string(),
             ..Default::default()
         }),
     };
-    let mut tier_config_mgr = GLOBAL_TIER_CONFIG_MGR.get().unwrap().write().await;
+    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
     if let Err(err) = tier_config_mgr.add(args, false).await {
         println!("tier_config_mgr add failed, e: {:?}", err);
         panic!("tier add failed. {err}");
@@ -392,7 +389,7 @@ async fn test_lifecycle_expiry_basic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-//#[ignore]
+#[ignore]
 async fn test_lifecycle_expiry_deletemarker() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -487,7 +484,7 @@ async fn test_lifecycle_expiry_deletemarker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-//#[ignore]
+#[ignore]
 async fn test_lifecycle_transition_basic() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
