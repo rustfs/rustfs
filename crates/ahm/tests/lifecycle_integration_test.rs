@@ -18,10 +18,10 @@ use rustfs_ecstore::{
     bucket::metadata_sys,
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+    global::GLOBAL_TierConfigMgr,
     store::ECStore,
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier_config::{TierConfig, TierMinIO, TierType},
-    global::GLOBAL_TierConfigMgr,
 };
 use serial_test::serial;
 use std::sync::Once;

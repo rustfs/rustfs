@@ -331,7 +331,7 @@ impl TransitionClient {
             let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
             let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
-            
+
             if self.region == "" {
                 match err_response.code {
                     S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
