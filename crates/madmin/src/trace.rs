@@ -23,7 +23,7 @@ use crate::heal_commands::HealResultItem;
 pub struct TraceType(u64);
 
 impl TraceType {
-    // 定义一些常量
+    // Define some constants
     pub const OS: TraceType = TraceType(1 << 0);
     pub const STORAGE: TraceType = TraceType(1 << 1);
     pub const S3: TraceType = TraceType(1 << 2);

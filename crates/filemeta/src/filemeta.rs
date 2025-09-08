@@ -2710,7 +2710,7 @@ mod test {
                 ChecksumAlgo::HighwayHash => assert!(algo.valid()),
             }
 
-            // 验证序列化和反序列化
+            // Verify serialization and deserialization
             let data = obj.marshal_msg().unwrap();
             let mut obj2 = MetaObject::default();
             obj2.unmarshal_msg(&data).unwrap();
@@ -2741,7 +2741,7 @@ mod test {
             assert!(obj.erasure_n > 0, "校验块数量必须大于 0");
             assert_eq!(obj.erasure_dist.len(), data_blocks + parity_blocks);
 
-            // 验证序列化和反序列化
+            // Verify serialization and deserialization
             let data = obj.marshal_msg().unwrap();
             let mut obj2 = MetaObject::default();
             obj2.unmarshal_msg(&data).unwrap();
@@ -3039,18 +3039,18 @@ mod test {
 
     #[test]
     fn test_special_characters_in_metadata() {
-        // 测试元数据中的特殊字符处理
+        // Test special character handling in metadata
         let mut obj = MetaObject::default();
 
-        // 测试各种特殊字符
+        // Test various special characters
         let special_cases = vec![
             ("empty", ""),
-            ("unicode", "测试🚀🎉"),
+            ("unicode", "test🚀🎉"),
             ("newlines", "line1\nline2\nline3"),
             ("tabs", "col1\tcol2\tcol3"),
             ("quotes", "\"quoted\" and 'single'"),
             ("backslashes", "path\\to\\file"),
-            ("mixed", "Mixed: 中文，English, 123, !@#$%"),
+            ("mixed", "Mixed: Chinese，English, 123, !@#$%"),
         ];
 
         for (key, value) in special_cases {
@@ -3064,15 +3064,15 @@ mod test {
 
         assert_eq!(obj.meta_user, obj2.meta_user);
 
-        // 验证每个特殊字符都被正确保存
+        // Verify each special character is correctly saved
         for (key, expected_value) in [
             ("empty", ""),
-            ("unicode", "测试🚀🎉"),
+            ("unicode", "test🚀🎉"),
             ("newlines", "line1\nline2\nline3"),
             ("tabs", "col1\tcol2\tcol3"),
             ("quotes", "\"quoted\" and 'single'"),
             ("backslashes", "path\\to\\file"),
-            ("mixed", "Mixed: 中文，English, 123, !@#$%"),
+            ("mixed", "Mixed: Chinese，English, 123, !@#$%"),
         ] {
             assert_eq!(obj2.meta_user.get(key), Some(&expected_value.to_string()));
         }

@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn test_detect_file_type_utf8_text() {
         // Test UTF-8 text detection
-        let utf8_content = "Hello, 世界! 🌍".as_bytes();
+        let utf8_content = "Hello, World! 🌍".as_bytes();
         let result = S3Client::detect_file_type(None, utf8_content);
         match result {
             DetectedFileType::Text => {}

@@ -35,12 +35,12 @@ pub enum ServiceType {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct LatencyStat {
-    curr: u64, // 当前延迟
-    avg: u64,  // 平均延迟
-    max: u64,  // 最大延迟
+    curr: u64, // current latency
+    avg: u64,  // average latency
+    max: u64,  // maximum latency
 }
 
-// 定义 BucketTarget 结构体
+// Define BucketTarget struct
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketTarget {
     #[serde(rename = "sourcebucket")]
