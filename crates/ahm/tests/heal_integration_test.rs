@@ -29,6 +29,7 @@ use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
 

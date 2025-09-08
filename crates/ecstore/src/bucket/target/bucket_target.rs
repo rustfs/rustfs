@@ -15,6 +15,7 @@
 use crate::error::{Error, Result};
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
+use serde_with::{DurationSeconds, serde_as};
 use std::{
     fmt::{self, Display},
     time::Duration,
@@ -49,7 +50,9 @@ pub struct LatencyStat {
 pub enum BucketTargetType {
     #[default]
     None,
+    #[serde(rename = "replication")]
     ReplicationService,
+    #[serde(rename = "ilm")]
     IlmService,
 }
 
@@ -74,6 +77,7 @@ impl fmt::Display for BucketTargetType {
 
 // 定义 BucketTarget 结构体
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde_as]
 pub struct BucketTarget {
     #[serde(rename = "sourcebucket")]
     pub source_bucket: String,
@@ -102,6 +106,7 @@ pub struct BucketTarget {
 
     pub storage_class: String,
     #[serde(rename = "healthCheckDuration")]
+    #[serde_as(as = "DurationSeconds<u64>")]
     pub health_check_duration: Duration,
     #[serde(rename = "disableProxy")]
     pub disable_proxy: bool,
@@ -110,6 +115,7 @@ pub struct BucketTarget {
     pub reset_before_date: Option<OffsetDateTime>,
     pub reset_id: String,
     #[serde(rename = "totalDowntime")]
+    #[serde_as(as = "DurationSeconds<u64>")]
     pub total_downtime: Duration,
 
     pub last_online: Option<OffsetDateTime>,

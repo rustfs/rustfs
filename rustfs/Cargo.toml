@@ -106,6 +106,7 @@ tower-http = { workspace = true, features = [
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
+url.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
