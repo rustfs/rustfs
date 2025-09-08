@@ -580,18 +580,26 @@ impl Scanner {
             for obj in list_result.objects {
                 info!("Processing lifecycle for object: {}/{}", bucket_name, obj.name);
 
-                // Create a minimal MetaCacheEntry for the object
-                let meta_entry = rustfs_filemeta::metacache::MetaCacheEntry {
+                // Create ObjectInfo for lifecycle processing
+                let object_info = rustfs_ecstore::store_api::ObjectInfo {
+                    bucket: bucket_name.to_string(),
                     name: obj.name.clone(),
+                    version_id: None,
+                    mod_time: obj.mod_time,
+                    size: obj.size,
+                    user_defined: std::collections::HashMap::new(),
                     ..Default::default()
                 };
 
+                // Create SizeSummary for tracking
+                let mut size_summary = SizeSummary::default();
+
                 // Apply lifecycle actions
-                if let Err(e) = scanner_item.apply_actions(&obj.name, meta_entry).await {
-                    warn!("Failed to apply lifecycle actions for {}/{}: {}", bucket_name, obj.name, e);
-                } else {
-                    processed_count += 1;
+                let (deleted, _size) = scanner_item.apply_actions(&object_info, &mut size_summary).await;
+                if deleted {
+                    info!("Object {}/{} was deleted by lifecycle action", bucket_name, obj.name);
                 }
+                processed_count += 1;
             }
 
             // Check if there are more objects to list

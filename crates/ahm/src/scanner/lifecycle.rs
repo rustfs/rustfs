@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use time::OffsetDateTime;
 
 use crate::error::Result;
 use rustfs_common::data_usage::SizeSummary;
