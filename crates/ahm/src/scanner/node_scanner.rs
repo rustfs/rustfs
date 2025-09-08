@@ -16,8 +16,8 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -28,14 +28,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use rustfs_common::data_usage::DataUsageInfo;
-use rustfs_ecstore::disk::{DiskStore, DiskAPI};
-use rustfs_ecstore::StorageAPI; // Add this import
+use rustfs_ecstore::StorageAPI;
+use rustfs_ecstore::disk::{DiskAPI, DiskStore}; // Add this import
 
-use crate::error::Result;
 use super::checkpoint::CheckpointManager;
-use super::local_stats::{LocalStatsManager, BatchScanResult, ScanResultEntry};
 use super::io_monitor::{AdvancedIOMonitor, IOMonitorConfig};
 use super::io_throttler::{AdvancedIOThrottler, IOThrottlerConfig, MetricsSnapshot};
+use super::local_stats::{BatchScanResult, LocalStatsManager, ScanResultEntry};
+use crate::error::Result;
 
 /// SystemTime serde 序列化支持
 mod system_time_serde {
@@ -143,10 +143,10 @@ impl Default for NodeScannerConfig {
     fn default() -> Self {
         // Use a user-writable directory for scanner data
         let data_dir = std::env::temp_dir().join("rustfs_scanner");
-        
+
         Self {
-            scan_interval: Duration::from_secs(300),       // 5分钟基础间隔
-            disk_scan_delay: Duration::from_secs(10),      // 磁盘间10秒延迟
+            scan_interval: Duration::from_secs(300),  // 5分钟基础间隔
+            disk_scan_delay: Duration::from_secs(10), // 磁盘间10秒延迟
             enable_smart_scheduling: true,
             enable_checkpoint: true,
             checkpoint_save_interval: Duration::from_secs(30), // 30秒保存一次检查点
@@ -293,7 +293,7 @@ pub struct IOMonitor {
     /// CPU 使用率
     cpu_usage: Arc<AtomicU8>,
     /// 内存使用率
-/// 内存使用率 (预留字段)
+    /// 内存使用率 (预留字段)
     #[allow(dead_code)]
     memory_usage: Arc<AtomicU8>,
 }
@@ -366,7 +366,7 @@ impl IOThrottler {
             max_iops: Arc::new(AtomicU64::new(1000)), // 默认最大 1000 IOPS
             current_iops: Arc::new(AtomicU64::new(0)),
             business_priority: Arc::new(AtomicU8::new(95)), // 业务优先级 95%
-            scan_delay: Arc::new(AtomicU64::new(100)), // 默认 100ms 延迟
+            scan_delay: Arc::new(AtomicU64::new(100)),      // 默认 100ms 延迟
         }
     }
 
@@ -405,7 +405,7 @@ impl IOThrottler {
 }
 
 /// 去中心化节点扫描器
-/// 
+///
 /// 负责本地磁盘的串行扫描，实现智能调度和断点续传功能
 pub struct NodeScanner {
     /// 节点ID
@@ -443,14 +443,14 @@ impl NodeScanner {
         }
 
         let stats_manager = Arc::new(LocalStatsManager::new(&node_id, &config.data_dir));
-        
+
         let monitor_config = IOMonitorConfig {
             monitor_interval: Duration::from_secs(1),
             enable_system_monitoring: true,
             ..Default::default()
         };
         let io_monitor = Arc::new(AdvancedIOMonitor::new(monitor_config));
-        
+
         let throttler_config = IOThrottlerConfig {
             max_iops: 1000,
             base_business_priority: 95,
@@ -481,23 +481,26 @@ impl NodeScanner {
         // 获取磁盘路径并创建对应的scanner目录
         let disk_path = disk.path();
         let sys_dir = disk_path.join(".rustfs.sys").join("scanner");
-        
+
         // 确保目录存在
         if let Err(e) = std::fs::create_dir_all(&sys_dir) {
             error!("Failed to create scanner directory on disk {:?}: {}", disk_path, e);
             return;
         }
-        
+
         // 为该磁盘创建检查点管理器
         let disk_id = disk_path.to_string_lossy().to_string();
         let checkpoint_manager = Arc::new(CheckpointManager::new(&self.node_id, &sys_dir));
-        
+
         // 存储检查点管理器
-        self.checkpoint_managers.write().await.insert(disk_id.clone(), checkpoint_manager);
-        
+        self.checkpoint_managers
+            .write()
+            .await
+            .insert(disk_id.clone(), checkpoint_manager);
+
         // 添加磁盘到本地磁盘列表
         self.local_disks.write().await.push(disk.clone());
-        
+
         info!("Added disk {} with checkpoint manager to node {}", disk_id, self.node_id);
     }
 
@@ -506,21 +509,36 @@ impl NodeScanner {
         self.checkpoint_managers.read().await.get(disk_id).cloned()
     }
 
+    /// 获取默认检查点管理器（用于没有本地磁盘的情况）
+    async fn get_default_checkpoint_manager(&self) -> Option<Arc<CheckpointManager>> {
+        let config = self.config.read().await;
+        let data_dir = &config.data_dir;
+
+        // 确保数据目录存在
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            error!("Failed to create data directory {:?}: {}", data_dir, e);
+            return None;
+        }
+
+        // 创建默认检查点管理器
+        Some(Arc::new(CheckpointManager::new(&self.node_id, data_dir)))
+    }
+
     /// 为所有磁盘创建检查点管理器（初始化时调用）
     pub async fn initialize_checkpoint_managers(&self) {
         let local_disks = self.local_disks.read().await;
         let mut checkpoint_managers = self.checkpoint_managers.write().await;
-        
+
         for disk in local_disks.iter() {
             let disk_path = disk.path();
             let sys_dir = disk_path.join(".rustfs.sys").join("scanner");
-            
+
             // 确保目录存在
             if let Err(e) = std::fs::create_dir_all(&sys_dir) {
                 error!("Failed to create scanner directory on disk {:?}: {}", disk_path, e);
                 continue;
             }
-            
+
             // 为该磁盘创建检查点管理器
             let disk_id = disk_path.to_string_lossy().to_string();
             let checkpoint_manager = Arc::new(CheckpointManager::new(&self.node_id, &sys_dir));
@@ -574,25 +592,24 @@ impl NodeScanner {
         if !local_disks.is_empty() {
             let first_disk = &local_disks[0];
             let disk_id = first_disk.path().to_string_lossy().to_string();
-            
+
             if let Some(checkpoint_manager) = self.get_checkpoint_manager_for_disk(&disk_id).await {
                 match checkpoint_manager.load_checkpoint().await {
                     Ok(Some(progress)) => {
-                        info!("成功从磁盘 {} 恢复扫描进度: cycle={}, disk={}, last_key={:?}", 
-                              disk_id,
-                              progress.current_cycle, 
-                              progress.current_disk_index,
-                              progress.last_scan_key);
+                        info!(
+                            "成功从磁盘 {} 恢复扫描进度: cycle={}, disk={}, last_key={:?}",
+                            disk_id, progress.current_cycle, progress.current_disk_index, progress.last_scan_key
+                        );
 
                         *self.scan_progress.write().await = progress;
-                        
+
                         // 使用恢复的进度开始扫描
                         self.resume_scanning_from_checkpoint().await
-                    },
+                    }
                     Ok(None) => {
                         info!("磁盘 {} 无有效检查点，从头开始扫描", disk_id);
                         self.start_fresh_scanning().await
-                    },
+                    }
                     Err(e) => {
                         warn!("从磁盘 {} 恢复扫描进度失败: {}，从头开始", disk_id, e);
                         self.start_fresh_scanning().await
@@ -603,8 +620,44 @@ impl NodeScanner {
                 self.start_fresh_scanning().await
             }
         } else {
-            info!("无本地磁盘，从头开始扫描");
-            self.start_fresh_scanning().await
+            info!("无本地磁盘，尝试从默认检查点管理器恢复");
+
+            // 首先尝试从默认检查点管理器加载
+            if let Some(default_checkpoint_manager) = self.get_default_checkpoint_manager().await {
+                match default_checkpoint_manager.load_checkpoint().await {
+                    Ok(Some(scan_progress)) => {
+                        info!(
+                            "从默认检查点恢复扫描: cycle={}, last_key={:?}",
+                            scan_progress.current_cycle, scan_progress.last_scan_key
+                        );
+
+                        // 恢复扫描进度
+                        *self.scan_progress.write().await = scan_progress;
+
+                        return self.resume_scanning_from_checkpoint().await;
+                    }
+                    Ok(None) => {
+                        info!("没有找到默认检查点文件");
+                    }
+                    Err(e) => {
+                        warn!("加载默认检查点失败: {}", e);
+                    }
+                }
+            }
+
+            // 如果没有检查点，检查内存中是否有扫描进度（用于测试场景）
+            let current_progress = self.scan_progress.read().await;
+            if current_progress.current_cycle > 0 || current_progress.last_scan_key.is_some() {
+                info!(
+                    "发现内存中的扫描进度: cycle={}, disk={}, last_key={:?}",
+                    current_progress.current_cycle, current_progress.current_disk_index, current_progress.last_scan_key
+                );
+                drop(current_progress);
+                self.resume_scanning_from_checkpoint().await
+            } else {
+                drop(current_progress);
+                self.start_fresh_scanning().await
+            }
         }
     }
 
@@ -618,7 +671,8 @@ impl NodeScanner {
         info!("从磁盘 {} 位置恢复扫描，上次扫描到: {:?}", disk_index, last_scan_key);
 
         // 更新当前磁盘索引
-        self.current_disk_index.store(disk_index, std::sync::atomic::Ordering::Relaxed);
+        self.current_disk_index
+            .store(disk_index, std::sync::atomic::Ordering::Relaxed);
 
         // 启动 IO 监控
         self.start_io_monitoring().await?;
@@ -709,7 +763,7 @@ impl NodeScanner {
         while !self.cancel_token.is_cancelled() {
             // 检查业务负载
             let load_level = self.io_monitor.get_business_load_level().await;
-            
+
             // 获取当前系统指标
             let current_metrics = self.io_monitor.get_current_metrics().await;
             let metrics_snapshot = MetricsSnapshot {
@@ -718,10 +772,13 @@ impl NodeScanner {
                 cpu_usage: current_metrics.cpu_usage,
                 memory_usage: current_metrics.memory_usage,
             };
-            
+
             // 获取限流决策
-            let throttle_decision = self.throttler.make_throttle_decision(load_level, Some(metrics_snapshot)).await;
-            
+            let throttle_decision = self
+                .throttler
+                .make_throttle_decision(load_level, Some(metrics_snapshot))
+                .await;
+
             // 根据决策行动
             if throttle_decision.should_pause {
                 warn!("根据限流决策暂停扫描: {}", throttle_decision.reason);
@@ -742,9 +799,11 @@ impl NodeScanner {
             // 使用限流决策的建议延迟
             let scan_interval = throttle_decision.suggested_delay;
             info!("扫描完成，根据限流决策等待 {:?} 后开始下一轮", scan_interval);
-            info!("资源分配: 业务 {}%, 扫描器 {}%", 
-                  throttle_decision.resource_allocation.business_percentage,
-                  throttle_decision.resource_allocation.scanner_percentage);
+            info!(
+                "资源分配: 业务 {}%, 扫描器 {}%",
+                throttle_decision.resource_allocation.business_percentage,
+                throttle_decision.resource_allocation.scanner_percentage
+            );
 
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
@@ -769,7 +828,7 @@ impl NodeScanner {
             // 再次检查是否应该暂停
             let load_level = self.io_monitor.get_business_load_level().await;
             let should_pause = self.throttler.should_pause_scanning(load_level).await;
-            
+
             if should_pause {
                 warn!("业务负载过高，中断磁盘扫描");
                 break;
@@ -806,29 +865,35 @@ impl NodeScanner {
 
         let scan_start = SystemTime::now();
         let mut scan_entries = Vec::new();
-        
+
         // 获取ECStore实例进行真实的磁盘扫描
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
             // 获取磁盘上的所有存储桶
-            match ecstore.list_bucket(&rustfs_ecstore::store_api::BucketOptions::default()).await {
+            match ecstore
+                .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+                .await
+            {
                 Ok(buckets) => {
                     for bucket_info in buckets {
                         let bucket_name = &bucket_info.name;
-                        
+
                         // 跳过系统内部存储桶
                         if bucket_name == ".minio.sys" {
                             continue;
                         }
-                        
+
                         // 扫描存储桶中的对象
                         match self.scan_bucket_on_disk(&disk, bucket_name, &mut scan_entries).await {
                             Ok(object_count) => {
-                                debug!("磁盘 {:?} 上的存储桶 {} 扫描完成，发现 {} 个对象", 
-                                       disk.path(), bucket_name, object_count);
+                                debug!(
+                                    "磁盘 {:?} 上的存储桶 {} 扫描完成，发现 {} 个对象",
+                                    disk.path(),
+                                    bucket_name,
+                                    object_count
+                                );
                             }
                             Err(e) => {
-                                warn!("磁盘 {:?} 上的存储桶 {} 扫描失败: {}", 
-                                      disk.path(), bucket_name, e);
+                                warn!("磁盘 {:?} 上的存储桶 {} 扫描失败: {}", disk.path(), bucket_name, e);
                             }
                         }
                     }
@@ -861,7 +926,8 @@ impl NodeScanner {
         self.stats_manager.update_disk_scan_result(&batch_result).await?;
 
         // 同步更新本地统计数据结构
-        self.update_local_disk_stats(&disk.path().to_string_lossy(), batch_result.entries.len() as u64).await;
+        self.update_local_disk_stats(&disk.path().to_string_lossy(), batch_result.entries.len() as u64)
+            .await;
 
         Ok(())
     }
@@ -871,7 +937,7 @@ impl NodeScanner {
         let mut progress = self.scan_progress.write().await;
         progress.current_disk_index = disk_index;
         progress.completed_disks.insert(disk_id.to_string());
-        
+
         debug!("更新扫描进度: 磁盘索引 {}, 磁盘ID {}", disk_index, disk_id);
     }
 
@@ -882,19 +948,18 @@ impl NodeScanner {
         progress.current_disk_index = 0;
         progress.completed_disks.clear();
         progress.scan_start_time = SystemTime::now();
-        
+
         info!("完成扫描周期 {}", progress.current_cycle);
     }
 
     /// 更新本地磁盘统计
     async fn update_local_disk_stats(&self, disk_id: &str, objects_scanned: u64) {
         let mut stats = self.local_stats.write().await;
-        
-        let disk_stat = stats.disks_stats.entry(disk_id.to_string())
-            .or_insert_with(|| DiskStats {
-                disk_id: disk_id.to_string(),
-                ..Default::default()
-            });
+
+        let disk_stat = stats.disks_stats.entry(disk_id.to_string()).or_insert_with(|| DiskStats {
+            disk_id: disk_id.to_string(),
+            ..Default::default()
+        });
 
         disk_stat.objects_scanned += objects_scanned;
         disk_stat.last_scan_time = SystemTime::now();
@@ -908,33 +973,36 @@ impl NodeScanner {
     }
 
     /// 扫描磁盘上指定存储桶的对象
-    async fn scan_bucket_on_disk(&self, disk: &DiskStore, bucket_name: &str, scan_entries: &mut Vec<ScanResultEntry>) -> Result<usize> {
+    async fn scan_bucket_on_disk(
+        &self,
+        disk: &DiskStore,
+        bucket_name: &str,
+        scan_entries: &mut Vec<ScanResultEntry>,
+    ) -> Result<usize> {
         let disk_path = disk.path();
         let bucket_path = disk_path.join(bucket_name);
-        
+
         if !bucket_path.exists() {
             return Ok(0);
         }
-        
+
         let mut object_count = 0;
-        
+
         // 遍历存储桶目录中的所有对象
         if let Ok(entries) = std::fs::read_dir(&bucket_path) {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
                 if entry_path.is_dir() {
-                    let object_name = entry_path.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("unknown");
-                    
+                    let object_name = entry_path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown");
+
                     // 跳过隐藏文件和系统文件
                     if object_name.starts_with('.') {
                         continue;
                     }
-                    
+
                     // 获取对象大小（简化处理）
                     let object_size = self.estimate_object_size(&entry_path).await;
-                    
+
                     let entry = ScanResultEntry {
                         object_path: format!("{}/{}", bucket_name, object_name),
                         bucket_name: bucket_name.to_string(),
@@ -944,20 +1012,20 @@ impl NodeScanner {
                         scan_time: SystemTime::now(),
                         disk_id: disk_path.to_string_lossy().to_string(),
                     };
-                    
+
                     scan_entries.push(entry);
                     object_count += 1;
                 }
             }
         }
-        
+
         Ok(object_count)
     }
-    
+
     /// 估算对象大小
     async fn estimate_object_size(&self, object_dir: &std::path::Path) -> u64 {
         let mut total_size = 0u64;
-        
+
         if let Ok(entries) = std::fs::read_dir(object_dir) {
             for entry in entries.flatten() {
                 if let Ok(metadata) = entry.metadata() {
@@ -965,14 +1033,14 @@ impl NodeScanner {
                 }
             }
         }
-        
+
         total_size
     }
-    
+
     /// 生成回退扫描结果（用于测试或异常情况）
     async fn generate_fallback_scan_results(&self, disk: &DiskStore, scan_entries: &mut Vec<ScanResultEntry>) {
         debug!("生成回退扫描结果用于磁盘: {:?}", disk.path());
-        
+
         // 模拟一些扫描结果
         for i in 0..5 {
             let entry = ScanResultEntry {
@@ -1004,14 +1072,14 @@ impl NodeScanner {
     /// 保存检查点到当前磁盘
     async fn save_checkpoint(&self) -> Result<()> {
         let progress = self.scan_progress.read().await;
-        
+
         // 获取当前扫描的磁盘
         let current_disk_index = self.current_disk_index.load(std::sync::atomic::Ordering::Relaxed);
         let local_disks = self.local_disks.read().await;
         if current_disk_index < local_disks.len() {
             let current_disk = &local_disks[current_disk_index];
             let disk_id = current_disk.path().to_string_lossy().to_string();
-            
+
             // 获取该磁盘的检查点管理器
             if let Some(checkpoint_manager) = self.get_checkpoint_manager_for_disk(&disk_id).await {
                 checkpoint_manager.save_checkpoint(&progress).await?;
@@ -1020,30 +1088,35 @@ impl NodeScanner {
                 warn!("无法获取磁盘 {} 的检查点管理器", disk_id);
             }
         }
-        
+
         Ok(())
     }
 
     /// 强制保存检查点到当前磁盘
     pub async fn force_save_checkpoint(&self) -> Result<()> {
         let progress = self.scan_progress.read().await;
-        
+
         // 获取当前扫描的磁盘
         let current_disk_index = self.current_disk_index.load(std::sync::atomic::Ordering::Relaxed);
         let local_disks = self.local_disks.read().await;
-        if current_disk_index < local_disks.len() {
+
+        let checkpoint_manager = if current_disk_index < local_disks.len() {
+            // 有本地磁盘时，使用对应磁盘的检查点管理器
             let current_disk = &local_disks[current_disk_index];
             let disk_id = current_disk.path().to_string_lossy().to_string();
-            
-            // 获取该磁盘的检查点管理器
-            if let Some(checkpoint_manager) = self.get_checkpoint_manager_for_disk(&disk_id).await {
-                checkpoint_manager.force_save_checkpoint(&progress).await?;
-                info!("已强制保存磁盘 {} 的检查点", disk_id);
-            } else {
-                warn!("无法获取磁盘 {} 的检查点管理器", disk_id);
-            }
+            self.get_checkpoint_manager_for_disk(&disk_id).await
+        } else {
+            // 没有本地磁盘时，使用默认检查点管理器
+            self.get_default_checkpoint_manager().await
+        };
+
+        if let Some(checkpoint_manager) = checkpoint_manager {
+            checkpoint_manager.force_save_checkpoint(&progress).await?;
+            info!("已强制保存检查点");
+        } else {
+            warn!("无法获取检查点管理器");
         }
-        
+
         Ok(())
     }
 
@@ -1055,7 +1128,7 @@ impl NodeScanner {
         if current_disk_index < local_disks.len() {
             let current_disk = &local_disks[current_disk_index];
             let disk_id = current_disk.path().to_string_lossy().to_string();
-            
+
             // 获取该磁盘的检查点管理器
             if let Some(checkpoint_manager) = self.get_checkpoint_manager_for_disk(&disk_id).await {
                 checkpoint_manager.get_checkpoint_info().await
@@ -1063,6 +1136,8 @@ impl NodeScanner {
                 warn!("无法获取磁盘 {} 的检查点管理器", disk_id);
                 Ok(None)
             }
+        } else if let Some(default_checkpoint_manager) = self.get_default_checkpoint_manager().await {
+            default_checkpoint_manager.get_checkpoint_info().await
         } else {
             Ok(None)
         }
@@ -1118,7 +1193,9 @@ impl NodeScanner {
 
     /// 更新业务指标
     pub async fn update_business_metrics(&self, latency: u64, qps: u64, error_rate: u64, connections: u64) {
-        self.io_monitor.update_business_metrics(latency, qps, error_rate, connections).await;
+        self.io_monitor
+            .update_business_metrics(latency, qps, error_rate, connections)
+            .await;
     }
 
     /// 获取当前 IO 指标

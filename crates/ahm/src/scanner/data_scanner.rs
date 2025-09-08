@@ -41,7 +41,7 @@ use crate::{
     get_ahm_services_cancel_token,
 };
 
-use rustfs_common::data_usage::{DataUsageInfo, SizeSummary, BucketUsageInfo};
+use rustfs_common::data_usage::{BucketUsageInfo, DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
@@ -118,7 +118,7 @@ pub struct ScannerState {
 /// This is the new optimized scanner that uses the decentralized node-based architecture
 /// for minimal business IO impact. It wraps the NodeScanner and provides backward
 /// compatibility with the original Scanner interface.
-/// 
+///
 /// Key optimizations:
 /// - Node-local serial disk scanning instead of global parallel scanning
 /// - Intelligent IO throttling based on business load
@@ -141,7 +141,7 @@ pub struct Scanner {
     last_data_usage_collection: Arc<RwLock<Option<SystemTime>>>,
     /// Heal manager for auto-heal integration
     heal_manager: Option<Arc<HealManager>>,
-    
+
     // NEW: Optimized scanner components
     /// Node scanner for local disk scanning
     node_scanner: Arc<NodeScanner>,
@@ -156,10 +156,10 @@ impl Scanner {
     pub fn new(config: Option<ScannerConfig>, heal_manager: Option<Arc<HealManager>>) -> Self {
         let config = config.unwrap_or_default();
         info!("Creating optimized AHM scanner with decentralized architecture");
-        
+
         // Generate unique node ID
         let node_id = format!("scanner-node-{}", uuid::Uuid::new_v4().simple());
-        
+
         // Create node scanner configuration - we'll set the data directory properly later
         let data_dir = std::env::temp_dir().join("rustfs_scanner");
         let node_config = NodeScannerConfig {
@@ -171,10 +171,10 @@ impl Scanner {
             data_dir,
             max_retry_attempts: 3,
         };
-        
+
         // Create node scanner
         let node_scanner = Arc::new(NodeScanner::new(node_id.clone(), node_config));
-        
+
         // Create stats aggregator configuration
         let aggregator_config = DecentralizedStatsAggregatorConfig {
             aggregation_interval: Duration::from_secs(30),
@@ -182,10 +182,10 @@ impl Scanner {
             node_timeout: Duration::from_secs(5),
             max_concurrent_aggregations: 10,
         };
-        
+
         // Create stats aggregator
         let stats_aggregator = Arc::new(DecentralizedStatsAggregator::new(aggregator_config));
-        
+
         Self {
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(ScannerState::default())),
@@ -229,7 +229,7 @@ impl Scanner {
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
             info!("Initializing scanner with ECStore disks");
             let mut disk_count = 0;
-            
+
             // Get all local disks from ECStore and add them to the node scanner
             for pool in &ecstore.pools {
                 for set_disks in &pool.disk_set {
@@ -242,7 +242,7 @@ impl Scanner {
                     }
                 }
             }
-            
+
             info!("Scanner initialized with {} disks", disk_count);
         } else {
             warn!("ECStore not available during scanner initialization");
@@ -252,52 +252,63 @@ impl Scanner {
     /// Perform basic test scan for testing environments
     async fn perform_basic_test_scan(&self) -> Result<()> {
         debug!("Starting basic test scan using ECStore directly");
-        
+
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
             let mut total_objects_scanned = 0u64;
-            
+
             // Check if deep scan mode is enabled
             let config = self.config.read().await;
             let enable_deep_scan = config.scan_mode == ScanMode::Deep;
             let enable_healing = config.enable_healing;
             drop(config);
-            
+
             // List all buckets
             debug!("Listing buckets");
-            match ecstore.list_bucket(&rustfs_ecstore::store_api::BucketOptions::default()).await {
+            match ecstore
+                .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+                .await
+            {
                 Ok(buckets) => {
                     debug!("Found {} buckets", buckets.len());
                     for bucket_info in buckets {
                         let bucket_name = &bucket_info.name;
-                        
+
                         // Skip system buckets
                         if bucket_name.starts_with('.') {
                             debug!("Skipping system bucket: {}", bucket_name);
                             continue;
                         }
-                        
+
                         // Get bucket lifecycle configuration
                         let lifecycle_config = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name)
                             .await
                             .ok()
                             .map(|(c, _)| Arc::new(c));
-                        
+
                         // Get bucket versioning configuration
-                        let versioning_config = Arc::new(VersioningConfig { enabled: bucket_info.versioning });
-                        
+                        let versioning_config = Arc::new(VersioningConfig {
+                            enabled: bucket_info.versioning,
+                        });
+
                         // Count objects in this bucket
                         let actual_objects = self.count_objects_in_bucket(&ecstore, bucket_name).await;
                         total_objects_scanned += actual_objects;
                         debug!("Counted {} objects in bucket {} (actual count)", actual_objects, bucket_name);
-                        
+
                         // Process objects for lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
                             debug!("Processing lifecycle actions for bucket: {}", bucket_name);
-                            let mut scanner_item = 
-                                ScannerItem::new(bucket_name.to_string(), Some(lifecycle_config.clone()), Some(versioning_config.clone()));
-                            
+                            let mut scanner_item = ScannerItem::new(
+                                bucket_name.to_string(),
+                                Some(lifecycle_config.clone()),
+                                Some(versioning_config.clone()),
+                            );
+
                             // List objects in bucket and apply lifecycle actions
-                            match self.process_bucket_objects_for_lifecycle(&ecstore, bucket_name, &mut scanner_item).await {
+                            match self
+                                .process_bucket_objects_for_lifecycle(&ecstore, bucket_name, &mut scanner_item)
+                                .await
+                            {
                                 Ok(processed_count) => {
                                     debug!("Processed {} objects for lifecycle in bucket {}", processed_count, bucket_name);
                                 }
@@ -306,7 +317,7 @@ impl Scanner {
                                 }
                             }
                         }
-                        
+
                         // If deep scan is enabled, verify each object's integrity
                         if enable_deep_scan && enable_healing {
                             debug!("Deep scan enabled, verifying object integrity in bucket {}", bucket_name);
@@ -320,13 +331,13 @@ impl Scanner {
                     error!("Failed to list buckets: {}", e);
                 }
             }
-            
+
             debug!("Total objects scanned: {}", total_objects_scanned);
             if total_objects_scanned > 0 {
                 // Update metrics directly
                 self.metrics.increment_objects_scanned(total_objects_scanned);
                 debug!("Updated metrics with {} objects", total_objects_scanned);
-                
+
                 // Also update data usage statistics
                 self.update_data_usage_statistics(total_objects_scanned, &ecstore).await;
             } else {
@@ -335,62 +346,64 @@ impl Scanner {
         } else {
             warn!("ECStore not available");
         }
-        
+
         Ok(())
     }
 
     /// Update data usage statistics based on scan results
     async fn update_data_usage_statistics(&self, total_objects: u64, ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>) {
         debug!("Updating data usage statistics with {} objects", total_objects);
-        
+
         // Get buckets list to update data usage
-        match ecstore.list_bucket(&rustfs_ecstore::store_api::BucketOptions::default()).await {
+        match ecstore
+            .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+            .await
+        {
             Ok(buckets) => {
                 let buckets_len = buckets.len(); // Store length before moving
                 let mut data_usage_guard = self.data_usage_stats.lock().await;
-                
+
                 for bucket_info in buckets {
                     let bucket_name = &bucket_info.name;
-                    
+
                     // Skip system buckets
                     if bucket_name.starts_with('.') {
                         continue;
                     }
-                    
+
                     // Get object count for this bucket
                     let bucket_objects = self.count_objects_in_bucket(ecstore, bucket_name).await;
-                    
+
                     // Create or update bucket data usage info
-                    let bucket_data = data_usage_guard.entry(bucket_name.clone())
-                        .or_insert_with(|| {
-                            let mut info = DataUsageInfo::new();
-                            info.objects_total_count = bucket_objects;
-                            info.buckets_count = 1;
-                            
-                            // Add bucket to buckets_usage
-                            let bucket_usage = BucketUsageInfo {
-                                size: bucket_objects * 1024, // Estimate 1KB per object
-                                objects_count: bucket_objects,
-                                object_size_histogram: HashMap::new(),
-                                ..Default::default()
-                            };
-                            info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
-                            info
-                        });
-                        
+                    let bucket_data = data_usage_guard.entry(bucket_name.clone()).or_insert_with(|| {
+                        let mut info = DataUsageInfo::new();
+                        info.objects_total_count = bucket_objects;
+                        info.buckets_count = 1;
+
+                        // Add bucket to buckets_usage
+                        let bucket_usage = BucketUsageInfo {
+                            size: bucket_objects * 1024, // Estimate 1KB per object
+                            objects_count: bucket_objects,
+                            object_size_histogram: HashMap::new(),
+                            ..Default::default()
+                        };
+                        info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
+                        info
+                    });
+
                     // Update existing bucket data
                     bucket_data.objects_total_count = bucket_objects;
                     if let Some(bucket_usage) = bucket_data.buckets_usage.get_mut(bucket_name) {
                         bucket_usage.objects_count = bucket_objects;
                         bucket_usage.size = bucket_objects * 1024; // Estimate 1KB per object
                     }
-                    
+
                     debug!("Updated data usage for bucket {}: {} objects", bucket_name, bucket_objects);
                 }
-                
+
                 debug!("Data usage statistics updated for {} buckets", buckets_len);
                 debug!("Current data_usage_guard size after update: {}", data_usage_guard.len());
-                
+
                 // Also persist consolidated data to backend
                 drop(data_usage_guard); // Release the lock
                 debug!("About to get consolidated data usage info for persistence");
@@ -426,11 +439,15 @@ impl Scanner {
     }
 
     /// Deep scan objects in a bucket for integrity verification
-    async fn deep_scan_bucket_objects(&self, ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>, bucket_name: &str) -> Result<()> {
+    async fn deep_scan_bucket_objects(
+        &self,
+        ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>,
+        bucket_name: &str,
+    ) -> Result<()> {
         debug!("Starting deep scan for bucket: {}", bucket_name);
-        
+
         // Get list of objects in this bucket by scanning the filesystem
-        for pool in &ecstore.pools {
+        if let Some(pool) = ecstore.pools.first() {
             for set_disks in &pool.disk_set {
                 let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
                 if let Some(disk) = disks.first() {
@@ -444,9 +461,15 @@ impl Scanner {
                                             if !object_name.starts_with('.') {
                                                 debug!("Deep scanning object: {}/{}", bucket_name, object_name);
                                                 if let Err(e) = self.verify_object_integrity(bucket_name, object_name).await {
-                                                    warn!("Object integrity verification failed for {}/{}: {}", bucket_name, object_name, e);
+                                                    warn!(
+                                                        "Object integrity verification failed for {}/{}: {}",
+                                                        bucket_name, object_name, e
+                                                    );
                                                 } else {
-                                                    debug!("Object integrity verification passed for {}/{}", bucket_name, object_name);
+                                                    debug!(
+                                                        "Object integrity verification passed for {}/{}",
+                                                        bucket_name, object_name
+                                                    );
                                                 }
                                             }
                                         }
@@ -458,17 +481,16 @@ impl Scanner {
                     break; // Only scan first disk to avoid duplicates
                 }
             }
-            break; // Only scan first pool
         }
-        
+
         Ok(())
     }
     async fn count_objects_in_bucket(&self, ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>, bucket_name: &str) -> u64 {
         // Use filesystem scanning approach
-        
+
         // Get first disk path for scanning
         let mut total_objects = 0u64;
-        
+
         for pool in &ecstore.pools {
             for set_disks in &pool.disk_set {
                 let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
@@ -494,9 +516,13 @@ impl Scanner {
                                     }
                                 })
                                 .count() as u64;
-                            
-                            debug!("Filesystem scan found {} objects in bucket {} on disk {:?}", 
-                                     object_count, bucket_name, disk.path());
+
+                            debug!(
+                                "Filesystem scan found {} objects in bucket {} on disk {:?}",
+                                object_count,
+                                bucket_name,
+                                disk.path()
+                            );
                             total_objects = object_count; // Use count from first disk
                             break;
                         }
@@ -507,7 +533,7 @@ impl Scanner {
                 break;
             }
         }
-        
+
         if total_objects == 0 {
             // Fallback: assume 1 object if bucket exists
             debug!("Using fallback count of 1 for bucket {}", bucket_name);
@@ -526,21 +552,22 @@ impl Scanner {
     ) -> Result<u64> {
         info!("Processing objects for lifecycle in bucket: {}", bucket_name);
         let mut processed_count = 0u64;
-        
+
         // Instead of filesystem scanning, use ECStore's list_objects_v2 method to get correct object names
         let mut continuation_token = None;
         loop {
-            let list_result = match ecstore.clone()
+            let list_result = match ecstore
+                .clone()
                 .list_objects_v2(
                     bucket_name,
                     "", // prefix
                     continuation_token.clone(),
-                    None, // delimiter
-                    1000, // max_keys
+                    None,  // delimiter
+                    1000,  // max_keys
                     false, // fetch_owner
-                    None, // start_after
+                    None,  // start_after
                 )
-                .await 
+                .await
             {
                 Ok(result) => result,
                 Err(e) => {
@@ -548,16 +575,18 @@ impl Scanner {
                     break;
                 }
             };
-            
+
             info!("Found {} objects in bucket {}", list_result.objects.len(), bucket_name);
-            
+
             for obj in list_result.objects {
                 info!("Processing lifecycle for object: {}/{}", bucket_name, obj.name);
-                
+
                 // Create a minimal MetaCacheEntry for the object
-                let mut meta_entry = rustfs_filemeta::metacache::MetaCacheEntry::default();
-                meta_entry.name = obj.name.clone();
-                
+                let meta_entry = rustfs_filemeta::metacache::MetaCacheEntry {
+                    name: obj.name.clone(),
+                    ..Default::default()
+                };
+
                 // Apply lifecycle actions
                 if let Err(e) = scanner_item.apply_actions(&obj.name, meta_entry).await {
                     warn!("Failed to apply lifecycle actions for {}/{}: {}", bucket_name, obj.name, e);
@@ -565,7 +594,7 @@ impl Scanner {
                     processed_count += 1;
                 }
             }
-            
+
             // Check if there are more objects to list
             if list_result.is_truncated {
                 continuation_token = list_result.next_continuation_token.clone();
@@ -573,7 +602,7 @@ impl Scanner {
                 break;
             }
         }
-        
+
         info!("Processed {} objects for lifecycle in bucket {}", processed_count, bucket_name);
         Ok(processed_count)
     }
@@ -595,7 +624,7 @@ impl Scanner {
         // Initialize and start the node scanner
         self.node_scanner.initialize_stats().await?;
         self.node_scanner.start().await?;
-        
+
         // Set local stats in aggregator
         let local_stats = self.node_scanner.get_stats_summary().await;
         self.stats_aggregator.set_local_stats(local_stats).await;
@@ -638,10 +667,10 @@ impl Scanner {
         }
 
         drop(state);
-        
+
         // Clear any cached data
         self.stats_aggregator.clear_cache().await;
-        
+
         info!("Optimized AHM scanner stopped successfully");
         Ok(())
     }
@@ -655,14 +684,20 @@ impl Scanner {
             let data_usage_guard = self.data_usage_stats.lock().await;
             debug!("get_data_usage_info: Found {} bucket entries in cache", data_usage_guard.len());
             for (bucket_name, bucket_data) in data_usage_guard.iter() {
-                debug!("get_data_usage_info: Processing bucket {}: objects_total_count={}, buckets_usage.len()={}", 
-                        bucket_name, bucket_data.objects_total_count, bucket_data.buckets_usage.len());
-                
+                debug!(
+                    "get_data_usage_info: Processing bucket {}: objects_total_count={}, buckets_usage.len()={}",
+                    bucket_name,
+                    bucket_data.objects_total_count,
+                    bucket_data.buckets_usage.len()
+                );
+
                 // Merge bucket data into integrated info
                 integrated_info.merge(bucket_data);
-                
-                debug!("get_data_usage_info: After merging bucket {}: integrated_info.objects_total_count={}", 
-                        bucket_name, integrated_info.objects_total_count);
+
+                debug!(
+                    "get_data_usage_info: After merging bucket {}: integrated_info.objects_total_count={}",
+                    bucket_name, integrated_info.objects_total_count
+                );
             }
         }
 
@@ -765,7 +800,10 @@ impl Scanner {
         // Start global metrics collection for this cycle
         let stop_fn = Metrics::time(Metric::ScanCycle);
 
-        info!("Starting optimized scan cycle {} using node scanner", self.metrics.get_metrics().current_cycle + 1);
+        info!(
+            "Starting optimized scan cycle {} using node scanner",
+            self.metrics.get_metrics().current_cycle + 1
+        );
 
         // Update state
         {
@@ -789,7 +827,7 @@ impl Scanner {
 
         // Use the optimized node scanner instead of the old global scan
         // The node scanner handles serial disk scanning with intelligent throttling
-        
+
         // Force a checkpoint save to ensure progress is tracked
         if let Err(e) = self.node_scanner.force_save_checkpoint().await {
             warn!("Failed to save checkpoint: {}", e);
@@ -799,12 +837,17 @@ impl Scanner {
         debug!("About to get aggregated stats");
         match self.stats_aggregator.get_aggregated_stats().await {
             Ok(aggregated_stats) => {
-                debug!("Successfully got aggregated stats: {} objects scanned", aggregated_stats.total_objects_scanned);
-                info!("Aggregated stats: total_objects_scanned={}, online_node_count={}", 
-                      aggregated_stats.total_objects_scanned, aggregated_stats.online_node_count);
+                debug!(
+                    "Successfully got aggregated stats: {} objects scanned",
+                    aggregated_stats.total_objects_scanned
+                );
+                info!(
+                    "Aggregated stats: total_objects_scanned={}, online_node_count={}",
+                    aggregated_stats.total_objects_scanned, aggregated_stats.online_node_count
+                );
                 // Update legacy metrics with aggregated data
                 self.update_legacy_metrics_from_aggregated(&aggregated_stats).await;
-                
+
                 // If aggregated stats show no objects scanned, also try basic test scan
                 if aggregated_stats.total_objects_scanned == 0 {
                     debug!("Aggregated stats show 0 objects, falling back to direct ECStore scan for testing");
@@ -817,9 +860,11 @@ impl Scanner {
                 } else {
                     info!("Not calling perform_basic_test_scan because aggregated_stats.total_objects_scanned > 0");
                 }
-                
-                info!("Scan cycle completed with {} online nodes, {} total objects scanned", 
-                      aggregated_stats.online_node_count, aggregated_stats.total_objects_scanned);
+
+                info!(
+                    "Scan cycle completed with {} online nodes, {} total objects scanned",
+                    aggregated_stats.online_node_count, aggregated_stats.total_objects_scanned
+                );
             }
             Err(e) => {
                 warn!("Failed to get aggregated stats: {}", e);
@@ -828,7 +873,7 @@ impl Scanner {
                 debug!("Local stats: {} objects scanned", local_stats.total_objects_scanned);
                 info!("Local stats: total_objects_scanned={}", local_stats.total_objects_scanned);
                 self.update_legacy_metrics_from_local(&local_stats).await;
-                
+
                 // In test environments, if no real scanning happened, perform basic scan
                 if local_stats.total_objects_scanned == 0 {
                     debug!("No objects scanned by NodeScanner, falling back to direct ECStore scan for testing");
@@ -2279,20 +2324,20 @@ impl Scanner {
     /// Legacy scan loop for backward compatibility (runs in background)
     async fn legacy_scan_loop(&self) -> Result<()> {
         info!("Starting legacy scan loop for backward compatibility");
-        
+
         while !get_ahm_services_cancel_token().is_none_or(|t| t.is_cancelled()) {
             // Update local stats in aggregator
             let local_stats = self.node_scanner.get_stats_summary().await;
             self.stats_aggregator.set_local_stats(local_stats).await;
-            
+
             // Sleep for scan interval
             let config = self.config.read().await;
             let scan_interval = config.scan_interval;
             drop(config);
-            
+
             tokio::time::sleep(scan_interval).await;
         }
-        
+
         Ok(())
     }
 
@@ -2305,7 +2350,7 @@ impl Scanner {
             self.metrics.increment_corrupted_objects();
         }
         // Note: bytes_scanned and heal_triggered will be handled separately
-        
+
         // Update state with aggregated info
         let mut state = self.state.write().await;
         state.scanning_buckets = aggregated.aggregated_bucket_stats.keys().cloned().collect();
@@ -2330,12 +2375,12 @@ impl Scanner {
     async fn minimal_ec_verification(&self, _ecstore: &Arc<rustfs_ecstore::store::ECStore>) -> Result<()> {
         // This is a lightweight verification that only checks critical objects
         // The main scanning is now handled by the background NodeScanner
-        
+
         debug!("Performing minimal EC verification for critical objects");
-        
+
         // TODO: Implement minimal verification logic
         // For now, we rely on the NodeScanner to handle most verification
-        
+
         Ok(())
     }
 
@@ -2486,7 +2531,7 @@ mod tests {
 
         // create Scanner and test basic functionality
         let scanner = Scanner::new(None, None);
-        
+
         // Initialize scanner with ECStore disks
         scanner.initialize_with_ecstore().await;
 
@@ -2561,7 +2606,7 @@ mod tests {
 
         // prepare test bucket and object
         let bucket = "test-bucket-stats";
-        
+
         // Try to create bucket, handle case where it might already exist
         match ecstore.make_bucket(bucket, &Default::default()).await {
             Ok(_) => {
@@ -2574,7 +2619,7 @@ mod tests {
                 panic!("Failed to create bucket {}: {}", bucket, e);
             }
         }
-        
+
         let mut pr = PutObjReader::from_vec(b"hello".to_vec());
         ecstore
             .put_object(bucket, "obj1", &mut pr, &Default::default())
@@ -2610,7 +2655,7 @@ mod tests {
 
         // verify correctness of persisted data
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // Give more time for persistence
-        
+
         // Retry logic for loading persisted data (to handle potential lock contention)
         let mut retry_count = 0;
         let persisted = loop {
@@ -2620,7 +2665,10 @@ mod tests {
                     retry_count += 1;
                     if retry_count >= 3 {
                         // If we still can't load after 3 retries, log and skip this verification
-                        println!("Warning: Could not load persisted data after {} retries: {}. Skipping persistence verification.", retry_count, e);
+                        println!(
+                            "Warning: Could not load persisted data after {} retries: {}. Skipping persistence verification.",
+                            retry_count, e
+                        );
                         println!("This is likely due to concurrent test execution and doesn't indicate a functional issue.");
                         // Just continue with the rest of the test
                         break DataUsageInfo::new(); // Use empty data to skip assertions
@@ -2630,7 +2678,7 @@ mod tests {
                 }
             }
         };
-        
+
         // Only verify persisted data if we successfully loaded it
         if persisted.objects_total_count > 0 {
             assert_eq!(persisted.objects_total_count, du_after.objects_total_count);
@@ -2768,7 +2816,7 @@ mod tests {
         let heal_manager = Arc::new(crate::heal::HealManager::new(heal_storage, Some(heal_config)));
         heal_manager.start().await.unwrap();
         let scanner = Scanner::new(None, Some(heal_manager.clone()));
-        
+
         // Initialize scanner with ECStore disks
         scanner.initialize_with_ecstore().await;
 
@@ -2911,14 +2959,17 @@ mod tests {
         // The heal system might not restore files to the exact same paths
         // Instead, verify that heal tasks were submitted and the object remains accessible
         println!("=== Verifying heal system response ===");
-        
+
         // Check if heal tasks were submitted
         if heal_stats.total_tasks > 0 {
-            println!("✓ Scanner correctly detected missing data and submitted {} heal tasks", heal_stats.total_tasks);
+            println!(
+                "✓ Scanner correctly detected missing data and submitted {} heal tasks",
+                heal_stats.total_tasks
+            );
         } else {
             panic!("Heal tasks should have been submitted for missing data parts");
         }
-        
+
         // Verify object accessibility through the storage layer
         let object_accessible = match ecstore.get_object_info(bucket_name, object_name, &object_opts).await {
             Ok(info) => {
@@ -2930,7 +2981,7 @@ mod tests {
                 false
             }
         };
-        
+
         // The key success criteria for this test is that:
         // 1. Scanner detected missing data parts
         // 2. Scanner submitted heal tasks for the missing data
@@ -2993,7 +3044,7 @@ mod tests {
         let heal_manager = Arc::new(crate::heal::HealManager::new(heal_storage, Some(heal_config)));
         heal_manager.start().await.unwrap();
         let scanner = Scanner::new(None, Some(heal_manager.clone()));
-        
+
         // Initialize scanner with ECStore disks
         scanner.initialize_with_ecstore().await;
 
@@ -3194,10 +3245,10 @@ mod tests {
 
         // Create scanner with healing enabled
         let scanner = Scanner::new(None, Some(heal_manager.clone()));
-        
+
         // Initialize scanner with ECStore disks
         scanner.initialize_with_ecstore().await;
-        
+
         {
             let mut config = scanner.config.write().await;
             config.enable_healing = true;

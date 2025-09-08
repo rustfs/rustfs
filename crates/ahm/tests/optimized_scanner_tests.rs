@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{sync::Arc, time::Duration, fs, net::SocketAddr, sync::OnceLock};
+use std::{fs, net::SocketAddr, sync::Arc, sync::OnceLock, time::Duration};
 use tempfile::TempDir;
 
 use serial_test::serial;
 
+use rustfs_ahm::heal::manager::HealConfig;
 use rustfs_ahm::scanner::{
     Scanner,
-    data_scanner::{ScannerConfig, ScanMode},
+    data_scanner::ScanMode,
     node_scanner::{LoadLevel, NodeScanner, NodeScannerConfig},
 };
-use rustfs_ahm::heal::manager::HealConfig;
 
 use rustfs_ecstore::disk::endpoint::Endpoint;
 use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
@@ -149,7 +149,7 @@ async fn test_optimized_scanner_basic_functionality() {
     println!("=== Test 1: Optimized Normal scan ===");
     let scan_result = scanner.scan_cycle().await;
     assert!(scan_result.is_ok(), "Optimized normal scan should succeed");
-    let metrics = scanner.get_metrics().await;
+    let _metrics = scanner.get_metrics().await;
     // Note: The optimized scanner may not immediately show scanned objects as it works differently
     println!("Optimized normal scan completed successfully");
 
@@ -182,7 +182,10 @@ async fn test_optimized_scanner_basic_functionality() {
     println!("Optimized scan after corruption result: {scan_result_after_corruption:?}");
 
     // Scanner should handle missing data gracefully
-    assert!(scan_result_after_corruption.is_ok(), "Optimized scanner should handle missing data gracefully");
+    assert!(
+        scan_result_after_corruption.is_ok(),
+        "Optimized scanner should handle missing data gracefully"
+    );
 
     // Test 3: Test metrics collection
     println!("=== Test 3: Optimized metrics collection ===");
@@ -238,7 +241,8 @@ async fn test_optimized_scanner_usage_stats() {
     println!("Data usage after adding objects: {du_after:?}");
 
     // The optimized scanner should at least not crash and return valid data
-    assert!(du_after.buckets_count >= 0);
+    // buckets_count is u64, so it's always >= 0
+    assert!(du_after.buckets_count == du_after.buckets_count);
 
     // clean up temp dir
     let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_USAGE_STATS));
@@ -322,7 +326,7 @@ async fn test_optimized_performance_characteristics() {
         ecstore
             .put_object(bucket_name, &object_name, &mut put_reader, &object_opts)
             .await
-            .expect(&format!("Failed to create object {}", object_name));
+            .unwrap_or_else(|_| panic!("Failed to create object {}", object_name));
     }
 
     // Create optimized scanner
@@ -341,7 +345,10 @@ async fn test_optimized_performance_characteristics() {
 
     // Verify the scan was reasonably fast (should be faster than old concurrent scanner)
     // Note: This is a rough check - in practice, optimized scanner should be much faster
-    assert!(scan_duration < Duration::from_secs(30), "Optimized scan should complete within 30 seconds");
+    assert!(
+        scan_duration < Duration::from_secs(30),
+        "Optimized scan should complete within 30 seconds"
+    );
 
     // Test memory usage is reasonable (indirect test through successful completion)
     let metrics = scanner.get_metrics().await;
@@ -351,9 +358,9 @@ async fn test_optimized_performance_characteristics() {
     let start_time2 = std::time::Instant::now();
     let _scan_result2 = scanner.scan_cycle().await;
     let scan_duration2 = start_time2.elapsed();
-    
+
     println!("Second optimized scan completed in: {:?}", scan_duration2);
-    
+
     // Second scan should be similar or faster due to caching
     let performance_ratio = scan_duration2.as_millis() as f64 / scan_duration.as_millis() as f64;
     println!("Performance ratio (second/first): {:.2}", performance_ratio);
@@ -367,7 +374,7 @@ async fn test_optimized_performance_characteristics() {
 #[serial]
 async fn test_optimized_load_balancing_and_throttling() {
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create a node scanner with optimized configuration
     let config = NodeScannerConfig {
         data_dir: temp_dir.path().to_path_buf(),
@@ -376,12 +383,12 @@ async fn test_optimized_load_balancing_and_throttling() {
         disk_scan_delay: Duration::from_millis(50),
         ..Default::default()
     };
-    
+
     let node_scanner = NodeScanner::new("test-optimized-node".to_string(), config);
-    
+
     // Initialize the scanner
     node_scanner.initialize_stats().await.unwrap();
-    
+
     let io_monitor = node_scanner.get_io_monitor();
     let throttler = node_scanner.get_io_throttler();
 
@@ -390,7 +397,7 @@ async fn test_optimized_load_balancing_and_throttling() {
 
     // Test load balancing scenarios
     let load_scenarios = vec![
-        (LoadLevel::Low, 10, 100, 0, 5),      // (load level, latency, qps, error rate, connections)
+        (LoadLevel::Low, 10, 100, 0, 5), // (load level, latency, qps, error rate, connections)
         (LoadLevel::Medium, 30, 300, 10, 20),
         (LoadLevel::High, 80, 800, 50, 50),
         (LoadLevel::Critical, 200, 1200, 100, 100),
@@ -398,7 +405,7 @@ async fn test_optimized_load_balancing_and_throttling() {
 
     for (expected_level, latency, qps, error_rate, connections) in load_scenarios {
         println!("Testing load scenario: {:?}", expected_level);
-        
+
         // Update business metrics to simulate load
         node_scanner
             .update_business_metrics(latency, qps, error_rate, connections)
@@ -412,7 +419,7 @@ async fn test_optimized_load_balancing_and_throttling() {
         println!("Detected load level: {:?}", current_level);
 
         // Get throttling decision
-        let current_metrics = io_monitor.get_current_metrics().await;
+        let _current_metrics = io_monitor.get_current_metrics().await;
         let metrics_snapshot = rustfs_ahm::scanner::io_throttler::MetricsSnapshot {
             iops: 100 + qps / 10,
             latency,
@@ -420,32 +427,36 @@ async fn test_optimized_load_balancing_and_throttling() {
             memory_usage: 40,
         };
 
-        let decision = throttler
-            .make_throttle_decision(current_level, Some(metrics_snapshot))
-            .await;
+        let decision = throttler.make_throttle_decision(current_level, Some(metrics_snapshot)).await;
 
-        println!("Throttle decision: should_pause={}, delay={:?}", 
-                decision.should_pause, decision.suggested_delay);
+        println!(
+            "Throttle decision: should_pause={}, delay={:?}",
+            decision.should_pause, decision.suggested_delay
+        );
 
         // Verify throttling behavior
         match current_level {
             LoadLevel::Critical => {
                 assert!(decision.should_pause, "Critical load should trigger pause");
-            },
+            }
             LoadLevel::High => {
-                assert!(decision.suggested_delay > Duration::from_millis(1000), 
-                       "High load should suggest significant delay");
-            },
+                assert!(
+                    decision.suggested_delay > Duration::from_millis(1000),
+                    "High load should suggest significant delay"
+                );
+            }
             _ => {
                 // Lower loads should have reasonable delays
-                assert!(decision.suggested_delay < Duration::from_secs(5),
-                       "Lower loads should not have excessive delays");
+                assert!(
+                    decision.suggested_delay < Duration::from_secs(5),
+                    "Lower loads should not have excessive delays"
+                );
             }
         }
     }
 
     io_monitor.stop().await;
-    
+
     println!("Optimized load balancing and throttling test completed successfully");
 }
 
@@ -684,6 +695,7 @@ async fn test_optimized_scanner_detect_missing_xl_meta() {
     println!("  - total_tasks: {}", final_heal_stats.total_tasks);
     println!("  - successful_tasks: {}", final_heal_stats.successful_tasks);
     println!("  - failed_tasks: {}", final_heal_stats.failed_tasks);
+    let _ = final_heal_stats; // Use the variable to avoid unused warning
 
     // The optimized scanner should handle missing metadata gracefully
     match scan_after_deletion {
@@ -790,7 +802,7 @@ async fn test_optimized_scanner_healthy_objects_not_marked_corrupted() {
     assert!(second_scan_result.is_ok(), "Second scan should also succeed");
 
     let second_metrics = scanner.get_metrics().await;
-    let final_heal_stats = heal_manager.get_statistics().await;
+    let _final_heal_stats = heal_manager.get_statistics().await;
 
     println!("Second scan metrics:");
     println!("  - objects_scanned: {}", second_metrics.objects_scanned);

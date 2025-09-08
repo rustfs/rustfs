@@ -14,8 +14,8 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -25,11 +25,11 @@ use tracing::{debug, error, info, warn};
 
 use rustfs_common::data_usage::DataUsageInfo;
 
-use crate::{error::Result, Error};
-use super::node_scanner::{DiskStats, LocalScanStats, BucketStats};
+use super::node_scanner::{BucketStats, DiskStats, LocalScanStats};
+use crate::{Error, error::Result};
 
 /// 统计数据持久化管理器
-/// 
+///
 /// 负责本地统计数据的收集、存储和持久化：
 /// - 实时更新扫描统计数据
 /// - 定期持久化到磁盘
@@ -158,7 +158,7 @@ impl LocalStatsManager {
             }
             Err(e) => {
                 warn!("加载主统计文件失败: {}，尝试备份文件", e);
-                
+
                 match self.load_stats_from_file(&self.backup_file).await {
                     Ok(stats) => {
                         *self.stats.write().await = stats;
@@ -176,11 +176,12 @@ impl LocalStatsManager {
 
     /// 从文件加载统计数据
     async fn load_stats_from_file(&self, file_path: &Path) -> Result<LocalScanStats> {
-        let content = tokio::fs::read_to_string(file_path).await
+        let content = tokio::fs::read_to_string(file_path)
+            .await
             .map_err(|e| Error::IO(format!("读取统计文件失败: {}", e)))?;
 
-        let stats: LocalScanStats = serde_json::from_str(&content)
-            .map_err(|e| Error::Serialization(format!("反序列化统计数据失败: {}", e)))?;
+        let stats: LocalScanStats =
+            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("反序列化统计数据失败: {}", e)))?;
 
         Ok(stats)
     }
@@ -196,23 +197,26 @@ impl LocalStatsManager {
         }
 
         let stats = self.stats.read().await.clone();
-        
+
         // 序列化
-        let json_data = serde_json::to_string_pretty(&stats)
-            .map_err(|e| Error::Serialization(format!("序列化统计数据失败: {}", e)))?;
+        let json_data =
+            serde_json::to_string_pretty(&stats).map_err(|e| Error::Serialization(format!("序列化统计数据失败: {}", e)))?;
 
         // 原子性写入
-        tokio::fs::write(&self.temp_file, json_data).await
+        tokio::fs::write(&self.temp_file, json_data)
+            .await
             .map_err(|e| Error::IO(format!("写入临时统计文件失败: {}", e)))?;
 
         // 备份现有文件
         if self.stats_file.exists() {
-            tokio::fs::copy(&self.stats_file, &self.backup_file).await
+            tokio::fs::copy(&self.stats_file, &self.backup_file)
+                .await
                 .map_err(|e| Error::IO(format!("备份统计文件失败: {}", e)))?;
         }
 
         // 原子性替换
-        tokio::fs::rename(&self.temp_file, &self.stats_file).await
+        tokio::fs::rename(&self.temp_file, &self.stats_file)
+            .await
             .map_err(|e| Error::IO(format!("替换统计文件失败: {}", e)))?;
 
         *self.last_save.write().await = now;
@@ -232,11 +236,10 @@ impl LocalStatsManager {
         let mut stats = self.stats.write().await;
 
         // 更新磁盘统计
-        let disk_stat = stats.disks_stats.entry(result.disk_id.clone())
-            .or_insert_with(|| DiskStats {
-                disk_id: result.disk_id.clone(),
-                ..Default::default()
-            });
+        let disk_stat = stats.disks_stats.entry(result.disk_id.clone()).or_insert_with(|| DiskStats {
+            disk_id: result.disk_id.clone(),
+            ..Default::default()
+        });
 
         let healthy_count = result.entries.iter().filter(|e| e.is_healthy).count() as u64;
         let error_count = result.entries.iter().filter(|e| !e.is_healthy).count() as u64;
@@ -255,7 +258,9 @@ impl LocalStatsManager {
 
         // 按存储桶更新统计
         for entry in &result.entries {
-            let _bucket_stat = stats.buckets_stats.entry(entry.bucket_name.clone())
+            let _bucket_stat = stats
+                .buckets_stats
+                .entry(entry.bucket_name.clone())
                 .or_insert_with(BucketStats::default);
 
             // TODO: 更新 BucketStats 的具体字段
@@ -263,10 +268,16 @@ impl LocalStatsManager {
         }
 
         // 更新原子计数器
-        self.counters.total_objects_scanned.fetch_add(result.entries.len() as u64, Ordering::Relaxed);
-        self.counters.total_healthy_objects.fetch_add(healthy_count, Ordering::Relaxed);
-        self.counters.total_corrupted_objects.fetch_add(error_count, Ordering::Relaxed);
-        
+        self.counters
+            .total_objects_scanned
+            .fetch_add(result.entries.len() as u64, Ordering::Relaxed);
+        self.counters
+            .total_healthy_objects
+            .fetch_add(healthy_count, Ordering::Relaxed);
+        self.counters
+            .total_corrupted_objects
+            .fetch_add(error_count, Ordering::Relaxed);
+
         let total_bytes: u64 = result.entries.iter().map(|e| e.object_size).sum();
         self.counters.total_bytes_scanned.fetch_add(total_bytes, Ordering::Relaxed);
 
@@ -276,8 +287,13 @@ impl LocalStatsManager {
 
         drop(stats);
 
-        debug!("更新磁盘 {} 扫描结果：对象数 {}, 健康 {}, 错误 {}", 
-               result.disk_id, result.entries.len(), healthy_count, error_count);
+        debug!(
+            "更新磁盘 {} 扫描结果：对象数 {}, 健康 {}, 错误 {}",
+            result.disk_id,
+            result.entries.len(),
+            healthy_count,
+            error_count
+        );
 
         Ok(())
     }
@@ -327,7 +343,7 @@ impl LocalStatsManager {
     /// 获取统计摘要
     pub async fn get_stats_summary(&self) -> StatsSummary {
         let stats = self.stats.read().await;
-        
+
         StatsSummary {
             node_id: self.node_id.clone(),
             total_objects_scanned: self.counters.total_objects_scanned.load(Ordering::Relaxed),
@@ -346,7 +362,7 @@ impl LocalStatsManager {
     /// 记录 heal 触发
     pub async fn record_heal_triggered(&self, object_path: &str, error_message: &str) {
         self.counters.total_heal_triggered.fetch_add(1, Ordering::Relaxed);
-        
+
         info!("记录 heal 触发: 对象={}, 错误={}", object_path, error_message);
     }
 
@@ -355,7 +371,7 @@ impl LocalStatsManager {
         let mut stats = self.stats.write().await;
         stats.data_usage = data_usage;
         stats.last_update = SystemTime::now();
-        
+
         debug!("更新数据使用统计");
     }
 
@@ -363,19 +379,22 @@ impl LocalStatsManager {
     pub async fn cleanup_stats_files(&self) -> Result<()> {
         // 删除主文件
         if self.stats_file.exists() {
-            tokio::fs::remove_file(&self.stats_file).await
+            tokio::fs::remove_file(&self.stats_file)
+                .await
                 .map_err(|e| Error::IO(format!("删除统计文件失败: {}", e)))?;
         }
 
         // 删除备份文件
         if self.backup_file.exists() {
-            tokio::fs::remove_file(&self.backup_file).await
+            tokio::fs::remove_file(&self.backup_file)
+                .await
                 .map_err(|e| Error::IO(format!("删除备份统计文件失败: {}", e)))?;
         }
 
         // 删除临时文件
         if self.temp_file.exists() {
-            tokio::fs::remove_file(&self.temp_file).await
+            tokio::fs::remove_file(&self.temp_file)
+                .await
                 .map_err(|e| Error::IO(format!("删除临时统计文件失败: {}", e)))?;
         }
 

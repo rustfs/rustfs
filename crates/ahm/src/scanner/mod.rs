@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod checkpoint;
 pub mod data_scanner;
 pub mod histogram;
-pub mod lifecycle;
-pub mod metrics;
-pub mod node_scanner;
-pub mod checkpoint;
-pub mod local_stats;
 pub mod io_monitor;
 pub mod io_throttler;
+pub mod lifecycle;
+pub mod local_stats;
+pub mod metrics;
+pub mod node_scanner;
 pub mod stats_aggregator;
 
-pub use data_scanner::{Scanner, ScannerConfig, ScanMode, ScannerState};
+pub use checkpoint::{CheckpointData, CheckpointInfo, CheckpointManager};
+pub use data_scanner::{ScanMode, Scanner, ScannerConfig, ScannerState};
+pub use io_monitor::{AdvancedIOMonitor, IOMetrics, IOMonitorConfig};
+pub use io_throttler::{AdvancedIOThrottler, IOThrottlerConfig, ResourceAllocation, ThrottleDecision};
+pub use local_stats::{BatchScanResult, LocalStatsManager, ScanResultEntry, StatsSummary};
 pub use metrics::ScannerMetrics;
-pub use node_scanner::{NodeScanner, NodeScannerConfig, LocalScanStats, LoadLevel, IOMonitor, IOThrottler};
-pub use checkpoint::{CheckpointManager, CheckpointData, CheckpointInfo};
-pub use local_stats::{LocalStatsManager, BatchScanResult, ScanResultEntry, StatsSummary};
-pub use io_monitor::{AdvancedIOMonitor, IOMonitorConfig, IOMetrics};
-pub use io_throttler::{AdvancedIOThrottler, IOThrottlerConfig, ThrottleDecision, ResourceAllocation};
-pub use stats_aggregator::{DecentralizedStatsAggregator, NodeClient, AggregatedStats, NodeInfo};
+pub use node_scanner::{IOMonitor, IOThrottler, LoadLevel, LocalScanStats, NodeScanner, NodeScannerConfig};
+pub use stats_aggregator::{AggregatedStats, DecentralizedStatsAggregator, NodeClient, NodeInfo};

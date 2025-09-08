@@ -47,19 +47,3 @@ walkdir = "2.5.0"
 tempfile = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 sysinfo = "0.30.8"
-
-[[bench]]
-name = "business_io_impact"
-harness = false
-
-[[bench]]
-name = "scanner_performance"
-harness = false
-
-[[bench]]
-name = "resource_contention"
-harness = false
-
-[[bench]]
-name = "adaptive_scheduling"
-harness = false
