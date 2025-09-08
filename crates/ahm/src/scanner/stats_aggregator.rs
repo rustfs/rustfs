@@ -389,7 +389,13 @@ impl DecentralizedStatsAggregator {
             let node_id = node_id.clone();
 
             let task = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        warn!("Failed to acquire semaphore for node {}: {}", node_id, e);
+                        return None;
+                    }
+                };
 
                 match client.get_stats_summary().await {
                     Ok(summary) => {

@@ -204,8 +204,16 @@ impl ScannerItem {
 
         info!("apply_lifecycle: Evaluating lifecycle for object: {}", oi.name);
 
+        let lifecycle = match self.lifecycle.as_ref() {
+            Some(lc) => lc,
+            None => {
+                info!("No lifecycle configuration found for object: {}", oi.name);
+                return (IlmAction::NoneAction, 0);
+            }
+        };
+
         let lc_evt = eval_action_from_lifecycle(
-            self.lifecycle.as_ref().unwrap(),
+            lifecycle,
             olcfg
                 .as_ref()
                 .and_then(|(c, _)| c.rule.as_ref().and_then(|r| r.default_retention.clone())),

@@ -1462,7 +1462,13 @@ impl Scanner {
             let scanner = self.clone_for_background();
 
             let future = async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        error!("Failed to acquire semaphore for disk scan");
+                        return Err(Error::Other("Semaphore acquisition failed".to_string()));
+                    }
+                };
                 scanner.scan_disk(&disk).await
             };
 
@@ -2196,7 +2202,11 @@ impl Scanner {
                     }
 
                     // Add object to data usage statistics (pass entire FileMeta for accurate version counting)
-                    data_usage.add_object_from_file_meta(&object_key, objects.get(object_name).unwrap());
+                    if let Some(file_meta) = objects.get(object_name) {
+                        data_usage.add_object_from_file_meta(&object_key, file_meta);
+                    } else {
+                        warn!("Object {} not found in objects map, skipping", object_name);
+                    }
                 }
             }
         }
@@ -2439,9 +2449,13 @@ mod tests {
         let test_base_dir = test_dir.unwrap_or("/tmp/rustfs_ahm_test");
         let temp_dir = std::path::PathBuf::from(test_base_dir);
         if temp_dir.exists() {
-            fs::remove_dir_all(&temp_dir).unwrap();
+            if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                panic!("Failed to remove test directory: {}", e);
+            }
         }
-        fs::create_dir_all(&temp_dir).unwrap();
+        if let Err(e) = fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create test directory: {}", e);
+        }
 
         // create 4 disk dirs
         let disk_paths = vec![
@@ -2452,13 +2466,16 @@ mod tests {
         ];
 
         for disk_path in &disk_paths {
-            fs::create_dir_all(disk_path).unwrap();
+            if let Err(e) = fs::create_dir_all(disk_path) {
+                panic!("Failed to create disk directory {:?}: {}", disk_path, e);
+            }
         }
 
         // create EndpointServerPools
         let mut endpoints = Vec::new();
         for (i, disk_path) in disk_paths.iter().enumerate() {
-            let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+            let disk_str = disk_path.to_str().expect("Invalid disk path");
+            let mut endpoint = Endpoint::try_from(disk_str).expect("Failed to create endpoint from disk path");
             // set correct index
             endpoint.set_pool_index(0);
             endpoint.set_set_index(0);
@@ -2478,12 +2495,16 @@ mod tests {
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
         // format disks
-        rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+        rustfs_ecstore::store::init_local_disks(endpoint_pools.clone())
+            .await
+            .expect("Failed to initialize local disks");
 
         // create ECStore with dynamic port
         let port = port.unwrap_or(9000);
-        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("Invalid server address format");
+        let ecstore = ECStore::new(server_addr, endpoint_pools)
+            .await
+            .expect("Failed to create ECStore");
 
         // init bucket metadata system
         let buckets_list = ecstore
@@ -2492,7 +2513,7 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .unwrap();
+            .expect("Failed to list buckets");
         let buckets = buckets_list.into_iter().map(|v| v.name).collect();
         rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
@@ -2525,7 +2546,7 @@ mod tests {
         let buckets = ecstore
             .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
             .await
-            .unwrap();
+            .expect("Failed to list buckets in test");
         assert!(buckets.iter().any(|b| b.name == bucket_name), "bucket not found after creation");
 
         // write object
@@ -2631,7 +2652,7 @@ mod tests {
         ecstore
             .put_object(bucket, "obj1", &mut pr, &Default::default())
             .await
-            .unwrap();
+            .expect("Failed to put object in test");
 
         let scanner = Scanner::new(None, None);
 
@@ -2645,19 +2666,28 @@ mod tests {
         }
 
         // first scan and get statistics
-        scanner.scan_cycle().await.unwrap();
-        let du_initial = scanner.get_data_usage_info().await.unwrap();
+        scanner.scan_cycle().await.expect("Failed to scan cycle in test");
+        let du_initial = scanner
+            .get_data_usage_info()
+            .await
+            .expect("Failed to get data usage info in test");
         assert!(du_initial.objects_total_count > 0);
 
         // write 3 more objects and get statistics again
         for size in [1024, 2048, 4096] {
             let name = format!("obj_{size}");
             let mut pr = PutObjReader::from_vec(vec![b'x'; size]);
-            ecstore.put_object(bucket, &name, &mut pr, &Default::default()).await.unwrap();
+            ecstore
+                .put_object(bucket, &name, &mut pr, &Default::default())
+                .await
+                .expect("Failed to put object in test");
         }
 
-        scanner.scan_cycle().await.unwrap();
-        let du_after = scanner.get_data_usage_info().await.unwrap();
+        scanner.scan_cycle().await.expect("Failed to scan cycle in test");
+        let du_after = scanner
+            .get_data_usage_info()
+            .await
+            .expect("Failed to get data usage info in test");
         assert!(du_after.objects_total_count >= du_initial.objects_total_count + 3);
 
         // verify correctness of persisted data
@@ -2690,8 +2720,11 @@ mod tests {
         if persisted.objects_total_count > 0 {
             assert_eq!(persisted.objects_total_count, du_after.objects_total_count);
             assert_eq!(persisted.buckets_count, du_after.buckets_count);
-            let p_bucket = persisted.buckets_usage.get(bucket).unwrap();
-            let m_bucket = du_after.buckets_usage.get(bucket).unwrap();
+            let p_bucket = persisted
+                .buckets_usage
+                .get(bucket)
+                .expect("Failed to get persisted bucket usage");
+            let m_bucket = du_after.buckets_usage.get(bucket).expect("Failed to get memory bucket usage");
             assert_eq!(p_bucket.objects_count, m_bucket.objects_count);
             assert_eq!(p_bucket.size, m_bucket.size);
             println!("✓ Persisted data verification passed");
@@ -2700,8 +2733,11 @@ mod tests {
         }
 
         // consistency - again scan should not change count
-        scanner.scan_cycle().await.unwrap();
-        let du_cons = scanner.get_data_usage_info().await.unwrap();
+        scanner.scan_cycle().await.expect("Failed to scan cycle in test");
+        let du_cons = scanner
+            .get_data_usage_info()
+            .await
+            .expect("Failed to get consolidated data usage info in test");
         assert_eq!(du_after.objects_total_count, du_cons.objects_total_count);
 
         // clean up temp dir
@@ -2719,21 +2755,27 @@ mod tests {
         let bucket1 = "test-bucket-1";
         let bucket2 = "test-bucket-2";
 
-        ecstore.make_bucket(bucket1, &Default::default()).await.unwrap();
-        ecstore.make_bucket(bucket2, &Default::default()).await.unwrap();
+        ecstore
+            .make_bucket(bucket1, &Default::default())
+            .await
+            .expect("Failed to make bucket1 in test");
+        ecstore
+            .make_bucket(bucket2, &Default::default())
+            .await
+            .expect("Failed to make bucket2 in test");
 
         // Add some test objects
         let mut pr1 = PutObjReader::from_vec(b"test data 1".to_vec());
         ecstore
             .put_object(bucket1, "obj1", &mut pr1, &Default::default())
             .await
-            .unwrap();
+            .expect("Failed to put object in bucket1");
 
         let mut pr2 = PutObjReader::from_vec(b"test data 2".to_vec());
         ecstore
             .put_object(bucket2, "obj2", &mut pr2, &Default::default())
             .await
-            .unwrap();
+            .expect("Failed to put object in bucket2");
 
         // Simulate missing bucket on one disk by removing bucket directory
         let disk1_bucket1_path = disk_paths[0].join(bucket1);
@@ -2782,7 +2824,10 @@ mod tests {
         let bucket_name = "test-bucket-parts";
         let object_name = "large-object-20mb";
 
-        ecstore.make_bucket(bucket_name, &Default::default()).await.unwrap();
+        ecstore
+            .make_bucket(bucket_name, &Default::default())
+            .await
+            .expect("Failed to make bucket in test");
 
         // Create a 20MB object to ensure it has multiple parts (MIN_PART_SIZE is 16MB)
         let large_data = vec![b'A'; 20 * 1024 * 1024]; // 20MB of 'A' characters
@@ -2821,7 +2866,7 @@ mod tests {
             queue_size: 1000,
         };
         let heal_manager = Arc::new(crate::heal::HealManager::new(heal_storage, Some(heal_config)));
-        heal_manager.start().await.unwrap();
+        heal_manager.start().await.expect("Failed to start heal manager in test");
         let scanner = Scanner::new(None, Some(heal_manager.clone()));
 
         // Initialize scanner with ECStore disks
@@ -3018,7 +3063,10 @@ mod tests {
         let bucket_name = "test-bucket-meta";
         let object_name = "test-object-meta";
 
-        ecstore.make_bucket(bucket_name, &Default::default()).await.unwrap();
+        ecstore
+            .make_bucket(bucket_name, &Default::default())
+            .await
+            .expect("Failed to make bucket in test");
 
         // Create a test object
         let test_data = vec![b'B'; 5 * 1024 * 1024]; // 5MB of 'B' characters
@@ -3049,7 +3097,7 @@ mod tests {
             queue_size: 1000,
         };
         let heal_manager = Arc::new(crate::heal::HealManager::new(heal_storage, Some(heal_config)));
-        heal_manager.start().await.unwrap();
+        heal_manager.start().await.expect("Failed to start heal manager in test");
         let scanner = Scanner::new(None, Some(heal_manager.clone()));
 
         // Initialize scanner with ECStore disks
@@ -3248,7 +3296,7 @@ mod tests {
         let heal_config = HealConfig::default();
         let heal_storage = Arc::new(crate::heal::storage::ECStoreHealStorage::new(ecstore.clone()));
         let heal_manager = Arc::new(crate::heal::manager::HealManager::new(heal_storage, Some(heal_config)));
-        heal_manager.start().await.unwrap();
+        heal_manager.start().await.expect("Failed to start heal manager in test");
 
         // Create scanner with healing enabled
         let scanner = Scanner::new(None, Some(heal_manager.clone()));
@@ -3265,7 +3313,10 @@ mod tests {
         // Create test bucket and multiple healthy objects
         let bucket_name = "healthy-test-bucket";
         let bucket_opts = MakeBucketOptions::default();
-        ecstore.make_bucket(bucket_name, &bucket_opts).await.unwrap();
+        ecstore
+            .make_bucket(bucket_name, &bucket_opts)
+            .await
+            .expect("Failed to make bucket in test");
 
         // Create multiple test objects with different sizes
         let test_objects = vec![
