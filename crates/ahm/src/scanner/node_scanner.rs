@@ -37,7 +37,7 @@ use super::io_throttler::{AdvancedIOThrottler, IOThrottlerConfig, MetricsSnapsho
 use super::local_stats::{BatchScanResult, LocalStatsManager, ScanResultEntry};
 use crate::error::Result;
 
-/// SystemTime serde 序列化支持
+/// SystemTime serde
 mod system_time_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,7 +59,7 @@ mod system_time_serde {
     }
 }
 
-/// Option<SystemTime> serde 序列化支持
+/// Option<SystemTime> serde
 mod option_system_time_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,7 +86,7 @@ mod option_system_time_serde {
     }
 }
 
-/// 临时的 BucketStats 定义，用于向后兼容
+/// temporary BucketStats definition, for backward compatibility
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketStats {
     pub name: String,
@@ -107,76 +107,76 @@ impl Default for BucketStats {
     }
 }
 
-/// 业务负载级别枚举
+/// business load level enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LoadLevel {
-    /// 低负载 (<30%)
+    /// low load (<30%)
     Low,
-    /// 中负载 (30-60%)
+    /// medium load (30-60%)
     Medium,
-    /// 高负载 (60-80%)
+    /// high load (60-80%)
     High,
-    /// 超高负载 (>80%)
+    /// ultra high load (>80%)
     Critical,
 }
 
-/// 节点扫描器配置
+/// node scanner config
 #[derive(Debug, Clone)]
 pub struct NodeScannerConfig {
-    /// 扫描间隔
+    /// scan interval
     pub scan_interval: Duration,
-    /// 磁盘间扫描延迟
+    /// disk scan delay
     pub disk_scan_delay: Duration,
-    /// 是否启用智能调度
+    /// whether to enable smart scheduling
     pub enable_smart_scheduling: bool,
-    /// 是否启用断点续传
+    /// whether to enable checkpoint resume
     pub enable_checkpoint: bool,
-    /// 检查点保存间隔
+    /// checkpoint save interval
     pub checkpoint_save_interval: Duration,
-    /// 数据目录路径
+    /// data directory path
     pub data_dir: PathBuf,
-    /// 最大扫描重试次数
+    /// max scan retry attempts
     pub max_retry_attempts: u32,
 }
 
 impl Default for NodeScannerConfig {
     fn default() -> Self {
-        // Use a user-writable directory for scanner data
+        // use a user-writable directory for scanner data
         let data_dir = std::env::temp_dir().join("rustfs_scanner");
 
         Self {
-            scan_interval: Duration::from_secs(300),  // 5分钟基础间隔
-            disk_scan_delay: Duration::from_secs(10), // 磁盘间10秒延迟
+            scan_interval: Duration::from_secs(300),  // 5 minutes base interval
+            disk_scan_delay: Duration::from_secs(10), // disk scan delay 10 seconds
             enable_smart_scheduling: true,
             enable_checkpoint: true,
-            checkpoint_save_interval: Duration::from_secs(30), // 30秒保存一次检查点
+            checkpoint_save_interval: Duration::from_secs(30), // checkpoint save interval 30 seconds
             data_dir,
             max_retry_attempts: 3,
         }
     }
 }
 
-/// 本地扫描统计数据
+/// local scan stats data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalScanStats {
-    /// 已扫描对象数量
+    /// scanned objects count
     pub objects_scanned: u64,
-    /// 健康对象数量
+    /// healthy objects count
     pub healthy_objects: u64,
-    /// 损坏对象数量
+    /// corrupted objects count
     pub corrupted_objects: u64,
-    /// 数据使用情况
+    /// data usage
     pub data_usage: DataUsageInfo,
-    /// 最后更新时间
+    /// last update time
     #[serde(with = "system_time_serde")]
     pub last_update: SystemTime,
-    /// 存储桶统计
+    /// buckets stats
     pub buckets_stats: HashMap<String, BucketStats>,
-    /// 磁盘统计
+    /// disks stats
     pub disks_stats: HashMap<String, DiskStats>,
-    /// 扫描进度
+    /// scan progress
     pub scan_progress: ScanProgress,
-    /// 检查点时间戳
+    /// checkpoint timestamp
     #[serde(with = "system_time_serde")]
     pub checkpoint_timestamp: SystemTime,
 }
@@ -197,21 +197,21 @@ impl Default for LocalScanStats {
     }
 }
 
-/// 磁盘统计信息
+/// disk stats info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskStats {
-    /// 磁盘ID
+    /// disk id
     pub disk_id: String,
-    /// 已扫描对象数量
+    /// scanned objects count
     pub objects_scanned: u64,
-    /// 错误数量
+    /// errors count
     pub errors_count: u64,
-    /// 最后扫描时间
+    /// last scan time
     #[serde(with = "system_time_serde")]
     pub last_scan_time: SystemTime,
-    /// 扫描耗时
+    /// scan duration
     pub scan_duration: Duration,
-    /// 是否完成扫描
+    /// whether scan is completed
     pub scan_completed: bool,
 }
 
@@ -228,27 +228,27 @@ impl Default for DiskStats {
     }
 }
 
-/// 扫描进度状态
+/// scan progress state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProgress {
-    /// 当前扫描周期
+    /// current scan cycle
     pub current_cycle: u64,
-    /// 当前磁盘索引
+    /// current disk index
     pub current_disk_index: usize,
-    /// 当前存储桶
+    /// current bucket
     pub current_bucket: Option<String>,
-    /// 当前对象前缀
+    /// current object prefix
     pub current_object_prefix: Option<String>,
-    /// 已完成的磁盘集合
+    /// completed disks
     pub completed_disks: HashSet<String>,
-    /// 已完成的存储桶扫描状态
+    /// completed buckets scan state
     pub completed_buckets: HashMap<String, BucketScanState>,
-    /// 最后扫描的对象key
+    /// last scanned object key
     pub last_scan_key: Option<String>,
-    /// 扫描开始时间
+    /// scan start time
     #[serde(with = "system_time_serde")]
     pub scan_start_time: SystemTime,
-    /// 预计完成时间
+    /// estimated completion time
     #[serde(with = "option_system_time_serde")]
     pub estimated_completion: Option<SystemTime>,
 }
@@ -269,31 +269,31 @@ impl Default for ScanProgress {
     }
 }
 
-/// 存储桶扫描状态
+/// bucket scan state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketScanState {
-    /// 是否完成
+    /// whether completed
     pub completed: bool,
-    /// 最后扫描的对象key
+    /// last scanned object key
     pub last_object_key: Option<String>,
-    /// 已扫描对象数量
+    /// scanned objects count
     pub objects_scanned: u64,
-    /// 扫描时间戳
+    /// scan timestamp
     pub scan_timestamp: SystemTime,
 }
 
-/// IO 监控器
+/// IO monitor
 pub struct IOMonitor {
-    /// 当前磁盘 IOPS
+    /// current disk IOPS
     current_iops: Arc<AtomicU64>,
-    /// 磁盘队列深度
+    /// disk queue depth
     queue_depth: Arc<AtomicU64>,
-    /// 业务请求延迟（毫秒）
+    /// business request latency (milliseconds)
     business_latency: Arc<AtomicU64>,
-    /// CPU 使用率
+    /// CPU usage
     cpu_usage: Arc<AtomicU8>,
-    /// 内存使用率
-    /// 内存使用率 (预留字段)
+    /// memory usage
+    /// memory usage (reserved field)
     #[allow(dead_code)]
     memory_usage: Arc<AtomicU8>,
 }
@@ -309,14 +309,14 @@ impl IOMonitor {
         }
     }
 
-    /// 获取当前业务负载级别
+    /// get current business load level
     pub async fn get_business_load_level(&self) -> LoadLevel {
         let iops = self.current_iops.load(Ordering::Relaxed);
         let queue_depth = self.queue_depth.load(Ordering::Relaxed);
         let latency = self.business_latency.load(Ordering::Relaxed);
         let cpu = self.cpu_usage.load(Ordering::Relaxed);
 
-        // 综合评估负载级别
+        // comprehensive evaluation of load level
         let load_score = self.calculate_load_score(iops, queue_depth, latency, cpu);
 
         match load_score {
@@ -328,16 +328,16 @@ impl IOMonitor {
     }
 
     fn calculate_load_score(&self, iops: u64, queue_depth: u64, latency: u64, cpu: u8) -> u8 {
-        // 简化的负载评分算法，实际实现需要根据具体硬件指标调整
-        let iops_score = std::cmp::min(iops / 100, 25) as u8; // IOPS 权重 25%
-        let queue_score = std::cmp::min(queue_depth * 5, 25) as u8; // 队列深度权重 25%
-        let latency_score = std::cmp::min(latency / 10, 25) as u8; // 延迟权重 25%
-        let cpu_score = std::cmp::min(cpu / 4, 25); // CPU 权重 25%
+        // simplified load score algorithm, actual implementation needs to adjust based on specific hardware metrics
+        let iops_score = std::cmp::min(iops / 100, 25) as u8; // IOPS weight 25%
+        let queue_score = std::cmp::min(queue_depth * 5, 25) as u8; // queue depth weight 25%
+        let latency_score = std::cmp::min(latency / 10, 25) as u8; // latency weight 25%
+        let cpu_score = std::cmp::min(cpu / 4, 25); // CPU weight 25%
 
         iops_score + queue_score + latency_score + cpu_score
     }
 
-    /// 更新系统指标
+    /// update system metrics
     pub async fn update_metrics(&self, iops: u64, queue_depth: u64, latency: u64, cpu: u8) {
         self.current_iops.store(iops, Ordering::Relaxed);
         self.queue_depth.store(queue_depth, Ordering::Relaxed);
@@ -346,40 +346,40 @@ impl IOMonitor {
     }
 }
 
-/// IO 限流器
+/// IO throttler
 pub struct IOThrottler {
-    /// 最大 IOPS 限制 (预留字段)
+    /// max IOPS limit (reserved field)
     #[allow(dead_code)]
     max_iops: Arc<AtomicU64>,
-    /// 当前 IOPS 使用量 (预留字段)
+    /// current IOPS usage (reserved field)
     #[allow(dead_code)]
     current_iops: Arc<AtomicU64>,
-    /// 业务优先级权重 (0-100)
+    /// business priority weight (0-100)
     business_priority: Arc<AtomicU8>,
-    /// 扫描操作间延迟 (毫秒)
+    /// scan operation delay (milliseconds)
     scan_delay: Arc<AtomicU64>,
 }
 
 impl IOThrottler {
     pub fn new() -> Self {
         Self {
-            max_iops: Arc::new(AtomicU64::new(1000)), // 默认最大 1000 IOPS
+            max_iops: Arc::new(AtomicU64::new(1000)), // default max 1000 IOPS
             current_iops: Arc::new(AtomicU64::new(0)),
-            business_priority: Arc::new(AtomicU8::new(95)), // 业务优先级 95%
-            scan_delay: Arc::new(AtomicU64::new(100)),      // 默认 100ms 延迟
+            business_priority: Arc::new(AtomicU8::new(95)), // business priority 95%
+            scan_delay: Arc::new(AtomicU64::new(100)),      // default 100ms delay
         }
     }
 
-    /// 根据负载级别调整扫描延迟
+    /// adjust scanning delay based on load level
     pub async fn adjust_for_load_level(&self, load_level: LoadLevel) -> Duration {
         let delay_ms = match load_level {
             LoadLevel::Low => {
-                self.scan_delay.store(100, Ordering::Relaxed); // 100ms
+                self.scan_delay.store(100, Ordering::Relaxed); // 100ms delay
                 self.business_priority.store(90, Ordering::Relaxed);
                 100
             }
             LoadLevel::Medium => {
-                self.scan_delay.store(500, Ordering::Relaxed); // 500ms
+                self.scan_delay.store(500, Ordering::Relaxed); // 500ms delay
                 self.business_priority.store(95, Ordering::Relaxed);
                 500
             }
@@ -389,7 +389,7 @@ impl IOThrottler {
                 2000
             }
             LoadLevel::Critical => {
-                self.scan_delay.store(10000, Ordering::Relaxed); // 10s（实际会暂停扫描）
+                self.scan_delay.store(10000, Ordering::Relaxed); // 10s delay (actually will pause scanning)
                 self.business_priority.store(99, Ordering::Relaxed);
                 10000
             }
@@ -398,47 +398,47 @@ impl IOThrottler {
         Duration::from_millis(delay_ms)
     }
 
-    /// 检查是否应该暂停扫描
+    /// check whether should pause scanning
     pub async fn should_pause_scanning(&self, load_level: LoadLevel) -> bool {
         matches!(load_level, LoadLevel::Critical)
     }
 }
 
-/// 去中心化节点扫描器
+/// decentralized node scanner
 ///
-/// 负责本地磁盘的串行扫描，实现智能调度和断点续传功能
+/// responsible for serial scanning of local disks, implementing smart scheduling and checkpoint resume functionality
 pub struct NodeScanner {
-    /// 节点ID
+    /// node id
     node_id: String,
-    /// 本地磁盘列表
+    /// local disks list
     local_disks: Arc<RwLock<Vec<Arc<DiskStore>>>>,
-    /// IO监控器
+    /// IO monitor
     io_monitor: Arc<AdvancedIOMonitor>,
-    /// IO限流器
+    /// IO throttler
     throttler: Arc<AdvancedIOThrottler>,
-    /// 配置
+    /// config
     config: Arc<RwLock<NodeScannerConfig>>,
-    /// 当前扫描的磁盘索引
+    /// current scanned disk index
     current_disk_index: Arc<AtomicUsize>,
-    /// 本地统计数据
+    /// local stats data
     local_stats: Arc<RwLock<LocalScanStats>>,
-    /// 统计数据管理器
+    /// stats data manager
     stats_manager: Arc<LocalStatsManager>,
-    /// 扫描进度状态
+    /// scan progress state
     scan_progress: Arc<RwLock<ScanProgress>>,
-    /// 检查点管理器映射（每个磁盘一个）
+    /// checkpoint manager mapping (one for each disk)
     checkpoint_managers: Arc<RwLock<HashMap<String, Arc<CheckpointManager>>>>,
-    /// 取消令牌
+    /// cancel token
     cancel_token: CancellationToken,
 }
 
 impl NodeScanner {
-    /// Create a new node scanner
+    /// create a new node scanner
     pub fn new(node_id: String, config: NodeScannerConfig) -> Self {
         // Ensure data directory exists
         if !config.data_dir.exists() {
             if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
-                error!("创建数据目录失败 {:?}: {}", config.data_dir, e);
+                error!("create data directory failed {:?}: {}", config.data_dir, e);
             }
         }
 
@@ -476,55 +476,55 @@ impl NodeScanner {
         }
     }
 
-    /// 添加本地磁盘并为该磁盘创建检查点管理器
+    /// add local disk and create checkpoint manager for it
     pub async fn add_local_disk(&self, disk: Arc<DiskStore>) {
-        // 获取磁盘路径并创建对应的scanner目录
+        // get disk path and create corresponding scanner directory
         let disk_path = disk.path();
         let sys_dir = disk_path.join(".rustfs.sys").join("scanner");
 
-        // 确保目录存在
+        // ensure directory exists
         if let Err(e) = std::fs::create_dir_all(&sys_dir) {
             error!("Failed to create scanner directory on disk {:?}: {}", disk_path, e);
             return;
         }
 
-        // 为该磁盘创建检查点管理器
+        // create checkpoint manager for the disk
         let disk_id = disk_path.to_string_lossy().to_string();
         let checkpoint_manager = Arc::new(CheckpointManager::new(&self.node_id, &sys_dir));
 
-        // 存储检查点管理器
+        // store checkpoint manager
         self.checkpoint_managers
             .write()
             .await
             .insert(disk_id.clone(), checkpoint_manager);
 
-        // 添加磁盘到本地磁盘列表
+        // add disk to local disks list
         self.local_disks.write().await.push(disk.clone());
 
         info!("Added disk {} with checkpoint manager to node {}", disk_id, self.node_id);
     }
 
-    /// 获取指定磁盘的检查点管理器
+    /// get checkpoint manager for the disk
     async fn get_checkpoint_manager_for_disk(&self, disk_id: &str) -> Option<Arc<CheckpointManager>> {
         self.checkpoint_managers.read().await.get(disk_id).cloned()
     }
 
-    /// 获取默认检查点管理器（用于没有本地磁盘的情况）
+    /// get default checkpoint manager (for the case when there is no local disk)
     async fn get_default_checkpoint_manager(&self) -> Option<Arc<CheckpointManager>> {
         let config = self.config.read().await;
         let data_dir = &config.data_dir;
 
-        // 确保数据目录存在
+        // ensure data directory exists
         if let Err(e) = std::fs::create_dir_all(data_dir) {
             error!("Failed to create data directory {:?}: {}", data_dir, e);
             return None;
         }
 
-        // 创建默认检查点管理器
+        // create default checkpoint manager
         Some(Arc::new(CheckpointManager::new(&self.node_id, data_dir)))
     }
 
-    /// 为所有磁盘创建检查点管理器（初始化时调用）
+    /// create checkpoint manager for all disks (called during initialization)
     pub async fn initialize_checkpoint_managers(&self) {
         let local_disks = self.local_disks.read().await;
         let mut checkpoint_managers = self.checkpoint_managers.write().await;
@@ -533,20 +533,20 @@ impl NodeScanner {
             let disk_path = disk.path();
             let sys_dir = disk_path.join(".rustfs.sys").join("scanner");
 
-            // 确保目录存在
+            // ensure directory exists
             if let Err(e) = std::fs::create_dir_all(&sys_dir) {
                 error!("Failed to create scanner directory on disk {:?}: {}", disk_path, e);
                 continue;
             }
 
-            // 为该磁盘创建检查点管理器
+            // create checkpoint manager for the disk
             let disk_id = disk_path.to_string_lossy().to_string();
             let checkpoint_manager = Arc::new(CheckpointManager::new(&self.node_id, &sys_dir));
             checkpoint_managers.insert(disk_id, checkpoint_manager);
         }
     }
 
-    /// 设置数据目录
+    /// set data directory
     pub async fn set_data_dir(&self, data_dir: &Path) {
         // Update the checkpoint manager with the new data directory
         let _new_checkpoint_manager = CheckpointManager::new(&self.node_id, data_dir);
@@ -555,39 +555,39 @@ impl NodeScanner {
         // TODO: Implement proper data directory management
     }
 
-    /// 获取节点ID
+    /// get node id
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
 
-    /// 获取本地统计数据
+    /// get local stats data
     pub async fn get_local_stats(&self) -> LocalScanStats {
         self.local_stats.read().await.clone()
     }
 
-    /// 获取扫描进度
+    /// get scan progress
     pub async fn get_scan_progress(&self) -> ScanProgress {
         self.scan_progress.read().await.clone()
     }
 
-    /// 启动扫描器
+    /// start scanner
     pub async fn start(&self) -> Result<()> {
-        info!("启动节点 {} 的扫描器", self.node_id);
+        info!("start scanner for node {}", self.node_id);
 
-        // 尝试从检查点恢复
+        // try to resume from checkpoint
         self.start_with_resume().await?;
 
         Ok(())
     }
 
-    /// 节点启动时先尝试恢复断点
+    /// try to resume from checkpoint when node starts
     pub async fn start_with_resume(&self) -> Result<()> {
-        info!("节点 {} 启动，尝试恢复断点续传", self.node_id);
+        info!("node {} start, try to resume checkpoint", self.node_id);
 
-        // 初始化检查点管理器
+        // initialize checkpoint managers
         self.initialize_checkpoint_managers().await;
 
-        // 尝试恢复扫描进度（从第一个磁盘开始）
+        // try to resume scanning progress (from the first disk)
         let local_disks = self.local_disks.read().await;
         if !local_disks.is_empty() {
             let first_disk = &local_disks[0];
@@ -597,59 +597,59 @@ impl NodeScanner {
                 match checkpoint_manager.load_checkpoint().await {
                     Ok(Some(progress)) => {
                         info!(
-                            "成功从磁盘 {} 恢复扫描进度: cycle={}, disk={}, last_key={:?}",
+                            "success to resume scanning from disk {}: cycle={}, disk={}, last_key={:?}",
                             disk_id, progress.current_cycle, progress.current_disk_index, progress.last_scan_key
                         );
 
                         *self.scan_progress.write().await = progress;
 
-                        // 使用恢复的进度开始扫描
+                        // use the resumed progress to start scanning
                         self.resume_scanning_from_checkpoint().await
                     }
                     Ok(None) => {
-                        info!("磁盘 {} 无有效检查点，从头开始扫描", disk_id);
+                        info!("disk {} has no valid checkpoint, start fresh scanning", disk_id);
                         self.start_fresh_scanning().await
                     }
                     Err(e) => {
-                        warn!("从磁盘 {} 恢复扫描进度失败: {}，从头开始", disk_id, e);
+                        warn!("failed to resume scanning from disk {}: {}, start fresh scanning", disk_id, e);
                         self.start_fresh_scanning().await
                     }
                 }
             } else {
-                info!("无法获取磁盘 {} 的检查点管理器，从头开始扫描", disk_id);
+                info!("cannot get checkpoint manager for disk {}, start fresh scanning", disk_id);
                 self.start_fresh_scanning().await
             }
         } else {
-            info!("无本地磁盘，尝试从默认检查点管理器恢复");
+            info!("no local disk, try to resume from default checkpoint manager");
 
-            // 首先尝试从默认检查点管理器加载
+            // try to load from default checkpoint manager
             if let Some(default_checkpoint_manager) = self.get_default_checkpoint_manager().await {
                 match default_checkpoint_manager.load_checkpoint().await {
                     Ok(Some(scan_progress)) => {
                         info!(
-                            "从默认检查点恢复扫描: cycle={}, last_key={:?}",
+                            "resume scanning from default checkpoint: cycle={}, last_key={:?}",
                             scan_progress.current_cycle, scan_progress.last_scan_key
                         );
 
-                        // 恢复扫描进度
+                        // resume scanning progress
                         *self.scan_progress.write().await = scan_progress;
 
                         return self.resume_scanning_from_checkpoint().await;
                     }
                     Ok(None) => {
-                        info!("没有找到默认检查点文件");
+                        info!("no default checkpoint file");
                     }
                     Err(e) => {
-                        warn!("加载默认检查点失败: {}", e);
+                        warn!("load default checkpoint failed: {}", e);
                     }
                 }
             }
 
-            // 如果没有检查点，检查内存中是否有扫描进度（用于测试场景）
+            // if no checkpoint, check if there is scanning progress in memory (for test scenario)
             let current_progress = self.scan_progress.read().await;
             if current_progress.current_cycle > 0 || current_progress.last_scan_key.is_some() {
                 info!(
-                    "发现内存中的扫描进度: cycle={}, disk={}, last_key={:?}",
+                    "found scanning progress in memory: cycle={}, disk={}, last_key={:?}",
                     current_progress.current_cycle, current_progress.current_disk_index, current_progress.last_scan_key
                 );
                 drop(current_progress);
@@ -661,38 +661,38 @@ impl NodeScanner {
         }
     }
 
-    /// 从检查点恢复扫描
+    /// resume scanning from checkpoint
     async fn resume_scanning_from_checkpoint(&self) -> Result<()> {
         let progress = self.scan_progress.read().await;
         let disk_index = progress.current_disk_index;
         let last_scan_key = progress.last_scan_key.clone();
         drop(progress);
 
-        info!("从磁盘 {} 位置恢复扫描，上次扫描到: {:?}", disk_index, last_scan_key);
+        info!("resume scanning from disk {}: last_scan_key={:?}", disk_index, last_scan_key);
 
-        // 更新当前磁盘索引
+        // update current disk index
         self.current_disk_index
             .store(disk_index, std::sync::atomic::Ordering::Relaxed);
 
-        // 启动 IO 监控
+        // start IO monitoring
         self.start_io_monitoring().await?;
 
-        // 开始扫描循环
+        // start scanning loop
         let scanner_clone = self.clone_for_background();
         tokio::spawn(async move {
             if let Err(e) = scanner_clone.scan_loop_with_resume(last_scan_key).await {
-                error!("节点扫描循环失败: {}", e);
+                error!("scanning loop failed: {}", e);
             }
         });
 
         Ok(())
     }
 
-    /// 全新开始扫描
+    /// start fresh scanning
     async fn start_fresh_scanning(&self) -> Result<()> {
-        info!("开始全新扫描循环");
+        info!("start fresh scanning loop");
 
-        // 初始化扫描进度
+        // initialize scanning progress
         {
             let mut progress = self.scan_progress.write().await;
             progress.current_cycle += 1;
@@ -705,28 +705,28 @@ impl NodeScanner {
 
         self.current_disk_index.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        // 启动 IO 监控
+        // start IO monitoring
         self.start_io_monitoring().await?;
 
-        // 开始扫描循环
+        // start scanning loop
         let scanner_clone = self.clone_for_background();
         tokio::spawn(async move {
             if let Err(e) = scanner_clone.scan_loop_with_resume(None).await {
-                error!("节点扫描循环失败: {}", e);
+                error!("scanning loop failed: {}", e);
             }
         });
 
         Ok(())
     }
 
-    /// 停止扫描器
+    /// stop scanner
     pub async fn stop(&self) -> Result<()> {
-        info!("停止节点 {} 的扫描器", self.node_id);
+        info!("stop scanner for node {}", self.node_id);
         self.cancel_token.cancel();
         Ok(())
     }
 
-    /// 克隆用于后台任务
+    /// clone for background task
     fn clone_for_background(&self) -> Self {
         Self {
             node_id: self.node_id.clone(),
@@ -743,28 +743,28 @@ impl NodeScanner {
         }
     }
 
-    /// 启动 IO 监控
+    /// start IO monitoring
     async fn start_io_monitoring(&self) -> Result<()> {
-        info!("启动高级 IO 监控");
+        info!("start advanced IO monitoring");
         self.io_monitor.start().await?;
         Ok(())
     }
 
-    /// 主扫描循环（不支持断点续传）
+    /// main scanning loop (not supported checkpoint resume)
     #[allow(dead_code)]
     async fn scan_loop(&self) -> Result<()> {
         self.scan_loop_with_resume(None).await
     }
 
-    /// 带断点续传的主扫描循环
+    /// main scanning loop with checkpoint resume
     async fn scan_loop_with_resume(&self, resume_from_key: Option<String>) -> Result<()> {
-        info!("节点 {} 开始扫描循环，续传key: {:?}", self.node_id, resume_from_key);
+        info!("node {} start scanning loop, resume from key: {:?}", self.node_id, resume_from_key);
 
         while !self.cancel_token.is_cancelled() {
-            // 检查业务负载
+            // check business load
             let load_level = self.io_monitor.get_business_load_level().await;
 
-            // 获取当前系统指标
+            // get current system metrics
             let current_metrics = self.io_monitor.get_current_metrics().await;
             let metrics_snapshot = MetricsSnapshot {
                 iops: current_metrics.iops,
@@ -773,45 +773,45 @@ impl NodeScanner {
                 memory_usage: current_metrics.memory_usage,
             };
 
-            // 获取限流决策
+            // get throttle decision
             let throttle_decision = self
                 .throttler
                 .make_throttle_decision(load_level, Some(metrics_snapshot))
                 .await;
 
-            // 根据决策行动
+            // according to decision action
             if throttle_decision.should_pause {
-                warn!("根据限流决策暂停扫描: {}", throttle_decision.reason);
-                tokio::time::sleep(Duration::from_secs(600)).await; // 暂停 10 分钟
+                warn!("pause scanning according to throttle decision: {}", throttle_decision.reason);
+                tokio::time::sleep(Duration::from_secs(600)).await; // pause 10 minutes
                 continue;
             }
 
-            // 执行串行磁盘扫描
+            // execute serial disk scanning
             if let Err(e) = self.scan_all_disks_serially().await {
-                error!("磁盘扫描失败: {}", e);
+                error!("disk scanning failed: {}", e);
             }
 
-            // 保存检查点
+            // save checkpoint
             if let Err(e) = self.save_checkpoint().await {
-                warn!("保存检查点失败: {}", e);
+                warn!("save checkpoint failed: {}", e);
             }
 
-            // 使用限流决策的建议延迟
+            // use throttle decision suggested delay
             let scan_interval = throttle_decision.suggested_delay;
-            info!("扫描完成，根据限流决策等待 {:?} 后开始下一轮", scan_interval);
+            info!("scan completed, wait {:?} for next round", scan_interval);
             info!(
-                "资源分配: 业务 {}%, 扫描器 {}%",
+                "resource allocation: business {}%, scanner {}%",
                 throttle_decision.resource_allocation.business_percentage,
                 throttle_decision.resource_allocation.scanner_percentage
             );
 
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
-                    info!("扫描循环被取消");
+                    info!("scanning loop cancelled");
                     break;
                 }
                 _ = tokio::time::sleep(scan_interval) => {
-                    // 继续下一轮扫描
+                    // continue next round scanning
                 }
             }
         }
@@ -819,56 +819,56 @@ impl NodeScanner {
         Ok(())
     }
 
-    /// 串行扫描所有本地磁盘
+    /// serial scanning all local disks
     async fn scan_all_disks_serially(&self) -> Result<()> {
         let local_disks = self.local_disks.read().await;
-        info!("开始串行扫描节点 {} 的 {} 个磁盘", self.node_id, local_disks.len());
+        info!("start serial scanning node {} of {} disks", self.node_id, local_disks.len());
 
         for (index, disk) in local_disks.iter().enumerate() {
-            // 再次检查是否应该暂停
+            // check again whether should pause
             let load_level = self.io_monitor.get_business_load_level().await;
             let should_pause = self.throttler.should_pause_scanning(load_level).await;
 
             if should_pause {
-                warn!("业务负载过高，中断磁盘扫描");
+                warn!("business load too high, interrupt disk scanning");
                 break;
             }
 
-            info!("开始扫描磁盘 {:?} (索引: {})", disk.path(), index);
+            info!("start scanning disk {:?} (index: {})", disk.path(), index);
 
-            // 扫描单个磁盘
+            // scan single disk
             if let Err(e) = self.scan_single_disk(disk.clone()).await {
-                error!("扫描磁盘 {:?} 失败: {}", disk.path(), e);
+                error!("scan disk {:?} failed: {}", disk.path(), e);
                 continue;
             }
 
-            // 更新扫描进度
+            // update scan progress
             self.update_disk_scan_progress(index, &disk.path().to_string_lossy()).await;
 
-            // 磁盘间延迟（使用智能限流器决策）
+            // disk inter-delay (using smart throttle decision)
             if index < local_disks.len() - 1 {
                 let delay = self.throttler.adjust_for_load_level(load_level).await;
-                info!("磁盘 {:?} 扫描完成，智能延迟 {:?} 后继续", disk.path(), delay);
+                info!("disk {:?} scan completed, smart delay {:?} for next", disk.path(), delay);
                 tokio::time::sleep(delay).await;
             }
         }
 
-        // 更新周期扫描进度
+        // update cycle scan progress
         self.complete_scan_cycle().await;
 
         Ok(())
     }
 
-    /// 扫描单个磁盘
+    /// scan single disk
     async fn scan_single_disk(&self, disk: Arc<DiskStore>) -> Result<()> {
-        info!("扫描磁盘: path={:?}", disk.path());
+        info!("scan disk: path={:?}", disk.path());
 
         let scan_start = SystemTime::now();
         let mut scan_entries = Vec::new();
 
-        // 获取ECStore实例进行真实的磁盘扫描
+        // get ECStore instance for real disk scanning
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
-            // 获取磁盘上的所有存储桶
+            // get all buckets on disk
             match ecstore
                 .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
                 .await
@@ -877,43 +877,43 @@ impl NodeScanner {
                     for bucket_info in buckets {
                         let bucket_name = &bucket_info.name;
 
-                        // 跳过系统内部存储桶
+                        // skip system internal buckets
                         if bucket_name == ".minio.sys" {
                             continue;
                         }
 
-                        // 扫描存储桶中的对象
+                        // scan objects in bucket
                         match self.scan_bucket_on_disk(&disk, bucket_name, &mut scan_entries).await {
                             Ok(object_count) => {
                                 debug!(
-                                    "磁盘 {:?} 上的存储桶 {} 扫描完成，发现 {} 个对象",
+                                    "disk {:?} bucket {} scan completed, found {} objects",
                                     disk.path(),
                                     bucket_name,
                                     object_count
                                 );
                             }
                             Err(e) => {
-                                warn!("磁盘 {:?} 上的存储桶 {} 扫描失败: {}", disk.path(), bucket_name, e);
+                                warn!("disk {:?} bucket {} scan failed: {}", disk.path(), bucket_name, e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("获取存储桶列表失败: {}", e);
-                    // Fallback: 模拟一些扫描结果以便测试继续进行
+                    warn!("get bucket list failed: {}", e);
+                    // Fallback: simulate some scan results for testing to continue
                     self.generate_fallback_scan_results(&disk, &mut scan_entries).await;
                 }
             }
         } else {
-            warn!("ECStore实例不可用，使用模拟扫描数据");
-            // Fallback: 模拟一些扫描结果以便测试继续进行
+            warn!("ECStore instance not available, use simulated scan data");
+            // Fallback: simulate some scan results for testing to continue
             self.generate_fallback_scan_results(&disk, &mut scan_entries).await;
         }
 
         let scan_end = SystemTime::now();
         let scan_duration = scan_end.duration_since(scan_start).unwrap_or(Duration::ZERO);
 
-        // 创建批量扫描结果
+        // create batch scan result
         let batch_result = BatchScanResult {
             disk_id: disk.path().to_string_lossy().to_string(),
             entries: scan_entries,
@@ -922,26 +922,26 @@ impl NodeScanner {
             scan_duration,
         };
 
-        // 更新统计数据
+        // update stats data
         self.stats_manager.update_disk_scan_result(&batch_result).await?;
 
-        // 同步更新本地统计数据结构
+        // sync update local stats data structure
         self.update_local_disk_stats(&disk.path().to_string_lossy(), batch_result.entries.len() as u64)
             .await;
 
         Ok(())
     }
 
-    /// 更新磁盘扫描进度
+    /// update disk scan progress
     async fn update_disk_scan_progress(&self, disk_index: usize, disk_id: &str) {
         let mut progress = self.scan_progress.write().await;
         progress.current_disk_index = disk_index;
         progress.completed_disks.insert(disk_id.to_string());
 
-        debug!("更新扫描进度: 磁盘索引 {}, 磁盘ID {}", disk_index, disk_id);
+        debug!("update scan progress: disk index {}, disk id {}", disk_index, disk_id);
     }
 
-    /// 完成扫描周期
+    /// complete scan cycle
     async fn complete_scan_cycle(&self) {
         let mut progress = self.scan_progress.write().await;
         progress.current_cycle += 1;
@@ -949,10 +949,10 @@ impl NodeScanner {
         progress.completed_disks.clear();
         progress.scan_start_time = SystemTime::now();
 
-        info!("完成扫描周期 {}", progress.current_cycle);
+        info!("complete scan cycle {}", progress.current_cycle);
     }
 
-    /// 更新本地磁盘统计
+    /// update local disk stats
     async fn update_local_disk_stats(&self, disk_id: &str, objects_scanned: u64) {
         let mut stats = self.local_stats.write().await;
 
@@ -967,12 +967,12 @@ impl NodeScanner {
 
         stats.last_update = SystemTime::now();
         stats.objects_scanned += objects_scanned;
-        stats.healthy_objects += objects_scanned; // 假设大部分对象是健康的
+        stats.healthy_objects += objects_scanned; // assume most objects are healthy
 
-        debug!("更新磁盘 {} 统计数据，扫描对象 {} 个", disk_id, objects_scanned);
+        debug!("update disk {} stats, scanned objects {}", disk_id, objects_scanned);
     }
 
-    /// 扫描磁盘上指定存储桶的对象
+    /// scan objects in specified bucket on disk
     async fn scan_bucket_on_disk(
         &self,
         disk: &DiskStore,
@@ -988,26 +988,26 @@ impl NodeScanner {
 
         let mut object_count = 0;
 
-        // 遍历存储桶目录中的所有对象
+        // iterate all objects in bucket directory
         if let Ok(entries) = std::fs::read_dir(&bucket_path) {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
                 if entry_path.is_dir() {
                     let object_name = entry_path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown");
 
-                    // 跳过隐藏文件和系统文件
+                    // skip hidden files and system files
                     if object_name.starts_with('.') {
                         continue;
                     }
 
-                    // 获取对象大小（简化处理）
+                    // get object size (simplified processing)
                     let object_size = self.estimate_object_size(&entry_path).await;
 
                     let entry = ScanResultEntry {
                         object_path: format!("{}/{}", bucket_name, object_name),
                         bucket_name: bucket_name.to_string(),
                         object_size,
-                        is_healthy: true, // 大部分对象郇定为健康
+                        is_healthy: true, // assume most objects are healthy
                         error_message: None,
                         scan_time: SystemTime::now(),
                         disk_id: disk_path.to_string_lossy().to_string(),
@@ -1022,7 +1022,7 @@ impl NodeScanner {
         Ok(object_count)
     }
 
-    /// 估算对象大小
+    /// estimate object size
     async fn estimate_object_size(&self, object_dir: &std::path::Path) -> u64 {
         let mut total_size = 0u64;
 
@@ -1037,11 +1037,11 @@ impl NodeScanner {
         total_size
     }
 
-    /// 生成回退扫描结果（用于测试或异常情况）
+    /// generate fallback scan results (for testing or exceptional cases)
     async fn generate_fallback_scan_results(&self, disk: &DiskStore, scan_entries: &mut Vec<ScanResultEntry>) {
-        debug!("生成回退扫描结果用于磁盘: {:?}", disk.path());
+        debug!("generate fallback scan results for disk: {:?}", disk.path());
 
-        // 模拟一些扫描结果
+        // simulate some scan results
         for i in 0..5 {
             let entry = ScanResultEntry {
                 object_path: format!("/fallback-bucket/object_{}", i),
@@ -1056,7 +1056,7 @@ impl NodeScanner {
         }
     }
 
-    /// 获取自适应扫描间隔
+    /// get adaptive scan interval
     #[allow(dead_code)]
     async fn get_adaptive_scan_interval(&self, load_level: LoadLevel) -> Duration {
         let base_interval = self.config.read().await.scan_interval;
@@ -1069,71 +1069,71 @@ impl NodeScanner {
         }
     }
 
-    /// 保存检查点到当前磁盘
+    /// save checkpoint to current disk
     async fn save_checkpoint(&self) -> Result<()> {
         let progress = self.scan_progress.read().await;
 
-        // 获取当前扫描的磁盘
+        // get current scanned disk
         let current_disk_index = self.current_disk_index.load(std::sync::atomic::Ordering::Relaxed);
         let local_disks = self.local_disks.read().await;
         if current_disk_index < local_disks.len() {
             let current_disk = &local_disks[current_disk_index];
             let disk_id = current_disk.path().to_string_lossy().to_string();
 
-            // 获取该磁盘的检查点管理器
+            // get checkpoint manager for disk
             if let Some(checkpoint_manager) = self.get_checkpoint_manager_for_disk(&disk_id).await {
                 checkpoint_manager.save_checkpoint(&progress).await?;
-                debug!("已保存磁盘 {} 的检查点", disk_id);
+                debug!("save checkpoint to disk {}", disk_id);
             } else {
-                warn!("无法获取磁盘 {} 的检查点管理器", disk_id);
+                warn!("cannot get checkpoint manager for disk {}", disk_id);
             }
         }
 
         Ok(())
     }
 
-    /// 强制保存检查点到当前磁盘
+    /// force save checkpoint to current disk
     pub async fn force_save_checkpoint(&self) -> Result<()> {
         let progress = self.scan_progress.read().await;
 
-        // 获取当前扫描的磁盘
+        // get current scanned disk
         let current_disk_index = self.current_disk_index.load(std::sync::atomic::Ordering::Relaxed);
         let local_disks = self.local_disks.read().await;
 
         let checkpoint_manager = if current_disk_index < local_disks.len() {
-            // 有本地磁盘时，使用对应磁盘的检查点管理器
+            // when there is local disk, use corresponding disk's checkpoint manager
             let current_disk = &local_disks[current_disk_index];
             let disk_id = current_disk.path().to_string_lossy().to_string();
             self.get_checkpoint_manager_for_disk(&disk_id).await
         } else {
-            // 没有本地磁盘时，使用默认检查点管理器
+            // when there is no local disk, use default checkpoint manager
             self.get_default_checkpoint_manager().await
         };
 
         if let Some(checkpoint_manager) = checkpoint_manager {
             checkpoint_manager.force_save_checkpoint(&progress).await?;
-            info!("已强制保存检查点");
+            info!("force save checkpoint");
         } else {
-            warn!("无法获取检查点管理器");
+            warn!("cannot get checkpoint manager");
         }
 
         Ok(())
     }
 
-    /// 获取检查点信息（从当前磁盘）
+    /// get checkpoint info (from current disk)
     pub async fn get_checkpoint_info(&self) -> Result<Option<super::checkpoint::CheckpointInfo>> {
-        // 获取当前扫描的磁盘
+        // get current scanned disk
         let current_disk_index = self.current_disk_index.load(std::sync::atomic::Ordering::Relaxed);
         let local_disks = self.local_disks.read().await;
         if current_disk_index < local_disks.len() {
             let current_disk = &local_disks[current_disk_index];
             let disk_id = current_disk.path().to_string_lossy().to_string();
 
-            // 获取该磁盘的检查点管理器
+            // get checkpoint manager for disk
             if let Some(checkpoint_manager) = self.get_checkpoint_manager_for_disk(&disk_id).await {
                 checkpoint_manager.get_checkpoint_info().await
             } else {
-                warn!("无法获取磁盘 {} 的检查点管理器", disk_id);
+                warn!("cannot get checkpoint manager for disk {}", disk_id);
                 Ok(None)
             }
         } else if let Some(default_checkpoint_manager) = self.get_default_checkpoint_manager().await {
@@ -1143,77 +1143,77 @@ impl NodeScanner {
         }
     }
 
-    /// 清理所有磁盘的检查点
+    /// cleanup all checkpoints on all disks
     pub async fn cleanup_checkpoint(&self) -> Result<()> {
         let checkpoint_managers = self.checkpoint_managers.read().await;
         for (disk_id, checkpoint_manager) in checkpoint_managers.iter() {
             if let Err(e) = checkpoint_manager.cleanup_checkpoint().await {
-                warn!("清理磁盘 {} 的检查点失败: {}", disk_id, e);
+                warn!("cleanup checkpoint on disk {} failed: {}", disk_id, e);
             } else {
-                info!("已清理磁盘 {} 的检查点", disk_id);
+                info!("cleanup checkpoint on disk {}", disk_id);
             }
         }
         Ok(())
     }
 
-    /// 获取统计数据管理器
+    /// get stats data manager
     pub fn get_stats_manager(&self) -> Arc<LocalStatsManager> {
         self.stats_manager.clone()
     }
 
-    /// 获取统计摘要
+    /// get stats summary
     pub async fn get_stats_summary(&self) -> super::local_stats::StatsSummary {
         self.stats_manager.get_stats_summary().await
     }
 
-    /// 记录 heal 触发
+    /// record heal triggered
     pub async fn record_heal_triggered(&self, object_path: &str, error_message: &str) {
         self.stats_manager.record_heal_triggered(object_path, error_message).await;
     }
 
-    /// 更新数据使用统计
+    /// update data usage stats
     pub async fn update_data_usage(&self, data_usage: DataUsageInfo) {
         self.stats_manager.update_data_usage(data_usage).await;
     }
 
-    /// 初始化统计数据
+    /// initialize stats data
     pub async fn initialize_stats(&self) -> Result<()> {
         self.stats_manager.load_stats().await
     }
 
-    /// 获取 IO 监控器
+    /// get IO monitor
     pub fn get_io_monitor(&self) -> Arc<AdvancedIOMonitor> {
         self.io_monitor.clone()
     }
 
-    /// 获取 IO 限流器
+    /// get IO throttler
     pub fn get_io_throttler(&self) -> Arc<AdvancedIOThrottler> {
         self.throttler.clone()
     }
 
-    /// 更新业务指标
+    /// update business metrics
     pub async fn update_business_metrics(&self, latency: u64, qps: u64, error_rate: u64, connections: u64) {
         self.io_monitor
             .update_business_metrics(latency, qps, error_rate, connections)
             .await;
     }
 
-    /// 获取当前 IO 指标
+    /// get current IO metrics
     pub async fn get_current_io_metrics(&self) -> super::io_monitor::IOMetrics {
         self.io_monitor.get_current_metrics().await
     }
 
-    /// 获取限流统计
+    /// get throttle stats
     pub async fn get_throttle_stats(&self) -> super::io_throttler::ThrottleStats {
         self.throttler.get_throttle_stats().await
     }
 
-    /// 运行业务负载压力测试
+    /// run business pressure simulation
     pub async fn run_business_pressure_simulation(&self, duration: Duration) -> super::io_throttler::SimulationResult {
         self.throttler.simulate_business_pressure(duration).await
     }
 
-    /// 更新扫描进度（仅用于测试）
+    /// update scan progress (for testing)
     pub async fn update_scan_progress_for_test(&self, cycle: u64, disk_index: usize, last_key: Option<String>) {
         let mut progress = self.scan_progress.write().await;
         progress.current_cycle = cycle;

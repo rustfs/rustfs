@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! 测试Endpoint索引设置是否正确
+//! test endpoint index settings
 
 use rustfs_ecstore::disk::endpoint::Endpoint;
 use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
@@ -23,24 +23,24 @@ use tempfile::TempDir;
 async fn test_endpoint_index_settings() -> anyhow::Result<()> {
     let temp_dir = TempDir::new()?;
 
-    // 创建测试磁盘路径
+    // create test disk paths
     let disk_paths: Vec<_> = (0..4).map(|i| temp_dir.path().join(format!("disk{}", i))).collect();
 
     for path in &disk_paths {
         tokio::fs::create_dir_all(path).await?;
     }
 
-    // 构建endpoints
+    // build endpoints
     let mut endpoints: Vec<Endpoint> = disk_paths
         .iter()
         .map(|p| Endpoint::try_from(p.to_string_lossy().as_ref()).unwrap())
         .collect();
 
-    // 正确设置Endpoint索引
+    // set endpoint indexes correctly
     for (i, endpoint) in endpoints.iter_mut().enumerate() {
         endpoint.set_pool_index(0);
         endpoint.set_set_index(0);
-        endpoint.set_disk_index(i); // 注意：disk_index是usize类型
+        endpoint.set_disk_index(i); // note: disk_index is usize type
         println!(
             "Endpoint {}: pool_idx={}, set_idx={}, disk_idx={}",
             i, endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx
@@ -58,7 +58,7 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    // 验证所有Endpoint的索引都在有效范围内
+    // validate all endpoint indexes are in valid range
     for (i, ep) in endpoints.iter().enumerate() {
         assert_eq!(ep.pool_idx, 0, "Endpoint {} pool_idx should be 0", i);
         assert_eq!(ep.set_idx, 0, "Endpoint {} set_idx should be 0", i);
@@ -69,7 +69,7 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
         );
     }
 
-    // 测试ECStore初始化
+    // test ECStore initialization
     rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await?;
 
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

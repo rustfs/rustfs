@@ -19,7 +19,7 @@ use tracing::error;
 
 pub const MIN_COMPRESSIBLE_SIZE: usize = 4096;
 
-// 环境变量名称，用于控制是否启用压缩
+// Environment variable name to control whether compression is enabled
 pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
 
 // Some standard object extensions which we strictly dis-allow for compression.
@@ -39,14 +39,14 @@ pub const STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES: &[&str] = &[
 ];
 
 pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
-    // 检查环境变量是否启用压缩，默认关闭
+    // Check if compression is enabled via environment variable, default disabled
     if let Ok(compression_enabled) = env::var(ENV_COMPRESSION_ENABLED) {
         if compression_enabled.to_lowercase() != "true" {
             error!("Compression is disabled by environment variable");
             return false;
         }
     } else {
-        // 环境变量未设置时默认关闭
+        // Default disabled when environment variable is not set
         return false;
     }
 
@@ -79,7 +79,7 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        // 测试环境变量控制
+        // Test environment variable control
         temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("false"), || {
             assert!(!is_compressible(&headers, "file.txt"));
         });
@@ -94,14 +94,14 @@ mod tests {
 
         temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
             let mut headers = HeaderMap::new();
-            // 测试不可压缩的扩展名
+            // Test non-compressible extensions
             headers.insert("content-type", "text/plain".parse().unwrap());
             assert!(!is_compressible(&headers, "file.gz"));
             assert!(!is_compressible(&headers, "file.zip"));
             assert!(!is_compressible(&headers, "file.mp4"));
             assert!(!is_compressible(&headers, "file.jpg"));
 
-            // 测试不可压缩的内容类型
+            // Test non-compressible content types
             headers.insert("content-type", "video/mp4".parse().unwrap());
             assert!(!is_compressible(&headers, "file.txt"));
 
@@ -114,7 +114,7 @@ mod tests {
             headers.insert("content-type", "application/x-gzip".parse().unwrap());
             assert!(!is_compressible(&headers, "file.txt"));
 
-            // 测试可压缩的情况
+            // Test compressible cases
             headers.insert("content-type", "text/plain".parse().unwrap());
             assert!(is_compressible(&headers, "file.txt"));
             assert!(is_compressible(&headers, "file.log"));

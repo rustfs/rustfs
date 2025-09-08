@@ -25,122 +25,122 @@ use tracing::{debug, info, warn};
 
 use super::node_scanner::LoadLevel;
 
-/// IO 限流配置
+/// IO throttler config
 #[derive(Debug, Clone)]
 pub struct IOThrottlerConfig {
-    /// 最大 IOPS 限制
+    /// max IOPS limit
     pub max_iops: u64,
-    /// 业务优先级基线（百分比）
+    /// business priority baseline (percentage)
     pub base_business_priority: u8,
-    /// 扫描器最小延迟（毫秒）
+    /// scanner minimum delay (milliseconds)
     pub min_scan_delay: u64,
-    /// 扫描器最大延迟（毫秒）
+    /// scanner maximum delay (milliseconds)
     pub max_scan_delay: u64,
-    /// 是否启用动态调节
+    /// whether enable dynamic adjustment
     pub enable_dynamic_adjustment: bool,
-    /// 调节响应时间（秒）
+    /// adjustment response time (seconds)
     pub adjustment_response_time: u64,
 }
 
 impl Default for IOThrottlerConfig {
     fn default() -> Self {
         Self {
-            max_iops: 1000,             // 默认最大 1000 IOPS
-            base_business_priority: 95, // 业务优先级 95%
-            min_scan_delay: 5000,       // 最小 5s 延迟
-            max_scan_delay: 60000,      // 最大 60s 延迟
+            max_iops: 1000,             // default max 1000 IOPS
+            base_business_priority: 95, // business priority 95%
+            min_scan_delay: 5000,       // minimum 5s delay
+            max_scan_delay: 60000,      // maximum 60s delay
             enable_dynamic_adjustment: true,
-            adjustment_response_time: 5, // 5秒响应时间
+            adjustment_response_time: 5, // 5 seconds response time
         }
     }
 }
 
-/// 资源分配策略
+/// resource allocation strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceAllocationStrategy {
-    /// 业务优先策略
+    /// business priority strategy
     BusinessFirst,
-    /// 平衡策略
+    /// balanced strategy
     Balanced,
-    /// 维护优先策略（仅在特殊情况下使用）
+    /// maintenance priority strategy (only used in special cases)
     MaintenanceFirst,
 }
 
-/// 限流决策
+/// throttle decision
 #[derive(Debug, Clone)]
 pub struct ThrottleDecision {
-    /// 是否应该暂停扫描
+    /// whether should pause scanning
     pub should_pause: bool,
-    /// 建议的扫描延迟
+    /// suggested scanning delay
     pub suggested_delay: Duration,
-    /// 资源分配建议
+    /// resource allocation suggestion
     pub resource_allocation: ResourceAllocation,
-    /// 决策原因
+    /// decision reason
     pub reason: String,
 }
 
-/// 资源分配
+/// resource allocation
 #[derive(Debug, Clone)]
 pub struct ResourceAllocation {
-    /// 业务 IO 分配比例 (0-100)
+    /// business IO allocation percentage (0-100)
     pub business_percentage: u8,
-    /// 扫描器 IO 分配比例 (0-100)
+    /// scanner IO allocation percentage (0-100)
     pub scanner_percentage: u8,
-    /// 分配策略
+    /// allocation strategy
     pub strategy: ResourceAllocationStrategy,
 }
 
-/// 增强的 IO 限流器
+/// enhanced IO throttler
 ///
-/// 根据实时系统负载和业务需求动态调节扫描器的资源使用，
-/// 确保业务 IO 获得优先保障。
+/// dynamically adjust the resource usage of the scanner based on real-time system load and business demand,
+/// ensure business IO gets priority protection.
 pub struct AdvancedIOThrottler {
-    /// 配置
+    /// config
     config: Arc<RwLock<IOThrottlerConfig>>,
-    /// 当前 IOPS 使用量 (预留字段)
+    /// current IOPS usage (reserved field)
     #[allow(dead_code)]
     current_iops: Arc<AtomicU64>,
-    /// 业务优先级权重 (0-100)
+    /// business priority weight (0-100)
     business_priority: Arc<AtomicU8>,
-    /// 扫描操作间延迟 (毫秒)
+    /// scanning operation delay (milliseconds)
     scan_delay: Arc<AtomicU64>,
-    /// 资源分配策略
+    /// resource allocation strategy
     allocation_strategy: Arc<RwLock<ResourceAllocationStrategy>>,
-    /// 限流历史记录
+    /// throttle history record
     throttle_history: Arc<RwLock<Vec<ThrottleRecord>>>,
-    /// 最后调节时间 (预留字段)
+    /// last adjustment time (reserved field)
     #[allow(dead_code)]
     last_adjustment: Arc<RwLock<SystemTime>>,
 }
 
-/// 限流记录
+/// throttle record
 #[derive(Debug, Clone)]
 pub struct ThrottleRecord {
-    /// 时间戳
+    /// timestamp
     pub timestamp: SystemTime,
-    /// 负载级别
+    /// load level
     pub load_level: LoadLevel,
-    /// 决策
+    /// decision
     pub decision: ThrottleDecision,
-    /// 系统指标快照
+    /// system metrics snapshot
     pub metrics_snapshot: MetricsSnapshot,
 }
 
-/// 指标快照
+/// metrics snapshot
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     /// IOPS
     pub iops: u64,
-    /// 延迟
+    /// latency
     pub latency: u64,
-    /// CPU 使用率
+    /// CPU usage
     pub cpu_usage: u8,
-    /// 内存使用率
+    /// memory usage
     pub memory_usage: u8,
 }
 
 impl AdvancedIOThrottler {
-    /// 创建新的高级 IO 限流器
+    /// create new advanced IO throttler
     pub fn new(config: IOThrottlerConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -153,27 +153,27 @@ impl AdvancedIOThrottler {
         }
     }
 
-    /// 根据负载级别调整扫描延迟
+    /// adjust scanning delay based on load level
     pub async fn adjust_for_load_level(&self, load_level: LoadLevel) -> Duration {
         let config = self.config.read().await;
 
         let delay_ms = match load_level {
             LoadLevel::Low => {
-                // 低负载：使用最小延迟
+                // low load: use minimum delay
                 self.scan_delay.store(config.min_scan_delay, Ordering::Relaxed);
                 self.business_priority
                     .store(config.base_business_priority.saturating_sub(5), Ordering::Relaxed);
                 config.min_scan_delay
             }
             LoadLevel::Medium => {
-                // 中负载：适度增加延迟
+                // medium load: increase delay moderately
                 let delay = config.min_scan_delay * 5; // 500ms
                 self.scan_delay.store(delay, Ordering::Relaxed);
                 self.business_priority.store(config.base_business_priority, Ordering::Relaxed);
                 delay
             }
             LoadLevel::High => {
-                // 高负载：显著增加延迟
+                // high load: increase delay significantly
                 let delay = config.min_scan_delay * 10; // 50s
                 self.scan_delay.store(delay, Ordering::Relaxed);
                 self.business_priority
@@ -181,7 +181,7 @@ impl AdvancedIOThrottler {
                 delay
             }
             LoadLevel::Critical => {
-                // 关键负载：最大延迟或暂停
+                // critical load: maximum delay or pause
                 let delay = config.max_scan_delay; // 60s
                 self.scan_delay.store(delay, Ordering::Relaxed);
                 self.business_priority.store(99, Ordering::Relaxed);
@@ -191,12 +191,12 @@ impl AdvancedIOThrottler {
 
         let duration = Duration::from_millis(delay_ms);
 
-        debug!("根据负载级别 {:?} 调整扫描延迟: {:?}", load_level, duration);
+        debug!("Adjust scanning delay based on load level {:?}: {:?}", load_level, duration);
 
         duration
     }
 
-    /// 创建限流决策
+    /// create throttle decision
     pub async fn make_throttle_decision(&self, load_level: LoadLevel, metrics: Option<MetricsSnapshot>) -> ThrottleDecision {
         let _config = self.config.read().await;
 
@@ -207,10 +207,10 @@ impl AdvancedIOThrottler {
         let resource_allocation = self.calculate_resource_allocation(load_level).await;
 
         let reason = match load_level {
-            LoadLevel::Low => "系统负载较低，扫描器可以正常运行".to_string(),
-            LoadLevel::Medium => "系统负载适中，扫描器降速运行".to_string(),
-            LoadLevel::High => "系统负载较高，扫描器显著降速".to_string(),
-            LoadLevel::Critical => "系统负载过高，暂停扫描器运行".to_string(),
+            LoadLevel::Low => "system load is low, scanner can run normally".to_string(),
+            LoadLevel::Medium => "system load is moderate, scanner is running at reduced speed".to_string(),
+            LoadLevel::High => "system load is high, scanner is running at significantly reduced speed".to_string(),
+            LoadLevel::Critical => "system load is too high, scanner is paused".to_string(),
         };
 
         let decision = ThrottleDecision {
@@ -220,7 +220,7 @@ impl AdvancedIOThrottler {
             reason,
         };
 
-        // 记录决策历史
+        // record decision history
         if let Some(snapshot) = metrics {
             self.record_throttle_decision(load_level, decision.clone(), snapshot).await;
         }
@@ -228,7 +228,7 @@ impl AdvancedIOThrottler {
         decision
     }
 
-    /// 计算资源分配
+    /// calculate resource allocation
     async fn calculate_resource_allocation(&self, load_level: LoadLevel) -> ResourceAllocation {
         let strategy = *self.allocation_strategy.read().await;
 
@@ -243,7 +243,7 @@ impl AdvancedIOThrottler {
             (ResourceAllocationStrategy::Balanced, LoadLevel::High) => (90, 10),
             (ResourceAllocationStrategy::Balanced, LoadLevel::Critical) => (95, 5),
 
-            (ResourceAllocationStrategy::MaintenanceFirst, _) => (70, 30), // 特殊维护模式
+            (ResourceAllocationStrategy::MaintenanceFirst, _) => (70, 30), // special maintenance mode
         };
 
         ResourceAllocation {
@@ -253,18 +253,18 @@ impl AdvancedIOThrottler {
         }
     }
 
-    /// 检查是否应该暂停扫描
+    /// check whether should pause scanning
     pub async fn should_pause_scanning(&self, load_level: LoadLevel) -> bool {
         match load_level {
             LoadLevel::Critical => {
-                warn!("系统负载达到关键级别，暂停扫描器");
+                warn!("System load reached critical level, pausing scanner");
                 true
             }
             _ => false,
         }
     }
 
-    /// 记录限流决策
+    /// record throttle decision
     async fn record_throttle_decision(&self, load_level: LoadLevel, decision: ThrottleDecision, metrics: MetricsSnapshot) {
         let record = ThrottleRecord {
             timestamp: SystemTime::now(),
@@ -276,30 +276,30 @@ impl AdvancedIOThrottler {
         let mut history = self.throttle_history.write().await;
         history.push(record);
 
-        // 保持历史记录在合理范围内（最近 1000 条）
+        // keep history record in reasonable range (last 1000 records)
         while history.len() > 1000 {
             history.remove(0);
         }
     }
 
-    /// 设置资源分配策略
+    /// set resource allocation strategy
     pub async fn set_allocation_strategy(&self, strategy: ResourceAllocationStrategy) {
         *self.allocation_strategy.write().await = strategy;
-        info!("设置资源分配策略: {:?}", strategy);
+        info!("Set resource allocation strategy: {:?}", strategy);
     }
 
-    /// 获取当前资源分配
+    /// get current resource allocation
     pub async fn get_current_allocation(&self) -> ResourceAllocation {
-        let current_load = LoadLevel::Low; // 需要从外部获取
+        let current_load = LoadLevel::Low; // need to get from external
         self.calculate_resource_allocation(current_load).await
     }
 
-    /// 获取限流历史
+    /// get throttle history
     pub async fn get_throttle_history(&self) -> Vec<ThrottleRecord> {
         self.throttle_history.read().await.clone()
     }
 
-    /// 获取限流统计
+    /// get throttle stats
     pub async fn get_throttle_stats(&self) -> ThrottleStats {
         let history = self.throttle_history.read().await;
 
@@ -317,7 +317,7 @@ impl AdvancedIOThrottler {
             Duration::ZERO
         };
 
-        // 按负载级别统计
+        // count by load level
         let low_count = history.iter().filter(|r| r.load_level == LoadLevel::Low).count();
         let medium_count = history.iter().filter(|r| r.load_level == LoadLevel::Medium).count();
         let high_count = history.iter().filter(|r| r.load_level == LoadLevel::High).count();
@@ -336,37 +336,37 @@ impl AdvancedIOThrottler {
         }
     }
 
-    /// 重置限流历史
+    /// reset throttle history
     pub async fn reset_history(&self) {
         self.throttle_history.write().await.clear();
-        info!("已重置限流历史记录");
+        info!("Reset throttle history");
     }
 
-    /// 更新配置
+    /// update config
     pub async fn update_config(&self, new_config: IOThrottlerConfig) {
         *self.config.write().await = new_config;
-        info!("已更新 IO 限流器配置");
+        info!("Updated IO throttler configuration");
     }
 
-    /// 获取当前扫描延迟
+    /// get current scanning delay
     pub fn get_current_scan_delay(&self) -> Duration {
         let delay_ms = self.scan_delay.load(Ordering::Relaxed);
         Duration::from_millis(delay_ms)
     }
 
-    /// 获取当前业务优先级
+    /// get current business priority
     pub fn get_current_business_priority(&self) -> u8 {
         self.business_priority.load(Ordering::Relaxed)
     }
 
-    /// 模拟业务负载压力测试
+    /// simulate business load pressure test
     pub async fn simulate_business_pressure(&self, duration: Duration) -> SimulationResult {
-        info!("开始模拟业务负载压力测试，持续时间: {:?}", duration);
+        info!("Start simulating business load pressure test, duration: {:?}", duration);
 
         let start_time = SystemTime::now();
         let mut simulation_records = Vec::new();
 
-        // 模拟不同负载级别的变化
+        // simulate different load level changes
         let load_levels = [
             LoadLevel::Low,
             LoadLevel::Medium,
@@ -382,7 +382,7 @@ impl AdvancedIOThrottler {
         for (i, &load_level) in load_levels.iter().enumerate() {
             let _step_start = SystemTime::now();
 
-            // 模拟该负载级别下的指标
+            // simulate metrics for this load level
             let metrics = MetricsSnapshot {
                 iops: match load_level {
                     LoadLevel::Low => 200,
@@ -421,14 +421,14 @@ impl AdvancedIOThrottler {
             });
 
             info!(
-                "模拟步骤 {}: 负载={:?}, 延迟={:?}, 暂停={}",
+                "simulate step {}: load={:?}, delay={:?}, pause={}",
                 i + 1,
                 load_level,
                 decision.suggested_delay,
                 decision.should_pause
             );
 
-            // 等待步骤时间
+            // wait for step duration
             tokio::time::sleep(step_duration).await;
         }
 
@@ -442,55 +442,55 @@ impl AdvancedIOThrottler {
     }
 }
 
-/// 限流统计
+/// throttle stats
 #[derive(Debug, Clone)]
 pub struct ThrottleStats {
-    /// 总决策数
+    /// total decisions
     pub total_decisions: usize,
-    /// 暂停决策数
+    /// pause decisions
     pub pause_decisions: usize,
-    /// 平均延迟
+    /// average delay
     pub average_delay: Duration,
-    /// 负载级别分布
+    /// load level distribution
     pub load_level_distribution: LoadLevelDistribution,
 }
 
-/// 负载级别分布
+/// load level distribution
 #[derive(Debug, Clone)]
 pub struct LoadLevelDistribution {
-    /// 低负载次数
+    /// low load count
     pub low_count: usize,
-    /// 中负载次数
+    /// medium load count
     pub medium_count: usize,
-    /// 高负载次数
+    /// high load count
     pub high_count: usize,
-    /// 关键负载次数
+    /// critical load count
     pub critical_count: usize,
 }
 
-/// 模拟结果
+/// simulation result
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
-    /// 总持续时间
+    /// total duration
     pub total_duration: Duration,
-    /// 模拟记录
+    /// simulation records
     pub simulation_records: Vec<SimulationRecord>,
-    /// 最终统计
+    /// final stats
     pub final_stats: ThrottleStats,
 }
 
-/// 模拟记录
+/// simulation record
 #[derive(Debug, Clone)]
 pub struct SimulationRecord {
-    /// 步骤编号
+    /// step number
     pub step: usize,
-    /// 负载级别
+    /// load level
     pub load_level: LoadLevel,
-    /// 指标快照
+    /// metrics snapshot
     pub metrics: MetricsSnapshot,
-    /// 限流决策
+    /// throttle decision
     pub decision: ThrottleDecision,
-    /// 步骤持续时间
+    /// step duration
     pub step_duration: Duration,
 }
 

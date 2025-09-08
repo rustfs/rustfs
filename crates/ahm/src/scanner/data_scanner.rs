@@ -31,8 +31,7 @@ use tracing::{debug, error, info, warn};
 use super::metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics};
 use super::node_scanner::{NodeScanner, NodeScannerConfig};
 use super::stats_aggregator::{DecentralizedStatsAggregator, DecentralizedStatsAggregatorConfig};
-// IO监控组件已集成到NodeScanner中
-// IO限流组件已集成到NodeScanner中
+// IO throttling component is integrated into NodeScanner
 use crate::heal::HealManager;
 use crate::scanner::lifecycle::ScannerItem;
 use crate::{
@@ -1757,7 +1756,7 @@ impl Scanner {
                         objects_with_issues += 1;
                         warn!("Object {} has no versions", entry.name);
 
-                        // 对象元数据损坏，提交元数据 heal 任务
+                        // object metadata damaged, submit metadata heal task
                         let enable_healing = self.config.read().await.enable_healing;
                         if enable_healing {
                             if let Some(heal_manager) = &self.heal_manager {
@@ -1866,7 +1865,7 @@ impl Scanner {
                     objects_with_issues += 1;
                     warn!("Failed to parse metadata for object {}", entry.name);
 
-                    // 对象元数据解析失败，提交元数据 heal 任务
+                    // object metadata parse failed, submit metadata heal task
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
                         if let Some(heal_manager) = &self.heal_manager {
@@ -2130,7 +2129,7 @@ impl Scanner {
                         break;
                     }
 
-                    // 检查取消信号
+                    // check cancel signal
                     if cancel_token.is_cancelled() {
                         info!("Cancellation requested, exiting scanner loop");
                         break;

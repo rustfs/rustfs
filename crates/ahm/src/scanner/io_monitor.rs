@@ -29,59 +29,59 @@ use tracing::{debug, error, info, warn};
 use super::node_scanner::LoadLevel;
 use crate::error::Result;
 
-/// IO 监控配置
+/// IO monitor config   
 #[derive(Debug, Clone)]
 pub struct IOMonitorConfig {
-    /// 监控间隔
+    /// monitor interval
     pub monitor_interval: Duration,
-    /// 历史数据保留时间
+    /// history data retention time
     pub history_retention: Duration,
-    /// 负载评估窗口大小
+    /// load evaluation window size
     pub load_window_size: usize,
-    /// 是否启用实际系统监控
+    /// whether to enable actual system monitoring
     pub enable_system_monitoring: bool,
-    /// 磁盘路径列表（用于监控特定磁盘）
+    /// disk path list (for monitoring specific disks)
     pub disk_paths: Vec<String>,
 }
 
 impl Default for IOMonitorConfig {
     fn default() -> Self {
         Self {
-            monitor_interval: Duration::from_secs(1),    // 1秒监控间隔
-            history_retention: Duration::from_secs(300), // 保留5分钟历史
-            load_window_size: 30,                        // 30个采样点的滑动窗口
-            enable_system_monitoring: false,             // 默认使用模拟数据
+            monitor_interval: Duration::from_secs(1),    // 1 second monitor interval
+            history_retention: Duration::from_secs(300), // keep 5 minutes history
+            load_window_size: 30,                        // 30 sample points sliding window
+            enable_system_monitoring: false,             // default use simulated data
             disk_paths: Vec::new(),
         }
     }
 }
 
-/// IO 监控指标
+/// IO monitor metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IOMetrics {
-    /// 时间戳
+    /// timestamp
     pub timestamp: SystemTime,
-    /// 磁盘 IOPS（读 + 写）
+    /// disk IOPS (read + write)
     pub iops: u64,
-    /// 读 IOPS
+    /// read IOPS
     pub read_iops: u64,
-    /// 写 IOPS
+    /// write IOPS
     pub write_iops: u64,
-    /// 磁盘队列深度
+    /// disk queue depth
     pub queue_depth: u64,
-    /// 平均延迟（毫秒）
+    /// average latency (milliseconds)
     pub avg_latency: u64,
-    /// 读延迟（毫秒）
+    /// read latency (milliseconds)
     pub read_latency: u64,
-    /// 写延迟（毫秒）
+    /// write latency (milliseconds)
     pub write_latency: u64,
-    /// CPU 使用率 (0-100)
+    /// CPU usage (0-100)
     pub cpu_usage: u8,
-    /// 内存使用率 (0-100)
+    /// memory usage (0-100)
     pub memory_usage: u8,
-    /// 磁盘使用率 (0-100)
+    /// disk usage (0-100)
     pub disk_utilization: u8,
-    /// 网络 IO (Mbps)
+    /// network IO (Mbps)
     pub network_io: u64,
 }
 
@@ -104,52 +104,52 @@ impl Default for IOMetrics {
     }
 }
 
-/// 负载级别统计
+/// load level stats
 #[derive(Debug, Clone, Default)]
 pub struct LoadLevelStats {
-    /// 低负载时间（秒）
+    /// low load duration (seconds)
     pub low_load_duration: u64,
-    /// 中负载时间（秒）
+    /// medium load duration (seconds)
     pub medium_load_duration: u64,
-    /// 高负载时间（秒）
+    /// high load duration (seconds)
     pub high_load_duration: u64,
-    /// 超高负载时间（秒）
+    /// critical load duration (seconds)
     pub critical_load_duration: u64,
-    /// 负载切换次数
+    /// load transitions
     pub load_transitions: u64,
 }
 
-/// 增强的 IO 监控器
+/// advanced IO monitor
 pub struct AdvancedIOMonitor {
-    /// 配置
+    /// config
     config: Arc<RwLock<IOMonitorConfig>>,
-    /// 当前指标
+    /// current metrics
     current_metrics: Arc<RwLock<IOMetrics>>,
-    /// 历史指标（滑动窗口）
+    /// history metrics (sliding window)
     history_metrics: Arc<RwLock<VecDeque<IOMetrics>>>,
-    /// 当前负载级别
+    /// current load level
     current_load_level: Arc<RwLock<LoadLevel>>,
-    /// 负载级别历史
+    /// load level history
     load_level_history: Arc<RwLock<VecDeque<(SystemTime, LoadLevel)>>>,
-    /// 负载级别统计
+    /// load level stats
     load_stats: Arc<RwLock<LoadLevelStats>>,
-    /// 业务 IO 指标（由外部更新）
+    /// business IO metrics (updated by external)
     business_metrics: Arc<BusinessIOMetrics>,
-    /// 取消令牌
+    /// cancel token
     cancel_token: CancellationToken,
 }
 
-/// 业务 IO 指标
+/// business IO metrics
 pub struct BusinessIOMetrics {
-    /// 业务请求延迟（毫秒）
+    /// business request latency (milliseconds)
     pub request_latency: AtomicU64,
-    /// 业务请求 QPS
+    /// business request QPS
     pub request_qps: AtomicU64,
-    /// 业务错误率 (0-10000, 表示0.00%-100.00%)
+    /// business error rate (0-10000, 0.00%-100.00%)
     pub error_rate: AtomicU64,
-    /// 活跃连接数
+    /// active connections
     pub active_connections: AtomicU64,
-    /// 最后更新时间
+    /// last update time
     pub last_update: Arc<RwLock<SystemTime>>,
 }
 
@@ -166,7 +166,7 @@ impl Default for BusinessIOMetrics {
 }
 
 impl AdvancedIOMonitor {
-    /// 创建新的高级 IO 监控器
+    /// create new advanced IO monitor
     pub fn new(config: IOMonitorConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -180,27 +180,27 @@ impl AdvancedIOMonitor {
         }
     }
 
-    /// 启动监控
+    /// start monitoring
     pub async fn start(&self) -> Result<()> {
-        info!("启动高级 IO 监控器");
+        info!("start advanced IO monitor");
 
         let monitor = self.clone_for_background();
         tokio::spawn(async move {
             if let Err(e) = monitor.monitoring_loop().await {
-                error!("IO 监控循环失败: {}", e);
+                error!("IO monitoring loop failed: {}", e);
             }
         });
 
         Ok(())
     }
 
-    /// 停止监控
+    /// stop monitoring
     pub async fn stop(&self) {
-        info!("停止 IO 监控器");
+        info!("stop IO monitor");
         self.cancel_token.cancel();
     }
 
-    /// 监控循环
+    /// monitoring loop
     async fn monitoring_loop(&self) -> Result<()> {
         let mut interval = {
             let config = self.config.read().await;
@@ -213,33 +213,33 @@ impl AdvancedIOMonitor {
         loop {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
-                    info!("IO 监控循环被取消");
+                    info!("IO monitoring loop cancelled");
                     break;
                 }
                 _ = interval.tick() => {
-                    // 收集系统指标
+                    // collect system metrics
                     let metrics = self.collect_system_metrics().await;
 
-                    // 更新当前指标
+                    // update current metrics
                     *self.current_metrics.write().await = metrics.clone();
 
-                    // 更新历史指标
+                    // update history metrics
                     self.update_metrics_history(metrics.clone()).await;
 
-                    // 计算负载级别
+                    // calculate load level
                     let new_load_level = self.calculate_load_level(&metrics).await;
 
-                    // 检查负载级别是否变化
+                    // check if load level changed
                     if new_load_level != last_load_level {
                         self.handle_load_level_change(last_load_level, new_load_level, load_level_start_time).await;
                         last_load_level = new_load_level;
                         load_level_start_time = SystemTime::now();
                     }
 
-                    // 更新当前负载级别
+                    // update current load level
                     *self.current_load_level.write().await = new_load_level;
 
-                    debug!("IO 监控更新: IOPS={}, 队列深度={}, 延迟={}ms, 负载级别={:?}",
+                    debug!("IO monitor updated: IOPS={}, queue depth={}, latency={}ms, load level={:?}",
                            metrics.iops, metrics.queue_depth, metrics.avg_latency, new_load_level);
                 }
             }
@@ -248,61 +248,61 @@ impl AdvancedIOMonitor {
         Ok(())
     }
 
-    /// 收集系统指标
+    /// collect system metrics
     async fn collect_system_metrics(&self) -> IOMetrics {
         let config = self.config.read().await;
 
         if config.enable_system_monitoring {
-            // 实际系统监控实现
+            // actual system monitoring implementation
             self.collect_real_system_metrics().await
         } else {
-            // 模拟数据
+            // simulated data
             self.generate_simulated_metrics().await
         }
     }
 
-    /// 收集真实系统指标（需要根据具体系统实现）
+    /// collect real system metrics (need to be implemented according to specific system)
     async fn collect_real_system_metrics(&self) -> IOMetrics {
-        // TODO: 实现真实的系统指标收集
-        // 可以使用 procfs、sysfs 或其他系统 API
+        // TODO: implement actual system metrics collection
+        // can use procfs, sysfs or other system API
 
         let metrics = IOMetrics {
             timestamp: SystemTime::now(),
             ..Default::default()
         };
 
-        // 示例：读取 /proc/diskstats
+        // example: read /proc/diskstats
         if let Ok(diskstats) = tokio::fs::read_to_string("/proc/diskstats").await {
-            // 解析磁盘统计信息
-            // 这里需要实现具体的解析逻辑
-            debug!("读取磁盘统计信息: {} 字节", diskstats.len());
+            // parse disk stats info
+            // here need to implement specific parsing logic
+            debug!("read disk stats info: {} bytes", diskstats.len());
         }
 
-        // 示例：读取 /proc/stat 获取 CPU 信息
+        // example: read /proc/stat to get CPU info
         if let Ok(stat) = tokio::fs::read_to_string("/proc/stat").await {
-            // 解析 CPU 统计信息
-            debug!("读取 CPU 统计信息: {} 字节", stat.len());
+            // parse CPU stats info
+            debug!("read CPU stats info: {} bytes", stat.len());
         }
 
-        // 示例：读取 /proc/meminfo 获取内存信息
+        // example: read /proc/meminfo to get memory info
         if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
-            // 解析内存统计信息
-            debug!("读取内存统计信息: {} 字节", meminfo.len());
+            // parse memory stats info
+            debug!("read memory stats info: {} bytes", meminfo.len());
         }
 
         metrics
     }
 
-    /// 生成模拟指标（用于测试和开发）
+    /// generate simulated metrics (for testing and development)
     async fn generate_simulated_metrics(&self) -> IOMetrics {
         use rand::Rng;
         let mut rng = rand::rng();
 
-        // 获取业务指标影响
+        // get business metrics impact
         let business_latency = self.business_metrics.request_latency.load(Ordering::Relaxed);
         let business_qps = self.business_metrics.request_qps.load(Ordering::Relaxed);
 
-        // 基于业务负载生成模拟的系统指标
+        // generate simulated system metrics based on business load
         let base_iops = 100 + (business_qps / 10);
         let base_latency = 5 + (business_latency / 10);
 
@@ -322,15 +322,15 @@ impl AdvancedIOMonitor {
         }
     }
 
-    /// 更新指标历史
+    /// update metrics history
     async fn update_metrics_history(&self, metrics: IOMetrics) {
         let mut history = self.history_metrics.write().await;
         let config = self.config.read().await;
 
-        // 添加新指标
+        // add new metrics
         history.push_back(metrics);
 
-        // 清理过期数据
+        // clean expired data
         let retention_cutoff = SystemTime::now() - config.history_retention;
         while let Some(front) = history.front() {
             if front.timestamp < retention_cutoff {
@@ -340,18 +340,18 @@ impl AdvancedIOMonitor {
             }
         }
 
-        // 限制窗口大小
+        // limit window size
         while history.len() > config.load_window_size {
             history.pop_front();
         }
     }
 
-    /// 计算负载级别
+    /// calculate load level
     async fn calculate_load_level(&self, metrics: &IOMetrics) -> LoadLevel {
-        // 多维度负载评估算法
+        // multi-dimensional load evaluation algorithm
         let mut load_score = 0u32;
 
-        // IOPS 负载评估 (权重: 25%)
+        // IOPS load evaluation (weight: 25%)
         let iops_score = match metrics.iops {
             0..=200 => 0,
             201..=500 => 15,
@@ -360,7 +360,7 @@ impl AdvancedIOMonitor {
         };
         load_score += iops_score;
 
-        // 延迟负载评估 (权重: 30%)
+        // latency load evaluation (weight: 30%)
         let latency_score = match metrics.avg_latency {
             0..=10 => 0,
             11..=50 => 20,
@@ -369,7 +369,7 @@ impl AdvancedIOMonitor {
         };
         load_score += latency_score;
 
-        // 队列深度评估 (权重: 20%)
+        // queue depth evaluation (weight: 20%)
         let queue_score = match metrics.queue_depth {
             0..=5 => 0,
             6..=15 => 10,
@@ -378,7 +378,7 @@ impl AdvancedIOMonitor {
         };
         load_score += queue_score;
 
-        // CPU 使用率评估 (权重: 15%)
+        // CPU usage evaluation (weight: 15%)
         let cpu_score = match metrics.cpu_usage {
             0..=30 => 0,
             31..=60 => 8,
@@ -387,7 +387,7 @@ impl AdvancedIOMonitor {
         };
         load_score += cpu_score;
 
-        // 磁盘使用率评估 (权重: 10%)
+        // disk usage evaluation (weight: 10%)
         let disk_score = match metrics.disk_utilization {
             0..=50 => 0,
             51..=75 => 5,
@@ -396,23 +396,23 @@ impl AdvancedIOMonitor {
         };
         load_score += disk_score;
 
-        // 业务指标影响
+        // business metrics impact
         let business_latency = self.business_metrics.request_latency.load(Ordering::Relaxed);
         let business_error_rate = self.business_metrics.error_rate.load(Ordering::Relaxed);
 
         if business_latency > 100 {
-            load_score += 20; // 业务延迟过高
+            load_score += 20; // business latency too high
         }
         if business_error_rate > 100 {
             // > 1%
-            load_score += 15; // 业务错误率过高
+            load_score += 15; // business error rate too high
         }
 
-        // 历史趋势分析
+        // history trend analysis
         let trend_score = self.calculate_trend_score().await;
         load_score += trend_score;
 
-        // 根据总分确定负载级别
+        // determine load level based on total score
         match load_score {
             0..=30 => LoadLevel::Low,
             31..=60 => LoadLevel::Medium,
@@ -421,18 +421,18 @@ impl AdvancedIOMonitor {
         }
     }
 
-    /// 计算趋势评分
+    /// calculate trend score
     async fn calculate_trend_score(&self) -> u32 {
         let history = self.history_metrics.read().await;
 
         if history.len() < 5 {
-            return 0; // 数据不足，无法分析趋势
+            return 0; // data insufficient, cannot analyze trend
         }
 
-        // 分析最近 5 个样本的趋势
+        // analyze trend of last 5 samples
         let recent: Vec<_> = history.iter().rev().take(5).collect();
 
-        // 检查 IOPS 上升趋势
+        // check IOPS rising trend
         let mut iops_trend = 0;
         for i in 1..recent.len() {
             if recent[i - 1].iops > recent[i].iops {
@@ -440,7 +440,7 @@ impl AdvancedIOMonitor {
             }
         }
 
-        // 检查延迟上升趋势
+        // check latency rising trend
         let mut latency_trend = 0;
         for i in 1..recent.len() {
             if recent[i - 1].avg_latency > recent[i].avg_latency {
@@ -448,21 +448,21 @@ impl AdvancedIOMonitor {
             }
         }
 
-        // 如果 IOPS 和延迟都在上升，增加负载评分
+        // if IOPS and latency are both rising, increase load score
         if iops_trend >= 3 && latency_trend >= 3 {
-            15 // 明显上升趋势
+            15 // obvious rising trend
         } else if iops_trend >= 2 || latency_trend >= 2 {
-            5 // 轻微上升趋势
+            5 // slight rising trend
         } else {
-            0 // 无明显趋势
+            0 // no obvious trend
         }
     }
 
-    /// 处理负载级别变化
+    /// handle load level change
     async fn handle_load_level_change(&self, old_level: LoadLevel, new_level: LoadLevel, start_time: SystemTime) {
         let duration = SystemTime::now().duration_since(start_time).unwrap_or(Duration::ZERO);
 
-        // 更新统计
+        // update stats
         {
             let mut stats = self.load_stats.write().await;
             match old_level {
@@ -474,46 +474,46 @@ impl AdvancedIOMonitor {
             stats.load_transitions += 1;
         }
 
-        // 更新历史
+        // update history
         {
             let mut history = self.load_level_history.write().await;
             history.push_back((SystemTime::now(), new_level));
 
-            // 保持历史记录在合理范围内
+            // keep history record in reasonable range
             while history.len() > 100 {
                 history.pop_front();
             }
         }
 
-        info!("负载级别变化: {:?} -> {:?}, 持续时间: {:?}", old_level, new_level, duration);
+        info!("load level changed: {:?} -> {:?}, duration: {:?}", old_level, new_level, duration);
 
-        // 如果进入关键负载状态，记录警告
+        // if enter critical load state, record warning
         if new_level == LoadLevel::Critical {
-            warn!("系统进入关键负载状态，Scanner 将暂停运行");
+            warn!("system entered critical load state, Scanner will pause running");
         }
     }
 
-    /// 获取当前负载级别
+    /// get current load level
     pub async fn get_business_load_level(&self) -> LoadLevel {
         *self.current_load_level.read().await
     }
 
-    /// 获取当前指标
+    /// get current metrics
     pub async fn get_current_metrics(&self) -> IOMetrics {
         self.current_metrics.read().await.clone()
     }
 
-    /// 获取历史指标
+    /// get history metrics
     pub async fn get_history_metrics(&self) -> Vec<IOMetrics> {
         self.history_metrics.read().await.iter().cloned().collect()
     }
 
-    /// 获取负载统计
+    /// get load stats
     pub async fn get_load_stats(&self) -> LoadLevelStats {
         self.load_stats.read().await.clone()
     }
 
-    /// 更新业务 IO 指标
+    /// update business IO metrics
     pub async fn update_business_metrics(&self, latency: u64, qps: u64, error_rate: u64, connections: u64) {
         self.business_metrics.request_latency.store(latency, Ordering::Relaxed);
         self.business_metrics.request_qps.store(qps, Ordering::Relaxed);
@@ -523,12 +523,12 @@ impl AdvancedIOMonitor {
         *self.business_metrics.last_update.write().await = SystemTime::now();
 
         debug!(
-            "更新业务指标: 延迟={}ms, QPS={}, 错误率={}‰, 连接数={}",
+            "update business metrics: latency={}ms, QPS={}, error rate={}‰, connections={}",
             latency, qps, error_rate, connections
         );
     }
 
-    /// 克隆用于后台任务
+    /// clone for background task
     fn clone_for_background(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -542,15 +542,15 @@ impl AdvancedIOMonitor {
         }
     }
 
-    /// 重置统计
+    /// reset stats
     pub async fn reset_stats(&self) {
         *self.load_stats.write().await = LoadLevelStats::default();
         self.load_level_history.write().await.clear();
         self.history_metrics.write().await.clear();
-        info!("已重置 IO 监控统计");
+        info!("IO monitor stats reset");
     }
 
-    /// 获取负载级别历史
+    /// get load level history
     pub async fn get_load_level_history(&self) -> Vec<(SystemTime, LoadLevel)> {
         self.load_level_history.read().await.iter().cloned().collect()
     }

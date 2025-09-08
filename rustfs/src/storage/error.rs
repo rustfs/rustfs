@@ -454,13 +454,13 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_with_unicode_strings() {
-        let storage_err = StorageError::BucketNotFound("测试桶".to_string());
+        let storage_err = StorageError::BucketNotFound("test-bucket".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::NoSuchBucket);
         assert!(s3_err.message().unwrap().contains("bucket not found"));
-        assert!(s3_err.message().unwrap().contains("测试桶"));
+        assert!(s3_err.message().unwrap().contains("test-bucket"));
     }
 
     #[test]

@@ -14,10 +14,8 @@
 
 use thiserror::Error;
 
-/// RustFS AHM/Heal/Scanner 统一错误类型
 #[derive(Debug, Error)]
 pub enum Error {
-    // 通用
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -39,14 +37,13 @@ pub enum Error {
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
 
-    // Scanner相关
+    // Scanner
     #[error("Scanner error: {0}")]
     Scanner(String),
 
     #[error("Metrics error: {0}")]
     Metrics(String),
 
-    // 检查点相关
     #[error("Serialization error: {0}")]
     Serialization(String),
 
@@ -59,7 +56,7 @@ pub enum Error {
     #[error("Invalid checkpoint: {0}")]
     InvalidCheckpoint(String),
 
-    // Heal相关
+    // Heal
     #[error("Heal task not found: {task_id}")]
     TaskNotFound { task_id: String },
 
@@ -99,7 +96,6 @@ impl Error {
     }
 }
 
-// 可选：实现与 std::io::Error 的互转
 impl From<Error> for std::io::Error {
     fn from(err: Error) -> Self {
         std::io::Error::other(err)

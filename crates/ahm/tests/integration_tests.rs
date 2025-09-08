@@ -49,28 +49,28 @@ async fn test_load_balancing_and_throttling_integration() {
     let io_monitor = scanner.get_io_monitor();
     let throttler = scanner.get_io_throttler();
 
-    // 启动 IO 监控
+    // Start IO monitoring
     io_monitor.start().await.expect("Failed to start IO monitor");
 
-    // 模拟负载变化场景
+    // Simulate load variation scenarios
     let load_scenarios = vec![
-        (LoadLevel::Low, 10, 100, 0, 5), // (负载级别, 延迟, QPS, 错误率, 连接数)
+        (LoadLevel::Low, 10, 100, 0, 5), // (load level, latency, QPS, error rate, connections)
         (LoadLevel::Medium, 30, 300, 10, 20),
         (LoadLevel::High, 80, 800, 50, 50),
         (LoadLevel::Critical, 200, 1200, 100, 100),
     ];
 
     for (expected_level, latency, qps, error_rate, connections) in load_scenarios {
-        // 更新业务指标
+        // Update business metrics
         scanner.update_business_metrics(latency, qps, error_rate, connections).await;
 
-        // 等待监控系统响应
+        // Wait for monitoring system response
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
-        // 获取当前负载级别
+        // Get current load level
         let current_level = io_monitor.get_business_load_level().await;
 
-        // 获取限流决策
+        // Get throttling decision
         let metrics_snapshot = MetricsSnapshot {
             iops: 100 + qps / 10,
             latency,
@@ -85,7 +85,7 @@ async fn test_load_balancing_and_throttling_integration() {
             expected_level, current_level, decision.should_pause, decision.suggested_delay
         );
 
-        // 验证高负载时的限流效果
+        // Verify throttling effect under high load
         if matches!(current_level, LoadLevel::High | LoadLevel::Critical) {
             assert!(decision.suggested_delay > Duration::from_millis(1000));
         }
@@ -102,7 +102,7 @@ async fn test_load_balancing_and_throttling_integration() {
 async fn test_checkpoint_resume_functionality() {
     let temp_dir = TempDir::new().unwrap();
 
-    // 创建第一个扫描器实例
+    // Create first scanner instance
     let scanner1 = {
         let config = NodeScannerConfig {
             data_dir: temp_dir.path().to_path_buf(),
@@ -111,21 +111,21 @@ async fn test_checkpoint_resume_functionality() {
         NodeScanner::new("checkpoint-test-node".to_string(), config)
     };
 
-    // 初始化并模拟一些扫描进度
+    // Initialize and simulate some scan progress
     scanner1.initialize_stats().await.unwrap();
 
-    // 模拟扫描进度
+    // Simulate scan progress
     scanner1
         .update_scan_progress_for_test(3, 1, Some("checkpoint-test-key".to_string()))
         .await;
 
-    // 保存检查点
+    // Save checkpoint
     scanner1.force_save_checkpoint().await.unwrap();
 
-    // 停止第一个扫描器
+    // Stop first scanner
     scanner1.stop().await.unwrap();
 
-    // 创建第二个扫描器实例（模拟重启）
+    // Create second scanner instance (simulate restart)
     let scanner2 = {
         let config = NodeScannerConfig {
             data_dir: temp_dir.path().to_path_buf(),
@@ -134,16 +134,16 @@ async fn test_checkpoint_resume_functionality() {
         NodeScanner::new("checkpoint-test-node".to_string(), config)
     };
 
-    // 尝试从检查点恢复
+    // Try to recover from checkpoint
     scanner2.start_with_resume().await.unwrap();
 
-    // 验证恢复的进度
+    // Verify recovered progress
     let recovered_progress = scanner2.get_scan_progress().await;
     assert_eq!(recovered_progress.current_cycle, 3);
     assert_eq!(recovered_progress.current_disk_index, 1);
     assert_eq!(recovered_progress.last_scan_key, Some("checkpoint-test-key".to_string()));
 
-    // 清理
+    // Cleanup
     scanner2.cleanup_checkpoint().await.unwrap();
 }
 
@@ -151,13 +151,13 @@ async fn test_checkpoint_resume_functionality() {
 async fn test_distributed_stats_aggregation() {
     // Create decentralized stats aggregator
     let config = DecentralizedStatsAggregatorConfig {
-        cache_ttl: Duration::from_secs(10),       // 增加缓存TTL以确保测试期间缓存有效
-        node_timeout: Duration::from_millis(500), // 减少超时时间
+        cache_ttl: Duration::from_secs(10), // Increase cache TTL to ensure cache is valid during test
+        node_timeout: Duration::from_millis(500), // Reduce timeout
         ..Default::default()
     };
     let aggregator = DecentralizedStatsAggregator::new(config);
 
-    // 模拟多个节点（这些节点在测试环境中不存在，会导致连接失败）
+    // Simulate multiple nodes (these nodes don't exist in test environment, will cause connection failures)
     let node_infos = vec![
         NodeInfo {
             node_id: "node-1".to_string(),
@@ -177,12 +177,12 @@ async fn test_distributed_stats_aggregation() {
         },
     ];
 
-    // 添加节点到聚合器
+    // Add nodes to aggregator
     for node_info in node_infos {
         aggregator.add_node(node_info).await;
     }
 
-    // 设置本地统计（模拟本地节点）
+    // Set local statistics (simulate local node)
     let local_stats = StatsSummary {
         node_id: "local-node".to_string(),
         total_objects_scanned: 1000,
@@ -199,14 +199,14 @@ async fn test_distributed_stats_aggregation() {
 
     aggregator.set_local_stats(local_stats).await;
 
-    // 获取聚合统计（远程节点会失败，但本地节点应该成功）
+    // Get aggregated statistics (remote nodes will fail, but local node should succeed)
     let aggregated = aggregator.get_aggregated_stats().await.unwrap();
 
-    // 验证本地节点统计被包含
+    // Verify local node statistics are included
     assert!(aggregated.node_summaries.contains_key("local-node"));
     assert!(aggregated.total_objects_scanned >= 1000);
 
-    // 由于远程节点连接失败，只有本地节点的数据
+    // Only local node data due to remote node connection failures
     assert_eq!(aggregated.node_summaries.len(), 1);
 
     // Test caching mechanism
@@ -216,19 +216,19 @@ async fn test_distributed_stats_aggregation() {
     let cached_result = aggregator.get_aggregated_stats().await.unwrap();
     let cached_duration = start_time.elapsed();
 
-    // 验证缓存生效：时间戳应该相同
+    // Verify cache is effective: timestamps should be the same
     assert_eq!(original_timestamp, cached_result.aggregation_timestamp);
 
-    // 缓存调用应该很快（放宽到200ms以适应测试环境）
+    // Cached calls should be fast (relaxed to 200ms for test environment)
     assert!(cached_duration < Duration::from_millis(200));
 
-    // 强制刷新
+    // Force refresh
     let _refreshed = aggregator.force_refresh_aggregated_stats().await.unwrap();
 
-    // 清除缓存
+    // Clear cache
     aggregator.clear_cache().await;
 
-    // 验证缓存状态
+    // Verify cache status
     let cache_status = aggregator.get_cache_status().await;
     assert!(!cache_status.has_cached_data);
 }
@@ -238,35 +238,35 @@ async fn test_performance_impact_measurement() {
     let temp_dir = TempDir::new().unwrap();
     let scanner = create_test_scanner(&temp_dir).await;
 
-    // 启动性能监控
+    // Start performance monitoring
     let io_monitor = scanner.get_io_monitor();
     let _throttler = scanner.get_io_throttler();
 
     io_monitor.start().await.unwrap();
 
-    // 基准测试：无扫描器负载
+    // Baseline test: no scanner load
     let baseline_start = std::time::Instant::now();
     simulate_business_workload(1000).await;
     let baseline_duration = baseline_start.elapsed();
 
-    // 模拟扫描器活动
+    // Simulate scanner activity
     scanner.update_business_metrics(50, 500, 0, 25).await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // 性能测试：有扫描器负载
+    // Performance test: with scanner load
     let with_scanner_start = std::time::Instant::now();
     simulate_business_workload(1000).await;
     let with_scanner_duration = with_scanner_start.elapsed();
 
-    // 计算性能影响
+    // Calculate performance impact
     let overhead_ms = with_scanner_duration.saturating_sub(baseline_duration).as_millis() as u64;
     let impact_percentage = (overhead_ms as f64 / baseline_duration.as_millis() as f64) * 100.0;
 
     let benchmark = PerformanceBenchmark {
         _scanner_overhead_ms: overhead_ms,
         business_impact_percentage: impact_percentage,
-        _throttle_effectiveness: 95.0, // 模拟值
+        _throttle_effectiveness: 95.0, // Simulated value
     };
 
     println!("Performance impact measurement:");
@@ -276,8 +276,8 @@ async fn test_performance_impact_measurement() {
     println!("  Impact percentage: {:.2}%", impact_percentage);
     println!("  Meets optimization goals: {}", benchmark.meets_optimization_goals());
 
-    // 验证优化目标（业务影响 < 10%）
-    // 注意：在实际环境中这个测试可能需要更长时间和真实负载
+    // Verify optimization target (business impact < 10%)
+    // Note: In real environment this test may need longer time and real load
     assert!(impact_percentage < 50.0, "Performance impact too high: {:.2}%", impact_percentage);
 
     io_monitor.stop().await;
@@ -290,9 +290,9 @@ async fn test_concurrent_scanner_operations() {
 
     scanner.initialize_stats().await.unwrap();
 
-    // 并发执行多个扫描器操作
+    // Execute multiple scanner operations concurrently
     let tasks = vec![
-        // 任务1：定期更新业务指标
+        // Task 1: Periodically update business metrics
         {
             let scanner = scanner.clone();
             tokio::spawn(async move {
@@ -302,7 +302,7 @@ async fn test_concurrent_scanner_operations() {
                 }
             })
         },
-        // 任务2：定期保存检查点
+        // Task 2: Periodically save checkpoints
         {
             let scanner = scanner.clone();
             tokio::spawn(async move {
@@ -314,7 +314,7 @@ async fn test_concurrent_scanner_operations() {
                 }
             })
         },
-        // 任务3：定期获取统计
+        // Task 3: Periodically get statistics
         {
             let scanner = scanner.clone();
             tokio::spawn(async move {
@@ -327,29 +327,29 @@ async fn test_concurrent_scanner_operations() {
         },
     ];
 
-    // 等待所有任务完成
+    // Wait for all tasks to complete
     for task in tasks {
         task.await.unwrap();
     }
 
-    // 验证最终状态
+    // Verify final state
     let final_stats = scanner.get_stats_summary().await;
     let _final_progress = scanner.get_scan_progress().await;
 
     assert_eq!(final_stats.node_id, "integration-test-node");
     assert!(final_stats.last_update > std::time::SystemTime::UNIX_EPOCH);
 
-    // 清理
+    // Cleanup
     scanner.cleanup_checkpoint().await.unwrap();
 }
 
-// 模拟业务工作负载的辅助函数
+// Helper function to simulate business workload
 async fn simulate_business_workload(operations: usize) {
     for _i in 0..operations {
-        // 模拟一些计算密集型操作
+        // Simulate some CPU-intensive operations
         let _result: u64 = (0..100).map(|x| x * x).sum();
 
-        // 小延迟模拟 IO 操作
+        // Small delay to simulate IO operations
         if _i % 100 == 0 {
             tokio::task::yield_now().await;
         }
@@ -361,27 +361,27 @@ async fn test_error_recovery_and_resilience() {
     let temp_dir = TempDir::new().unwrap();
     let scanner = create_test_scanner(&temp_dir).await;
 
-    // 测试统计初始化失败恢复
+    // Test recovery from stats initialization failure
     scanner.initialize_stats().await.unwrap();
 
-    // 测试检查点损坏恢复
+    // Test recovery from checkpoint corruption
     scanner.force_save_checkpoint().await.unwrap();
 
-    // 人为损坏检查点文件（通过写入无效数据）
+    // Artificially corrupt checkpoint file (by writing invalid data)
     let checkpoint_file = temp_dir.path().join("scanner_checkpoint_integration-test-node.json");
     if checkpoint_file.exists() {
         tokio::fs::write(&checkpoint_file, "invalid json data").await.unwrap();
     }
 
-    // 验证系统能够优雅处理损坏的检查点
+    // Verify system can gracefully handle corrupted checkpoint
     let checkpoint_info = scanner.get_checkpoint_info().await;
-    // 应该返回错误或空值，而不是崩溃
+    // Should return error or null value, not crash
     assert!(checkpoint_info.is_err() || checkpoint_info.unwrap().is_none());
 
-    // 清理损坏的检查点
+    // Clean up corrupted checkpoint
     scanner.cleanup_checkpoint().await.unwrap();
 
-    // 验证能够重新创建有效检查点
+    // Verify ability to recreate valid checkpoint
     scanner.force_save_checkpoint().await.unwrap();
     let new_checkpoint_info = scanner.get_checkpoint_info().await.unwrap();
     assert!(new_checkpoint_info.is_some());
