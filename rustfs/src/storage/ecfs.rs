@@ -2772,13 +2772,10 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                warn!("get_notification_config err {:?}", err);
-                None
-            }
-        };
+        let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
+            warn!("get_notification_config err {:?}", err);
+            None
+        });
 
         // TODO: valid target list
 
@@ -3434,7 +3431,7 @@ fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFilter>) -> (S
 }
 
 /// Auxiliary functions: Handle configuration
-fn process_queue_configurations<F>(
+pub(crate) fn process_queue_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
     configurations: Option<Vec<QueueConfiguration>>,
     target_id_parser: F,
@@ -3451,7 +3448,7 @@ fn process_queue_configurations<F>(
     }
 }
 
-fn process_topic_configurations<F>(
+pub(crate) fn process_topic_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
     configurations: Option<Vec<TopicConfiguration>>,
     target_id_parser: F,
@@ -3468,7 +3465,7 @@ fn process_topic_configurations<F>(
     }
 }
 
-fn process_lambda_configurations<F>(
+pub(crate) fn process_lambda_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
     configurations: Option<Vec<LambdaFunctionConfiguration>>,
     target_id_parser: F,
