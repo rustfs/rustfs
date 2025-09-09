@@ -12,32 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::{metadata::BucketMetadata, replication::StatusType};
+use aws_credential_types::Credentials as SdkCredentials;
+use aws_sdk_s3::config::Region as SdkRegion;
+
+use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+};
+use aws_sdk_s3::{Client as S3Client, Config as S3Config, Error as S3Error, operation::head_object::HeadObjectOutput};
+use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client as HttpClient;
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, RUSTFS_BUCKET_REPLICATION_CHECK,
+    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_FORCE_DELETE,
+    is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::error;
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-use crate::bucket::metadata::BucketMetadata;
-
 use crate::bucket::metadata_sys::get_bucket_targets_config;
+use crate::bucket::metadata_sys::get_replication_config;
+use crate::bucket::replication::ObjectOpts;
+use crate::bucket::replication::ReplicationConfigurationExt;
+use crate::bucket::replication::ReplicationType;
 use crate::bucket::target::ARN;
+use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
-use crate::client;
-use crate::client::credentials::SignatureType;
-use crate::client::credentials::Static;
-use crate::client::credentials::Value;
-use crate::client::transition_api::Options;
-use crate::client::transition_api::TransitionClient;
+use crate::bucket::versioning_sys::BucketVersioningSys;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
@@ -364,6 +383,8 @@ impl BucketTargetSys {
     }
 
     pub async fn set_target(&self, bucket: &str, target: &BucketTarget, update: bool) -> Result<(), BucketTargetError> {
+        warn!("set target: {} {} {}", bucket, target.arn, target.endpoint);
+
         if !target.target_type.is_valid() && !update {
             return Err(BucketTargetError::BucketRemoteArnTypeInvalid {
                 bucket: bucket.to_string(),
@@ -379,6 +400,46 @@ impl BucketTargetSys {
             });
         }
 
+        match target_client.bucket_exists(&target.target_bucket).await {
+            Ok(false) => {
+                return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                    bucket: target.target_bucket.clone(),
+                });
+            }
+            Err(e) => {
+                warn!("check target bucket exists error: {}", e);
+                return Err(BucketTargetError::RemoteTargetConnectionErr {
+                    bucket: target.target_bucket.clone(),
+                    access_key: target.credentials.as_ref().map(|c| c.access_key.clone()).unwrap_or_default(),
+                    error: e.to_string(),
+                });
+            }
+            Ok(true) => {}
+        }
+
+        if target.target_type == BucketTargetType::ReplicationService {
+            warn!("replication service target: {} {}", target.arn, target.endpoint);
+
+            if !BucketVersioningSys::enabled(bucket).await {
+                return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
+                    bucket: bucket.to_string(),
+                });
+            }
+
+            let versioning = target_client.get_bucket_versioning(bucket).await.map_err(|e| {
+                warn!("get bucket versioning error: {}", e);
+                BucketTargetError::BucketReplicationSourceNotVersioned {
+                    bucket: bucket.to_string(),
+                }
+            })?;
+
+            if versioning.is_none() {
+                return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
+                    bucket: bucket.to_string(),
+                });
+            }
+        }
+
         {
             let mut targets_map = self.targets_map.write().await;
             let bucket_targets = targets_map.entry(bucket.to_string()).or_insert_with(Vec::new);
@@ -388,6 +449,7 @@ impl BucketTargetSys {
                 if existing_target.target_type.to_string() == target.target_type.to_string() {
                     if existing_target.arn == target.arn {
                         if !update {
+                            warn!("target already exists1: {} {}", existing_target.arn, target.arn);
                             return Err(BucketTargetError::BucketRemoteAlreadyExists {
                                 bucket: existing_target.target_bucket.clone(),
                             });
@@ -397,6 +459,7 @@ impl BucketTargetSys {
                         break;
                     }
                     if existing_target.endpoint == target.endpoint {
+                        warn!("target already exists2: {} {}", existing_target.endpoint, target.endpoint);
                         return Err(BucketTargetError::BucketRemoteAlreadyExists {
                             bucket: existing_target.target_bucket.clone(),
                         });
@@ -421,6 +484,64 @@ impl BucketTargetSys {
         }
 
         self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
+        Ok(())
+    }
+
+    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<(), BucketTargetError> {
+        if arn_str.is_empty() {
+            return Err(BucketTargetError::BucketRemoteArnInvalid {
+                bucket: bucket.to_string(),
+            });
+        }
+
+        let arn = ARN::from_str(arn_str).map_err(|_e| BucketTargetError::BucketRemoteArnInvalid {
+            bucket: bucket.to_string(),
+        })?;
+
+        if arn.arn_type == BucketTargetType::ReplicationService {
+            if let Ok((config, _)) = get_replication_config(bucket).await {
+                for rule in config.filter_target_arns(&ObjectOpts {
+                    op_type: ReplicationType::All,
+                    ..Default::default()
+                }) {
+                    if rule == arn_str || config.role == arn_str {
+                        let arn_remotes_map = self.arn_remotes_map.write().await;
+                        if arn_remotes_map.get(arn_str).is_some() {
+                            return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                                bucket: bucket.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            let mut targets_map = self.targets_map.write().await;
+
+            let Some(targets) = targets_map.get(bucket) else {
+                return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                    bucket: bucket.to_string(),
+                });
+            };
+
+            let new_targets: Vec<BucketTarget> = targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
+
+            if new_targets.len() == targets.len() {
+                return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                    bucket: bucket.to_string(),
+                });
+            }
+
+            targets_map.insert(bucket.to_string(), new_targets);
+        }
+
+        {
+            self.arn_remotes_map.write().await.remove(arn_str);
+        }
+
+        self.update_bandwidth_limit(bucket, arn_str, 0);
+
         Ok(())
     }
 
@@ -501,13 +622,19 @@ impl BucketTargetSys {
             });
         };
 
-        let creds = client::credentials::Credentials::new(Static(Value {
-            access_key_id: credentials.access_key.clone(),
-            secret_access_key: credentials.secret_key.clone(),
-            session_token: "".to_string(),
-            signer_type: SignatureType::SignatureV4,
-            ..Default::default()
-        }));
+        let creds = SdkCredentials::builder()
+            .access_key_id(credentials.access_key.clone())
+            .secret_access_key(credentials.secret_key.clone())
+            .account_id(target.reset_id.clone())
+            .provider_name("bucket_target_sys")
+            .build();
+
+        let config = S3Config::builder()
+            .endpoint_url(target.endpoint.clone())
+            .credentials_provider(SharedCredentialsProvider::new(creds))
+            .region(SdkRegion::new(target.region.clone()))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
 
         Ok(TargetClient {
             endpoint: target.endpoint.clone(),
@@ -520,18 +647,7 @@ impl BucketTargetSys {
             secure: target.secure,
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
-            client: Arc::new(
-                TransitionClient::new(
-                    &target.endpoint,
-                    Options {
-                        creds,
-                        secure: target.secure,
-                        region: target.region.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await?,
-            ),
+            client: Arc::new(S3Client::from_conf(config)),
         })
     }
 
@@ -621,31 +737,35 @@ impl BucketTargetSys {
     // getRemoteARN gets existing ARN for an endpoint or generates a new one.
     pub async fn get_remote_arn(&self, bucket: &str, target: Option<&BucketTarget>, depl_id: &str) -> (String, bool) {
         let Some(target) = target else {
+            warn!("get remote arn: target not found: {}", bucket);
             return (String::new(), false);
         };
 
-        let targets_map = self.targets_map.read().await;
-        let Some(targets) = targets_map.get(bucket) else {
-            return (String::new(), false);
-        };
-
-        for tgt in targets {
-            if tgt.target_type == target.target_type
-                && tgt.target_bucket == target.target_bucket
-                && target.endpoint == tgt.endpoint
-                && tgt
-                    .credentials
-                    .as_ref()
-                    .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
-                    .unwrap_or(false)
-            {
-                return (tgt.arn.clone(), true);
+        {
+            let targets_map = self.targets_map.read().await;
+            if let Some(targets) = targets_map.get(bucket) {
+                for tgt in targets {
+                    if tgt.target_type == target.target_type
+                        && tgt.target_bucket == target.target_bucket
+                        && target.endpoint == tgt.endpoint
+                        && tgt
+                            .credentials
+                            .as_ref()
+                            .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
+                            .unwrap_or(false)
+                    {
+                        return (tgt.arn.clone(), true);
+                    }
+                }
             }
         }
+
         if !target.target_type.is_valid() {
+            warn!("get remote arn: target type invalid: {}", bucket);
             return (String::new(), false);
         }
         let arn = generate_arn(target, depl_id);
+        warn!("get remote arn: generated arn: {}", arn);
         (arn, false)
     }
 }
@@ -658,12 +778,235 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
         depl_id.to_string()
     };
     let arn = ARN {
-        arn_type: t.target_type.to_string(),
+        arn_type: t.target_type.clone(),
         id: uuid,
         region: t.region.clone(),
         bucket: t.target_bucket.clone(),
     };
     arn.to_string()
+}
+
+pub struct RemoveObjectOptions {
+    pub force_delete: bool,
+    pub governance_bypass: bool,
+    pub replication_delete_marker: bool,
+    pub replication_mtime: Option<OffsetDateTime>,
+    pub replication_status: StatusType,
+    pub replication_request: bool,
+    pub replication_validity_check: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdvancedPutOptions {
+    pub source_version_id: String,
+    pub source_etag: String,
+    pub replication_status: StatusType,
+    pub source_mtime: OffsetDateTime,
+    pub replication_request: bool,
+    pub retention_timestamp: OffsetDateTime,
+    pub tagging_timestamp: OffsetDateTime,
+    pub legalhold_timestamp: OffsetDateTime,
+    pub replication_validity_check: bool,
+}
+
+impl Default for AdvancedPutOptions {
+    fn default() -> Self {
+        Self {
+            source_version_id: "".to_string(),
+            source_etag: "".to_string(),
+            replication_status: StatusType::Pending,
+            source_mtime: OffsetDateTime::now_utc(),
+            replication_request: false,
+            retention_timestamp: OffsetDateTime::now_utc(),
+            tagging_timestamp: OffsetDateTime::now_utc(),
+            legalhold_timestamp: OffsetDateTime::now_utc(),
+            replication_validity_check: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PutObjectOptions {
+    pub user_metadata: HashMap<String, String>,
+    pub user_tags: HashMap<String, String>,
+    //pub progress: ReaderImpl,
+    pub content_type: String,
+    pub content_encoding: String,
+    pub content_disposition: String,
+    pub content_language: String,
+    pub cache_control: String,
+    pub expires: OffsetDateTime,
+    pub mode: Option<ObjectLockRetentionMode>,
+    pub retain_until_date: OffsetDateTime,
+    //pub server_side_encryption: encrypt::ServerSide,
+    pub num_threads: u64,
+    pub storage_class: String,
+    pub website_redirect_location: String,
+    pub part_size: u64,
+    pub legalhold: Option<ObjectLockLegalHoldStatus>,
+    pub send_content_md5: bool,
+    pub disable_content_sha256: bool,
+    pub disable_multipart: bool,
+    pub auto_checksum: Option<ChecksumMode>,
+    pub checksum: Option<ChecksumMode>,
+    pub concurrent_stream_parts: bool,
+    pub internal: AdvancedPutOptions,
+    pub custom_header: HeaderMap,
+}
+
+impl Default for PutObjectOptions {
+    fn default() -> Self {
+        Self {
+            user_metadata: HashMap::new(),
+            user_tags: HashMap::new(),
+            //progress: ReaderImpl::Body(Bytes::new()),
+            content_type: "".to_string(),
+            content_encoding: "".to_string(),
+            content_disposition: "".to_string(),
+            content_language: "".to_string(),
+            cache_control: "".to_string(),
+            expires: OffsetDateTime::UNIX_EPOCH,
+            mode: None,
+            retain_until_date: OffsetDateTime::UNIX_EPOCH,
+            //server_side_encryption: encrypt.ServerSide::default(),
+            num_threads: 0,
+            storage_class: "".to_string(),
+            website_redirect_location: "".to_string(),
+            part_size: 0,
+            legalhold: None,
+            send_content_md5: false,
+            disable_content_sha256: false,
+            disable_multipart: false,
+            auto_checksum: None,
+            checksum: None,
+            concurrent_stream_parts: false,
+            internal: AdvancedPutOptions::default(),
+            custom_header: HeaderMap::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl PutObjectOptions {
+    fn set_match_etag(&mut self, etag: &str) {
+        if etag == "*" {
+            self.custom_header
+                .insert("If-Match", HeaderValue::from_str("*").expect("err"));
+        } else {
+            self.custom_header
+                .insert("If-Match", HeaderValue::from_str(&format!("\"{etag}\"")).expect("err"));
+        }
+    }
+
+    fn set_match_etag_except(&mut self, etag: &str) {
+        if etag == "*" {
+            self.custom_header
+                .insert("If-None-Match", HeaderValue::from_str("*").expect("err"));
+        } else {
+            self.custom_header
+                .insert("If-None-Match", HeaderValue::from_str(&format!("\"{etag}\"")).expect("err"));
+        }
+    }
+
+    pub fn header(&self) -> HeaderMap {
+        let mut header = HeaderMap::new();
+
+        let mut content_type = self.content_type.clone();
+        if content_type.is_empty() {
+            content_type = "application/octet-stream".to_string();
+        }
+        header.insert("Content-Type", HeaderValue::from_str(&content_type).expect("err"));
+
+        if !self.content_encoding.is_empty() {
+            header.insert("Content-Encoding", HeaderValue::from_str(&self.content_encoding).expect("err"));
+        }
+        if !self.content_disposition.is_empty() {
+            header.insert("Content-Disposition", HeaderValue::from_str(&self.content_disposition).expect("err"));
+        }
+        if !self.content_language.is_empty() {
+            header.insert("Content-Language", HeaderValue::from_str(&self.content_language).expect("err"));
+        }
+        if !self.cache_control.is_empty() {
+            header.insert("Cache-Control", HeaderValue::from_str(&self.cache_control).expect("err"));
+        }
+
+        if self.expires.unix_timestamp() != 0 {
+            header.insert("Expires", HeaderValue::from_str(&self.expires.format(&Rfc3339).unwrap()).expect("err")); //rustfs invalid header
+        }
+
+        if let Some(mode) = &self.mode {
+            header.insert(AMZ_OBJECT_LOCK_MODE, HeaderValue::from_str(mode.as_str()).expect("err"));
+        }
+
+        if self.retain_until_date.unix_timestamp() != 0 {
+            header.insert(
+                AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+                HeaderValue::from_str(&self.retain_until_date.format(&Rfc3339).unwrap()).expect("err"),
+            );
+        }
+
+        if let Some(legalhold) = &self.legalhold {
+            header.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD, HeaderValue::from_str(legalhold.as_str()).expect("err"));
+        }
+
+        if !self.storage_class.is_empty() {
+            header.insert(AMZ_STORAGE_CLASS, HeaderValue::from_str(&self.storage_class).expect("err"));
+        }
+
+        if !self.website_redirect_location.is_empty() {
+            header.insert(
+                AMZ_WEBSITE_REDIRECT_LOCATION,
+                HeaderValue::from_str(&self.website_redirect_location).expect("err"),
+            );
+        }
+
+        if !self.internal.replication_status.as_str().is_empty() {
+            header.insert(
+                AMZ_BUCKET_REPLICATION_STATUS,
+                HeaderValue::from_str(self.internal.replication_status.as_str()).expect("err"),
+            );
+        }
+
+        for (k, v) in &self.user_metadata {
+            if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k)
+            {
+                if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
+                    header.insert(header_name, HeaderValue::from_str(v).unwrap());
+                }
+            } else if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{k}").as_bytes()) {
+                header.insert(header_name, HeaderValue::from_str(v).unwrap());
+            }
+        }
+
+        for (k, v) in self.custom_header.iter() {
+            header.insert(k.clone(), v.clone());
+        }
+
+        header
+    }
+
+    fn validate(&self, _c: Arc<TargetClient>) -> Result<(), std::io::Error> {
+        //if self.checksum.is_set() {
+        /*if !self.trailing_header_support {
+            return Err(Error::from(err_invalid_argument("Checksum requires Client with TrailingHeaders enabled")));
+        }*/
+        /*else if self.override_signer_type == SignatureType::SignatureV2 {
+            return Err(Error::from(err_invalid_argument("Checksum cannot be used with v2 signatures")));
+        }*/
+        //}
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PutObjectPartOptions {
+    pub md5_base64: String,
+    pub sha256_hex: String,
+    //pub sse: encrypt.ServerSide,
+    pub custom_header: HeaderMap,
+    pub trailer: HeaderMap,
+    pub disable_content_sha256: bool,
 }
 
 #[derive(Debug)]
@@ -678,7 +1021,211 @@ pub struct TargetClient {
     pub secure: bool,
     pub health_check_duration: Duration,
     pub replicate_sync: bool,
-    pub client: Arc<TransitionClient>,
+    pub client: Arc<S3Client>,
+}
+
+impl TargetClient {
+    pub fn to_url(&self) -> Url {
+        let scheme = if self.secure { "https" } else { "http" };
+        Url::parse(&format!("{scheme}://{}", self.endpoint)).unwrap()
+    }
+
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3Error> {
+        match self.client.head_bucket().bucket(bucket).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<BucketVersioningStatus>, S3Error> {
+        match self.client.get_bucket_versioning().bucket(bucket).send().await {
+            Ok(res) => Ok(res.status),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn head_object(&self, bucket: &str, object: &str, version_id: Option<String>) -> Result<HeadObjectOutput, S3Error> {
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(version_id)
+            .send()
+            .await
+        {
+            Ok(res) => Ok(res),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        body: ByteStream,
+        opts: &PutObjectOptions,
+    ) -> Result<(), S3Error> {
+        let headers = opts.header();
+
+        match self
+            .client
+            .put_object()
+            .bucket(bucket)
+            .key(object)
+            .content_length(size)
+            .body(body)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in &headers {
+                    req.headers_mut().insert(k.clone(), v.clone());
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn create_multipart_upload(&self, bucket: &str, object: &str, _opts: &PutObjectOptions) -> Result<String, S3Error> {
+        match self.client.create_multipart_upload().bucket(bucket).key(object).send().await {
+            Ok(res) => Ok(res.upload_id.unwrap_or_default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: i32,
+        size: i64,
+        body: ByteStream,
+        opts: &PutObjectPartOptions,
+    ) -> Result<UploadPartOutput, S3Error> {
+        let headers = opts.custom_header.clone();
+
+        match self
+            .client
+            .upload_part()
+            .bucket(bucket)
+            .key(object)
+            .upload_id(upload_id)
+            .part_number(part_id)
+            .content_length(size)
+            .body(body)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in &headers {
+                    req.headers_mut().insert(k.clone(), v.clone());
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
+            Ok(res) => Ok(res),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        parts: Vec<CompletedPart>,
+        opts: &PutObjectOptions,
+    ) -> Result<CompleteMultipartUploadOutput, S3Error> {
+        let multipart_upload = CompletedMultipartUpload::builder().set_parts(Some(parts)).build();
+
+        let headers = opts.header();
+
+        match self
+            .client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(object)
+            .upload_id(upload_id)
+            .multipart_upload(multipart_upload)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in &headers {
+                    req.headers_mut().insert(k.clone(), v.clone());
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
+            Ok(res) => Ok(res),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn remove_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        opts: RemoveObjectOptions,
+    ) -> Result<(), S3Error> {
+        let mut headers = HeaderMap::new();
+        if opts.force_delete {
+            headers.insert(RUSTFS_FORCE_DELETE, "true".parse().unwrap());
+        }
+        if opts.governance_bypass {
+            headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
+        }
+
+        if opts.replication_delete_marker {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, "true".parse().unwrap());
+        }
+
+        if let Some(t) = opts.replication_mtime {
+            headers.insert(
+                RUSTFS_BUCKET_SOURCE_MTIME,
+                t.format(&Rfc3339).unwrap_or_default().as_str().parse().unwrap(),
+            );
+        }
+
+        if !opts.replication_status.is_empty() {
+            headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
+        }
+
+        if opts.replication_request {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, "true".parse().unwrap());
+        }
+        if opts.replication_validity_check {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_CHECK, "true".parse().unwrap());
+        }
+
+        match self
+            .client
+            .delete_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(version_id)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in &headers {
+                    req.headers_mut().insert(k.clone(), v.clone());
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[derive(Debug)]

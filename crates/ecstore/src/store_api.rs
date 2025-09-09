@@ -35,10 +35,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use time::OffsetDateTime;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
@@ -219,6 +221,12 @@ impl GetObjectReader {
         // }
 
         Ok(data)
+    }
+}
+
+impl AsyncRead for GetObjectReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 

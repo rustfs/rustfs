@@ -17,6 +17,7 @@ use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Display},
+    str::FromStr,
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -103,6 +104,18 @@ impl BucketTargetType {
         match self {
             BucketTargetType::None => false,
             BucketTargetType::ReplicationService | BucketTargetType::IlmService => true,
+        }
+    }
+}
+
+impl FromStr for BucketTargetType {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "replication" => Ok(BucketTargetType::ReplicationService),
+            "ilm" => Ok(BucketTargetType::IlmService),
+            _ => Ok(BucketTargetType::None),
         }
     }
 }

@@ -14,6 +14,7 @@
 
 use convert_case::{Case, Casing};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 pub const LAST_MODIFIED: &str = "Last-Modified";
 pub const DATE: &str = "Date";
@@ -163,13 +164,24 @@ pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
+pub const RUSTFS_FORCE_DELETE: &str = "X-Rustfs-Force-Delete";
+
 pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
 pub const RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";
+
+pub const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-Rustfs-Source-Mtime";
+pub const RUSTFS_BUCKET_SOURCE_ETAG: &str = "X-Rustfs-Source-Etag";
+pub const RUSTFS_BUCKET_REPLICATION_DELETE_MARKER: &str = "X-Rustfs-Source-DeleteMarker";
+pub const RUSTFS_BUCKET_REPLICATION_PROXY_REQUEST: &str = "X-Rustfs-Source-Proxy-Request";
+pub const RUSTFS_BUCKET_REPLICATION_REQUEST: &str = "X-Rustfs-Source-Replication-Request";
+pub const RUSTFS_BUCKET_REPLICATION_CHECK: &str = "X-Rustfs-Source-Replication-Check";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
 pub const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
 pub const SSEC_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
+
+pub const AMZ_WEBSITE_REDIRECT_LOCATION: &str = "x-amz-website-redirect-location";
 
 pub trait HeaderExt {
     fn lookup(&self, s: &str) -> Option<&str>;
@@ -189,4 +201,76 @@ impl HeaderExt for HashMap<String, String> {
 
         None
     }
+}
+
+static SUPPORTED_QUERY_VALUES: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("attributes".to_string(), true);
+    m.insert("partNumber".to_string(), true);
+    m.insert("versionId".to_string(), true);
+    m.insert("response-cache-control".to_string(), true);
+    m.insert("response-content-disposition".to_string(), true);
+    m.insert("response-content-encoding".to_string(), true);
+    m.insert("response-content-language".to_string(), true);
+    m.insert("response-content-type".to_string(), true);
+    m.insert("response-expires".to_string(), true);
+    m
+});
+static SUPPORTED_HEADERS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("content-type".to_string(), true);
+    m.insert("cache-control".to_string(), true);
+    m.insert("content-encoding".to_string(), true);
+    m.insert("content-disposition".to_string(), true);
+    m.insert("content-language".to_string(), true);
+    m.insert("x-amz-website-redirect-location".to_string(), true);
+    m.insert("x-amz-object-lock-mode".to_string(), true);
+    m.insert("x-amz-metadata-directive".to_string(), true);
+    m.insert("x-amz-object-lock-retain-until-date".to_string(), true);
+    m.insert("expires".to_string(), true);
+    m.insert("x-amz-replication-status".to_string(), true);
+    m
+});
+static SSE_HEADERS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("x-amz-server-side-encryption".to_string(), true);
+    m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), true);
+    m.insert("x-amz-server-side-encryption-context".to_string(), true);
+    m.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), true);
+    m.insert("x-amz-server-side-encryption-customer-key".to_string(), true);
+    m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), true);
+    m
+});
+
+pub fn is_standard_query_value(qs_key: &str) -> bool {
+    *SUPPORTED_QUERY_VALUES.get(qs_key).unwrap_or(&false)
+}
+
+pub fn is_storageclass_header(header_key: &str) -> bool {
+    header_key.to_lowercase() == AMZ_STORAGE_CLASS.to_lowercase()
+}
+
+pub fn is_standard_header(header_key: &str) -> bool {
+    *SUPPORTED_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
+}
+
+pub fn is_sse_header(header_key: &str) -> bool {
+    *SSE_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
+}
+
+pub fn is_amz_header(header_key: &str) -> bool {
+    let key = header_key.to_lowercase();
+    key.starts_with("x-amz-meta-")
+        || key.starts_with("x-amz-grant-")
+        || key == "x-amz-acl"
+        || is_sse_header(header_key)
+        || key.starts_with("x-amz-checksum-")
+}
+
+pub fn is_rustfs_header(header_key: &str) -> bool {
+    header_key.to_lowercase().starts_with("x-rustfs-")
+}
+
+pub fn is_minio_header(header_key: &str) -> bool {
+    header_key.to_lowercase().starts_with("x-minio-")
 }

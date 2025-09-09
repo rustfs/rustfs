@@ -569,9 +569,9 @@ dependencies = [
 
 [[package]]
 name = "aws-credential-types"
-version = "1.2.5"
+version = "1.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1541072f81945fa1251f8795ef6c92c4282d74d59f88498ae7d4bf00f0ebdad9"
+checksum = "d025db5d9f52cbc413b167136afb3d8aeea708c0d8884783cf6253be5e22f6f2"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
@@ -5826,7 +5826,9 @@ dependencies = [
  "async-channel",
  "async-recursion",
  "async-trait",
+ "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "base64 0.22.1",
  "byteorder",
  "bytes",

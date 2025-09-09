@@ -350,6 +350,7 @@ impl BucketMetadataSys {
                 if !is_erasure().await && !is_dist_erasure().await && is_err_bucket_not_found(&err) {
                     BucketMetadata::new(bucket)
                 } else {
+                    error!("load bucket metadata failed: {}", err);
                     return Err(err);
                 }
             }

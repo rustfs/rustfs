@@ -1,4 +1,6 @@
-use crate::bucket::bucket_target_sys::{BucketTargetSys, TargetClient};
+use crate::bucket::bucket_target_sys::{
+    AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+};
 use crate::bucket::metadata_sys;
 use crate::bucket::replication::{MrfReplicateEntry, ReplicationAction, ReplicationWorkerOperation, ResyncStatusType};
 use crate::bucket::replication::{
@@ -10,19 +12,17 @@ use crate::bucket::replication::{
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::api_get_options::{AdvancedGetOptions, GetObjectOptions, StatObjectOptions};
-use crate::client::api_put_object::{AdvancedPutOptions, PutObjectOptions};
-use crate::client::api_remove::{AdvancedRemoveOptions, RemoveObjectOptions};
-use crate::client::api_s3_datatypes;
-use crate::client::transition_api::{self, PutObjectPartOptions, ReaderImpl, TransitionCore};
+use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use byteorder::ByteOrder;
-use bytes::Bytes;
 use futures::future::join_all;
 use http::HeaderMap;
 
@@ -34,7 +34,7 @@ use rustfs_utils::http::{
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
-use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationConfiguration, ReplicationStatus};
+use s3s::dto::ReplicationConfiguration;
 use serde::Deserialize;
 use serde::Serialize;
 use std::any::Any;
@@ -452,15 +452,7 @@ impl ReplicationResyncer {
                     let reset_id = target_client.reset_id.clone();
 
                     let (size, err) = if let Err(err) = target_client
-                        .client
-                        .stat_object(
-                            &target_client.bucket,
-                            &roi.name,
-                            &GetObjectOptions {
-                                version_id: roi.version_id.map(|v| v.to_string()).unwrap_or_default(),
-                                ..Default::default()
-                            },
-                        )
+                        .head_object(&target_client.bucket, &roi.name, roi.version_id.map(|v| v.to_string()))
                         .await
                     {
                         if roi.delete_marker {
@@ -1256,8 +1248,8 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
 
     let mut rinfo = dobj.delete_object.replication_state.target_state(&tgt_client.arn);
     rinfo.op_type = dobj.op_type;
-    rinfo.endpoint = tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string();
-    rinfo.secure = tgt_client.client.endpoint_url.scheme() == "https";
+    rinfo.endpoint = tgt_client.endpoint.clone();
+    rinfo.secure = tgt_client.secure;
 
     if dobj.delete_object.version_id.is_none()
         && rinfo.prev_replication_status == StatusType::Completed
@@ -1271,7 +1263,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+    if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
         info!("remote target is offline for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
 
         if dobj.delete_object.version_id.is_none() {
@@ -1282,17 +1274,11 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
+    let version_id = if version_id.is_empty() { None } else { Some(version_id) };
+
     if dobj.delete_object.delete_marker_version_id.is_some() {
         let _resp = match tgt_client
-            .client
-            .stat_object(
-                &tgt_client.bucket,
-                &dobj.delete_object.object_name,
-                &GetObjectOptions {
-                    version_id: version_id.clone(),
-                    ..Default::default()
-                },
-            )
+            .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
             .await
         {
             Ok(resp) => resp,
@@ -1310,25 +1296,23 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     }
 
     match tgt_client
-        .client
         .remove_object(
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
+            version_id,
             RemoveObjectOptions {
-                version_id: version_id.clone(),
-                internal: AdvancedRemoveOptions {
-                    replication_delete_marker: dobj.delete_object.delete_marker_version_id.is_some(),
-                    replication_mtime: dobj.delete_object.delete_marker_mtime,
-                    replication_status: ReplicationStatus::from_static(ReplicationStatus::REPLICA),
-                    replication_request: true,
-                    replication_validity_check: false,
-                },
-                ..Default::default()
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: dobj.delete_object.delete_marker_version_id.is_some(),
+                replication_mtime: dobj.delete_object.delete_marker_mtime,
+                replication_status: StatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
             },
         )
         .await
     {
-        None => {
+        Ok(_) => {
             info!("removed object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
             if dobj.delete_object.version_id.is_none() {
                 rinfo.replication_status = StatusType::Completed;
@@ -1336,7 +1320,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
             }
         }
-        Some(e) => {
+        Err(e) => {
             error!("failed to remove object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
             rinfo.error = Some(e.to_string());
             if dobj.delete_object.version_id.is_none() {
@@ -1459,8 +1443,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             op_type: self.op_type,
             replication_status: StatusType::Failed,
             prev_replication_status: self.target_replication_status(&tgt_client.arn),
-            endpoint: tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string(),
-            secure: tgt_client.client.endpoint_url.scheme() == "https",
+            endpoint: tgt_client.endpoint.clone(),
+            secure: tgt_client.secure,
             ..Default::default()
         };
 
@@ -1474,7 +1458,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+        if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
             error!("target is offline for bucket:{} arn:{}", bucket, tgt_client.arn);
             // TODO: send event
             return rinfo;
@@ -1483,7 +1467,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
 
-        let gr = match storage
+        let mut gr = match storage
             .get_object_reader(
                 &bucket,
                 &object,
@@ -1546,23 +1530,26 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         // TODO:bandwidth
 
         if let Some(err) = if is_multipart {
-            replicate_object_with_multipart(
-                &TransitionCore(tgt_client.client.clone()),
-                &bucket,
-                &object,
-                gr.stream,
-                &object_info,
-                put_opts,
-            )
-            .await
-            .err()
-        } else {
-            let reader = ReaderImpl::ObjectBody(gr);
-            tgt_client
-                .client
-                .clone()
-                .put_object(&bucket, &object, reader, size, &put_opts)
+            replicate_object_with_multipart(tgt_client.clone(), &bucket, &object, gr.stream, &object_info, put_opts)
                 .await
+                .err()
+        } else {
+            // TODO: use stream
+            let body = match gr.read_all().await {
+                Ok(body) => body,
+                Err(e) => {
+                    error!("failed to read object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                    rinfo.replication_status = StatusType::Failed;
+                    rinfo.error = Some(e.to_string());
+                    // TODO: send event
+                    return rinfo;
+                }
+            };
+            let reader = ByteStream::from(body);
+            tgt_client
+                .put_object(&bucket, &object, size, reader, &put_opts)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
                 .err()
         } {
             rinfo.replication_status = StatusType::Failed;
@@ -1590,12 +1577,12 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             op_type: self.op_type,
             replication_status: StatusType::Failed,
             prev_replication_status: self.target_replication_status(&tgt_client.arn),
-            endpoint: tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string(),
-            secure: tgt_client.client.endpoint_url.scheme() == "https",
+            endpoint: tgt_client.endpoint.clone(),
+            secure: tgt_client.secure,
             ..Default::default()
         };
 
-        if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+        if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
             error!("target is offline for bucket:{} arn:{}", bucket, tgt_client.arn);
             // TODO: send event
             return rinfo;
@@ -1604,7 +1591,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
 
-        let gr = match storage
+        let mut gr = match storage
             .get_object_reader(
                 &bucket,
                 &object,
@@ -1670,7 +1657,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS");
 
-        let oi = match tgt_client.client.stat_object(&tgt_client.bucket, &object, &sopts).await {
+        let oi = match tgt_client
+            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
+            .await
+        {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
                 oi
@@ -1688,7 +1678,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         if replication_action == ReplicationAction::None {
             if self.op_type == ReplicationType::ExistingObject
-                && object_info.mod_time > oi.mod_time
+                && object_info.mod_time
+                    > oi.last_modified.map(|dt| {
+                        time::OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+                    })
                 && object_info.version_id.is_none()
             {
                 info!("skip replicate existing object for bucket:{} arn:{}", bucket, tgt_client.arn);
@@ -1721,23 +1714,25 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
             if let Some(err) = if is_multipart {
-                replicate_object_with_multipart(
-                    &TransitionCore(tgt_client.client.clone()),
-                    &bucket,
-                    &object,
-                    gr.stream,
-                    &object_info,
-                    put_opts,
-                )
-                .await
-                .err()
-            } else {
-                let reader = ReaderImpl::ObjectBody(gr);
-                tgt_client
-                    .client
-                    .clone()
-                    .put_object(&bucket, &object, reader, size, &put_opts)
+                replicate_object_with_multipart(tgt_client.clone(), &bucket, &object, gr.stream, &object_info, put_opts)
                     .await
+                    .err()
+            } else {
+                let body = match gr.read_all().await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        error!("failed to read object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                        rinfo.replication_status = StatusType::Failed;
+                        rinfo.error = Some(e.to_string());
+                        // TODO: send event
+                        return rinfo;
+                    }
+                };
+                let reader = ByteStream::from(body);
+                tgt_client
+                    .put_object(&bucket, &object, size, reader, &put_opts)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
                     .err()
             } {
                 rinfo.replication_status = StatusType::Failed;
@@ -1820,7 +1815,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
             source_version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
             source_etag: object_info.etag.clone().unwrap_or_default(),
             source_mtime: object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_status: StatusType::Pending,
             replication_request: true,
             ..Default::default()
         },
@@ -1857,7 +1852,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
 
     if let Some(v) = object_info.user_defined.lookup(headers::AMZ_OBJECT_LOCK_MODE) {
         let mode = v.to_string().to_uppercase();
-        put_op.mode = ObjectLockRetentionMode::from(mode);
+        put_op.mode = Some(aws_sdk_s3::types::ObjectLockRetentionMode::from(mode.as_str()));
     }
 
     if let Some(v) = object_info.user_defined.lookup(headers::AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
@@ -1873,8 +1868,8 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     }
 
     if let Some(v) = object_info.user_defined.lookup(headers::AMZ_OBJECT_LOCK_LEGAL_HOLD) {
-        let hold = v.to_string().to_uppercase();
-        put_op.legalhold = ObjectLockLegalHoldStatus::from(hold);
+        let hold = v.to_uppercase();
+        put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
         put_op.internal.legalhold_timestamp = if let Some(v) = object_info
             .user_defined
             .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-legalhold-timestamp"))
@@ -1891,7 +1886,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
 }
 
 async fn replicate_object_with_multipart(
-    cli: &TransitionCore,
+    cli: Arc<TargetClient>,
     bucket: &str,
     object: &str,
     reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
@@ -1900,7 +1895,7 @@ async fn replicate_object_with_multipart(
 ) -> std::io::Result<()> {
     let mut attempts = 1;
     let upload_id = loop {
-        match cli.new_multipart_upload(bucket, object, opts.clone()).await {
+        match cli.create_multipart_upload(bucket, object, &opts).await {
             Ok(id) => {
                 break id;
             }
@@ -1908,7 +1903,7 @@ async fn replicate_object_with_multipart(
                 attempts += 1;
                 if attempts > 3 {
                     error!("failed to create multipart upload for bucket:{} object:{} error:{}", bucket, object, e);
-                    return Err(e);
+                    return Err(std::io::Error::other(e.to_string()));
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -1918,7 +1913,7 @@ async fn replicate_object_with_multipart(
         }
     };
 
-    let mut uploaded_parts: Vec<api_s3_datatypes::CompletePart> = Vec::new();
+    let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
 
     let mut reader = reader;
     for part_info in object_info.parts.iter() {
@@ -1930,18 +1925,20 @@ async fn replicate_object_with_multipart(
                 bucket,
                 object,
                 &upload_id,
-                part_info.number as i64,
-                ReaderImpl::Body(Bytes::from(chunk)),
+                part_info.number as i32,
                 part_info.actual_size,
-                PutObjectPartOptions { ..Default::default() },
+                ByteStream::from(chunk),
+                &PutObjectPartOptions { ..Default::default() },
             )
-            .await?;
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        uploaded_parts.push(api_s3_datatypes::CompletePart {
-            part_num: object_part.part_num,
-            etag: object_part.etag.clone(),
-            ..Default::default()
-        });
+        uploaded_parts.push(
+            CompletedPart::builder()
+                .part_number(part_info.number as i32)
+                .e_tag(object_part.e_tag.unwrap_or_default())
+                .build(),
+        );
     }
 
     let mut user_metadata = HashMap::new();
@@ -1959,28 +1956,38 @@ async fn replicate_object_with_multipart(
         bucket,
         object,
         &upload_id,
-        &uploaded_parts,
-        PutObjectOptions {
+        uploaded_parts,
+        &PutObjectOptions {
             user_metadata,
             ..Default::default()
         },
     )
-    .await?;
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(())
 }
 
-fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op_type: ReplicationType) -> ReplicationAction {
-    if op_type == ReplicationType::ExistingObject && oi1.mod_time > oi2.mod_time && oi1.version_id.is_none() {
+fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: ReplicationType) -> ReplicationAction {
+    if op_type == ReplicationType::ExistingObject
+        && oi1.mod_time
+            > oi2
+                .last_modified
+                .map(|dt| time::OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH))
+        && oi1.version_id.is_none()
+    {
         return ReplicationAction::None;
     }
 
     let size = oi1.get_actual_size().unwrap_or_default();
 
-    if oi1.etag != oi2.etag
-        || oi1.version_id != oi2.version_id
-        || size != oi2.size
-        || oi1.delete_marker != oi2.is_delete_marker
-        || oi1.mod_time != oi2.mod_time
+    if oi1.etag != oi2.e_tag
+        || oi1.version_id.map(|v| v.to_string()) != oi2.version_id
+        || size != oi2.content_length.unwrap_or_default()
+        || oi1.delete_marker != oi2.delete_marker.unwrap_or_default()
+        || oi1.mod_time
+            != oi2
+                .last_modified
+                .map(|dt| time::OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH))
     {
         return ReplicationAction::All;
     }
@@ -1989,13 +1996,15 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op
         return ReplicationAction::Metadata;
     }
 
+    let empty_metadata = HashMap::new();
+    let metadata = oi2.metadata.as_ref().unwrap_or(&empty_metadata);
+
     if let Some(content_encoding) = &oi1.content_encoding {
-        if let Some(enc) = oi2
-            .metadata
+        if let Some(enc) = metadata
             .get(CONTENT_ENCODING)
-            .or_else(|| oi2.metadata.get(CONTENT_ENCODING.to_ascii_lowercase()))
+            .or_else(|| metadata.get(&CONTENT_ENCODING.to_lowercase()))
         {
-            if enc.to_str().unwrap_or_default() != content_encoding {
+            if enc != content_encoding {
                 return ReplicationAction::Metadata;
             }
         } else {
@@ -2004,9 +2013,11 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op
     }
 
     let oi1_tags = decode_tags_to_map(&oi1.user_tags);
-    let oi2_tags = decode_tags_to_map(&oi2.user_tags);
+    let oi2_tags = decode_tags_to_map(metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default().as_str());
 
-    if (oi2.user_tag_count > 0 && oi1_tags != oi2_tags) || oi2.user_tag_count != oi1_tags.len() {
+    if (oi2.tag_count.unwrap_or_default() > 0 && oi1_tags != oi2_tags)
+        || oi2.tag_count.unwrap_or_default() != oi1_tags.len() as i32
+    {
         return ReplicationAction::Metadata;
     }
 
@@ -2039,7 +2050,7 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op
     }
 
     let mut compare_meta2 = HashMap::new();
-    for (k, v) in &oi2.metadata {
+    for (k, v) in metadata {
         let mut found = false;
         for prefix in &compare_keys {
             if strings_has_prefix_fold(k.to_string().as_str(), prefix) {
@@ -2048,7 +2059,7 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &transition_api::ObjectInfo, op
             }
         }
         if found {
-            compare_meta2.insert(k.to_string().to_lowercase(), v.to_str().unwrap_or_default().to_string());
+            compare_meta2.insert(k.to_lowercase(), v.clone());
         }
     }
 

@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::BucketTargetType;
 use std::fmt::Display;
 use std::str::FromStr;
 
 pub struct ARN {
-    pub arn_type: String,
+    pub arn_type: BucketTargetType,
     pub id: String,
     pub region: String,
     pub bucket: String,
 }
 
 impl ARN {
-    pub fn new(arn_type: String, id: String, region: String, bucket: String) -> Self {
+    pub fn new(arn_type: BucketTargetType, id: String, region: String, bucket: String) -> Self {
         Self {
             arn_type,
             id,
@@ -33,7 +34,7 @@ impl ARN {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.arn_type.is_empty()
+        self.arn_type.is_valid()
     }
 }
 
@@ -56,7 +57,7 @@ impl FromStr for ARN {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid ARN format"));
         }
         Ok(ARN {
-            arn_type: parts[2].to_string(),
+            arn_type: BucketTargetType::from_str(parts[2]).unwrap_or_default(),
             id: parts[3].to_string(),
             region: parts[4].to_string(),
             bucket: parts[5].to_string(),
