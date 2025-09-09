@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::error;
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
@@ -379,6 +380,23 @@ impl BucketTargetSys {
             });
         }
 
+        match target_client.client.bucket_exists(&target.target_bucket).await {
+            Ok(false) => {
+                return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                    bucket: target.target_bucket.clone(),
+                });
+            }
+            Err(e) => {
+                warn!("check target bucket exists error: {}", e);
+                return Err(BucketTargetError::RemoteTargetConnectionErr {
+                    bucket: target.target_bucket.clone(),
+                    access_key: target.credentials.as_ref().map(|c| c.access_key.clone()).unwrap_or_default(),
+                    error: e.to_string(),
+                });
+            }
+            Ok(true) => {}
+        }
+
         {
             let mut targets_map = self.targets_map.write().await;
             let bucket_targets = targets_map.entry(bucket.to_string()).or_insert_with(Vec::new);
@@ -621,31 +639,35 @@ impl BucketTargetSys {
     // getRemoteARN gets existing ARN for an endpoint or generates a new one.
     pub async fn get_remote_arn(&self, bucket: &str, target: Option<&BucketTarget>, depl_id: &str) -> (String, bool) {
         let Some(target) = target else {
+            warn!("get remote arn: target not found: {}", bucket);
             return (String::new(), false);
         };
 
-        let targets_map = self.targets_map.read().await;
-        let Some(targets) = targets_map.get(bucket) else {
-            return (String::new(), false);
-        };
-
-        for tgt in targets {
-            if tgt.target_type == target.target_type
-                && tgt.target_bucket == target.target_bucket
-                && target.endpoint == tgt.endpoint
-                && tgt
-                    .credentials
-                    .as_ref()
-                    .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
-                    .unwrap_or(false)
-            {
-                return (tgt.arn.clone(), true);
+        {
+            let targets_map = self.targets_map.read().await;
+            if let Some(targets) = targets_map.get(bucket) {
+                for tgt in targets {
+                    if tgt.target_type == target.target_type
+                        && tgt.target_bucket == target.target_bucket
+                        && target.endpoint == tgt.endpoint
+                        && tgt
+                            .credentials
+                            .as_ref()
+                            .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
+                            .unwrap_or(false)
+                    {
+                        return (tgt.arn.clone(), true);
+                    }
+                }
             }
         }
+
         if !target.target_type.is_valid() {
+            warn!("get remote arn: target type invalid: {}", bucket);
             return (String::new(), false);
         }
         let arn = generate_arn(target, depl_id);
+        warn!("get remote arn: generated arn: {}", arn);
         (arn, false)
     }
 }

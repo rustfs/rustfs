@@ -23,6 +23,7 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use std::{collections::HashMap, str::FromStr};
 use tokio::io::BufReader;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::client::{
@@ -60,6 +61,8 @@ impl TransitionClient {
         if let Ok(resp) = resp {
             let b = resp.body().bytes().expect("err").to_vec();
             let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
+
+            warn!("bucket exists, resp: {:?}, resperr: {:?}", resp, resperr);
             /*if to_error_response(resperr).code == "NoSuchBucket" {
                 return Ok(false);
             }

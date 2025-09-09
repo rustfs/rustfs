@@ -837,6 +837,11 @@ impl Operation for GetReplicationMetricsHandler {
     }
 }
 
+#[derive(Serialize)]
+pub struct SetRemoteTargetResponse {
+    arn: String,
+}
+
 pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
@@ -848,6 +853,8 @@ impl Operation for SetRemoteTargetHandler {
         };
 
         let update = queries.get("update").is_some_and(|v| v == "true");
+
+        warn!("set remote target, bucket: {}, update: {}", bucket, update);
 
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
@@ -896,9 +903,13 @@ impl Operation for SetRemoteTargetHandler {
         let bucket_target_sys = BucketTargetSys::get();
 
         if !update {
-            let (exist_arn, exist) = bucket_target_sys.get_remote_arn(bucket, Some(&remote_target), "").await;
-            if exist && !exist_arn.is_empty() {
-                return Ok(S3Response::new((StatusCode::OK, Body::from(exist_arn))));
+            let (arn, exist) = bucket_target_sys.get_remote_arn(bucket, Some(&remote_target), "").await;
+            remote_target.arn = arn.clone();
+            if exist && !arn.is_empty() {
+                let arn_str = serde_json::to_string(&arn).unwrap_or_default();
+
+                warn!("return exists, arn: {}", arn_str);
+                return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
             }
         }
 
@@ -917,13 +928,14 @@ impl Operation for SetRemoteTargetHandler {
             target.credentials = remote_target.credentials;
             target.endpoint = remote_target.endpoint;
             target.secure = remote_target.secure;
-            target.target_bucket = bucket.clone();
+            target.target_bucket = remote_target.target_bucket;
 
             target.path = remote_target.path;
             target.replication_sync = remote_target.replication_sync;
             target.bandwidth_limit = remote_target.bandwidth_limit;
             target.health_check_duration = remote_target.health_check_duration;
 
+            warn!("update target, target: {:?}", target);
             remote_target = target;
         }
 
@@ -938,19 +950,23 @@ impl Operation for SetRemoteTargetHandler {
             error!("Failed to list bucket targets: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
         })?;
-        let json_targets = serde_json::to_vec(&targets).map_err(|e| {
+        let json_targets = serde_json::to_string(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
         })?;
 
-        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        warn!("update bucket targets: {}", json_targets);
+
+        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets.as_bytes().to_vec())
             .await
             .map_err(|e| {
                 error!("Failed to update bucket targets: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, "Failed to update bucket targets".to_string())
+                S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
 
-        return Ok(S3Response::new((StatusCode::OK, Body::from(arn))));
+        let arn_str = serde_json::to_string(&arn).unwrap_or_default();
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))))
     }
 }
 
