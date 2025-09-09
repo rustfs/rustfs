@@ -30,16 +30,16 @@ use tracing::{debug, error, info, warn};
 /// Create different types of targets based on the parameters provided without knowing the specific implementation details.
 #[async_trait]
 pub trait AuditTargetFactory: Send + Sync {
-    /// 根据提供的参数创建一个新的审计目标。
+    /// Create a new audit objective based on the parameters provided.
     ///
     /// # Arguments
     ///
-    /// * `id` - 目标的唯一标识符。
-    /// * `args` - 特定于目标的配置参数。
+    /// * `id` - A unique identifier for the target.
+    /// * `args` - Target-specific configuration parameters。
     ///
     /// # Returns
     ///
-    /// 返回一个 `Result`，其中包含一个装箱的 `Target` trait 对象，或者一个 `TargetError`。
+    /// Returns a 'Result' containing a boxed 'Target' trait object, or a 'TargetError'.
     async fn create(&self, id: String, args: TargetArgs) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError>;
 }
 
