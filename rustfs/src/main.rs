@@ -332,7 +332,7 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
     let region = match region_opt {
         Some(ref r) if !r.is_empty() => r,
         _ => {
-            warn!("Global region is not set, skipping notification configuration for all buckets.");
+            warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
             ""
         }
     };
