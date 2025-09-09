@@ -366,7 +366,7 @@ impl ObjectStore {
     //         user.credentials.access_key = name.to_owned();
     //     }
 
-    //     // todo, 校验 session token
+    //     // todo, validate session token
 
     //     Ok(Some(user))
     // }
@@ -894,7 +894,7 @@ impl Store for ObjectStore {
                 }
             }
 
-            // 合并 items_cache 到 user_items_cache
+            // Merge items_cache to user_items_cache
             user_items_cache.extend(items_cache);
 
             // cache.users.store(Arc::new(items_cache.update_load_time()));
@@ -960,7 +960,7 @@ impl Store for ObjectStore {
     //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
     //     );
 
-    //     // 一次读取 32 个元素
+    //     // Read 32 elements at a time
     //     let iter = items
     //         .iter()
     //         .map(|item| item.trim_start_matches("config/iam/"))

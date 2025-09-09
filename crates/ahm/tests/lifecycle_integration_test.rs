@@ -19,7 +19,7 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier::TierConfigMgr,
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
@@ -29,8 +29,8 @@ use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::info;
 use tracing::warn;
+use tracing::{debug, info};
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -127,6 +127,22 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
+        .await
+        .expect("Failed to create test bucket");
+    info!("Created test bucket: {}", bucket_name);
+}
+
+/// Test helper: Create a test lock bucket
+async fn create_test_lock_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
+    (**ecstore)
+        .make_bucket(
+            bucket_name,
+            &MakeBucketOptions {
+                lock_enabled: true,
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to create test bucket");
     info!("Created test bucket: {}", bucket_name);
@@ -262,7 +278,7 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 #[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        println!("oi: {:?}", oi);
+        debug!("oi: {:?}", oi);
         oi.delete_marker
     } else {
         panic!("object_is_delete_marker is error");
@@ -339,12 +355,13 @@ async fn test_lifecycle_expiry_basic() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Check if object has been expired (delete_marker)
-    //let check_result = object_is_delete_marker(&ecstore, bucket_name, object_name).await;
     let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object is_delete_marker after lifecycle processing: {check_result}");
 
-    if !check_result {
+    if check_result {
         println!("❌ Object was not deleted by lifecycle processing");
+    } else {
+        println!("✅ Object was successfully deleted by lifecycle processing");
         // Let's try to get object info to see its details
         match ecstore
             .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
@@ -360,11 +377,9 @@ async fn test_lifecycle_expiry_basic() {
                 println!("Error getting object info: {e:?}");
             }
         }
-    } else {
-        println!("✅ Object was successfully deleted by lifecycle processing");
     }
 
-    assert!(check_result);
+    assert!(!check_result);
     println!("✅ Object successfully expired");
 
     // Stop scanner
@@ -384,7 +399,7 @@ async fn test_lifecycle_expiry_deletemarker() {
     let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
     let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-    create_test_bucket(&ecstore, bucket_name).await;
+    create_test_lock_bucket(&ecstore, bucket_name).await;
     upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
     // Verify object exists initially
@@ -433,6 +448,7 @@ async fn test_lifecycle_expiry_deletemarker() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Check if object has been expired (deleted)
+    //let check_result = object_is_delete_marker(&ecstore, bucket_name, object_name).await;
     let check_result = object_exists(&ecstore, bucket_name, object_name).await;
     println!("Object exists after lifecycle processing: {check_result}");
 

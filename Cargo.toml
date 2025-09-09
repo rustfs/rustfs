@@ -107,7 +107,7 @@ bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.0.1"
 byteorder = "1.5.0"
 cfg-if = "1.0.3"
-crc-fast = "1.4.0"
+crc-fast = "1.5.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.46", features = ["derive", "env"] }

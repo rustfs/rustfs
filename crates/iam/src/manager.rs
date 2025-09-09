@@ -109,7 +109,7 @@ where
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // 检查环境变量是否设置
+        // Check if environment variable is set
         let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 
         if !skip_background_task {

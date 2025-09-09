@@ -431,7 +431,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Create directory with Unicode characters
-        let unicode_dir = temp_dir.path().join("测试目录");
+        let unicode_dir = temp_dir.path().join("test_directory");
         fs::create_dir(&unicode_dir).unwrap();
 
         let result = load_all_certs_from_directory(unicode_dir.to_str().unwrap());

@@ -844,7 +844,7 @@ impl Operation for SetRemoteTargetHandler {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
-        let _is_owner = true; // 先按 true 处理，后期根据请求决定
+        let _is_owner = true; // Treat as true for now, decide based on request later
         let body = _req.input.store_all_unlimited().await.unwrap();
         debug!("Request body received, size: {} bytes", body.len());
 
@@ -901,7 +901,7 @@ impl Operation for SetRemoteTargetHandler {
                     match sys.set_target(bucket, &remote_target, false, false).await {
                         Ok(_) => {
                             {
-                                //todo 各种持久化的工作
+                                //todo various persistence work
                                 let targets = sys.list_targets(Some(bucket), None).await;
                                 info!("targets is {}", targets.len());
                                 match serde_json::to_vec(&targets) {
@@ -919,7 +919,7 @@ impl Operation for SetRemoteTargetHandler {
                                         // }
                                     }
                                     Err(e) => {
-                                        error!("序列化失败{}", e);
+                                        error!("Serialization failed: {}", e);
                                     }
                                 }
                             }

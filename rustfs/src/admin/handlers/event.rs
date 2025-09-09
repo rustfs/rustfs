@@ -227,7 +227,7 @@ impl Operation for NotificationTarget {
             let port = url
                 .port_or_known_default()
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing port"))?;
-            let addr = format!("{}:{}", host, port);
+            let addr = format!("{host}:{port}");
             // First, try to parse as SocketAddr (IP:port)
             if addr.parse::<SocketAddr>().is_err() {
                 // If not an IP:port, try DNS resolution
@@ -509,7 +509,7 @@ impl Operation for GetBucketNotification {
     }
 }
 
-/// 删除存储桶的所有通知规则
+/// Remove all notification rules for a bucket
 pub struct RemoveBucketNotification {}
 #[async_trait::async_trait]
 impl Operation for RemoveBucketNotification {
