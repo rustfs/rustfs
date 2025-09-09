@@ -260,7 +260,6 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
-serde_with = { version = "3", features = ["chrono", "std"] }
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "rustfs-audit-logger", "tokio-test"]

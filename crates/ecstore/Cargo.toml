@@ -101,7 +101,6 @@ rustfs-signer.workspace = true
 rustfs-checksums.workspace = true
 futures-util.workspace = true
 async-recursion.workspace = true
-serde_with.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }
