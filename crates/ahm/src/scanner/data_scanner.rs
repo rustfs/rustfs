@@ -840,6 +840,16 @@ impl Scanner {
             warn!("Failed to save checkpoint: {}", e);
         }
 
+        // Always trigger data usage collection during scan cycle
+        let config = self.config.read().await;
+        if config.enable_data_usage_stats {
+            info!("Data usage stats enabled, collecting data");
+            if let Err(e) = self.collect_and_persist_data_usage().await {
+                error!("Failed to collect data usage during scan cycle: {}", e);
+            }
+        }
+        drop(config);
+
         // Get aggregated statistics from all nodes
         debug!("About to get aggregated stats");
         match self.stats_aggregator.get_aggregated_stats().await {
@@ -918,6 +928,126 @@ impl Scanner {
 
         info!("Optimized scan cycle completed in {:?}", scan_duration);
         Ok(())
+    }
+
+    /// Collect and persist data usage statistics
+    async fn collect_and_persist_data_usage(&self) -> Result<()> {
+        info!("Starting data usage collection and persistence");
+
+        // Get ECStore instance
+        let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() else {
+            warn!("ECStore not available for data usage collection");
+            return Ok(());
+        };
+
+        // Collect data usage from NodeScanner stats
+        let _local_stats = self.node_scanner.get_stats_summary().await;
+
+        // Build data usage from ECStore directly for now
+        let data_usage = self.build_data_usage_from_ecstore(&ecstore).await?;
+
+        // Update NodeScanner with collected data
+        self.node_scanner.update_data_usage(data_usage.clone()).await;
+
+        // Store to local cache
+        {
+            let mut data_usage_guard = self.data_usage_stats.lock().await;
+            data_usage_guard.insert("consolidated".to_string(), data_usage.clone());
+        }
+
+        // Update last collection time
+        {
+            let mut last_collection = self.last_data_usage_collection.write().await;
+            *last_collection = Some(SystemTime::now());
+        }
+
+        // Persist to backend asynchronously
+        let data_clone = data_usage.clone();
+        let store_clone = ecstore.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store_data_usage_in_backend(data_clone, store_clone).await {
+                error!("Failed to persist data usage to backend: {}", e);
+            } else {
+                info!("Successfully persisted data usage to backend");
+            }
+        });
+
+        info!(
+            "Data usage collection completed: {} buckets, {} objects",
+            data_usage.buckets_count, data_usage.objects_total_count
+        );
+
+        Ok(())
+    }
+
+    /// Build data usage statistics directly from ECStore
+    async fn build_data_usage_from_ecstore(&self, ecstore: &Arc<rustfs_ecstore::store::ECStore>) -> Result<DataUsageInfo> {
+        let mut data_usage = DataUsageInfo::default();
+
+        // Get bucket list
+        match ecstore
+            .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+            .await
+        {
+            Ok(buckets) => {
+                data_usage.buckets_count = buckets.len() as u64;
+                data_usage.last_update = Some(SystemTime::now());
+
+                let mut total_objects = 0u64;
+                let mut total_size = 0u64;
+
+                for bucket_info in buckets {
+                    if bucket_info.name.starts_with('.') {
+                        continue; // Skip system buckets
+                    }
+
+                    // Try to get actual object count for this bucket
+                    let (object_count, bucket_size) = match ecstore
+                        .clone()
+                        .list_objects_v2(
+                            &bucket_info.name,
+                            "",    // prefix
+                            None,  // continuation_token
+                            None,  // delimiter
+                            100,   // max_keys - small limit for performance
+                            false, // fetch_owner
+                            None,  // start_after
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            let count = result.objects.len() as u64;
+                            let size = result.objects.iter().map(|obj| obj.size as u64).sum();
+                            (count, size)
+                        }
+                        Err(_) => (0, 0),
+                    };
+
+                    total_objects += object_count;
+                    total_size += bucket_size;
+
+                    let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
+                        size: bucket_size,
+                        objects_count: object_count,
+                        versions_count: object_count, // Simplified
+                        delete_markers_count: 0,
+                        ..Default::default()
+                    };
+
+                    data_usage.buckets_usage.insert(bucket_info.name.clone(), bucket_usage);
+                    data_usage.bucket_sizes.insert(bucket_info.name, bucket_size);
+                }
+
+                data_usage.objects_total_count = total_objects;
+                data_usage.objects_total_size = total_size;
+                data_usage.versions_total_count = total_objects;
+            }
+            Err(e) => {
+                warn!("Failed to list buckets for data usage collection: {}", e);
+            }
+        }
+
+        Ok(data_usage)
     }
 
     /// Verify object integrity and trigger healing if necessary
