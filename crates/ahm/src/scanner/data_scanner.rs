@@ -2580,11 +2580,11 @@ mod tests {
         let temp_dir = std::path::PathBuf::from(test_base_dir);
         if temp_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&temp_dir) {
-                panic!("Failed to remove test directory: {}", e);
+                panic!("Failed to remove test directory: {e}");
             }
         }
         if let Err(e) = fs::create_dir_all(&temp_dir) {
-            panic!("Failed to create test directory: {}", e);
+            panic!("Failed to create test directory: {e}");
         }
 
         // create 4 disk dirs
@@ -2597,7 +2597,7 @@ mod tests {
 
         for disk_path in &disk_paths {
             if let Err(e) = fs::create_dir_all(disk_path) {
-                panic!("Failed to create disk directory {:?}: {}", disk_path, e);
+                panic!("Failed to create disk directory {disk_path:?}: {e}");
             }
         }
 
@@ -2768,13 +2768,13 @@ mod tests {
         // Try to create bucket, handle case where it might already exist
         match ecstore.make_bucket(bucket, &Default::default()).await {
             Ok(_) => {
-                println!("Successfully created bucket: {}", bucket);
+                println!("Successfully created bucket: {bucket}");
             }
             Err(rustfs_ecstore::error::StorageError::BucketExists(_)) => {
-                println!("Bucket {} already exists, continuing with test", bucket);
+                println!("Bucket {bucket} already exists, continuing with test");
             }
             Err(e) => {
-                panic!("Failed to create bucket {}: {}", bucket, e);
+                panic!("Failed to create bucket {bucket}: {e}");
             }
         }
 
@@ -2833,14 +2833,13 @@ mod tests {
                     if retry_count >= 3 {
                         // If we still can't load after 3 retries, log and skip this verification
                         println!(
-                            "Warning: Could not load persisted data after {} retries: {}. Skipping persistence verification.",
-                            retry_count, e
+                            "Warning: Could not load persisted data after {retry_count} retries: {e}. Skipping persistence verification."
                         );
                         println!("This is likely due to concurrent test execution and doesn't indicate a functional issue.");
                         // Just continue with the rest of the test
                         break DataUsageInfo::new(); // Use empty data to skip assertions
                     }
-                    println!("Retry {} loading persisted data after error: {}", retry_count, e);
+                    println!("Retry {retry_count} loading persisted data after error: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }

@@ -91,9 +91,9 @@ impl CheckpointManager {
             }
         }
 
-        let checkpoint_file = data_dir.join(format!("scanner_checkpoint_{}.json", node_id));
-        let backup_file = data_dir.join(format!("scanner_checkpoint_{}.backup", node_id));
-        let temp_file = data_dir.join(format!("scanner_checkpoint_{}.tmp", node_id));
+        let checkpoint_file = data_dir.join(format!("scanner_checkpoint_{node_id}.json"));
+        let backup_file = data_dir.join(format!("scanner_checkpoint_{node_id}.backup"));
+        let temp_file = data_dir.join(format!("scanner_checkpoint_{node_id}.tmp"));
 
         Self {
             checkpoint_file,
@@ -116,21 +116,21 @@ impl CheckpointManager {
         let checkpoint_data = CheckpointData::new(progress.clone(), self.node_id.clone());
 
         let json_data = serde_json::to_string_pretty(&checkpoint_data)
-            .map_err(|e| Error::Serialization(format!("serialize checkpoint failed: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("serialize checkpoint failed: {e}")))?;
 
         tokio::fs::write(&self.temp_file, json_data)
             .await
-            .map_err(|e| Error::IO(format!("write temp checkpoint file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("write temp checkpoint file failed: {e}")))?;
 
         if self.checkpoint_file.exists() {
             tokio::fs::copy(&self.checkpoint_file, &self.backup_file)
                 .await
-                .map_err(|e| Error::IO(format!("backup checkpoint file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("backup checkpoint file failed: {e}")))?;
         }
 
         tokio::fs::rename(&self.temp_file, &self.checkpoint_file)
             .await
-            .map_err(|e| Error::IO(format!("replace checkpoint file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("replace checkpoint file failed: {e}")))?;
 
         *self.last_save.write().await = now;
 
@@ -183,17 +183,17 @@ impl CheckpointManager {
     /// load checkpoint from file
     async fn load_checkpoint_from_file(&self, file_path: &Path) -> Result<ScanProgress> {
         if !file_path.exists() {
-            return Err(Error::NotFound(format!("checkpoint file not exists: {:?}", file_path)));
+            return Err(Error::NotFound(format!("checkpoint file not exists: {file_path:?}")));
         }
 
         // read file content
         let content = tokio::fs::read_to_string(file_path)
             .await
-            .map_err(|e| Error::IO(format!("read checkpoint file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("read checkpoint file failed: {e}")))?;
 
         // deserialize
         let checkpoint_data: CheckpointData =
-            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("deserialize checkpoint failed: {}", e)))?;
+            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("deserialize checkpoint failed: {e}")))?;
 
         // validate checkpoint data
         self.validate_checkpoint(&checkpoint_data)?;
@@ -223,7 +223,7 @@ impl CheckpointManager {
 
         // checkpoint is too old (more than 24 hours), may be data expired
         if checkpoint_age > Duration::from_secs(24 * 3600) {
-            return Err(Error::InvalidCheckpoint(format!("checkpoint data is too old: {:?}", checkpoint_age)));
+            return Err(Error::InvalidCheckpoint(format!("checkpoint data is too old: {checkpoint_age:?}")));
         }
 
         // validate version compatibility
@@ -245,21 +245,21 @@ impl CheckpointManager {
         if self.checkpoint_file.exists() {
             tokio::fs::remove_file(&self.checkpoint_file)
                 .await
-                .map_err(|e| Error::IO(format!("delete main checkpoint file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("delete main checkpoint file failed: {e}")))?;
         }
 
         // delete backup file
         if self.backup_file.exists() {
             tokio::fs::remove_file(&self.backup_file)
                 .await
-                .map_err(|e| Error::IO(format!("delete backup checkpoint file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("delete backup checkpoint file failed: {e}")))?;
         }
 
         // delete temp file
         if self.temp_file.exists() {
             tokio::fs::remove_file(&self.temp_file)
                 .await
-                .map_err(|e| Error::IO(format!("delete temp checkpoint file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("delete temp checkpoint file failed: {e}")))?;
         }
 
         info!("cleaned up all checkpoint files");
@@ -274,14 +274,14 @@ impl CheckpointManager {
 
         let metadata = tokio::fs::metadata(&self.checkpoint_file)
             .await
-            .map_err(|e| Error::IO(format!("get checkpoint file metadata failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("get checkpoint file metadata failed: {e}")))?;
 
         let content = tokio::fs::read_to_string(&self.checkpoint_file)
             .await
-            .map_err(|e| Error::IO(format!("read checkpoint file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("read checkpoint file failed: {e}")))?;
 
         let checkpoint_data: CheckpointData =
-            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("deserialize checkpoint failed: {}", e)))?;
+            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("deserialize checkpoint failed: {e}")))?;
 
         Ok(Some(CheckpointInfo {
             file_size: metadata.len(),

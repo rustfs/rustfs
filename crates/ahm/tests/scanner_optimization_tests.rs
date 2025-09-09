@@ -298,7 +298,7 @@ async fn test_scanner_performance_impact() {
     let throttle_stats = throttler.get_throttle_stats().await;
 
     println!("Performance test results:");
-    println!("  Load level: {:?}", load_level);
+    println!("  Load level: {load_level:?}");
     println!("  Throttle decisions: {}", throttle_stats.total_decisions);
     println!("  Average delay: {:?}", throttle_stats.average_delay);
 
