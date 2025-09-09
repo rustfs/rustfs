@@ -24,7 +24,7 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
     let temp_dir = TempDir::new()?;
 
     // create test disk paths
-    let disk_paths: Vec<_> = (0..4).map(|i| temp_dir.path().join(format!("disk{}", i))).collect();
+    let disk_paths: Vec<_> = (0..4).map(|i| temp_dir.path().join(format!("disk{i}"))).collect();
 
     for path in &disk_paths {
         tokio::fs::create_dir_all(path).await?;
@@ -60,9 +60,9 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
 
     // validate all endpoint indexes are in valid range
     for (i, ep) in endpoints.iter().enumerate() {
-        assert_eq!(ep.pool_idx, 0, "Endpoint {} pool_idx should be 0", i);
-        assert_eq!(ep.set_idx, 0, "Endpoint {} set_idx should be 0", i);
-        assert_eq!(ep.disk_idx, i as i32, "Endpoint {} disk_idx should be {}", i, i);
+        assert_eq!(ep.pool_idx, 0, "Endpoint {i} pool_idx should be 0");
+        assert_eq!(ep.set_idx, 0, "Endpoint {i} set_idx should be 0");
+        assert_eq!(ep.disk_idx, i as i32, "Endpoint {i} disk_idx should be {i}");
         println!(
             "Endpoint {} indices are valid: pool={}, set={}, disk={}",
             i, ep.pool_idx, ep.set_idx, ep.disk_idx
