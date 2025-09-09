@@ -251,6 +251,8 @@ pub struct ScanProgress {
     /// estimated completion time
     #[serde(with = "option_system_time_serde")]
     pub estimated_completion: Option<SystemTime>,
+    /// data usage statistics
+    pub data_usage: Option<DataUsageInfo>,
 }
 
 impl Default for ScanProgress {
@@ -265,6 +267,7 @@ impl Default for ScanProgress {
             last_scan_key: None,
             scan_start_time: SystemTime::now(),
             estimated_completion: None,
+            data_usage: None,
         }
     }
 }
