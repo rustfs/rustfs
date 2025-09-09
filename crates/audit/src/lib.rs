@@ -20,6 +20,6 @@ mod system;
 
 pub use entity::*;
 pub use error::AuditError;
-pub use global::{audit_logger, initialize, AuditLogger};
+pub use global::{AuditLogger, audit_logger, initialize};
 pub use registry::{AuditTargetFactory, TargetRegistry};
 pub use system::AuditSystem;

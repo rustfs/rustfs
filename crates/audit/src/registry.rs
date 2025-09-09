@@ -14,11 +14,11 @@
 
 use crate::entity::AuditEntry;
 use async_trait::async_trait;
+use rustfs_targets::TargetError;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::mqtt::{MQTTArgs, MQTTTarget};
 use rustfs_targets::target::webhook::{WebhookArgs, WebhookTarget};
 use rustfs_targets::target::{EntityTarget, Target, TargetType};
-use rustfs_targets::TargetError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -43,7 +43,8 @@ pub trait AuditTargetFactory: Send + Sync {
     async fn create(&self, id: String, args: TargetArgs) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError>;
 }
 
-/// `AuditTargetFactory` 的默认实现。
+/// `AuditTargetFactory` default implementation。
+#[allow(dead_code)]
 pub struct DefaultAuditTargetFactory;
 
 #[async_trait]
@@ -80,13 +81,16 @@ pub enum TargetArgs {
     Webhook(WebhookArgs),
 }
 
+type AuditTargetMap = Arc<RwLock<HashMap<TargetID, Arc<dyn Target<AuditEntry> + Send + Sync>>>>;
+
 /// Registry for managing audit objectives。
 ///
 /// 'TargetRegistry' is responsible for maintaining a collection of active audit objectives. It provides the ability to add,
 /// A way to retrieve and dispatch events to these destinations.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TargetRegistry {
-    targets: Arc<RwLock<HashMap<TargetID, Arc<dyn Target<AuditEntry> + Send + Sync>>>>,
+    targets: AuditTargetMap,
     factory: Arc<dyn AuditTargetFactory>,
 }
 
