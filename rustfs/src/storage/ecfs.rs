@@ -2158,13 +2158,9 @@ impl S3 for FS {
         let mut tag_keys = std::collections::HashSet::new();
         for tag in &tagging.tag_set {
             
-            let key = tag.key.as_ref().ok_or_else(|| {
+            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
                 s3_error!(InvalidTag, "Tag key cannot be empty")
             })?;
-            
-            if key.is_empty() {
-                return Err(s3_error!(InvalidTag, "Tag key cannot be empty"));
-            }
             
             if key.chars().count() > 128 {
                 return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
