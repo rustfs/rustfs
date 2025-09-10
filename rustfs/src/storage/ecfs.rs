@@ -292,6 +292,21 @@ impl FS {
     }
 }
 
+/// Helper function to get store and validate bucket exists
+async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
+    let Some(store) = new_object_layer_fn() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+
+    // Validate bucket exists
+    store
+        .get_bucket_info(bucket, &BucketOptions::default())
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(store)
+}
+
 #[async_trait::async_trait]
 impl S3 for FS {
     #[tracing::instrument(
@@ -928,9 +943,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
@@ -1215,15 +1228,17 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
+        let max_keys = match max_keys {
+            Some(v) if v > 0 && v <= 1000 => v,
+            None => 1000,
+            _ => return Err(s3_error!(InvalidArgument, "max-keys must be between 1 and 1000")),
+        };
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
             .list_objects_v2(
@@ -1310,9 +1325,7 @@ impl S3 for FS {
         let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
         let delimiter = delimiter.filter(|v| !v.is_empty());
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
             .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
@@ -1423,9 +1436,7 @@ impl S3 for FS {
 
         // let mut reader = PutObjReader::new(body, content_length as usize);
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let mut metadata = metadata.unwrap_or_default();
 
