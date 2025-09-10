@@ -2171,7 +2171,7 @@ impl S3 for FS {
                 .filter(|k| !k.is_empty())
                 .ok_or_else(|| s3_error!(InvalidTag, "Tag key cannot be empty"))?;
 
-            if key.chars().count() > 128 {
+            if key.len() > 128 {
                 return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
             }
 
@@ -2184,7 +2184,7 @@ impl S3 for FS {
                 return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
             }
 
-            if value.chars().count() > 256 {
+            if value.len() > 256 {
                 return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
             }
 
