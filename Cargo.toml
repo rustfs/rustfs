@@ -129,6 +129,7 @@ glob = "0.3.3"
 hex = "0.4.3"
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
+hickory-resolver = { version = "0.25.2", features = ["tls-ring"] }
 hmac = "0.12.1"
 hyper = "1.7.0"
 hyper-util = { version = "0.1.16", features = [
@@ -149,6 +150,7 @@ lz4 = "1.28.1"
 matchit = "0.8.4"
 md-5 = "0.10.6"
 mime_guess = "2.0.5"
+moka = { version = "0.12.10", features = ["future"] }
 netif = "0.1.6"
 nix = { version = "0.30.1", features = ["fs"] }
 nu-ansi-term = "0.50.1"
@@ -260,9 +262,6 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
-hickory-resolver = "0.25.2"
-moka = { version = "0.12.10", features = ["future"] }
-
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "rustfs-audit-logger", "tokio-test"]
