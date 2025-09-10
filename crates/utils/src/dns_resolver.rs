@@ -16,15 +16,18 @@
 //!
 //! This module provides robust DNS resolution with multiple fallback layers:
 //! 1. Local cache (Moka) for previously resolved results
-//! 2. System DNS resolver (container/host adaptive)
-//! 3. Public DNS servers as final fallback (8.8.8.8, 1.1.1.1)
+//! 2. System DNS resolver (container/host adaptive) using hickory-resolver
+//! 3. Public DNS servers as final fallback (8.8.8.8, 1.1.1.1) using hickory-resolver with TLS
 //!
 //! The resolver is designed to handle 5-level or deeper domain names that may fail
 //! in Kubernetes environments due to CoreDNS configuration, DNS recursion limits,
-//! or network-related issues. Will use hickory-resolver for actual DNS queries.
+//! or network-related issues. Uses hickory-resolver for actual DNS queries with TLS support.
 
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::Resolver;
 use moka::future::Cache;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, info, warn, error, instrument};
@@ -37,17 +40,6 @@ const MAX_LABEL_LENGTH: usize = 63;
 const CACHE_TTL_SECONDS: u64 = 300; // 5 minutes
 /// Maximum cache size (number of entries)
 const MAX_CACHE_SIZE: u64 = 10000;
-
-/// Public DNS servers for fallback resolution
-const PUBLIC_DNS_SERVERS: &[&str] = &[
-    "8.8.8.8",     // Google DNS Primary
-    "8.8.4.4",     // Google DNS Secondary  
-    "1.1.1.1",     // Cloudflare DNS Primary
-    "1.0.0.1",     // Cloudflare DNS Secondary
-];
-
-// TODO: Implement hickory-resolver integration for true multi-layer DNS resolution
-// For now using standard library resolution as a foundation
 
 /// DNS resolution error types with detailed context and tracing information
 #[derive(Debug, thiserror::Error)]
@@ -92,15 +84,17 @@ pub enum DnsError {
 pub struct LayeredDnsResolver {
     /// Local cache for resolved domains using Moka for high performance
     cache: Cache<String, Vec<IpAddr>>,
-    /// Configuration for public DNS servers
-    public_dns_servers: Vec<String>,
+    /// System DNS resolver using hickory-resolver with default configuration
+    system_resolver: Resolver<TokioConnectionProvider>,
+    /// Public DNS resolver using hickory-resolver with Cloudflare DNS servers
+    public_resolver: Resolver<TokioConnectionProvider>,
 }
 
 impl LayeredDnsResolver {
     /// Create a new layered DNS resolver with automatic DNS configuration detection
     #[instrument(skip_all)]
     pub async fn new() -> Result<Self, DnsError> {
-        info!("Initializing layered DNS resolver with Moka cache and fallback strategies");
+        info!("Initializing layered DNS resolver with hickory-resolver, Moka cache and public DNS fallback");
 
         // Create Moka cache with TTL and size limits
         let cache = Cache::builder()
@@ -108,13 +102,24 @@ impl LayeredDnsResolver {
             .max_capacity(MAX_CACHE_SIZE)
             .build();
 
-        let public_dns_servers = PUBLIC_DNS_SERVERS.iter().map(|s| s.to_string()).collect();
+        // Create system DNS resolver with default configuration (auto-detects container/host DNS)
+        let system_resolver = Resolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default()
+        ).build();
 
-        info!("DNS resolver initialized successfully with system and public fallback");
+        // Create public DNS resolver using Cloudflare DNS with TLS support
+        let public_resolver = Resolver::builder_with_config(
+            ResolverConfig::cloudflare_tls(),
+            TokioConnectionProvider::default()
+        ).build();
+
+        info!("DNS resolver initialized successfully with hickory-resolver system and Cloudflare TLS public fallback");
 
         Ok(Self {
             cache,
-            public_dns_servers,
+            system_resolver,
+            public_resolver,
         })
     }
 
@@ -194,77 +199,72 @@ impl LayeredDnsResolver {
         info!("DNS cache invalidated");
     }
 
-    /// Resolve domain using system DNS (cluster/host DNS configuration)
+    /// Resolve domain using system DNS (cluster/host DNS configuration) with hickory-resolver
     #[instrument(skip_all, fields(domain = %domain))]
     async fn resolve_with_system_dns(&self, domain: &str) -> Result<Vec<IpAddr>, DnsError> {
-        debug!("Attempting system DNS resolution for domain: {}", domain);
+        debug!("Attempting system DNS resolution for domain: {} using hickory-resolver", domain);
 
-        // Use system DNS resolver (standard library for now, will upgrade to hickory-resolver)
-        match (domain, 0).to_socket_addrs() {
-            Ok(addrs) => {
-                let ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
+        match self.system_resolver.lookup_ip(domain).await {
+            Ok(lookup) => {
+                let ips: Vec<IpAddr> = lookup.iter().collect();
                 if !ips.is_empty() {
                     info!("System DNS resolution successful for domain: {} -> {} IPs", domain, ips.len());
                     debug!("System DNS resolved IPs: {:?}", ips);
-                    return Ok(ips);
+                    Ok(ips)
                 } else {
                     warn!("System DNS returned empty result for domain: {}", domain);
+                    Err(DnsError::SystemDnsFailed {
+                        domain: domain.to_string(),
+                        source: "No IP addresses found".to_string().into(),
+                    })
                 }
             }
             Err(e) => {
                 warn!("System DNS resolution failed for domain: {} - {}", domain, e);
-                return Err(DnsError::SystemDnsFailed {
+                Err(DnsError::SystemDnsFailed {
                     domain: domain.to_string(),
                     source: Box::new(e),
-                });
+                })
             }
         }
-
-        Err(DnsError::SystemDnsFailed {
-            domain: domain.to_string(),
-            source: "No IP addresses found".to_string().into(),
-        })
     }
 
-    /// Resolve domain using public DNS servers (8.8.8.8, 1.1.1.1, etc.)
+    /// Resolve domain using public DNS servers (Cloudflare TLS DNS) with hickory-resolver
     #[instrument(skip_all, fields(domain = %domain))]
     async fn resolve_with_public_dns(&self, domain: &str) -> Result<Vec<IpAddr>, DnsError> {
-        debug!("Attempting public DNS resolution for domain: {} using servers: {:?}", domain, self.public_dns_servers);
+        debug!("Attempting public DNS resolution for domain: {} using hickory-resolver with TLS-enabled Cloudflare DNS", domain);
 
-        // For now, use standard library resolution (will upgrade to hickory-resolver with specific servers)
-        // TODO: Implement actual public DNS server resolution with hickory-resolver
-        match (domain, 0).to_socket_addrs() {
-            Ok(addrs) => {
-                let ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
+        match self.public_resolver.lookup_ip(domain).await {
+            Ok(lookup) => {
+                let ips: Vec<IpAddr> = lookup.iter().collect();
                 if !ips.is_empty() {
                     info!("Public DNS resolution successful for domain: {} -> {} IPs", domain, ips.len());
                     debug!("Public DNS resolved IPs: {:?}", ips);
-                    return Ok(ips);
+                    Ok(ips)
                 } else {
                     warn!("Public DNS returned empty result for domain: {}", domain);
+                    Err(DnsError::PublicDnsFailed {
+                        domain: domain.to_string(),
+                        source: "No IP addresses found".to_string().into(),
+                    })
                 }
             }
             Err(e) => {
                 error!("Public DNS resolution failed for domain: {} - {}", domain, e);
-                return Err(DnsError::PublicDnsFailed {
+                Err(DnsError::PublicDnsFailed {
                     domain: domain.to_string(),
                     source: Box::new(e),
-                });
+                })
             }
         }
-
-        Err(DnsError::PublicDnsFailed {
-            domain: domain.to_string(),
-            source: "No IP addresses found".to_string().into(),
-        })
     }
 
-    /// Resolve domain with layered fallback strategy
+    /// Resolve domain with layered fallback strategy using hickory-resolver
     ///
     /// Resolution order with detailed tracing:
     /// 1. Local cache (Moka with TTL)
-    /// 2. System DNS (host/container adaptive resolver)  
-    /// 3. Public DNS (Google DNS, Cloudflare DNS fallback)
+    /// 2. System DNS (hickory-resolver with host/container adaptive configuration)  
+    /// 3. Public DNS (hickory-resolver with TLS-enabled Cloudflare DNS fallback)
     #[instrument(skip_all, fields(domain = %domain))]
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>, DnsError> {
         // Validate domain format first

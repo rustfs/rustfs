@@ -260,7 +260,8 @@ winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "2.4.2"
 zstd = "0.13.3"
-hickory-resolver = "0.25.2"
+hickory-resolver = { version = "0.25.2", features = ["tls-ring"] }
+hickory-proto = "0.25.2"
 moka = { version = "0.12.10", features = ["future"] }
 
 

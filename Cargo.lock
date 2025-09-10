@@ -3173,6 +3173,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
 dependencies = [
  "async-trait",
+ "bytes",
  "cfg-if",
  "data-encoding",
  "enum-as-inner",
@@ -3184,9 +3185,11 @@ dependencies = [
  "once_cell",
  "rand 0.9.2",
  "ring",
+ "rustls 0.23.31",
  "thiserror 2.0.16",
  "tinyvec",
  "tokio",
+ "tokio-rustls 0.26.2",
  "tracing",
  "url",
 ]
@@ -3206,9 +3209,11 @@ dependencies = [
  "parking_lot",
  "rand 0.9.2",
  "resolv-conf",
+ "rustls 0.23.31",
  "smallvec",
  "thiserror 2.0.16",
  "tokio",
+ "tokio-rustls 0.26.2",
  "tracing",
 ]
 
@@ -6324,6 +6329,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex-simd",
+ "hickory-proto",
  "hickory-resolver",
  "highway",
  "hmac 0.12.1",
