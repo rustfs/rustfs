@@ -2167,8 +2167,12 @@ impl S3 for FS {
             }
             
             let value = tag.value.as_ref().ok_or_else(|| {
-                s3_error!(InvalidTag, "Tag value cannot be empty")
+                s3_error!(InvalidTag, "Tag value cannot be null")
             })?;
+            
+            if value.is_empty() {
+                return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
+            }
             
             if value.chars().count() > 256 {
                 return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
