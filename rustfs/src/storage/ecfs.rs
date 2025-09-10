@@ -2163,7 +2163,7 @@ impl S3 for FS {
             return Err(s3_error!(InvalidArgument, "Object tags cannot be greater than 10"));
         }
 
-        let mut tag_keys = std::collections::HashSet::new();
+        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
         for tag in &tagging.tag_set {
             let key = tag
                 .key
