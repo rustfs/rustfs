@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
-use tracing::{instrument, warn};
+use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, get_host_ip_async, is_local_host};
+use tracing::{error, instrument, warn};
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
@@ -241,9 +241,20 @@ impl PoolEndpointList {
                 }
 
                 let host = ep.url.host().unwrap();
-                let host_ip_set = host_ip_cache.entry(host.clone()).or_insert({
-                    get_host_ip(host.clone()).map_err(|e| Error::other(format!("host '{host}' cannot resolve: {e}")))?
-                });
+                let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
+                    set
+                } else {
+                    let ips = match get_host_ip(host.clone()) {
+                        Ok(ips) => ips,
+                        Err(e) => {
+                            error!("host {} not found, error:{}", host, e);
+                            get_host_ip_async(host.clone())
+                                .map_err(|e| Error::other(format!("host '{host}' cannot resolve: {e}")))?
+                        }
+                    };
+                    host_ip_cache.insert(host.clone(), ips);
+                    host_ip_cache.get(&host).unwrap()
+                };
 
                 let path = ep.get_file_path();
                 match path_ip_map.entry(path) {
