@@ -2149,6 +2149,39 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        
+        // Validate tag_set length doesn't exceed 10
+        if tagging.tag_set.len() > 10 {
+            return Err(s3_error!(InvalidArgument, "Object tags cannot be greater than 10"));
+        }
+
+        let mut tag_keys = std::collections::HashSet::new();
+        for tag in &tagging.tag_set {
+            
+            let key = tag.key.as_ref().ok_or_else(|| {
+                s3_error!(InvalidTag, "Tag key cannot be empty")
+            })?;
+            
+            if key.is_empty() {
+                return Err(s3_error!(InvalidTag, "Tag key cannot be empty"));
+            }
+            
+            if key.chars().count() > 128 {
+                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
+            }
+            
+            let value = tag.value.as_ref().ok_or_else(|| {
+                s3_error!(InvalidTag, "Tag value cannot be empty")
+            })?;
+            
+            if value.chars().count() > 256 {
+                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
+            }
+
+            if !tag_keys.insert(key) {
+                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
+            }   
+        }
 
         let tags = encode_tags(tagging.tag_set);
 
