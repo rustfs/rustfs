@@ -101,6 +101,7 @@ rustfs-signer.workspace = true
 rustfs-checksums.workspace = true
 futures-util.workspace = true
 async-recursion.workspace = true
+aws-credential-types = "1.2.6"
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

@@ -452,15 +452,7 @@ impl ReplicationResyncer {
                     let reset_id = target_client.reset_id.clone();
 
                     let (size, err) = if let Err(err) = target_client
-                        .client
-                        .stat_object(
-                            &target_client.bucket,
-                            &roi.name,
-                            &GetObjectOptions {
-                                version_id: roi.version_id.map(|v| v.to_string()).unwrap_or_default(),
-                                ..Default::default()
-                            },
-                        )
+                        .head_object(&target_client.bucket, &roi.name, roi.version_id.map(|v| v.to_string()))
                         .await
                     {
                         if roi.delete_marker {
@@ -1256,8 +1248,8 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
 
     let mut rinfo = dobj.delete_object.replication_state.target_state(&tgt_client.arn);
     rinfo.op_type = dobj.op_type;
-    rinfo.endpoint = tgt_client.client.endpoint_url.host_str().unwrap_or_default().to_string();
-    rinfo.secure = tgt_client.client.endpoint_url.scheme() == "https";
+    rinfo.endpoint = tgt_client.endpoint.clone();
+    rinfo.secure = tgt_client.secure;
 
     if dobj.delete_object.version_id.is_none()
         && rinfo.prev_replication_status == StatusType::Completed
@@ -1271,7 +1263,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if BucketTargetSys::get().is_offline(&tgt_client.client.endpoint_url).await {
+    if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
         info!("remote target is offline for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
 
         if dobj.delete_object.version_id.is_none() {
@@ -1283,16 +1275,9 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     }
 
     if dobj.delete_object.delete_marker_version_id.is_some() {
+        let version_id = if version_id.is_empty() { None } else { Some(version_id) };
         let _resp = match tgt_client
-            .client
-            .stat_object(
-                &tgt_client.bucket,
-                &dobj.delete_object.object_name,
-                &GetObjectOptions {
-                    version_id: version_id.clone(),
-                    ..Default::default()
-                },
-            )
+            .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id)
             .await
         {
             Ok(resp) => resp,
@@ -1310,7 +1295,6 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     }
 
     match tgt_client
-        .client
         .remove_object(
             &tgt_client.bucket,
             &dobj.delete_object.object_name,

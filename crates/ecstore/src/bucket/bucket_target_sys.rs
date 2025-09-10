@@ -12,11 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::metadata::BucketMetadata;
+use aws_credential_types::{
+    Credentials as SdkCredentials,
+    provider::{self, ProvideCredentials, error::CredentialsError, future},
+};
+use aws_sdk_s3::{Client as S3Client, Config as S3Config, Error as S3Error, operation::head_object::HeadObjectOutput};
+use aws_sdk_s3::{config::Region as SdkRegion, operation::get_bucket_versioning::GetBucketVersioningOutput};
+use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -28,11 +37,15 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-use crate::bucket::metadata::BucketMetadata;
-
 use crate::bucket::metadata_sys::get_bucket_targets_config;
+use crate::bucket::metadata_sys::get_replication_config;
+use crate::bucket::replication::ObjectOpts;
+use crate::bucket::replication::ReplicationConfigurationExt;
+use crate::bucket::replication::ReplicationType;
 use crate::bucket::target::ARN;
+use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
+use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client;
 use crate::client::credentials::SignatureType;
 use crate::client::credentials::Static;
@@ -365,6 +378,8 @@ impl BucketTargetSys {
     }
 
     pub async fn set_target(&self, bucket: &str, target: &BucketTarget, update: bool) -> Result<(), BucketTargetError> {
+        warn!("set target: {} {} {}", bucket, target.arn, target.endpoint);
+
         if !target.target_type.is_valid() && !update {
             return Err(BucketTargetError::BucketRemoteArnTypeInvalid {
                 bucket: bucket.to_string(),
@@ -380,7 +395,7 @@ impl BucketTargetSys {
             });
         }
 
-        match target_client.client.bucket_exists(&target.target_bucket).await {
+        match target_client.bucket_exists(&target.target_bucket).await {
             Ok(false) => {
                 return Err(BucketTargetError::BucketRemoteTargetNotFound {
                     bucket: target.target_bucket.clone(),
@@ -397,6 +412,29 @@ impl BucketTargetSys {
             Ok(true) => {}
         }
 
+        if target.target_type == BucketTargetType::ReplicationService {
+            warn!("replication service target: {} {}", target.arn, target.endpoint);
+
+            if !BucketVersioningSys::enabled(bucket).await {
+                return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
+                    bucket: bucket.to_string(),
+                });
+            }
+
+            let versioning = target_client.get_bucket_versioning(bucket).await.map_err(|e| {
+                warn!("get bucket versioning error: {}", e);
+                BucketTargetError::BucketReplicationSourceNotVersioned {
+                    bucket: bucket.to_string(),
+                }
+            })?;
+
+            if versioning.is_none() {
+                return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
+                    bucket: bucket.to_string(),
+                });
+            }
+        }
+
         {
             let mut targets_map = self.targets_map.write().await;
             let bucket_targets = targets_map.entry(bucket.to_string()).or_insert_with(Vec::new);
@@ -406,6 +444,7 @@ impl BucketTargetSys {
                 if existing_target.target_type.to_string() == target.target_type.to_string() {
                     if existing_target.arn == target.arn {
                         if !update {
+                            warn!("target already exists1: {} {}", existing_target.arn, target.arn);
                             return Err(BucketTargetError::BucketRemoteAlreadyExists {
                                 bucket: existing_target.target_bucket.clone(),
                             });
@@ -415,6 +454,7 @@ impl BucketTargetSys {
                         break;
                     }
                     if existing_target.endpoint == target.endpoint {
+                        warn!("target already exists2: {} {}", existing_target.endpoint, target.endpoint);
                         return Err(BucketTargetError::BucketRemoteAlreadyExists {
                             bucket: existing_target.target_bucket.clone(),
                         });
@@ -439,6 +479,64 @@ impl BucketTargetSys {
         }
 
         self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
+        Ok(())
+    }
+
+    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<(), BucketTargetError> {
+        if arn_str.is_empty() {
+            return Err(BucketTargetError::BucketRemoteArnInvalid {
+                bucket: bucket.to_string(),
+            });
+        }
+
+        let arn = ARN::from_str(arn_str).map_err(|_e| BucketTargetError::BucketRemoteArnInvalid {
+            bucket: bucket.to_string(),
+        })?;
+
+        if arn.arn_type == BucketTargetType::ReplicationService {
+            if let Ok((config, _)) = get_replication_config(bucket).await {
+                for rule in config.filter_target_arns(&ObjectOpts {
+                    op_type: ReplicationType::All,
+                    ..Default::default()
+                }) {
+                    if rule == arn_str || config.role == arn_str {
+                        let arn_remotes_map = self.arn_remotes_map.write().await;
+                        if arn_remotes_map.get(arn_str).is_some() {
+                            return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                                bucket: bucket.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            let mut targets_map = self.targets_map.write().await;
+
+            let Some(targets) = targets_map.get(bucket) else {
+                return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                    bucket: bucket.to_string(),
+                });
+            };
+
+            let new_targets: Vec<BucketTarget> = targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
+
+            if new_targets.len() == targets.len() {
+                return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                    bucket: bucket.to_string(),
+                });
+            }
+
+            targets_map.insert(bucket.to_string(), new_targets);
+        }
+
+        {
+            self.arn_remotes_map.write().await.remove(arn_str);
+        }
+
+        self.update_bandwidth_limit(bucket, arn_str, 0);
+
         Ok(())
     }
 
@@ -519,13 +617,19 @@ impl BucketTargetSys {
             });
         };
 
-        let creds = client::credentials::Credentials::new(Static(Value {
-            access_key_id: credentials.access_key.clone(),
-            secret_access_key: credentials.secret_key.clone(),
-            session_token: "".to_string(),
-            signer_type: SignatureType::SignatureV4,
-            ..Default::default()
-        }));
+        let creds = SdkCredentials::builder()
+            .access_key_id(credentials.access_key.clone())
+            .secret_access_key(credentials.secret_key.clone())
+            .account_id(target.reset_id.clone())
+            .provider_name("bucket_target_sys")
+            .build();
+
+        let config = S3Config::builder()
+            .endpoint_url(target.endpoint.clone())
+            .credentials_provider(SharedCredentialsProvider::new(creds))
+            .region(SdkRegion::new(target.region.clone()))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
 
         Ok(TargetClient {
             endpoint: target.endpoint.clone(),
@@ -538,18 +642,7 @@ impl BucketTargetSys {
             secure: target.secure,
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
-            client: Arc::new(
-                TransitionClient::new(
-                    &target.endpoint,
-                    Options {
-                        creds,
-                        secure: target.secure,
-                        region: target.region.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await?,
-            ),
+            client: Arc::new(S3Client::from_conf(config)),
         })
     }
 
@@ -680,7 +773,7 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
         depl_id.to_string()
     };
     let arn = ARN {
-        arn_type: t.target_type.to_string(),
+        arn_type: t.target_type.clone(),
         id: uuid,
         region: t.region.clone(),
         bucket: t.target_bucket.clone(),
@@ -700,7 +793,58 @@ pub struct TargetClient {
     pub secure: bool,
     pub health_check_duration: Duration,
     pub replicate_sync: bool,
-    pub client: Arc<TransitionClient>,
+    pub client: Arc<S3Client>,
+}
+
+impl TargetClient {
+    pub fn to_url(&self) -> Url {
+        let scheme = if self.secure { "https" } else { "http" };
+        Url::parse(&format!("{scheme}://{}", self.endpoint)).unwrap()
+    }
+
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3Error> {
+        match self.client.head_bucket().bucket(bucket).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<BucketVersioningStatus>, S3Error> {
+        match self.client.get_bucket_versioning().bucket(bucket).send().await {
+            Ok(res) => Ok(res.status),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn head_object(&self, bucket: &str, object: &str, version_id: Option<String>) -> Result<HeadObjectOutput, S3Error> {
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(version_id)
+            .send()
+            .await
+        {
+            Ok(res) => Ok(res),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn remove_object(&self, bucket: &str, object: &str, version_id: Option<String>) -> Result<(), S3Error> {
+        match self
+            .client
+            .delete_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(version_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[derive(Debug)]
