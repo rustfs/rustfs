@@ -152,7 +152,7 @@ pub struct ReplicationPool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[repr(u8)] // 明确表示底层值为 u8
+#[repr(u8)] // Explicitly indicate underlying value is u8
 pub enum ReplicationType {
     #[default]
     UnsetReplicationType = 0,
@@ -600,7 +600,7 @@ use super::bucket_targets::TargetClient;
 //use crate::storage;
 
 // 模拟依赖的类型
-pub struct Context; // 用于代替 Go 的 `context.Context`
+pub struct Context; // Used to replace Go's `context.Context`
 #[derive(Default)]
 pub struct ReplicationStats;
 
@@ -728,7 +728,7 @@ impl ReplicationPool {
             // Either already satisfied or worker count changed while waiting for the lock.
             return;
         }
-        println!("2 resize_lrg_workers");
+        debug!("Resizing large workers pool");
 
         let active_workers = Arc::clone(&self.active_lrg_workers);
         let obj_layer = Arc::clone(&self.obj_layer);
@@ -743,7 +743,7 @@ impl ReplicationPool {
 
             tokio::spawn(async move {
                 while let Some(operation) = receiver.recv().await {
-                    println!("resize workers 1");
+                    debug!("Processing replication operation in worker");
                     active_workers_clone.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(info) = operation.as_any().downcast_ref::<ReplicateObjectInfo>() {
@@ -1024,7 +1024,7 @@ impl ReplicationStatusType {
         matches!(self, ReplicationStatusType::Pending) // Adjust logic if needed
     }
 
-    // 从字符串构造 ReplicationStatusType 枚举
+    // Construct ReplicationStatusType enum from string
     pub fn from(value: &str) -> Self {
         match value.to_uppercase().as_str() {
             "PENDING" => ReplicationStatusType::Pending,
@@ -1053,13 +1053,13 @@ impl VersionPurgeStatusType {
         matches!(self, VersionPurgeStatusType::Empty)
     }
 
-    // 检查是否是 Pending（Pending 或 Failed 都算作 Pending 状态）
+    // Check if it's Pending (both Pending and Failed are considered Pending status)
     pub fn is_pending(&self) -> bool {
         matches!(self, VersionPurgeStatusType::Pending | VersionPurgeStatusType::Failed)
     }
 }
 
-// 从字符串实现转换（类似于 Go 的字符串比较）
+// Implement conversion from string (similar to Go's string comparison)
 impl From<&str> for VersionPurgeStatusType {
     fn from(value: &str) -> Self {
         match value.to_uppercase().as_str() {
@@ -1233,12 +1233,12 @@ pub fn get_replication_action(oi1: &ObjectInfo, oi2: &ObjectInfo, op_type: &str)
     ReplicationAction::ReplicateNone
 }
 
-/// 目标的复制决策结构
+/// Target replication decision structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicateTargetDecision {
-    pub replicate: bool,   // 是否进行复制
-    pub synchronous: bool, // 是否是同步复制
-    pub arn: String,       // 复制目标的 ARN
+    pub replicate: bool,   // Whether to perform replication
+    pub synchronous: bool, // Whether it's synchronous replication
+    pub arn: String,       // ARN of the replication target
     pub id: String,        // ID
 }
 
@@ -1396,16 +1396,16 @@ pub struct ReplicatedTargetInfo {
     pub arn: String,
     pub size: i64,
     pub duration: Duration,
-    pub replication_action: ReplicationAction,          // 完整或仅元数据
-    pub op_type: i32,                                   // 传输类型
-    pub replication_status: ReplicationStatusType,      // 当前复制状态
-    pub prev_replication_status: ReplicationStatusType, // 上一个复制状态
-    pub version_purge_status: VersionPurgeStatusType,   // 版本清理状态
-    pub resync_timestamp: String,                       // 重同步时间戳
-    pub replication_resynced: bool,                     // 是否重同步
-    pub endpoint: String,                               // 目标端点
-    pub secure: bool,                                   // 是否安全连接
-    pub err: Option<String>,                            // 错误信息
+    pub replication_action: ReplicationAction,          // Complete or metadata only
+    pub op_type: i32,                                   // Transfer type
+    pub replication_status: ReplicationStatusType,      // Current replication status
+    pub prev_replication_status: ReplicationStatusType, // Previous replication status
+    pub version_purge_status: VersionPurgeStatusType,   // Version purge status
+    pub resync_timestamp: String,                       // Resync timestamp
+    pub replication_resynced: bool,                     // Whether resynced
+    pub endpoint: String,                               // Target endpoint
+    pub secure: bool,                                   // Whether secure connection
+    pub err: Option<String>,                            // Error information
 }
 
 // 实现 ReplicatedTargetInfo 方法
@@ -1418,12 +1418,12 @@ impl ReplicatedTargetInfo {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeletedObjectReplicationInfo {
-    #[serde(flatten)] // 使用 `flatten` 将 `DeletedObject` 的字段展开到当前结构体
+    #[serde(flatten)] // Use `flatten` to expand `DeletedObject` fields into current struct
     pub deleted_object: DeletedObject,
 
     pub bucket: String,
     pub event_type: String,
-    pub op_type: ReplicationType, // 假设 `replication.Type` 是 `ReplicationType` 枚举
+    pub op_type: ReplicationType, // Assume `replication.Type` is `ReplicationType` enum
     pub reset_id: String,
     pub target_arn: String,
 }
@@ -2040,22 +2040,22 @@ impl ReplicateObjectInfo {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeletedObject {
     #[serde(rename = "DeleteMarker")]
-    pub delete_marker: Option<bool>, // Go 中的 `bool` 转换为 Rust 中的 `Option<bool>` 以支持 `omitempty`
+    pub delete_marker: Option<bool>, // Go's `bool` converted to Rust's `Option<bool>` to support `omitempty`
 
     #[serde(rename = "DeleteMarkerVersionId")]
-    pub delete_marker_version_id: Option<String>, // `omitempty` 转为 `Option<String>`
+    pub delete_marker_version_id: Option<String>, // `omitempty` converted to `Option<String>`
 
     #[serde(rename = "Key")]
-    pub object_name: Option<String>, // 同样适用 `Option` 包含 `omitempty`
+    pub object_name: Option<String>, // Similarly use `Option` to include `omitempty`
 
     #[serde(rename = "VersionId")]
-    pub version_id: Option<String>, // 同上
+    pub version_id: Option<String>, // Same as above
 
-    // 以下字段未出现在 XML 序列化中，因此不需要 serde 标注
+    // The following fields do not appear in XML serialization, so no serde annotation needed
     #[serde(skip)]
-    pub delete_marker_mtime: DateTime<Utc>, // 自定义类型，需定义或引入
+    pub delete_marker_mtime: DateTime<Utc>, // Custom type, needs definition or import
     #[serde(skip)]
-    pub replication_state: ReplicationState, // 自定义类型，需定义或引入
+    pub replication_state: ReplicationState, // Custom type, needs definition or import
 }
 
 // 假设 `DeleteMarkerMTime` 和 `ReplicationState` 的定义如下：
@@ -2446,8 +2446,8 @@ pub fn clone_mss(v: &HashMap<String, String>) -> HashMap<String, String> {
 pub fn get_must_replicate_options(
     user_defined: &HashMap<String, String>,
     user_tags: &str,
-    status: ReplicationStatusType, // 假设 `status` 是字符串类型
-    op: ReplicationType,           // 假设 `op` 是字符串类型
+    status: ReplicationStatusType, // Assume `status` is string type
+    op: ReplicationType,           // Assume `op` is string type
     opts: &ObjectOptions,
 ) -> MustReplicateOptions {
     let mut meta = clone_mss(user_defined);

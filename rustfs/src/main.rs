@@ -26,6 +26,7 @@ mod version;
 // Ensure the correct path for parse_license is imported
 use crate::admin::handlers::profile::start_profilers;
 use crate::server::{start_http_server, wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
+use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
@@ -35,6 +36,7 @@ use rustfs_ahm::{
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
@@ -52,9 +54,13 @@ use rustfs_ecstore::{
     StorageAPI,
 };
 use rustfs_iam::init_iam_sys;
+use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
+use s3s::s3_error;
 use std::io::{Error, Result};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -168,7 +174,6 @@ async fn main() -> Result<()> {
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
-
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
     }
@@ -246,26 +251,36 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(Error::other)?;
 
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+    // Collect bucket names into a vector
+    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    init_bucket_metadata_sys(store.clone(), buckets).await;
+    // Initialize the bucket metadata system
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
+    // Initialize the IAM system
     init_iam_sys(store.clone()).await?;
 
+    // add bucket notification configuration
+    add_bucket_notification_configuration(buckets).await;
+
+    // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys failed {:?}", &err);
         Error::other(err)
     })?;
 
+    // Create a cancellation token for AHM services
     let _ = create_ahm_services_cancel_token();
 
     // Initialize heal manager with channel processor
     let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
     let heal_manager = init_heal_manager(heal_storage, None).await?;
-
     let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
     scanner.start().await?;
+
+    // print server info
     print_server_info();
+    // initialize bucket replication pool
     init_bucket_replication_pool().await;
 
     // Async update check (optional)
@@ -347,7 +362,7 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
 }
 
 #[instrument]
-pub(crate) async fn init_event_notifier() {
+async fn init_event_notifier() {
     info!("Initializing event notifier...");
 
     // 1. Get the global configuration loaded by ecstore
@@ -365,8 +380,8 @@ pub(crate) async fn init_event_notifier() {
         .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
         .is_none()
         || server_config
-            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-            .is_none()
+        .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+        .is_none()
     {
         info!("'notify' subsystem not configured, skipping event notifier initialization.");
         return;
@@ -385,8 +400,48 @@ pub(crate) async fn init_event_notifier() {
     });
 }
 
+#[instrument(skip_all)]
+async fn add_bucket_notification_configuration(buckets: Vec<String>) {
+    let region_opt = rustfs_ecstore::global::get_global_region();
+    let region = match region_opt {
+        Some(ref r) if !r.is_empty() => r,
+        _ => {
+            warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
+            ""
+        }
+    };
+    for bucket in buckets.iter() {
+        let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
+            warn!("get_notification_config err {:?}", err);
+            None
+        });
+
+        match has_notification_config {
+            Some(cfg) => {
+                info!("Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
+
+                let mut event_rules = Vec::new();
+                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), TargetID::from_str);
+                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), TargetID::from_str);
+                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), TargetID::from_str);
+
+                if let Err(e) = notifier_instance()
+                    .add_event_specific_rules(bucket, region, &event_rules)
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
+                {
+                    error!("Failed to add rules for bucket '{}': {:?}", bucket, e);
+                }
+            }
+            None => {
+                info!("Bucket '{}' has no existing notification configuration.", bucket);
+            }
+        }
+    }
+}
+
 /// Shuts down the event notifier system gracefully
-pub async fn shutdown_event_notifier() {
+async fn shutdown_event_notifier() {
     info!("Shutting down event notifier system...");
 
     if !rustfs_notify::is_notification_system_initialized() {

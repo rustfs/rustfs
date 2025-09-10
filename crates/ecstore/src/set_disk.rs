@@ -61,6 +61,7 @@ use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
+use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
@@ -3218,6 +3219,44 @@ impl SetDisks {
         obj?;
         Ok(())
     }
+
+    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+        let mut opts = opts.clone();
+
+        let http_preconditions = opts.http_preconditions?;
+        opts.http_preconditions = None;
+
+        // Never claim a lock here, to avoid deadlock
+        // - If no_lock is false, we must have obtained the lock out side of this function
+        // - If no_lock is true, we should not obtain locks
+        opts.no_lock = true;
+        let oi = self.get_object_info(bucket, object, &opts).await;
+
+        match oi {
+            Ok(oi) => {
+                if should_prevent_write(&oi, http_preconditions.if_none_match, http_preconditions.if_match) {
+                    return Some(StorageError::PreconditionFailed);
+                }
+            }
+
+            Err(StorageError::VersionNotFound(_, _, _))
+            | Err(StorageError::ObjectNotFound(_, _))
+            | Err(StorageError::ErasureReadQuorum) => {
+                // When the object is not found,
+                // - if If-Match is set, we should return 404 NotFound
+                // - if If-None-Match is set, we should be able to proceed with the request
+                if http_preconditions.if_match.is_some() {
+                    return Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string()));
+                }
+            }
+
+            Err(e) => {
+                return Some(e);
+            }
+        }
+
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -3232,18 +3271,18 @@ impl ObjectIO for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         // Acquire a shared read-lock early to protect read consistency
-        let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
+        // let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
 
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _read_lock_guard = guard_opt;
-        }
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _read_lock_guard = guard_opt;
+        // }
 
         let (fi, files, disks) = self
             .get_object_fileinfo(bucket, object, opts, true)
@@ -3291,9 +3330,9 @@ impl ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         // Move the read-lock guard into the task so it lives for the duration of the read
-        let _guard_to_hold = _read_lock_guard; // moved into closure below
+        // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
-            let _guard = _guard_to_hold; // keep guard alive until task ends
+            // let _guard = _guard_to_hold; // keep guard alive until task ends
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
@@ -3322,17 +3361,23 @@ impl ObjectIO for SetDisks {
         let disks = self.disks.read().await;
 
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
+        // let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
 
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _object_lock_guard = guard_opt;
+        // }
+
+        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
             }
-            _object_lock_guard = guard_opt;
         }
 
         let mut user_defined = opts.user_defined.clone();
@@ -4111,17 +4156,17 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire a shared read-lock to protect consistency during info fetch
-        let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _read_lock_guard = guard_opt;
-        }
+        // let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _read_lock_guard = guard_opt;
+        // }
 
         let (fi, _, _) = self
             .get_object_fileinfo(bucket, object, opts, false)
@@ -4154,17 +4199,17 @@ impl StorageAPI for SetDisks {
         // TODO: nslock
 
         // Guard lock for metadata update
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _lock_guard = guard_opt;
+        // }
 
         let disks = self.get_disks_internal().await;
 
@@ -4257,17 +4302,17 @@ impl StorageAPI for SetDisks {
         };
 
         // Acquire write-lock early; hold for the whole transition operation scope
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _lock_guard = guard_opt;
+        // }
 
         let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true).await?;
         /*if err != nil {
@@ -4386,17 +4431,17 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         // Acquire write-lock early for the restore operation
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _lock_guard = guard_opt;
+        // }
         let set_restore_header_fn = async move |oi: &mut ObjectInfo, rerr: Option<Error>| -> Result<()> {
             if rerr.is_none() {
                 return Ok(());
@@ -4471,17 +4516,17 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire write-lock for tag update (metadata write)
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.no_lock {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
+        // if !opts.no_lock {
+        //     let guard_opt = self
+        //         .namespace_lock
+        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+        //         .await?;
+        //     if guard_opt.is_none() {
+        //         return Err(Error::other("can not get lock. please retry".to_string()));
+        //     }
+        //     _lock_guard = guard_opt;
+        // }
         let (mut fi, _, disks) = self.get_object_fileinfo(bucket, object, opts, false).await?;
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
@@ -4733,10 +4778,18 @@ impl StorageAPI for SetDisks {
 
         let part_number_marker = part_number_marker.unwrap_or_default();
 
+        // Extract storage class from metadata, default to STANDARD if not found
+        let storage_class = fi
+            .metadata
+            .get(rustfs_filemeta::headers::AMZ_STORAGE_CLASS)
+            .cloned()
+            .unwrap_or_else(|| storageclass::STANDARD.to_string());
+
         let mut ret = ListPartsInfo {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             upload_id: upload_id.to_owned(),
+            storage_class,
             max_parts,
             part_number_marker,
             user_defined: fi.metadata.clone(),
@@ -5122,6 +5175,26 @@ impl StorageAPI for SetDisks {
 
         let disks = disks.clone();
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
+
+        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
+        // let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
+        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            // if !opts.no_lock {
+            //     let guard_opt = self
+            //         .namespace_lock
+            //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
+            //         .await?;
+
+            //     if guard_opt.is_none() {
+            //         return Err(Error::other("can not get lock. please retry".to_string()));
+            //     }
+            //     _object_lock_guard = guard_opt;
+            // }
+
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
+        }
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
 
@@ -5942,13 +6015,79 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{:x}-{}", hasher.finalize(), parts.len())
 }
 
+pub fn canonicalize_etag(etag: &str) -> String {
+    let re = Regex::new("\"*?([^\"]*?)\"*?$").unwrap();
+    re.replace_all(etag, "$1").to_string()
+}
+
+pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
+    if condition.trim() == "*" {
+        return true;
+    }
+    canonicalize_etag(etag) == canonicalize_etag(condition)
+}
+
+pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
+    match &oi.etag {
+        Some(etag) => {
+            if let Some(if_none_match) = if_none_match {
+                if e_tag_matches(etag, &if_none_match) {
+                    return true;
+                }
+            }
+            if let Some(if_match) = if_match {
+                if !e_tag_matches(etag, &if_match) {
+                    return true;
+                }
+            }
+            false
+        }
+        // If we can't obtain the etag of the object, perevent the write only when we have at least one condition
+        None => if_none_match.is_some() || if_match.is_some(),
+    }
+}
+
+/// Validates if the given storage class is supported
+pub fn is_valid_storage_class(storage_class: &str) -> bool {
+    matches!(
+        storage_class,
+        storageclass::STANDARD
+            | storageclass::RRS
+            | storageclass::DEEP_ARCHIVE
+            | storageclass::EXPRESS_ONEZONE
+            | storageclass::GLACIER
+            | storageclass::GLACIER_IR
+            | storageclass::INTELLIGENT_TIERING
+            | storageclass::ONEZONE_IA
+            | storageclass::OUTPOSTS
+            | storageclass::SNOW
+            | storageclass::STANDARD_IA
+    )
+}
+
+/// Returns true if the storage class is a cold storage tier that requires special handling
+pub fn is_cold_storage_class(storage_class: &str) -> bool {
+    matches!(
+        storage_class,
+        storageclass::DEEP_ARCHIVE | storageclass::GLACIER | storageclass::GLACIER_IR
+    )
+}
+
+/// Returns true if the storage class is an infrequent access tier
+pub fn is_infrequent_access_class(storage_class: &str) -> bool {
+    matches!(
+        storage_class,
+        storageclass::ONEZONE_IA | storageclass::STANDARD_IA | storageclass::INTELLIGENT_TIERING
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::error::DiskError;
-    use crate::store_api::CompletePart;
+    use crate::store_api::{CompletePart, ObjectInfo};
     use rustfs_filemeta::ErasureInfo;
     use std::collections::HashMap;
     use time::OffsetDateTime;
@@ -6372,5 +6511,112 @@ mod tests {
         let result2 = SetDisks::shuffle_disks(&disks, &empty_distribution);
         assert_eq!(result2.len(), 3);
         assert!(result2.iter().all(|d| d.is_none()));
+    }
+
+    #[test]
+    fn test_etag_matches() {
+        assert!(e_tag_matches("abc", "abc"));
+        assert!(e_tag_matches("\"abc\"", "abc"));
+        assert!(e_tag_matches("\"abc\"", "*"));
+    }
+
+    #[test]
+    fn test_should_prevent_write() {
+        let oi = ObjectInfo {
+            etag: Some("abc".to_string()),
+            ..Default::default()
+        };
+        let if_none_match = Some("abc".to_string());
+        let if_match = None;
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("*".to_string());
+        let if_match = None;
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
+        let if_match = Some("def".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
+        let if_match = Some("*".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = None;
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = Some("*".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("def".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some("*".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let oi = ObjectInfo {
+            etag: None,
+            ..Default::default()
+        };
+        let if_none_match = Some("*".to_string());
+        let if_match = Some("\"abc\"".to_string());
+        assert!(should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = None;
+        let if_match = None;
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+    }
+
+    #[test]
+    fn test_is_valid_storage_class() {
+        // Test valid storage classes
+        assert!(is_valid_storage_class(storageclass::STANDARD));
+        assert!(is_valid_storage_class(storageclass::RRS));
+        assert!(is_valid_storage_class(storageclass::DEEP_ARCHIVE));
+        assert!(is_valid_storage_class(storageclass::EXPRESS_ONEZONE));
+        assert!(is_valid_storage_class(storageclass::GLACIER));
+        assert!(is_valid_storage_class(storageclass::GLACIER_IR));
+        assert!(is_valid_storage_class(storageclass::INTELLIGENT_TIERING));
+        assert!(is_valid_storage_class(storageclass::ONEZONE_IA));
+        assert!(is_valid_storage_class(storageclass::OUTPOSTS));
+        assert!(is_valid_storage_class(storageclass::SNOW));
+        assert!(is_valid_storage_class(storageclass::STANDARD_IA));
+
+        // Test invalid storage classes
+        assert!(!is_valid_storage_class("INVALID"));
+        assert!(!is_valid_storage_class(""));
+        assert!(!is_valid_storage_class("standard")); // lowercase
+    }
+
+    #[test]
+    fn test_is_cold_storage_class() {
+        // Test cold storage classes
+        assert!(is_cold_storage_class(storageclass::DEEP_ARCHIVE));
+        assert!(is_cold_storage_class(storageclass::GLACIER));
+        assert!(is_cold_storage_class(storageclass::GLACIER_IR));
+
+        // Test non-cold storage classes
+        assert!(!is_cold_storage_class(storageclass::STANDARD));
+        assert!(!is_cold_storage_class(storageclass::RRS));
+        assert!(!is_cold_storage_class(storageclass::STANDARD_IA));
+        assert!(!is_cold_storage_class(storageclass::EXPRESS_ONEZONE));
+    }
+
+    #[test]
+    fn test_is_infrequent_access_class() {
+        // Test infrequent access classes
+        assert!(is_infrequent_access_class(storageclass::ONEZONE_IA));
+        assert!(is_infrequent_access_class(storageclass::STANDARD_IA));
+        assert!(is_infrequent_access_class(storageclass::INTELLIGENT_TIERING));
+
+        // Test frequent access classes
+        assert!(!is_infrequent_access_class(storageclass::STANDARD));
+        assert!(!is_infrequent_access_class(storageclass::RRS));
+        assert!(!is_infrequent_access_class(storageclass::DEEP_ARCHIVE));
+        assert!(!is_infrequent_access_class(storageclass::EXPRESS_ONEZONE));
     }
 }

@@ -14,11 +14,11 @@
 
 use super::rules_map::RulesMap;
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
-use crate::EventName;
-use crate::arn::TargetID;
 use crate::rules::NotificationConfiguration;
 use crate::rules::pattern_rules;
 use crate::rules::target_id_set;
+use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -101,8 +101,8 @@ impl BucketNotificationConfig {
                 for target_id in target_id_set {
                     // Construct the ARN string for this target_id and self.region
                     let arn_to_check = target_id.to_arn(&self.region); // Assuming TargetID has to_arn
-                    if !arn_list.contains(&arn_to_check.to_arn_string()) {
-                        return Err(BucketNotificationConfigError::ArnNotFound(arn_to_check.to_arn_string()));
+                    if !arn_list.contains(&arn_to_check.to_string()) {
+                        return Err(BucketNotificationConfigError::ArnNotFound(arn_to_check.to_string()));
                     }
                 }
             }

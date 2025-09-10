@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
@@ -39,7 +39,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -587,7 +587,7 @@ impl TransitionState {
 pub async fn init_background_expiry(api: Arc<ECStore>) {
     let mut workers = num_cpus::get() / 2;
     //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_EXPIRATION_WORKERS") {
+    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
             workers = num_expirations;
         }
@@ -686,7 +686,14 @@ pub async fn expire_transitioned_object(
         //transitionLogIf(ctx, err);
     }
 
-    let dobj = api.delete_object(&oi.bucket, &oi.name, opts).await?;
+    let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
+        Ok(obj) => obj,
+        Err(e) => {
+            error!("Failed to delete transitioned object {}/{}: {:?}", oi.bucket, oi.name, e);
+            // Return the original object info if deletion fails
+            oi.clone()
+        }
+    };
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
@@ -945,10 +952,17 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 
     // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
 
-    let mut dobj = api
-        .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
-        .await
-        .unwrap();
+    //debug!("lc_event.action: {:?}", lc_event.action);
+    //debug!("opts: {:?}", opts);
+    let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
+        Ok(obj) => obj,
+        Err(e) => {
+            error!("Failed to delete object {}/{}: {:?}", oi.bucket, oi.name, e);
+            // Return the original object info if deletion fails
+            oi.clone()
+        }
+    };
+    //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
     }

@@ -72,7 +72,7 @@ pub struct Opt {
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,
 
-    /// tls path for rustfs api and console.
+    /// tls path for rustfs API and console.
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
 

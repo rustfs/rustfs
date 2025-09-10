@@ -23,7 +23,7 @@ fmt-check:
 .PHONY: clippy
 clippy:
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --fix --allow-dirty 
+	cargo clippy --fix --allow-dirty
 	cargo clippy --all-targets --all-features -- -D warnings
 
 .PHONY: check
@@ -34,7 +34,12 @@ check:
 .PHONY: test
 test:
 	@echo "🧪 Running tests..."
-	cargo nextest run --all --exclude e2e_test
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --all --exclude e2e_test; \
+	else \
+		echo "ℹ️ cargo-nextest not found; falling back to 'cargo test'"; \
+		cargo test --workspace --exclude e2e_test -- --nocapture; \
+	fi
 	cargo test --all --doc
 
 .PHONY: pre-commit
@@ -210,7 +215,9 @@ docker-build-production:
 docker-build-source:
 	@echo "🏗️ Building single-architecture source Docker image..."
 	@echo "💡 Consider using 'make docker-dev-local' for multi-arch support"
-	$(DOCKER_CLI) build -f $(DOCKERFILE_SOURCE) -t rustfs:source .
+	DOCKER_BUILDKIT=1 $(DOCKER_CLI) build \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		-f $(DOCKERFILE_SOURCE) -t rustfs:source .
 
 # ========================================================================================
 # Development Environment

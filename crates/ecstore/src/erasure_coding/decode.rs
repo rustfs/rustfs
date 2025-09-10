@@ -41,14 +41,14 @@ impl<R> ParallelReader<R>
 where
     R: AsyncRead + Unpin + Send + Sync,
 {
-    // readers传入前应处理disk错误，确保每个reader达到可用数量的BitrotReader
+    // Readers should handle disk errors before being passed in, ensuring each reader reaches the available number of BitrotReaders
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
         let offset = (offset / e.block_size) * shard_size;
 
-        // 确保offset不超过shard_file_size
+        // Ensure offset does not exceed shard_file_size
 
         ParallelReader {
             readers,
@@ -99,7 +99,7 @@ where
                     }
                 }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
             } else {
-                // reader是None时返回FileNotFound错误
+                // Return FileNotFound error when reader is None
                 Box::pin(async move { (i, Err(Error::FileNotFound)) })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
             };
@@ -146,7 +146,7 @@ where
     }
 }
 
-/// 获取数据块总长度
+/// Get the total length of data blocks
 fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
     let mut size = 0;
     for shard in shards.iter().take(data_blocks).flatten() {
@@ -156,7 +156,7 @@ fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
     size
 }
 
-/// 将编码块中的数据块写入目标，支持 offset 和 length
+/// Write data blocks from encoded blocks to target, supporting offset and length
 async fn write_data_blocks<W>(
     writer: &mut W,
     en_blocks: &[Option<Vec<u8>>],

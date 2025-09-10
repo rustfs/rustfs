@@ -844,7 +844,7 @@ mod tests {
     }
 }
 
-const SIZE_LAST_ELEM_MARKER: usize = 10; // 这里假设你的 marker 是 10，请根据实际情况修改
+const SIZE_LAST_ELEM_MARKER: usize = 10; // Assumed marker size is 10, modify according to actual situation
 
 #[allow(dead_code)]
 #[derive(Debug, Default)]

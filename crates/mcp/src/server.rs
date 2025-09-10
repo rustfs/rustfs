@@ -15,7 +15,7 @@
 use anyhow::Result;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability},
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
@@ -52,6 +52,18 @@ pub struct UploadFileRequest {
     #[serde(default)]
     #[schemars(description = "Optional cache control header")]
     pub cache_control: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct CreateBucketReqeust {
+    #[schemars(description = "Name of the S3 bucket to create")]
+    pub bucket_name: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct DeleteBucketReqeust {
+    #[schemars(description = "Name of the S3 bucket to delete")]
+    pub bucket_name: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -108,6 +120,53 @@ impl RustfsMcpServer {
             _config: config,
             tool_router: Self::tool_router(),
         })
+    }
+
+    #[tool(description = "Create a new S3 bucket with the specified name")]
+    pub async fn create_bucket(&self, Parameters(req): Parameters<CreateBucketReqeust>) -> String {
+        info!("Executing create_bucket tool for bucket: {}", req.bucket_name);
+
+        match self.s3_client.create_bucket(&req.bucket_name).await {
+            Ok(_) => {
+                format!("Successfully created bucket: {}", req.bucket_name)
+            }
+            Err(e) => {
+                format!("Failed to create bucket '{}': {:?}", req.bucket_name, e)
+            }
+        }
+    }
+
+    #[tool(description = "Delete an existing S3 bucket with the specified name")]
+    pub async fn delete_bucket(&self, Parameters(req): Parameters<DeleteBucketReqeust>) -> String {
+        info!("Executing delete_bucket tool for bucket: {}", req.bucket_name);
+
+        // check if bucket is empty, if not, can not delete bucket directly.
+        let object_result = match self
+            .s3_client
+            .list_objects_v2(&req.bucket_name, ListObjectsOptions::default())
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to list objects in bucket '{}': {:?}", req.bucket_name, e);
+                return format!("Failed to list objects in bucket '{}': {:?}", req.bucket_name, e);
+            }
+        };
+
+        if !object_result.objects.is_empty() {
+            error!("Bucket '{}' is not empty", req.bucket_name);
+            return format!("Failed to delete bucket '{}': bucket is not empty", req.bucket_name);
+        }
+
+        // delete the bucket.
+        match self.s3_client.delete_bucket(&req.bucket_name).await {
+            Ok(_) => {
+                format!("Successfully deleted bucket: {}", req.bucket_name)
+            }
+            Err(e) => {
+                format!("Failed to delete bucket '{}': {:?}", req.bucket_name, e)
+            }
+        }
     }
 
     #[tool(description = "List all S3 buckets accessible with the configured credentials")]
@@ -666,5 +725,21 @@ mod tests {
 
         assert_eq!(read_mode_deser, GetObjectMode::Read);
         assert_eq!(download_mode_deser, GetObjectMode::Download);
+    }
+
+    #[test]
+    fn test_bucket_creation() {
+        let request = CreateBucketReqeust {
+            bucket_name: "test-bucket".to_string(),
+        };
+        assert_eq!(request.bucket_name, "test-bucket");
+    }
+
+    #[test]
+    fn test_bucket_deletion() {
+        let request = DeleteBucketReqeust {
+            bucket_name: "test-bucket".to_string(),
+        };
+        assert_eq!(request.bucket_name, "test-bucket");
     }
 }

@@ -16,8 +16,10 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::ObjectOptions;
+
+use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
 use rustfs_utils::path::is_dir_object;
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -105,6 +107,32 @@ pub async fn get_opts(
     Ok(opts)
 }
 
+fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> Result<()> {
+    if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
+        let mut preconditions = HTTPPreconditions::default();
+        if let Some(if_none_match) = headers.get("If-None-Match") {
+            preconditions.if_none_match = Some(
+                if_none_match
+                    .to_str()
+                    .map_err(|_| StorageError::other("Invalid If-None-Match header"))?
+                    .to_string(),
+            );
+        }
+        if let Some(if_match) = headers.get("If-Match") {
+            preconditions.if_match = Some(
+                if_match
+                    .to_str()
+                    .map_err(|_| StorageError::other("Invalid If-Match header"))?
+                    .to_string(),
+            );
+        }
+
+        opts.http_preconditions = Some(preconditions);
+    }
+
+    Ok(())
+}
+
 /// Creates options for putting an object in a bucket.
 pub async fn put_opts(
     bucket: &str,
@@ -141,6 +169,14 @@ pub async fn put_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
+
+    Ok(opts)
+}
+
+pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
+    let mut opts = ObjectOptions::default();
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
 }
 
@@ -269,6 +305,61 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-replication-status",
     ]
 });
+
+/// Parse copy source range string in format "bytes=start-end"
+pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
+    if !range_str.starts_with("bytes=") {
+        return Err(s3_error!(InvalidArgument, "Invalid range format"));
+    }
+
+    let range_part = &range_str[6..]; // Remove "bytes=" prefix
+
+    if let Some(dash_pos) = range_part.find('-') {
+        let start_str = &range_part[..dash_pos];
+        let end_str = &range_part[dash_pos + 1..];
+
+        if start_str.is_empty() && end_str.is_empty() {
+            return Err(s3_error!(InvalidArgument, "Invalid range format"));
+        }
+
+        if start_str.is_empty() {
+            // Suffix range: bytes=-500 (last 500 bytes)
+            let length = end_str
+                .parse::<i64>()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: true,
+                start: -length,
+                end: -1,
+            })
+        } else {
+            let start = start_str
+                .parse::<i64>()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?;
+
+            let end = if end_str.is_empty() {
+                -1 // Open-ended range: bytes=500-
+            } else {
+                end_str
+                    .parse::<i64>()
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid range format"))?
+            };
+
+            if start < 0 || (end != -1 && end < start) {
+                return Err(s3_error!(InvalidArgument, "Invalid range format"));
+            }
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: false,
+                start,
+                end,
+            })
+        }
+    } else {
+        Err(s3_error!(InvalidArgument, "Invalid range format"))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -613,13 +704,13 @@ mod tests {
     #[test]
     fn test_extract_metadata_from_mime_unicode_values() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-amz-meta-chinese", HeaderValue::from_bytes("测试值".as_bytes()).unwrap());
+        headers.insert("x-amz-meta-chinese", HeaderValue::from_bytes("test-value".as_bytes()).unwrap());
         headers.insert("x-rustfs-meta-emoji", HeaderValue::from_bytes("🚀".as_bytes()).unwrap());
 
         let mut metadata = HashMap::new();
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata.get("chinese"), Some(&"测试值".to_string()));
+        assert_eq!(metadata.get("chinese"), Some(&"test-value".to_string()));
         assert_eq!(metadata.get("emoji"), Some(&"🚀".to_string()));
     }
 
@@ -702,7 +793,7 @@ mod tests {
     fn test_extract_metadata_from_mime_with_various_data_formats() {
         let test_cases = vec![
             ("data.parquet", "application/vnd.apache.parquet"),
-            ("data.PARQUET", "application/vnd.apache.parquet"), // 测试大小写不敏感
+            ("data.PARQUET", "application/vnd.apache.parquet"), // Test case insensitive
             ("file.avro", "application/avro"),
             ("file.orc", "application/orc"),
             ("file.feather", "application/feather"),
@@ -710,7 +801,7 @@ mod tests {
             ("file.json", "application/json"),
             ("file.csv", "text/csv"),
             ("file.txt", "text/plain"),
-            ("file.unknownext", "application/octet-stream"), // 使用真正未知的扩展名
+            ("file.unknownext", "application/octet-stream"), // Use truly unknown extension
         ];
 
         for (filename, expected_content_type) in test_cases {
@@ -735,31 +826,58 @@ mod tests {
         let mut metadata = HashMap::new();
         extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("test.parquet"));
 
-        // 应该保留现有的 content-type，不被覆盖
+        // Should preserve existing content-type, not overwrite
         assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
     }
 
     #[test]
     fn test_detect_content_type_from_object_name() {
-        // 测试 Parquet 文件（我们的自定义处理）
+        // Test Parquet files (our custom handling)
         assert_eq!(detect_content_type_from_object_name("test.parquet"), "application/vnd.apache.parquet");
         assert_eq!(detect_content_type_from_object_name("TEST.PARQUET"), "application/vnd.apache.parquet");
 
-        // 测试其他自定义数据格式
+        // Test other custom data formats
         assert_eq!(detect_content_type_from_object_name("data.avro"), "application/avro");
         assert_eq!(detect_content_type_from_object_name("data.orc"), "application/orc");
         assert_eq!(detect_content_type_from_object_name("data.feather"), "application/feather");
         assert_eq!(detect_content_type_from_object_name("data.arrow"), "application/arrow");
 
-        // 测试标准格式（mime_guess 处理）
+        // Test standard formats (mime_guess handling)
         assert_eq!(detect_content_type_from_object_name("data.json"), "application/json");
         assert_eq!(detect_content_type_from_object_name("data.csv"), "text/csv");
         assert_eq!(detect_content_type_from_object_name("data.txt"), "text/plain");
 
-        // 测试真正未知的格式（使用一个 mime_guess 不认识的扩展名）
+        // Test truly unknown format (using extension mime_guess doesn't recognize)
         assert_eq!(detect_content_type_from_object_name("unknown.unknownext"), "application/octet-stream");
 
-        // 测试没有扩展名的文件
+        // Test files without extension
         assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_parse_copy_source_range() {
+        // Test complete range: bytes=0-1023
+        let result = parse_copy_source_range("bytes=0-1023").unwrap();
+        assert!(!result.is_suffix_length);
+        assert_eq!(result.start, 0);
+        assert_eq!(result.end, 1023);
+
+        // Test open-ended range: bytes=500-
+        let result = parse_copy_source_range("bytes=500-").unwrap();
+        assert!(!result.is_suffix_length);
+        assert_eq!(result.start, 500);
+        assert_eq!(result.end, -1);
+
+        // Test suffix range: bytes=-500 (last 500 bytes)
+        let result = parse_copy_source_range("bytes=-500").unwrap();
+        assert!(result.is_suffix_length);
+        assert_eq!(result.start, -500);
+        assert_eq!(result.end, -1);
+
+        // Test invalid format
+        assert!(parse_copy_source_range("invalid").is_err());
+        assert!(parse_copy_source_range("bytes=").is_err());
+        assert!(parse_copy_source_range("bytes=abc-def").is_err());
+        assert!(parse_copy_source_range("bytes=100-50").is_err()); // start > end
     }
 }

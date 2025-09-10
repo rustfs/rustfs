@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod audit;
 pub mod com;
 #[allow(dead_code)]
 pub mod heal;
@@ -21,8 +22,9 @@ pub mod storageclass;
 use crate::error::Result;
 use crate::store::ECStore;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
+use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_config::notify::{COMMENT_KEY, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;

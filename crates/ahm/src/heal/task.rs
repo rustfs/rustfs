@@ -299,7 +299,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("{bucket}/{object}")));
-            progress.update_progress(0, 4, 0, 0); // 开始heal，总共4个步骤
+            progress.update_progress(0, 4, 0, 0);
         }
 
         // Step 1: Check if object exists and get metadata

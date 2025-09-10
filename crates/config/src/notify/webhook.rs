@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::notify::{COMMENT_KEY, ENABLE_KEY};
+use crate::{COMMENT_KEY, ENABLE_KEY};
 
 // Webhook Keys
 pub const WEBHOOK_ENDPOINT: &str = "endpoint";
@@ -24,7 +24,7 @@ pub const WEBHOOK_CLIENT_KEY: &str = "client_key";
 
 /// A list of all valid configuration keys for a webhook target.
 pub const NOTIFY_WEBHOOK_KEYS: &[&str] = &[
-    ENABLE_KEY, // "enable" is a common key
+    ENABLE_KEY,
     WEBHOOK_ENDPOINT,
     WEBHOOK_AUTH_TOKEN,
     WEBHOOK_QUEUE_LIMIT,

@@ -367,6 +367,16 @@ impl Operation for DataUsageInfoHandler {
             s3_error!(InternalError, "load_data_usage_from_backend failed")
         })?;
 
+        // If no valid data exists, attempt real-time collection
+        if info.objects_total_count == 0 && info.buckets_count == 0 {
+            info!("No data usage statistics found, attempting real-time collection");
+
+            if let Err(e) = collect_realtime_data_usage(&mut info, store.clone()).await {
+                warn!("Failed to collect real-time data usage: {}", e);
+            }
+        }
+
+        // Set capacity information
         let sinfo = store.storage_info().await;
         info.total_capacity = get_total_usable_capacity(&sinfo.disks, &sinfo) as u64;
         info.total_free_capacity = get_total_usable_capacity_free(&sinfo.disks, &sinfo) as u64;
@@ -839,22 +849,21 @@ pub struct SetRemoteTargetHandler {}
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, mut _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         //return Ok(S3Response::new((StatusCode::OK, Body::from("OK".to_string()))));
-        // println!("handle MetricsHandler, params: {:?}", _req.input);
-        info!("SetRemoteTargetHandler params: {:?}", _req.credentials);
+        debug!("Processing SetRemoteTargetHandler request");
+        info!("SetRemoteTargetHandler credentials: {:?}", _req.credentials);
         let queries = extract_query_params(&_req.uri);
         let Some(_cred) = _req.credentials else {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
-        let _is_owner = true; // 先按 true 处理，后期根据请求决定
+        let _is_owner = true; // Treat as true for now, decide based on request later
         let body = _req.input.store_all_unlimited().await.unwrap();
-        //println!("body: {}", std::str::from_utf8(&body.clone()).unwrap());
+        debug!("Request body received, size: {} bytes", body.len());
 
-        //println!("bucket is:{}", bucket.clone());
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 info!("have bucket: {}", bucket);
-                return Ok(S3Response::new((StatusCode::OK, Body::from("fuck".to_string()))));
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "No buckets found".to_string()));
             }
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -904,12 +913,12 @@ impl Operation for SetRemoteTargetHandler {
                     match sys.set_target(bucket, &remote_target, false, false).await {
                         Ok(_) => {
                             {
-                                //todo 各种持久化的工作
+                                //todo various persistence work
                                 let targets = sys.list_targets(Some(bucket), None).await;
                                 info!("targets is {}", targets.len());
                                 match serde_json::to_vec(&targets) {
                                     Ok(json) => {
-                                        //println!("json is:{:?}", json.clone().to_ascii_lowercase());
+                                        debug!("Serialized targets configuration, size: {} bytes", json.len());
                                         //metadata_sys::GLOBAL_BucketMetadataSys::
                                         //BUCKET_TARGETS_FILE: &str = "bucket-targets.json"
                                         let _ = metadata_sys::update(bucket, "bucket-targets.json", json).await;
@@ -922,7 +931,7 @@ impl Operation for SetRemoteTargetHandler {
                                         // }
                                     }
                                     Err(e) => {
-                                        error!("序列化失败{}", e);
+                                        error!("Serialization failed: {}", e);
                                     }
                                 }
                             }
@@ -1013,7 +1022,7 @@ impl Operation for ListRemoteTargetHandler {
 
                 return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
             } else {
-                println!("GLOBAL_BUCKET_TARGET_SYS is not initialized");
+                error!("GLOBAL_BUCKET_TARGET_SYS is not initialized");
                 return Err(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "GLOBAL_BUCKET_TARGET_SYS is not initialized".to_string(),
@@ -1021,7 +1030,7 @@ impl Operation for ListRemoteTargetHandler {
             }
         }
 
-        println!("Bucket parameter missing in request");
+        warn!("Bucket parameter is missing in request");
         Ok(S3Response::new((
             StatusCode::BAD_REQUEST,
             Body::from("Bucket parameter is required".to_string()),
@@ -1093,6 +1102,86 @@ impl Operation for RemoveRemoteTargetHandler {
         // }
 
         return Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))));
+    }
+}
+
+/// Real-time data collection function
+async fn collect_realtime_data_usage(
+    info: &mut rustfs_common::data_usage::DataUsageInfo,
+    store: Arc<rustfs_ecstore::store::ECStore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Get bucket list and collect basic statistics
+    let buckets = store
+        .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+        .await?;
+
+    info.buckets_count = buckets.len() as u64;
+    info.last_update = Some(std::time::SystemTime::now());
+
+    let mut total_objects = 0u64;
+    let mut total_size = 0u64;
+
+    // For each bucket, try to get object count
+    for bucket_info in buckets {
+        let bucket_name = &bucket_info.name;
+
+        // Skip system buckets
+        if bucket_name.starts_with('.') {
+            continue;
+        }
+
+        // Try to count objects in this bucket
+        let (object_count, bucket_size) = count_bucket_objects(&store, bucket_name).await.unwrap_or((0, 0));
+
+        total_objects += object_count;
+        total_size += bucket_size;
+
+        let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
+            objects_count: object_count,
+            size: bucket_size,
+            versions_count: object_count, // Simplified: assume 1 version per object
+            ..Default::default()
+        };
+
+        info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
+        info.bucket_sizes.insert(bucket_name.clone(), bucket_size);
+    }
+
+    info.objects_total_count = total_objects;
+    info.objects_total_size = total_size;
+    info.versions_total_count = total_objects; // Simplified
+
+    Ok(())
+}
+
+/// Helper function to count objects in a bucket
+async fn count_bucket_objects(
+    store: &Arc<rustfs_ecstore::store::ECStore>,
+    bucket_name: &str,
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    // Use list_objects_v2 to get actual object count
+    match store
+        .clone()
+        .list_objects_v2(
+            bucket_name,
+            "",    // prefix
+            None,  // continuation_token
+            None,  // delimiter
+            1000,  // max_keys - limit for performance
+            false, // fetch_owner
+            None,  // start_after
+        )
+        .await
+    {
+        Ok(result) => {
+            let object_count = result.objects.len() as u64;
+            let total_size = result.objects.iter().map(|obj| obj.size as u64).sum();
+            Ok((object_count, total_size))
+        }
+        Err(e) => {
+            warn!("Failed to list objects in bucket {}: {}", bucket_name, e);
+            Ok((0, 0))
+        }
     }
 }
 
@@ -1199,7 +1288,7 @@ mod tests {
     fn test_decode() {
         let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
         let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
-        println!("{s:?}");
+        debug!("Parsed HealOpts: {:?}", s);
     }
 
     // Note: Testing the actual async handler implementations requires:

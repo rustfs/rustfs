@@ -317,7 +317,7 @@ impl TransitionClient {
         //}
 
         let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, self.random);
-        while let Some(v) = retry_timer.next().await {
+        while retry_timer.next().await.is_some() {
             let req = self.new_request(&method, metadata).await?;
 
             resp = self.doit(req).await?;
@@ -569,7 +569,16 @@ impl TransitionClient {
     }
 
     pub fn is_virtual_host_style_request(&self, url: &Url, bucket_name: &str) -> bool {
-        if bucket_name == "" {
+        // Contract:
+        // - return true if we should use virtual-hosted-style addressing (bucket as subdomain)
+        // Heuristics (aligned with AWS S3/MinIO clients):
+        // - explicit DNS mode => true
+        // - explicit PATH mode => false
+        // - AUTO:
+        //   - bucket must be non-empty and DNS compatible
+        //   - endpoint host must be a DNS name (not an IPv4/IPv6 literal)
+        //   - when using TLS (https), buckets with dots are avoided due to wildcard/cert issues
+        if bucket_name.is_empty() {
             return false;
         }
 
