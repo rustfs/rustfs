@@ -124,7 +124,7 @@ pub async fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAd
 }
 
 /// returns IP address of given host using standard resolution.
-/// 
+///
 /// **Note**: This function uses standard library DNS resolution.
 /// For enhanced DNS resolution with Kubernetes support, use `get_host_ip_async()`.
 pub fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {

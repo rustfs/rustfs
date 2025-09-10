@@ -14,17 +14,17 @@
 
 #[cfg(feature = "tls")]
 pub mod certs;
+#[cfg(feature = "net")]
+pub mod dns_resolver;
 #[cfg(feature = "ip")]
 pub mod ip;
 #[cfg(feature = "net")]
 pub mod net;
-#[cfg(feature = "net")]
-pub mod dns_resolver;
 
 #[cfg(feature = "net")]
-pub use net::*;
-#[cfg(feature = "net")]
 pub use dns_resolver::*;
+#[cfg(feature = "net")]
+pub use net::*;
 
 #[cfg(all(feature = "net", feature = "io"))]
 pub mod retry;
