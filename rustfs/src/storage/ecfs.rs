@@ -292,6 +292,21 @@ impl FS {
     }
 }
 
+/// Helper function to get store and validate bucket exists
+async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
+    let Some(store) = new_object_layer_fn() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+
+    // Validate bucket exists
+    store
+        .get_bucket_info(bucket, &BucketOptions::default())
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(store)
+}
+
 #[async_trait::async_trait]
 impl S3 for FS {
     #[tracing::instrument(
@@ -928,9 +943,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
@@ -1215,15 +1228,17 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
+        let max_keys = match max_keys {
+            Some(v) if v > 0 && v <= 1000 => v,
+            None => 1000,
+            _ => return Err(s3_error!(InvalidArgument, "max-keys must be between 1 and 1000")),
+        };
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
             .list_objects_v2(
@@ -1310,9 +1325,7 @@ impl S3 for FS {
         let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
         let delimiter = delimiter.filter(|v| !v.is_empty());
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
             .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
@@ -1423,9 +1436,7 @@ impl S3 for FS {
 
         // let mut reader = PutObjReader::new(body, content_length as usize);
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let mut metadata = metadata.unwrap_or_default();
 
@@ -1879,7 +1890,15 @@ impl S3 for FS {
         };
 
         let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = max_parts.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
+        let max_parts = match max_parts {
+            Some(parts) => {
+                if !(1..=1000).contains(&parts) {
+                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
+                }
+                parts as usize
+            }
+            None => 1000,
+        };
 
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
@@ -2138,6 +2157,41 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        // Validate tag_set length doesn't exceed 10
+        if tagging.tag_set.len() > 10 {
+            return Err(s3_error!(InvalidArgument, "Object tags cannot be greater than 10"));
+        }
+
+        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
+        for tag in &tagging.tag_set {
+            let key = tag
+                .key
+                .as_ref()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| s3_error!(InvalidTag, "Tag key cannot be empty"))?;
+
+            if key.len() > 128 {
+                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
+            }
+
+            let value = tag
+                .value
+                .as_ref()
+                .ok_or_else(|| s3_error!(InvalidTag, "Tag value cannot be null"))?;
+
+            if value.is_empty() {
+                return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
+            }
+
+            if value.len() > 256 {
+                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
+            }
+
+            if !tag_keys.insert(key) {
+                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
+            }
+        }
 
         let tags = encode_tags(tagging.tag_set);
 
