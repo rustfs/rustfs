@@ -62,6 +62,7 @@ hmac = { workspace = true, optional = true }
 s3s = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
+moka = { workspace = true, optional = true, features = ["future"] }
 thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -79,7 +80,7 @@ workspace = true
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
-net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hyper-util", "dep:hickory-resolver", "dep:thiserror"]  # network features with DNS resolver
+net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hyper-util", "dep:hickory-resolver", "dep:moka", "dep:thiserror"]  # network features with DNS resolver
 io = ["dep:tokio"]
 path = []
 notify = ["dep:hyper", "dep:s3s"]  # file system notification features
