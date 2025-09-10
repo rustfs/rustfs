@@ -1890,7 +1890,15 @@ impl S3 for FS {
         };
 
         let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = max_parts.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
+        let max_parts = match max_parts {
+            Some(parts) => {
+                if !(1..=1000).contains(&parts) {
+                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
+                }
+                parts as usize
+            }
+            None => 1000,
+        };
 
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
