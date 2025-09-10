@@ -86,7 +86,50 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
     Ok(is_local_host)
 }
 
-/// returns IP address of given host.
+/// returns IP address of given host using layered DNS resolution.
+pub fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
+    match host {
+        Host::Domain(domain) => {
+            #[cfg(feature = "net")]
+            {
+                use crate::dns_resolver::resolve_domain;
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    match resolve_domain(domain).await {
+                        Ok(ips) => Ok(ips.into_iter().collect()),
+                        Err(e) => Err(std::io::Error::other(format!("DNS resolution failed: {}", e))),
+                    }
+                })
+            }
+            #[cfg(not(feature = "net"))]
+            {
+                // Fallback to standard resolution when DNS resolver is not available
+                match (domain, 0)
+                    .to_socket_addrs()
+                    .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
+                {
+                    Ok(ips) => Ok(ips),
+                    Err(err) => Err(std::io::Error::other(err)),
+                }
+            }
+        }
+        Host::Ipv4(ip) => {
+            let mut set = HashSet::with_capacity(1);
+            set.insert(IpAddr::V4(ip));
+            Ok(set)
+        }
+        Host::Ipv6(ip) => {
+            let mut set = HashSet::with_capacity(1);
+            set.insert(IpAddr::V6(ip));
+            Ok(set)
+        }
+    }
+}
+
+/// returns IP address of given host using standard resolution.
+///
+/// **Note**: This function uses standard library DNS resolution.
+/// For enhanced DNS resolution with Kubernetes support, use `get_host_ip_async()`.
 pub fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => match (domain, 0)

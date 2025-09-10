@@ -57,6 +57,7 @@ use rustfs_iam::init_iam_sys;
 use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
+use rustfs_utils::dns_resolver::init_global_dns_resolver;
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::s3_error;
 use std::io::{Error, Result};
@@ -174,6 +175,12 @@ async fn main() -> Result<()> {
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
+
+    // Initialize global DNS resolver early for enhanced DNS resolution
+    if let Err(e) = init_global_dns_resolver().await {
+        warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
+    }
+
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
     }
