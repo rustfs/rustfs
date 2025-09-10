@@ -42,3 +42,4 @@ url.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 once_cell.workspace = true
+parking_lot = "0.12"

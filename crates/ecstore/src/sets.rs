@@ -163,18 +163,15 @@ impl Sets {
                 }
             }
 
-            let lock_clients = create_unique_clients(&set_endpoints).await?;
+            let _lock_clients = create_unique_clients(&set_endpoints).await?;
 
-            // Bind lock quorum to EC write quorum for this set: data_shards (+1 if equal to parity) per default_write_quorum()
-            let mut write_quorum = set_drive_count - parity_count;
-            if write_quorum == parity_count {
-                write_quorum += 1;
-            }
-            let namespace_lock =
-                rustfs_lock::NamespaceLock::with_clients_and_quorum(format!("set-{i}"), lock_clients, write_quorum);
+            // Note: write_quorum was used for the old lock system, no longer needed with FastLock
+            let _write_quorum = set_drive_count - parity_count;
+            // Create fast lock manager for high performance
+            let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
 
             let set_disks = SetDisks::new(
-                Arc::new(namespace_lock),
+                fast_lock_manager,
                 GLOBAL_Local_Node_Name.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,

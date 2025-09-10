@@ -6064,6 +6064,7 @@ dependencies = [
  "bytes",
  "futures",
  "once_cell",
+ "parking_lot",
  "rustfs-protos",
  "serde",
  "serde_json",

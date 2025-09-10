@@ -110,7 +110,7 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
-    pub namespace_lock: Arc<rustfs_lock::NamespaceLock>,
+    pub fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
     pub set_endpoints: Vec<Endpoint>,
@@ -124,7 +124,7 @@ pub struct SetDisks {
 impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        namespace_lock: Arc<rustfs_lock::NamespaceLock>,
+        fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
         locker_owner: String,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
         set_drive_count: usize,
@@ -135,7 +135,7 @@ impl SetDisks {
         format: FormatV3,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
-            namespace_lock,
+            fast_lock_manager,
             locker_owner,
             disks,
             set_drive_count,
@@ -2336,9 +2336,16 @@ impl SetDisks {
             ..Default::default()
         };
 
-        if !opts.no_lock {
-            // TODO: locker
-        }
+        let _write_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal operation: {:?}", e)))?,
+            )
+        } else {
+            None
+        };
 
         let version_id_op = {
             if version_id.is_empty() {
@@ -2916,6 +2923,12 @@ impl SetDisks {
         dry_run: bool,
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
+        let _write_lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock("", object, self.locker_owner.as_str())
+            .await
+            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {:?}", e)))?;
+
         let disks = {
             let disks = self.disks.read().await;
             disks.clone()
@@ -3271,18 +3284,16 @@ impl ObjectIO for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         // Acquire a shared read-lock early to protect read consistency
-        // let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _read_lock_guard = guard_opt;
-        // }
+        let _read_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_read_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let (fi, files, disks) = self
             .get_object_fileinfo(bucket, object, opts, true)
@@ -3361,18 +3372,16 @@ impl ObjectIO for SetDisks {
         let disks = self.disks.read().await;
 
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        // let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _object_lock_guard = guard_opt;
-        // }
+        let _object_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -3660,17 +3669,11 @@ impl StorageAPI for SetDisks {
         }
 
         // Guard lock for source object metadata update
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(src_object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        let _lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock("", src_object, self.locker_owner.as_str())
+            .await
+            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
 
         let disks = self.get_disks_internal().await;
 
@@ -3766,17 +3769,11 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         // Guard lock for single object delete-version
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        let _lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock("", object, self.locker_owner.as_str())
+            .await
+            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -3833,21 +3830,31 @@ impl StorageAPI for SetDisks {
             del_errs.push(None)
         }
 
-        // Per-object guards to keep until function end
-        let mut _guards: HashMap<String, rustfs_lock::LockGuard> = HashMap::new();
-        // Acquire locks for all objects first; mark errors for failures
-        for (i, dobj) in objects.iter().enumerate() {
-            if !_guards.contains_key(&dobj.object_name) {
-                match self
-                    .namespace_lock
-                    .lock_guard(&dobj.object_name, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                    .await?
-                {
-                    Some(g) => {
-                        _guards.insert(dobj.object_name.clone(), g);
-                    }
-                    None => {
-                        del_errs[i] = Some(Error::other("can not get lock. please retry"));
+        // Use fast batch locking to acquire all locks atomically
+        let mut _guards: HashMap<String, rustfs_lock::FastLockGuard> = HashMap::new();
+        let mut unique_objects: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Collect unique object names
+        for dobj in &objects {
+            unique_objects.insert(dobj.object_name.clone());
+        }
+
+        // Acquire all locks in batch to prevent deadlocks
+        for object_name in unique_objects {
+            match self
+                .fast_lock_manager
+                .acquire_write_lock("", object_name.as_str(), self.locker_owner.as_str())
+                .await
+            {
+                Ok(guard) => {
+                    _guards.insert(object_name, guard);
+                }
+                Err(_) => {
+                    // Mark all operations on this object as failed
+                    for (i, dobj) in objects.iter().enumerate() {
+                        if dobj.object_name == object_name {
+                            del_errs[i] = Some(Error::other("can not get lock. please retry"));
+                        }
                     }
                 }
             }
@@ -3967,17 +3974,16 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.delete_prefix {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        let _lock_guard = if !opts.delete_prefix {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
         if opts.delete_prefix {
             self.delete_prefix(bucket, object)
                 .await
@@ -4156,17 +4162,16 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire a shared read-lock to protect consistency during info fetch
-        // let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _read_lock_guard = guard_opt;
-        // }
+        let _read_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_read_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let (fi, _, _) = self
             .get_object_fileinfo(bucket, object, opts, false)
@@ -4199,17 +4204,16 @@ impl StorageAPI for SetDisks {
         // TODO: nslock
 
         // Guard lock for metadata update
-        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _lock_guard = guard_opt;
-        // }
+        let _lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let disks = self.get_disks_internal().await;
 
@@ -5467,6 +5471,17 @@ impl StorageAPI for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        let _write_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {:?}", e)))?,
+            )
+        } else {
+            None
+        };
+
         if has_suffix(object, SLASH_SEPARATOR) {
             let (result, err) = self.heal_object_dir(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
