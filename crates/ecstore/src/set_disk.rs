@@ -5268,10 +5268,16 @@ impl StorageAPI for SetDisks {
 
             if (i < uploaded_parts.len() - 1) && !is_min_allowed_part_size(ext_part.actual_size) {
                 error!(
-                    "complete_multipart_upload is_min_allowed_part_size err {:?}, part_id={}, bucket={}, object={}",
-                    ext_part.actual_size, p.part_num, bucket, object
+                    "complete_multipart_upload part size too small: part {} size {} is less than minimum {}",
+                    p.part_num,
+                    ext_part.actual_size,
+                    GLOBAL_MIN_PART_SIZE.as_u64()
                 );
-                return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                return Err(Error::EntityTooSmall(
+                    p.part_num,
+                    ext_part.actual_size,
+                    GLOBAL_MIN_PART_SIZE.as_u64() as i64,
+                ));
             }
 
             object_size += ext_part.size;
