@@ -6329,6 +6329,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex-simd",
+ "hickory-proto",
  "hickory-resolver",
  "highway",
  "hmac 0.12.1",

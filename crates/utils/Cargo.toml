@@ -27,43 +27,44 @@ categories = ["web-programming", "development-tools", "cryptography"]
 [dependencies]
 base64-simd = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
-crc32fast.workspace = true
+brotli = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+crc32fast = { workspace = true }
+flate2 = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
+hickory-resolver = { workspace = true, optional = true }
+hickory-proto = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 local-ip-address = { workspace = true, optional = true }
+lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
+moka = { workspace = true, optional = true, features = ["future"] }
 netif = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 rustfs-config = { workspace = true, features = ["constants"] }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
+s3s = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-siphasher = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
-tracing = { workspace = true }
-url = { workspace = true, optional = true }
-flate2 = { workspace = true, optional = true }
-brotli = { workspace = true, optional = true }
-zstd = { workspace = true, optional = true }
-snap = { workspace = true, optional = true }
-lz4 = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-transform-stream = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
-sysinfo = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-hmac = { workspace = true, optional = true }
-s3s = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hickory-resolver = { workspace = true, optional = true }
-moka = { workspace = true, optional = true, features = ["future"] }
+siphasher = { workspace = true, optional = true }
+snap = { workspace = true, optional = true }
+sysinfo = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
+tracing = { workspace = true }
+transform-stream = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -80,7 +81,7 @@ workspace = true
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
-net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hyper-util", "dep:hickory-resolver", "dep:moka", "dep:thiserror"]  # network features with DNS resolver
+net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hyper-util", "dep:hickory-resolver", "dep:hickory-proto", "dep:moka", "dep:thiserror"]  # network features with DNS resolver
 io = ["dep:tokio"]
 path = []
 notify = ["dep:hyper", "dep:s3s"]  # file system notification features

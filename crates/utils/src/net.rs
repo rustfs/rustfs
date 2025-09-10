@@ -87,16 +87,19 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 }
 
 /// returns IP address of given host using layered DNS resolution.
-pub async fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
+pub fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
             #[cfg(feature = "net")]
             {
                 use crate::dns_resolver::resolve_domain;
-                match resolve_domain(domain).await {
-                    Ok(ips) => Ok(ips.into_iter().collect()),
-                    Err(e) => Err(std::io::Error::other(format!("DNS resolution failed: {}", e))),
-                }
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    match resolve_domain(domain).await {
+                        Ok(ips) => Ok(ips.into_iter().collect()),
+                        Err(e) => Err(std::io::Error::other(format!("DNS resolution failed: {}", e))),
+                    }
+                })
             }
             #[cfg(not(feature = "net"))]
             {
