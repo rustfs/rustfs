@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::router::Operation;
+use crate::admin::auth::validate_admin_request;
 use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
@@ -45,6 +46,7 @@ use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::action::Action;
+use rustfs_policy::policy::action::AdminAction;
 use rustfs_policy::policy::action::S3Action;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_utils::path::path_join;
@@ -300,7 +302,23 @@ pub struct ServerInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         let info = get_server_info(true).await;
 
         let data = serde_json::to_vec(&info)
@@ -328,8 +346,24 @@ pub struct StorageInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for StorageInfoHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StorageInfoHandler");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -353,8 +387,24 @@ pub struct DataUsageInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DataUsageInfoHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle DataUsageInfoHandler");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DataUsageInfoAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
