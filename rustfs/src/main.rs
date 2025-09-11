@@ -18,6 +18,7 @@ mod config;
 mod error;
 // mod grpc;
 pub mod license;
+#[cfg(not(target_os = "windows"))]
 mod profiling;
 mod server;
 mod storage;
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
     set_global_guard(guard).map_err(Error::other)?;
 
     // Initialize performance profiling if enabled
+    #[cfg(not(target_os = "windows"))]
     profiling::start_profiling_if_enabled();
 
     // Run parameters
