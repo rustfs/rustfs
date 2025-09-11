@@ -24,7 +24,10 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_http_server, wait_for_shutdown};
+use crate::server::{
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_console_server, start_http_server,
+    wait_for_shutdown,
+};
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
@@ -157,6 +160,18 @@ async fn run(opt: config::Opt) -> Result<()> {
     state_manager.update(ServiceState::Starting);
 
     let shutdown_tx = start_http_server(&opt, state_manager.clone()).await?;
+
+    // Start console server if enabled
+    let console_shutdown_tx = shutdown_tx.clone();
+    if opt.console_enable {
+        let opt_clone = opt.clone();
+        tokio::spawn(async move {
+            let console_shutdown_rx = console_shutdown_tx.subscribe();
+            if let Err(e) = start_console_server(&opt_clone, console_shutdown_rx).await {
+                error!("Console server failed to start: {}", e);
+            }
+        });
+    }
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;

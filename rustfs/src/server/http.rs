@@ -107,12 +107,6 @@ pub async fn start_http_server(
     let api_endpoints = format!("http://{local_ip}:{server_port}");
     let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
     info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-    if opt.console_enable {
-        info!(
-            "   WebUI: http://{}:{}/rustfs/console/index.html http://127.0.0.1:{}/rustfs/console/index.html http://{}/rustfs/console/index.html",
-            local_ip, server_port, server_port, server_address
-        );
-    }
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
@@ -134,7 +128,9 @@ pub async fn start_http_server(
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route(opt.console_enable)?);
+        // When console runs on separate port, disable console routes on main endpoint
+        let console_on_endpoint = false; // Console will run separately
+        b.set_route(admin::make_admin_route(console_on_endpoint)?);
 
         if !opt.server_domains.is_empty() {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains

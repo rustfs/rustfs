@@ -69,6 +69,7 @@ RUN chmod +x /usr/bin/rustfs /entrypoint.sh && \
     chmod 0750 /data /logs
 
 ENV RUSTFS_ADDRESS=":9000" \
+    RUSTFS_CONSOLE_ADDRESS=":9001" \
     RUSTFS_ACCESS_KEY="rustfsadmin" \
     RUSTFS_SECRET_KEY="rustfsadmin" \
     RUSTFS_CONSOLE_ENABLE="true" \
@@ -77,7 +78,7 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_OBS_LOG_DIRECTORY="/logs" \
     RUSTFS_SINKS_FILE_PATH="/logs"
 
-EXPOSE 9000
+EXPOSE 9000 9001
 VOLUME ["/data", "/logs"]
 
 ENTRYPOINT ["/entrypoint.sh"]
