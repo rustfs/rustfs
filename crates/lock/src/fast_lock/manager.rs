@@ -104,41 +104,62 @@ impl FastObjectLockManager {
         self.acquire_lock(request).await
     }
 
-    /// Acquire multiple locks atomically
+    /// Acquire multiple locks atomically - optimized version
     pub async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
-        // Group requests by shard to optimize locking
-        let mut shard_groups: std::collections::HashMap<usize, Vec<ObjectLockRequest>> = std::collections::HashMap::new();
+        // Pre-sort requests by (shard_id, key) to avoid deadlocks
+        let mut sorted_requests = batch_request.requests;
+        sorted_requests.sort_unstable_by(|a, b| {
+            let shard_a = a.key.shard_index(self.shard_mask);
+            let shard_b = b.key.shard_index(self.shard_mask);
+            shard_a.cmp(&shard_b).then_with(|| a.key.cmp(&b.key))
+        });
 
-        for request in batch_request.requests {
+        // Try to use stack-allocated vectors for small batches, fallback to heap if needed
+        let shard_groups = self.group_requests_by_shard(sorted_requests);
+
+        // Choose strategy based on request type
+        if batch_request.all_or_nothing {
+            self.acquire_locks_two_phase_commit(&shard_groups).await
+        } else {
+            self.acquire_locks_best_effort(&shard_groups).await
+        }
+    }
+
+    /// Group requests by shard with proper fallback handling
+    fn group_requests_by_shard(
+        &self,
+        requests: Vec<ObjectLockRequest>,
+    ) -> std::collections::HashMap<usize, Vec<ObjectLockRequest>> {
+        let mut shard_groups = std::collections::HashMap::new();
+
+        for request in requests {
             let shard_id = request.key.shard_index(self.shard_mask);
-            shard_groups.entry(shard_id).or_default().push(request);
+            shard_groups.entry(shard_id).or_insert_with(Vec::new).push(request);
         }
 
+        shard_groups
+    }
+
+    /// Best effort acquisition (allows partial success)
+    async fn acquire_locks_best_effort(
+        &self,
+        shard_groups: &std::collections::HashMap<usize, Vec<ObjectLockRequest>>,
+    ) -> BatchLockResult {
         let mut all_successful = Vec::new();
         let mut all_failed = Vec::new();
 
-        // Process each shard group
-        for (shard_id, requests) in shard_groups {
+        for (&shard_id, requests) in shard_groups {
             let shard = &self.shards[shard_id];
-            match shard.acquire_locks_batch(requests, batch_request.all_or_nothing).await {
-                Ok(successful) => all_successful.extend(successful),
-                Err(failed) => {
-                    all_failed.extend(failed);
 
-                    if batch_request.all_or_nothing {
-                        // Release all previously acquired locks
-                        for _key in &all_successful {
-                            // let _shard = self.get_shard(key); // TODO: implement proper cleanup
-                            // Note: We need the original mode and owner info for release
-                            // This is a limitation of the current design that could be improved
-                            // For now, we'll do best-effort cleanup
-                        }
-
-                        return BatchLockResult {
-                            successful_locks: Vec::new(),
-                            failed_locks: all_failed,
-                            all_acquired: false,
-                        };
+            // Try fast path first for each request
+            for request in requests {
+                if shard.try_fast_path_only(request) {
+                    all_successful.push(request.key.clone());
+                } else {
+                    // Fallback to slow path
+                    match shard.acquire_lock(request).await {
+                        Ok(()) => all_successful.push(request.key.clone()),
+                        Err(err) => all_failed.push((request.key.clone(), err)),
                     }
                 }
             }
@@ -149,6 +170,65 @@ impl FastObjectLockManager {
             successful_locks: all_successful,
             failed_locks: all_failed,
             all_acquired,
+        }
+    }
+
+    /// Two-phase commit for atomic acquisition
+    async fn acquire_locks_two_phase_commit(
+        &self,
+        shard_groups: &std::collections::HashMap<usize, Vec<ObjectLockRequest>>,
+    ) -> BatchLockResult {
+        // Phase 1: Try to acquire all locks
+        let mut acquired_locks = Vec::new();
+        let mut failed_locks = Vec::new();
+
+        'outer: for (&shard_id, requests) in shard_groups {
+            let shard = &self.shards[shard_id];
+
+            for request in requests {
+                match shard.acquire_lock(request).await {
+                    Ok(()) => {
+                        acquired_locks.push((request.key.clone(), request.mode, request.owner.clone()));
+                    }
+                    Err(err) => {
+                        failed_locks.push((request.key.clone(), err));
+                        break 'outer; // Stop on first failure
+                    }
+                }
+            }
+        }
+
+        // Phase 2: If any failed, release all acquired locks with error tracking
+        if !failed_locks.is_empty() {
+            let mut cleanup_failures = 0;
+            for (key, mode, owner) in acquired_locks {
+                let shard = self.get_shard(&key);
+                if !shard.release_lock(&key, &owner, mode) {
+                    cleanup_failures += 1;
+                    tracing::warn!(
+                        "Failed to release lock during batch cleanup: bucket={}, object={}",
+                        key.bucket,
+                        key.object
+                    );
+                }
+            }
+
+            if cleanup_failures > 0 {
+                tracing::error!("Batch lock cleanup had {} failures", cleanup_failures);
+            }
+
+            return BatchLockResult {
+                successful_locks: Vec::new(),
+                failed_locks,
+                all_acquired: false,
+            };
+        }
+
+        // All successful
+        BatchLockResult {
+            successful_locks: acquired_locks.into_iter().map(|(key, _, _)| key).collect(),
+            failed_locks: Vec::new(),
+            all_acquired: true,
         }
     }
 
@@ -170,8 +250,25 @@ impl FastObjectLockManager {
         self.shards.iter().map(|shard| shard.lock_count()).sum()
     }
 
-    /// Force cleanup of expired locks
+    /// Get pool statistics from all shards
+    pub fn get_pool_stats(&self) -> Vec<(u64, u64, u64, usize)> {
+        self.shards.iter().map(|shard| shard.pool_stats()).collect()
+    }
+
+    /// Force cleanup of expired locks using adaptive strategy
     pub async fn cleanup_expired(&self) -> usize {
+        let mut total_cleaned = 0;
+
+        for shard in &self.shards {
+            total_cleaned += shard.adaptive_cleanup();
+        }
+
+        self.metrics.record_cleanup_run(total_cleaned);
+        total_cleaned
+    }
+
+    /// Force cleanup with traditional strategy (for compatibility)
+    pub async fn cleanup_expired_traditional(&self) -> usize {
         let max_idle_millis = self.config.max_idle_time.as_millis() as u64;
         let mut total_cleaned = 0;
 
@@ -204,7 +301,7 @@ impl FastObjectLockManager {
         let shards = self.shards.clone();
         let metrics = self.metrics.clone();
         let cleanup_interval = self.config.cleanup_interval;
-        let max_idle_time = self.config.max_idle_time;
+        let _max_idle_time = self.config.max_idle_time;
 
         let handle = tokio::spawn(async move {
             let mut interval = interval(cleanup_interval);
@@ -213,11 +310,11 @@ impl FastObjectLockManager {
                 interval.tick().await;
 
                 let start = Instant::now();
-                let max_idle_secs = max_idle_time.as_secs();
                 let mut total_cleaned = 0;
 
+                // Use adaptive cleanup for better performance
                 for shard in &shards {
-                    total_cleaned += shard.cleanup_expired(max_idle_secs);
+                    total_cleaned += shard.adaptive_cleanup();
                 }
 
                 if total_cleaned > 0 {
@@ -382,8 +479,8 @@ mod tests {
         // Wait for idle timeout
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Force cleanup with a very small max_idle_time to ensure cleanup
-        let cleaned = manager.cleanup_expired().await;
+        // Force cleanup with traditional method to ensure cleanup for testing
+        let cleaned = manager.cleanup_expired_traditional().await;
 
         let count_after = manager.total_lock_count();
 

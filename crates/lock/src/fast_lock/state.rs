@@ -2,20 +2,25 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
+use crate::fast_lock::optimized_notify::OptimizedNotify;
 use crate::fast_lock::types::{LockMode, LockPriority};
 
-/// Atomic lock state encoding in u64
-/// Bits:  [63:48] writers_waiting | [47:32] readers_waiting | [31:16] readers_count | [15:1] flags | [0] writer_flag
+/// Optimized atomic lock state encoding in u64
+/// Bits: [63:48] reserved | [47:32] writers_waiting | [31:16] readers_waiting | [15:8] readers_count | [7:1] flags | [0] writer_flag
 const WRITER_FLAG_MASK: u64 = 0x1;
-const READERS_SHIFT: u8 = 16;
-const READERS_MASK: u64 = 0xFFFF << READERS_SHIFT;
-const READERS_WAITING_SHIFT: u8 = 32;
+const READERS_SHIFT: u8 = 8;
+const READERS_MASK: u64 = 0xFF << READERS_SHIFT; // Support up to 255 concurrent readers
+const READERS_WAITING_SHIFT: u8 = 16;
 const READERS_WAITING_MASK: u64 = 0xFFFF << READERS_WAITING_SHIFT;
-const WRITERS_WAITING_SHIFT: u8 = 48;
+const WRITERS_WAITING_SHIFT: u8 = 32;
 const WRITERS_WAITING_MASK: u64 = 0xFFFF << WRITERS_WAITING_SHIFT;
+
+// Fast path check masks
+const NO_WRITER_AND_NO_WAITING_WRITERS: u64 = WRITER_FLAG_MASK | WRITERS_WAITING_MASK;
+const COMPLETELY_UNLOCKED: u64 = 0;
 
 /// Fast atomic lock state for single version
 #[derive(Debug)]
@@ -34,7 +39,28 @@ impl AtomicLockState {
     pub fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
-            last_accessed: AtomicU64::new(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()),
+            last_accessed: AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs(),
+            ),
+        }
+    }
+
+    /// Check if fast path is available for given lock mode
+    #[inline(always)]
+    pub fn is_fast_path_available(&self, mode: LockMode) -> bool {
+        let state = self.state.load(Ordering::Relaxed); // Use Relaxed for better performance
+        match mode {
+            LockMode::Shared => {
+                // No writer and no waiting writers
+                (state & NO_WRITER_AND_NO_WAITING_WRITERS) == 0
+            }
+            LockMode::Exclusive => {
+                // Completely unlocked
+                state == COMPLETELY_UNLOCKED
+            }
         }
     }
 
@@ -45,13 +71,14 @@ impl AtomicLockState {
         loop {
             let current = self.state.load(Ordering::Acquire);
 
-            // Cannot acquire if there's a writer or writers waiting
-            if (current & WRITER_FLAG_MASK) != 0 || self.writers_waiting(current) > 0 {
+            // Fast path check - cannot acquire if there's a writer or writers waiting
+            if (current & NO_WRITER_AND_NO_WAITING_WRITERS) != 0 {
                 return false;
             }
 
             let readers = self.readers_count(current);
-            if readers == 0xFFFF {
+            if readers == 0xFF {
+                // Updated limit to 255
                 return false; // Too many readers
             }
 
@@ -231,12 +258,15 @@ impl AtomicLockState {
     }
 
     pub fn update_access_time(&self) {
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
         self.last_accessed.store(now, Ordering::Relaxed);
     }
 
-    fn readers_count(&self, state: u64) -> u16 {
-        ((state & READERS_MASK) >> READERS_SHIFT) as u16
+    fn readers_count(&self, state: u64) -> u8 {
+        ((state & READERS_MASK) >> READERS_SHIFT) as u8
     }
 
     fn readers_waiting(&self, state: u64) -> u16 {
@@ -248,19 +278,27 @@ impl AtomicLockState {
     }
 }
 
-/// Object lock state with version support
+/// Object lock state with version support - optimized memory layout
 #[derive(Debug)]
+#[repr(align(64))] // Align to cache line boundary
 pub struct ObjectLockState {
-    /// Current owner of exclusive lock (if any)
-    pub current_owner: parking_lot::RwLock<Option<Arc<str>>>,
-    /// Shared owners set
-    pub shared_owners: parking_lot::RwLock<std::collections::HashSet<Arc<str>>>,
+    // First cache line: Most frequently accessed data
     /// Atomic state for fast operations
     pub atomic_state: AtomicLockState,
-    /// Notification for readers
+
+    // Second cache line: Notification mechanisms
+    /// Notification for readers (traditional)
     pub read_notify: Notify,
-    /// Notification for writers  
+    /// Notification for writers (traditional)
     pub write_notify: Notify,
+    /// Optimized notification system (optional)
+    pub optimized_notify: OptimizedNotify,
+
+    // Third cache line: Less frequently accessed data
+    /// Current owner of exclusive lock (if any)
+    pub current_owner: parking_lot::RwLock<Option<Arc<str>>>,
+    /// Shared owners - optimized for small number of readers
+    pub shared_owners: parking_lot::RwLock<smallvec::SmallVec<[Arc<str>; 4]>>,
     /// Lock priority for conflict resolution
     pub priority: parking_lot::RwLock<LockPriority>,
 }
@@ -274,11 +312,12 @@ impl Default for ObjectLockState {
 impl ObjectLockState {
     pub fn new() -> Self {
         Self {
-            current_owner: parking_lot::RwLock::new(None),
-            shared_owners: parking_lot::RwLock::new(std::collections::HashSet::new()),
             atomic_state: AtomicLockState::new(),
             read_notify: Notify::new(),
             write_notify: Notify::new(),
+            optimized_notify: OptimizedNotify::new(),
+            current_owner: parking_lot::RwLock::new(None),
+            shared_owners: parking_lot::RwLock::new(smallvec::SmallVec::new()),
             priority: parking_lot::RwLock::new(LockPriority::Normal),
         }
     }
@@ -288,7 +327,9 @@ impl ObjectLockState {
         if self.atomic_state.try_acquire_shared() {
             self.atomic_state.update_access_time();
             let mut shared = self.shared_owners.write();
-            shared.insert(owner.clone());
+            if !shared.contains(owner) {
+                shared.push(owner.clone());
+            }
             true
         } else {
             false
@@ -310,17 +351,18 @@ impl ObjectLockState {
     /// Release shared lock
     pub fn release_shared(&self, owner: &Arc<str>) -> bool {
         let mut shared = self.shared_owners.write();
-        if shared.remove(owner) {
+        if let Some(pos) = shared.iter().position(|x| x.as_ref() == owner.as_ref()) {
+            shared.remove(pos);
             if self.atomic_state.release_shared() {
                 // Notify waiting writers if no more readers
                 if shared.is_empty() {
                     drop(shared);
-                    self.write_notify.notify_one();
+                    self.optimized_notify.notify_writer();
                 }
                 true
             } else {
                 // Inconsistency - re-add owner
-                shared.insert(owner.clone());
+                shared.push(owner.clone());
                 false
             }
         } else {
@@ -335,15 +377,15 @@ impl ObjectLockState {
             if self.atomic_state.release_exclusive() {
                 *current = None;
                 drop(current);
-                // Notify waiters - prefer writers over readers
+                // Notify waiters using optimized system - prefer writers over readers
                 if self
                     .atomic_state
                     .writers_waiting(self.atomic_state.state.load(Ordering::Acquire))
                     > 0
                 {
-                    self.write_notify.notify_one();
+                    self.optimized_notify.notify_writer();
                 } else {
-                    self.read_notify.notify_waiters();
+                    self.optimized_notify.notify_readers();
                 }
                 true
             } else {

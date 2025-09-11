@@ -8,6 +8,7 @@ use tokio::time::timeout;
 
 use crate::fast_lock::{
     metrics::ShardMetrics,
+    object_pool::ObjectStatePool,
     state::ObjectLockState,
     types::{LockMode, LockResult, ObjectKey, ObjectLockRequest},
 };
@@ -17,6 +18,8 @@ use crate::fast_lock::{
 pub struct LockShard {
     /// Object lock states - using parking_lot for better performance
     objects: RwLock<HashMap<ObjectKey, Arc<ObjectLockState>>>,
+    /// Object state pool for memory optimization
+    object_pool: ObjectStatePool,
     /// Shard-level metrics
     metrics: ShardMetrics,
     /// Shard ID for debugging
@@ -27,6 +30,7 @@ impl LockShard {
     pub fn new(shard_id: usize) -> Self {
         Self {
             objects: RwLock::new(HashMap::new()),
+            object_pool: ObjectStatePool::new(),
             metrics: ShardMetrics::new(),
             _shard_id: shard_id,
         }
@@ -44,6 +48,17 @@ impl LockShard {
 
         // Slow path with waiting
         self.acquire_lock_slow_path(request, start_time).await
+    }
+
+    /// Try fast path only (without fallback to slow path)
+    pub fn try_fast_path_only(&self, request: &ObjectLockRequest) -> bool {
+        // Early check to avoid unnecessary lock contention
+        if let Some(state) = self.objects.read().get(&request.key) {
+            if !state.atomic_state.is_fast_path_available(request.mode) {
+                return false;
+            }
+        }
+        self.try_fast_path(request).is_some()
     }
 
     /// Try fast path lock acquisition (lock-free when possible)
@@ -81,8 +96,9 @@ impl LockShard {
                     return Some(state);
                 }
             } else {
-                // Create new state and acquire immediately
-                let state = Arc::new(ObjectLockState::new());
+                // Create new state from pool and acquire immediately
+                let state_box = self.object_pool.acquire();
+                let state = Arc::new(*state_box);
                 if state.try_acquire_exclusive_fast(&request.owner) {
                     objects.insert(request.key.clone(), state.clone());
                     return Some(state);
@@ -101,10 +117,15 @@ impl LockShard {
             // Get or create object state
             let state = {
                 let mut objects = self.objects.write();
-                objects
-                    .entry(request.key.clone())
-                    .or_insert_with(|| Arc::new(ObjectLockState::new()))
-                    .clone()
+                match objects.get(&request.key) {
+                    Some(state) => state.clone(),
+                    None => {
+                        let state_box = self.object_pool.acquire();
+                        let state = Arc::new(*state_box);
+                        objects.insert(request.key.clone(), state.clone());
+                        state
+                    }
+                }
             };
 
             // Try acquisition again
@@ -124,18 +145,18 @@ impl LockShard {
                 return Err(LockResult::Timeout);
             }
 
-            // Wait for notification
+            // Wait for notification using optimized notify system
             let remaining = deadline - Instant::now();
             let wait_result = match request.mode {
                 LockMode::Shared => {
                     state.atomic_state.inc_readers_waiting();
-                    let result = timeout(remaining, state.read_notify.notified()).await;
+                    let result = timeout(remaining, state.optimized_notify.wait_for_read()).await;
                     state.atomic_state.dec_readers_waiting();
                     result
                 }
                 LockMode::Exclusive => {
                     state.atomic_state.inc_writers_waiting();
-                    let result = timeout(remaining, state.write_notify.notified()).await;
+                    let result = timeout(remaining, state.optimized_notify.wait_for_write()).await;
                     state.atomic_state.dec_writers_waiting();
                     result
                 }
@@ -229,7 +250,7 @@ impl LockShard {
                     }
                     LockMode::Shared => {
                         let shared_owners = state.shared_owners.read();
-                        shared_owners.iter().next()?.clone()
+                        shared_owners.first()?.clone()
                     }
                 };
 
@@ -252,6 +273,46 @@ impl LockShard {
         None
     }
 
+    /// Get current load factor of the shard
+    pub fn current_load_factor(&self) -> f64 {
+        let objects = self.objects.read();
+        let total_locks = objects.len();
+        if total_locks == 0 {
+            return 0.0;
+        }
+
+        let active_locks = objects.values().filter(|state| state.is_locked()).count();
+        active_locks as f64 / total_locks as f64
+    }
+
+    /// Get count of active locks
+    pub fn active_lock_count(&self) -> usize {
+        let objects = self.objects.read();
+        objects.values().filter(|state| state.is_locked()).count()
+    }
+
+    /// Adaptive cleanup based on current load
+    pub fn adaptive_cleanup(&self) -> usize {
+        let current_load = self.current_load_factor();
+        let lock_count = self.lock_count();
+
+        // Dynamically adjust cleanup strategy based on load
+        let cleanup_batch_size = match current_load {
+            load if load > 0.9 => lock_count / 20, // High load: small batch cleanup
+            load if load > 0.7 => lock_count / 10, // Medium load: moderate cleanup
+            _ => lock_count / 5,                   // Low load: aggressive cleanup
+        };
+
+        // Use longer timeout for high load scenarios
+        let cleanup_threshold_millis = match current_load {
+            load if load > 0.8 => 300_000, // 5 minutes for high load
+            load if load > 0.5 => 180_000, // 3 minutes for medium load
+            _ => 60_000,                   // 1 minute for low load
+        };
+
+        self.cleanup_expired_batch(cleanup_batch_size.max(10), cleanup_threshold_millis)
+    }
+
     /// Cleanup expired and unused locks
     pub fn cleanup_expired(&self, max_idle_secs: u64) -> usize {
         let max_idle_millis = max_idle_secs * 1000;
@@ -261,7 +322,10 @@ impl LockShard {
     /// Cleanup expired and unused locks with millisecond precision
     pub fn cleanup_expired_millis(&self, max_idle_millis: u64) -> usize {
         let mut cleaned = 0;
-        let now_millis = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let now_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
 
         let mut objects = self.objects.write();
         objects.retain(|_key, state| {
@@ -285,6 +349,54 @@ impl LockShard {
         cleaned
     }
 
+    /// Batch cleanup with limited processing to avoid blocking
+    fn cleanup_expired_batch(&self, max_batch_size: usize, cleanup_threshold_millis: u64) -> usize {
+        let mut cleaned = 0;
+        let now_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+
+        let mut objects = self.objects.write();
+        let mut processed = 0;
+
+        // Process in batches to avoid long-held locks
+        let mut to_recycle = Vec::new();
+        objects.retain(|_key, state| {
+            if processed >= max_batch_size {
+                return true; // Stop processing after batch limit
+            }
+            processed += 1;
+
+            if !state.is_locked() && !state.atomic_state.has_waiters() {
+                let last_access_millis = state.atomic_state.last_accessed() * 1000;
+                let idle_time = now_millis.saturating_sub(last_access_millis);
+
+                if idle_time > cleanup_threshold_millis {
+                    // Try to recycle the state back to pool if possible
+                    if let Ok(state_box) = Arc::try_unwrap(state.clone()) {
+                        to_recycle.push(state_box);
+                    }
+                    cleaned += 1;
+                    false // Remove
+                } else {
+                    true // Keep
+                }
+            } else {
+                true // Keep active locks
+            }
+        });
+
+        // Return recycled objects to pool
+        for state_box in to_recycle {
+            let boxed_state = Box::new(state_box);
+            self.object_pool.release(boxed_state);
+        }
+
+        self.metrics.record_cleanup(cleaned);
+        cleaned
+    }
+
     /// Get shard metrics
     pub fn metrics(&self) -> &ShardMetrics {
         &self.metrics
@@ -300,6 +412,16 @@ impl LockShard {
         // Don't immediately cleanup - let cleanup_expired handle it
         // This allows the cleanup test to work properly
         let _ = key; // Suppress unused variable warning
+    }
+
+    /// Get object pool statistics
+    pub fn pool_stats(&self) -> (u64, u64, u64, usize) {
+        self.object_pool.stats()
+    }
+
+    /// Get object pool hit rate
+    pub fn pool_hit_rate(&self) -> f64 {
+        self.object_pool.hit_rate()
     }
 }
 

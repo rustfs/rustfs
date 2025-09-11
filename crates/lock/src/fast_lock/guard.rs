@@ -165,8 +165,8 @@ impl MultipleLockGuards {
         self.guards.iter().map(|guard| guard.key()).collect()
     }
 
-    /// Split guards by lock mode
-    pub fn split_by_mode(&mut self) -> (Vec<FastLockGuard>, Vec<FastLockGuard>) {
+    /// Split guards by lock mode (consumes the original guards)
+    pub fn split_by_mode(mut self) -> (Vec<FastLockGuard>, Vec<FastLockGuard>) {
         let mut shared_guards = Vec::new();
         let mut exclusive_guards = Vec::new();
 
@@ -178,6 +178,58 @@ impl MultipleLockGuards {
         }
 
         (shared_guards, exclusive_guards)
+    }
+
+    /// Split guards by lock mode without consuming (returns references)
+    pub fn split_by_mode_ref(&self) -> (Vec<&FastLockGuard>, Vec<&FastLockGuard>) {
+        let mut shared_guards = Vec::new();
+        let mut exclusive_guards = Vec::new();
+
+        for guard in &self.guards {
+            match guard.mode() {
+                LockMode::Shared => shared_guards.push(guard),
+                LockMode::Exclusive => exclusive_guards.push(guard),
+            }
+        }
+
+        (shared_guards, exclusive_guards)
+    }
+
+    /// Merge multiple guard collections into this one
+    pub fn merge(&mut self, mut other: MultipleLockGuards) {
+        self.guards.append(&mut other.guards);
+    }
+
+    /// Merge multiple individual guards into this collection
+    pub fn merge_guards(&mut self, guards: Vec<FastLockGuard>) {
+        self.guards.extend(guards);
+    }
+
+    /// Filter guards by predicate (non-consuming)
+    pub fn filter<F>(&self, predicate: F) -> Vec<&FastLockGuard>
+    where
+        F: Fn(&FastLockGuard) -> bool,
+    {
+        self.guards.iter().filter(|guard| predicate(guard)).collect()
+    }
+
+    /// Filter guards by predicate (consuming)
+    pub fn filter_owned<F>(mut self, predicate: F) -> Vec<FastLockGuard>
+    where
+        F: Fn(&FastLockGuard) -> bool,
+    {
+        self.guards.retain(|guard| predicate(guard));
+        std::mem::take(&mut self.guards)
+    }
+
+    /// Get guards for specific bucket
+    pub fn guards_for_bucket(&self, bucket: &str) -> Vec<&FastLockGuard> {
+        self.filter(|guard| guard.key().bucket.as_ref() == bucket)
+    }
+
+    /// Get guards for specific owner
+    pub fn guards_for_owner(&self, owner: &str) -> Vec<&FastLockGuard> {
+        self.filter(|guard| guard.owner().as_ref() == owner)
     }
 }
 
@@ -307,10 +359,54 @@ mod tests {
         assert_eq!(multiple.len(), 3);
         assert_eq!(multiple.active_count(), 3);
 
-        // Split by mode
+        // Test split by mode without consuming
+        let (shared_refs, exclusive_refs) = multiple.split_by_mode_ref();
+        assert_eq!(shared_refs.len(), 2);
+        assert_eq!(exclusive_refs.len(), 1);
+
+        // Original should still have all guards
+        assert_eq!(multiple.len(), 3);
+
+        // Split by mode (consuming)
         let (shared, exclusive) = multiple.split_by_mode();
         assert_eq!(shared.len(), 2);
         assert_eq!(exclusive.len(), 1);
+
+        // Test merge functionality
+        let mut new_multiple = MultipleLockGuards::new();
+        new_multiple.merge_guards(shared);
+        new_multiple.merge_guards(exclusive);
+        assert_eq!(new_multiple.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_guard_iteration_improvements() {
+        let manager = FastObjectLockManager::new();
+        let mut multiple = MultipleLockGuards::new();
+
+        // Acquire locks for different buckets and owners
+        let guard1 = manager.acquire_read_lock("bucket1", "obj1", "owner1").await.unwrap();
+        let guard2 = manager.acquire_read_lock("bucket2", "obj2", "owner1").await.unwrap();
+        let guard3 = manager.acquire_write_lock("bucket1", "obj3", "owner2").await.unwrap();
+
+        multiple.add(guard1);
+        multiple.add(guard2);
+        multiple.add(guard3);
+
+        // Test filtering by bucket
+        let bucket1_guards = multiple.guards_for_bucket("bucket1");
+        assert_eq!(bucket1_guards.len(), 2);
+
+        // Test filtering by owner
+        let owner1_guards = multiple.guards_for_owner("owner1");
+        assert_eq!(owner1_guards.len(), 2);
+
+        // Test custom filter
+        let write_guards = multiple.filter(|guard| guard.mode() == LockMode::Exclusive);
+        assert_eq!(write_guards.len(), 1);
+
+        // Test that original is not consumed
+        assert_eq!(multiple.len(), 3);
     }
 
     #[tokio::test]

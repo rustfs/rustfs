@@ -532,7 +532,10 @@ pub type Timestamp = u64;
 
 /// Get current timestamp
 pub fn current_timestamp() -> Timestamp {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 /// Convert timestamp to system time

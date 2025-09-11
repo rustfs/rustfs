@@ -16,8 +16,11 @@
 
 pub mod guard;
 pub mod integration_example;
+pub mod integration_test;
 pub mod manager;
 pub mod metrics;
+pub mod object_pool;
+pub mod optimized_notify;
 pub mod shard;
 pub mod state;
 pub mod types;

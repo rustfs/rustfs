@@ -394,26 +394,14 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool> {
         debug!("Checking object exists: {}/{}", bucket, object);
 
-        // Use heal_object with no-op options to check existence with proper locking
-        let heal_opts = HealOpts {
-            dry_run: true, // Don't actually heal
-            scan_mode: HealScanMode::Normal,
-            remove: false,
-            recreate: false,
-            update_parity: false,
-            recursive: false,
-            no_lock: false, // Use locks to avoid race with delete operations
-            pool: None,
-            set: None,
-        };
-
-        match self.ecstore.heal_object(bucket, object, "", &heal_opts).await {
-            Ok((_, None)) => Ok(true),    // Object exists and is healthy
-            Ok((_, Some(_))) => Ok(true), // Object exists but has some issues
+        // Use get_object_info for efficient existence check without heavy heal operations
+        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
+            Ok(_) => Ok(true), // Object exists
             Err(e) => {
-                let error_msg = format!("{}", e);
-                if error_msg.contains("not found") || error_msg.contains("Not found") {
-                    Ok(false) // Object doesn't exist
+                // Map ObjectNotFound to false, other errors to false as well for safety
+                if matches!(e, rustfs_ecstore::error::StorageError::ObjectNotFound(_, _)) {
+                    debug!("Object not found: {}/{}", bucket, object);
+                    Ok(false)
                 } else {
                     debug!("Error checking object existence {}/{}: {}", bucket, object, e);
                     Ok(false) // Treat errors as non-existence to be safe

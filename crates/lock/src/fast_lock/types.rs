@@ -1,6 +1,8 @@
 // Copyright 2024 RustFS Team
 
+use once_cell::unsync::OnceCell;
 use serde::{Deserialize, Serialize};
+use smartstring::SmartString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -43,6 +45,112 @@ impl ObjectKey {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.hash(&mut hasher);
         hasher.finish() as usize & shard_mask
+    }
+}
+
+/// Optimized object key using smart strings for better performance
+#[derive(Debug, Clone)]
+pub struct OptimizedObjectKey {
+    /// Bucket name - uses inline storage for small strings
+    pub bucket: SmartString<smartstring::LazyCompact>,
+    /// Object name - uses inline storage for small strings
+    pub object: SmartString<smartstring::LazyCompact>,
+    /// Version - optional for latest version semantics
+    pub version: Option<SmartString<smartstring::LazyCompact>>,
+    /// Cached hash to avoid recomputation
+    hash_cache: OnceCell<u64>,
+}
+
+// Manual implementations to handle OnceCell properly
+impl PartialEq for OptimizedObjectKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket == other.bucket && self.object == other.object && self.version == other.version
+    }
+}
+
+impl Eq for OptimizedObjectKey {}
+
+impl Hash for OptimizedObjectKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.bucket.hash(state);
+        self.object.hash(state);
+        self.version.hash(state);
+    }
+}
+
+impl PartialOrd for OptimizedObjectKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OptimizedObjectKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bucket
+            .cmp(&other.bucket)
+            .then_with(|| self.object.cmp(&other.object))
+            .then_with(|| self.version.cmp(&other.version))
+    }
+}
+
+impl OptimizedObjectKey {
+    pub fn new(
+        bucket: impl Into<SmartString<smartstring::LazyCompact>>,
+        object: impl Into<SmartString<smartstring::LazyCompact>>,
+    ) -> Self {
+        Self {
+            bucket: bucket.into(),
+            object: object.into(),
+            version: None,
+            hash_cache: OnceCell::new(),
+        }
+    }
+
+    pub fn with_version(
+        bucket: impl Into<SmartString<smartstring::LazyCompact>>,
+        object: impl Into<SmartString<smartstring::LazyCompact>>,
+        version: impl Into<SmartString<smartstring::LazyCompact>>,
+    ) -> Self {
+        Self {
+            bucket: bucket.into(),
+            object: object.into(),
+            version: Some(version.into()),
+            hash_cache: OnceCell::new(),
+        }
+    }
+
+    /// Get shard index with cached hash for better performance
+    pub fn shard_index(&self, shard_mask: usize) -> usize {
+        let hash = *self.hash_cache.get_or_init(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.hash(&mut hasher);
+            hasher.finish()
+        });
+        (hash as usize) & shard_mask
+    }
+
+    /// Reset hash cache if key is modified
+    pub fn invalidate_cache(&mut self) {
+        self.hash_cache = OnceCell::new();
+    }
+
+    /// Convert from regular ObjectKey
+    pub fn from_object_key(key: &ObjectKey) -> Self {
+        Self {
+            bucket: SmartString::from(key.bucket.as_ref()),
+            object: SmartString::from(key.object.as_ref()),
+            version: key.version.as_ref().map(|v| SmartString::from(v.as_ref())),
+            hash_cache: OnceCell::new(),
+        }
+    }
+
+    /// Convert to regular ObjectKey
+    pub fn to_object_key(&self) -> ObjectKey {
+        ObjectKey {
+            bucket: Arc::from(self.bucket.as_str()),
+            object: Arc::from(self.object.as_str()),
+            version: self.version.as_ref().map(|v| Arc::from(v.as_str())),
+        }
     }
 }
 
