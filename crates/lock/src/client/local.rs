@@ -53,60 +53,90 @@ impl Default for LocalClient {
 impl LockClient for LocalClient {
     async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
         let fast_lock_manager = self.get_fast_lock_manager();
-        let guard = fast_lock_manager
-            .acquire_write_lock("", request.resource.clone(), request.owner.clone())
-            .await
-            .map_err(|e| crate::error::LockError::internal(format!("Lock acquisition failed: {:?}", e)))?;
+        let lock_request = crate::fast_lock::ObjectLockRequest::new_write("", request.resource.clone(), request.owner.clone())
+            .with_acquire_timeout(request.acquire_timeout);
 
-        let lock_id = crate::types::LockId::new_deterministic(&request.resource);
+        match fast_lock_manager.acquire_lock(lock_request).await {
+            Ok(guard) => {
+                let lock_id = crate::types::LockId::new_deterministic(&request.resource);
 
-        // Store guard for later release
-        let mut guards = self.guard_storage.write().await;
-        guards.insert(lock_id.clone(), guard);
+                // Store guard for later release
+                let mut guards = self.guard_storage.write().await;
+                guards.insert(lock_id.clone(), guard);
 
-        let lock_info = LockInfo {
-            id: lock_id,
-            resource: request.resource.clone(),
-            lock_type: LockType::Exclusive,
-            status: crate::types::LockStatus::Acquired,
-            owner: request.owner.clone(),
-            acquired_at: std::time::SystemTime::now(),
-            expires_at: std::time::SystemTime::now() + request.ttl,
-            last_refreshed: std::time::SystemTime::now(),
-            metadata: request.metadata.clone(),
-            priority: request.priority,
-            wait_start_time: None,
-        };
-        Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+                let lock_info = LockInfo {
+                    id: lock_id,
+                    resource: request.resource.clone(),
+                    lock_type: LockType::Exclusive,
+                    status: crate::types::LockStatus::Acquired,
+                    owner: request.owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + request.ttl,
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: request.metadata.clone(),
+                    priority: request.priority,
+                    wait_start_time: None,
+                };
+                Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+            }
+            Err(crate::fast_lock::LockResult::Timeout) => {
+                Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout))
+            }
+            Err(crate::fast_lock::LockResult::Conflict {
+                current_owner,
+                current_mode,
+            }) => Ok(LockResponse::failure(
+                format!("Lock conflict: resource held by {} in {:?} mode", current_owner, current_mode),
+                std::time::Duration::ZERO,
+            )),
+            Err(crate::fast_lock::LockResult::Acquired) => {
+                unreachable!("Acquired should not be an error")
+            }
+        }
     }
 
     async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
         let fast_lock_manager = self.get_fast_lock_manager();
-        let guard = fast_lock_manager
-            .acquire_read_lock("", request.resource.clone(), request.owner.clone())
-            .await
-            .map_err(|e| crate::error::LockError::internal(format!("Shared lock acquisition failed: {:?}", e)))?;
+        let lock_request = crate::fast_lock::ObjectLockRequest::new_read("", request.resource.clone(), request.owner.clone())
+            .with_acquire_timeout(request.acquire_timeout);
 
-        let lock_id = crate::types::LockId::new_deterministic(&request.resource);
+        match fast_lock_manager.acquire_lock(lock_request).await {
+            Ok(guard) => {
+                let lock_id = crate::types::LockId::new_deterministic(&request.resource);
 
-        // Store guard for later release
-        let mut guards = self.guard_storage.write().await;
-        guards.insert(lock_id.clone(), guard);
+                // Store guard for later release
+                let mut guards = self.guard_storage.write().await;
+                guards.insert(lock_id.clone(), guard);
 
-        let lock_info = LockInfo {
-            id: lock_id,
-            resource: request.resource.clone(),
-            lock_type: LockType::Shared,
-            status: crate::types::LockStatus::Acquired,
-            owner: request.owner.clone(),
-            acquired_at: std::time::SystemTime::now(),
-            expires_at: std::time::SystemTime::now() + request.ttl,
-            last_refreshed: std::time::SystemTime::now(),
-            metadata: request.metadata.clone(),
-            priority: request.priority,
-            wait_start_time: None,
-        };
-        Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+                let lock_info = LockInfo {
+                    id: lock_id,
+                    resource: request.resource.clone(),
+                    lock_type: LockType::Shared,
+                    status: crate::types::LockStatus::Acquired,
+                    owner: request.owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + request.ttl,
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: request.metadata.clone(),
+                    priority: request.priority,
+                    wait_start_time: None,
+                };
+                Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+            }
+            Err(crate::fast_lock::LockResult::Timeout) => {
+                Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout))
+            }
+            Err(crate::fast_lock::LockResult::Conflict {
+                current_owner,
+                current_mode,
+            }) => Ok(LockResponse::failure(
+                format!("Lock conflict: resource held by {} in {:?} mode", current_owner, current_mode),
+                std::time::Duration::ZERO,
+            )),
+            Err(crate::fast_lock::LockResult::Acquired) => {
+                unreachable!("Acquired should not be an error")
+            }
+        }
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
@@ -132,14 +162,18 @@ impl LockClient for LocalClient {
 
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>> {
         let guards = self.guard_storage.read().await;
-        if guards.contains_key(lock_id) {
+        if let Some(guard) = guards.get(lock_id) {
             // We have an active guard for this lock
+            let lock_type = match guard.mode() {
+                crate::fast_lock::types::LockMode::Shared => crate::types::LockType::Shared,
+                crate::fast_lock::types::LockMode::Exclusive => crate::types::LockType::Exclusive,
+            };
             Ok(Some(LockInfo {
                 id: lock_id.clone(),
                 resource: lock_id.resource.clone(),
-                lock_type: crate::types::LockType::Exclusive, // Simplified - could track actual type
+                lock_type,
                 status: crate::types::LockStatus::Acquired,
-                owner: "local_client".to_string(), // Simplified - could track actual owner
+                owner: guard.owner().to_string(),
                 acquired_at: std::time::SystemTime::now(),
                 expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
                 last_refreshed: std::time::SystemTime::now(),

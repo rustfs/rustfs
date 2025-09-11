@@ -97,6 +97,7 @@ impl AtomicLockState {
                 .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                self.update_access_time();
                 return true;
             }
         }
@@ -118,6 +119,7 @@ impl AtomicLockState {
                 .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                self.update_access_time();
                 return true;
             }
         }
@@ -228,7 +230,7 @@ impl AtomicLockState {
         self.last_accessed.load(Ordering::Relaxed)
     }
 
-    fn update_access_time(&self) {
+    pub fn update_access_time(&self) {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         self.last_accessed.store(now, Ordering::Relaxed);
     }
@@ -284,6 +286,7 @@ impl ObjectLockState {
     /// Try fast path shared lock acquisition
     pub fn try_acquire_shared_fast(&self, owner: &Arc<str>) -> bool {
         if self.atomic_state.try_acquire_shared() {
+            self.atomic_state.update_access_time();
             let mut shared = self.shared_owners.write();
             shared.insert(owner.clone());
             true
@@ -295,6 +298,7 @@ impl ObjectLockState {
     /// Try fast path exclusive lock acquisition
     pub fn try_acquire_exclusive_fast(&self, owner: &Arc<str>) -> bool {
         if self.atomic_state.try_acquire_exclusive() {
+            self.atomic_state.update_access_time();
             let mut current = self.current_owner.write();
             *current = Some(owner.clone());
             true

@@ -2326,7 +2326,10 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        info!("SetDisks heal_object");
+        info!(
+            "SetDisks heal_object: bucket={}, object={}, version_id={}, opts={:?}",
+            bucket, object, version_id, opts
+        );
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
             bucket: bucket.to_string(),
@@ -2337,13 +2340,31 @@ impl SetDisks {
         };
 
         let _write_lock_guard = if !opts.no_lock {
-            Some(
-                self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal operation: {:?}", e)))?,
-            )
+            info!("Acquiring write lock for object: {}, owner: {}", object, self.locker_owner);
+
+            // Check if lock is already held
+            let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
+            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
+                warn!("Lock already exists for object {}: {:?}", object, lock_info);
+            } else {
+                info!("No existing lock found for object {}", object);
+            }
+
+            let start_time = std::time::Instant::now();
+            let lock_result = self
+                .fast_lock_manager
+                .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                .await
+                .map_err(|e| {
+                    let elapsed = start_time.elapsed();
+                    error!("Failed to acquire write lock for heal operation after {:?}: {:?}", elapsed, e);
+                    DiskError::other(format!("Failed to acquire write lock for heal operation: {:?}", e))
+                })?;
+            let elapsed = start_time.elapsed();
+            info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
+            Some(lock_result)
         } else {
+            info!("Skipping lock acquisition (no_lock=true)");
             None
         };
 
@@ -2358,6 +2379,7 @@ impl SetDisks {
         let disks = { self.disks.read().await.clone() };
 
         let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+        info!("Read file info: parts_metadata.len()={}, errs={:?}", parts_metadata.len(), errs);
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -2376,6 +2398,7 @@ impl SetDisks {
             ));
         }
 
+        info!("About to call object_quorum_from_meta with parts_metadata.len()={}", parts_metadata.len());
         match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count) {
             Ok((read_quorum, _)) => {
                 result.parity_blocks = result.disk_count - read_quorum as usize;
@@ -2483,12 +2506,19 @@ impl SetDisks {
                         }
 
                         if disks_to_heal_count == 0 {
+                            info!("No disks to heal, returning early");
                             return Ok((result, None));
                         }
 
                         if opts.dry_run {
+                            info!("Dry run mode, returning early");
                             return Ok((result, None));
                         }
+
+                        info!(
+                            "Proceeding with heal: disks_to_heal_count={}, dry_run={}",
+                            disks_to_heal_count, opts.dry_run
+                        );
 
                         if !latest_meta.deleted && disks_to_heal_count > latest_meta.erasure.parity_blocks {
                             error!(
@@ -2615,6 +2645,11 @@ impl SetDisks {
                         let src_data_dir = latest_meta.data_dir.unwrap().to_string();
                         let dst_data_dir = latest_meta.data_dir.unwrap();
 
+                        info!(
+                            "Checking heal conditions: deleted={}, is_remote={}",
+                            latest_meta.deleted,
+                            latest_meta.is_remote()
+                        );
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let erasure_info = latest_meta.erasure;
                             for part in latest_meta.parts.iter() {
@@ -2667,19 +2702,30 @@ impl SetDisks {
                                         false
                                     }
                                 };
-                                // write to all disks
-                                for disk in self.disks.read().await.iter() {
-                                    let writer = create_bitrot_writer(
-                                        is_inline_buffer,
-                                        disk.as_ref(),
-                                        RUSTFS_META_TMP_BUCKET,
-                                        &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
-                                        erasure.shard_file_size(part.size as i64),
-                                        erasure.shard_size(),
-                                        HashAlgorithm::HighwayHash256,
-                                    )
-                                    .await?;
-                                    writers.push(Some(writer));
+                                // create writers for all disk positions, but only for outdated disks
+                                info!(
+                                    "Creating writers: latest_disks len={}, out_dated_disks len={}",
+                                    latest_disks.len(),
+                                    out_dated_disks.len()
+                                );
+                                for (index, disk) in latest_disks.iter().enumerate() {
+                                    if let Some(outdated_disk) = &out_dated_disks[index] {
+                                        info!("Creating writer for index {} (outdated disk)", index);
+                                        let writer = create_bitrot_writer(
+                                            is_inline_buffer,
+                                            Some(outdated_disk),
+                                            RUSTFS_META_TMP_BUCKET,
+                                            &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
+                                            erasure.shard_file_size(part.size as i64),
+                                            erasure.shard_size(),
+                                            HashAlgorithm::HighwayHash256,
+                                        )
+                                        .await?;
+                                        writers.push(Some(writer));
+                                    } else {
+                                        info!("Skipping writer for index {} (not outdated)", index);
+                                        writers.push(None);
+                                    }
 
                                     // if let Some(disk) = disk {
                                     //     // let filewriter = {
@@ -2782,8 +2828,8 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
-                        for (index, disk) in out_dated_disks.iter().enumerate() {
-                            if let Some(disk) = disk {
+                        for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
+                            if let Some(disk) = outdated_disk {
                                 // record the index of the updated disks
                                 parts_metadata[index].erasure.index = index + 1;
                                 // Attempt a rename now from healed data to final location.
@@ -5699,6 +5745,11 @@ async fn disks_with_all_parts(
     object: &str,
     scan_mode: HealScanMode,
 ) -> disk::error::Result<(Vec<Option<DiskStore>>, HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
+    info!(
+        "disks_with_all_parts: starting with online_disks.len()={}, scan_mode={:?}",
+        online_disks.len(),
+        scan_mode
+    );
     let mut available_disks = vec![None; online_disks.len()];
     let mut data_errs_by_disk: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..online_disks.len() {
