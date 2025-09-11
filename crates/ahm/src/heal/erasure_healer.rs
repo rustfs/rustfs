@@ -248,11 +248,32 @@ impl ErasureSetHealer {
                 .set_current_item(Some(bucket.to_string()), Some(object.clone()))
                 .await?;
 
+            // Check if object still exists before attempting heal
+            let object_exists = match self.storage.object_exists(bucket, object).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    warn!("Failed to check existence of {}/{}: {}, skipping", bucket, object, e);
+                    *current_object_index = obj_idx + 1;
+                    continue;
+                }
+            };
+
+            if !object_exists {
+                info!(
+                    "Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
+                    bucket, object
+                );
+                checkpoint_manager.add_processed_object(object.clone()).await?;
+                *successful_objects += 1; // Treat as successful - object is gone as intended
+                *current_object_index = obj_idx + 1;
+                continue;
+            }
+
             // heal object
             let heal_opts = HealOpts {
                 scan_mode: HealScanMode::Normal,
                 remove: true,
-                recreate: true,
+                recreate: true, // Keep recreate enabled for legitimate heal scenarios
                 ..Default::default()
             };
 
