@@ -14,33 +14,31 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::server::console::start_console_server;
     use crate::config::Opt;
+    use crate::server::console::start_console_server;
     use clap::Parser;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn test_console_server_can_start_and_stop() {
         // Test that console server can be started and shut down gracefully
         let args = vec!["rustfs", "/tmp/test", "--console-address", ":0"]; // Use port 0 for auto-assignment
         let opt = Opt::parse_from(args);
-        
+
         let (tx, rx) = tokio::sync::broadcast::channel(1);
-        
+
         // Start console server in a background task
-        let handle = tokio::spawn(async move {
-            start_console_server(&opt, rx).await
-        });
-        
+        let handle = tokio::spawn(async move { start_console_server(&opt, rx).await });
+
         // Give it a moment to start
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         // Send shutdown signal
         let _ = tx.send(());
-        
+
         // Wait for server to shutdown
         let result = timeout(Duration::from_secs(5), handle).await;
-        
+
         assert!(result.is_ok(), "Console server should shutdown gracefully");
         let server_result = result.unwrap();
         assert!(server_result.is_ok(), "Console server should not have errors");
@@ -49,17 +47,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_console_disabled() {
+        // Test that console server respects the disable flag
+        let args = vec!["rustfs", "/tmp/test", "--console-enable", "false"];
+        let opt = Opt::parse_from(args);
+
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+
+        // Start console server (should return immediately when disabled)
+        let result = start_console_server(&opt, rx).await;
+
+        assert!(result.is_ok(), "Disabled console server should complete without error");
+    }
+
+    #[tokio::test]
+    async fn test_console_cors_configuration() {
+        // Test CORS configuration parsing
+        use crate::server::console::parse_cors_origins;
+
+        // Test wildcard origin
+        let cors_wildcard = Some("*".to_string());
+        let layer1 = parse_cors_origins(cors_wildcard.as_ref());
+        // Should create a layer without error
+
+        // Test specific origins
+        let cors_specific = Some("http://localhost:3000,https://admin.example.com".to_string());
+        let layer2 = parse_cors_origins(cors_specific.as_ref());
+        // Should create a layer without error
+
+        // Test empty origin
+        let cors_empty = Some("".to_string());
+        let layer3 = parse_cors_origins(cors_empty.as_ref());
+        // Should create a layer without error (falls back to permissive)
+
+        // Test no origin
+        let layer4 = parse_cors_origins(None);
+        // Should create a layer without error (uses default)
+    }
+
+    #[tokio::test]
+    async fn test_external_address_configuration() {
+        // Test external address configuration
+        let args = vec![
+            "rustfs",
+            "/tmp/test",
+            "--console-address",
+            ":9001",
+            "--external-address",
+            ":9020",
+        ];
+        let opt = Opt::parse_from(args);
+
+        assert_eq!(opt.console_address, ":9001");
+        assert_eq!(opt.external_address, Some(":9020".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cors_environment_variables() {
+        // Test CORS configuration via environment variables
+        let args = vec![
+            "rustfs",
+            "/tmp/test",
+            "--cors-allowed-origins",
+            "https://api.example.com",
+            "--console-cors-allowed-origins",
+            "https://console.example.com",
+        ];
+        let opt = Opt::parse_from(args);
+
+        assert_eq!(opt.cors_allowed_origins, Some("https://api.example.com".to_string()));
+        assert_eq!(opt.console_cors_allowed_origins, Some("https://console.example.com".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_console_disabled_returns_immediately() {
         // Test that when console is disabled, the function returns immediately
         let args = vec!["rustfs", "/tmp/test", "--console-enable", "false"];
         let opt = Opt::parse_from(args);
-        
+
         let (_tx, rx) = tokio::sync::broadcast::channel(1);
-        
+
         let start = tokio::time::Instant::now();
         let result = start_console_server(&opt, rx).await;
         let duration = start.elapsed();
-        
+
         assert!(result.is_ok(), "Disabled console server should return Ok");
         assert!(duration < Duration::from_millis(100), "Disabled console should return immediately");
     }

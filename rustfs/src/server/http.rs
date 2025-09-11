@@ -46,11 +46,67 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 
 const MI_B: usize = 1024 * 1024;
+
+/// Parse CORS allowed origins from configuration
+fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
+    use http::Method;
+
+    let cors_layer = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::header::ACCEPT,
+            http::header::ORIGIN,
+            http::header::X_REQUESTED_WITH,
+            http::header::CACHE_CONTROL,
+            http::header::X_AMZ_CONTENT_SHA256,
+            http::header::X_AMZ_DATE,
+            http::header::X_AMZ_SECURITY_TOKEN,
+            http::header::X_AMZ_USER_AGENT,
+            http::header::RANGE,
+        ]);
+
+    match origins {
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any),
+        Some(origins_str) => {
+            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
+            if origins.is_empty() {
+                warn!("Empty CORS origins provided, using permissive CORS");
+                cors_layer.allow_origin(Any)
+            } else {
+                let parsed_origins: Result<Vec<_>, _> = origins.into_iter().map(|origin| origin.parse()).collect();
+
+                match parsed_origins {
+                    Ok(valid_origins) => {
+                        info!("Endpoint CORS origins configured: {:?}", valid_origins);
+                        cors_layer.allow_origin(AllowOrigin::list(valid_origins))
+                    }
+                    Err(e) => {
+                        warn!("Invalid CORS origins provided ({}), using permissive CORS", e);
+                        cors_layer.allow_origin(Any)
+                    }
+                }
+            }
+        }
+        None => {
+            debug!("No CORS origins configured for endpoint, using permissive CORS");
+            cors_layer.allow_origin(Any)
+        }
+    }
+}
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -172,7 +228,13 @@ pub async fn start_http_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
+    // Capture CORS configuration for the server loop
+    let cors_allowed_origins = opt.cors_allowed_origins.clone();
+
     tokio::spawn(async move {
+        // Create CORS layer inside the server loop closure
+        let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
+
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
             use tokio::signal::unix::{SignalKind, signal};
@@ -259,7 +321,14 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(socket, tls_acceptor.clone(), http_server.clone(), s3_service.clone(), graceful.clone());
+            process_connection(
+                socket,
+                tls_acceptor.clone(),
+                http_server.clone(),
+                s3_service.clone(),
+                graceful.clone(),
+                cors_layer.clone(),
+            );
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -366,6 +435,7 @@ fn process_connection(
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
     graceful: Arc<GracefulShutdown>,
+    cors_layer: CorsLayer,
 ) {
     tokio::spawn(async move {
         // Build services inside each connected task to avoid passing complex service types across tasks,
@@ -417,7 +487,7 @@ fn process_connection(
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
-            .layer(CorsLayer::permissive())
+            .layer(cors_layer)
             .layer(RedirectLayer)
             .service(service);
         let hybrid_service = TowerToHyperService::new(hybrid_service);

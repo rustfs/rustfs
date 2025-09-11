@@ -76,8 +76,20 @@ pub struct Opt {
     pub console_address: String,
 
     /// External address for console to access endpoint (used in Docker deployments)
+    /// This should match the mapped host port when using Docker port mapping
+    /// Example: ":9020" when mapping host port 9020 to container port 9000
     #[arg(long, env = "RUSTFS_EXTERNAL_ADDRESS")]
     pub external_address: Option<String>,
+
+    /// CORS allowed origins for the endpoint service
+    /// Comma-separated list of origins or "*" for all origins
+    #[arg(long, env = "RUSTFS_CORS_ALLOWED_ORIGINS")]
+    pub cors_allowed_origins: Option<String>,
+
+    /// CORS allowed origins for the console service
+    /// Comma-separated list of origins or "*" for all origins
+    #[arg(long, env = "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS")]
+    pub console_cors_allowed_origins: Option<String>,
 
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]

@@ -22,7 +22,7 @@ mod tests {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
         let opt = Opt::parse_from(args);
-        
+
         assert_eq!(opt.console_enable, true);
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.external_address, None);
@@ -35,12 +35,15 @@ mod tests {
         let args = vec![
             "rustfs",
             "/test/volume",
-            "--console-address", ":8080",
-            "--address", ":8000",
-            "--console-enable", "false"
+            "--console-address",
+            ":8080",
+            "--address",
+            ":8000",
+            "--console-enable",
+            "false",
         ];
         let opt = Opt::parse_from(args);
-        
+
         assert_eq!(opt.console_enable, false);
         assert_eq!(opt.console_address, ":8080");
         assert_eq!(opt.address, ":8000");
@@ -49,13 +52,9 @@ mod tests {
     #[test]
     fn test_external_address_configuration() {
         // Test external address configuration for Docker
-        let args = vec![
-            "rustfs",
-            "/test/volume",
-            "--external-address", ":9020"
-        ];
+        let args = vec!["rustfs", "/test/volume", "--external-address", ":9020"];
         let opt = Opt::parse_from(args);
-        
+
         assert_eq!(opt.external_address, Some(":9020".to_string()));
     }
 
@@ -64,11 +63,15 @@ mod tests {
         // Ensure console and endpoint use different default ports
         let args = vec!["rustfs", "/test/volume"];
         let opt = Opt::parse_from(args);
-        
+
         // Parse port numbers from addresses
         let endpoint_port: u16 = opt.address.trim_start_matches(':').parse().expect("Invalid endpoint port");
-        let console_port: u16 = opt.console_address.trim_start_matches(':').parse().expect("Invalid console port");
-        
+        let console_port: u16 = opt
+            .console_address
+            .trim_start_matches(':')
+            .parse()
+            .expect("Invalid console port");
+
         assert_ne!(endpoint_port, console_port, "Console and endpoint should use different ports");
         assert_eq!(endpoint_port, 9000);
         assert_eq!(console_port, 9001);
