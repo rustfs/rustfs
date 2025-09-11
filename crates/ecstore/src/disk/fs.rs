@@ -12,12 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs::Metadata, path::Path};
+use std::{fs::Metadata, path::Path, sync::OnceLock};
 
 use tokio::{
     fs::{self, File},
     io,
 };
+
+static READONLY_OPTIONS: OnceLock<fs::OpenOptions> = OnceLock::new();
+static WRITEONLY_OPTIONS: OnceLock<fs::OpenOptions> = OnceLock::new();
+static READWRITE_OPTIONS: OnceLock<fs::OpenOptions> = OnceLock::new();
+
+fn get_readonly_options() -> &'static fs::OpenOptions {
+    READONLY_OPTIONS.get_or_init(|| {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        opts
+    })
+}
+
+fn get_writeonly_options() -> &'static fs::OpenOptions {
+    WRITEONLY_OPTIONS.get_or_init(|| {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true);
+        opts
+    })
+}
+
+fn get_readwrite_options() -> &'static fs::OpenOptions {
+    READWRITE_OPTIONS.get_or_init(|| {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true);
+        opts
+    })
+}
 
 #[cfg(not(windows))]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
@@ -84,35 +112,28 @@ pub const O_APPEND: FileMode = 0x00400;
 //     create_new: bool,
 
 pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
-    let mut opts = fs::OpenOptions::new();
-
-    match mode & (O_RDONLY | O_WRONLY | O_RDWR) {
-        O_RDONLY => {
-            opts.read(true);
-        }
-        O_WRONLY => {
-            opts.write(true);
-        }
-        O_RDWR => {
-            opts.read(true);
-            opts.write(true);
-        }
-        _ => (),
+    let base_opts = match mode & (O_RDONLY | O_WRONLY | O_RDWR) {
+        O_RDONLY => get_readonly_options(),
+        O_WRONLY => get_writeonly_options(),
+        O_RDWR => get_readwrite_options(),
+        _ => get_readonly_options(),
     };
 
-    if mode & O_CREATE != 0 {
-        opts.create(true);
+    if (mode & (O_CREATE | O_APPEND | O_TRUNC)) != 0 {
+        let mut opts = base_opts.clone();
+        if mode & O_CREATE != 0 {
+            opts.create(true);
+        }
+        if mode & O_APPEND != 0 {
+            opts.append(true);
+        }
+        if mode & O_TRUNC != 0 {
+            opts.truncate(true);
+        }
+        opts.open(path.as_ref()).await
+    } else {
+        base_opts.open(path.as_ref()).await
     }
-
-    if mode & O_APPEND != 0 {
-        opts.append(true);
-    }
-
-    if mode & O_TRUNC != 0 {
-        opts.truncate(true);
-    }
-
-    opts.open(path.as_ref()).await
 }
 
 pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {
@@ -121,7 +142,7 @@ pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub fn access_std(path: impl AsRef<Path>) -> io::Result<()> {
-    tokio::task::block_in_place(|| std::fs::metadata(path))?;
+    std::fs::metadata(path)?;
     Ok(())
 }
 
@@ -130,7 +151,7 @@ pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
 }
 
 pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    tokio::task::block_in_place(|| std::fs::metadata(path))
+    std::fs::metadata(path)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
@@ -159,26 +180,22 @@ pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
-    tokio::task::block_in_place(|| {
-        let meta = std::fs::metadata(path)?;
-        if meta.is_dir() {
-            std::fs::remove_dir(path)
-        } else {
-            std::fs::remove_file(path)
-        }
-    })
+    let meta = std::fs::metadata(path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
-    tokio::task::block_in_place(|| {
-        let meta = std::fs::metadata(path)?;
-        if meta.is_dir() {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        }
-    })
+    let meta = std::fs::metadata(path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
@@ -190,7 +207,7 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
 }
 
 pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-    tokio::task::block_in_place(|| std::fs::rename(from, to))
+    std::fs::rename(from, to)
 }
 
 #[tracing::instrument(level = "debug", skip_all)]

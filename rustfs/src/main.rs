@@ -18,6 +18,7 @@ mod config;
 mod error;
 // mod grpc;
 pub mod license;
+mod profiling;
 mod server;
 mod storage;
 mod update;
@@ -94,6 +95,9 @@ async fn main() -> Result<()> {
     // Store in global storage
     set_global_guard(guard).map_err(Error::other)?;
 
+    // Initialize performance profiling if enabled
+    profiling::start_profiling_if_enabled();
+
     // Run parameters
     run(opt).await
 }
@@ -102,10 +106,12 @@ async fn main() -> Result<()> {
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
-    // Initialize global DNS resolver early for enhanced DNS resolution
-    if let Err(e) = init_global_dns_resolver().await {
-        warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
-    }
+    // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
+    let dns_init = tokio::spawn(async {
+        if let Err(e) = init_global_dns_resolver().await {
+            warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
+        }
+    });
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -176,6 +182,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize event notifier
     init_event_notifier().await;
 
+    // Wait for DNS initialization to complete before network-heavy operations
+    dns_init.await.map_err(Error::other)?;
+
     let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -187,14 +196,31 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    // Initialize the bucket metadata system
-    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
+    // Parallelize initialization tasks for better network performance
+    let bucket_metadata_task = tokio::spawn({
+        let store = store.clone();
+        let buckets = buckets.clone();
+        async move {
+            init_bucket_metadata_sys(store, buckets).await;
+        }
+    });
 
-    // Initialize the IAM system
-    init_iam_sys(store.clone()).await?;
+    let iam_init_task = tokio::spawn({
+        let store = store.clone();
+        async move { init_iam_sys(store).await }
+    });
 
-    // add bucket notification configuration
-    add_bucket_notification_configuration(buckets).await;
+    let notification_config_task = tokio::spawn({
+        let buckets = buckets.clone();
+        async move {
+            add_bucket_notification_configuration(buckets).await;
+        }
+    });
+
+    // Wait for all parallel initialization tasks to complete
+    bucket_metadata_task.await.map_err(Error::other)?;
+    iam_init_task.await.map_err(Error::other)??;
+    notification_config_task.await.map_err(Error::other)?;
 
     // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
@@ -239,12 +265,13 @@ async fn run(opt: config::Opt) -> Result<()> {
     // initialize bucket replication pool
     init_bucket_replication_pool().await;
 
-    // Async update check (optional)
+    // Async update check with timeout (optional)
     tokio::spawn(async {
         use crate::update::{UpdateCheckError, check_updates};
 
-        match check_updates().await {
-            Ok(result) => {
+        // Add timeout to prevent hanging network calls
+        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+            Ok(Ok(result)) => {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
@@ -262,11 +289,14 @@ async fn run(opt: config::Opt) -> Result<()> {
                     debug!("✅ Version check: Current version is up to date: {}", result.current_version);
                 }
             }
-            Err(UpdateCheckError::HttpError(e)) => {
+            Ok(Err(UpdateCheckError::HttpError(e))) => {
                 debug!("Version check: network error (this is normal): {}", e);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!("Version check: failed (this is normal): {}", e);
+            }
+            Err(_) => {
+                debug!("Version check: timeout after 30 seconds (this is normal)");
             }
         }
     });
@@ -364,14 +394,12 @@ async fn init_event_notifier() {
     info!("Event notifier configuration found, proceeding with initialization.");
 
     // 3. Initialize the notification system asynchronously with a global configuration
-    // Put it into a separate task to avoid blocking the main initialization process
-    tokio::spawn(async move {
-        if let Err(e) = rustfs_notify::initialize(server_config).await {
-            error!("Failed to initialize event notifier system: {}", e);
-        } else {
-            info!("Event notifier system initialized successfully.");
-        }
-    });
+    // Use direct await for better error handling and faster initialization
+    if let Err(e) = rustfs_notify::initialize(server_config).await {
+        error!("Failed to initialize event notifier system: {}", e);
+    } else {
+        info!("Event notifier system initialized successfully.");
+    }
 }
 
 #[instrument(skip_all)]
