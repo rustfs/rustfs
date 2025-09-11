@@ -22,8 +22,8 @@ pub mod namespace;
 // Abstraction Layer Modules
 pub mod client;
 
-// Local Layer Modules
-pub mod local;
+// Fast Lock System (New High-Performance Implementation)
+pub mod fast_lock;
 
 // Core Modules
 pub mod error;
@@ -40,8 +40,12 @@ pub use crate::{
     client::{LockClient, local::LocalClient, remote::RemoteClient},
     // Error types
     error::{LockError, Result},
+    // Fast Lock System exports
+    fast_lock::{
+        BatchLockRequest, BatchLockResult, FastLockGuard, FastObjectLockManager, LockMode, LockResult, ObjectKey,
+        ObjectLockRequest,
+    },
     guard::LockGuard,
-    local::LocalLockMap,
     // Main components
     namespace::{NamespaceLock, NamespaceLockManager},
     // Core types
@@ -65,18 +69,20 @@ pub const BUILD_TIMESTAMP: &str = "unknown";
 pub const MAX_DELETE_LIST: usize = 1000;
 
 // ============================================================================
-// Global Lock Map
+// Global FastLock Manager
 // ============================================================================
 
-// Global singleton lock map shared across all lock implementations
+// Global singleton FastLock manager shared across all lock implementations
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
-static GLOBAL_LOCK_MAP: OnceCell<Arc<local::LocalLockMap>> = OnceCell::new();
+static GLOBAL_FAST_LOCK_MANAGER: OnceCell<Arc<fast_lock::FastObjectLockManager>> = OnceCell::new();
 
-/// Get the global shared lock map instance
-pub fn get_global_lock_map() -> Arc<local::LocalLockMap> {
-    GLOBAL_LOCK_MAP.get_or_init(|| Arc::new(local::LocalLockMap::new())).clone()
+/// Get the global shared FastLock manager instance
+pub fn get_global_fast_lock_manager() -> Arc<fast_lock::FastObjectLockManager> {
+    GLOBAL_FAST_LOCK_MANAGER
+        .get_or_init(|| Arc::new(fast_lock::FastObjectLockManager::new()))
+        .clone()
 }
 
 // ============================================================================
