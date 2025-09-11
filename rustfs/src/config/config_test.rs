@@ -25,7 +25,7 @@ mod tests {
 
         assert_eq!(opt.console_enable, true);
         assert_eq!(opt.console_address, ":9001");
-        assert_eq!(opt.external_address, None);
+        assert_eq!(opt.external_address, ":9000"); // Now defaults to DEFAULT_ADDRESS
         assert_eq!(opt.address, ":9000");
     }
 
@@ -55,7 +55,7 @@ mod tests {
         let args = vec!["rustfs", "/test/volume", "--external-address", ":9020"];
         let opt = Opt::parse_from(args);
 
-        assert_eq!(opt.external_address, Some(":9020".to_string()));
+        assert_eq!(opt.external_address, ":9020".to_string());
     }
 
     #[test]

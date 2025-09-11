@@ -102,7 +102,7 @@ mod tests {
         let opt = Opt::parse_from(args);
 
         assert_eq!(opt.console_address, ":9001");
-        assert_eq!(opt.external_address, Some(":9020".to_string()));
+        assert_eq!(opt.external_address, ":9020".to_string());
     }
 
     #[tokio::test]
@@ -140,22 +140,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_console_tls_configuration() {
-        // Test TLS configuration options
+        // Test TLS configuration options (now uses shared tls_path)
         let args = vec![
             "rustfs",
             "/tmp/test",
-            "--console-tls-enable",
-            "true",
-            "--console-tls-cert",
-            "/path/to/cert.pem",
-            "--console-tls-key",
-            "/path/to/key.pem",
+            "--tls-path",
+            "/path/to/tls",
         ];
         let opt = Opt::parse_from(args);
 
-        assert_eq!(opt.console_tls_enable, true);
-        assert_eq!(opt.console_tls_cert, Some("/path/to/cert.pem".to_string()));
-        assert_eq!(opt.console_tls_key, Some("/path/to/key.pem".to_string()));
+        assert_eq!(opt.tls_path, Some("/path/to/tls".to_string()));
     }
 
     #[tokio::test]
@@ -233,7 +227,7 @@ mod tests {
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.console_cors_allowed_origins, Some("http://localhost:3000,https://admin.example.com".to_string()));
-        assert_eq!(opt.external_address, Some(":9020".to_string()));
+        assert_eq!(opt.external_address, ":9020".to_string());
     }
 
     #[tokio::test] 

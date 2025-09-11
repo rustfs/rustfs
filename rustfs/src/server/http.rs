@@ -70,8 +70,6 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
             http::header::AUTHORIZATION,
             http::header::ACCEPT,
             http::header::ORIGIN,
-            http::header::X_REQUESTED_WITH,
-            http::header::CACHE_CONTROL,
             // Note: X_AMZ_* headers are custom and may need to be defined
             // http::header::X_AMZ_CONTENT_SHA256,
             // http::header::X_AMZ_DATE,
@@ -93,9 +91,7 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
                 for origin in origins {
                     match origin.parse::<http::HeaderValue>() {
                         Ok(header_value) => {
-                            if let Ok(uri) = header_value.to_str().unwrap_or("").parse::<http::Uri>() {
-                                valid_origins.push(uri);
-                            }
+                            valid_origins.push(header_value);
                         }
                         Err(e) => {
                             warn!("Invalid CORS origin '{}': {}", origin, e);
