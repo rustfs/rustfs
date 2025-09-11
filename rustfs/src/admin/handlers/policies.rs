@@ -319,10 +319,6 @@ impl Operation for SetPolicyForUserOrGroup {
             }
         };
 
-        if query.policy_name.is_empty() {
-            return Err(s3_error!(InvalidArgument, "policy name is empty"));
-        }
-
         if query.user_or_group.is_empty() {
             return Err(s3_error!(InvalidArgument, "user or group is empty"));
         }
