@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, get_host_ip_async, is_local_host};
+use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use tracing::{error, instrument, warn};
 
 use crate::{
@@ -248,8 +248,7 @@ impl PoolEndpointList {
                         Ok(ips) => ips,
                         Err(e) => {
                             error!("host {} not found, error:{}", host, e);
-                            get_host_ip_async(host.clone())
-                                .map_err(|e| Error::other(format!("host '{host}' cannot resolve: {e}")))?
+                            return Err(Error::other(format!("host '{host}' cannot resolve: {e}")));
                         }
                     };
                     host_ip_cache.insert(host.clone(), ips);

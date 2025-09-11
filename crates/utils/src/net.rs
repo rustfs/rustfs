@@ -16,16 +16,39 @@ use bytes::Bytes;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use std::net::Ipv6Addr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Display,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
+    time::{Duration, Instant},
 };
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 
 static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(|| must_get_local_ips().unwrap());
+
+#[derive(Debug, Clone)]
+struct DnsCacheEntry {
+    ips: HashSet<IpAddr>,
+    cached_at: Instant,
+}
+
+impl DnsCacheEntry {
+    fn new(ips: HashSet<IpAddr>) -> Self {
+        Self {
+            ips,
+            cached_at: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self, ttl: Duration) -> bool {
+        self.cached_at.elapsed() > ttl
+    }
+}
+
+static DNS_CACHE: LazyLock<Mutex<HashMap<String, DnsCacheEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 /// helper for validating if the provided arg is an ip address.
 pub fn is_socket_addr(addr: &str) -> bool {
@@ -87,19 +110,19 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 }
 
 /// returns IP address of given host using layered DNS resolution.
-pub fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
+///
+/// This is the async version of `get_host_ip()` that provides enhanced DNS resolution
+/// with Kubernetes support when the "net" feature is enabled.
+pub async fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
             #[cfg(feature = "net")]
             {
                 use crate::dns_resolver::resolve_domain;
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    match resolve_domain(domain).await {
-                        Ok(ips) => Ok(ips.into_iter().collect()),
-                        Err(e) => Err(std::io::Error::other(format!("DNS resolution failed: {}", e))),
-                    }
-                })
+                match resolve_domain(domain).await {
+                    Ok(ips) => Ok(ips.into_iter().collect()),
+                    Err(e) => Err(std::io::Error::other(format!("DNS resolution failed: {}", e))),
+                }
             }
             #[cfg(not(feature = "net"))]
             {
@@ -128,17 +151,41 @@ pub fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
 
 /// returns IP address of given host using standard resolution.
 ///
-/// **Note**: This function uses standard library DNS resolution.
+/// **Note**: This function uses standard library DNS resolution with caching.
 /// For enhanced DNS resolution with Kubernetes support, use `get_host_ip_async()`.
 pub fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
-        Host::Domain(domain) => match (domain, 0)
-            .to_socket_addrs()
-            .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
-        {
-            Ok(ips) => Ok(ips),
-            Err(err) => Err(std::io::Error::other(err)),
-        },
+        Host::Domain(domain) => {
+            // Check cache first
+            if let Ok(mut cache) = DNS_CACHE.lock() {
+                if let Some(entry) = cache.get(domain) {
+                    if !entry.is_expired(DNS_CACHE_TTL) {
+                        return Ok(entry.ips.clone());
+                    }
+                    // Remove expired entry
+                    cache.remove(domain);
+                }
+            }
+
+            // Perform DNS resolution
+            match (domain, 0)
+                .to_socket_addrs()
+                .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
+            {
+                Ok(ips) => {
+                    // Cache the result
+                    if let Ok(mut cache) = DNS_CACHE.lock() {
+                        cache.insert(domain.to_string(), DnsCacheEntry::new(ips.clone()));
+                        // Limit cache size to prevent memory bloat
+                        if cache.len() > 1000 {
+                            cache.retain(|_, v| !v.is_expired(DNS_CACHE_TTL));
+                        }
+                    }
+                    Ok(ips)
+                }
+                Err(err) => Err(std::io::Error::other(err)),
+            }
+        }
         Host::Ipv4(ip) => {
             let mut set = HashSet::with_capacity(1);
             set.insert(IpAddr::V4(ip));

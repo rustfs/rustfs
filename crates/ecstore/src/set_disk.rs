@@ -15,6 +15,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::versioning::VersioningApi;
@@ -232,7 +233,10 @@ impl SetDisks {
             });
         }
 
-        let results = join_all(futures).await;
+        // Use optimized batch processor for disk info retrieval
+        let processor = get_global_processors().metadata_processor();
+        let results = processor.execute_batch(futures).await;
+
         for result in results {
             match result {
                 Ok(res) => {
@@ -507,21 +511,28 @@ impl SetDisks {
 
     #[tracing::instrument(skip(disks))]
     async fn cleanup_multipart_path(disks: &[Option<DiskStore>], paths: &[String]) {
-        let mut futures = Vec::with_capacity(disks.len());
-
         let mut errs = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, paths).await
-                } else {
-                    Err(DiskError::DiskNotFound)
+        // Use improved simple batch processor instead of join_all for better performance
+        let processor = get_global_processors().write_processor();
+
+        let tasks: Vec<_> = disks
+            .iter()
+            .map(|disk| {
+                let disk = disk.clone();
+                let paths = paths.to_vec();
+
+                async move {
+                    if let Some(disk) = disk {
+                        disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, &paths).await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
                 }
             })
-        }
+            .collect();
 
-        let results = join_all(futures).await;
+        let results = processor.execute_batch(tasks).await;
         for result in results {
             match result {
                 Ok(_) => {
@@ -545,21 +556,32 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let mut futures = Vec::with_capacity(disks.len());
-        for (i, disk) in disks.iter().enumerate() {
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.read_parts(bucket, part_meta_paths).await
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
-            });
-        }
-
         let mut errs = Vec::with_capacity(disks.len());
         let mut object_parts = Vec::with_capacity(disks.len());
 
-        let results = join_all(futures).await;
+        // Use batch processor for better performance
+        let processor = get_global_processors().read_processor();
+        let bucket = bucket.to_string();
+        let part_meta_paths = part_meta_paths.to_vec();
+
+        let tasks: Vec<_> = disks
+            .iter()
+            .map(|disk| {
+                let disk = disk.clone();
+                let bucket = bucket.clone();
+                let part_meta_paths = part_meta_paths.clone();
+
+                async move {
+                    if let Some(disk) = disk {
+                        disk.read_parts(&bucket, &part_meta_paths).await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
+                }
+            })
+            .collect();
+
+        let results = processor.execute_batch(tasks).await;
         for result in results {
             match result {
                 Ok(res) => {
@@ -1369,20 +1391,69 @@ impl SetDisks {
             })
         });
 
+        // Wait for all tasks to complete
         let results = join_all(futures).await;
+
         for result in results {
-            match result? {
-                Ok(res) => {
-                    ress.push(res);
-                    errors.push(None);
-                }
-                Err(e) => {
+            match result {
+                Ok(res) => match res {
+                    Ok(file_info) => {
+                        ress.push(file_info);
+                        errors.push(None);
+                    }
+                    Err(e) => {
+                        ress.push(FileInfo::default());
+                        errors.push(Some(e));
+                    }
+                },
+                Err(_) => {
                     ress.push(FileInfo::default());
-                    errors.push(Some(e));
+                    errors.push(Some(DiskError::Unexpected));
                 }
             }
         }
         Ok((ress, errors))
+    }
+
+    // Optimized version using batch processor with quorum support
+    pub async fn read_version_optimized(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &ReadOptions,
+    ) -> Result<Vec<rustfs_filemeta::FileInfo>> {
+        // Use existing disk selection logic
+        let disks = self.disks.read().await;
+        let required_reads = self.format.erasure.sets.len();
+
+        // Clone parameters outside the closure to avoid lifetime issues
+        let bucket = bucket.to_string();
+        let object = object.to_string();
+        let version_id = version_id.to_string();
+        let opts = opts.clone();
+
+        let processor = get_global_processors().read_processor();
+        let tasks: Vec<_> = disks
+            .iter()
+            .take(required_reads + 2) // Read a few extra for reliability
+            .filter_map(|disk| {
+                disk.as_ref().map(|d| {
+                    let disk = d.clone();
+                    let bucket = bucket.clone();
+                    let object = object.clone();
+                    let version_id = version_id.clone();
+                    let opts = opts.clone();
+
+                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &opts).await }
+                })
+            })
+            .collect();
+
+        match processor.execute_batch_with_quorum(tasks, required_reads).await {
+            Ok(results) => Ok(results),
+            Err(_) => Err(DiskError::FileNotFound.into()), // Use existing error type
+        }
     }
 
     async fn read_all_xl(
@@ -1403,9 +1474,10 @@ impl SetDisks {
         object: &str,
         read_data: bool,
     ) -> (Vec<Option<RawFileInfo>>, Vec<Option<DiskError>>) {
-        let mut futures = Vec::with_capacity(disks.len());
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
+
+        let mut futures = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
             futures.push(async move {

@@ -214,6 +214,18 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
+        AdminOperation(&handlers::ProfileHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
+        AdminOperation(&handlers::ProfileStatusHandler {}),
+    )?;
+
     Ok(r)
 }
 
