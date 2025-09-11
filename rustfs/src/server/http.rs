@@ -58,7 +58,7 @@ pub async fn start_http_server(
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
-    let server_address = server_addr.to_string();
+    let _server_address = server_addr.to_string();
 
     // The listening address and port are obtained from the parameters
     let listener = {

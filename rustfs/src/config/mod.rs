@@ -17,6 +17,9 @@ use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
+#[cfg(test)]
+mod config_test;
+
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
     if !build::TAG.is_empty() {

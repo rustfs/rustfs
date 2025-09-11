@@ -23,6 +23,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info};
 
+#[cfg(test)]
+mod console_test;
+
 const CONSOLE_PREFIX: &str = "/rustfs/console";
 
 /// Start the standalone console server
