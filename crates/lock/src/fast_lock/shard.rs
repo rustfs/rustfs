@@ -1,4 +1,16 @@
 // Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -220,22 +232,39 @@ impl LockShard {
 
         for request in requests {
             match self.acquire_lock(&request).await {
-                Ok(()) => acquired.push(request.key),
+                Ok(()) => acquired.push((request.key.clone(), request.mode, request.owner.clone())),
                 Err(err) => {
                     failed.push((request.key, err));
 
                     if all_or_nothing {
-                        // Release all acquired locks
-                        for key in &acquired {
-                            self.release_lock(key, &request.owner, request.mode);
+                        // Release all acquired locks using their correct owner and mode
+                        let mut cleanup_failures = 0;
+                        for (key, mode, owner) in &acquired {
+                            if !self.release_lock(key, owner, *mode) {
+                                cleanup_failures += 1;
+                                tracing::warn!(
+                                    "Failed to release lock during batch cleanup in shard: bucket={}, object={}",
+                                    key.bucket,
+                                    key.object
+                                );
+                            }
                         }
+
+                        if cleanup_failures > 0 {
+                            tracing::error!("Shard batch lock cleanup had {} failures", cleanup_failures);
+                        }
+
                         return Err(failed);
                     }
                 }
             }
         }
 
-        if failed.is_empty() { Ok(acquired) } else { Err(failed) }
+        if failed.is_empty() {
+            Ok(acquired.into_iter().map(|(key, _, _)| key).collect())
+        } else {
+            Err(failed)
+        }
     }
 
     /// Get lock information for monitoring
@@ -515,5 +544,32 @@ mod tests {
 
         let acquired = result.unwrap();
         assert_eq!(acquired.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_lock_cleanup_safety() {
+        let shard = LockShard::new(0);
+
+        // First acquire a lock that will block the batch operation
+        let blocking_request = ObjectLockRequest::new_write("bucket", "obj1", "blocking_owner");
+        shard.acquire_lock(&blocking_request).await.unwrap();
+
+        // Now try a batch operation that should fail and clean up properly
+        let requests = vec![
+            ObjectLockRequest::new_read("bucket", "obj2", "batch_owner"), // This should succeed
+            ObjectLockRequest::new_write("bucket", "obj1", "batch_owner"), // This should fail due to existing lock
+        ];
+
+        let result = shard.acquire_locks_batch(requests, true).await;
+        assert!(result.is_err()); // Should fail due to obj1 being locked
+
+        // Verify that obj2 lock was properly cleaned up (no resource leak)
+        let obj2_key = ObjectKey::new("bucket", "obj2");
+        assert!(shard.get_lock_info(&obj2_key).is_none(), "obj2 should not be locked after cleanup");
+
+        // Verify obj1 is still locked by the original owner
+        let obj1_key = ObjectKey::new("bucket", "obj1");
+        let lock_info = shard.get_lock_info(&obj1_key);
+        assert!(lock_info.is_some(), "obj1 should still be locked by blocking_owner");
     }
 }

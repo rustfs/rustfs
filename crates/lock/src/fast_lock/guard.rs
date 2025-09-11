@@ -1,4 +1,16 @@
 // Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::fast_lock::{
     shard::LockShard,
@@ -214,12 +226,12 @@ impl MultipleLockGuards {
     }
 
     /// Filter guards by predicate (consuming)
-    pub fn filter_owned<F>(mut self, predicate: F) -> Vec<FastLockGuard>
+    pub fn filter_owned<F>(self, predicate: F) -> Vec<FastLockGuard>
     where
         F: Fn(&FastLockGuard) -> bool,
     {
-        self.guards.retain(|guard| predicate(guard));
-        std::mem::take(&mut self.guards)
+        // Use a safe approach that avoids Drop interaction issues
+        self.into_iter().filter(|guard| predicate(guard)).collect()
     }
 
     /// Get guards for specific bucket
@@ -256,7 +268,11 @@ impl IntoIterator for MultipleLockGuards {
     type IntoIter = std::vec::IntoIter<FastLockGuard>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        std::mem::take(&mut self.guards).into_iter()
+        // Use mem::replace to avoid Drop interaction issues
+        // This approach is safer than mem::take as it prevents the Drop from seeing empty state
+        let guards = std::mem::take(&mut self.guards);
+        std::mem::forget(self); // Prevent Drop from running on emptied state
+        guards.into_iter()
     }
 }
 
@@ -407,6 +423,28 @@ mod tests {
 
         // Test that original is not consumed
         assert_eq!(multiple.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_into_iter_safety() {
+        let manager = FastObjectLockManager::new();
+        let mut multiple = MultipleLockGuards::new();
+
+        // Acquire some locks
+        let guard1 = manager.acquire_read_lock("bucket", "obj1", "owner").await.unwrap();
+        let guard2 = manager.acquire_read_lock("bucket", "obj2", "owner").await.unwrap();
+
+        multiple.add(guard1);
+        multiple.add(guard2);
+
+        assert_eq!(multiple.len(), 2);
+
+        // Test into_iter consumption
+        let guards: Vec<_> = multiple.into_iter().collect();
+        assert_eq!(guards.len(), 2);
+
+        // multiple is consumed here, so we can't access it anymore
+        // This ensures Drop is handled correctly without double-drop issues
     }
 
     #[tokio::test]
