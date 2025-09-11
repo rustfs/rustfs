@@ -16,6 +16,7 @@
 use http::{HeaderMap, StatusCode};
 //use iam::get_global_action_cred;
 use matchit::Params;
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -26,7 +27,7 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 use crate::{
-    admin::router::Operation,
+    admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
 };
 
@@ -88,8 +89,10 @@ impl Operation for AddTier {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {
@@ -196,8 +199,10 @@ impl Operation for EditTier {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {
@@ -265,6 +270,15 @@ impl Operation for ListTiers {
             }
         };
 
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
@@ -296,11 +310,10 @@ impl Operation for RemoveTier {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        //let sys_cred = get_global_action_cred()
-        //    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut force: bool = false;
         let force_str = query.force.clone().unwrap_or_default();
@@ -360,11 +373,10 @@ impl Operation for VerifyTier {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        //let sys_cred = get_global_action_cred()
-        //    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         tier_config_mgr.verify(&query.tier.unwrap()).await;
@@ -380,6 +392,15 @@ pub struct GetTierInfo {}
 #[async_trait::async_trait]
 impl Operation for GetTierInfo {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddTierQuery =
@@ -423,12 +444,14 @@ impl Operation for ClearTier {
             }
         };
 
-        //let Some(input_cred) = req.credentials else {
-        //    return Err(s3_error!(InvalidRequest, "get cred failed"));
-        //};
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
 
-        //let (cred, _owner) =
-        //    check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut force: bool = false;
         let force_str = query.force;

@@ -18,6 +18,7 @@ mod config;
 mod error;
 // mod grpc;
 pub mod license;
+mod profiling;
 mod server;
 mod storage;
 mod update;
@@ -25,14 +26,14 @@ mod version;
 
 // Ensure the correct path for parse_license is imported
 use crate::admin::handlers::profile::start_profilers;
-use crate::server::{start_http_server, wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
+use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_http_server, wait_for_shutdown};
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::scanner::data_scanner::ScannerConfig;
 use rustfs_ahm::{
-    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services, Scanner,
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
@@ -44,14 +45,14 @@ use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
 use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
+    StorageAPI,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
-    store::init_local_disks,
     store::ECStore,
+    store::init_local_disks,
     update_erasure_type,
-    StorageAPI,
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_notify::global::notifier_instance;
@@ -168,6 +169,9 @@ async fn main() -> Result<()> {
     // Store in global storage
     set_global_guard(guard).map_err(Error::other)?;
 
+    // Initialize performance profiling if enabled
+    profiling::start_profiling_if_enabled();
+
     // Run parameters
     run(opt).await
 }
@@ -176,10 +180,12 @@ async fn main() -> Result<()> {
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
-    // Initialize global DNS resolver early for enhanced DNS resolution
-    if let Err(e) = init_global_dns_resolver().await {
-        warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
-    }
+    // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
+    let dns_init = tokio::spawn(async {
+        if let Err(e) = init_global_dns_resolver().await {
+            warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
+        }
+    });
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -250,6 +256,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize event notifier
     init_event_notifier().await;
 
+    // Wait for DNS initialization to complete before network-heavy operations
+    dns_init.await.map_err(Error::other)?;
+
     let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -261,14 +270,31 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    // Initialize the bucket metadata system
-    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
+    // Parallelize initialization tasks for better network performance
+    let bucket_metadata_task = tokio::spawn({
+        let store = store.clone();
+        let buckets = buckets.clone();
+        async move {
+            init_bucket_metadata_sys(store, buckets).await;
+        }
+    });
 
-    // Initialize the IAM system
-    init_iam_sys(store.clone()).await?;
+    let iam_init_task = tokio::spawn({
+        let store = store.clone();
+        async move { init_iam_sys(store).await }
+    });
 
-    // add bucket notification configuration
-    add_bucket_notification_configuration(buckets).await;
+    let notification_config_task = tokio::spawn({
+        let buckets = buckets.clone();
+        async move {
+            add_bucket_notification_configuration(buckets).await;
+        }
+    });
+
+    // Wait for all parallel initialization tasks to complete
+    bucket_metadata_task.await.map_err(Error::other)?;
+    iam_init_task.await.map_err(Error::other)??;
+    notification_config_task.await.map_err(Error::other)?;
 
     // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
@@ -279,23 +305,47 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Create a cancellation token for AHM services
     let _ = create_ahm_services_cancel_token();
 
-    // Initialize heal manager with channel processor
-    let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-    let heal_manager = init_heal_manager(heal_storage, None).await?;
-    let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-    scanner.start().await?;
+    // Check environment variables to determine if scanner and heal should be enabled
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
+
+    info!("Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal);
+
+    // Initialize heal manager and scanner based on environment variables
+    if enable_heal || enable_scanner {
+        if enable_heal {
+            // Initialize heal manager with channel processor
+            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+            let heal_manager = init_heal_manager(heal_storage, None).await?;
+
+            if enable_scanner {
+                info!("Starting scanner with heal manager...");
+                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
+                scanner.start().await?;
+            } else {
+                info!("Scanner disabled, but heal manager is initialized and available");
+            }
+        } else if enable_scanner {
+            info!("Starting scanner without heal manager...");
+            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
+            scanner.start().await?;
+        }
+    } else {
+        info!("Both scanner and heal are disabled, skipping AHM service initialization");
+    }
 
     // print server info
     print_server_info();
     // initialize bucket replication pool
     init_bucket_replication_pool().await;
 
-    // Async update check (optional)
+    // Async update check with timeout (optional)
     tokio::spawn(async {
-        use crate::update::{check_updates, UpdateCheckError};
+        use crate::update::{UpdateCheckError, check_updates};
 
-        match check_updates().await {
-            Ok(result) => {
+        // Add timeout to prevent hanging network calls
+        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+            Ok(Ok(result)) => {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
@@ -313,11 +363,14 @@ async fn run(opt: config::Opt) -> Result<()> {
                     debug!("✅ Version check: Current version is up to date: {}", result.current_version);
                 }
             }
-            Err(UpdateCheckError::HttpError(e)) => {
+            Ok(Err(UpdateCheckError::HttpError(e))) => {
                 debug!("Version check: network error (this is normal): {}", e);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!("Version check: failed (this is normal): {}", e);
+            }
+            Err(_) => {
+                debug!("Version check: timeout after 30 seconds (this is normal)");
             }
         }
     });
@@ -340,19 +393,37 @@ async fn run(opt: config::Opt) -> Result<()> {
     Ok(())
 }
 
+/// Parse a boolean environment variable with default value
+///
+/// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
+/// false if set to false/0/no/off/disabled
+fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
+    std::env::var(var_name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<bool>()
+        .unwrap_or(default)
+}
+
 /// Handles the shutdown process of the server
 async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
     info!("Shutdown signal received in main thread");
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);
 
-    // Stop background services (data scanner and auto heal) gracefully
-    info!("Stopping background services (data scanner and auto heal)...");
-    shutdown_background_services();
+    // Check environment variables to determine what services need to be stopped
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
 
-    // Stop AHM services gracefully
-    info!("Stopping AHM services...");
-    shutdown_ahm_services();
+    // Stop background services based on what was enabled
+    if enable_scanner || enable_heal {
+        info!("Stopping background services (data scanner and auto heal)...");
+        shutdown_background_services();
+
+        info!("Stopping AHM services...");
+        shutdown_ahm_services();
+    } else {
+        info!("Background services were disabled, skipping AHM shutdown");
+    }
 
     // Stop the notification system
     shutdown_event_notifier().await;
@@ -387,8 +458,8 @@ async fn init_event_notifier() {
         .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
         .is_none()
         || server_config
-        .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-        .is_none()
+            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+            .is_none()
     {
         info!("'notify' subsystem not configured, skipping event notifier initialization.");
         return;
@@ -397,14 +468,12 @@ async fn init_event_notifier() {
     info!("Event notifier configuration found, proceeding with initialization.");
 
     // 3. Initialize the notification system asynchronously with a global configuration
-    // Put it into a separate task to avoid blocking the main initialization process
-    tokio::spawn(async move {
-        if let Err(e) = rustfs_notify::initialize(server_config).await {
-            error!("Failed to initialize event notifier system: {}", e);
-        } else {
-            info!("Event notifier system initialized successfully.");
-        }
-    });
+    // Use direct await for better error handling and faster initialization
+    if let Err(e) = rustfs_notify::initialize(server_config).await {
+        error!("Failed to initialize event notifier system: {}", e);
+    } else {
+        info!("Event notifier system initialized successfully.");
+    }
 }
 
 #[instrument(skip_all)]

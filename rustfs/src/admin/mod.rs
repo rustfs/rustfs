@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth;
 pub mod console;
 pub mod handlers;
 pub mod router;
@@ -20,15 +21,16 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    bucket_meta, event::{
+    GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
+    event::{
         GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
         SetBucketNotification,
-    }, group, policies, pools,
+    },
+    group, policies, pools,
     profile::{TriggerProfileCPU, TriggerProfileMemory},
-    rebalance, service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount}, sts, tier,
-    user,
-    GetReplicationMetricsHandler,
-    ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    rebalance,
+    service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
+    sts, tier, user,
 };
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -212,6 +214,18 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
         AdminOperation(&RemoveRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
+        AdminOperation(&handlers::ProfileHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
+        AdminOperation(&handlers::ProfileStatusHandler {}),
     )?;
 
     Ok(r)

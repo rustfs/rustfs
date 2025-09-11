@@ -102,6 +102,7 @@ aws-sdk-s3 = "1.101.0"
 axum = "0.8.4"
 base64-simd = "0.8.0"
 base64 = "0.22.1"
+blake3 = { version = "1.8.2" }
 brotli = "8.0.2"
 bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.0.1"
@@ -176,7 +177,6 @@ opentelemetry-semantic-conventions = { version = "0.30.0", features = [
 parking_lot = "0.12.4"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
-blake3 = { version = "1.8.2" }
 pbkdf2 = "0.12.2"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.16"
