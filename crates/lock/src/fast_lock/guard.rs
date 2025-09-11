@@ -26,8 +26,9 @@ pub struct FastLockGuard {
     key: ObjectKey,
     mode: LockMode,
     owner: Arc<str>,
-    shard: Arc<LockShard>,
+    shard: Option<Arc<LockShard>>, // None when locks are disabled
     released: bool,
+    disabled: bool, // True when locks are disabled globally
 }
 
 impl FastLockGuard {
@@ -36,8 +37,21 @@ impl FastLockGuard {
             key,
             mode,
             owner,
-            shard,
+            shard: Some(shard),
             released: false,
+            disabled: false,
+        }
+    }
+
+    /// Create a disabled guard (when locks are globally disabled)
+    pub(crate) fn new_disabled(key: ObjectKey, mode: LockMode, owner: Arc<str>) -> Self {
+        Self {
+            key,
+            mode,
+            owner,
+            shard: None,
+            released: false,
+            disabled: true,
         }
     }
 
@@ -65,11 +79,23 @@ impl FastLockGuard {
             return false;
         }
 
-        let success = self.shard.release_lock(&self.key, &self.owner, self.mode);
-        if success {
+        if self.disabled {
+            // For disabled locks, always succeed
             self.released = true;
+            return true;
         }
-        success
+
+        if let Some(shard) = &self.shard {
+            let success = shard.release_lock(&self.key, &self.owner, self.mode);
+            if success {
+                self.released = true;
+            }
+            success
+        } else {
+            // Should not happen, but handle gracefully
+            self.released = true;
+            false
+        }
     }
 
     /// Check if the lock has been released
@@ -77,27 +103,36 @@ impl FastLockGuard {
         self.released
     }
 
+    /// Check if this guard represents a disabled lock
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
     /// Get lock information for monitoring
     pub fn lock_info(&self) -> Option<crate::fast_lock::types::ObjectLockInfo> {
-        if self.released {
+        if self.released || self.disabled {
             None
+        } else if let Some(shard) = &self.shard {
+            shard.get_lock_info(&self.key)
         } else {
-            self.shard.get_lock_info(&self.key)
+            None
         }
     }
 }
 
 impl Drop for FastLockGuard {
     fn drop(&mut self) {
-        if !self.released {
-            let success = self.shard.release_lock(&self.key, &self.owner, self.mode);
-            if !success {
-                tracing::warn!(
-                    "Failed to release lock during drop: key={}, owner={}, mode={:?}",
-                    self.key,
-                    self.owner,
-                    self.mode
-                );
+        if !self.released && !self.disabled {
+            if let Some(shard) = &self.shard {
+                let success = shard.release_lock(&self.key, &self.owner, self.mode);
+                if !success {
+                    tracing::warn!(
+                        "Failed to release lock during drop: key={}, owner={}, mode={:?}",
+                        self.key,
+                        self.owner,
+                        self.mode
+                    );
+                }
             }
         }
     }
@@ -110,6 +145,7 @@ impl std::fmt::Debug for FastLockGuard {
             .field("mode", &self.mode)
             .field("owner", &self.owner)
             .field("released", &self.released)
+            .field("disabled", &self.disabled)
             .finish()
     }
 }

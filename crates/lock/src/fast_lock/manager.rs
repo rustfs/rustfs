@@ -18,9 +18,10 @@ use tokio::time::{Instant, interval};
 
 use crate::fast_lock::{
     guard::FastLockGuard,
-    metrics::GlobalMetrics,
+    manager_trait::LockManager,
+    metrics::{AggregatedMetrics, GlobalMetrics},
     shard::LockShard,
-    types::{BatchLockRequest, BatchLockResult, LockConfig, LockResult, ObjectLockRequest},
+    types::{BatchLockRequest, BatchLockResult, LockConfig, LockResult, ObjectKey, ObjectLockInfo, ObjectLockRequest},
 };
 
 /// High-performance object lock manager
@@ -358,6 +359,87 @@ impl Drop for FastObjectLockManager {
                 handle.abort();
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl LockManager for FastObjectLockManager {
+    async fn acquire_lock(&self, request: ObjectLockRequest) -> Result<FastLockGuard, LockResult> {
+        self.acquire_lock(request).await
+    }
+
+    async fn acquire_read_lock(
+        &self,
+        bucket: impl Into<Arc<str>> + Send,
+        object: impl Into<Arc<str>> + Send,
+        owner: impl Into<Arc<str>> + Send,
+    ) -> Result<FastLockGuard, LockResult> {
+        self.acquire_read_lock(bucket, object, owner).await
+    }
+
+    async fn acquire_read_lock_versioned(
+        &self,
+        bucket: impl Into<Arc<str>> + Send,
+        object: impl Into<Arc<str>> + Send,
+        version: impl Into<Arc<str>> + Send,
+        owner: impl Into<Arc<str>> + Send,
+    ) -> Result<FastLockGuard, LockResult> {
+        self.acquire_read_lock_versioned(bucket, object, version, owner).await
+    }
+
+    async fn acquire_write_lock(
+        &self,
+        bucket: impl Into<Arc<str>> + Send,
+        object: impl Into<Arc<str>> + Send,
+        owner: impl Into<Arc<str>> + Send,
+    ) -> Result<FastLockGuard, LockResult> {
+        self.acquire_write_lock(bucket, object, owner).await
+    }
+
+    async fn acquire_write_lock_versioned(
+        &self,
+        bucket: impl Into<Arc<str>> + Send,
+        object: impl Into<Arc<str>> + Send,
+        version: impl Into<Arc<str>> + Send,
+        owner: impl Into<Arc<str>> + Send,
+    ) -> Result<FastLockGuard, LockResult> {
+        self.acquire_write_lock_versioned(bucket, object, version, owner).await
+    }
+
+    async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
+        self.acquire_locks_batch(batch_request).await
+    }
+
+    fn get_lock_info(&self, key: &ObjectKey) -> Option<ObjectLockInfo> {
+        self.get_lock_info(key)
+    }
+
+    fn get_metrics(&self) -> AggregatedMetrics {
+        self.get_metrics()
+    }
+
+    fn total_lock_count(&self) -> usize {
+        self.total_lock_count()
+    }
+
+    fn get_pool_stats(&self) -> Vec<(u64, u64, u64, usize)> {
+        self.get_pool_stats()
+    }
+
+    async fn cleanup_expired(&self) -> usize {
+        self.cleanup_expired().await
+    }
+
+    async fn cleanup_expired_traditional(&self) -> usize {
+        self.cleanup_expired_traditional().await
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown().await
+    }
+
+    fn is_disabled(&self) -> bool {
+        false
     }
 }
 
