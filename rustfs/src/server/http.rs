@@ -209,6 +209,8 @@ pub async fn start_http_server(
         b.build()
     };
 
+    // Server will be created per connection - this ensures isolation
+
     tokio::spawn(async move {
         // Record the PID-related metrics of the current process
         let meter = opentelemetry::global::meter("system");
