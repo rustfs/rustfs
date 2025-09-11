@@ -20,18 +20,16 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug"
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=info"
             },
             "args": [
                 "--access-key",
-                "AKEXAMPLERUSTFS",
+                "rustfsadmin",
                 "--secret-key",
-                "SKEXAMPLERUSTFS",
+                "rustfsadmin",
                 "--address",
                 "0.0.0.0:9010",
-                "--domain-name",
-                "127.0.0.1:9010",
-                "./target/volume/test{0...4}"
+                "./target/volume/test{1...4}"
             ],
             "cwd": "${workspaceFolder}"
         },

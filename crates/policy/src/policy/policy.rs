@@ -519,14 +519,9 @@ mod test {
 
         let p = Policy::parse_config(data.as_bytes())?;
 
-        // println!("{:?}", p);
-
         let str = serde_json::to_string(&p)?;
 
-        // println!("----- {}", str);
-
         let _p2 = Policy::parse_config(str.as_bytes())?;
-        // println!("33{:?}", p2);
 
         // assert_eq!(p, p2);
         Ok(())

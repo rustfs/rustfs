@@ -509,7 +509,7 @@ impl Operation for GetBucketNotification {
     }
 }
 
-/// 删除存储桶的所有通知规则
+/// Remove all notification rules for a bucket
 pub struct RemoveBucketNotification {}
 #[async_trait::async_trait]
 impl Operation for RemoveBucketNotification {

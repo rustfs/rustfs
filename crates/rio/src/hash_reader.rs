@@ -415,16 +415,16 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let reader = BufReader::new(reader);
 
-        // 启用压缩测试
+        // Enable compression test
         let is_compress = true;
         let size = data.len() as i64;
         let actual_size = data.len() as i64;
 
         let reader = Box::new(WarpReader::new(reader));
-        // 创建 HashReader
+        // Create HashReader
         let mut hr = HashReader::new(reader, size, actual_size, Some(expected.clone()), false).unwrap();
 
-        // 如果启用压缩，先压缩数据
+        // If compression is enabled, compress data first
         let compressed_data = if is_compress {
             let mut compressed_buf = Vec::new();
             let compress_reader = CompressReader::new(hr, CompressionAlgorithm::Gzip);
@@ -435,7 +435,7 @@ mod tests {
 
             compressed_buf
         } else {
-            // 如果不压缩，直接读取原始数据
+            // If not compressing, read original data directly
             let mut buf = Vec::new();
             hr.read_to_end(&mut buf).await.unwrap();
             buf
@@ -449,7 +449,7 @@ mod tests {
         let is_encrypt = true;
 
         if is_encrypt {
-            // 加密压缩后的数据
+            // Encrypt compressed data
             let encrypt_reader = encrypt_reader::EncryptReader::new(WarpReader::new(Cursor::new(compressed_data)), key, nonce);
             let mut encrypted_data = Vec::new();
             let mut encrypt_reader = encrypt_reader;
@@ -457,14 +457,14 @@ mod tests {
 
             println!("Encrypted size: {}", encrypted_data.len());
 
-            // 解密数据
+            // Decrypt data
             let decrypt_reader = DecryptReader::new(WarpReader::new(Cursor::new(encrypted_data)), key, nonce);
             let mut decrypt_reader = decrypt_reader;
             let mut decrypted_data = Vec::new();
             decrypt_reader.read_to_end(&mut decrypted_data).await.unwrap();
 
             if is_compress {
-                // 如果使用了压缩，需要解压缩
+                // If compression was used, decompress is needed
                 let decompress_reader =
                     DecompressReader::new(WarpReader::new(Cursor::new(decrypted_data)), CompressionAlgorithm::Gzip);
                 let mut decompress_reader = decompress_reader;

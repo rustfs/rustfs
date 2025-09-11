@@ -612,7 +612,7 @@ impl ECStore {
         Ok(result)
     }
 
-    // 读所有
+    // Read all
     async fn list_merged(
         &self,
         rx: B_Receiver<bool>,

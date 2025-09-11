@@ -48,7 +48,7 @@ use uuid::Uuid;
 pub struct ReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
-    // 使用RwLock确保线程安全，实现Send + Sync
+    // Use RwLock to ensure thread safety, implementing Send + Sync
     encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
     decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
 }
@@ -98,7 +98,7 @@ impl ReedSolomonEncoder {
     fn encode_with_simd(&self, shards_vec: &mut [&mut [u8]]) -> io::Result<()> {
         let shard_len = shards_vec[0].len();
 
-        // 获取或创建encoder
+        // Get or create encoder
         let mut encoder = {
             let mut cache_guard = self
                 .encoder_cache
@@ -107,10 +107,10 @@ impl ReedSolomonEncoder {
 
             match cache_guard.take() {
                 Some(mut cached_encoder) => {
-                    // 使用reset方法重置现有encoder以适应新的参数
+                    // Use reset method to reset existing encoder to adapt to new parameters
                     if let Err(e) = cached_encoder.reset(self.data_shards, self.parity_shards, shard_len) {
                         warn!("Failed to reset SIMD encoder: {:?}, creating new one", e);
-                        // 如果reset失败，创建新的encoder
+                        // If reset fails, create new encoder
                         reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
                             .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?
                     } else {
@@ -118,34 +118,34 @@ impl ReedSolomonEncoder {
                     }
                 }
                 None => {
-                    // 第一次使用，创建新encoder
+                    // First use, create new encoder
                     reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
                         .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?
                 }
             }
         };
 
-        // 添加原始shards
+        // Add original shards
         for (i, shard) in shards_vec.iter().enumerate().take(self.data_shards) {
             encoder
                 .add_original_shard(shard)
                 .map_err(|e| io::Error::other(format!("Failed to add shard {i}: {e:?}")))?;
         }
 
-        // 编码并获取恢复shards
+        // Encode and get recovery shards
         let result = encoder
             .encode()
             .map_err(|e| io::Error::other(format!("SIMD encoding failed: {e:?}")))?;
 
-        // 将恢复shards复制到输出缓冲区
+        // Copy recovery shards to output buffer
         for (i, recovery_shard) in result.recovery_iter().enumerate() {
             if i + self.data_shards < shards_vec.len() {
                 shards_vec[i + self.data_shards].copy_from_slice(recovery_shard);
             }
         }
 
-        // 将encoder放回缓存（在result被drop后encoder自动重置，可以重用）
-        drop(result); // 显式drop result，确保encoder被重置
+        // Return encoder to cache (encoder is automatically reset after result is dropped, can be reused)
+        drop(result); // Explicitly drop result to ensure encoder is reset
 
         *self
             .encoder_cache
@@ -157,7 +157,7 @@ impl ReedSolomonEncoder {
 
     /// Reconstruct missing shards.
     pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
-        // 使用 SIMD 进行重构
+        // Use SIMD for reconstruction
         let simd_result = self.reconstruct_with_simd(shards);
 
         match simd_result {
@@ -333,9 +333,9 @@ impl Erasure {
         // let shard_size = self.shard_size();
         // let total_size = shard_size * self.total_shard_count();
 
-        // 数据切片数量
+        // Data shard count
         let per_shard_size = calc_shard_size(data.len(), self.data_shards);
-        // 总需求大小
+        // Total required size
         let need_total_size = per_shard_size * self.total_shard_count();
 
         // Create a new buffer with the required total length for all shards
@@ -972,28 +972,28 @@ mod tests {
 
             assert_eq!(shards.len(), data_shards + parity_shards);
 
-            // 验证每个shard的大小足够大，适合SIMD优化
+            // Verify that each shard is large enough for SIMD optimization
             for (i, shard) in shards.iter().enumerate() {
                 println!("🔍 Shard {}: {} bytes ({}KB)", i, shard.len(), shard.len() / 1024);
                 assert!(shard.len() >= 512, "Shard {} is too small for SIMD: {} bytes", i, shard.len());
             }
 
-            // 模拟数据丢失 - 丢失最大可恢复数量的shard
+            // Simulate data loss - lose maximum recoverable number of shards
             let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|b| Some(b.to_vec())).collect();
-            shards_opt[0] = None; // 丢失第1个数据shard
-            shards_opt[2] = None; // 丢失第3个数据shard  
-            shards_opt[8] = None; // 丢失第3个奇偶shard (index 6+3-1=8)
+            shards_opt[0] = None; // Lose 1st data shard
+            shards_opt[2] = None; // Lose 3rd data shard  
+            shards_opt[8] = None; // Lose 3rd parity shard (index 6+3-1=8)
 
             println!("💥 Simulated loss of 3 shards (max recoverable with 3 parity shards)");
 
-            // 解码恢复数据
+            // Decode and recover data
             let start = std::time::Instant::now();
             erasure.decode_data(&mut shards_opt).unwrap();
             let decode_duration = start.elapsed();
 
             println!("⏱️  Decoding completed in: {decode_duration:?}");
 
-            // 验证恢复的数据完整性
+            // Verify recovered data integrity
             let mut recovered = Vec::new();
             for shard in shards_opt.iter().take(data_shards) {
                 recovered.extend_from_slice(shard.as_ref().unwrap());
