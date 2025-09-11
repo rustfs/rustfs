@@ -15,12 +15,12 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use crate::server::console::{start_console_server, parse_cors_origins};
-    use clap::Parser;
-    use tokio::time::{Duration, timeout};
+    use crate::server::console::{parse_cors_origins, start_console_server};
     use axum::http::StatusCode;
+    use clap::Parser;
     use hyper::Client;
     use hyper_util::rt::TokioExecutor;
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn test_console_server_can_start_and_stop() {
@@ -141,12 +141,7 @@ mod tests {
     #[tokio::test]
     async fn test_console_tls_configuration() {
         // Test TLS configuration options (now uses shared tls_path)
-        let args = vec![
-            "rustfs",
-            "/tmp/test",
-            "--tls-path",
-            "/path/to/tls",
-        ];
+        let args = vec!["rustfs", "/tmp/test", "--tls-path", "/path/to/tls"];
         let opt = Opt::parse_from(args);
 
         assert_eq!(opt.tls_path, Some("/path/to/tls".to_string()));
@@ -156,7 +151,7 @@ mod tests {
     async fn test_console_rate_limiting_configuration() {
         // Test rate limiting configuration
         let args = vec![
-            "rustfs", 
+            "rustfs",
             "/tmp/test",
             "--console-rate-limit-enable",
             "true",
@@ -172,12 +167,7 @@ mod tests {
     #[tokio::test]
     async fn test_console_auth_timeout_configuration() {
         // Test authentication timeout configuration
-        let args = vec![
-            "rustfs",
-            "/tmp/test", 
-            "--console-auth-timeout",
-            "7200",
-        ];
+        let args = vec!["rustfs", "/tmp/test", "--console-auth-timeout", "7200"];
         let opt = Opt::parse_from(args);
 
         assert_eq!(opt.console_auth_timeout, 7200);
@@ -198,15 +188,15 @@ mod tests {
     #[tokio::test]
     async fn test_console_separate_logging_target() {
         // Test that console uses separate logging targets
+        use tracing::{Level, info};
         use tracing_test::traced_test;
-        use tracing::{info, Level};
-        
+
         // This test verifies that logging targets are properly set up
         info!(target: "rustfs::console::startup", "Test console startup log");
         info!(target: "rustfs::console::access", "Test console access log");
         info!(target: "rustfs::console::error", "Test console error log");
         info!(target: "rustfs::console::shutdown", "Test console shutdown log");
-        
+
         // In a real implementation, we would verify these logs are captured separately
     }
 
@@ -216,21 +206,28 @@ mod tests {
         let args = vec![
             "rustfs",
             "/tmp/test",
-            "--console-enable", "true",
-            "--console-address", ":9001",
-            "--console-cors-allowed-origins", "http://localhost:3000,https://admin.example.com",
-            "--external-address", ":9020",
+            "--console-enable",
+            "true",
+            "--console-address",
+            ":9001",
+            "--console-cors-allowed-origins",
+            "http://localhost:3000,https://admin.example.com",
+            "--external-address",
+            ":9020",
         ];
         let opt = Opt::parse_from(args);
 
         // Verify all console-related configuration is parsed correctly
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
-        assert_eq!(opt.console_cors_allowed_origins, Some("http://localhost:3000,https://admin.example.com".to_string()));
+        assert_eq!(
+            opt.console_cors_allowed_origins,
+            Some("http://localhost:3000,https://admin.example.com".to_string())
+        );
         assert_eq!(opt.external_address, ":9020".to_string());
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_console_error_handling_fallback() {
         // Test error handling and fallback mechanisms
         let args = vec!["rustfs", "/tmp/test", "--console-address", "invalid:address:format"];
@@ -240,7 +237,7 @@ mod tests {
 
         // This should handle the invalid address gracefully
         let result = start_console_server(&opt, rx).await;
-        
+
         // Should return an error for invalid address, but shouldn't panic
         assert!(result.is_err(), "Invalid address should return error");
     }

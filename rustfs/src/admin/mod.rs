@@ -21,7 +21,8 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
+    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    bucket_meta,
     event::{
         GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
         SetBucketNotification,
