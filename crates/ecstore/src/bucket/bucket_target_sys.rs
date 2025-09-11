@@ -781,6 +781,11 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
     arn.to_string()
 }
 
+pub struct RemoveObjectOptions {
+    pub version_id: Option<String>,
+    pub internal: AdvancedRemoveOptions,
+}
+
 #[derive(Debug)]
 pub struct TargetClient {
     pub endpoint: String,
@@ -831,13 +836,20 @@ impl TargetClient {
         }
     }
 
-    pub async fn remove_object(&self, bucket: &str, object: &str, version_id: Option<String>) -> Result<(), S3Error> {
+    pub async fn remove_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        opts: RemoveObjectOptions,
+    ) -> Result<(), S3Error> {
         match self
             .client
             .delete_object()
             .bucket(bucket)
             .key(object)
             .set_version_id(version_id)
+            .customize()
             .send()
             .await
         {
