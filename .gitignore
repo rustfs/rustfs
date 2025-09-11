@@ -22,3 +22,4 @@ profile.json
 .secrets
 *.go
 *.pb
+*.svg
