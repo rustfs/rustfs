@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error};
 use time::OffsetDateTime;
 
 use super::Policy;
@@ -59,15 +59,17 @@ impl TryFrom<Vec<u8>> for PolicyDoc {
     type Error = serde_json::Error;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        match serde_json::from_slice::<PolicyDoc>(&value) {
-            Ok(res) => Ok(res),
-            Err(err) => match serde_json::from_slice::<Policy>(&value) {
-                Ok(res2) => Ok(Self {
-                    policy: res2,
-                    ..Default::default()
-                }),
-                Err(_) => Err(err),
-            },
+        // Try to parse as PolicyDoc first
+        if let Ok(policy_doc) = serde_json::from_slice::<PolicyDoc>(&value) {
+            return Ok(policy_doc);
         }
+
+        // Fall back to parsing as Policy and wrap in PolicyDoc
+        serde_json::from_slice::<Policy>(&value)
+            .map(|policy| Self {
+                policy,
+                ..Default::default()
+            })
+            .map_err(|_| serde_json::Error::custom("Failed to parse as PolicyDoc or Policy".to_string()))
     }
 }

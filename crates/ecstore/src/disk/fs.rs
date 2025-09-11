@@ -12,38 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs::Metadata, path::Path, sync::OnceLock};
+use std::{
+    fs::Metadata,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use tokio::{
     fs::{self, File},
     io,
 };
 
-static READONLY_OPTIONS: OnceLock<fs::OpenOptions> = OnceLock::new();
-static WRITEONLY_OPTIONS: OnceLock<fs::OpenOptions> = OnceLock::new();
-static READWRITE_OPTIONS: OnceLock<fs::OpenOptions> = OnceLock::new();
+static READONLY_OPTIONS: OnceLock<Arc<fs::OpenOptions>> = OnceLock::new();
+static WRITEONLY_OPTIONS: OnceLock<Arc<fs::OpenOptions>> = OnceLock::new();
+static READWRITE_OPTIONS: OnceLock<Arc<fs::OpenOptions>> = OnceLock::new();
 
-fn get_readonly_options() -> &'static fs::OpenOptions {
+fn get_readonly_options() -> &'static Arc<fs::OpenOptions> {
     READONLY_OPTIONS.get_or_init(|| {
         let mut opts = fs::OpenOptions::new();
         opts.read(true);
-        opts
+        Arc::new(opts)
     })
 }
 
-fn get_writeonly_options() -> &'static fs::OpenOptions {
+fn get_writeonly_options() -> &'static Arc<fs::OpenOptions> {
     WRITEONLY_OPTIONS.get_or_init(|| {
         let mut opts = fs::OpenOptions::new();
         opts.write(true);
-        opts
+        Arc::new(opts)
     })
 }
 
-fn get_readwrite_options() -> &'static fs::OpenOptions {
+fn get_readwrite_options() -> &'static Arc<fs::OpenOptions> {
     READWRITE_OPTIONS.get_or_init(|| {
         let mut opts = fs::OpenOptions::new();
         opts.read(true).write(true);
-        opts
+        Arc::new(opts)
     })
 }
 
@@ -120,7 +124,7 @@ pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<Fil
     };
 
     if (mode & (O_CREATE | O_APPEND | O_TRUNC)) != 0 {
-        let mut opts = base_opts.clone();
+        let mut opts = (**base_opts).clone();
         if mode & O_CREATE != 0 {
             opts.create(true);
         }

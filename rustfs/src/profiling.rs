@@ -18,16 +18,19 @@ use tracing::info;
 
 static PROFILER_GUARD: OnceLock<Arc<Mutex<ProfilerGuard<'static>>>> = OnceLock::new();
 
-pub fn init_profiler() {
+pub fn init_profiler() -> Result<(), Box<dyn std::error::Error>> {
     let guard = pprof::ProfilerGuardBuilder::default()
         .frequency(1000)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
-        .unwrap();
+        .map_err(|e| format!("Failed to build profiler guard: {}", e))?;
 
-    let _ = PROFILER_GUARD.set(Arc::new(Mutex::new(guard)));
+    PROFILER_GUARD
+        .set(Arc::new(Mutex::new(guard)))
+        .map_err(|_| "Failed to set profiler guard (already initialized)")?;
 
     info!("Performance profiler initialized");
+    Ok(())
 }
 
 pub fn is_profiler_enabled() -> bool {
@@ -45,8 +48,15 @@ pub fn start_profiling_if_enabled() {
         .unwrap_or(false);
 
     if enable_profiling {
-        init_profiler();
-        info!("Performance profiling enabled via RUSTFS_ENABLE_PROFILING environment variable");
+        match init_profiler() {
+            Ok(()) => {
+                info!("Performance profiling enabled via RUSTFS_ENABLE_PROFILING environment variable");
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize profiler: {}", e);
+                info!("Performance profiling disabled due to initialization error");
+            }
+        }
     } else {
         info!("Performance profiling disabled. Set RUSTFS_ENABLE_PROFILING=true to enable");
     }

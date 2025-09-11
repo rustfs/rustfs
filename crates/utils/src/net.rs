@@ -110,6 +110,9 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 }
 
 /// returns IP address of given host using layered DNS resolution.
+///
+/// This is the async version of `get_host_ip()` that provides enhanced DNS resolution
+/// with Kubernetes support when the "net" feature is enabled.
 pub async fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {

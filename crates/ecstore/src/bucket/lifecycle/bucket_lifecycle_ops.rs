@@ -467,7 +467,11 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let mut n = std::cmp::min(num_cpus::get() as i64, 8);
+        let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+        let mut n = max_workers;
         let tw = 8; //globalILMConfig.getTransitionWorkers(); 
         if tw > 0 {
             n = tw;
@@ -561,9 +565,18 @@ impl TransitionState {
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
         if n == 0 {
-            n = std::cmp::min(num_cpus::get() as i64, 8);
+            let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+            n = max_workers;
         }
-        n = std::cmp::min(n, 16);
+        // Allow environment override of maximum workers
+        let absolute_max = std::env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(32);
+        n = std::cmp::min(n, absolute_max);
 
         let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
         while num_workers < n {
@@ -586,7 +599,10 @@ impl TransitionState {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = std::cmp::min(num_cpus::get(), 8);
+    let mut workers = std::env::var("RUSTFS_MAX_EXPIRY_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 16));
     //globalILMConfig.getExpirationWorkers()
     if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
@@ -595,7 +611,10 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     if workers == 0 {
-        workers = 8;
+        workers = std::env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8);
     }
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
