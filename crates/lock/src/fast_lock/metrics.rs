@@ -142,6 +142,20 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
+    /// Create empty snapshot (for disabled lock manager)
+    pub fn empty() -> Self {
+        Self {
+            fast_path_success: 0,
+            slow_path_success: 0,
+            timeouts: 0,
+            releases: 0,
+            cleanups: 0,
+            contention_events: 0,
+            total_wait_time_ns: 0,
+            max_wait_time_ns: 0,
+        }
+    }
+
     pub fn total_acquisitions(&self) -> u64 {
         self.fast_path_success + self.slow_path_success
     }
@@ -251,6 +265,22 @@ pub struct AggregatedMetrics {
 }
 
 impl AggregatedMetrics {
+    /// Create empty metrics (for disabled lock manager)
+    pub fn empty() -> Self {
+        Self {
+            shard_metrics: MetricsSnapshot::empty(),
+            shard_count: 0,
+            uptime: Duration::ZERO,
+            cleanup_runs: 0,
+            total_objects_cleaned: 0,
+        }
+    }
+
+    /// Check if metrics are empty (indicates disabled or no activity)
+    pub fn is_empty(&self) -> bool {
+        self.shard_count == 0 && self.shard_metrics.total_acquisitions() == 0 && self.shard_metrics.releases == 0
+    }
+
     /// Get operations per second
     pub fn ops_per_second(&self) -> f64 {
         let total_ops = self.shard_metrics.total_acquisitions() + self.shard_metrics.releases;

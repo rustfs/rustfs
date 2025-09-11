@@ -205,11 +205,34 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Create a cancellation token for AHM services
     let _ = create_ahm_services_cancel_token();
 
-    // Initialize heal manager with channel processor
-    let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-    let heal_manager = init_heal_manager(heal_storage, None).await?;
-    let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-    scanner.start().await?;
+    // Check environment variables to determine if scanner and heal should be enabled
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
+
+    info!("Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal);
+
+    // Initialize heal manager and scanner based on environment variables
+    if enable_heal || enable_scanner {
+        if enable_heal {
+            // Initialize heal manager with channel processor
+            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+            let heal_manager = init_heal_manager(heal_storage, None).await?;
+
+            if enable_scanner {
+                info!("Starting scanner with heal manager...");
+                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
+                scanner.start().await?;
+            } else {
+                info!("Scanner disabled, but heal manager is initialized and available");
+            }
+        } else if enable_scanner {
+            info!("Starting scanner without heal manager...");
+            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
+            scanner.start().await?;
+        }
+    } else {
+        info!("Both scanner and heal are disabled, skipping AHM service initialization");
+    }
 
     // print server info
     print_server_info();
@@ -266,19 +289,37 @@ async fn run(opt: config::Opt) -> Result<()> {
     Ok(())
 }
 
+/// Parse a boolean environment variable with default value
+///
+/// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
+/// false if set to false/0/no/off/disabled
+fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
+    std::env::var(var_name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<bool>()
+        .unwrap_or(default)
+}
+
 /// Handles the shutdown process of the server
 async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
     info!("Shutdown signal received in main thread");
     // update the status to stopping first
     state_manager.update(ServiceState::Stopping);
 
-    // Stop background services (data scanner and auto heal) gracefully
-    info!("Stopping background services (data scanner and auto heal)...");
-    shutdown_background_services();
+    // Check environment variables to determine what services need to be stopped
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
 
-    // Stop AHM services gracefully
-    info!("Stopping AHM services...");
-    shutdown_ahm_services();
+    // Stop background services based on what was enabled
+    if enable_scanner || enable_heal {
+        info!("Stopping background services (data scanner and auto heal)...");
+        shutdown_background_services();
+
+        info!("Stopping AHM services...");
+        shutdown_ahm_services();
+    } else {
+        info!("Background services were disabled, skipping AHM shutdown");
+    }
 
     // Stop the notification system
     shutdown_event_notifier().await;

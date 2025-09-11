@@ -17,9 +17,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::{
+    GlobalLockManager,
     client::LockClient,
     error::Result,
-    fast_lock::{FastLockGuard, FastObjectLockManager},
+    fast_lock::{FastLockGuard, LockManager},
     types::{LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockType},
 };
 
@@ -37,9 +38,9 @@ impl LocalClient {
         }
     }
 
-    /// Get the global fast lock manager
-    pub fn get_fast_lock_manager(&self) -> Arc<FastObjectLockManager> {
-        crate::get_global_fast_lock_manager()
+    /// Get the global lock manager
+    pub fn get_lock_manager(&self) -> Arc<GlobalLockManager> {
+        crate::get_global_lock_manager()
     }
 }
 
@@ -52,11 +53,11 @@ impl Default for LocalClient {
 #[async_trait::async_trait]
 impl LockClient for LocalClient {
     async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
-        let fast_lock_manager = self.get_fast_lock_manager();
+        let lock_manager = self.get_lock_manager();
         let lock_request = crate::fast_lock::ObjectLockRequest::new_write("", request.resource.clone(), request.owner.clone())
             .with_acquire_timeout(request.acquire_timeout);
 
-        match fast_lock_manager.acquire_lock(lock_request).await {
+        match lock_manager.acquire_lock(lock_request).await {
             Ok(guard) => {
                 let lock_id = crate::types::LockId::new_deterministic(&request.resource);
 
@@ -96,11 +97,11 @@ impl LockClient for LocalClient {
     }
 
     async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
-        let fast_lock_manager = self.get_fast_lock_manager();
+        let lock_manager = self.get_lock_manager();
         let lock_request = crate::fast_lock::ObjectLockRequest::new_read("", request.resource.clone(), request.owner.clone())
             .with_acquire_timeout(request.acquire_timeout);
 
-        match fast_lock_manager.acquire_lock(lock_request).await {
+        match lock_manager.acquire_lock(lock_request).await {
             Ok(guard) => {
                 let lock_id = crate::types::LockId::new_deterministic(&request.resource);
 

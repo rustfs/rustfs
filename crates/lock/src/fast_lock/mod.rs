@@ -24,10 +24,12 @@
 //! 4. **Async Optimized** - True async locks that avoid thread blocking
 //! 5. **Auto Cleanup** - Access-time based automatic lock reclamation
 
+pub mod disabled_manager;
 pub mod guard;
 pub mod integration_example;
 pub mod integration_test;
 pub mod manager;
+pub mod manager_trait;
 pub mod metrics;
 pub mod object_pool;
 pub mod optimized_notify;
@@ -39,8 +41,10 @@ pub mod types;
 // pub mod benchmarks; // Temporarily disabled due to compilation issues
 
 // Re-export main types
+pub use disabled_manager::DisabledLockManager;
 pub use guard::FastLockGuard;
 pub use manager::FastObjectLockManager;
+pub use manager_trait::LockManager;
 pub use types::*;
 
 /// Default shard count (must be power of 2)
