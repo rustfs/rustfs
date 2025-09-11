@@ -102,6 +102,8 @@ tower-http = { workspace = true, features = [
     "compression-gzip",
     "cors",
     "catch-panic",
+    "timeout",
+    "limit",
 ] }
 url = { workspace = true }
 urlencoding = { workspace = true }
