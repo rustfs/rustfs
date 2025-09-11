@@ -78,7 +78,7 @@ use std::sync::Arc;
 
 /// Enum wrapper for different lock manager implementations
 pub enum GlobalLockManager {
-    Enabled(fast_lock::FastObjectLockManager),
+    Enabled(Arc<fast_lock::FastObjectLockManager>),
     Disabled(fast_lock::DisabledLockManager),
 }
 
@@ -103,7 +103,7 @@ impl GlobalLockManager {
             }
             _ => {
                 tracing::info!("Lock system enabled");
-                Self::Enabled(fast_lock::FastObjectLockManager::new())
+                Self::Enabled(Arc::new(fast_lock::FastObjectLockManager::new()))
             }
         }
     }
@@ -111,6 +111,14 @@ impl GlobalLockManager {
     /// Check if the lock manager is disabled
     pub fn is_disabled(&self) -> bool {
         matches!(self, Self::Disabled(_))
+    }
+
+    /// Get the FastObjectLockManager if enabled, otherwise returns None
+    pub fn as_fast_lock_manager(&self) -> Option<Arc<fast_lock::FastObjectLockManager>> {
+        match self {
+            Self::Enabled(manager) => Some(manager.clone()),
+            Self::Disabled(_) => None,
+        }
     }
 }
 
@@ -257,12 +265,9 @@ pub fn get_global_lock_manager() -> Arc<GlobalLockManager> {
 #[deprecated(note = "Use get_global_lock_manager() instead")]
 pub fn get_global_fast_lock_manager() -> Arc<fast_lock::FastObjectLockManager> {
     let manager = get_global_lock_manager();
-    if manager.is_disabled() {
+    manager.as_fast_lock_manager().unwrap_or_else(|| {
         panic!("Cannot get FastObjectLockManager when locks are disabled. Use get_global_lock_manager() instead.");
-    }
-
-    // Create a new instance since we can't extract from the enum directly
-    Arc::new(fast_lock::FastObjectLockManager::new())
+    })
 }
 
 // ============================================================================
@@ -326,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_global_manager_enum_wrapper() {
         // Test the GlobalLockManager enum directly
-        let enabled_manager = GlobalLockManager::Enabled(fast_lock::FastObjectLockManager::new());
+        let enabled_manager = GlobalLockManager::Enabled(Arc::new(fast_lock::FastObjectLockManager::new()));
         let disabled_manager = GlobalLockManager::Disabled(fast_lock::DisabledLockManager::new());
 
         assert!(!enabled_manager.is_disabled());

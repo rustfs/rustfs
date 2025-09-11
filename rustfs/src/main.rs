@@ -206,15 +206,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     let _ = create_ahm_services_cancel_token();
 
     // Check environment variables to determine if scanner and heal should be enabled
-    let enable_scanner = std::env::var("RUSTFS_ENABLE_SCANNER")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse::<bool>()
-        .unwrap_or(true);
-
-    let enable_heal = std::env::var("RUSTFS_ENABLE_HEAL")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse::<bool>()
-        .unwrap_or(true);
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
 
     info!("Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal);
 
@@ -296,6 +289,17 @@ async fn run(opt: config::Opt) -> Result<()> {
     Ok(())
 }
 
+/// Parse a boolean environment variable with default value
+///
+/// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
+/// false if set to false/0/no/off/disabled
+fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
+    std::env::var(var_name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<bool>()
+        .unwrap_or(default)
+}
+
 /// Handles the shutdown process of the server
 async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
     info!("Shutdown signal received in main thread");
@@ -303,15 +307,8 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
     state_manager.update(ServiceState::Stopping);
 
     // Check environment variables to determine what services need to be stopped
-    let enable_scanner = std::env::var("RUSTFS_ENABLE_SCANNER")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse::<bool>()
-        .unwrap_or(true);
-
-    let enable_heal = std::env::var("RUSTFS_ENABLE_HEAL")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse::<bool>()
-        .unwrap_or(true);
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
 
     // Stop background services based on what was enabled
     if enable_scanner || enable_heal {
