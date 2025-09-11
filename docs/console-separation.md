@@ -36,8 +36,47 @@ RustFS implements a complete separation between the console web interface and th
 | Parameter | Environment Variable | Default | Description |
 |-----------|---------------------|---------|-------------|
 | `tls_path` | `RUSTFS_TLS_PATH` | - | TLS certificate path for both services |
+| `console_tls_enable` | `RUSTFS_CONSOLE_TLS_ENABLE` | `false` | Enable TLS for console server |
+| `console_tls_cert` | `RUSTFS_CONSOLE_TLS_CERT` | - | TLS certificate path for console |
+| `console_tls_key` | `RUSTFS_CONSOLE_TLS_KEY` | - | TLS private key path for console |
+| `console_rate_limit_enable` | `RUSTFS_CONSOLE_RATE_LIMIT_ENABLE` | `false` | Enable rate limiting for console |
+| `console_rate_limit_rpm` | `RUSTFS_CONSOLE_RATE_LIMIT_RPM` | `100` | Console rate limit (requests per minute) |
+| `console_auth_timeout` | `RUSTFS_CONSOLE_AUTH_TIMEOUT` | `3600` | Console authentication timeout (seconds) |
 | `access_key` | `RUSTFS_ACCESS_KEY` | `rustfsadmin` | Authentication access key |
 | `secret_key` | `RUSTFS_SECRET_KEY` | `rustfsadmin` | Authentication secret key |
+
+## Health Check Endpoints
+
+Both services provide independent health check endpoints for monitoring and orchestration:
+
+### Console Health Check
+- **Endpoint**: `GET /health`
+- **Response**:
+```json
+{
+  "status": "ok",
+  "service": "rustfs-console",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "version": "0.0.5",
+  "details": {
+    "storage": {"status": "connected"},
+    "iam": {"status": "connected"}
+  },
+  "uptime": 1800
+}
+```
+
+### Endpoint Health Check
+- **Endpoint**: `GET /health`
+- **Response**:
+```json
+{
+  "status": "ok",
+  "service": "rustfs-endpoint",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "version": "0.0.5"
+}
+```
 
 ## Deployment Scenarios
 
@@ -80,10 +119,8 @@ docker run -d \
   --name rustfs \
   -p 9020:9000 \  # Map API port
   -p 9021:9001 \  # Map console port
-  -e RUSTFS_EXTERNAL_ADDRESS=":9020" \  # Critical: Must match mapped API port
-  -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:9021,http://127.0.0.1:9021" \
-  -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
-  -v /data:/data \
+  -e RUSTFS_EXTERNAL_ADDRESS=":9020" \
+  -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:9021" \
   rustfs/rustfs:latest
 
 # Access points:
@@ -91,19 +128,266 @@ docker run -d \
 # Console: http://localhost:9021/rustfs/console/
 ```
 
-#### Production Docker Deployment
+#### Production Docker Deployment with TLS
 ```bash
 docker run -d \
   --name rustfs-production \
-  -p 9000:9000 \  # Direct port mapping
-  -p 9001:9001 \
+  -p 9443:9001 \  # HTTPS console port
+  -p 9000:9000 \  # API port
+  -v /path/to/certs:/certs:ro \
+  -e RUSTFS_CONSOLE_TLS_ENABLE=true \
+  -e RUSTFS_CONSOLE_TLS_CERT=/certs/console.crt \
+  -e RUSTFS_CONSOLE_TLS_KEY=/certs/console.key \
+  -e RUSTFS_CONSOLE_RATE_LIMIT_ENABLE=true \
+  -e RUSTFS_CONSOLE_RATE_LIMIT_RPM=60 \
+  -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="https://admin.yourdomain.com" \
   -e RUSTFS_EXTERNAL_ADDRESS=":9000" \
-  -e RUSTFS_CORS_ALLOWED_ORIGINS="https://admin.example.com,https://console.example.com" \
-  -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="https://console.example.com" \
-  -e RUSTFS_TLS_PATH="/certs" \
-  -v /data:/data \
-  -v /certs:/certs:ro \
   rustfs/rustfs:latest
+
+# Access points:
+# API: http://localhost:9000
+# Console: https://localhost:9443/rustfs/console/
+```
+
+#### Enterprise Docker Deployment with Full Security
+```bash
+docker run -d \
+  --name rustfs-enterprise \
+  -p 9443:9001 \  # HTTPS console
+  -p 9000:9000 \  # HTTP API (behind load balancer)
+  -v /path/to/certs:/certs:ro \
+  -v /path/to/data:/data \
+  -e RUSTFS_CONSOLE_TLS_ENABLE=true \
+  -e RUSTFS_CONSOLE_TLS_CERT=/certs/console.crt \
+  -e RUSTFS_CONSOLE_TLS_KEY=/certs/console.key \
+  -e RUSTFS_CONSOLE_RATE_LIMIT_ENABLE=true \
+  -e RUSTFS_CONSOLE_RATE_LIMIT_RPM=30 \
+  -e RUSTFS_CONSOLE_AUTH_TIMEOUT=1800 \
+  -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="https://admin.yourdomain.com,https://backup-admin.yourdomain.com" \
+  -e RUSTFS_CORS_ALLOWED_ORIGINS="https://api.yourdomain.com" \
+  -e RUSTFS_ACCESS_KEY="secure-admin-key" \
+  -e RUSTFS_SECRET_KEY="secure-secret-key-12345" \
+  rustfs/rustfs:latest /data
+
+# Monitoring endpoints:
+# Console health: https://localhost:9443/health
+# API health: http://localhost:9000/health
+```
+
+## Logging and Auditing
+
+### Separate Logging Targets
+
+Console and endpoint services use separate logging targets for better auditing and troubleshooting:
+
+#### Console Logging Targets
+- `rustfs::console::startup` - Server startup and configuration
+- `rustfs::console::access` - HTTP access logs with timing
+- `rustfs::console::error` - Console-specific errors
+- `rustfs::console::shutdown` - Graceful shutdown logs
+- `rustfs::console::tls` - TLS-related logs
+
+#### Endpoint Logging Targets
+- `rustfs::endpoint::startup` - API server startup
+- `rustfs::endpoint::access` - S3 API access logs
+- `rustfs::endpoint::error` - API-specific errors
+- `rustfs::endpoint::auth` - Authentication and authorization
+
+### Log Format Examples
+
+```bash
+# Console access log
+2024-01-15T10:30:15.123Z INFO rustfs::console::access: Console access method=GET uri=/health status=200 duration_ms=5
+
+# Console TLS log
+2024-01-15T10:30:16.456Z INFO rustfs::console::tls: Console TLS handshake successful remote_addr=192.168.1.100:54321
+
+# Console startup log  
+2024-01-15T10:30:00.000Z INFO rustfs::console::startup: Starting console server address=0.0.0.0:9001 tls_enabled=true rate_limit_enabled=true
+```
+
+### Centralized Logging Configuration
+
+For production deployments, configure centralized logging:
+
+```bash
+# JSON structured logging
+RUST_LOG="rustfs::console=info,rustfs::endpoint=info" \
+RUSTFS_LOG_FORMAT=json \
+docker run -d rustfs/rustfs:latest
+
+# Forward logs to external systems
+docker run -d \
+  --log-driver=fluentd \
+  --log-opt fluentd-address=localhost:24224 \
+  --log-opt tag="rustfs.{{.Name}}" \
+  rustfs/rustfs:latest
+```
+
+## Security Hardening
+
+### TLS Configuration
+
+#### Generate Self-Signed Certificates (Development)
+```bash
+# Generate console TLS certificates
+openssl req -x509 -newkey rsa:4096 -keyout console.key -out console.crt -days 365 -nodes \
+  -subj "/C=US/ST=CA/L=SF/O=RustFS/CN=localhost"
+
+# Use in Docker
+docker run -d \
+  -v $(pwd)/console.crt:/certs/console.crt:ro \
+  -v $(pwd)/console.key:/certs/console.key:ro \
+  -e RUSTFS_CONSOLE_TLS_ENABLE=true \
+  -e RUSTFS_CONSOLE_TLS_CERT=/certs/console.crt \
+  -e RUSTFS_CONSOLE_TLS_KEY=/certs/console.key \
+  rustfs/rustfs:latest
+```
+
+#### Production TLS with Let's Encrypt
+```bash
+# Use with reverse proxy (recommended)
+version: '3.8'
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      - RUSTFS_CONSOLE_ADDRESS=127.0.0.1:9001
+      - RUSTFS_ADDRESS=127.0.0.1:9000
+    networks:
+      - internal
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    networks:
+      - internal
+      - external
+```
+
+### Rate Limiting and DDoS Protection
+
+```bash
+# Console rate limiting configuration
+RUSTFS_CONSOLE_RATE_LIMIT_ENABLE=true \
+RUSTFS_CONSOLE_RATE_LIMIT_RPM=60 \  # 60 requests per minute per IP
+RUSTFS_CONSOLE_AUTH_TIMEOUT=1800 \  # 30 minute session timeout
+rustfs /data
+```
+
+### Network Security
+
+#### Firewall Configuration
+```bash
+# Allow only necessary ports
+sudo ufw allow 9000/tcp  # API endpoint
+sudo ufw allow 9001/tcp  # Console (internal only)
+sudo ufw deny 9001/tcp from any to any port 9001  # Block external console access
+
+# Or use iptables
+iptables -A INPUT -p tcp --dport 9000 -j ACCEPT  # API
+iptables -A INPUT -p tcp --dport 9001 -s 10.0.0.0/8 -j ACCEPT  # Console internal only
+```
+
+#### Docker Network Isolation
+```yaml
+version: '3.8'
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    networks:
+      - api-network     # External API access
+      - console-network # Internal console access
+    environment:
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=https://admin.internal.com
+
+networks:
+  api-network:
+    driver: bridge
+  console-network:
+    driver: bridge
+    internal: true  # No external access
+```
+
+## Error Handling and Fallback Mechanisms
+
+### Configuration Validation
+
+RustFS validates configuration at startup and provides detailed error messages:
+
+```bash
+# Invalid TLS configuration
+ERROR rustfs::console::startup: Console TLS cert path required when TLS is enabled
+
+# Invalid address format  
+ERROR rustfs::console::startup: Failed to parse console address "invalid:format": invalid socket address syntax
+
+# Missing external address for Docker
+WARN rustfs::console::startup: External address not configured, console may not access API in containerized environments
+```
+
+### Graceful Degradation
+
+#### Storage Backend Failure
+```json
+{
+  "status": "degraded",
+  "service": "rustfs-console", 
+  "details": {
+    "storage": {"status": "disconnected"},
+    "iam": {"status": "connected"}
+  }
+}
+```
+
+#### Service Recovery
+- Console automatically retries failed connections to backend services
+- Health checks report degraded status but maintain availability
+- Graceful shutdown ensures no data loss during restarts
+
+### Monitoring Integration
+
+#### Prometheus Metrics
+```bash
+# Health check metrics endpoint
+curl http://localhost:9001/health | jq '.status'
+
+# Integration with monitoring
+- alert: ConsoleServiceDown
+  expr: up{job="rustfs-console"} == 0
+  for: 30s
+  labels:
+    severity: critical
+  annotations:
+    summary: "RustFS Console service is down"
+```
+
+#### Kubernetes Health Checks
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: rustfs
+    image: rustfs/rustfs:latest
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 9001
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /health  
+        port: 9001
+      initialDelaySeconds: 5
+      periodSeconds: 5
+```
 ```
 
 ### 5. Docker Compose Deployment

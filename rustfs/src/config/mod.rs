@@ -99,6 +99,30 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
 
+    /// Enable TLS for console server (independent from endpoint TLS)
+    #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_TLS_ENABLE")]
+    pub console_tls_enable: bool,
+
+    /// TLS certificate path for console server
+    #[arg(long, env = "RUSTFS_CONSOLE_TLS_CERT")]
+    pub console_tls_cert: Option<String>,
+
+    /// TLS private key path for console server
+    #[arg(long, env = "RUSTFS_CONSOLE_TLS_KEY")]
+    pub console_tls_key: Option<String>,
+
+    /// Enable rate limiting for console
+    #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_RATE_LIMIT_ENABLE")]
+    pub console_rate_limit_enable: bool,
+
+    /// Console rate limit: requests per minute
+    #[arg(long, default_value_t = 100, env = "RUSTFS_CONSOLE_RATE_LIMIT_RPM")]
+    pub console_rate_limit_rpm: u32,
+
+    /// Console authentication timeout in seconds
+    #[arg(long, default_value_t = 3600, env = "RUSTFS_CONSOLE_AUTH_TIMEOUT")]
+    pub console_auth_timeout: u64,
+
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
 

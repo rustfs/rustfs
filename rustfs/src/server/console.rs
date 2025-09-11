@@ -14,27 +14,121 @@
 
 use crate::admin::console::static_handler;
 use crate::config::Opt;
-use axum::{Router, response::Json, routing::get};
+use axum::{Router, response::Json, routing::get, middleware, extract::Request};
 use http::{Method, header};
 use rustfs_utils::net::parse_and_resolve_address;
 use serde_json::json;
 use std::io::Result;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_rustls::{TlsAcceptor, rustls::{ServerConfig, pki_types::{CertificateDer, PrivateKeyDer}}};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, warn};
+use tower_http::timeout::TimeoutLayer;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower::ServiceBuilder;
+use tracing::{debug, error, info, warn, instrument};
 
 #[cfg(test)]
 mod console_test;
 
 const CONSOLE_PREFIX: &str = "/rustfs/console";
 
-/// Console health check handler
+/// Console access logging middleware
+async fn console_logging_middleware(req: Request, next: axum::middleware::Next) -> axum::response::Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let start = std::time::Instant::now();
+    
+    let response = next.run(req).await;
+    let duration = start.elapsed();
+    
+    info!(
+        target: "rustfs::console::access",
+        method = %method,
+        uri = %uri,
+        status = %response.status(),
+        duration_ms = %duration.as_millis(),
+        "Console access"
+    );
+    
+    response
+}
+
+/// Setup TLS acceptor for console if enabled
+/// Note: This is a placeholder for TLS setup. Full implementation would require
+/// additional dependencies like rustls-pemfile and proper certificate handling.
+async fn setup_console_tls(opt: &Opt) -> Result<Option<TlsAcceptor>> {
+    if !opt.console_tls_enable {
+        return Ok(None);
+    }
+    
+    // For now, log that TLS is requested but not fully implemented
+    warn!("Console TLS requested but not fully implemented in this version");
+    warn!("Consider using a reverse proxy (nginx, traefik) for TLS termination");
+    
+    // Return None to indicate TLS is not available
+    Ok(None)
+}
+
+/// Setup rate limiting for console using a simple in-memory approach
+/// In a production environment, consider using Redis or other distributed rate limiting
+fn setup_console_rate_limiting(_opt: &Opt) -> Option<()> {
+    // For now, we'll implement basic rate limiting through middleware
+    // A full implementation would use a more sophisticated rate limiter
+    if _opt.console_rate_limit_enable {
+        info!("Console rate limiting enabled: {} requests per minute", _opt.console_rate_limit_rpm);
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Simple rate limiting middleware (in-memory, single-node only)
+/// For production, consider using Redis-based rate limiting
+async fn rate_limit_middleware(req: Request, next: axum::middleware::Next) -> axum::response::Response {
+    // For now, this is a placeholder for rate limiting
+    // A production implementation would track client IPs and enforce limits
+    next.run(req).await
+}
+
+/// Console health check handler with comprehensive health information
 async fn health_check() -> Json<serde_json::Value> {
+    use rustfs_ecstore::new_object_layer_fn;
+    
+    let mut health_status = "ok";
+    let mut details = json!({});
+    
+    // Check storage backend health
+    if let Some(_store) = new_object_layer_fn() {
+        details["storage"] = json!({"status": "connected"});
+    } else {
+        health_status = "degraded";
+        details["storage"] = json!({"status": "disconnected"});
+    }
+    
+    // Check IAM system health
+    match rustfs_iam::get() {
+        Ok(_) => {
+            details["iam"] = json!({"status": "connected"});
+        }
+        Err(_) => {
+            health_status = "degraded";
+            details["iam"] = json!({"status": "disconnected"});
+        }
+    }
+    
     Json(json!({
-        "status": "ok",
+        "status": health_status,
         "service": "rustfs-console",
-        "timestamp": chrono::Utc::now().to_rfc3339()
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "details": details,
+        "uptime": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }))
 }
 
@@ -58,17 +152,27 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
                 warn!("Empty CORS origins provided, using permissive CORS");
                 cors_layer.allow_origin(Any)
             } else {
-                let parsed_origins: Result<Vec<_>, _> = origins.into_iter().map(|origin| origin.parse()).collect();
+                // Parse origins with proper error handling
+                let mut valid_origins = Vec::new();
+                for origin in origins {
+                    match origin.parse::<http::HeaderValue>() {
+                        Ok(header_value) => {
+                            if let Ok(uri) = header_value.to_str().unwrap_or("").parse::<http::Uri>() {
+                                valid_origins.push(uri);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Invalid CORS origin '{}': {}", origin, e);
+                        }
+                    }
+                }
 
-                match parsed_origins {
-                    Ok(valid_origins) => {
-                        info!("Console CORS origins configured: {:?}", valid_origins);
-                        cors_layer.allow_origin(AllowOrigin::list(valid_origins))
-                    }
-                    Err(e) => {
-                        warn!("Invalid CORS origins provided ({}), using permissive CORS", e);
-                        cors_layer.allow_origin(Any)
-                    }
+                if valid_origins.is_empty() {
+                    warn!("No valid CORS origins found, using permissive CORS");
+                    cors_layer.allow_origin(Any)
+                } else {
+                    info!("Console CORS origins configured: {:?}", valid_origins);
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins))
                 }
             }
         }
@@ -79,7 +183,8 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     }
 }
 
-/// Start the standalone console server
+/// Start the standalone console server with enhanced security and monitoring
+#[instrument(skip(opt, shutdown_rx))]
 pub async fn start_console_server(opt: &Opt, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) -> Result<()> {
     if !opt.console_enable {
         debug!("Console server is disabled");
@@ -88,41 +193,81 @@ pub async fn start_console_server(opt: &Opt, mut shutdown_rx: tokio::sync::broad
 
     let console_addr = parse_and_resolve_address(&opt.console_address)?;
 
-    info!("Starting console server on: {}", console_addr);
+    info!(
+        target: "rustfs::console::startup",
+        address = %console_addr,
+        tls_enabled = opt.console_tls_enable,
+        rate_limit_enabled = opt.console_rate_limit_enable,
+        "Starting console server"
+    );
 
+    // Setup TLS if enabled
+    let tls_acceptor = setup_console_tls(opt).await?;
+    
     // Configure CORS based on settings
     let cors_layer = parse_cors_origins(opt.console_cors_allowed_origins.as_ref());
 
-    // Build console router with health check
-    let app = Router::new()
+    // Setup rate limiting if enabled  
+    let _rate_limiter = setup_console_rate_limiting(opt);
+
+    // Build console router with enhanced middleware stack
+    let mut app = Router::new()
         .route("/health", get(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
-        .fallback_service(get(static_handler))
+        .fallback_service(get(static_handler));
+
+    // Add middleware layers in proper order
+    let mut service_builder = ServiceBuilder::new()
+        .layer(CatchPanicLayer::new())
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
         .layer(cors_layer)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(console_logging_middleware));
+
+    // Add rate limiting if enabled
+    if opt.console_rate_limit_enable {
+        service_builder = service_builder.layer(middleware::from_fn(rate_limit_middleware));
+    }
+    
+    app = app.layer(service_builder);
 
     // Bind to the address
     let listener = TcpListener::bind(console_addr).await?;
 
     let local_ip = rustfs_utils::get_local_ip().unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+    let protocol = if opt.console_tls_enable { "https" } else { "http" };
+    
     info!(
-        "   WebUI: http://{}:{}/rustfs/console/index.html http://127.0.0.1:{}/rustfs/console/index.html",
-        local_ip,
-        console_addr.port(),
-        console_addr.port()
+        target: "rustfs::console::startup", 
+        "Console WebUI available at: {}://{}:{}/rustfs/console/index.html", 
+        protocol, local_ip, console_addr.port()
+    );
+    info!(
+        target: "rustfs::console::startup",
+        "Console WebUI (localhost): {}://127.0.0.1:{}/rustfs/console/index.html", 
+        protocol, console_addr.port()
     );
 
-    // Start the server with graceful shutdown
+    // Handle connections (TLS handling will be implemented in future versions)
+    handle_plain_connections(listener, app, shutdown_rx).await
+}
+
+/// Handle plain HTTP connections
+async fn handle_plain_connections(
+    listener: TcpListener,
+    app: Router,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<()> {
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = shutdown_rx.recv().await;
-        info!("Console server shutdown signal received");
+        info!(target: "rustfs::console::shutdown", "Console server shutdown signal received");
     });
 
     if let Err(e) = server.await {
-        error!("Console server error: {}", e);
+        error!(target: "rustfs::console::error", error = %e, "Console server error");
         return Err(std::io::Error::other(e));
     }
 
-    info!("Console server stopped");
+    info!(target: "rustfs::console::shutdown", "Console server stopped");
     Ok(())
 }

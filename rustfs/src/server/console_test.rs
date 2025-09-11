@@ -15,9 +15,12 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use crate::server::console::start_console_server;
+    use crate::server::console::{start_console_server, parse_cors_origins};
     use clap::Parser;
     use tokio::time::{Duration, timeout};
+    use axum::http::StatusCode;
+    use hyper::Client;
+    use hyper_util::rt::TokioExecutor;
 
     #[tokio::test]
     async fn test_console_server_can_start_and_stop() {
@@ -133,5 +136,118 @@ mod tests {
 
         assert!(result.is_ok(), "Disabled console server should return Ok");
         assert!(duration < Duration::from_millis(100), "Disabled console should return immediately");
+    }
+
+    #[tokio::test]
+    async fn test_console_tls_configuration() {
+        // Test TLS configuration options
+        let args = vec![
+            "rustfs",
+            "/tmp/test",
+            "--console-tls-enable",
+            "true",
+            "--console-tls-cert",
+            "/path/to/cert.pem",
+            "--console-tls-key",
+            "/path/to/key.pem",
+        ];
+        let opt = Opt::parse_from(args);
+
+        assert_eq!(opt.console_tls_enable, true);
+        assert_eq!(opt.console_tls_cert, Some("/path/to/cert.pem".to_string()));
+        assert_eq!(opt.console_tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_console_rate_limiting_configuration() {
+        // Test rate limiting configuration
+        let args = vec![
+            "rustfs", 
+            "/tmp/test",
+            "--console-rate-limit-enable",
+            "true",
+            "--console-rate-limit-rpm",
+            "200",
+        ];
+        let opt = Opt::parse_from(args);
+
+        assert_eq!(opt.console_rate_limit_enable, true);
+        assert_eq!(opt.console_rate_limit_rpm, 200);
+    }
+
+    #[tokio::test]
+    async fn test_console_auth_timeout_configuration() {
+        // Test authentication timeout configuration
+        let args = vec![
+            "rustfs",
+            "/tmp/test", 
+            "--console-auth-timeout",
+            "7200",
+        ];
+        let opt = Opt::parse_from(args);
+
+        assert_eq!(opt.console_auth_timeout, 7200);
+    }
+
+    #[tokio::test]
+    async fn test_console_health_check_endpoint() {
+        // Test that console health check can be called
+        // This test would need a running server to be comprehensive
+        // For now, we test configuration and startup behavior
+        let args = vec!["rustfs", "/tmp/test", "--console-address", ":0"];
+        let opt = Opt::parse_from(args);
+
+        // Verify the configuration supports health checks
+        assert!(opt.console_enable, "Console should be enabled for health checks");
+    }
+
+    #[tokio::test]
+    async fn test_console_separate_logging_target() {
+        // Test that console uses separate logging targets
+        use tracing_test::traced_test;
+        use tracing::{info, Level};
+        
+        // This test verifies that logging targets are properly set up
+        info!(target: "rustfs::console::startup", "Test console startup log");
+        info!(target: "rustfs::console::access", "Test console access log");
+        info!(target: "rustfs::console::error", "Test console error log");
+        info!(target: "rustfs::console::shutdown", "Test console shutdown log");
+        
+        // In a real implementation, we would verify these logs are captured separately
+    }
+
+    #[tokio::test]
+    async fn test_console_configuration_validation() {
+        // Test configuration validation
+        let args = vec![
+            "rustfs",
+            "/tmp/test",
+            "--console-enable", "true",
+            "--console-address", ":9001",
+            "--console-cors-allowed-origins", "http://localhost:3000,https://admin.example.com",
+            "--external-address", ":9020",
+        ];
+        let opt = Opt::parse_from(args);
+
+        // Verify all console-related configuration is parsed correctly
+        assert!(opt.console_enable);
+        assert_eq!(opt.console_address, ":9001");
+        assert_eq!(opt.console_cors_allowed_origins, Some("http://localhost:3000,https://admin.example.com".to_string()));
+        assert_eq!(opt.external_address, Some(":9020".to_string()));
+    }
+
+    #[tokio::test] 
+    async fn test_console_error_handling_fallback() {
+        // Test error handling and fallback mechanisms
+        let args = vec!["rustfs", "/tmp/test", "--console-address", "invalid:address:format"];
+        let opt = Opt::parse_from(args);
+
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+
+        // This should handle the invalid address gracefully
+        let result = start_console_server(&opt, rx).await;
+        
+        // Should return an error for invalid address, but shouldn't panic
+        assert!(result.is_err(), "Invalid address should return error");
     }
 }

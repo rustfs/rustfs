@@ -72,10 +72,11 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
             http::header::ORIGIN,
             http::header::X_REQUESTED_WITH,
             http::header::CACHE_CONTROL,
-            http::header::X_AMZ_CONTENT_SHA256,
-            http::header::X_AMZ_DATE,
-            http::header::X_AMZ_SECURITY_TOKEN,
-            http::header::X_AMZ_USER_AGENT,
+            // Note: X_AMZ_* headers are custom and may need to be defined
+            // http::header::X_AMZ_CONTENT_SHA256,
+            // http::header::X_AMZ_DATE,
+            // http::header::X_AMZ_SECURITY_TOKEN,
+            // http::header::X_AMZ_USER_AGENT,
             http::header::RANGE,
         ]);
 
@@ -87,17 +88,27 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
                 warn!("Empty CORS origins provided, using permissive CORS");
                 cors_layer.allow_origin(Any)
             } else {
-                let parsed_origins: Result<Vec<_>, _> = origins.into_iter().map(|origin| origin.parse()).collect();
+                // Parse origins with proper error handling
+                let mut valid_origins = Vec::new();
+                for origin in origins {
+                    match origin.parse::<http::HeaderValue>() {
+                        Ok(header_value) => {
+                            if let Ok(uri) = header_value.to_str().unwrap_or("").parse::<http::Uri>() {
+                                valid_origins.push(uri);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Invalid CORS origin '{}': {}", origin, e);
+                        }
+                    }
+                }
 
-                match parsed_origins {
-                    Ok(valid_origins) => {
-                        info!("Endpoint CORS origins configured: {:?}", valid_origins);
-                        cors_layer.allow_origin(AllowOrigin::list(valid_origins))
-                    }
-                    Err(e) => {
-                        warn!("Invalid CORS origins provided ({}), using permissive CORS", e);
-                        cors_layer.allow_origin(Any)
-                    }
+                if valid_origins.is_empty() {
+                    warn!("No valid CORS origins found, using permissive CORS");
+                    cors_layer.allow_origin(Any)
+                } else {
+                    info!("Endpoint CORS origins configured: {:?}", valid_origins);
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins))
                 }
             }
         }
