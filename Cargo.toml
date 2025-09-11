@@ -100,6 +100,8 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.6" }
 aws-sdk-s3 = "1.101.0"
 axum = "0.8.4"
+axum-extra = "0.10.1"
+axum-server = "0.7.2"
 base64-simd = "0.8.0"
 base64 = "0.22.1"
 brotli = "8.0.2"
