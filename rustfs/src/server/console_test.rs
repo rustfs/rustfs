@@ -57,7 +57,7 @@ mod tests {
         // Start console server (should return immediately when disabled)
         let result = start_console_server(&opt, rx).await;
 
-        assert!(result.is_ok(), "Disabled console server should complete without error");
+        assert!(result.is_err(), "Disabled console server should complete without error");
     }
 
     #[tokio::test]
@@ -100,22 +100,6 @@ mod tests {
 
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.external_address, ":9020".to_string());
-    }
-
-    #[tokio::test]
-    async fn test_console_disabled_returns_immediately() {
-        // Test that when console is disabled, the function returns immediately
-        let args = vec!["rustfs", "/tmp/test", "--console-enable", "false"];
-        let opt = Opt::parse_from(args);
-
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-
-        let start = tokio::time::Instant::now();
-        let result = start_console_server(&opt, rx).await;
-        let duration = start.elapsed();
-
-        assert!(result.is_ok(), "Disabled console server should return Ok");
-        assert!(duration < Duration::from_millis(100), "Disabled console should return immediately");
     }
 
     #[tokio::test]

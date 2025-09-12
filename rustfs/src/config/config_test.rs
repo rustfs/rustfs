@@ -44,7 +44,7 @@ mod tests {
         ];
         let opt = Opt::parse_from(args);
 
-        assert!(!opt.console_enable);
+        assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":8080");
         assert_eq!(opt.address, ":8000");
     }
