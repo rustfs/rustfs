@@ -1260,101 +1260,112 @@ pub struct ProfileHandler {}
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        use crate::profiling;
-
-        if !profiling::is_profiler_enabled() {
+        #[cfg(target_os = "windows")]
+        {
             return Ok(S3Response::new((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Body::from("Profiler not enabled. Set RUSTFS_ENABLE_PROFILING=true to enable profiling".to_string()),
+                StatusCode::NOT_IMPLEMENTED,
+                Body::from("CPU profiling is not supported on Windows platform".to_string()),
             )));
         }
 
-        let queries = extract_query_params(&req.uri);
-        let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
-        let format = queries.get("format").cloned().unwrap_or_else(|| "protobuf".to_string());
+        #[cfg(not(target_os = "windows"))]
+        {
+            use crate::profiling;
 
-        if seconds > 300 {
-            return Ok(S3Response::new((
-                StatusCode::BAD_REQUEST,
-                Body::from("Profile duration cannot exceed 300 seconds".to_string()),
-            )));
-        }
-
-        let guard = match profiling::get_profiler_guard() {
-            Some(guard) => guard,
-            None => {
+            if !profiling::is_profiler_enabled() {
                 return Ok(S3Response::new((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Body::from("Profiler not initialized".to_string()),
+                    Body::from("Profiler not enabled. Set RUSTFS_ENABLE_PROFILING=true to enable profiling".to_string()),
                 )));
             }
-        };
 
-        info!("Starting CPU profile collection for {} seconds", seconds);
+            let queries = extract_query_params(&req.uri);
+            let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
+            let format = queries.get("format").cloned().unwrap_or_else(|| "protobuf".to_string());
 
-        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-
-        let guard_lock = match guard.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                error!("Failed to acquire profiler guard lock");
+            if seconds > 300 {
                 return Ok(S3Response::new((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Body::from("Failed to acquire profiler lock".to_string()),
+                    StatusCode::BAD_REQUEST,
+                    Body::from("Profile duration cannot exceed 300 seconds".to_string()),
                 )));
             }
-        };
 
-        let report = match guard_lock.report().build() {
-            Ok(report) => report,
-            Err(e) => {
-                error!("Failed to build profiler report: {}", e);
-                return Ok(S3Response::new((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Body::from(format!("Failed to build profile report: {}", e)),
-                )));
-            }
-        };
-
-        info!("CPU profile collection completed");
-
-        match format.as_str() {
-            "protobuf" | "pb" => {
-                let profile = report.pprof().unwrap();
-                let mut body = Vec::new();
-                if let Err(e) = profile.write_to_vec(&mut body) {
-                    error!("Failed to serialize protobuf profile: {}", e);
+            let guard = match profiling::get_profiler_guard() {
+                Some(guard) => guard,
+                None => {
                     return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from("Failed to serialize profile".to_string()),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Body::from("Profiler not initialized".to_string()),
                     )));
                 }
+            };
 
-                let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
-            }
-            "flamegraph" | "svg" => {
-                let mut flamegraph_buf = Vec::new();
-                match report.flamegraph(&mut flamegraph_buf) {
-                    Ok(()) => (),
-                    Err(e) => {
-                        error!("Failed to generate flamegraph: {}", e);
+            info!("Starting CPU profile collection for {} seconds", seconds);
+
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+
+            let guard_lock = match guard.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    error!("Failed to acquire profiler guard lock");
+                    return Ok(S3Response::new((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from("Failed to acquire profiler lock".to_string()),
+                    )));
+                }
+            };
+
+            let report = match guard_lock.report().build() {
+                Ok(report) => report,
+                Err(e) => {
+                    error!("Failed to build profiler report: {}", e);
+                    return Ok(S3Response::new((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from(format!("Failed to build profile report: {}", e)),
+                    )));
+                }
+            };
+
+            info!("CPU profile collection completed");
+
+            match format.as_str() {
+                "protobuf" | "pb" => {
+                    let profile = report.pprof().unwrap();
+                    let mut body = Vec::new();
+                    if let Err(e) = profile.write_to_vec(&mut body) {
+                        error!("Failed to serialize protobuf profile: {}", e);
                         return Ok(S3Response::new((
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Body::from(format!("Failed to generate flamegraph: {}", e)),
+                            Body::from("Failed to serialize profile".to_string()),
                         )));
                     }
-                };
 
-                let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "image/svg+xml".parse().unwrap());
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(flamegraph_buf)), headers))
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+                }
+                "flamegraph" | "svg" => {
+                    let mut flamegraph_buf = Vec::new();
+                    match report.flamegraph(&mut flamegraph_buf) {
+                        Ok(()) => (),
+                        Err(e) => {
+                            error!("Failed to generate flamegraph: {}", e);
+                            return Ok(S3Response::new((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from(format!("Failed to generate flamegraph: {}", e)),
+                            )));
+                        }
+                    };
+
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, "image/svg+xml".parse().unwrap());
+                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(flamegraph_buf)), headers))
+                }
+                _ => Ok(S3Response::new((
+                    StatusCode::BAD_REQUEST,
+                    Body::from("Unsupported format. Use 'protobuf' or 'flamegraph'".to_string()),
+                ))),
             }
-            _ => Ok(S3Response::new((
-                StatusCode::BAD_REQUEST,
-                Body::from("Unsupported format. Use 'protobuf' or 'flamegraph'".to_string()),
-            ))),
         }
     }
 }
@@ -1363,23 +1374,35 @@ pub struct ProfileStatusHandler {}
 #[async_trait::async_trait]
 impl Operation for ProfileStatusHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        use crate::profiling;
         use std::collections::HashMap;
 
-        let status = if profiling::is_profiler_enabled() {
-            HashMap::from([
-                ("enabled", "true"),
-                ("status", "running"),
-                ("supported_formats", "protobuf, flamegraph"),
-                ("max_duration_seconds", "300"),
-                ("endpoint", "/rustfs/admin/debug/pprof/profile"),
-            ])
-        } else {
-            HashMap::from([
-                ("enabled", "false"),
-                ("status", "disabled"),
-                ("message", "Set RUSTFS_ENABLE_PROFILING=true to enable profiling"),
-            ])
+        #[cfg(target_os = "windows")]
+        let status = HashMap::from([
+            ("enabled", "false"),
+            ("status", "not_supported"),
+            ("platform", "windows"),
+            ("message", "CPU profiling is not supported on Windows platform"),
+        ]);
+
+        #[cfg(not(target_os = "windows"))]
+        let status = {
+            use crate::profiling;
+
+            if profiling::is_profiler_enabled() {
+                HashMap::from([
+                    ("enabled", "true"),
+                    ("status", "running"),
+                    ("supported_formats", "protobuf, flamegraph"),
+                    ("max_duration_seconds", "300"),
+                    ("endpoint", "/rustfs/admin/debug/pprof/profile"),
+                ])
+            } else {
+                HashMap::from([
+                    ("enabled", "false"),
+                    ("status", "disabled"),
+                    ("message", "Set RUSTFS_ENABLE_PROFILING=true to enable profiling"),
+                ])
+            }
         };
 
         match serde_json::to_string(&status) {

@@ -6341,7 +6341,6 @@ dependencies = [
  "heapless",
  "once_cell",
  "parking_lot",
- "pprof",
  "rustfs-protos",
  "serde",
  "serde_json",

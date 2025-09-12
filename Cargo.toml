@@ -180,7 +180,6 @@ opentelemetry-semantic-conventions = { version = "0.30.0", features = [
 parking_lot = "0.12.4"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
-pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 blake3 = { version = "1.8.2" }
 pbkdf2 = "0.12.2"
 percent-encoding = "2.3.2"

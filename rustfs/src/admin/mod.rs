@@ -218,6 +218,7 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
+    // Performance profiling endpoints (available on all platforms, with platform-specific responses)
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
