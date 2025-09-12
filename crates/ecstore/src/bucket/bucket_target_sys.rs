@@ -12,15 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::metadata::BucketMetadata;
+use crate::bucket::{metadata::BucketMetadata, replication::StatusType};
 use aws_credential_types::{
     Credentials as SdkCredentials,
     provider::{self, ProvideCredentials, error::CredentialsError, future},
 };
-use aws_sdk_s3::{Client as S3Client, Config as S3Config, Error as S3Error, operation::head_object::HeadObjectOutput};
+use aws_sdk_s3::{
+    Client as S3Client, Config as S3Config, Error as S3Error, operation::head_object::HeadObjectOutput, types::ReplicationStatus,
+};
 use aws_sdk_s3::{config::Region as SdkRegion, operation::get_bucket_versioning::GetBucketVersioningOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
+use http::HeaderMap;
 use reqwest::Client as HttpClient;
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, RUSTFS_BUCKET_REPLICATION_CHECK,
+    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_FORCE_DELETE,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -29,7 +36,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::error;
@@ -782,8 +789,13 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
 }
 
 pub struct RemoveObjectOptions {
-    pub version_id: Option<String>,
-    pub internal: AdvancedRemoveOptions,
+    pub force_delete: bool,
+    pub governance_bypass: bool,
+    pub replication_delete_marker: bool,
+    pub replication_mtime: Option<OffsetDateTime>,
+    pub replication_status: StatusType,
+    pub replication_request: bool,
+    pub replication_validity_check: bool,
 }
 
 #[derive(Debug)]
@@ -843,6 +855,36 @@ impl TargetClient {
         version_id: Option<String>,
         opts: RemoveObjectOptions,
     ) -> Result<(), S3Error> {
+        let mut headers = HeaderMap::new();
+        if opts.force_delete {
+            headers.insert(RUSTFS_FORCE_DELETE, "true".parse().unwrap());
+        }
+        if opts.governance_bypass {
+            headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
+        }
+
+        if opts.replication_delete_marker {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, "true".parse().unwrap());
+        }
+
+        if let Some(t) = opts.replication_mtime {
+            headers.insert(
+                RUSTFS_BUCKET_SOURCE_MTIME,
+                t.format(&Rfc3339).unwrap_or_default().as_str().parse().unwrap(),
+            );
+        }
+
+        if !opts.replication_status.is_empty() {
+            headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
+        }
+
+        if opts.replication_request {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, "true".parse().unwrap());
+        }
+        if opts.replication_validity_check {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_CHECK, "true".parse().unwrap());
+        }
+
         match self
             .client
             .delete_object()
@@ -850,10 +892,16 @@ impl TargetClient {
             .key(object)
             .set_version_id(version_id)
             .customize()
+            .map_request(|mut req| {
+                for (k, v) in headers {
+                    req.headers_mut().insert(k.unwrap(), v);
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
             .send()
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(a) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

@@ -5828,6 +5828,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "base64 0.22.1",
  "byteorder",
  "bytes",

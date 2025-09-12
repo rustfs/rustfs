@@ -163,8 +163,17 @@ pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
+pub const RUSTFS_FORCE_DELETE: &str = "X-Rustfs-Force-Delete";
+
 pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
 pub const RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";
+
+pub const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-Rustfs-Source-Mtime";
+pub const RUSTFS_BUCKET_SOURCE_ETAG: &str = "X-Rustfs-Source-Etag";
+pub const RUSTFS_BUCKET_REPLICATION_DELETE_MARKER: &str = "X-Rustfs-Source-DeleteMarker";
+pub const RUSTFS_BUCKET_REPLICATION_PROXY_REQUEST: &str = "X-Rustfs-Source-Proxy-Request";
+pub const RUSTFS_BUCKET_REPLICATION_REQUEST: &str = "X-Rustfs-Source-Replication-Request";
+pub const RUSTFS_BUCKET_REPLICATION_CHECK: &str = "X-Rustfs-Source-Replication-Check";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
