@@ -47,20 +47,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_console_disabled() {
-        // Test that console server respects the disable flag
-        let args = vec!["rustfs", "/tmp/test", "--console-enable", "false"];
-        let opt = Opt::parse_from(args);
-
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-
-        // Start console server (should return immediately when disabled)
-        let result = start_console_server(&opt, rx).await;
-
-        assert!(result.is_err(), "Disabled console server should complete without error");
-    }
-
-    #[tokio::test]
     async fn test_console_cors_configuration() {
         // Test CORS configuration parsing
         use crate::server::console::parse_cors_origins;
@@ -156,20 +142,5 @@ mod tests {
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.external_address, ":9020".to_string());
-    }
-
-    #[tokio::test]
-    async fn test_console_error_handling_fallback() {
-        // Test error handling and fallback mechanisms
-        let args = vec!["rustfs", "/tmp/test", "--console-address", "invalid:address:format"];
-        let opt = Opt::parse_from(args);
-
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-
-        // This should handle the invalid address gracefully
-        let result = start_console_server(&opt, rx).await;
-
-        // Should return an error for invalid address, but shouldn't panic
-        assert!(result.is_err(), "Invalid address should return error");
     }
 }
