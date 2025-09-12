@@ -47,7 +47,7 @@ use std::sync::OnceLock;
 // use tokio::signal;
 // use tower_http::cors::{Any, CorsLayer};
 // use tower_http::trace::TraceLayer;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 // shadow!(build);
 
@@ -243,6 +243,7 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
+        warn!("Parsed SocketAddr: {}, IP: {} ", socket_addr, ip);
         if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
     } else {
         // Failed to parse, it might be a domain name or a bare IP, use it as is.

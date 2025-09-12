@@ -190,7 +190,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         } else {
             (server_addr.ip(), server_port)
         };
-        info!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
+        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
         // init console configuration
         init_console_cfg(external_addr, external_port);
 
