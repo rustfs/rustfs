@@ -81,6 +81,7 @@ pub mod sts;
 pub mod tier;
 pub mod trace;
 pub mod user;
+#[cfg(not(target_os = "windows"))]
 use pprof::protos::Message;
 use urlencoding::decode;
 
