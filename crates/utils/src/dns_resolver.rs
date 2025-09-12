@@ -127,6 +127,7 @@ impl LayeredDnsResolver {
     /// Validate domain format according to RFC standards
     #[instrument(skip_all, fields(domain = %domain))]
     fn validate_domain_format(domain: &str) -> Result<(), DnsError> {
+        info!("Validating domain format start");
         // Check FQDN length
         if domain.len() > MAX_FQDN_LENGTH {
             return Err(DnsError::InvalidFormat {
@@ -157,7 +158,7 @@ impl LayeredDnsResolver {
                 });
             }
         }
-
+        info!("DNS resolver validated successfully");
         Ok(())
     }
 
@@ -209,7 +210,6 @@ impl LayeredDnsResolver {
                 let ips: Vec<IpAddr> = lookup.iter().collect();
                 if !ips.is_empty() {
                     info!("System DNS resolution successful for domain: {} -> {} IPs", domain, ips.len());
-                    debug!("System DNS resolved IPs: {:?}", ips);
                     Ok(ips)
                 } else {
                     warn!("System DNS returned empty result for domain: {}", domain);
@@ -242,7 +242,6 @@ impl LayeredDnsResolver {
                 let ips: Vec<IpAddr> = lookup.iter().collect();
                 if !ips.is_empty() {
                     info!("Public DNS resolution successful for domain: {} -> {} IPs", domain, ips.len());
-                    debug!("Public DNS resolved IPs: {:?}", ips);
                     Ok(ips)
                 } else {
                     warn!("Public DNS returned empty result for domain: {}", domain);
@@ -270,6 +269,7 @@ impl LayeredDnsResolver {
     /// 3. Public DNS (hickory-resolver with TLS-enabled Cloudflare DNS fallback)
     #[instrument(skip_all, fields(domain = %domain))]
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>, DnsError> {
+        info!("Starting DNS resolution process for domain: {} start", domain);
         // Validate domain format first
         Self::validate_domain_format(domain)?;
 
@@ -305,7 +305,7 @@ impl LayeredDnsResolver {
             }
             Err(public_err) => {
                 error!(
-                    "All DNS resolution attempts failed for domain: {}. System DNS: failed, Public DNS: {}",
+                    "All DNS resolution attempts failed for domain:` {}`. System DNS: failed, Public DNS: {}",
                     domain, public_err
                 );
                 Err(DnsError::AllAttemptsFailed {
@@ -345,6 +345,7 @@ pub fn get_global_dns_resolver() -> Option<&'static LayeredDnsResolver> {
 /// Resolve domain using the global DNS resolver with comprehensive tracing
 #[instrument(skip_all, fields(domain = %domain))]
 pub async fn resolve_domain(domain: &str) -> Result<Vec<IpAddr>, DnsError> {
+    info!("resolving domain for: {}", domain);
     match get_global_dns_resolver() {
         Some(resolver) => resolver.resolve(domain).await,
         None => Err(DnsError::InitializationFailed {

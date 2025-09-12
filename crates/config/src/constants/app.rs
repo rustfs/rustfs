@@ -81,36 +81,6 @@ pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 /// Example: --console-enable true
 pub const DEFAULT_CONSOLE_ENABLE: bool = true;
 
-/// Default console rate limit enable
-/// This is the default value for enabling rate limiting on the console server.
-/// Rate limiting helps protect against abuse and DoS attacks on the management interface.
-/// Default value: false
-/// Environment variable: RUSTFS_CONSOLE_RATE_LIMIT_ENABLE
-/// Command line argument: --console-rate-limit-enable
-/// Example: RUSTFS_CONSOLE_RATE_LIMIT_ENABLE=true
-/// Example: --console-rate-limit-enable true
-pub const DEFAULT_CONSOLE_RATE_LIMIT_ENABLE: bool = false;
-
-/// Default console rate limit requests per minute
-/// This is the default rate limit for console requests when rate limiting is enabled.
-/// Limits the number of requests per minute per client IP to prevent abuse.
-/// Default value: 100 requests per minute
-/// Environment variable: RUSTFS_CONSOLE_RATE_LIMIT_RPM
-/// Command line argument: --console-rate-limit-rpm
-/// Example: RUSTFS_CONSOLE_RATE_LIMIT_RPM=100
-/// Example: --console-rate-limit-rpm 100
-pub const DEFAULT_CONSOLE_RATE_LIMIT_RPM: u32 = 100;
-
-/// Default console authentication timeout in seconds
-/// This is the default timeout for console authentication sessions.
-/// After this timeout, users need to re-authenticate to access the console.
-/// Default value: 3600 seconds (1 hour)
-/// Environment variable: RUSTFS_CONSOLE_AUTH_TIMEOUT
-/// Command line argument: --console-auth-timeout
-/// Example: RUSTFS_CONSOLE_AUTH_TIMEOUT=3600
-/// Example: --console-auth-timeout 3600
-pub const DEFAULT_CONSOLE_AUTH_TIMEOUT: u64 = 3600;
-
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
 /// Command line argument: --obs-endpoint
@@ -189,6 +159,16 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
 /// Default value: 30
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
+
+/// This is the external address for rustfs to access endpoint (used in Docker deployments).
+/// This should match the mapped host port when using Docker port mapping.
+/// Example: ":9020" when mapping host port 9020 to container port 9000.
+/// Default value: DEFAULT_ADDRESS
+/// Environment variable: RUSTFS_EXTERNAL_ADDRESS
+/// Command line argument: --external-address
+/// Example: RUSTFS_EXTERNAL_ADDRESS=":9020"
+/// Example: --external-address ":9020"
+pub const ENV_EXTERNAL_ADDRESS: &str = "RUSTFS_EXTERNAL_ADDRESS";
 
 #[cfg(test)]
 mod tests {

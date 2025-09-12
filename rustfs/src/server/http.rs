@@ -115,6 +115,13 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     }
 }
 
+fn get_cors_allowed_origins() -> String {
+    std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
+        .parse::<String>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
+}
+
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
@@ -238,8 +245,12 @@ pub async fn start_http_server(
     let shutdown_tx_clone = shutdown_tx.clone();
 
     // Capture CORS configuration for the server loop
-    let cors_allowed_origins = opt.cors_allowed_origins.clone();
-
+    let cors_allowed_origins = get_cors_allowed_origins();
+    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
+        None
+    } else {
+        Some(cors_allowed_origins)
+    };
     tokio::spawn(async move {
         // Create CORS layer inside the server loop closure
         let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());

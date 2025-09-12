@@ -81,16 +81,6 @@ pub struct Opt {
     #[arg(long, default_value_t = rustfs_config::DEFAULT_ADDRESS.to_string(), env = "RUSTFS_EXTERNAL_ADDRESS")]
     pub external_address: String,
 
-    /// CORS allowed origins for the endpoint service
-    /// Comma-separated list of origins or "*" for all origins
-    #[arg(long, env = "RUSTFS_CORS_ALLOWED_ORIGINS")]
-    pub cors_allowed_origins: Option<String>,
-
-    /// CORS allowed origins for the console service
-    /// Comma-separated list of origins or "*" for all origins
-    #[arg(long, env = "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS")]
-    pub console_cors_allowed_origins: Option<String>,
-
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,

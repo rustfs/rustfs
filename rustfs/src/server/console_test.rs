@@ -15,10 +15,8 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use crate::server::console::{parse_cors_origins, start_console_server};
-    use axum::http::StatusCode;
+    use crate::server::console::start_console_server;
     use clap::Parser;
-    use hyper_util::rt::TokioExecutor;
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
@@ -38,7 +36,7 @@ mod tests {
         // Send shutdown signal
         let _ = tx.send(());
 
-        // Wait for server to shutdown
+        // Wait for server to shut down
         let result = timeout(Duration::from_secs(5), handle).await;
 
         assert!(result.is_ok(), "Console server should shutdown gracefully");
@@ -54,7 +52,7 @@ mod tests {
         let args = vec!["rustfs", "/tmp/test", "--console-enable", "false"];
         let opt = Opt::parse_from(args);
 
-        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let (_tx, rx) = tokio::sync::broadcast::channel(1);
 
         // Start console server (should return immediately when disabled)
         let result = start_console_server(&opt, rx).await;
@@ -69,21 +67,21 @@ mod tests {
 
         // Test wildcard origin
         let cors_wildcard = Some("*".to_string());
-        let layer1 = parse_cors_origins(cors_wildcard.as_ref());
+        let _layer1 = parse_cors_origins(cors_wildcard.as_ref());
         // Should create a layer without error
 
         // Test specific origins
         let cors_specific = Some("http://localhost:3000,https://admin.example.com".to_string());
-        let layer2 = parse_cors_origins(cors_specific.as_ref());
+        let _layer2 = parse_cors_origins(cors_specific.as_ref());
         // Should create a layer without error
 
         // Test empty origin
         let cors_empty = Some("".to_string());
-        let layer3 = parse_cors_origins(cors_empty.as_ref());
+        let _layer3 = parse_cors_origins(cors_empty.as_ref());
         // Should create a layer without error (falls back to permissive)
 
         // Test no origin
-        let layer4 = parse_cors_origins(None);
+        let _layer4 = parse_cors_origins(None);
         // Should create a layer without error (uses default)
     }
 
@@ -102,23 +100,6 @@ mod tests {
 
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.external_address, ":9020".to_string());
-    }
-
-    #[tokio::test]
-    async fn test_cors_environment_variables() {
-        // Test CORS configuration via environment variables
-        let args = vec![
-            "rustfs",
-            "/tmp/test",
-            "--cors-allowed-origins",
-            "https://api.example.com",
-            "--console-cors-allowed-origins",
-            "https://console.example.com",
-        ];
-        let opt = Opt::parse_from(args);
-
-        assert_eq!(opt.cors_allowed_origins, Some("https://api.example.com".to_string()));
-        assert_eq!(opt.console_cors_allowed_origins, Some("https://console.example.com".to_string()));
     }
 
     #[tokio::test]
@@ -147,32 +128,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_console_rate_limiting_configuration() {
-        // Test rate limiting configuration
-        let args = vec![
-            "rustfs",
-            "/tmp/test",
-            "--console-rate-limit-enable",
-            "true",
-            "--console-rate-limit-rpm",
-            "200",
-        ];
-        let opt = Opt::parse_from(args);
-
-        assert_eq!(opt.console_rate_limit_enable, true);
-        assert_eq!(opt.console_rate_limit_rpm, 200);
-    }
-
-    #[tokio::test]
-    async fn test_console_auth_timeout_configuration() {
-        // Test authentication timeout configuration
-        let args = vec!["rustfs", "/tmp/test", "--console-auth-timeout", "7200"];
-        let opt = Opt::parse_from(args);
-
-        assert_eq!(opt.console_auth_timeout, 7200);
-    }
-
-    #[tokio::test]
     async fn test_console_health_check_endpoint() {
         // Test that console health check can be called
         // This test would need a running server to be comprehensive
@@ -187,8 +142,7 @@ mod tests {
     #[tokio::test]
     async fn test_console_separate_logging_target() {
         // Test that console uses separate logging targets
-        use tracing::{Level, info};
-        use tracing_test::traced_test;
+        use tracing::info;
 
         // This test verifies that logging targets are properly set up
         info!(target: "rustfs::console::startup", "Test console startup log");
@@ -209,8 +163,6 @@ mod tests {
             "true",
             "--console-address",
             ":9001",
-            "--console-cors-allowed-origins",
-            "http://localhost:3000,https://admin.example.com",
             "--external-address",
             ":9020",
         ];
@@ -219,10 +171,6 @@ mod tests {
         // Verify all console-related configuration is parsed correctly
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
-        assert_eq!(
-            opt.console_cors_allowed_origins,
-            Some("http://localhost:3000,https://admin.example.com".to_string())
-        );
         assert_eq!(opt.external_address, ":9020".to_string());
     }
 
@@ -232,7 +180,7 @@ mod tests {
         let args = vec!["rustfs", "/tmp/test", "--console-address", "invalid:address:format"];
         let opt = Opt::parse_from(args);
 
-        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let (_tx, rx) = tokio::sync::broadcast::channel(1);
 
         // This should handle the invalid address gracefully
         let result = start_console_server(&opt, rx).await;

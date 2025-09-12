@@ -15,6 +15,7 @@
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
+use std::io::Error;
 use std::net::Ipv6Addr;
 use std::sync::{LazyLock, Mutex};
 use std::{
@@ -23,6 +24,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
     time::{Duration, Instant},
 };
+use tracing::{error, info};
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 
@@ -61,7 +63,7 @@ pub fn is_socket_addr(addr: &str) -> bool {
 pub fn check_local_server_addr(server_addr: &str) -> std::io::Result<SocketAddr> {
     let addr: Vec<SocketAddr> = match server_addr.to_socket_addrs() {
         Ok(addr) => addr.collect(),
-        Err(err) => return Err(std::io::Error::other(err)),
+        Err(err) => return Err(Error::other(err)),
     };
 
     // 0.0.0.0 is a wildcard address and refers to local network
@@ -82,7 +84,7 @@ pub fn check_local_server_addr(server_addr: &str) -> std::io::Result<SocketAddr>
         }
     }
 
-    Err(std::io::Error::other("host in server address should be this server"))
+    Err(Error::other("host in server address should be this server"))
 }
 
 /// checks if the given parameter correspond to one of
@@ -93,7 +95,7 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
         Host::Domain(domain) => {
             let ips = match (domain, 0).to_socket_addrs().map(|v| v.map(|v| v.ip()).collect::<Vec<_>>()) {
                 Ok(ips) => ips,
-                Err(err) => return Err(std::io::Error::other(err)),
+                Err(err) => return Err(Error::other(err)),
             };
 
             ips.iter().any(|ip| local_set.contains(ip))
@@ -113,49 +115,20 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 ///
 /// This is the async version of `get_host_ip()` that provides enhanced DNS resolution
 /// with Kubernetes support when the "net" feature is enabled.
-pub async fn get_host_ip_async(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
+pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
-            #[cfg(feature = "net")]
-            {
-                use crate::dns_resolver::resolve_domain;
-                match resolve_domain(domain).await {
-                    Ok(ips) => Ok(ips.into_iter().collect()),
-                    Err(e) => Err(std::io::Error::other(format!("DNS resolution failed: {}", e))),
+            match crate::dns_resolver::resolve_domain(domain).await {
+                Ok(ips) => {
+                    info!("Resolved domain {domain} using custom DNS resolver: {ips:?}");
+                    return Ok(ips.into_iter().collect());
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to resolve domain {domain} using custom DNS resolver, falling back to system resolver,err: {err}"
+                    );
                 }
             }
-            #[cfg(not(feature = "net"))]
-            {
-                // Fallback to standard resolution when DNS resolver is not available
-                match (domain, 0)
-                    .to_socket_addrs()
-                    .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
-                {
-                    Ok(ips) => Ok(ips),
-                    Err(err) => Err(std::io::Error::other(err)),
-                }
-            }
-        }
-        Host::Ipv4(ip) => {
-            let mut set = HashSet::with_capacity(1);
-            set.insert(IpAddr::V4(ip));
-            Ok(set)
-        }
-        Host::Ipv6(ip) => {
-            let mut set = HashSet::with_capacity(1);
-            set.insert(IpAddr::V6(ip));
-            Ok(set)
-        }
-    }
-}
-
-/// returns IP address of given host using standard resolution.
-///
-/// **Note**: This function uses standard library DNS resolution with caching.
-/// For enhanced DNS resolution with Kubernetes support, use `get_host_ip_async()`.
-pub fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
-    match host {
-        Host::Domain(domain) => {
             // Check cache first
             if let Ok(mut cache) = DNS_CACHE.lock() {
                 if let Some(entry) = cache.get(domain) {
@@ -167,7 +140,9 @@ pub fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
                 }
             }
 
-            // Perform DNS resolution
+            info!("Cache miss for domain {domain}, querying system resolver.");
+
+            // Fallback to standard resolution when DNS resolver is not available
             match (domain, 0)
                 .to_socket_addrs()
                 .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
@@ -181,21 +156,17 @@ pub fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
                             cache.retain(|_, v| !v.is_expired(DNS_CACHE_TTL));
                         }
                     }
+                    info!("System query for domain {domain}: {:?}", ips);
                     Ok(ips)
                 }
-                Err(err) => Err(std::io::Error::other(err)),
+                Err(err) => {
+                    error!("Failed to resolve domain {domain} using system resolver, err: {err}");
+                    Err(Error::other(err))
+                }
             }
         }
-        Host::Ipv4(ip) => {
-            let mut set = HashSet::with_capacity(1);
-            set.insert(IpAddr::V4(ip));
-            Ok(set)
-        }
-        Host::Ipv6(ip) => {
-            let mut set = HashSet::with_capacity(1);
-            set.insert(IpAddr::V6(ip));
-            Ok(set)
-        }
+        Host::Ipv4(ip) => Ok([IpAddr::V4(ip)].into_iter().collect()),
+        Host::Ipv6(ip) => Ok([IpAddr::V6(ip)].into_iter().collect()),
     }
 }
 
@@ -207,7 +178,7 @@ pub fn get_available_port() -> u16 {
 pub fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
     match netif::up() {
         Ok(up) => Ok(up.map(|x| x.address().to_owned()).collect()),
-        Err(err) => Err(std::io::Error::other(format!("Unable to get IP addresses of this host: {err}"))),
+        Err(err) => Err(Error::other(format!("Unable to get IP addresses of this host: {err}"))),
     }
 }
 
@@ -215,7 +186,7 @@ pub fn get_default_location(_u: Url, _region_override: &str) -> String {
     todo!();
 }
 
-pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, std::io::Error> {
+pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, Error> {
     let mut scheme = "https";
     if !secure {
         scheme = "http";
@@ -223,7 +194,7 @@ pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, std::io::Er
 
     let endpoint_url_str = format!("{scheme}://{endpoint}");
     let Ok(endpoint_url) = Url::parse(&endpoint_url_str) else {
-        return Err(std::io::Error::other("url parse error."));
+        return Err(Error::other("url parse error."));
     };
 
     //is_valid_endpoint_url(endpoint_url)?;
@@ -258,7 +229,7 @@ impl Display for XHost {
 }
 
 impl TryFrom<String> for XHost {
-    type Error = std::io::Error;
+    type Error = Error;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if let Some(addr) = value.to_socket_addrs()?.next() {
@@ -268,7 +239,7 @@ impl TryFrom<String> for XHost {
                 is_port_set: addr.port() > 0,
             })
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "value invalid"))
+            Err(Error::new(std::io::ErrorKind::InvalidData, "value invalid"))
         }
     }
 }
@@ -278,7 +249,7 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
         let port_str = port;
         let port: u16 = port_str
             .parse()
-            .map_err(|e| std::io::Error::other(format!("Invalid port format: {addr_str}, err:{e:?}")))?;
+            .map_err(|e| Error::other(format!("Invalid port format: {addr_str}, err:{e:?}")))?;
         let final_port = if port == 0 {
             get_available_port() // assume get_available_port is available here
         } else {
@@ -318,9 +289,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
     use super::*;
+    use crate::init_global_dns_resolver;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_is_socket_addr() {
@@ -424,23 +395,29 @@ mod test {
         assert!(is_local_host(invalid_host, 0, 0).is_err());
     }
 
-    #[test]
-    fn test_get_host_ip() {
+    #[tokio::test]
+    async fn test_get_host_ip() {
+        match init_global_dns_resolver().await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Failed to initialize global DNS resolver: {e}");
+            }
+        }
         // Test IPv4 address
         let ipv4_host = Host::Ipv4(Ipv4Addr::new(192, 168, 1, 1));
-        let ipv4_result = get_host_ip(ipv4_host).unwrap();
+        let ipv4_result = get_host_ip(ipv4_host).await.unwrap();
         assert_eq!(ipv4_result.len(), 1);
         assert!(ipv4_result.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
 
         // Test IPv6 address
         let ipv6_host = Host::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        let ipv6_result = get_host_ip(ipv6_host).unwrap();
+        let ipv6_result = get_host_ip(ipv6_host).await.unwrap();
         assert_eq!(ipv6_result.len(), 1);
         assert!(ipv6_result.contains(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))));
 
         // Test localhost domain
         let localhost_host = Host::Domain("localhost");
-        let localhost_result = get_host_ip(localhost_host).unwrap();
+        let localhost_result = get_host_ip(localhost_host).await.unwrap();
         assert!(!localhost_result.is_empty());
         // Should contain at least loopback address
         assert!(
@@ -450,7 +427,16 @@ mod test {
 
         // Test invalid domain
         let invalid_host = Host::Domain("invalid.nonexistent.domain.example");
-        assert!(get_host_ip(invalid_host).is_err());
+        match get_host_ip(invalid_host.clone()).await {
+            Ok(ips) => {
+                // Depending on DNS resolver behavior, it might return empty set or error
+                assert!(ips.is_empty(), "Expected empty IP set for invalid domain, got: {:?}", ips);
+            }
+            Err(_) => {
+                error!("Expected error for invalid domain");
+            } // Expected error
+        }
+        assert!(get_host_ip(invalid_host).await.is_err());
     }
 
     #[test]

@@ -111,16 +111,16 @@ async fn setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<Ru
     if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
         debug!("Found legacy single TLS certificate for console, starting with HTTPS");
 
-        match RustlsConfig::from_pem_file(cert_path, key_path).await {
+        return match RustlsConfig::from_pem_file(cert_path, key_path).await {
             Ok(config) => {
                 info!(target: "rustfs::console::tls", "Console TLS enabled with single certificate");
-                return Ok(Some(config));
+                Ok(Some(config))
             }
             Err(e) => {
                 error!(target: "rustfs::console::error", error = %e, "Failed to create TLS config for console");
-                return Err(std::io::Error::other(e));
+                Err(std::io::Error::other(e))
             }
-        }
+        };
     }
 
     debug!("No valid TLS certificates found in the directory for console, starting with HTTP");
@@ -128,23 +128,27 @@ async fn setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<Ru
 }
 
 /// Get console configuration from environment variables
-fn get_console_config_from_env() -> (bool, u32, u64) {
-    let rate_limit_enable = std::env::var("RUSTFS_CONSOLE_RATE_LIMIT_ENABLE")
+fn get_console_config_from_env() -> (bool, u32, u64, String) {
+    let rate_limit_enable = std::env::var(rustfs_config::ENV_CONSOLE_RATE_LIMIT_ENABLE)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE.to_string())
         .parse::<bool>()
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE);
 
-    let rate_limit_rpm = std::env::var("RUSTFS_CONSOLE_RATE_LIMIT_RPM")
+    let rate_limit_rpm = std::env::var(rustfs_config::ENV_CONSOLE_RATE_LIMIT_RPM)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_RPM.to_string())
         .parse::<u32>()
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_RPM);
 
-    let auth_timeout = std::env::var("RUSTFS_CONSOLE_AUTH_TIMEOUT")
+    let auth_timeout = std::env::var(rustfs_config::ENV_CONSOLE_AUTH_TIMEOUT)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_AUTH_TIMEOUT.to_string())
         .parse::<u64>()
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_AUTH_TIMEOUT);
+    let cors_allowed_origins = std::env::var(rustfs_config::ENV_CONSOLE_CORS_ALLOWED_ORIGINS)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
+        .parse::<String>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string());
 
-    (rate_limit_enable, rate_limit_rpm, auth_timeout)
+    (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
@@ -155,6 +159,8 @@ fn setup_console_middleware_stack(
     auth_timeout: u64,
 ) -> Router {
     let mut app = Router::new()
+        .route("/license", get(crate::admin::console::license_handler))
+        .route("/config.json", get(crate::admin::console::config_handler))
         .route("/health", get(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
@@ -274,7 +280,7 @@ pub async fn start_console_server(opt: &Opt, shutdown_rx: tokio::sync::broadcast
     let console_addr = parse_and_resolve_address(&opt.console_address)?;
 
     // Get configuration from environment variables
-    let (rate_limit_enable, rate_limit_rpm, auth_timeout) = get_console_config_from_env();
+    let (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins) = get_console_config_from_env();
 
     // Setup TLS configuration if certificates are available
     let tls_config = setup_console_tls_config(opt.tls_path.as_ref()).await?;
@@ -287,11 +293,19 @@ pub async fn start_console_server(opt: &Opt, shutdown_rx: tokio::sync::broadcast
         rate_limit_enabled = rate_limit_enable,
         rate_limit_rpm = rate_limit_rpm,
         auth_timeout_seconds = auth_timeout,
+        cors_allowed_origins = %cors_allowed_origins,
         "Starting console server"
     );
 
+    // String to Option<&String>
+    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
+        None
+    } else {
+        Some(&cors_allowed_origins)
+    };
+
     // Configure CORS based on settings
-    let cors_layer = parse_cors_origins(opt.console_cors_allowed_origins.as_ref());
+    let cors_layer = parse_cors_origins(cors_allowed_origins);
 
     // Build console router with enhanced middleware stack using tower-http features
     let app = setup_console_middleware_stack(cors_layer, rate_limit_enable, rate_limit_rpm, auth_timeout);
