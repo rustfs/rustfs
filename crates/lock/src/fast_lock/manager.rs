@@ -27,7 +27,7 @@ use crate::fast_lock::{
 /// High-performance object lock manager
 #[derive(Debug)]
 pub struct FastObjectLockManager {
-    shards: Vec<Arc<LockShard>>,
+    pub shards: Vec<Arc<LockShard>>,
     shard_mask: usize,
     config: LockConfig,
     metrics: Arc<GlobalMetrics>,
@@ -66,7 +66,12 @@ impl FastObjectLockManager {
     pub async fn acquire_lock(&self, request: ObjectLockRequest) -> Result<FastLockGuard, LockResult> {
         let shard = self.get_shard(&request.key);
         match shard.acquire_lock(&request).await {
-            Ok(()) => Ok(FastLockGuard::new(request.key, request.mode, request.owner, shard.clone())),
+            Ok(()) => {
+                let guard = FastLockGuard::new(request.key, request.mode, request.owner, shard.clone());
+                // Register guard to prevent premature cleanup
+                shard.register_guard(guard.guard_id());
+                Ok(guard)
+            }
             Err(err) => Err(err),
         }
     }
@@ -114,6 +119,54 @@ impl FastObjectLockManager {
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
         let request = ObjectLockRequest::new_write(bucket, object, owner).with_version(version);
+        self.acquire_lock(request).await
+    }
+
+    /// Acquire high-priority read lock - optimized for database queries
+    pub async fn acquire_high_priority_read_lock(
+        &self,
+        bucket: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+        owner: impl Into<Arc<str>>,
+    ) -> Result<FastLockGuard, LockResult> {
+        let request =
+            ObjectLockRequest::new_read(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::High);
+        self.acquire_lock(request).await
+    }
+
+    /// Acquire high-priority write lock - optimized for database queries
+    pub async fn acquire_high_priority_write_lock(
+        &self,
+        bucket: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+        owner: impl Into<Arc<str>>,
+    ) -> Result<FastLockGuard, LockResult> {
+        let request =
+            ObjectLockRequest::new_write(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::High);
+        self.acquire_lock(request).await
+    }
+
+    /// Acquire critical priority read lock - for system operations
+    pub async fn acquire_critical_read_lock(
+        &self,
+        bucket: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+        owner: impl Into<Arc<str>>,
+    ) -> Result<FastLockGuard, LockResult> {
+        let request =
+            ObjectLockRequest::new_read(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::Critical);
+        self.acquire_lock(request).await
+    }
+
+    /// Acquire critical priority write lock - for system operations
+    pub async fn acquire_critical_write_lock(
+        &self,
+        bucket: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+        owner: impl Into<Arc<str>>,
+    ) -> Result<FastLockGuard, LockResult> {
+        let request =
+            ObjectLockRequest::new_write(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::Critical);
         self.acquire_lock(request).await
     }
 
@@ -304,7 +357,7 @@ impl FastObjectLockManager {
     }
 
     /// Get shard for object key
-    fn get_shard(&self, key: &crate::fast_lock::types::ObjectKey) -> &Arc<LockShard> {
+    pub fn get_shard(&self, key: &crate::fast_lock::types::ObjectKey) -> &Arc<LockShard> {
         let index = key.shard_index(self.shard_mask);
         &self.shards[index]
     }
@@ -358,6 +411,18 @@ impl Drop for FastObjectLockManager {
             if let Some(handle) = handle_guard.as_ref() {
                 handle.abort();
             }
+        }
+    }
+}
+
+impl Clone for FastObjectLockManager {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            shard_mask: self.shard_mask,
+            config: self.config.clone(),
+            metrics: self.metrics.clone(),
+            cleanup_handle: RwLock::new(None), // Don't clone the cleanup task
         }
     }
 }

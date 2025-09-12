@@ -373,11 +373,23 @@ impl ObjectLockState {
                 }
                 true
             } else {
-                // Inconsistency - re-add owner
+                // Inconsistency detected - atomic state shows no shared lock but owner was found
+                tracing::warn!(
+                    "Atomic state inconsistency during shared lock release: owner={}, remaining_owners={}",
+                    owner,
+                    shared.len()
+                );
+                // Re-add owner to maintain consistency
                 shared.push(owner.clone());
                 false
             }
         } else {
+            // Owner not found in shared owners list
+            tracing::debug!(
+                "Shared lock release failed - owner not found: owner={}, current_owners={:?}",
+                owner,
+                shared.iter().map(|s| s.as_ref()).collect::<Vec<_>>()
+            );
             false
         }
     }
@@ -401,9 +413,21 @@ impl ObjectLockState {
                 }
                 true
             } else {
+                // Atomic state inconsistency - current owner matches but atomic release failed
+                tracing::warn!(
+                    "Atomic state inconsistency during exclusive lock release: owner={}, atomic_state={:b}",
+                    owner,
+                    self.atomic_state.state.load(Ordering::Acquire)
+                );
                 false
             }
         } else {
+            // Owner mismatch
+            tracing::debug!(
+                "Exclusive lock release failed - owner mismatch: expected_owner={}, actual_owner={:?}",
+                owner,
+                current.as_ref().map(|s| s.as_ref())
+            );
             false
         }
     }
