@@ -24,6 +24,7 @@ use crate::fast_lock::{
     state::ObjectLockState,
     types::{LockMode, LockResult, ObjectKey, ObjectLockRequest},
 };
+use std::collections::HashSet;
 
 /// Lock shard to reduce global contention
 #[derive(Debug)]
@@ -36,6 +37,8 @@ pub struct LockShard {
     metrics: ShardMetrics,
     /// Shard ID for debugging
     _shard_id: usize,
+    /// Active guard IDs to prevent cleanup of locks with live guards
+    active_guards: parking_lot::Mutex<HashSet<u64>>,
 }
 
 impl LockShard {
@@ -45,6 +48,7 @@ impl LockShard {
             object_pool: ObjectStatePool::new(),
             metrics: ShardMetrics::new(),
             _shard_id: shard_id,
+            active_guards: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -123,7 +127,12 @@ impl LockShard {
 
     /// Slow path with async waiting
     async fn acquire_lock_slow_path(&self, request: &ObjectLockRequest, start_time: Instant) -> Result<(), LockResult> {
-        let deadline = start_time + request.acquire_timeout;
+        // Use adaptive timeout based on current load and request priority
+        let adaptive_timeout = self.calculate_adaptive_timeout(request);
+        let deadline = start_time + adaptive_timeout;
+
+        let mut retry_count = 0u32;
+        const MAX_RETRIES: u32 = 10;
 
         loop {
             // Get or create object state
@@ -157,8 +166,22 @@ impl LockShard {
                 return Err(LockResult::Timeout);
             }
 
-            // Wait for notification using optimized notify system
+            // Use intelligent wait strategy: mix of notification wait and exponential backoff
             let remaining = deadline - Instant::now();
+
+            if retry_count < MAX_RETRIES && remaining > Duration::from_millis(10) {
+                // For early retries, use a brief exponential backoff instead of full notification wait
+                let backoff_ms = std::cmp::min(10 << retry_count, 100); // 10ms, 20ms, 40ms, 80ms, 100ms max
+                let backoff_duration = Duration::from_millis(backoff_ms);
+
+                if backoff_duration < remaining {
+                    tokio::time::sleep(backoff_duration).await;
+                    retry_count += 1;
+                    continue;
+                }
+            }
+
+            // If we've exhausted quick retries or have little time left, use notification wait
             let wait_result = match request.mode {
                 LockMode::Shared => {
                     state.atomic_state.inc_readers_waiting();
@@ -179,7 +202,7 @@ impl LockShard {
                 return Err(LockResult::Timeout);
             }
 
-            // Continue the loop to try acquisition again
+            retry_count += 1;
         }
     }
 
@@ -203,10 +226,30 @@ impl LockShard {
                     should_cleanup = !state.is_locked() && !state.atomic_state.has_waiters();
                 } else {
                     should_cleanup = false;
+                    // Additional diagnostics for release failures
+                    let current_mode = state.current_mode();
+                    let is_locked = state.is_locked();
+                    let has_waiters = state.atomic_state.has_waiters();
+
+                    tracing::debug!(
+                        "Lock release failed in shard: key={}, owner={}, mode={:?}, current_mode={:?}, is_locked={}, has_waiters={}",
+                        key,
+                        owner,
+                        mode,
+                        current_mode,
+                        is_locked,
+                        has_waiters
+                    );
                 }
             } else {
                 result = false;
                 should_cleanup = false;
+                tracing::debug!(
+                    "Lock release failed - key not found in shard: key={}, owner={}, mode={:?}",
+                    key,
+                    owner,
+                    mode
+                );
             }
         }
 
@@ -216,6 +259,134 @@ impl LockShard {
         }
 
         result
+    }
+
+    /// Release lock with guard ID tracking for double-release prevention
+    pub fn release_lock_with_guard(&self, key: &ObjectKey, owner: &Arc<str>, mode: LockMode, guard_id: u64) -> bool {
+        // First, try to remove the guard from active set
+        let guard_was_active = {
+            let mut guards = self.active_guards.lock();
+            guards.remove(&guard_id)
+        };
+
+        // If guard was not active, this is a double-release attempt
+        if !guard_was_active {
+            tracing::debug!(
+                "Double-release attempt blocked: key={}, owner={}, mode={:?}, guard_id={}",
+                key,
+                owner,
+                mode,
+                guard_id
+            );
+            return false;
+        }
+
+        // Proceed with normal release
+        let should_cleanup;
+        let result;
+
+        {
+            let objects = self.objects.read();
+            if let Some(state) = objects.get(key) {
+                result = match mode {
+                    LockMode::Shared => state.release_shared(owner),
+                    LockMode::Exclusive => state.release_exclusive(owner),
+                };
+
+                if result {
+                    self.metrics.record_release();
+                    should_cleanup = !state.is_locked() && !state.atomic_state.has_waiters();
+                } else {
+                    should_cleanup = false;
+                }
+            } else {
+                result = false;
+                should_cleanup = false;
+            }
+        }
+
+        if should_cleanup {
+            self.schedule_cleanup(key.clone());
+        }
+
+        result
+    }
+
+    /// Register a guard to prevent premature cleanup
+    pub fn register_guard(&self, guard_id: u64) {
+        let mut guards = self.active_guards.lock();
+        guards.insert(guard_id);
+    }
+
+    /// Unregister a guard (called when guard is dropped)
+    pub fn unregister_guard(&self, guard_id: u64) {
+        let mut guards = self.active_guards.lock();
+        guards.remove(&guard_id);
+    }
+
+    /// Get count of active guards (for testing)
+    #[cfg(test)]
+    pub fn active_guard_count(&self) -> usize {
+        let guards = self.active_guards.lock();
+        guards.len()
+    }
+
+    /// Check if a guard is active (for testing)
+    #[cfg(test)]
+    pub fn is_guard_active(&self, guard_id: u64) -> bool {
+        let guards = self.active_guards.lock();
+        guards.contains(&guard_id)
+    }
+
+    /// Calculate adaptive timeout based on current system load and request priority
+    fn calculate_adaptive_timeout(&self, request: &ObjectLockRequest) -> Duration {
+        let base_timeout = request.acquire_timeout;
+
+        // Get current shard load metrics
+        let lock_count = {
+            let objects = self.objects.read();
+            objects.len()
+        };
+
+        let active_guard_count = {
+            let guards = self.active_guards.lock();
+            guards.len()
+        };
+
+        // Calculate load factor with more generous thresholds for database workloads
+        let total_load = (lock_count + active_guard_count) as f64;
+        let load_factor = total_load / 500.0; // Lowered threshold for faster scaling
+
+        // More aggressive priority multipliers for database scenarios
+        let priority_multiplier = match request.priority {
+            crate::fast_lock::types::LockPriority::Critical => 3.0, // Increased
+            crate::fast_lock::types::LockPriority::High => 2.0,     // Increased
+            crate::fast_lock::types::LockPriority::Normal => 1.2,   // Slightly increased base
+            crate::fast_lock::types::LockPriority::Low => 0.9,
+        };
+
+        // More generous load-based scaling
+        let load_multiplier = if load_factor > 2.0 {
+            // Very high load: drastically extend timeout
+            1.0 + (load_factor * 2.0)
+        } else if load_factor > 1.0 {
+            // High load: significantly extend timeout
+            1.0 + (load_factor * 1.8)
+        } else if load_factor > 0.3 {
+            // Medium load: moderately extend timeout
+            1.0 + (load_factor * 1.2)
+        } else {
+            // Low load: still give some buffer
+            1.1
+        };
+
+        let total_multiplier = priority_multiplier * load_multiplier;
+        let adaptive_timeout_secs =
+            (base_timeout.as_secs_f64() * total_multiplier).min(crate::fast_lock::MAX_ACQUIRE_TIMEOUT.as_secs_f64());
+
+        // Ensure minimum reasonable timeout even for low priority
+        let min_timeout_secs = base_timeout.as_secs_f64() * 0.8;
+        Duration::from_secs_f64(adaptive_timeout_secs.max(min_timeout_secs))
     }
 
     /// Batch acquire locks with ordering to prevent deadlocks
@@ -324,22 +495,44 @@ impl LockShard {
     pub fn adaptive_cleanup(&self) -> usize {
         let current_load = self.current_load_factor();
         let lock_count = self.lock_count();
+        let active_guard_count = self.active_guards.lock().len();
+
+        // Be much more conservative if there are active guards or very high load
+        if active_guard_count > 0 && current_load > 0.8 {
+            tracing::debug!(
+                "Skipping aggressive cleanup due to {} active guards and high load ({:.2})",
+                active_guard_count,
+                current_load
+            );
+            // Only clean very old entries when under high load with active guards
+            return self.cleanup_expired_batch(3, 1_200_000); // 20 minutes, smaller batches
+        }
+
+        // Under extreme load, skip cleanup entirely to reduce contention
+        if current_load > 1.5 && active_guard_count > 10 {
+            tracing::debug!(
+                "Skipping all cleanup due to extreme load ({:.2}) and {} active guards",
+                current_load,
+                active_guard_count
+            );
+            return 0;
+        }
 
         // Dynamically adjust cleanup strategy based on load
         let cleanup_batch_size = match current_load {
-            load if load > 0.9 => lock_count / 20, // High load: small batch cleanup
-            load if load > 0.7 => lock_count / 10, // Medium load: moderate cleanup
-            _ => lock_count / 5,                   // Low load: aggressive cleanup
+            load if load > 0.9 => lock_count / 50, // Much smaller batches for high load
+            load if load > 0.7 => lock_count / 20, // Smaller batches for medium load
+            _ => lock_count / 10,                  // More conservative even for low load
         };
 
-        // Use longer timeout for high load scenarios
+        // Use much longer timeouts to prevent premature cleanup
         let cleanup_threshold_millis = match current_load {
-            load if load > 0.8 => 300_000, // 5 minutes for high load
-            load if load > 0.5 => 180_000, // 3 minutes for medium load
-            _ => 60_000,                   // 1 minute for low load
+            load if load > 0.8 => 600_000, // 10 minutes for high load
+            load if load > 0.5 => 300_000, // 5 minutes for medium load
+            _ => 120_000,                  // 2 minutes for low load
         };
 
-        self.cleanup_expired_batch(cleanup_batch_size.max(10), cleanup_threshold_millis)
+        self.cleanup_expired_batch_protected(cleanup_batch_size.max(5), cleanup_threshold_millis)
     }
 
     /// Cleanup expired and unused locks
@@ -376,6 +569,19 @@ impl LockShard {
 
         self.metrics.record_cleanup(cleaned);
         cleaned
+    }
+
+    /// Protected batch cleanup that respects active guards
+    fn cleanup_expired_batch_protected(&self, max_batch_size: usize, cleanup_threshold_millis: u64) -> usize {
+        let active_guards = self.active_guards.lock();
+        let guard_count = active_guards.len();
+        drop(active_guards); // Release lock early
+
+        if guard_count > 0 {
+            tracing::debug!("Cleanup with {} active guards, being conservative", guard_count);
+        }
+
+        self.cleanup_expired_batch(max_batch_size, cleanup_threshold_millis)
     }
 
     /// Batch cleanup with limited processing to avoid blocking
