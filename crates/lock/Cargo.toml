@@ -42,9 +42,9 @@ url.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 once_cell.workspace = true
-parking_lot = "0.12"
-smallvec = "1.11"
-smartstring = "1.0"
-crossbeam-queue = "0.3"
-heapless = "0.8"
+parking_lot.workspace = true
+smallvec.workspace = true
+smartstring.workspace = true
+crossbeam-queue = { workspace = true }
+heapless = { workspace = true }
 pprof.workspace = true

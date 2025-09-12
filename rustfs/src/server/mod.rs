@@ -19,6 +19,9 @@ mod hybrid;
 mod layer;
 mod service_state;
 
+#[cfg(test)]
+mod console_test;
+
 pub(crate) use console::start_console_server;
 pub(crate) use http::start_http_server;
 pub(crate) use service_state::SHUTDOWN_TIMEOUT;

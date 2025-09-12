@@ -45,4 +45,4 @@ tracing-subscriber = { workspace = true }
 walkdir = "2.5.0"
 tempfile = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
-sysinfo = "0.30.8"
+sysinfo = { workspace = true }

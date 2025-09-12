@@ -32,9 +32,6 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn};
 
-#[cfg(test)]
-mod console_test;
-
 const CONSOLE_PREFIX: &str = "/rustfs/console";
 
 /// Console access logging middleware

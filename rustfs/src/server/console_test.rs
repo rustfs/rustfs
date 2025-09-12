@@ -18,7 +18,6 @@ mod tests {
     use crate::server::console::{parse_cors_origins, start_console_server};
     use axum::http::StatusCode;
     use clap::Parser;
-    use hyper::Client;
     use hyper_util::rt::TokioExecutor;
     use tokio::time::{Duration, timeout};
 
