@@ -53,8 +53,11 @@ pub const DEFAULT_SHARD_COUNT: usize = 1024;
 /// Default lock timeout
 pub const DEFAULT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Default acquire timeout  
-pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Default acquire timeout - increased for database workloads  
+pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum acquire timeout for high-load scenarios
+pub const MAX_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Lock cleanup interval
 pub const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);

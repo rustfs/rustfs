@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 /// Optimized notification pool to reduce memory overhead and thundering herd effects
-static NOTIFY_POOL: Lazy<Vec<Arc<Notify>>> = Lazy::new(|| (0..64).map(|_| Arc::new(Notify::new())).collect());
+/// Increased pool size for better performance under high concurrency
+static NOTIFY_POOL: Lazy<Vec<Arc<Notify>>> = Lazy::new(|| (0..128).map(|_| Arc::new(Notify::new())).collect());
 
 /// Optimized notification system for object locks
 #[derive(Debug)]
