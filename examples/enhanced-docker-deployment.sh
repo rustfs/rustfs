@@ -82,9 +82,12 @@ deploy_basic() {
     wait_for_service "http://localhost:9021/health" "Console Service"
     
     log_info "Basic deployment ready!"
-    log_info "API endpoint: http://localhost:9020"
-    log_info "Console UI: http://localhost:9021/rustfs/console/"
-    log_info "Credentials: basic-access / basic-secret"
+    log_info "🌐 API endpoint: http://localhost:9020"
+    log_info "🖥️  Console UI: http://localhost:9021/rustfs/console/"
+    log_info "🔐 Credentials: basic-access / basic-secret"
+    log_info "🏥 Health checks:"
+    log_info "    API: curl http://localhost:9020/health"
+    log_info "    Console: curl http://localhost:9021/health"
 }
 
 # Scenario 2: Development environment
@@ -111,10 +114,13 @@ deploy_development() {
     wait_for_service "http://localhost:9031/health" "Dev Console Service"
     
     log_info "Development deployment ready!"
-    log_info "API endpoint: http://localhost:9030"
-    log_info "Console UI: http://localhost:9031/rustfs/console/"
-    log_info "Credentials: dev-access / dev-secret"
-    log_info "Debug logging enabled"
+    log_info "🌐 API endpoint: http://localhost:9030"
+    log_info "🖥️  Console UI: http://localhost:9031/rustfs/console/"
+    log_info "🔐 Credentials: dev-access / dev-secret"
+    log_info "📊 Debug logging enabled"
+    log_info "🏥 Health checks:"
+    log_info "    API: curl http://localhost:9030/health"
+    log_info "    Console: curl http://localhost:9031/health"
 }
 
 # Scenario 3: Production-like environment with security
@@ -126,6 +132,15 @@ deploy_production() {
     # Generate secure credentials
     ACCESS_KEY=$(openssl rand -hex 16)
     SECRET_KEY=$(openssl rand -hex 32)
+    
+    # Save credentials for reference
+    cat > rustfs-prod-credentials.env << EOF
+# RustFS Production Deployment Credentials
+# Generated: $(date)
+RUSTFS_ACCESS_KEY=$ACCESS_KEY
+RUSTFS_SECRET_KEY=$SECRET_KEY
+EOF
+    chmod 600 rustfs-prod-credentials.env
     
     docker run -d \
         --name rustfs-prod \
@@ -146,10 +161,15 @@ deploy_production() {
     wait_for_service "http://127.0.0.1:9041/health" "Prod Console Service"
     
     log_info "Production deployment ready!"
-    log_info "API endpoint: http://localhost:9040 (public)"
-    log_info "Console UI: http://127.0.0.1:9041/rustfs/console/ (localhost only)"
-    log_info "Credentials: $ACCESS_KEY / $SECRET_KEY"
-    log_warn "Console is restricted to localhost for security"
+    log_info "🌐 API endpoint: http://localhost:9040 (public)"
+    log_info "🖥️  Console UI: http://127.0.0.1:9041/rustfs/console/ (localhost only)"
+    log_info "🔐 Credentials: $ACCESS_KEY / $SECRET_KEY"
+    log_info "🔒 Security: Console restricted to localhost"
+    log_info "🏥 Health checks:"
+    log_info "    API: curl http://localhost:9040/health"
+    log_info "    Console: curl http://127.0.0.1:9041/health"
+    log_warn "⚠️  Console is restricted to localhost for security"
+    log_warn "⚠️  Credentials saved to rustfs-prod-credentials.env file"
 }
 
 # Function to show service status
