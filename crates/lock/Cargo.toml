@@ -47,4 +47,3 @@ smallvec = "1.11"
 smartstring = "1.0"
 crossbeam-queue = "0.3"
 heapless = "0.8"
-pprof.workspace = true
