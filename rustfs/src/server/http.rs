@@ -198,7 +198,7 @@ pub async fn start_http_server(
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
         // When console runs on separate port, disable console routes on main endpoint
-        let console_on_endpoint = false; // Console will run separately
+        let console_on_endpoint = opt.console_enable; // Console will run separately
         b.set_route(admin::make_admin_route(console_on_endpoint)?);
 
         if !opt.server_domains.is_empty() {
