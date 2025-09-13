@@ -227,37 +227,25 @@ fn _is_private_ip(ip: IpAddr) -> bool {
 #[allow(dead_code)]
 #[instrument(fields(host))]
 pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
-    warn!("Config handler URI: {}, Host: {}", uri, host);
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
-    // Print logs for debugging
-    info!("Config handler Scheme: {}, ", scheme);
-
-    // Get the host from the uri and use the value of the host extractor if it doesn't have one
-    warn!("Config handler URI Host: {:?}, Extracted Host: {}", uri.host(), host);
-    // Prefer the host from the URI if available, otherwise use the extracted host
-    // This ensures we handle cases where the host might include a port
     let raw_host = uri.host().unwrap_or(host.as_str());
-    warn!("Config handler Host: {}", raw_host);
     let host_for_url = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
-        warn!("Config handler Parsed SocketAddr: {}, IP: {} ", socket_addr, ip);
         if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
     } else if let Ok(ip) = raw_host.parse::<IpAddr>() {
-        warn!("Config handler Parsed IpAddr: {}", ip);
         // Pure IP (no ports)
         if ip.is_ipv6() { format!("[{}]", ip) } else { ip.to_string() }
     } else {
         // The domain name may not be able to resolve directly to IP, remove the port
         raw_host.split(':').next().unwrap_or(raw_host).to_string()
     };
-    warn!("Config handler Final Host for URL: {}", host_for_url);
 
     // Make a copy of the current configuration
     let mut cfg = match CONSOLE_CONFIG.get() {
@@ -270,7 +258,6 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
                 .unwrap();
         }
     };
-    warn!("Config handler port: {}", cfg.port);
 
     let url = format!("{}://{}:{}", scheme, host_for_url, cfg.port);
     cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
