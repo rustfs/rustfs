@@ -47,7 +47,7 @@ use std::sync::OnceLock;
 // use tokio::signal;
 // use tower_http::cors::{Any, CorsLayer};
 // use tower_http::trace::TraceLayer;
-use tracing::{error, info, instrument, warn};
+use tracing::{error, instrument};
 
 // shadow!(build);
 
