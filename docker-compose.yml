@@ -46,7 +46,7 @@ services:
       - rustfs_data_1:/data/rustfs1
       - rustfs_data_2:/data/rustfs2
       - rustfs_data_3:/data/rustfs3
-      - ./logs:/app/logs
+      - logs_data:/app/logs
     networks:
       - rustfs-network
     restart: unless-stopped
@@ -113,7 +113,7 @@ services:
     command:
       - --config=/etc/otelcol-contrib/otel-collector.yml
     volumes:
-      - ./.docker/observability/otel-collector.yml:/etc/otelcol-contrib/otel-collector.yml:ro
+      - ./.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/otel-collector.yml:ro
     ports:
       - "4317:4317" # OTLP gRPC receiver
       - "4318:4318" # OTLP HTTP receiver
@@ -236,4 +236,6 @@ volumes:
   grafana_data:
     driver: local
   redis_data:
+    driver: local
+  logs_data:
     driver: local
