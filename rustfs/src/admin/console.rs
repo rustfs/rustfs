@@ -241,19 +241,23 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
     warn!("Config handler URI Host: {:?}, Extracted Host: {}", uri.host(), host);
     // Prefer the host from the URI if available, otherwise use the extracted host
     // This ensures we handle cases where the host might include a port
-    let host = uri.host().unwrap_or(host.as_str());
-    warn!("Config handler Host: {}", host);
-    let host = if let Ok(socket_addr) = host.parse::<SocketAddr>() {
+    let raw_host = uri.host().unwrap_or(host.as_str());
+    warn!("Config handler Host: {}", raw_host);
+    let host_for_url = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
-        warn!("Parsed SocketAddr: {}, IP: {} ", socket_addr, ip);
+        warn!("Config handler Parsed SocketAddr: {}, IP: {} ", socket_addr, ip);
         if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
+    } else if let Ok(ip) = raw_host.parse::<IpAddr>() {
+        warn!("Config handler Parsed IpAddr: {}", ip);
+        // Pure IP (no ports)
+        if ip.is_ipv6() { format!("[{}]", ip) } else { ip.to_string() }
     } else {
-        // Failed to parse, it might be a domain name or a bare IP, use it as is.
-        host.to_string()
+        // The domain name may not be able to resolve directly to IP, remove the port
+        raw_host.split(':').next().unwrap_or(raw_host).to_string()
     };
-    warn!("Config handler Final Host for URL: {}", host);
+    warn!("Config handler Final Host for URL: {}", host_for_url);
 
     // Make a copy of the current configuration
     let mut cfg = match CONSOLE_CONFIG.get() {
@@ -268,7 +272,7 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
     };
     warn!("Config handler port: {}", cfg.port);
 
-    let url = format!("{}://{}:{}", scheme, host, cfg.port);
+    let url = format!("{}://{}:{}", scheme, host_for_url, cfg.port);
     cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
     cfg.s3.endpoint = url;
 
