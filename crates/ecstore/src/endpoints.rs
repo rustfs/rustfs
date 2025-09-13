@@ -169,7 +169,7 @@ impl AsMut<Vec<Endpoints>> for PoolEndpointList {
 impl PoolEndpointList {
     /// creates a list of endpoints per pool, resolves their relevant
     /// hostnames and discovers those are local or remote.
-    fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
+    async fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
         if disks_layout.is_empty_layout() {
             return Err(Error::other("invalid number of endpoints"));
         }
@@ -244,7 +244,7 @@ impl PoolEndpointList {
                 let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
                     set
                 } else {
-                    let ips = match get_host_ip(host.clone()) {
+                    let ips = match get_host_ip(host.clone()).await {
                         Ok(ips) => ips,
                         Err(e) => {
                             error!("host {} not found, error:{}", host, e);
@@ -466,19 +466,22 @@ impl EndpointServerPools {
         }
         None
     }
-    pub fn from_volumes(server_addr: &str, endpoints: Vec<String>) -> Result<(EndpointServerPools, SetupType)> {
+    pub async fn from_volumes(server_addr: &str, endpoints: Vec<String>) -> Result<(EndpointServerPools, SetupType)> {
         let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
-        Self::create_server_endpoints(server_addr, &layouts)
+        Self::create_server_endpoints(server_addr, &layouts).await
     }
     /// validates and creates new endpoints from input args, supports
     /// both ellipses and without ellipses transparently.
-    pub fn create_server_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<(EndpointServerPools, SetupType)> {
+    pub async fn create_server_endpoints(
+        server_addr: &str,
+        disks_layout: &DisksLayout,
+    ) -> Result<(EndpointServerPools, SetupType)> {
         if disks_layout.pools.is_empty() {
             return Err(Error::other("Invalid arguments specified"));
         }
 
-        let pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout)?;
+        let pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout).await?;
 
         let mut ret: EndpointServerPools = Vec::with_capacity(pool_eps.as_ref().len()).into();
         for (i, eps) in pool_eps.inner.into_iter().enumerate() {
@@ -753,8 +756,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_create_pool_endpoints() {
+    #[tokio::test]
+    async fn test_create_pool_endpoints() {
         #[derive(Default)]
         struct TestCase<'a> {
             num: usize,
@@ -1276,7 +1279,7 @@ mod test {
 
             match (
                 test_case.expected_err,
-                PoolEndpointList::create_pool_endpoints(test_case.server_addr, &disks_layout),
+                PoolEndpointList::create_pool_endpoints(test_case.server_addr, &disks_layout).await,
             ) {
                 (None, Err(err)) => panic!("Test {}: error: expected = <nil>, got = {}", test_case.num, err),
                 (Some(err), Ok(_)) => panic!("Test {}: error: expected = {}, got = <nil>", test_case.num, err),
@@ -1343,8 +1346,8 @@ mod test {
         (urls, local_flags)
     }
 
-    #[test]
-    fn test_create_server_endpoints() {
+    #[tokio::test]
+    async fn test_create_server_endpoints() {
         let test_cases = [
             // Invalid input.
             ("", vec![], false),
@@ -1379,7 +1382,7 @@ mod test {
                 }
             };
 
-            let ret = EndpointServerPools::create_server_endpoints(test_case.0, &disks_layout);
+            let ret = EndpointServerPools::create_server_endpoints(test_case.0, &disks_layout).await;
 
             if let Err(err) = ret {
                 if test_case.2 {

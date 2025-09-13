@@ -17,6 +17,9 @@ use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
+#[cfg(test)]
+mod config_test;
+
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
     if !build::TAG.is_empty() {
@@ -68,6 +71,16 @@ pub struct Opt {
     #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ENABLE, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
+    /// Console server bind address
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string(), env = "RUSTFS_CONSOLE_ADDRESS")]
+    pub console_address: String,
+
+    /// External address for console to access endpoint (used in Docker deployments)
+    /// This should match the mapped host port when using Docker port mapping
+    /// Example: ":9020" when mapping host port 9020 to container port 9000
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_ADDRESS.to_string(), env = "RUSTFS_EXTERNAL_ADDRESS")]
+    pub external_address: String,
+
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,
@@ -75,6 +88,18 @@ pub struct Opt {
     /// tls path for rustfs API and console.
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
+
+    /// Enable rate limiting for console
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE, env = "RUSTFS_CONSOLE_RATE_LIMIT_ENABLE")]
+    pub console_rate_limit_enable: bool,
+
+    /// Console rate limit: requests per minute
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_RPM, env = "RUSTFS_CONSOLE_RATE_LIMIT_RPM")]
+    pub console_rate_limit_rpm: u32,
+
+    /// Console authentication timeout in seconds
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_AUTH_TIMEOUT, env = "RUSTFS_CONSOLE_AUTH_TIMEOUT")]
+    pub console_auth_timeout: u64,
 
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,

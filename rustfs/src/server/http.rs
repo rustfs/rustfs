@@ -46,11 +46,81 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 
 const MI_B: usize = 1024 * 1024;
+
+/// Parse CORS allowed origins from configuration
+fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
+    use http::Method;
+
+    let cors_layer = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::header::ACCEPT,
+            http::header::ORIGIN,
+            // Note: X_AMZ_* headers are custom and may need to be defined
+            // http::header::X_AMZ_CONTENT_SHA256,
+            // http::header::X_AMZ_DATE,
+            // http::header::X_AMZ_SECURITY_TOKEN,
+            // http::header::X_AMZ_USER_AGENT,
+            http::header::RANGE,
+        ]);
+
+    match origins {
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any),
+        Some(origins_str) => {
+            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
+            if origins.is_empty() {
+                warn!("Empty CORS origins provided, using permissive CORS");
+                cors_layer.allow_origin(Any)
+            } else {
+                // Parse origins with proper error handling
+                let mut valid_origins = Vec::new();
+                for origin in origins {
+                    match origin.parse::<http::HeaderValue>() {
+                        Ok(header_value) => {
+                            valid_origins.push(header_value);
+                        }
+                        Err(e) => {
+                            warn!("Invalid CORS origin '{}': {}", origin, e);
+                        }
+                    }
+                }
+
+                if valid_origins.is_empty() {
+                    warn!("No valid CORS origins found, using permissive CORS");
+                    cors_layer.allow_origin(Any)
+                } else {
+                    info!("Endpoint CORS origins configured: {:?}", valid_origins);
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins))
+                }
+            }
+        }
+        None => {
+            debug!("No CORS origins configured for endpoint, using permissive CORS");
+            cors_layer.allow_origin(Any)
+        }
+    }
+}
+
+fn get_cors_allowed_origins() -> String {
+    std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
+        .parse::<String>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
+}
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -58,7 +128,7 @@ pub async fn start_http_server(
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
-    let server_address = server_addr.to_string();
+    let _server_address = server_addr.to_string();
 
     // The listening address and port are obtained from the parameters
     let listener = {
@@ -107,12 +177,6 @@ pub async fn start_http_server(
     let api_endpoints = format!("http://{local_ip}:{server_port}");
     let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
     info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-    if opt.console_enable {
-        info!(
-            "   WebUI: http://{}:{}/rustfs/console/index.html http://127.0.0.1:{}/rustfs/console/index.html http://{}/rustfs/console/index.html",
-            local_ip, server_port, server_port, server_address
-        );
-    }
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
@@ -134,7 +198,9 @@ pub async fn start_http_server(
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route(opt.console_enable)?);
+        // When console runs on separate port, disable console routes on main endpoint
+        let console_on_endpoint = false; // Console will run separately
+        b.set_route(admin::make_admin_route(console_on_endpoint)?);
 
         if !opt.server_domains.is_empty() {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
@@ -178,7 +244,17 @@ pub async fn start_http_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
+    // Capture CORS configuration for the server loop
+    let cors_allowed_origins = get_cors_allowed_origins();
+    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
+        None
+    } else {
+        Some(cors_allowed_origins)
+    };
     tokio::spawn(async move {
+        // Create CORS layer inside the server loop closure
+        let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
+
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
             use tokio::signal::unix::{SignalKind, signal};
@@ -265,7 +341,14 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(socket, tls_acceptor.clone(), http_server.clone(), s3_service.clone(), graceful.clone());
+            process_connection(
+                socket,
+                tls_acceptor.clone(),
+                http_server.clone(),
+                s3_service.clone(),
+                graceful.clone(),
+                cors_layer.clone(),
+            );
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -372,6 +455,7 @@ fn process_connection(
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
     graceful: Arc<GracefulShutdown>,
+    cors_layer: CorsLayer,
 ) {
     tokio::spawn(async move {
         // Build services inside each connected task to avoid passing complex service types across tasks,
@@ -423,7 +507,7 @@ fn process_connection(
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
-            .layer(CorsLayer::permissive())
+            .layer(cors_layer)
             .layer(RedirectLayer)
             .service(service);
         let hybrid_service = TowerToHyperService::new(hybrid_service);

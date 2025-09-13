@@ -100,6 +100,8 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.6" }
 aws-sdk-s3 = "1.101.0"
 axum = "0.8.4"
+axum-extra = "0.10.1"
+axum-server = "0.7.2"
 base64-simd = "0.8.0"
 base64 = "0.22.1"
 brotli = "8.0.2"
@@ -109,11 +111,12 @@ byteorder = "1.5.0"
 cfg-if = "1.0.3"
 crc-fast = "1.5.0"
 chacha20poly1305 = { version = "0.10.1" }
-chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.46", features = ["derive", "env"] }
-const-str = { version = "0.6.4", features = ["std", "proc"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.47", features = ["derive", "env"] }
+const-str = { version = "0.7.0", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.7", features = ["html_reports"] }
+crossbeam-queue = "0.3.12"
 dashmap = "6.1.0"
 datafusion = "46.0.1"
 derive_builder = "0.20.2"
@@ -126,6 +129,7 @@ futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 glob = "0.3.3"
+heapless = "0.9.1"
 hex = "0.4.3"
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
@@ -141,7 +145,7 @@ hyper-util = { version = "0.1.16", features = [
 hyper-rustls = "0.27.7"
 http = "1.3.1"
 http-body = "1.0.1"
-humantime = "2.2.0"
+humantime = "2.3.0"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 jsonwebtoken = "9.3.1"
 lazy_static = "1.5.0"
@@ -196,11 +200,11 @@ reqwest = { version = "0.12.23", default-features = false, features = [
     "json",
     "blocking",
 ] }
-rmcp = { version = "0.6.1" }
+rmcp = { version = "0.6.4" }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rsa = "0.9.8"
-rumqttc = { version = "0.24" }
+rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.7.2" }
 rustfs-rsc = "2025.506.1"
 rustls = { version = "0.23.31" }
@@ -217,17 +221,18 @@ sha2 = "0.10.9"
 shadow-rs = { version = "1.3.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
-snafu = "0.8.8"
+smartstring = "1.0.1"
+snafu = "0.8.9"
 snap = "1.1.1"
 socket2 = "0.6.0"
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.37.0"
 sysctl = "0.6.0"
-tempfile = "3.21.0"
+tempfile = "3.22.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thiserror = "2.0.16"
-time = { version = "0.3.42", features = [
+time = { version = "0.3.43", features = [
     "std",
     "parsing",
     "formatting",
@@ -240,9 +245,9 @@ tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
 tokio-test = "0.4.4"
 tokio-util = { version = "0.7.16", features = ["io", "compat"] }
-tonic = { version = "0.14.1", features = ["gzip"] }
-tonic-prost = { version = "0.14.1" }
-tonic-prost-build = { version = "0.14.1" }
+tonic = { version = "0.14.2", features = ["gzip"] }
+tonic-prost = { version = "0.14.2" }
+tonic-prost-build = { version = "0.14.2" }
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
@@ -253,7 +258,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.7"
 urlencoding = "2.1.3"
-uuid = { version = "1.18.0", features = [
+uuid = { version = "1.18.1", features = [
     "v4",
     "fast-rng",
     "macro-diagnostics",

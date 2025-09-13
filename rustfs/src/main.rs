@@ -26,7 +26,11 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_http_server, wait_for_shutdown};
+use crate::admin::console::init_console_cfg;
+use crate::server::{
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_console_server, start_http_server,
+    wait_for_shutdown,
+};
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
@@ -123,7 +127,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
-    debug!("server_address {}", &server_address);
+    info!("server_address {}, ip:{}", &server_address, server_addr.ip());
 
     // Set up AK and SK
     rustfs_ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
@@ -133,8 +137,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     set_global_addr(&opt.address).await;
 
     // For RPC
-    let (endpoint_pools, setup_type) =
-        EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone()).map_err(Error::other)?;
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
+        .await
+        .map_err(Error::other)?;
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
@@ -165,6 +170,47 @@ async fn run(opt: config::Opt) -> Result<()> {
     state_manager.update(ServiceState::Starting);
 
     let shutdown_tx = start_http_server(&opt, state_manager.clone()).await?;
+    // Start console server if enabled
+    let console_shutdown_tx = shutdown_tx.clone();
+    if opt.console_enable && !opt.console_address.is_empty() {
+        // Deal with port mapping issues for virtual machines like docker
+        let (external_addr, external_port) = if !opt.external_address.is_empty() {
+            let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
+            let external_port = external_addr.port();
+            if external_port != server_port {
+                warn!(
+                    "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
+                    external_port, server_port
+                );
+            }
+            info!("Using external address {} for endpoint access", external_addr);
+            rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
+            set_global_addr(&opt.external_address).await;
+            (external_addr.ip(), external_port)
+        } else {
+            (server_addr.ip(), server_port)
+        };
+        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
+        // init console configuration
+        init_console_cfg(external_addr, external_port);
+
+        let opt_clone = opt.clone();
+        tokio::spawn(async move {
+            let console_shutdown_rx = console_shutdown_tx.subscribe();
+            if let Err(e) = start_console_server(&opt_clone, console_shutdown_rx).await {
+                error!("Console server failed to start: {}", e);
+            }
+        });
+    } else {
+        info!("Console server is disabled.");
+        info!("You can access the RustFS API at {}", &opt.address);
+        info!("For more information, visit https://rustfs.com/docs/");
+        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
+        info!(
+            "Current console address is set to: '{}' ,console enable is set to: '{}'",
+            &opt.console_address, &opt.console_enable
+        );
+    }
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
@@ -303,6 +349,21 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
     });
 
+    // if opt.console_enable {
+    //     debug!("console is enabled");
+    //     let console_address = opt.console_address.clone();
+    //     let tls_path = opt.tls_path.clone();
+    //
+    //     if console_address.is_empty() {
+    //         error!("console_address is empty");
+    //         return Err(Error::other("console_address is empty".to_string()));
+    //     }
+    //
+    //     tokio::spawn(async move {
+    //         console::start_static_file_server(&console_address, tls_path).await;
+    //     });
+    // }
+
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
@@ -380,7 +441,7 @@ async fn init_event_notifier() {
         }
     };
 
-    info!("Global server configuration loaded successfully. config: {:?}", server_config);
+    info!("Global server configuration loaded successfully");
     // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
     if server_config
         .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)

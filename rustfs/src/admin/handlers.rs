@@ -94,6 +94,28 @@ pub struct AccountInfo {
     pub policy: BucketPolicy,
 }
 
+/// Health check handler for endpoint monitoring
+pub struct HealthCheckHandler {}
+
+#[async_trait::async_trait]
+impl Operation for HealthCheckHandler {
+    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        use serde_json::json;
+
+        let health_info = json!({
+            "status": "ok",
+            "service": "rustfs-endpoint",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "version": env!("CARGO_PKG_VERSION")
+        });
+
+        let body = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
+        let response_body = Body::from(body);
+
+        Ok(S3Response::new((StatusCode::OK, response_body)))
+    }
+}
+
 pub struct AccountInfoHandler {}
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
