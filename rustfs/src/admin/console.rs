@@ -227,6 +227,7 @@ fn _is_private_ip(ip: IpAddr) -> bool {
 #[allow(dead_code)]
 #[instrument(fields(host))]
 pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+    warn!("Config handler URI: {}, Host: {}", uri, host);
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
@@ -234,11 +235,14 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
     // Print logs for debugging
-    info!("Scheme: {}, ", scheme);
+    info!("Config handler Scheme: {}, ", scheme);
 
     // Get the host from the uri and use the value of the host extractor if it doesn't have one
+    warn!("Config handler URI Host: {:?}, Extracted Host: {}", uri.host(), host);
+    // Prefer the host from the URI if available, otherwise use the extracted host
+    // This ensures we handle cases where the host might include a port
     let host = uri.host().unwrap_or(host.as_str());
-
+    warn!("Config handler Host: {}", host);
     let host = if let Ok(socket_addr) = host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
@@ -249,6 +253,7 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
         // Failed to parse, it might be a domain name or a bare IP, use it as is.
         host.to_string()
     };
+    warn!("Config handler Final Host for URL: {}", host);
 
     // Make a copy of the current configuration
     let mut cfg = match CONSOLE_CONFIG.get() {
@@ -261,6 +266,7 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
                 .unwrap();
         }
     };
+    warn!("Config handler port: {}", cfg.port);
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
     cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
