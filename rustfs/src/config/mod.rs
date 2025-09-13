@@ -106,6 +106,10 @@ pub struct Opt {
 
     #[arg(long, env = "RUSTFS_REGION")]
     pub region: Option<String>,
+
+    /// Disable background update check
+    #[arg(long, default_value_t = false, env = "RUSTFS_NO_UPDATE_CHECK")]
+    pub no_update_check: bool,
 }
 
 // lazy_static::lazy_static! {

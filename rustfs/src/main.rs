@@ -314,40 +314,42 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_bucket_replication_pool().await;
 
     // Async update check with timeout (optional)
-    tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
+    if !opt.no_update_check {
+        tokio::spawn(async {
+            use crate::update::{UpdateCheckError, check_updates};
 
-        // Add timeout to prevent hanging network calls
-        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
-            Ok(Ok(result)) => {
-                if result.update_available {
-                    if let Some(latest) = &result.latest_version {
-                        info!(
-                            "🚀 Version check: New version available: {} -> {} (current: {})",
-                            result.current_version, latest.version, result.current_version
-                        );
-                        if let Some(notes) = &latest.release_notes {
-                            info!("📝 Release notes: {}", notes);
+            // Add timeout to prevent hanging network calls
+            match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+                Ok(Ok(result)) => {
+                    if result.update_available {
+                        if let Some(latest) = &result.latest_version {
+                            info!(
+                                "🚀 Version check: New version available: {} -> {} (current: {})",
+                                result.current_version, latest.version, result.current_version
+                            );
+                            if let Some(notes) = &latest.release_notes {
+                                info!("📝 Release notes: {}", notes);
+                            }
+                            if let Some(url) = &latest.download_url {
+                                info!("🔗 Download URL: {}", url);
+                            }
                         }
-                        if let Some(url) = &latest.download_url {
-                            info!("🔗 Download URL: {}", url);
-                        }
+                    } else {
+                        debug!("✅ Version check: Current version is up to date: {}", result.current_version);
                     }
-                } else {
-                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
+                }
+                Ok(Err(UpdateCheckError::HttpError(e))) => {
+                    debug!("Version check: network error (this is normal): {}", e);
+                }
+                Ok(Err(e)) => {
+                    debug!("Version check: failed (this is normal): {}", e);
+                }
+                Err(_) => {
+                    debug!("Version check: timeout after 30 seconds (this is normal)");
                 }
             }
-            Ok(Err(UpdateCheckError::HttpError(e))) => {
-                debug!("Version check: network error (this is normal): {}", e);
-            }
-            Ok(Err(e)) => {
-                debug!("Version check: failed (this is normal): {}", e);
-            }
-            Err(_) => {
-                debug!("Version check: timeout after 30 seconds (this is normal)");
-            }
-        }
-    });
+        });
+    }
 
     // if opt.console_enable {
     //     debug!("console is enabled");
