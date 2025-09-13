@@ -3234,15 +3234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hash32"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3261,16 +3252,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
-]
-
-[[package]]
-name = "heapless"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1edcd5a338e64688fbdcb7531a846cfd3476a54784dcb918a0844682bc7ada5"
-dependencies = [
- "hash32",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -6093,22 +6074,17 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "criterion",
  "futures",
- "lazy_static",
  "rand 0.9.2",
  "reqwest",
  "rustfs-common",
  "rustfs-ecstore",
  "rustfs-filemeta",
- "rustfs-lock",
  "rustfs-madmin",
- "rustfs-utils",
  "s3s",
  "serde",
  "serde_json",
  "serial_test",
- "sysinfo",
  "tempfile",
  "thiserror 2.0.16",
  "time",
@@ -6116,7 +6092,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
  "walkdir",
 ]
@@ -6338,7 +6313,6 @@ dependencies = [
  "bytes",
  "crossbeam-queue",
  "futures",
- "heapless",
  "once_cell",
  "parking_lot",
  "rustfs-protos",
@@ -6608,12 +6582,10 @@ dependencies = [
  "flate2",
  "futures",
  "hex-simd",
- "hickory-proto",
  "hickory-resolver",
  "highway",
  "hmac 0.12.1",
  "hyper 1.7.0",
- "hyper-util",
  "local-ip-address",
  "lz4",
  "md-5",

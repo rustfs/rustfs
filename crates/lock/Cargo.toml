@@ -46,4 +46,3 @@ parking_lot.workspace = true
 smallvec.workspace = true
 smartstring.workspace = true
 crossbeam-queue = { workspace = true }
-heapless = { workspace = true }
