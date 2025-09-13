@@ -14,18 +14,27 @@
 
 services:
 
+  tempo-init:
+    image: busybox:latest
+    command: ["sh", "-c", "chown -R 10001:10001 /var/tempo"]
+    volumes:
+      - ./tempo-data:/var/tempo
+    user: root
+    networks:
+      - otel-network
+    restart: "no"
+
   tempo:
     image: grafana/tempo:latest
-    #user: root # The container must be started with root to execute chown in the script
-    #entrypoint: [ "/etc/tempo/entrypoint.sh" ]  # Specify a custom entry point
+    user: "10001" # The container must be started with root to execute chown in the script
     command: [ "-config.file=/etc/tempo.yaml" ] # This is passed as a parameter to the entry point script
     volumes:
-      - ./tempo-entrypoint.sh:/etc/tempo/entrypoint.sh # Mount entry point script
-      - ./tempo.yaml:/etc/tempo.yaml
+      - ./tempo.yaml:/etc/tempo.yaml:ro
       - ./tempo-data:/var/tempo
     ports:
       - "3200:3200" # tempo
       - "24317:4317" # otlp grpc
+    restart: unless-stopped
     networks:
       - otel-network
 
@@ -94,4 +103,4 @@ networks:
     driver: bridge
     name: "network_otel_config"
     driver_opts:
-      com.docker.network.enable_ipv6: "true"    
+      com.docker.network.enable_ipv6: "true"
