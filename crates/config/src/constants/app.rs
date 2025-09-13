@@ -124,7 +124,7 @@ pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
 /// This is the default log filename for OBS.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".");
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, "");
 
 /// Default sink file log file for rustfs
 /// This is the default sink file log file for rustfs.
@@ -159,6 +159,16 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
 /// Default value: 30
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
+
+/// This is the external address for rustfs to access endpoint (used in Docker deployments).
+/// This should match the mapped host port when using Docker port mapping.
+/// Example: ":9020" when mapping host port 9020 to container port 9000.
+/// Default value: DEFAULT_ADDRESS
+/// Environment variable: RUSTFS_EXTERNAL_ADDRESS
+/// Command line argument: --external-address
+/// Example: RUSTFS_EXTERNAL_ADDRESS=":9020"
+/// Example: --external-address ":9020"
+pub const ENV_EXTERNAL_ADDRESS: &str = "RUSTFS_EXTERNAL_ADDRESS";
 
 #[cfg(test)]
 mod tests {

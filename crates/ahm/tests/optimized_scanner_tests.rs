@@ -319,14 +319,14 @@ async fn test_optimized_performance_characteristics() {
 
     // Create several test objects
     for i in 0..10 {
-        let object_name = format!("perf-object-{}", i);
+        let object_name = format!("perf-object-{i}");
         let test_data = vec![b'A' + (i % 26) as u8; 1024 * (i + 1)]; // Variable size objects
         let mut put_reader = PutObjReader::from_vec(test_data);
         let object_opts = rustfs_ecstore::store_api::ObjectOptions::default();
         ecstore
             .put_object(bucket_name, &object_name, &mut put_reader, &object_opts)
             .await
-            .unwrap_or_else(|_| panic!("Failed to create object {}", object_name));
+            .unwrap_or_else(|_| panic!("Failed to create object {object_name}"));
     }
 
     // Create optimized scanner
@@ -340,7 +340,7 @@ async fn test_optimized_performance_characteristics() {
     let scan_result = scanner.scan_cycle().await;
     let scan_duration = start_time.elapsed();
 
-    println!("Optimized scan completed in: {:?}", scan_duration);
+    println!("Optimized scan completed in: {scan_duration:?}");
     assert!(scan_result.is_ok(), "Performance scan should succeed");
 
     // Verify the scan was reasonably fast (should be faster than old concurrent scanner)
@@ -359,11 +359,11 @@ async fn test_optimized_performance_characteristics() {
     let _scan_result2 = scanner.scan_cycle().await;
     let scan_duration2 = start_time2.elapsed();
 
-    println!("Second optimized scan completed in: {:?}", scan_duration2);
+    println!("Second optimized scan completed in: {scan_duration2:?}");
 
     // Second scan should be similar or faster due to caching
     let performance_ratio = scan_duration2.as_millis() as f64 / scan_duration.as_millis() as f64;
-    println!("Performance ratio (second/first): {:.2}", performance_ratio);
+    println!("Performance ratio (second/first): {performance_ratio:.2}");
 
     // Clean up
     let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_PERF));
@@ -404,7 +404,7 @@ async fn test_optimized_load_balancing_and_throttling() {
     ];
 
     for (expected_level, latency, qps, error_rate, connections) in load_scenarios {
-        println!("Testing load scenario: {:?}", expected_level);
+        println!("Testing load scenario: {expected_level:?}");
 
         // Update business metrics to simulate load
         node_scanner
@@ -416,7 +416,7 @@ async fn test_optimized_load_balancing_and_throttling() {
 
         // Get current load level
         let current_level = io_monitor.get_business_load_level().await;
-        println!("Detected load level: {:?}", current_level);
+        println!("Detected load level: {current_level:?}");
 
         // Get throttling decision
         let _current_metrics = io_monitor.get_current_metrics().await;

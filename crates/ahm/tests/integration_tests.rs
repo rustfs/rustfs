@@ -270,15 +270,15 @@ async fn test_performance_impact_measurement() {
     };
 
     println!("Performance impact measurement:");
-    println!("  Baseline duration: {:?}", baseline_duration);
-    println!("  With scanner duration: {:?}", with_scanner_duration);
-    println!("  Overhead: {} ms", overhead_ms);
-    println!("  Impact percentage: {:.2}%", impact_percentage);
+    println!("  Baseline duration: {baseline_duration:?}");
+    println!("  With scanner duration: {with_scanner_duration:?}");
+    println!("  Overhead: {overhead_ms} ms");
+    println!("  Impact percentage: {impact_percentage:.2}%");
     println!("  Meets optimization goals: {}", benchmark.meets_optimization_goals());
 
     // Verify optimization target (business impact < 10%)
     // Note: In real environment this test may need longer time and real load
-    assert!(impact_percentage < 50.0, "Performance impact too high: {:.2}%", impact_percentage);
+    assert!(impact_percentage < 50.0, "Performance impact too high: {impact_percentage:.2}%");
 
     io_monitor.stop().await;
 }
@@ -308,7 +308,7 @@ async fn test_concurrent_scanner_operations() {
             tokio::spawn(async move {
                 for _i in 0..5 {
                     if let Err(e) = scanner.force_save_checkpoint().await {
-                        eprintln!("Checkpoint save failed: {}", e);
+                        eprintln!("Checkpoint save failed: {e}");
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }

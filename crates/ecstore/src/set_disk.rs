@@ -15,6 +15,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::versioning::VersioningApi;
@@ -110,7 +111,7 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
-    pub namespace_lock: Arc<rustfs_lock::NamespaceLock>,
+    pub fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
     pub set_endpoints: Vec<Endpoint>,
@@ -124,7 +125,7 @@ pub struct SetDisks {
 impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        namespace_lock: Arc<rustfs_lock::NamespaceLock>,
+        fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
         locker_owner: String,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
         set_drive_count: usize,
@@ -135,7 +136,7 @@ impl SetDisks {
         format: FormatV3,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
-            namespace_lock,
+            fast_lock_manager,
             locker_owner,
             disks,
             set_drive_count,
@@ -232,7 +233,10 @@ impl SetDisks {
             });
         }
 
-        let results = join_all(futures).await;
+        // Use optimized batch processor for disk info retrieval
+        let processor = get_global_processors().metadata_processor();
+        let results = processor.execute_batch(futures).await;
+
         for result in results {
             match result {
                 Ok(res) => {
@@ -507,21 +511,28 @@ impl SetDisks {
 
     #[tracing::instrument(skip(disks))]
     async fn cleanup_multipart_path(disks: &[Option<DiskStore>], paths: &[String]) {
-        let mut futures = Vec::with_capacity(disks.len());
-
         let mut errs = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, paths).await
-                } else {
-                    Err(DiskError::DiskNotFound)
+        // Use improved simple batch processor instead of join_all for better performance
+        let processor = get_global_processors().write_processor();
+
+        let tasks: Vec<_> = disks
+            .iter()
+            .map(|disk| {
+                let disk = disk.clone();
+                let paths = paths.to_vec();
+
+                async move {
+                    if let Some(disk) = disk {
+                        disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, &paths).await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
                 }
             })
-        }
+            .collect();
 
-        let results = join_all(futures).await;
+        let results = processor.execute_batch(tasks).await;
         for result in results {
             match result {
                 Ok(_) => {
@@ -545,21 +556,32 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let mut futures = Vec::with_capacity(disks.len());
-        for (i, disk) in disks.iter().enumerate() {
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.read_parts(bucket, part_meta_paths).await
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
-            });
-        }
-
         let mut errs = Vec::with_capacity(disks.len());
         let mut object_parts = Vec::with_capacity(disks.len());
 
-        let results = join_all(futures).await;
+        // Use batch processor for better performance
+        let processor = get_global_processors().read_processor();
+        let bucket = bucket.to_string();
+        let part_meta_paths = part_meta_paths.to_vec();
+
+        let tasks: Vec<_> = disks
+            .iter()
+            .map(|disk| {
+                let disk = disk.clone();
+                let bucket = bucket.clone();
+                let part_meta_paths = part_meta_paths.clone();
+
+                async move {
+                    if let Some(disk) = disk {
+                        disk.read_parts(&bucket, &part_meta_paths).await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
+                }
+            })
+            .collect();
+
+        let results = processor.execute_batch(tasks).await;
         for result in results {
             match result {
                 Ok(res) => {
@@ -1369,20 +1391,69 @@ impl SetDisks {
             })
         });
 
+        // Wait for all tasks to complete
         let results = join_all(futures).await;
+
         for result in results {
-            match result? {
-                Ok(res) => {
-                    ress.push(res);
-                    errors.push(None);
-                }
-                Err(e) => {
+            match result {
+                Ok(res) => match res {
+                    Ok(file_info) => {
+                        ress.push(file_info);
+                        errors.push(None);
+                    }
+                    Err(e) => {
+                        ress.push(FileInfo::default());
+                        errors.push(Some(e));
+                    }
+                },
+                Err(_) => {
                     ress.push(FileInfo::default());
-                    errors.push(Some(e));
+                    errors.push(Some(DiskError::Unexpected));
                 }
             }
         }
         Ok((ress, errors))
+    }
+
+    // Optimized version using batch processor with quorum support
+    pub async fn read_version_optimized(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &ReadOptions,
+    ) -> Result<Vec<rustfs_filemeta::FileInfo>> {
+        // Use existing disk selection logic
+        let disks = self.disks.read().await;
+        let required_reads = self.format.erasure.sets.len();
+
+        // Clone parameters outside the closure to avoid lifetime issues
+        let bucket = bucket.to_string();
+        let object = object.to_string();
+        let version_id = version_id.to_string();
+        let opts = opts.clone();
+
+        let processor = get_global_processors().read_processor();
+        let tasks: Vec<_> = disks
+            .iter()
+            .take(required_reads + 2) // Read a few extra for reliability
+            .filter_map(|disk| {
+                disk.as_ref().map(|d| {
+                    let disk = d.clone();
+                    let bucket = bucket.clone();
+                    let object = object.clone();
+                    let version_id = version_id.clone();
+                    let opts = opts.clone();
+
+                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &opts).await }
+                })
+            })
+            .collect();
+
+        match processor.execute_batch_with_quorum(tasks, required_reads).await {
+            Ok(results) => Ok(results),
+            Err(_) => Err(DiskError::FileNotFound.into()), // Use existing error type
+        }
     }
 
     async fn read_all_xl(
@@ -1403,9 +1474,10 @@ impl SetDisks {
         object: &str,
         read_data: bool,
     ) -> (Vec<Option<RawFileInfo>>, Vec<Option<DiskError>>) {
-        let mut futures = Vec::with_capacity(disks.len());
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
+
+        let mut futures = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
             futures.push(async move {
@@ -2326,7 +2398,10 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        info!("SetDisks heal_object");
+        info!(
+            "SetDisks heal_object: bucket={}, object={}, version_id={}, opts={:?}",
+            bucket, object, version_id, opts
+        );
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
             bucket: bucket.to_string(),
@@ -2336,9 +2411,34 @@ impl SetDisks {
             ..Default::default()
         };
 
-        if !opts.no_lock {
-            // TODO: locker
-        }
+        let _write_lock_guard = if !opts.no_lock {
+            info!("Acquiring write lock for object: {}, owner: {}", object, self.locker_owner);
+
+            // Check if lock is already held
+            let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
+            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
+                warn!("Lock already exists for object {}: {:?}", object, lock_info);
+            } else {
+                info!("No existing lock found for object {}", object);
+            }
+
+            let start_time = std::time::Instant::now();
+            let lock_result = self
+                .fast_lock_manager
+                .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                .await
+                .map_err(|e| {
+                    let elapsed = start_time.elapsed();
+                    error!("Failed to acquire write lock for heal operation after {:?}: {:?}", elapsed, e);
+                    DiskError::other(format!("Failed to acquire write lock for heal operation: {:?}", e))
+                })?;
+            let elapsed = start_time.elapsed();
+            info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
+            Some(lock_result)
+        } else {
+            info!("Skipping lock acquisition (no_lock=true)");
+            None
+        };
 
         let version_id_op = {
             if version_id.is_empty() {
@@ -2351,6 +2451,7 @@ impl SetDisks {
         let disks = { self.disks.read().await.clone() };
 
         let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+        info!("Read file info: parts_metadata.len()={}, errs={:?}", parts_metadata.len(), errs);
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -2369,6 +2470,7 @@ impl SetDisks {
             ));
         }
 
+        info!("About to call object_quorum_from_meta with parts_metadata.len()={}", parts_metadata.len());
         match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count) {
             Ok((read_quorum, _)) => {
                 result.parity_blocks = result.disk_count - read_quorum as usize;
@@ -2476,12 +2578,19 @@ impl SetDisks {
                         }
 
                         if disks_to_heal_count == 0 {
+                            info!("No disks to heal, returning early");
                             return Ok((result, None));
                         }
 
                         if opts.dry_run {
+                            info!("Dry run mode, returning early");
                             return Ok((result, None));
                         }
+
+                        info!(
+                            "Proceeding with heal: disks_to_heal_count={}, dry_run={}",
+                            disks_to_heal_count, opts.dry_run
+                        );
 
                         if !latest_meta.deleted && disks_to_heal_count > latest_meta.erasure.parity_blocks {
                             error!(
@@ -2608,6 +2717,11 @@ impl SetDisks {
                         let src_data_dir = latest_meta.data_dir.unwrap().to_string();
                         let dst_data_dir = latest_meta.data_dir.unwrap();
 
+                        info!(
+                            "Checking heal conditions: deleted={}, is_remote={}",
+                            latest_meta.deleted,
+                            latest_meta.is_remote()
+                        );
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let erasure_info = latest_meta.erasure;
                             for part in latest_meta.parts.iter() {
@@ -2660,19 +2774,30 @@ impl SetDisks {
                                         false
                                     }
                                 };
-                                // write to all disks
-                                for disk in self.disks.read().await.iter() {
-                                    let writer = create_bitrot_writer(
-                                        is_inline_buffer,
-                                        disk.as_ref(),
-                                        RUSTFS_META_TMP_BUCKET,
-                                        &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
-                                        erasure.shard_file_size(part.size as i64),
-                                        erasure.shard_size(),
-                                        HashAlgorithm::HighwayHash256,
-                                    )
-                                    .await?;
-                                    writers.push(Some(writer));
+                                // create writers for all disk positions, but only for outdated disks
+                                info!(
+                                    "Creating writers: latest_disks len={}, out_dated_disks len={}",
+                                    latest_disks.len(),
+                                    out_dated_disks.len()
+                                );
+                                for (index, disk) in latest_disks.iter().enumerate() {
+                                    if let Some(outdated_disk) = &out_dated_disks[index] {
+                                        info!("Creating writer for index {} (outdated disk)", index);
+                                        let writer = create_bitrot_writer(
+                                            is_inline_buffer,
+                                            Some(outdated_disk),
+                                            RUSTFS_META_TMP_BUCKET,
+                                            &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
+                                            erasure.shard_file_size(part.size as i64),
+                                            erasure.shard_size(),
+                                            HashAlgorithm::HighwayHash256,
+                                        )
+                                        .await?;
+                                        writers.push(Some(writer));
+                                    } else {
+                                        info!("Skipping writer for index {} (not outdated)", index);
+                                        writers.push(None);
+                                    }
 
                                     // if let Some(disk) = disk {
                                     //     // let filewriter = {
@@ -2775,8 +2900,8 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
-                        for (index, disk) in out_dated_disks.iter().enumerate() {
-                            if let Some(disk) = disk {
+                        for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
+                            if let Some(disk) = outdated_disk {
                                 // record the index of the updated disks
                                 parts_metadata[index].erasure.index = index + 1;
                                 // Attempt a rename now from healed data to final location.
@@ -2916,6 +3041,12 @@ impl SetDisks {
         dry_run: bool,
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
+        let _write_lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock("", object, self.locker_owner.as_str())
+            .await
+            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {:?}", e)))?;
+
         let disks = {
             let disks = self.disks.read().await;
             disks.clone()
@@ -3271,18 +3402,16 @@ impl ObjectIO for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         // Acquire a shared read-lock early to protect read consistency
-        // let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _read_lock_guard = guard_opt;
-        // }
+        let _read_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_read_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let (fi, files, disks) = self
             .get_object_fileinfo(bucket, object, opts, true)
@@ -3361,18 +3490,16 @@ impl ObjectIO for SetDisks {
         let disks = self.disks.read().await;
 
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        // let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _object_lock_guard = guard_opt;
-        // }
+        let _object_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -3660,17 +3787,11 @@ impl StorageAPI for SetDisks {
         }
 
         // Guard lock for source object metadata update
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(src_object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        let _lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock("", src_object, self.locker_owner.as_str())
+            .await
+            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
 
         let disks = self.get_disks_internal().await;
 
@@ -3766,17 +3887,11 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         // Guard lock for single object delete-version
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        let _lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock("", object, self.locker_owner.as_str())
+            .await
+            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -3833,21 +3948,31 @@ impl StorageAPI for SetDisks {
             del_errs.push(None)
         }
 
-        // Per-object guards to keep until function end
-        let mut _guards: HashMap<String, rustfs_lock::LockGuard> = HashMap::new();
-        // Acquire locks for all objects first; mark errors for failures
-        for (i, dobj) in objects.iter().enumerate() {
-            if !_guards.contains_key(&dobj.object_name) {
-                match self
-                    .namespace_lock
-                    .lock_guard(&dobj.object_name, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                    .await?
-                {
-                    Some(g) => {
-                        _guards.insert(dobj.object_name.clone(), g);
-                    }
-                    None => {
-                        del_errs[i] = Some(Error::other("can not get lock. please retry"));
+        // Use fast batch locking to acquire all locks atomically
+        let mut _guards: HashMap<String, rustfs_lock::FastLockGuard> = HashMap::new();
+        let mut unique_objects: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Collect unique object names
+        for dobj in &objects {
+            unique_objects.insert(dobj.object_name.clone());
+        }
+
+        // Acquire all locks in batch to prevent deadlocks
+        for object_name in unique_objects {
+            match self
+                .fast_lock_manager
+                .acquire_write_lock("", object_name.as_str(), self.locker_owner.as_str())
+                .await
+            {
+                Ok(guard) => {
+                    _guards.insert(object_name, guard);
+                }
+                Err(_) => {
+                    // Mark all operations on this object as failed
+                    for (i, dobj) in objects.iter().enumerate() {
+                        if dobj.object_name == object_name {
+                            del_errs[i] = Some(Error::other("can not get lock. please retry"));
+                        }
                     }
                 }
             }
@@ -3967,17 +4092,16 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
-        let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        if !opts.delete_prefix {
-            let guard_opt = self
-                .namespace_lock
-                .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-                .await?;
-            if guard_opt.is_none() {
-                return Err(Error::other("can not get lock. please retry".to_string()));
-            }
-            _lock_guard = guard_opt;
-        }
+        let _lock_guard = if !opts.delete_prefix {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
         if opts.delete_prefix {
             self.delete_prefix(bucket, object)
                 .await
@@ -4156,17 +4280,16 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire a shared read-lock to protect consistency during info fetch
-        // let mut _read_lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .rlock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _read_lock_guard = guard_opt;
-        // }
+        let _read_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_read_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let (fi, _, _) = self
             .get_object_fileinfo(bucket, object, opts, false)
@@ -4199,17 +4322,16 @@ impl StorageAPI for SetDisks {
         // TODO: nslock
 
         // Guard lock for metadata update
-        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _lock_guard = guard_opt;
-        // }
+        let _lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let disks = self.get_disks_internal().await;
 
@@ -5268,10 +5390,16 @@ impl StorageAPI for SetDisks {
 
             if (i < uploaded_parts.len() - 1) && !is_min_allowed_part_size(ext_part.actual_size) {
                 error!(
-                    "complete_multipart_upload is_min_allowed_part_size err {:?}, part_id={}, bucket={}, object={}",
-                    ext_part.actual_size, p.part_num, bucket, object
+                    "complete_multipart_upload part size too small: part {} size {} is less than minimum {}",
+                    p.part_num,
+                    ext_part.actual_size,
+                    GLOBAL_MIN_PART_SIZE.as_u64()
                 );
-                return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                return Err(Error::EntityTooSmall(
+                    p.part_num,
+                    ext_part.actual_size,
+                    GLOBAL_MIN_PART_SIZE.as_u64() as i64,
+                ));
             }
 
             object_size += ext_part.size;
@@ -5461,6 +5589,17 @@ impl StorageAPI for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        let _write_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {:?}", e)))?,
+            )
+        } else {
+            None
+        };
+
         if has_suffix(object, SLASH_SEPARATOR) {
             let (result, err) = self.heal_object_dir(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
@@ -5678,6 +5817,11 @@ async fn disks_with_all_parts(
     object: &str,
     scan_mode: HealScanMode,
 ) -> disk::error::Result<(Vec<Option<DiskStore>>, HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
+    info!(
+        "disks_with_all_parts: starting with online_disks.len()={}, scan_mode={:?}",
+        online_disks.len(),
+        scan_mode
+    );
     let mut available_disks = vec![None; online_disks.len()];
     let mut data_errs_by_disk: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..online_disks.len() {

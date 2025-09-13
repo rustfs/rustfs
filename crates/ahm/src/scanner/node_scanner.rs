@@ -251,6 +251,8 @@ pub struct ScanProgress {
     /// estimated completion time
     #[serde(with = "option_system_time_serde")]
     pub estimated_completion: Option<SystemTime>,
+    /// data usage statistics
+    pub data_usage: Option<DataUsageInfo>,
 }
 
 impl Default for ScanProgress {
@@ -265,6 +267,7 @@ impl Default for ScanProgress {
             last_scan_key: None,
             scan_start_time: SystemTime::now(),
             estimated_completion: None,
+            data_usage: None,
         }
     }
 }
@@ -1004,7 +1007,7 @@ impl NodeScanner {
                     let object_size = self.estimate_object_size(&entry_path).await;
 
                     let entry = ScanResultEntry {
-                        object_path: format!("{}/{}", bucket_name, object_name),
+                        object_path: format!("{bucket_name}/{object_name}"),
                         bucket_name: bucket_name.to_string(),
                         object_size,
                         is_healthy: true, // assume most objects are healthy
@@ -1044,7 +1047,7 @@ impl NodeScanner {
         // simulate some scan results
         for i in 0..5 {
             let entry = ScanResultEntry {
-                object_path: format!("/fallback-bucket/object_{}", i),
+                object_path: format!("/fallback-bucket/object_{i}"),
                 bucket_name: "fallback-bucket".to_string(),
                 object_size: 1024 * (i + 1),
                 is_healthy: true,

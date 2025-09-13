@@ -203,7 +203,7 @@ impl NodeClient {
             .get(url)
             .send()
             .await
-            .map_err(|e| Error::Other(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| Error::Other(format!("HTTP request failed: {e}")))?;
 
         if !response.status().is_success() {
             return Err(Error::Other(format!("HTTP status error: {}", response.status())));
@@ -212,7 +212,7 @@ impl NodeClient {
         let summary = response
             .json::<StatsSummary>()
             .await
-            .map_err(|e| Error::Serialization(format!("deserialize stats data failed: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("deserialize stats data failed: {e}")))?;
 
         Ok(summary)
     }

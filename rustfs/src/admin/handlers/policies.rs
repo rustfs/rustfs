@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::{router::Operation, utils::has_space_be};
+use crate::{
+    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    auth::{check_key_valid, get_session_token},
+};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_user;
 use rustfs_iam::store::MappedPolicy;
-use rustfs_policy::policy::Policy;
+use rustfs_policy::policy::{
+    Policy,
+    action::{Action, AdminAction},
+};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -39,6 +45,22 @@ pub struct ListCannedPolicies {}
 impl Operation for ListCannedPolicies {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListCannedPolicies");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListUserPoliciesAdminAction)],
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -81,6 +103,22 @@ pub struct AddCannedPolicy {}
 impl Operation for AddCannedPolicy {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle AddCannedPolicy");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::CreatePolicyAdminAction)],
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -138,6 +176,22 @@ impl Operation for InfoCannedPolicy {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle InfoCannedPolicy");
 
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::GetPolicyAdminAction)],
+        )
+        .await?;
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: PolicyNameQuery =
@@ -178,6 +232,22 @@ pub struct RemoveCannedPolicy {}
 impl Operation for RemoveCannedPolicy {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RemoveCannedPolicy");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DeletePolicyAdminAction)],
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -223,6 +293,22 @@ impl Operation for SetPolicyForUserOrGroup {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle SetPolicyForUserOrGroup");
 
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::AttachPolicyAdminAction)],
+        )
+        .await?;
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: SetPolicyForUserOrGroupQuery =
@@ -232,10 +318,6 @@ impl Operation for SetPolicyForUserOrGroup {
                 SetPolicyForUserOrGroupQuery::default()
             }
         };
-
-        if query.policy_name.is_empty() {
-            return Err(s3_error!(InvalidArgument, "policy name is empty"));
-        }
 
         if query.user_or_group.is_empty() {
             return Err(s3_error!(InvalidArgument, "user or group is empty"));

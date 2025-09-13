@@ -121,9 +121,9 @@ impl LocalStatsManager {
             }
         }
 
-        let stats_file = data_dir.join(format!("scanner_stats_{}.json", node_id));
-        let backup_file = data_dir.join(format!("scanner_stats_{}.backup", node_id));
-        let temp_file = data_dir.join(format!("scanner_stats_{}.tmp", node_id));
+        let stats_file = data_dir.join(format!("scanner_stats_{node_id}.json"));
+        let backup_file = data_dir.join(format!("scanner_stats_{node_id}.backup"));
+        let temp_file = data_dir.join(format!("scanner_stats_{node_id}.tmp"));
 
         Self {
             node_id: node_id.to_string(),
@@ -172,10 +172,10 @@ impl LocalStatsManager {
     async fn load_stats_from_file(&self, file_path: &Path) -> Result<LocalScanStats> {
         let content = tokio::fs::read_to_string(file_path)
             .await
-            .map_err(|e| Error::IO(format!("read stats file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("read stats file failed: {e}")))?;
 
         let stats: LocalScanStats =
-            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("deserialize stats data failed: {}", e)))?;
+            serde_json::from_str(&content).map_err(|e| Error::Serialization(format!("deserialize stats data failed: {e}")))?;
 
         Ok(stats)
     }
@@ -194,24 +194,24 @@ impl LocalStatsManager {
 
         // serialize
         let json_data = serde_json::to_string_pretty(&stats)
-            .map_err(|e| Error::Serialization(format!("serialize stats data failed: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("serialize stats data failed: {e}")))?;
 
         // atomic write
         tokio::fs::write(&self.temp_file, json_data)
             .await
-            .map_err(|e| Error::IO(format!("write temp stats file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("write temp stats file failed: {e}")))?;
 
         // backup existing file
         if self.stats_file.exists() {
             tokio::fs::copy(&self.stats_file, &self.backup_file)
                 .await
-                .map_err(|e| Error::IO(format!("backup stats file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("backup stats file failed: {e}")))?;
         }
 
         // atomic replace
         tokio::fs::rename(&self.temp_file, &self.stats_file)
             .await
-            .map_err(|e| Error::IO(format!("replace stats file failed: {}", e)))?;
+            .map_err(|e| Error::IO(format!("replace stats file failed: {e}")))?;
 
         *self.last_save.write().await = now;
 
@@ -374,21 +374,21 @@ impl LocalStatsManager {
         if self.stats_file.exists() {
             tokio::fs::remove_file(&self.stats_file)
                 .await
-                .map_err(|e| Error::IO(format!("delete stats file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("delete stats file failed: {e}")))?;
         }
 
         // delete backup file
         if self.backup_file.exists() {
             tokio::fs::remove_file(&self.backup_file)
                 .await
-                .map_err(|e| Error::IO(format!("delete backup stats file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("delete backup stats file failed: {e}")))?;
         }
 
         // delete temp file
         if self.temp_file.exists() {
             tokio::fs::remove_file(&self.temp_file)
                 .await
-                .map_err(|e| Error::IO(format!("delete temp stats file failed: {}", e)))?;
+                .map_err(|e| Error::IO(format!("delete temp stats file failed: {e}")))?;
         }
 
         info!("cleanup all stats files");

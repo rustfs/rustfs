@@ -56,4 +56,5 @@ if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rus
 fi
 
 echo "Starting: $*"
+set -- "$@" $LOCAL_VOLUMES
 exec "$@"

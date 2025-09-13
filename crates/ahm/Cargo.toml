@@ -17,7 +17,6 @@ rustfs-ecstore = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
-rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -29,10 +28,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-url = { workspace = true }
-rustfs-lock = { workspace = true }
 s3s = { workspace = true }
-lazy_static = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
@@ -44,5 +40,3 @@ serial_test = "3.2.0"
 tracing-subscriber = { workspace = true }
 walkdir = "2.5.0"
 tempfile = { workspace = true }
-criterion = { workspace = true, features = ["html_reports"] }
-sysinfo = "0.30.8"
