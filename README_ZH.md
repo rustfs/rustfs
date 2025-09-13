@@ -74,6 +74,14 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
    docker run -d -p 9000:9000  -v /data:/data rustfs/rustfs
    ```
 
+  对于使用 Docker 安装来讲，你还可以使用 `docker compose` 来启动 rustfs 实例。在仓库的根目录下面有一个 `docker-compose.yml` 文件。运行如下命令即可：
+
+  ```
+  docker compose --profile observability up -d
+  ```
+  
+  **注意**：在使用 `docker compose` 之前，你应该仔细阅读一下 `docker-compose.yaml`，因为该文件中包含多个服务，除了 rustfs 以外，还有 grafana、prometheus、jaeger 等，这些是为 rustfs 可观测性服务的，还有 redis 和 nginx。你想启动哪些容器，就需要用 `--profile` 参数指定相应的 profile。
+
 3. **访问控制台**：打开 Web 浏览器并导航到 `http://localhost:9000` 以访问 RustFS 控制台，默认的用户名和密码是 `rustfsadmin` 。
 4. **创建存储桶**：使用控制台为您的对象创建新的存储桶。
 5. **上传对象**：您可以直接通过控制台上传文件，或使用 S3 兼容的 API 与您的 RustFS 实例交互。
