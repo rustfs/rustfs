@@ -147,6 +147,9 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     set_global_addr(&opt.address).await;
 
+    // Wait for DNS initialization to complete before network-heavy operations
+    dns_init.await.map_err(Error::other)?;
+
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .await
@@ -240,9 +243,6 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize event notifier
     init_event_notifier().await;
-
-    // Wait for DNS initialization to complete before network-heavy operations
-    dns_init.await.map_err(Error::other)?;
 
     let buckets_list = store
         .list_bucket(&BucketOptions {
