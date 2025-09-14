@@ -74,6 +74,14 @@ use tracing::{debug, error, info, instrument, warn};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+const LOGO: &str = r#"
+
+░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
+░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
+░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
+
+"#;
+
 #[instrument]
 fn print_server_info() {
     let current_year = chrono::Utc::now().year();
@@ -96,6 +104,9 @@ async fn main() -> Result<()> {
 
     // Initialize Observability
     let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
+
+    // print startup logo
+    info!("{}", LOGO);
 
     // Store in global storage
     set_global_guard(guard).map_err(Error::other)?;
@@ -135,6 +146,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     set_global_rustfs_port(server_port);
 
     set_global_addr(&opt.address).await;
+
+    // Wait for DNS initialization to complete before network-heavy operations
+    dns_init.await.map_err(Error::other)?;
 
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
@@ -229,9 +243,6 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize event notifier
     init_event_notifier().await;
-
-    // Wait for DNS initialization to complete before network-heavy operations
-    dns_init.await.map_err(Error::other)?;
 
     let buckets_list = store
         .list_bucket(&BucketOptions {
