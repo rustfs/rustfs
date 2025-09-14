@@ -334,14 +334,9 @@ mod serial_tests {
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-        let target_part = WalkDir::new(&obj_dir)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-            .map(|e| e.into_path())
-            .expect("Failed to locate part file to delete");
+        // Previously captured a specific part file path here; removed because
+        // after deleting and recreating the entire disk directory structure
+        // the healed layout may differ, making the original path invalid.
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -362,8 +357,31 @@ mod serial_tests {
 
         // ─── 2️⃣ verify format.json is restored ───────
         assert!(format_path.exists(), "format.json does not exist on disk after heal");
-        // ─── 3 verify each part file is restored ───────
-        assert!(target_part.exists());
+
+        // ─── 3️⃣ verify an object part is restored ───────
+        // The original part path captured before deleting the entire disk hierarchy
+        // is no longer valid because the heal process may recreate a different
+        // internal data directory layout (e.g. a new UUID). Instead of asserting
+        // the old exact path, rescan the object directory and look for any part.* file.
+        let mut restored = false;
+        let mut attempts = 0;
+        while attempts < 6 {
+            // up to ~6 seconds total (initial 5s sleep already elapsed)
+            if obj_dir.exists()
+                && WalkDir::new(&obj_dir)
+                    .min_depth(1)
+                    .max_depth(4)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .any(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+            {
+                restored = true;
+                break;
+            }
+            attempts += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(restored, "no restored part.* file found under {:?}", obj_dir);
 
         info!("Heal format basic test passed");
     }

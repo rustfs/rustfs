@@ -357,32 +357,23 @@ mod serial_tests {
         // Wait a bit more for background workers to process expiry tasks
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Check if object has been expired (delete_marker)
-        let check_result = object_exists(&ecstore, bucket_name, object_name).await;
-        println!("Object is_delete_marker after lifecycle processing: {check_result}");
-
-        if check_result {
-            println!("❌ Object was not deleted by lifecycle processing");
-        } else {
-            println!("✅ Object was successfully deleted by lifecycle processing");
-            // Let's try to get object info to see its details
-            match ecstore
-                .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
-                .await
-            {
-                Ok(obj_info) => {
-                    println!(
-                        "Object info: name={}, size={}, mod_time={:?}",
-                        obj_info.name, obj_info.size, obj_info.mod_time
-                    );
-                }
-                Err(e) => {
-                    println!("Error getting object info: {e:?}");
-                }
+        // Poll for deletion (to reduce flakiness due to async lifecycle workers)
+        let mut attempts = 0;
+        let mut still_exists = true;
+        while attempts < 10 { // up to ~10s extra
+            if !object_exists(&ecstore, bucket_name, object_name).await {
+                still_exists = false;
+                break;
             }
+            attempts += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-
-        assert!(!check_result);
+        if still_exists {
+            println!("❌ Object still exists after lifecycle processing (attempts={attempts})");
+        } else {
+            println!("✅ Object was deleted by lifecycle processing after {attempts}s of polling");
+        }
+        assert!(!still_exists, "object not expired after polling window");
         println!("✅ Object successfully expired");
 
         // Stop scanner

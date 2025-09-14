@@ -24,7 +24,49 @@ use std::sync::Arc;
 use std::vec;
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{debug, error};
+
+// Environment variable keys (kept internal) for tuning without changing API surface.
+const ENV_EC_CHANNEL_MIN: &str = "RUSTFS_EC_ENCODE_QUEUE_MIN";
+const ENV_EC_CHANNEL_MAX: &str = "RUSTFS_EC_ENCODE_QUEUE_MAX";
+#[allow(dead_code)]
+const ENV_EC_BLOCKS_IN_FLIGHT: &str = "RUSTFS_EC_BLOCKS_IN_FLIGHT"; // future use
+const ENV_EC_DISABLE_ADAPTIVE: &str = "RUSTFS_EC_ADAPTIVE_DISABLE";
+
+fn adaptive_channel_depth(object_hint: Option<i64>, block_size: usize) -> usize {
+    if std::env::var(ENV_EC_DISABLE_ADAPTIVE).is_ok() {
+        return 8; // legacy fixed depth
+    }
+    // Default bounds
+    let default_min = 8usize;
+    let default_max = 32usize;
+
+    let min_depth = std::env::var(ENV_EC_CHANNEL_MIN)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_min);
+    let max_depth = std::env::var(ENV_EC_CHANNEL_MAX)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= min_depth)
+        .unwrap_or(default_max);
+
+    let hint = object_hint.unwrap_or(-1);
+    if hint <= 0 {
+        return min_depth;
+    }
+
+    // Estimate number of blocks; clamp between min_depth and max_depth.
+    let blocks = ((hint as usize) / block_size).max(1);
+    if blocks < min_depth {
+        min_depth
+    } else if blocks > max_depth {
+        max_depth
+    } else {
+        blocks
+    }
+}
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
@@ -130,7 +172,12 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
+        // Derive adaptive channel depth from object size hint if HashReader exposes size via actual_size().
+        // We cannot access size directly from generic R; rely on environment hint passed by caller through quorum heuristic.
+        // For now, pass None (future: plumb size). Keeping existing behaviour when unknown.
+        let chan_cap = adaptive_channel_depth(None, self.block_size);
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(chan_cap);
+        debug!(capacity = chan_cap, "erasure encode channel capacity decided");
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
@@ -170,5 +217,35 @@ impl Erasure {
         let (reader, total) = task.await??;
         // writers.shutdown().await?;
         Ok((reader, total))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_encode_adaptive_channel_basic() {
+        let e = Arc::new(Erasure::new(4, 2, 1024));
+        let data = vec![0u8; 10 * 1024];
+        let cursor = Cursor::new(data.clone());
+
+        // Prepare in-memory writers (inline bitrot writers) by constructing custom wrappers.
+        // We reuse create_bitrot_writer via inline path (no disk) to simulate writers.
+        use crate::bitrot::create_bitrot_writer;
+        use rustfs_utils::HashAlgorithm;
+
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = Vec::new();
+        for _ in 0..6 {
+            let w = create_bitrot_writer(true, None, "v", "p", 0, 1024, HashAlgorithm::HighwayHash256)
+                .await
+                .unwrap();
+            writers.push(Some(w));
+        }
+
+        let quorum = 4; // data shards
+        let (_r, total) = e.encode(cursor, &mut writers, quorum).await.unwrap();
+        assert!(total > 0);
     }
 }
