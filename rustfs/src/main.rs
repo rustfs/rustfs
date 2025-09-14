@@ -41,6 +41,8 @@ use rustfs_ahm::{
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_config::DEFAULT_UPDATE_CHECK;
+use rustfs_config::ENV_UPDATE_CHECK;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
@@ -324,41 +326,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // initialize bucket replication pool
     init_bucket_replication_pool().await;
 
-    // Async update check with timeout (optional)
-    tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
-
-        // Add timeout to prevent hanging network calls
-        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
-            Ok(Ok(result)) => {
-                if result.update_available {
-                    if let Some(latest) = &result.latest_version {
-                        info!(
-                            "🚀 Version check: New version available: {} -> {} (current: {})",
-                            result.current_version, latest.version, result.current_version
-                        );
-                        if let Some(notes) = &latest.release_notes {
-                            info!("📝 Release notes: {}", notes);
-                        }
-                        if let Some(url) = &latest.download_url {
-                            info!("🔗 Download URL: {}", url);
-                        }
-                    }
-                } else {
-                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
-                }
-            }
-            Ok(Err(UpdateCheckError::HttpError(e))) => {
-                debug!("Version check: network error (this is normal): {}", e);
-            }
-            Ok(Err(e)) => {
-                debug!("Version check: failed (this is normal): {}", e);
-            }
-            Err(_) => {
-                debug!("Version check: timeout after 30 seconds (this is normal)");
-            }
-        }
-    });
+    init_update_check();
 
     // if opt.console_enable {
     //     debug!("console is enabled");
@@ -474,6 +442,53 @@ async fn init_event_notifier() {
     } else {
         info!("Event notifier system initialized successfully.");
     }
+}
+
+fn init_update_check() {
+    let update_check_enable = std::env::var(ENV_UPDATE_CHECK)
+        .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
+        .parse::<bool>()
+        .unwrap_or(DEFAULT_UPDATE_CHECK);
+
+    if !update_check_enable {
+        return;
+    }
+
+    // Async update check with timeout
+    tokio::spawn(async {
+        use crate::update::{UpdateCheckError, check_updates};
+
+        // Add timeout to prevent hanging network calls
+        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+            Ok(Ok(result)) => {
+                if result.update_available {
+                    if let Some(latest) = &result.latest_version {
+                        info!(
+                            "🚀 Version check: New version available: {} -> {} (current: {})",
+                            result.current_version, latest.version, result.current_version
+                        );
+                        if let Some(notes) = &latest.release_notes {
+                            info!("📝 Release notes: {}", notes);
+                        }
+                        if let Some(url) = &latest.download_url {
+                            info!("🔗 Download URL: {}", url);
+                        }
+                    }
+                } else {
+                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
+                }
+            }
+            Ok(Err(UpdateCheckError::HttpError(e))) => {
+                debug!("Version check: network error (this is normal): {}", e);
+            }
+            Ok(Err(e)) => {
+                debug!("Version check: failed (this is normal): {}", e);
+            }
+            Err(_) => {
+                debug!("Version check: timeout after 30 seconds (this is normal)");
+            }
+        }
+    });
 }
 
 #[instrument(skip_all)]

@@ -79,3 +79,13 @@ pub const ENV_CONSOLE_AUTH_TIMEOUT: &str = "RUSTFS_CONSOLE_AUTH_TIMEOUT";
 /// Example: RUSTFS_CONSOLE_AUTH_TIMEOUT=3600
 /// Example: --console-auth-timeout 3600
 pub const DEFAULT_CONSOLE_AUTH_TIMEOUT: u64 = 3600;
+
+/// Toggle update check
+/// It controls whether to check for newer versions of rustfs
+/// Default value: true
+/// Environment variable: RUSTFS_CHECK_UPDATE
+/// Example: RUSTFS_CHECK_UPDATE=false
+pub const ENV_UPDATE_CHECK: &str = "RUSTFS_CHECK_UPDATE";
+
+/// Default value for update toggle
+pub const DEFAULT_UPDATE_CHECK: bool = true;
