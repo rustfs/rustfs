@@ -458,7 +458,7 @@ impl LocalDisk {
         {
             let cache = self.path_cache.read();
             for (i, (bucket, key)) in requests.iter().enumerate() {
-                let cache_key = format!("{}/{}", bucket, key);
+                let cache_key = format!("{bucket}/{key}");
                 if let Some(cached_path) = cache.get(&cache_key) {
                     results.push((i, cached_path.clone()));
                 } else {

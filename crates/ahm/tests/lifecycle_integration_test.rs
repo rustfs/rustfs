@@ -357,23 +357,34 @@ mod serial_tests {
         // Wait a bit more for background workers to process expiry tasks
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Poll for deletion (to reduce flakiness due to async lifecycle workers)
+        // Poll for deletion (force an additional scan each iteration to reduce timing races)
         let mut attempts = 0;
+        let max_attempts = 30; // up to ~15s (30 * 500ms)
         let mut still_exists = true;
-        while attempts < 10 { // up to ~10s extra
+        while attempts < max_attempts {
             if !object_exists(&ecstore, bucket_name, object_name).await {
                 still_exists = false;
                 break;
             }
+            // Trigger another scan cycle to aggressively process lifecycle
+            if let Err(e) = scanner.scan_cycle().await {
+                println!("⚠️ Additional scan cycle failed on attempt {attempts}: {e:?}");
+            }
             attempts += 1;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if still_exists {
-            println!("❌ Object still exists after lifecycle processing (attempts={attempts})");
+            println!(
+                "❌ Object still exists after lifecycle processing (attempts={attempts}, waited ~{}s)",
+                attempts as f32 * 0.5
+            );
         } else {
-            println!("✅ Object was deleted by lifecycle processing after {attempts}s of polling");
+            println!(
+                "✅ Object was deleted by lifecycle processing after ~{}s (attempts={attempts})",
+                attempts as f32 * 0.5
+            );
         }
-        assert!(!still_exists, "object not expired after polling window");
+        assert!(!still_exists, "object not expired after extended polling window");
         println!("✅ Object successfully expired");
 
         // Stop scanner

@@ -26,12 +26,18 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+pub(super) static PIPELINE_FORCE: AtomicBool = AtomicBool::new(false);
+
 // Environment variable keys (kept internal) for tuning without changing API surface.
 const ENV_EC_CHANNEL_MIN: &str = "RUSTFS_EC_ENCODE_QUEUE_MIN";
 const ENV_EC_CHANNEL_MAX: &str = "RUSTFS_EC_ENCODE_QUEUE_MAX";
-#[allow(dead_code)]
-const ENV_EC_BLOCKS_IN_FLIGHT: &str = "RUSTFS_EC_BLOCKS_IN_FLIGHT"; // future use
 const ENV_EC_DISABLE_ADAPTIVE: &str = "RUSTFS_EC_ADAPTIVE_DISABLE";
+const ENV_EC_PIPELINE_ENABLE: &str = "RUSTFS_EC_PIPELINE"; // any value enables double-buffer pipeline
+const ENV_EC_BLOCKS_IN_FLIGHT: &str = "RUSTFS_EC_BLOCKS_IN_FLIGHT"; // optional (currently only 1 or 2 respected)
 
 fn adaptive_channel_depth(object_hint: Option<i64>, block_size: usize) -> usize {
     if std::env::var(ENV_EC_DISABLE_ADAPTIVE).is_ok() {
@@ -172,41 +178,108 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        // Derive adaptive channel depth from object size hint if HashReader exposes size via actual_size().
-        // We cannot access size directly from generic R; rely on environment hint passed by caller through quorum heuristic.
-        // For now, pass None (future: plumb size). Keeping existing behaviour when unknown.
+        // Derive adaptive channel depth from object size hint (currently None).
         let chan_cap = adaptive_channel_depth(None, self.block_size);
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(chan_cap);
-        debug!(capacity = chan_cap, "erasure encode channel capacity decided");
+        let pipeline_enabled_env = std::env::var(ENV_EC_PIPELINE_ENABLE).is_ok();
+        #[cfg(test)]
+        let pipeline_enabled = pipeline_enabled_env || PIPELINE_FORCE.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let pipeline_enabled = pipeline_enabled_env;
+        let blocks_in_flight_raw = std::env::var(ENV_EC_BLOCKS_IN_FLIGHT)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1 && *v <= 2) // keep logic simple & ordered: only 1 (legacy) or 2 (double-buffer) for now
+            .unwrap_or(2);
+        let use_double_buffer = pipeline_enabled && blocks_in_flight_raw >= 2;
 
+        debug!(
+            capacity = chan_cap,
+            double_buffer = use_double_buffer,
+            "erasure encode pipeline configuration"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(chan_cap);
+        let this = self.clone();
+
+        // If pipeline disabled, fall back to legacy single-task producer.
         let task = tokio::spawn(async move {
-            let block_size = self.block_size;
-            let mut total = 0;
-            let mut buf = vec![0u8; block_size];
-            loop {
-                match rustfs_utils::read_full(&mut reader, &mut buf).await {
-                    Ok(n) if n > 0 => {
-                        total += n;
-                        let res = self.encode_data(&buf[..n])?;
-                        if let Err(err) = tx.send(res).await {
-                            return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+            if !use_double_buffer {
+                let mut total = 0;
+                let mut buf = vec![0u8; this.block_size];
+                loop {
+                    match rustfs_utils::read_full(&mut reader, &mut buf).await {
+                        Ok(n) if n > 0 => {
+                            total += n;
+                            let res = this.encode_data(&buf[..n])?;
+                            if let Err(err) = tx.send(res).await {
+                                return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                            }
                         }
-                    }
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        break;
-                    }
-                    Err(e) => {
-                        return Err(e);
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(e),
                     }
                 }
+                return Ok((reader, total));
+            }
+
+            // Double-buffer pipeline: overlap encoding (spawn_blocking) with next read.
+            let block_size = this.block_size;
+            let mut total = 0usize;
+
+            // Helper to spawn encoding of a buffer slice; returns JoinHandle.
+            let spawn_encode = |data: Vec<u8>, len: usize, enc: Arc<Erasure>| {
+                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Vec<Bytes>)> {
+                    let out = enc.encode_data(&data[..len])?;
+                    Ok((0, out)) // sequence not used yet (always in-order with double buffer)
+                })
+            };
+
+            // Read first block
+            let mut buf_a = vec![0u8; block_size];
+            let first_n = match rustfs_utils::read_full(&mut reader, &mut buf_a).await {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e),
+            };
+            if first_n == 0 {
+                return Ok((reader, 0));
+            }
+            total += first_n;
+            let mut enc_fut = spawn_encode(buf_a, first_n, this.clone());
+
+            loop {
+                // Prepare next buffer read while previous encoding running.
+                let mut buf_b = vec![0u8; block_size];
+                let next_n = match rustfs_utils::read_full(&mut reader, &mut buf_b).await {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                    Err(e) => return Err(e),
+                };
+
+                // Wait for previous encoded block.
+                match enc_fut.await {
+                    Ok(Ok((_s, shards))) => {
+                        if let Err(e) = tx.send(shards).await {
+                            return Err(std::io::Error::other(format!("send encoded: {e}")));
+                        }
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(join_err) => return Err(std::io::Error::other(format!("encode join err: {join_err}"))),
+                }
+
+                if next_n == 0 {
+                    break;
+                }
+                total += next_n;
+                // Spawn encoding for next block and continue loop.
+                enc_fut = spawn_encode(buf_b, next_n, this.clone());
             }
 
             Ok((reader, total))
         });
 
         let mut writers = MultiWriter::new(writers, quorum);
-
         while let Some(block) = rx.recv().await {
             if block.is_empty() {
                 break;
@@ -215,7 +288,6 @@ impl Erasure {
         }
 
         let (reader, total) = task.await??;
-        // writers.shutdown().await?;
         Ok((reader, total))
     }
 }
@@ -237,8 +309,10 @@ mod tests {
         use rustfs_utils::HashAlgorithm;
 
         let mut writers: Vec<Option<BitrotWriterWrapper>> = Vec::new();
+        // Bitrot writer shard size must match erasure per-shard encoded size, not the raw block size.
+        let shard_size = e.shard_size();
         for _ in 0..6 {
-            let w = create_bitrot_writer(true, None, "v", "p", 0, 1024, HashAlgorithm::HighwayHash256)
+            let w = create_bitrot_writer(true, None, "v", "p", 0, shard_size, HashAlgorithm::HighwayHash256)
                 .await
                 .unwrap();
             writers.push(Some(w));
@@ -247,5 +321,33 @@ mod tests {
         let quorum = 4; // data shards
         let (_r, total) = e.encode(cursor, &mut writers, quorum).await.unwrap();
         assert!(total > 0);
+    }
+
+    #[tokio::test]
+    async fn test_encode_pipeline_double_buffer() {
+        super::PIPELINE_FORCE.store(true, Ordering::Relaxed);
+        let e = Arc::new(Erasure::new(4, 2, 4096));
+        let mut cursor = Cursor::new(vec![0u8; 64 * 1024]);
+        use std::sync::{Arc, Mutex};
+        let blocks: Arc<Mutex<Vec<Vec<Bytes>>>> = Arc::new(Mutex::new(Vec::new()));
+        let total = e
+            .clone()
+            .encode_stream_callback_async(&mut cursor, {
+                let blocks_cloned = blocks.clone();
+                move |res| {
+                    let blocks_inner = blocks_cloned.clone();
+                    async move {
+                        let shards = res?;
+                        let mut guard = blocks_inner.lock().unwrap();
+                        guard.push(shards);
+                        Ok(()) as std::io::Result<()>
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert!(total >= 64 * 1024, "total={total}");
+        assert!(!blocks.lock().unwrap().is_empty());
+        super::PIPELINE_FORCE.store(false, Ordering::Relaxed);
     }
 }
