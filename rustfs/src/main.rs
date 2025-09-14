@@ -74,6 +74,14 @@ use tracing::{debug, error, info, instrument, warn};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+const LOGO: &str = r#"
+
+░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
+░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
+░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
+
+"#;
+
 #[instrument]
 fn print_server_info() {
     let current_year = chrono::Utc::now().year();
@@ -96,6 +104,9 @@ async fn main() -> Result<()> {
 
     // Initialize Observability
     let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
+
+    // print startup logo
+    info!("{}", LOGO);
 
     // Store in global storage
     set_global_guard(guard).map_err(Error::other)?;
