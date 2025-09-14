@@ -75,12 +75,11 @@ use tracing::{debug, error, info, instrument, warn};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const LOGO: &str = r#"
-                                        _              ___
-                                        / |_          .' ..]
-                _ .--.  __   _   .--. `| |-'______  _| |_  .--.
-                [ `/'`\][  | | | ( (`\] | | |______|'-| |-'( (`\]
-                | |     | \_/ |, `'.'. | |,          | |   `'.'.
-                [___]    '.__.'_/[\__) )\__/         [___] [\__) )
+
+░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
+░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
+░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
+
 "#;
 
 #[instrument]
