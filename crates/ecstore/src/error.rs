@@ -148,6 +148,9 @@ pub enum StorageError {
     #[error("Specified part could not be found. PartNumber {0}, Expected {1}, got {2}")]
     InvalidPart(usize, String, String),
 
+    #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
+    EntityTooSmall(usize, i64, i64),
+
     #[error("Invalid version id: {0}/{1}-{2}")]
     InvalidVersionID(String, String, String),
     #[error("invalid data movement operation, source and destination pool are the same for : {0}/{1}-{2}")]
@@ -408,6 +411,7 @@ impl Clone for StorageError {
             // StorageError::InsufficientWriteQuorum => StorageError::InsufficientWriteQuorum,
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
+            StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
@@ -486,6 +490,7 @@ impl StorageError {
             StorageError::InsufficientReadQuorum(_, _) => 0x39,
             StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
             StorageError::PreconditionFailed => 0x3B,
+            StorageError::EntityTooSmall(_, _, _) => 0x3C,
         }
     }
 

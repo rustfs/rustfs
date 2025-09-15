@@ -321,7 +321,7 @@ impl ExpiryState {
         let mut state = GLOBAL_ExpiryState.write().await;
 
         while state.tasks_tx.len() < n {
-            let (tx, rx) = mpsc::channel(10000);
+            let (tx, rx) = mpsc::channel(1000);
             let api = api.clone();
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             state.tasks_tx.push(tx);
@@ -432,7 +432,7 @@ pub struct TransitionState {
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
-        let (tx1, rx1) = bounded(100000);
+        let (tx1, rx1) = bounded(1000);
         let (tx2, rx2) = bounded(1);
         Arc::new(Self {
             transition_tx: tx1,
@@ -467,8 +467,12 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let mut n = 10; //globalAPIConfig.getTransitionWorkers();
-        let tw = 10; //globalILMConfig.getTransitionWorkers(); 
+        let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+        let mut n = max_workers;
+        let tw = 8; //globalILMConfig.getTransitionWorkers(); 
         if tw > 0 {
             n = tw;
         }
@@ -561,8 +565,18 @@ impl TransitionState {
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
         if n == 0 {
-            n = 100;
+            let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+            n = max_workers;
         }
+        // Allow environment override of maximum workers
+        let absolute_max = std::env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(32);
+        n = std::cmp::min(n, absolute_max);
 
         let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
         while num_workers < n {
@@ -585,7 +599,10 @@ impl TransitionState {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = num_cpus::get() / 2;
+    let mut workers = std::env::var("RUSTFS_MAX_EXPIRY_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 16));
     //globalILMConfig.getExpirationWorkers()
     if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
@@ -594,7 +611,10 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     if workers == 0 {
-        workers = 100;
+        workers = std::env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8);
     }
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
@@ -686,7 +706,14 @@ pub async fn expire_transitioned_object(
         //transitionLogIf(ctx, err);
     }
 
-    let dobj = api.delete_object(&oi.bucket, &oi.name, opts).await?;
+    let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
+        Ok(obj) => obj,
+        Err(e) => {
+            error!("Failed to delete transitioned object {}/{}: {:?}", oi.bucket, oi.name, e);
+            // Return the original object info if deletion fails
+            oi.clone()
+        }
+    };
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
@@ -735,11 +762,14 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
 pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
     let time_ilm = Metrics::time_ilm(lae.event.action);
 
+    let etag = if let Some(etag) = &oi.etag { etag } else { "" };
+    let etag = etag.to_string();
+
     let opts = ObjectOptions {
         transition: TransitionOptions {
             status: lifecycle::TRANSITION_PENDING.to_string(),
             tier: lae.event.storage_class,
-            etag: oi.etag.clone().expect("err").to_string(),
+            etag,
             ..Default::default()
         },
         //lifecycle_audit_event: lae,

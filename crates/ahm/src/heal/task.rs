@@ -299,7 +299,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("{bucket}/{object}")));
-            progress.update_progress(0, 4, 0, 0); // 开始heal，总共4个步骤
+            progress.update_progress(0, 4, 0, 0);
         }
 
         // Step 1: Check if object exists and get metadata
@@ -339,6 +339,20 @@ impl HealTask {
         match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
             Ok((result, error)) => {
                 if let Some(e) = error {
+                    // Check if this is a "File not found" error during delete operations
+                    let error_msg = format!("{}", e);
+                    if error_msg.contains("File not found") || error_msg.contains("not found") {
+                        info!(
+                            "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
+                            bucket, object
+                        );
+                        {
+                            let mut progress = self.progress.write().await;
+                            progress.update_progress(3, 3, 0, 0);
+                        }
+                        return Ok(());
+                    }
+
                     error!("Heal operation failed: {}/{} - {}", bucket, object, e);
 
                     // If heal failed and remove_corrupted is enabled, delete the corrupted object
@@ -380,6 +394,20 @@ impl HealTask {
                 Ok(())
             }
             Err(e) => {
+                // Check if this is a "File not found" error during delete operations
+                let error_msg = format!("{}", e);
+                if error_msg.contains("File not found") || error_msg.contains("not found") {
+                    info!(
+                        "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
+                        bucket, object
+                    );
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.update_progress(3, 3, 0, 0);
+                    }
+                    return Ok(());
+                }
+
                 error!("Heal operation failed: {}/{} - {}", bucket, object, e);
 
                 // If heal failed and remove_corrupted is enabled, delete the corrupted object

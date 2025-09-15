@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth;
 pub mod console;
 pub mod handlers;
 pub mod router;
@@ -20,7 +21,8 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
+    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    bucket_meta,
     event::{
         GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
         SetBucketNotification,
@@ -39,6 +41,9 @@ const ADMIN_PREFIX: &str = "/rustfs/admin";
 
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
+
+    // Health check endpoint for monitoring and orchestration
+    r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
@@ -211,6 +216,21 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
         AdminOperation(&RemoveRemoteTargetHandler {}),
+    )?;
+
+    // Performance profiling endpoints (available on all platforms, with platform-specific responses)
+    #[cfg(not(target_os = "windows"))]
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
+        AdminOperation(&handlers::ProfileHandler {}),
+    )?;
+
+    #[cfg(not(target_os = "windows"))]
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
+        AdminOperation(&handlers::ProfileStatusHandler {}),
     )?;
 
     Ok(r)

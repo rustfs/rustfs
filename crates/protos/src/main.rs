@@ -29,8 +29,9 @@ fn main() -> Result<(), AnyError> {
     let need_compile = match version.compare_ext(&VERSION_PROTOBUF) {
         Ok(cmp::Ordering::Greater) => true,
         Ok(_) => {
-            let version_err = Version::build_error_message(&version, &VERSION_PROTOBUF).unwrap();
-            println!("cargo:warning=Tool `protoc` {version_err}, skip compiling.");
+            if let Some(version_err) = Version::build_error_message(&version, &VERSION_PROTOBUF) {
+                println!("cargo:warning=Tool `protoc` {version_err}, skip compiling.");
+            }
             false
         }
         Err(version_err) => {
@@ -144,8 +145,9 @@ fn compile_flatbuffers_models<P: AsRef<Path>, S: AsRef<str>>(
     let need_compile = match version.compare_ext(&VERSION_FLATBUFFERS) {
         Ok(cmp::Ordering::Greater) => true,
         Ok(_) => {
-            let version_err = Version::build_error_message(&version, &VERSION_FLATBUFFERS).unwrap();
-            println!("cargo:warning=Tool `{flatc_path}` {version_err}, skip compiling.");
+            if let Some(version_err) = Version::build_error_message(&version, &VERSION_FLATBUFFERS) {
+                println!("cargo:warning=Tool `{flatc_path}` {version_err}, skip compiling.");
+            }
             false
         }
         Err(version_err) => {
@@ -253,7 +255,13 @@ impl Version {
                 } else {
                     match self.compare_major_version(expected_version) {
                         cmp::Ordering::Greater => Ok(cmp::Ordering::Greater),
-                        _ => Err(Self::build_error_message(self, expected_version).unwrap()),
+                        _ => {
+                            if let Some(error_msg) = Self::build_error_message(self, expected_version) {
+                                Err(error_msg)
+                            } else {
+                                Err("Unknown version comparison error".to_string())
+                            }
+                        }
                     }
                 }
             }

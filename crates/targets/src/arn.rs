@@ -212,7 +212,7 @@ impl Serialize for ARN {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_arn_string())
+        serializer.serialize_str(&self.to_string())
     }
 }
 

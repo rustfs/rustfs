@@ -377,14 +377,14 @@ impl AsyncWrite for HttpWriter {
 //         let data = vec![42u8; 8];
 
 //         // Write
-//         // 添加 header X-Deny-Write = 1 模拟不可写入的情况
+//         // Add header X-Deny-Write = 1 to simulate non-writable situation
 //         let mut headers = HeaderMap::new();
 //         headers.insert("X-Deny-Write", "1".parse().unwrap());
-//         // 这里我们使用 PUT 方法
+//         // Here we use PUT method
 //         let writer_result = HttpWriter::new(url.clone(), Method::PUT, headers).await;
 //         match writer_result {
 //             Ok(mut writer) => {
-//                 // 如果能创建成功，写入应该报错
+//                 // If creation succeeds, write should fail
 //                 let write_result = writer.write_all(&data).await;
 //                 assert!(write_result.is_err(), "write_all should fail when server denies write");
 //                 if let Err(e) = write_result {
@@ -396,7 +396,7 @@ impl AsyncWrite for HttpWriter {
 //                 }
 //             }
 //             Err(e) => {
-//                 // 直接构造失败也可以
+//                 // Direct construction failure is also acceptable
 //                 println!("HttpWriter::new error: {e}");
 //                 assert!(
 //                     e.to_string().contains("Empty PUT failed") || e.to_string().contains("Forbidden"),
@@ -411,11 +411,11 @@ impl AsyncWrite for HttpWriter {
 
 //     #[tokio::test]
 //     async fn test_http_writer_and_reader_ok() {
-//         // 使用本地 Go 测试服务器
+//         // Use local Go test server
 //         let url = "http://127.0.0.1:8081/testfile".to_string();
 //         let data = vec![99u8; 512 * 1024]; // 512KB of data
 
-//         // Write (不加 X-Deny-Write)
+//         // Write (without X-Deny-Write)
 //         let headers = HeaderMap::new();
 //         let mut writer = HttpWriter::new(url.clone(), Method::PUT, headers).await.unwrap();
 //         writer.write_all(&data).await.unwrap();

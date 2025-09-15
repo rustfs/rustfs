@@ -150,7 +150,7 @@ pub enum MetricName {
     // Webhook metrics
     WebhookOnline,
 
-    // API 拒绝指标
+    // API rejection metrics
     ApiRejectedAuthTotal,
     ApiRejectedHeaderTotal,
     ApiRejectedTimestampTotal,

@@ -22,6 +22,7 @@ use rustfs_ecstore::{
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOptions,
 };
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -32,7 +33,10 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::warn;
 
-use crate::admin::router::Operation;
+use crate::{
+    admin::{auth::validate_admin_request, router::Operation},
+    auth::{check_key_valid, get_session_token},
+};
 use rustfs_ecstore::rebalance::RebalanceMeta;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -84,8 +88,24 @@ pub struct RebalanceStart {}
 #[async_trait::async_trait]
 impl Operation for RebalanceStart {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RebalanceStart");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));
@@ -145,8 +165,24 @@ pub struct RebalanceStatus {}
 #[async_trait::async_trait]
 impl Operation for RebalanceStatus {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RebalanceStatus");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));
@@ -246,8 +282,24 @@ pub struct RebalanceStop {}
 #[async_trait::async_trait]
 impl Operation for RebalanceStop {
     #[tracing::instrument(skip_all)]
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RebalanceStop");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));

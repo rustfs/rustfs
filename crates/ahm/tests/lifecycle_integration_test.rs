@@ -294,13 +294,16 @@ async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &s
     }
 }
 
+mod serial_tests {
+    use super::*;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_lifecycle_expiry_basic() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
     // Create test bucket and object
-    let bucket_name = "test-lifecycle-bucket";
+        let bucket_name = "test-lifecycle-expiry-basic-bucket";
     let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
     let test_data = b"Hello, this is test data for lifecycle expiry!";
 
@@ -394,7 +397,7 @@ async fn test_lifecycle_expiry_deletemarker() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
     // Create test bucket and object
-    let bucket_name = "test-lifecycle-bucket";
+        let bucket_name = "test-lifecycle-expiry-deletemarker-bucket";
     let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
     let test_data = b"Hello, this is test data for lifecycle expiry!";
 
@@ -484,14 +487,14 @@ async fn test_lifecycle_expiry_deletemarker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[ignore]
+//#[ignore]
 async fn test_lifecycle_transition_basic() {
     let (_disk_paths, ecstore) = setup_test_env().await;
 
     create_test_tier().await;
 
     // Create test bucket and object
-    let bucket_name = "test-lifecycle-bucket";
+        let bucket_name = "test-lifecycle-transition-basic-bucket";
     let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
     let test_data = b"Hello, this is test data for lifecycle expiry!";
 
@@ -579,4 +582,5 @@ async fn test_lifecycle_transition_basic() {
     println!("✅ Scanner stopped");
 
     println!("Lifecycle transition basic test completed");
+}
 }

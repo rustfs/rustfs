@@ -52,8 +52,14 @@ impl super::Erasure {
         for _ in start_block..end_block {
             let (mut shards, errs) = reader.read().await;
 
-            if errs.iter().filter(|e| e.is_none()).count() < self.data_shards {
-                return Err(Error::other(format!("can not reconstruct data: not enough data shards {errs:?}")));
+            // Check if we have enough shards to reconstruct data
+            // We need at least data_shards available shards (data + parity combined)
+            let available_shards = errs.iter().filter(|e| e.is_none()).count();
+            if available_shards < self.data_shards {
+                return Err(Error::other(format!(
+                    "can not reconstruct data: not enough available shards (need {}, have {}) {errs:?}",
+                    self.data_shards, available_shards
+                )));
             }
 
             if self.parity_shards > 0 {
@@ -65,7 +71,12 @@ impl super::Erasure {
                 .map(|s| Bytes::from(s.unwrap_or_default()))
                 .collect::<Vec<_>>();
 
-            let mut writers = MultiWriter::new(writers, self.data_shards);
+            // Calculate proper write quorum for heal operation
+            // For heal, we only write to disks that need healing, so write quorum should be
+            // the number of available writers (disks that need healing)
+            let available_writers = writers.iter().filter(|w| w.is_some()).count();
+            let write_quorum = available_writers.max(1); // At least 1 writer must succeed
+            let mut writers = MultiWriter::new(writers, write_quorum);
             writers.write(shards).await?;
         }
 

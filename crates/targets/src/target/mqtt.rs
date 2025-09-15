@@ -438,7 +438,7 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
                 rumqttc::StateError::InvalidState          // The internal state machine is in invalid state
                 | rumqttc::StateError::WrongPacket         // Agreement Violation: Unexpected Data Packet Received
                 | rumqttc::StateError::Unsolicited(_)      // Agreement Violation: Unsolicited ACK Received
-                | rumqttc::StateError::OutgoingPacketTooLarge { .. } // Try to send too large packets
+                | rumqttc::StateError::CollisionTimeout    // Agreement Violation (if this stage occurs)
                 | rumqttc::StateError::EmptySubscription   // Agreement violation (if this stage occurs)
                 => true,
 

@@ -28,10 +28,15 @@ services:
         TARGETPLATFORM: linux/amd64
     ports:
       - "9000:9000" # S3 API port
+      - "9001:9001" # Console port
     environment:
       - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3
       - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_EXTERNAL_ADDRESS=:9000  # Same as internal since no port mapping
+      - RUSTFS_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_LOG_LEVEL=info
@@ -41,7 +46,7 @@ services:
       - rustfs_data_1:/data/rustfs1
       - rustfs_data_2:/data/rustfs2
       - rustfs_data_3:/data/rustfs3
-      - ./logs:/app/logs
+      - logs_data:/app/logs
     networks:
       - rustfs-network
     restart: unless-stopped
@@ -49,11 +54,8 @@ services:
       test:
         [
           "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://localhost:9000/health",
+          "sh", "-c",
+          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
         ]
       interval: 30s
       timeout: 10s
@@ -71,11 +73,16 @@ services:
       dockerfile: Dockerfile.source
       # Pure development environment
     ports:
-      - "9010:9000"
+      - "9010:9000" # S3 API port  
+      - "9011:9001" # Console port
     environment:
       - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1
       - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_EXTERNAL_ADDRESS=:9010  # External port mapping 9010 -> 9000
+      - RUSTFS_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin
       - RUSTFS_LOG_LEVEL=debug
@@ -85,6 +92,17 @@ services:
     networks:
       - rustfs-network
     restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh", "-c", 
+          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     profiles:
       - dev
 
@@ -95,7 +113,7 @@ services:
     command:
       - --config=/etc/otelcol-contrib/otel-collector.yml
     volumes:
-      - ./.docker/observability/otel-collector.yml:/etc/otelcol-contrib/otel-collector.yml:ro
+      - ./.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/otel-collector.yml:ro
     ports:
       - "4317:4317" # OTLP gRPC receiver
       - "4318:4318" # OTLP HTTP receiver
@@ -218,4 +236,6 @@ volumes:
   grafana_data:
     driver: local
   redis_data:
+    driver: local
+  logs_data:
     driver: local

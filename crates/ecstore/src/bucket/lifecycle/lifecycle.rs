@@ -325,7 +325,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         }
 
                         if let Some(days) = expiration.days {
-                            let expected_expiry = expected_expiry_time(obj.mod_time.expect("err!"), days /*, date*/);
+                            let expected_expiry = expected_expiry_time(obj.mod_time.unwrap(), days /*, date*/);
                             if now.unix_timestamp() == 0 || now.unix_timestamp() > expected_expiry.unix_timestamp() {
                                 events.push(Event {
                                     action: IlmAction::DeleteVersionAction,
@@ -439,6 +439,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             if date0.unix_timestamp() != 0
                                 && (now.unix_timestamp() == 0 || now.unix_timestamp() > date0.unix_timestamp())
                             {
+                                info!("eval_inner: expiration by date - date0={:?}", date0);
                                 events.push(Event {
                                     action: IlmAction::DeleteAction,
                                     rule_id: rule.id.clone().expect("err!"),
@@ -449,7 +450,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 });
                             }
                         } else if let Some(days) = expiration.days {
-                            let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.expect("err!"), days);
+                            let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.unwrap(), days);
                             info!(
                                 "eval_inner: expiration check - days={}, obj_time={:?}, expiry_time={:?}, now={:?}, should_expire={}",
                                 days,
@@ -473,7 +474,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 }*/
                                 events.push(event);
                             }
+                        } else {
+                            info!("eval_inner: expiration.days is None");
                         }
+                    } else {
+                        info!("eval_inner: rule.expiration is None");
                     }
 
                     if obj.transition_status != TRANSITION_COMPLETE {
@@ -579,8 +584,14 @@ impl LifecycleCalculate for LifecycleExpiration {
         if !obj.is_latest || !obj.delete_marker {
             return None;
         }
-
-        Some(expected_expiry_time(obj.mod_time.unwrap(), self.days.unwrap()))
+        match self.days {
+            Some(days) => {
+                Some(expected_expiry_time(obj.mod_time.unwrap(), days))
+            }
+            None => {
+                None
+            }
+        }
     }
 }
 
@@ -590,10 +601,16 @@ impl LifecycleCalculate for NoncurrentVersionTransition {
         if obj.is_latest || self.storage_class.is_none() {
             return None;
         }
-        if self.noncurrent_days.is_none() {
-            return obj.successor_mod_time;
+        match self.noncurrent_days {
+            Some(noncurrent_days) => {
+                if let Some(successor_mod_time) = obj.successor_mod_time {
+                    Some(expected_expiry_time(successor_mod_time, noncurrent_days))
+                } else {
+                    Some(expected_expiry_time(OffsetDateTime::now_utc(), noncurrent_days))
+                }
+            }
+            None => obj.successor_mod_time,
         }
-        Some(expected_expiry_time(obj.successor_mod_time.unwrap(), self.noncurrent_days.unwrap()))
     }
 }
 
@@ -608,15 +625,18 @@ impl LifecycleCalculate for Transition {
             return Some(date.into());
         }
 
-        if self.days.is_none() {
-            return obj.mod_time;
+        match self.days {
+            Some(days) => {
+                Some(expected_expiry_time(obj.mod_time.unwrap(), days))
+            }
+            None => obj.mod_time,
         }
-        Some(expected_expiry_time(obj.mod_time.unwrap(), self.days.unwrap()))
     }
 }
 
 pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTime {
     if days == 0 {
+        info!("expected_expiry_time: days=0, returning UNIX_EPOCH for immediate expiry");
         return OffsetDateTime::UNIX_EPOCH; // Return epoch time to ensure immediate expiry
     }
     let t = mod_time
@@ -629,6 +649,7 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
         }
     }
     //t.Truncate(24 * hour)
+    info!("expected_expiry_time: mod_time={:?}, days={}, result={:?}", mod_time, days, t);
     t
 }
 

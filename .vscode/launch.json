@@ -20,18 +20,16 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug"
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=info"
             },
             "args": [
                 "--access-key",
-                "AKEXAMPLERUSTFS",
+                "rustfsadmin",
                 "--secret-key",
-                "SKEXAMPLERUSTFS",
+                "rustfsadmin",
                 "--address",
                 "0.0.0.0:9010",
-                "--domain-name",
-                "127.0.0.1:9010",
-                "./target/volume/test{0...4}"
+                "./target/volume/test{1...4}"
             ],
             "cwd": "${workspaceFolder}"
         },
@@ -90,7 +88,7 @@
             "name": "Debug executable target/debug/test",
             "type":  "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/deps/lifecycle_integration_test-91c6e6bc43605131",
+            "program": "${workspaceFolder}/target/debug/deps/lifecycle_integration_test-5915cbfcab491b3b",
             "args": [
               "--skip",
               "test_lifecycle_expiry_basic",

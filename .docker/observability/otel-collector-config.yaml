@@ -42,9 +42,9 @@ exporters:
     namespace: "rustfs"  # 指标前缀
     send_timestamps: true  # 发送时间戳
     # enable_open_metrics: true
-  loki: # Loki 导出器，用于日志数据
+  otlphttp/loki: # Loki 导出器，用于日志数据
     # endpoint: "http://loki:3100/otlp/v1/logs"
-    endpoint: "http://loki:3100/loki/api/v1/push"
+    endpoint: "http://loki:3100/otlp/v1/logs"
     tls:
       insecure: true
 extensions:
@@ -65,7 +65,7 @@ service:
     logs:
       receivers: [ otlp ]
       processors: [ batch ]
-      exporters: [ loki ]
+      exporters: [ otlphttp/loki ]
   telemetry:
     logs:
       level: "info"  # Collector 日志级别

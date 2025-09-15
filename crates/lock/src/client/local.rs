@@ -12,30 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::{
+    GlobalLockManager,
     client::LockClient,
     error::Result,
-    local::LocalLockMap,
+    fast_lock::{FastLockGuard, LockManager},
     types::{LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockType},
 };
 
-/// Local lock client
-///
-/// Uses global singleton LocalLockMap to ensure all clients access the same lock instance
+/// Local lock client using FastLock
 #[derive(Debug, Clone)]
-pub struct LocalClient;
+pub struct LocalClient {
+    guard_storage: Arc<RwLock<HashMap<LockId, FastLockGuard>>>,
+}
 
 impl LocalClient {
     /// Create new local client
     pub fn new() -> Self {
-        Self
+        Self {
+            guard_storage: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
-    /// Get global lock map instance
-    pub fn get_lock_map(&self) -> Arc<LocalLockMap> {
-        crate::get_global_lock_map()
+    /// Get the global lock manager
+    pub fn get_lock_manager(&self) -> Arc<GlobalLockManager> {
+        crate::get_global_lock_manager()
     }
 }
 
@@ -48,71 +53,102 @@ impl Default for LocalClient {
 #[async_trait::async_trait]
 impl LockClient for LocalClient {
     async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
-        let lock_map = self.get_lock_map();
-        let success = lock_map
-            .lock_with_ttl_id(request)
-            .await
-            .map_err(|e| crate::error::LockError::internal(format!("Lock acquisition failed: {e}")))?;
-        if success {
-            let lock_info = LockInfo {
-                id: crate::types::LockId::new_deterministic(&request.resource),
-                resource: request.resource.clone(),
-                lock_type: LockType::Exclusive,
-                status: crate::types::LockStatus::Acquired,
-                owner: request.owner.clone(),
-                acquired_at: std::time::SystemTime::now(),
-                expires_at: std::time::SystemTime::now() + request.ttl,
-                last_refreshed: std::time::SystemTime::now(),
-                metadata: request.metadata.clone(),
-                priority: request.priority,
-                wait_start_time: None,
-            };
-            Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
-        } else {
-            Ok(LockResponse::failure("Lock acquisition failed".to_string(), std::time::Duration::ZERO))
+        let lock_manager = self.get_lock_manager();
+        let lock_request = crate::fast_lock::ObjectLockRequest::new_write("", request.resource.clone(), request.owner.clone())
+            .with_acquire_timeout(request.acquire_timeout);
+
+        match lock_manager.acquire_lock(lock_request).await {
+            Ok(guard) => {
+                let lock_id = crate::types::LockId::new_deterministic(&request.resource);
+
+                // Store guard for later release
+                let mut guards = self.guard_storage.write().await;
+                guards.insert(lock_id.clone(), guard);
+
+                let lock_info = LockInfo {
+                    id: lock_id,
+                    resource: request.resource.clone(),
+                    lock_type: LockType::Exclusive,
+                    status: crate::types::LockStatus::Acquired,
+                    owner: request.owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + request.ttl,
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: request.metadata.clone(),
+                    priority: request.priority,
+                    wait_start_time: None,
+                };
+                Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+            }
+            Err(crate::fast_lock::LockResult::Timeout) => {
+                Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout))
+            }
+            Err(crate::fast_lock::LockResult::Conflict {
+                current_owner,
+                current_mode,
+            }) => Ok(LockResponse::failure(
+                format!("Lock conflict: resource held by {} in {:?} mode", current_owner, current_mode),
+                std::time::Duration::ZERO,
+            )),
+            Err(crate::fast_lock::LockResult::Acquired) => {
+                unreachable!("Acquired should not be an error")
+            }
         }
     }
 
     async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
-        let lock_map = self.get_lock_map();
-        let success = lock_map
-            .rlock_with_ttl_id(request)
-            .await
-            .map_err(|e| crate::error::LockError::internal(format!("Shared lock acquisition failed: {e}")))?;
-        if success {
-            let lock_info = LockInfo {
-                id: crate::types::LockId::new_deterministic(&request.resource),
-                resource: request.resource.clone(),
-                lock_type: LockType::Shared,
-                status: crate::types::LockStatus::Acquired,
-                owner: request.owner.clone(),
-                acquired_at: std::time::SystemTime::now(),
-                expires_at: std::time::SystemTime::now() + request.ttl,
-                last_refreshed: std::time::SystemTime::now(),
-                metadata: request.metadata.clone(),
-                priority: request.priority,
-                wait_start_time: None,
-            };
-            Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
-        } else {
-            Ok(LockResponse::failure("Lock acquisition failed".to_string(), std::time::Duration::ZERO))
+        let lock_manager = self.get_lock_manager();
+        let lock_request = crate::fast_lock::ObjectLockRequest::new_read("", request.resource.clone(), request.owner.clone())
+            .with_acquire_timeout(request.acquire_timeout);
+
+        match lock_manager.acquire_lock(lock_request).await {
+            Ok(guard) => {
+                let lock_id = crate::types::LockId::new_deterministic(&request.resource);
+
+                // Store guard for later release
+                let mut guards = self.guard_storage.write().await;
+                guards.insert(lock_id.clone(), guard);
+
+                let lock_info = LockInfo {
+                    id: lock_id,
+                    resource: request.resource.clone(),
+                    lock_type: LockType::Shared,
+                    status: crate::types::LockStatus::Acquired,
+                    owner: request.owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + request.ttl,
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: request.metadata.clone(),
+                    priority: request.priority,
+                    wait_start_time: None,
+                };
+                Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+            }
+            Err(crate::fast_lock::LockResult::Timeout) => {
+                Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout))
+            }
+            Err(crate::fast_lock::LockResult::Conflict {
+                current_owner,
+                current_mode,
+            }) => Ok(LockResponse::failure(
+                format!("Lock conflict: resource held by {} in {:?} mode", current_owner, current_mode),
+                std::time::Duration::ZERO,
+            )),
+            Err(crate::fast_lock::LockResult::Acquired) => {
+                unreachable!("Acquired should not be an error")
+            }
         }
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        let lock_map = self.get_lock_map();
-
-        // Try to release the lock directly by ID
-        match lock_map.unlock_by_id(lock_id).await {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Try as read lock if exclusive unlock failed
-                match lock_map.runlock_by_id(lock_id).await {
-                    Ok(()) => Ok(true),
-                    Err(_) => Err(crate::error::LockError::internal("Lock ID not found".to_string())),
-                }
-            }
-            Err(e) => Err(crate::error::LockError::internal(format!("Release lock failed: {e}"))),
+        let mut guards = self.guard_storage.write().await;
+        if let Some(guard) = guards.remove(lock_id) {
+            // Guard automatically releases the lock when dropped
+            drop(guard);
+            Ok(true)
+        } else {
+            // Lock not found or already released
+            Ok(false)
         }
     }
 
@@ -126,45 +162,26 @@ impl LockClient for LocalClient {
     }
 
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>> {
-        let lock_map = self.get_lock_map();
-
-        // Check if the lock exists in our locks map
-        let locks_guard = lock_map.locks.read().await;
-        if let Some(entry) = locks_guard.get(lock_id) {
-            let entry_guard = entry.read().await;
-
-            // Determine lock type and owner based on the entry
-            if let Some(owner) = &entry_guard.writer {
-                Ok(Some(LockInfo {
-                    id: lock_id.clone(),
-                    resource: lock_id.resource.clone(),
-                    lock_type: crate::types::LockType::Exclusive,
-                    status: crate::types::LockStatus::Acquired,
-                    owner: owner.clone(),
-                    acquired_at: std::time::SystemTime::now(),
-                    expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
-                    last_refreshed: std::time::SystemTime::now(),
-                    metadata: LockMetadata::default(),
-                    priority: LockPriority::Normal,
-                    wait_start_time: None,
-                }))
-            } else if !entry_guard.readers.is_empty() {
-                Ok(Some(LockInfo {
-                    id: lock_id.clone(),
-                    resource: lock_id.resource.clone(),
-                    lock_type: crate::types::LockType::Shared,
-                    status: crate::types::LockStatus::Acquired,
-                    owner: entry_guard.readers.iter().next().map(|(k, _)| k.clone()).unwrap_or_default(),
-                    acquired_at: std::time::SystemTime::now(),
-                    expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
-                    last_refreshed: std::time::SystemTime::now(),
-                    metadata: LockMetadata::default(),
-                    priority: LockPriority::Normal,
-                    wait_start_time: None,
-                }))
-            } else {
-                Ok(None)
-            }
+        let guards = self.guard_storage.read().await;
+        if let Some(guard) = guards.get(lock_id) {
+            // We have an active guard for this lock
+            let lock_type = match guard.mode() {
+                crate::fast_lock::types::LockMode::Shared => crate::types::LockType::Shared,
+                crate::fast_lock::types::LockMode::Exclusive => crate::types::LockType::Exclusive,
+            };
+            Ok(Some(LockInfo {
+                id: lock_id.clone(),
+                resource: lock_id.resource.clone(),
+                lock_type,
+                status: crate::types::LockStatus::Acquired,
+                owner: guard.owner().to_string(),
+                acquired_at: std::time::SystemTime::now(),
+                expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+                last_refreshed: std::time::SystemTime::now(),
+                metadata: LockMetadata::default(),
+                priority: LockPriority::Normal,
+                wait_start_time: None,
+            }))
         } else {
             Ok(None)
         }

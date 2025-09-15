@@ -302,17 +302,19 @@ impl TierConfigMgr {
     }
 
     pub async fn get_driver<'a>(&'a mut self, tier_name: &str) -> std::result::Result<&'a WarmBackendImpl, AdminError> {
-        Ok(match self.driver_cache.entry(tier_name.to_string()) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
-                let t = self.tiers.get(tier_name);
-                if t.is_none() {
-                    return Err(ERR_TIER_NOT_FOUND.clone());
-                }
-                let d = new_warm_backend(t.expect("err"), false).await?;
-                e.insert(d)
-            }
-        })
+        // Return cached driver if present
+        if self.driver_cache.contains_key(tier_name) {
+            return Ok(self.driver_cache.get(tier_name).unwrap());
+        }
+
+        // Get tier configuration and create new driver
+        let tier_config = self.tiers.get(tier_name).ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
+
+        let driver = new_warm_backend(tier_config, false).await?;
+
+        // Insert and return reference
+        self.driver_cache.insert(tier_name.to_string(), driver);
+        Ok(self.driver_cache.get(tier_name).unwrap())
     }
 
     pub async fn reload(&mut self, api: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {
