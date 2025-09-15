@@ -29,7 +29,7 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
-use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
+use rustfs_config::observability::{DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_LOG_DIRECTORY};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
@@ -133,8 +133,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     // Environment-aware stdout configuration
     // Check for explicit environment control via RUSTFS_OBS_ENVIRONMENT
-    let detected_environment = std::env::var("RUSTFS_OBS_ENVIRONMENT").unwrap_or_else(|_| environment.to_string());
-    let is_production = detected_environment.to_lowercase() == "production";
+    let is_production = environment.to_lowercase() == DEFAULT_OBS_ENVIRONMENT_PRODUCTION;
 
     // Default stdout behavior based on environment
     let default_use_stdout = if is_production {
@@ -432,7 +431,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                 eprintln!("Stdout logging disabled in production environment for security and log aggregation.");
             } else {
                 eprintln!("Development/Test logging initialized with file logging to {log_directory}/{log_filename}.log");
-                eprintln!("Stdout logging enabled for debugging. Environment: {detected_environment}");
+                eprintln!("Stdout logging enabled for debugging. Environment: {environment}");
             }
 
             // Log rotation configuration details
