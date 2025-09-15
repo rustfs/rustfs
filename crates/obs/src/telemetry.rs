@@ -13,15 +13,19 @@
 // limitations under the License.
 
 use crate::OtelConfig;
-use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode, style};
+use flexi_logger::{
+    Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
+    WriteMode::{AsyncWith, BufferAndFlush},
+    style,
+};
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::{
     Resource,
+    logs::SdkLoggerProvider,
     metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
@@ -29,15 +33,19 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
-use rustfs_config::observability::{DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_LOG_DIRECTORY};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    observability::{
+        DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
+        ENV_OBS_LOG_DIRECTORY,
+    },
 };
 use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::fs;
 use std::io::IsTerminal;
+use std::time::Duration;
+use std::{env, fs};
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
@@ -121,7 +129,7 @@ fn resource(config: &OtelConfig) -> Resource {
 /// Creates a periodic reader for stdout metrics
 fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout::MetricExporter> {
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
-        .with_interval(std::time::Duration::from_secs(interval))
+        .with_interval(Duration::from_secs(interval))
         .build()
 }
 
@@ -209,7 +217,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
                 builder = builder.with_reader(
                     PeriodicReader::builder(exporter)
-                        .with_interval(std::time::Duration::from_secs(meter_interval))
+                        .with_interval(Duration::from_secs(meter_interval))
                         .build(),
                 );
 
@@ -291,7 +299,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
                     endpoint,
                     logger_level,
-                    std::env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
+                    env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
                 );
             }
         }
@@ -393,9 +401,18 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     // Choose write mode based on environment
     let write_mode = if is_production {
-        WriteMode::Async
+        get_env_async_with().unwrap_or_else(|| {
+            eprintln!(
+                "Using default Async write mode in production. To customize, set RUSTFS_OBS_LOG_POOL_CAPA, RUSTFS_OBS_LOG_MESSAGE_CAPA, and RUSTFS_OBS_LOG_FLUSH_MS environment variables."
+            );
+            AsyncWith {
+                pool_capa: DEFAULT_OBS_LOG_POOL_CAPA,
+                message_capa: DEFAULT_OBS_LOG_MESSAGE_CAPA,
+                flush_interval: Duration::from_millis(DEFAULT_OBS_LOG_FLUSH_MS),
+            }
+        })
     } else {
-        WriteMode::BufferAndFlush
+        BufferAndFlush
     };
 
     // Configure the flexi_logger with enhanced error handling
@@ -467,6 +484,26 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         meter_provider: None,
         logger_provider: None,
         _flexi_logger_handles: flexi_logger_handle,
+    }
+}
+
+// Read the AsyncWith parameter from the environment variable
+fn get_env_async_with() -> Option<WriteMode> {
+    let pool_capa = env::var("RUSTFS_OBS_LOG_POOL_CAPA")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let message_capa = env::var("RUSTFS_OBS_LOG_MESSAGE_CAPA")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let flush_ms = env::var("RUSTFS_OBS_LOG_FLUSH_MS").ok().and_then(|v| v.parse::<u64>().ok());
+
+    match (pool_capa, message_capa, flush_ms) {
+        (Some(pool), Some(msg), Some(flush)) => Some(AsyncWith {
+            pool_capa: pool,
+            message_capa: msg,
+            flush_interval: Duration::from_millis(flush),
+        }),
+        _ => None,
     }
 }
 

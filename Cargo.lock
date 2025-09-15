@@ -2942,6 +2942,7 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "crossbeam-queue",
+ "flate2",
  "log",
  "notify-debouncer-mini",
  "nu-ansi-term",
