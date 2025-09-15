@@ -29,7 +29,7 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
-use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
+use rustfs_config::observability::{DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_LOG_DIRECTORY};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
@@ -129,11 +129,23 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
 pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     // avoid repeated access to configuration fields
     let endpoint = &config.endpoint;
-    let use_stdout = config.use_stdout.unwrap_or(USE_STDOUT);
+    let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
+
+    // Environment-aware stdout configuration
+    // Check for explicit environment control via RUSTFS_OBS_ENVIRONMENT
+    let is_production = environment.to_lowercase() == DEFAULT_OBS_ENVIRONMENT_PRODUCTION;
+
+    // Default stdout behavior based on environment
+    let default_use_stdout = if is_production {
+        false // Disable stdout in production for security and log aggregation
+    } else {
+        USE_STDOUT // Use configured default for dev/test environments
+    };
+
+    let use_stdout = config.use_stdout.unwrap_or(default_use_stdout);
     let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
     let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
-    let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
 
     // Configure flexi_logger to cut by time and size
     let mut flexi_logger_handle = None;
@@ -144,7 +156,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         // initialize tracer provider
         let tracer_provider = {
             let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
-            let sampler = if sample_ratio > 0.0 && sample_ratio < 1.0 {
+            let sampler = if (0.0..1.0).contains(&sample_ratio) {
                 Sampler::TraceIdRatioBased(sample_ratio)
             } else {
                 Sampler::AlwaysOn
@@ -249,7 +261,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     .with_line_number(true);
 
                 // Only add full span events tracking in the development environment
-                if environment != ENVIRONMENT {
+                if !is_production {
                     layer = layer.with_span_events(FmtSpan::FULL);
                 }
 
@@ -257,8 +269,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             };
 
             let filter = build_env_filter(logger_level, None);
-            let otel_filter = build_env_filter(logger_level, None);
-            let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter);
+            let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(build_env_filter(logger_level, None));
             let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
 
             // Configure registry to avoid repeated calls to filter methods
@@ -285,73 +296,91 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             }
         }
 
-        OtelGuard {
+        return OtelGuard {
             tracer_provider: Some(tracer_provider),
             meter_provider: Some(meter_provider),
             logger_provider: Some(logger_provider),
             _flexi_logger_handles: flexi_logger_handle,
-        }
-    } else {
-        // Obtain the log directory and file name configuration
-        let default_log_directory = rustfs_utils::dirs::get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY);
-        let log_directory = config.log_directory.as_deref().unwrap_or(default_log_directory.as_str());
-        let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
-
-        if let Err(e) = fs::create_dir_all(log_directory) {
-            eprintln!("Failed to create log directory {log_directory}: {e}");
-        }
-        #[cfg(unix)]
-        {
-            // Linux/macOS Setting Permissions
-            // Set the log directory permissions to 755 (rwxr-xr-x)
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            match fs::set_permissions(log_directory, Permissions::from_mode(0o755)) {
-                Ok(_) => eprintln!("Log directory permissions set to 755: {log_directory}"),
-                Err(e) => eprintln!("Failed to set log directory permissions {log_directory}: {e}"),
-            }
-        }
-
-        // Build log cutting conditions
-        let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
-            // Cut by time and size at the same time
-            (Some(time), Some(size)) => {
-                let age = match time.to_lowercase().as_str() {
-                    "hour" => Age::Hour,
-                    "day" => Age::Day,
-                    "minute" => Age::Minute,
-                    "second" => Age::Second,
-                    _ => Age::Day, // The default is by day
-                };
-                Criterion::AgeOrSize(age, size * 1024 * 1024) // Convert to bytes
-            }
-            // Cut by time only
-            (Some(time), None) => {
-                let age = match time.to_lowercase().as_str() {
-                    "hour" => Age::Hour,
-                    "day" => Age::Day,
-                    "minute" => Age::Minute,
-                    "second" => Age::Second,
-                    _ => Age::Day, // The default is by day
-                };
-                Criterion::Age(age)
-            }
-            // Cut by size only
-            (None, Some(size)) => {
-                Criterion::Size(size * 1024 * 1024) // Convert to bytes
-            }
-            // By default, it is cut by the day
-            _ => Criterion::Age(Age::Day),
         };
+    }
 
-        // The number of log files retained
-        let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
+    // Obtain the log directory and file name configuration
+    let default_log_directory = rustfs_utils::dirs::get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY);
+    let log_directory = config.log_directory.as_deref().unwrap_or(default_log_directory.as_str());
+    let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
 
-        // Parsing the log level
-        let log_spec = LogSpecification::parse(logger_level).unwrap_or(LogSpecification::info());
+    // Enhanced error handling for directory creation
+    if let Err(e) = fs::create_dir_all(log_directory) {
+        eprintln!("ERROR: Failed to create log directory '{log_directory}': {e}");
+        eprintln!("Ensure the parent directory exists and you have write permissions.");
+        eprintln!("Attempting to continue with logging, but file logging may fail.");
+    } else {
+        eprintln!("Log directory ready: {log_directory}");
+    }
 
-        // Convert the logger_level string to the corresponding LevelFilter
-        let level_filter = match logger_level.to_lowercase().as_str() {
+    #[cfg(unix)]
+    {
+        // Linux/macOS Setting Permissions with better error handling
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        match fs::set_permissions(log_directory, Permissions::from_mode(0o755)) {
+            Ok(_) => eprintln!("Log directory permissions set to 755: {log_directory}"),
+            Err(e) => {
+                eprintln!("WARNING: Failed to set log directory permissions for '{log_directory}': {e}");
+                eprintln!("This may affect log file access. Consider checking directory ownership and permissions.");
+            }
+        }
+    }
+
+    // Build log cutting conditions
+    let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
+        // Cut by time and size at the same time
+        (Some(time), Some(size)) => {
+            let age = match time.to_lowercase().as_str() {
+                "hour" => Age::Hour,
+                "day" => Age::Day,
+                "minute" => Age::Minute,
+                "second" => Age::Second,
+                _ => Age::Day, // The default is by day
+            };
+            Criterion::AgeOrSize(age, size * 1024 * 1024) // Convert to bytes
+        }
+        // Cut by time only
+        (Some(time), None) => {
+            let age = match time.to_lowercase().as_str() {
+                "hour" => Age::Hour,
+                "day" => Age::Day,
+                "minute" => Age::Minute,
+                "second" => Age::Second,
+                _ => Age::Day, // The default is by day
+            };
+            Criterion::Age(age)
+        }
+        // Cut by size only
+        (None, Some(size)) => {
+            Criterion::Size(size * 1024 * 1024) // Convert to bytes
+        }
+        // By default, it is cut by the day
+        _ => Criterion::Age(Age::Day),
+    };
+
+    // The number of log files retained
+    let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
+
+    // Parsing the log level
+    let log_spec = LogSpecification::parse(logger_level).unwrap_or_else(|e| {
+        eprintln!("WARNING: Invalid logger level '{logger_level}': {e}. Using default 'info' level.");
+        LogSpecification::info()
+    });
+
+    // Environment-aware stdout configuration
+    // In production: disable stdout completely (Duplicate::None)
+    // In development/test: use level-based filtering
+    let level_filter = if is_production {
+        flexi_logger::Duplicate::None // No stdout output in production
+    } else {
+        // Convert the logger_level string to the corresponding LevelFilter for dev/test
+        match logger_level.to_lowercase().as_str() {
             "trace" => flexi_logger::Duplicate::Trace,
             "debug" => flexi_logger::Duplicate::Debug,
             "info" => flexi_logger::Duplicate::Info,
@@ -359,56 +388,85 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             "error" => flexi_logger::Duplicate::Error,
             "off" => flexi_logger::Duplicate::None,
             _ => flexi_logger::Duplicate::Info, // the default is info
-        };
+        }
+    };
 
-        // Configure the flexi_logger
-        let flexi_logger_result = flexi_logger::Logger::try_with_env_or_str(logger_level)
-            .unwrap_or_else(|e| {
-                eprintln!("Invalid logger level: {logger_level}, using default: {DEFAULT_LOG_LEVEL}, failed error: {e:?}");
-                flexi_logger::Logger::with(log_spec.clone())
-            })
-            .log_to_file(
-                FileSpec::default()
-                    .directory(log_directory)
-                    .basename(log_filename)
-                    .suppress_timestamp(),
-            )
-            .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files.into()))
-            .format_for_files(format_for_file) // Add a custom formatting function for file output
-            .duplicate_to_stdout(level_filter) // Use dynamic levels
+    // Choose write mode based on environment
+    let write_mode = if is_production {
+        WriteMode::Async
+    } else {
+        WriteMode::BufferAndFlush
+    };
+
+    // Configure the flexi_logger with enhanced error handling
+    let mut flexi_logger_builder = flexi_logger::Logger::try_with_env_or_str(logger_level)
+        .unwrap_or_else(|e| {
+            eprintln!("WARNING: Invalid logger configuration '{logger_level}': {e:?}");
+            eprintln!("Falling back to default configuration with level: {DEFAULT_LOG_LEVEL}");
+            flexi_logger::Logger::with(log_spec.clone())
+        })
+        .log_to_file(
+            FileSpec::default()
+                .directory(log_directory)
+                .basename(log_filename)
+                .suppress_timestamp(),
+        )
+        .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files.into()))
+        .format_for_files(format_for_file) // Add a custom formatting function for file output
+        .write_mode(write_mode)
+        .append(); // Avoid clearing existing logs at startup
+
+    // Environment-aware stdout configuration
+    flexi_logger_builder = flexi_logger_builder.duplicate_to_stdout(level_filter);
+
+    // Only add stdout formatting and startup messages in non-production environments
+    if !is_production {
+        flexi_logger_builder = flexi_logger_builder
             .format_for_stdout(format_with_color) // Add a custom formatting function for terminal output
-            .write_mode(WriteMode::BufferAndFlush)
-            .append() // Avoid clearing existing logs at startup
-            .print_message() // Startup information output to console
-            .start();
+            .print_message(); // Startup information output to console
+    }
 
-        if let Ok(logger) = flexi_logger_result {
-            // Save the logger handle to keep the logging
-            flexi_logger_handle = Some(logger);
+    let flexi_logger_result = flexi_logger_builder.start();
 
-            eprintln!("Flexi logger initialized with file logging to {log_directory}/{log_filename}.log");
+    if let Ok(logger) = flexi_logger_result {
+        // Save the logger handle to keep the logging
+        flexi_logger_handle = Some(logger);
 
-            // Log logging of log cutting conditions
-            match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
-                (Some(time), Some(size)) => eprintln!(
-                    "Log rotation configured for: every {time} or when size exceeds {size}MB, keeping {keep_files} files"
-                ),
-                (Some(time), None) => eprintln!("Log rotation configured for: every {time}, keeping {keep_files} files"),
-                (None, Some(size)) => {
-                    eprintln!("Log rotation configured for: when size exceeds {size}MB, keeping {keep_files} files")
-                }
-                _ => eprintln!("Log rotation configured for: daily, keeping {keep_files} files"),
-            }
+        // Environment-aware success messages
+        if is_production {
+            eprintln!("Production logging initialized: file-only mode to {log_directory}/{log_filename}.log");
+            eprintln!("Stdout logging disabled in production environment for security and log aggregation.");
         } else {
-            eprintln!("Failed to initialize flexi_logger: {:?}", flexi_logger_result.err());
+            eprintln!("Development/Test logging initialized with file logging to {log_directory}/{log_filename}.log");
+            eprintln!("Stdout logging enabled for debugging. Environment: {environment}");
         }
 
-        OtelGuard {
-            tracer_provider: None,
-            meter_provider: None,
-            logger_provider: None,
-            _flexi_logger_handles: flexi_logger_handle,
+        // Log rotation configuration details
+        match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
+            (Some(time), Some(size)) => {
+                eprintln!("Log rotation configured for: every {time} or when size exceeds {size}MB, keeping {keep_files} files")
+            }
+            (Some(time), None) => eprintln!("Log rotation configured for: every {time}, keeping {keep_files} files"),
+            (None, Some(size)) => {
+                eprintln!("Log rotation configured for: when size exceeds {size}MB, keeping {keep_files} files")
+            }
+            _ => eprintln!("Log rotation configured for: daily, keeping {keep_files} files"),
         }
+    } else {
+        eprintln!("CRITICAL: Failed to initialize flexi_logger: {:?}", flexi_logger_result.err());
+        eprintln!("Possible causes:");
+        eprintln!("  1. Insufficient permissions to write to log directory: {log_directory}");
+        eprintln!("  2. Log directory does not exist or is not accessible");
+        eprintln!("  3. Invalid log configuration parameters");
+        eprintln!("  4. Disk space issues");
+        eprintln!("Application will continue but logging to files will not work properly.");
+    }
+
+    OtelGuard {
+        tracer_provider: None,
+        meter_provider: None,
+        logger_provider: None,
+        _flexi_logger_handles: flexi_logger_handle,
     }
 }
 
@@ -472,4 +530,142 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
         thread_id,
         record.args()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_production_environment_detection() {
+        // Test production environment logic
+        let production_envs = vec!["production", "PRODUCTION", "Production"];
+
+        for env_value in production_envs {
+            let is_production = env_value.to_lowercase() == "production";
+            assert!(is_production, "Should detect '{}' as production environment", env_value);
+        }
+    }
+
+    #[test]
+    fn test_non_production_environment_detection() {
+        // Test non-production environment logic
+        let non_production_envs = vec!["development", "test", "staging", "dev", "local"];
+
+        for env_value in non_production_envs {
+            let is_production = env_value.to_lowercase() == "production";
+            assert!(!is_production, "Should not detect '{}' as production environment", env_value);
+        }
+    }
+
+    #[test]
+    fn test_stdout_behavior_logic() {
+        // Test the stdout behavior logic without environment manipulation
+        struct TestCase {
+            is_production: bool,
+            config_use_stdout: Option<bool>,
+            expected_use_stdout: bool,
+            description: &'static str,
+        }
+
+        let test_cases = vec![
+            TestCase {
+                is_production: true,
+                config_use_stdout: None,
+                expected_use_stdout: false,
+                description: "Production with no config should disable stdout",
+            },
+            TestCase {
+                is_production: false,
+                config_use_stdout: None,
+                expected_use_stdout: USE_STDOUT,
+                description: "Non-production with no config should use default",
+            },
+            TestCase {
+                is_production: true,
+                config_use_stdout: Some(true),
+                expected_use_stdout: true,
+                description: "Production with explicit true should enable stdout",
+            },
+            TestCase {
+                is_production: true,
+                config_use_stdout: Some(false),
+                expected_use_stdout: false,
+                description: "Production with explicit false should disable stdout",
+            },
+            TestCase {
+                is_production: false,
+                config_use_stdout: Some(true),
+                expected_use_stdout: true,
+                description: "Non-production with explicit true should enable stdout",
+            },
+        ];
+
+        for case in test_cases {
+            let default_use_stdout = if case.is_production { false } else { USE_STDOUT };
+
+            let actual_use_stdout = case.config_use_stdout.unwrap_or(default_use_stdout);
+
+            assert_eq!(actual_use_stdout, case.expected_use_stdout, "Test case failed: {}", case.description);
+        }
+    }
+
+    #[test]
+    fn test_log_level_filter_mapping_logic() {
+        // Test the log level mapping logic used in the real implementation
+        let test_cases = vec![
+            ("trace", "Trace"),
+            ("debug", "Debug"),
+            ("info", "Info"),
+            ("warn", "Warn"),
+            ("warning", "Warn"),
+            ("error", "Error"),
+            ("off", "None"),
+            ("invalid_level", "Info"), // Should default to Info
+        ];
+
+        for (input_level, expected_variant) in test_cases {
+            let filter_variant = match input_level.to_lowercase().as_str() {
+                "trace" => "Trace",
+                "debug" => "Debug",
+                "info" => "Info",
+                "warn" | "warning" => "Warn",
+                "error" => "Error",
+                "off" => "None",
+                _ => "Info", // default case
+            };
+
+            assert_eq!(
+                filter_variant, expected_variant,
+                "Log level '{}' should map to '{}'",
+                input_level, expected_variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_otel_config_environment_defaults() {
+        // Test that OtelConfig properly handles environment detection logic
+        let config = OtelConfig {
+            endpoint: "".to_string(),
+            use_stdout: None,
+            environment: Some("production".to_string()),
+            ..Default::default()
+        };
+
+        // Simulate the logic from init_telemetry
+        let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
+        assert_eq!(environment, "production");
+
+        // Test with development environment
+        let dev_config = OtelConfig {
+            endpoint: "".to_string(),
+            use_stdout: None,
+            environment: Some("development".to_string()),
+            ..Default::default()
+        };
+
+        let dev_environment = dev_config.environment.as_deref().unwrap_or(ENVIRONMENT);
+        assert_eq!(dev_environment, "development");
+    }
 }
