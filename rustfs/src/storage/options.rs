@@ -18,10 +18,13 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 
 use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
+use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
+use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use tracing::error;
 use uuid::Uuid;
 
 /// Creates options for deleting an object in a bucket.
@@ -35,22 +38,32 @@ pub async fn del_opts(
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::suspended(bucket).await;
 
-    // TODO: delete_prefix
+    let vid = if vid.is_none() {
+        headers
+            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
+            .map(|v| v.to_str().unwrap().to_owned())
+    } else {
+        vid
+    };
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
     if let Some(ref id) = vid {
-        if let Err(_err) = Uuid::parse_str(id.as_str()) {
+        if let Err(err) = Uuid::parse_str(id.as_str()) {
+            error!("del_opts: invalid version id: {} error: {}", id, err);
             return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
         }
 
         if !versioned {
+            error!("del_opts: object not versioned: {}", object);
             return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 
-    let mut opts = put_opts_from_headers(headers, metadata.clone())
-        .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
+    let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
+        error!("del_opts: invalid argument: {} error: {}", object, err);
+        StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
+    })?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
@@ -61,6 +74,11 @@ pub async fn del_opts(
     };
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
+
+    opts.delete_marker = headers
+        .get(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER)
+        .map(|v| v.to_str().unwrap() == "true")
+        .unwrap_or_default();
 
     Ok(opts)
 }
@@ -143,6 +161,14 @@ pub async fn put_opts(
 ) -> Result<ObjectOptions> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+
+    let vid = if vid.is_none() {
+        headers
+            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
+            .map(|v| v.to_str().unwrap().to_owned())
+    } else {
+        vid
+    };
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 

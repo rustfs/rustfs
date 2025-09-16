@@ -15,20 +15,22 @@
 use crate::error::{Error, Result};
 use crate::store_api::ObjectInfo;
 
-use super::datatypes::{StatusType, VersionPurgeStatusType};
 use regex::Regex;
 
+use rustfs_filemeta::VersionPurgeStatusType;
+use rustfs_filemeta::{ReplicatedInfos, ReplicationType};
+use rustfs_filemeta::{ReplicationState, ReplicationStatusType};
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_REPLICATION_RESET_STATUS;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const REPLICATION_RESET: &str = "replication-reset";
+pub const REPLICATION_STATUS: &str = "replication-status";
 
 // ReplicateQueued - replication being queued trail
 pub const REPLICATE_QUEUED: &str = "replicate:queue";
@@ -49,74 +51,6 @@ pub const REPLICATE_INCOMING_DELETE: &str = "replicate:incoming:delete";
 pub const REPLICATE_HEAL: &str = "replicate:heal";
 // ReplicateHealDelete - audit trail of healing of failed/pending delete replications.
 pub const REPLICATE_HEAL_DELETE: &str = "replicate:heal:delete";
-
-/// Type - replication type enum
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ReplicationType {
-    #[default]
-    Unset,
-    Object,
-    Delete,
-    Metadata,
-    Heal,
-    ExistingObject,
-    Resync,
-    All,
-}
-
-impl ReplicationType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReplicationType::Unset => "",
-            ReplicationType::Object => "OBJECT",
-            ReplicationType::Delete => "DELETE",
-            ReplicationType::Metadata => "METADATA",
-            ReplicationType::Heal => "HEAL",
-            ReplicationType::ExistingObject => "EXISTING_OBJECT",
-            ReplicationType::Resync => "RESYNC",
-            ReplicationType::All => "ALL",
-        }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        matches!(
-            self,
-            ReplicationType::Object
-                | ReplicationType::Delete
-                | ReplicationType::Metadata
-                | ReplicationType::Heal
-                | ReplicationType::ExistingObject
-                | ReplicationType::Resync
-                | ReplicationType::All
-        )
-    }
-
-    pub fn is_data_replication(&self) -> bool {
-        matches!(self, ReplicationType::Object | ReplicationType::Delete | ReplicationType::Heal)
-    }
-}
-
-impl fmt::Display for ReplicationType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl From<&str> for ReplicationType {
-    fn from(s: &str) -> Self {
-        match s {
-            "UNSET" => ReplicationType::Unset,
-            "OBJECT" => ReplicationType::Object,
-            "DELETE" => ReplicationType::Delete,
-            "METADATA" => ReplicationType::Metadata,
-            "HEAL" => ReplicationType::Heal,
-            "EXISTING_OBJECT" => ReplicationType::ExistingObject,
-            "RESYNC" => ReplicationType::Resync,
-            "ALL" => ReplicationType::All,
-            _ => ReplicationType::Unset,
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MrfReplicateEntry {
@@ -144,311 +78,6 @@ pub trait ReplicationWorkerOperation: Any + Send + Sync {
     fn get_size(&self) -> i64;
     fn is_delete_marker(&self) -> bool;
     fn get_op_type(&self) -> ReplicationType;
-}
-
-/// ReplicationState represents internal replication state
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ReplicationState {
-    pub replica_timestamp: Option<OffsetDateTime>,
-    pub replica_status: StatusType,
-    pub delete_marker: bool,
-    pub replication_timestamp: Option<OffsetDateTime>,
-    pub replication_status_internal: String,
-    pub version_purge_status_internal: String,
-    pub replicate_decision_str: String,
-    pub targets: HashMap<String, StatusType>,
-    pub purge_targets: HashMap<String, VersionPurgeStatusType>,
-    pub reset_statuses_map: HashMap<String, String>,
-}
-
-impl ReplicationState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns true if replication state is identical for version purge statuses and replication statuses
-    pub fn equal(&self, other: &ReplicationState) -> bool {
-        self.replica_status == other.replica_status
-            && self.replication_status_internal == other.replication_status_internal
-            && self.version_purge_status_internal == other.version_purge_status_internal
-    }
-
-    /// Returns overall replication status for the object version being replicated
-    pub fn composite_replication_status(&self) -> StatusType {
-        if !self.replication_status_internal.is_empty() {
-            match StatusType::from(self.replication_status_internal.as_str()) {
-                StatusType::Pending | StatusType::Completed | StatusType::Failed | StatusType::Replica => {
-                    return StatusType::from(self.replication_status_internal.as_str());
-                }
-                _ => {
-                    let repl_status = get_composite_replication_status(&self.targets);
-
-                    if self.replica_timestamp.is_none() {
-                        return repl_status;
-                    }
-
-                    if repl_status == StatusType::Completed {
-                        if let (Some(replica_timestamp), Some(replication_timestamp)) =
-                            (self.replica_timestamp, self.replication_timestamp)
-                        {
-                            if replica_timestamp > replication_timestamp {
-                                return self.replica_status.clone();
-                            }
-                        }
-                    }
-
-                    return repl_status;
-                }
-            }
-        } else if self.replica_status != StatusType::default() {
-            return self.replica_status.clone();
-        }
-
-        StatusType::default()
-    }
-
-    /// Returns overall replication purge status for the permanent delete being replicated
-    pub fn composite_version_purge_status(&self) -> VersionPurgeStatusType {
-        match VersionPurgeStatusType::from(self.version_purge_status_internal.as_str()) {
-            VersionPurgeStatusType::Pending | VersionPurgeStatusType::Complete | VersionPurgeStatusType::Failed => {
-                VersionPurgeStatusType::from(self.version_purge_status_internal.as_str())
-            }
-            _ => get_composite_version_purge_status(&self.purge_targets),
-        }
-    }
-
-    /// Returns replicatedInfos struct initialized with the previous state of replication
-    pub fn target_state(&self, arn: &str) -> ReplicatedTargetInfo {
-        ReplicatedTargetInfo {
-            arn: arn.to_string(),
-            prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
-            version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
-            resync_timestamp: self.reset_statuses_map.get(arn).cloned().unwrap_or_default(),
-            ..Default::default()
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ReplicationAction {
-    /// Replicate all data
-    All,
-    /// Replicate only metadata
-    Metadata,
-    /// Do not replicate
-    #[default]
-    None,
-}
-
-impl ReplicationAction {
-    /// Returns string representation of replication action
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReplicationAction::All => "all",
-            ReplicationAction::Metadata => "metadata",
-            ReplicationAction::None => "none",
-        }
-    }
-}
-
-impl fmt::Display for ReplicationAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl From<&str> for ReplicationAction {
-    fn from(s: &str) -> Self {
-        match s {
-            "all" => ReplicationAction::All,
-            "metadata" => ReplicationAction::Metadata,
-            "none" => ReplicationAction::None,
-            _ => ReplicationAction::None,
-        }
-    }
-}
-
-/// ReplicatedTargetInfo struct represents replication info on a target
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ReplicatedTargetInfo {
-    pub arn: String,
-    pub size: i64,
-    pub duration: Duration,
-    pub replication_action: ReplicationAction,
-    pub op_type: ReplicationType,
-    pub replication_status: StatusType,
-    pub prev_replication_status: StatusType,
-    pub version_purge_status: VersionPurgeStatusType,
-    pub resync_timestamp: String,
-    pub replication_resynced: bool,
-    pub endpoint: String,
-    pub secure: bool,
-    pub error: Option<String>,
-}
-
-impl ReplicatedTargetInfo {
-    /// Returns true for a target if arn is empty
-    pub fn is_empty(&self) -> bool {
-        self.arn.is_empty()
-    }
-}
-
-/// ReplicatedInfos struct contains replication information for multiple targets
-#[derive(Debug, Clone)]
-pub struct ReplicatedInfos {
-    pub replication_timestamp: Option<OffsetDateTime>,
-    pub targets: Vec<ReplicatedTargetInfo>,
-}
-
-impl ReplicatedInfos {
-    /// Returns the total size of completed replications
-    pub fn completed_size(&self) -> i64 {
-        let mut sz = 0i64;
-        for target in &self.targets {
-            if target.is_empty() {
-                continue;
-            }
-            if target.replication_status == StatusType::Completed && target.prev_replication_status != StatusType::Completed {
-                sz += target.size;
-            }
-        }
-        sz
-    }
-
-    /// Returns true if replication was attempted on any of the targets for the object version queued
-    pub fn replication_resynced(&self) -> bool {
-        for target in &self.targets {
-            if target.is_empty() || !target.replication_resynced {
-                continue;
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Returns internal representation of replication status for all targets
-    pub fn replication_status_internal(&self) -> String {
-        let mut result = String::new();
-        for target in &self.targets {
-            if target.is_empty() {
-                continue;
-            }
-            result.push_str(&format!("{}={};", target.arn, target.replication_status));
-        }
-        result
-    }
-
-    /// Returns overall replication status across all targets
-    pub fn replication_status(&self) -> StatusType {
-        if self.targets.is_empty() {
-            return StatusType::Empty;
-        }
-
-        let mut completed = 0;
-        for target in &self.targets {
-            match target.replication_status {
-                StatusType::Failed => return StatusType::Failed,
-                StatusType::Completed => completed += 1,
-                _ => {}
-            }
-        }
-
-        if completed == self.targets.len() {
-            StatusType::Completed
-        } else {
-            StatusType::Pending
-        }
-    }
-
-    /// Returns overall version purge status across all targets
-    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
-        if self.targets.is_empty() {
-            return VersionPurgeStatusType::Empty;
-        }
-
-        let mut completed = 0;
-        for target in &self.targets {
-            match target.version_purge_status {
-                VersionPurgeStatusType::Failed => return VersionPurgeStatusType::Failed,
-                VersionPurgeStatusType::Complete => completed += 1,
-                _ => {}
-            }
-        }
-
-        if completed == self.targets.len() {
-            VersionPurgeStatusType::Complete
-        } else {
-            VersionPurgeStatusType::Pending
-        }
-    }
-
-    /// Returns internal representation of version purge status for all targets
-    pub fn version_purge_status_internal(&self) -> String {
-        let mut result = String::new();
-        for target in &self.targets {
-            if target.is_empty() || target.version_purge_status.is_empty() {
-                continue;
-            }
-            result.push_str(&format!("{}={};", target.arn, target.version_purge_status));
-        }
-        result
-    }
-
-    /// Returns replication action based on target that actually performed replication
-    pub fn action(&self) -> ReplicationAction {
-        for target in &self.targets {
-            if target.is_empty() {
-                continue;
-            }
-            // rely on replication action from target that actually performed replication now.
-            if target.prev_replication_status != StatusType::Completed {
-                return target.replication_action;
-            }
-        }
-        ReplicationAction::None
-    }
-}
-
-pub fn get_composite_replication_status(targets: &HashMap<String, StatusType>) -> StatusType {
-    if targets.is_empty() {
-        return StatusType::Empty;
-    }
-
-    let mut completed = 0;
-    for status in targets.values() {
-        match status {
-            StatusType::Failed => return StatusType::Failed,
-            StatusType::Completed => completed += 1,
-            _ => {}
-        }
-    }
-
-    if completed == targets.len() {
-        StatusType::Completed
-    } else {
-        StatusType::Pending
-    }
-}
-
-pub fn get_composite_version_purge_status(targets: &HashMap<String, VersionPurgeStatusType>) -> VersionPurgeStatusType {
-    if targets.is_empty() {
-        return VersionPurgeStatusType::default();
-    }
-
-    let mut completed = 0;
-    for status in targets.values() {
-        match status {
-            VersionPurgeStatusType::Failed => return VersionPurgeStatusType::Failed,
-            VersionPurgeStatusType::Complete => completed += 1,
-            _ => {}
-        }
-    }
-
-    if completed == targets.len() {
-        VersionPurgeStatusType::Complete
-    } else {
-        VersionPurgeStatusType::Pending
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -505,14 +134,14 @@ impl ReplicateDecision {
     }
 
     /// Returns a stringified representation of internal replication status with all targets marked as `PENDING`
-    pub fn pending_status(&self) -> String {
+    pub fn pending_status(&self) -> Option<String> {
         let mut result = String::new();
         for target in self.targets_map.values() {
             if target.replicate {
-                result.push_str(&format!("{}={};", target.arn, StatusType::Pending.as_str()));
+                result.push_str(&format!("{}={};", target.arn, ReplicationStatusType::Pending.as_str()));
             }
         }
-        result
+        if result.is_empty() { None } else { Some(result) }
     }
 }
 
@@ -608,7 +237,7 @@ impl ResyncTargetDecision {
         arn: &str,
         reset_id: &str,
         reset_before_date: Option<OffsetDateTime>,
-        status: StatusType,
+        status: ReplicationStatusType,
     ) -> Self {
         let rs = oi
             .user_defined
@@ -627,7 +256,7 @@ impl ResyncTargetDecision {
                 return dec;
             }
 
-            dec.replicate = status == StatusType::Empty;
+            dec.replicate = status == ReplicationStatusType::Empty;
 
             return dec;
         }
@@ -647,7 +276,7 @@ impl ResyncTargetDecision {
 
         let new_reset = parts[0] == reset_id;
 
-        if !new_reset && status == StatusType::Completed {
+        if !new_reset && status == ReplicationStatusType::Completed {
             return dec;
         }
 
@@ -697,17 +326,17 @@ pub struct ReplicateObjectInfo {
     pub version_id: Option<Uuid>,
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
-    pub replication_status: StatusType,
-    pub replication_status_internal: String,
+    pub replication_status: ReplicationStatusType,
+    pub replication_status_internal: Option<String>,
     pub delete_marker: bool,
-    pub version_purge_status_internal: String,
+    pub version_purge_status_internal: Option<String>,
     pub version_purge_status: VersionPurgeStatusType,
-    pub replication_state: ReplicationState,
+    pub replication_state: Option<ReplicationState>,
     pub op_type: ReplicationType,
     pub event_type: String,
     pub dsc: ReplicateDecision,
     pub existing_obj_resync: ResyncDecision,
-    pub target_statuses: HashMap<String, StatusType>,
+    pub target_statuses: HashMap<String, ReplicationStatusType>,
     pub target_purge_statuses: HashMap<String, VersionPurgeStatusType>,
     pub replication_timestamp: Option<OffsetDateTime>,
     pub ssec: bool,
@@ -758,14 +387,15 @@ lazy_static::lazy_static! {
 
 impl ReplicateObjectInfo {
     /// Returns replication status of a target
-    pub fn target_replication_status(&self, arn: &str) -> StatusType {
-        let captures = REPL_STATUS_REGEX.captures_iter(&self.replication_status_internal);
+    pub fn target_replication_status(&self, arn: &str) -> ReplicationStatusType {
+        let binding = self.replication_status_internal.clone().unwrap_or_default();
+        let captures = REPL_STATUS_REGEX.captures_iter(&binding);
         for cap in captures {
             if cap.len() == 3 && &cap[1] == arn {
-                return StatusType::from(&cap[2]);
+                return ReplicationStatusType::from(&cap[2]);
             }
         }
-        StatusType::default()
+        ReplicationStatusType::default()
     }
 
     /// Returns the relevant info needed by MRF
@@ -781,14 +411,14 @@ impl ReplicateObjectInfo {
 }
 
 // constructs a replication status map from string representation
-pub fn replication_statuses_map(s: &str) -> HashMap<String, StatusType> {
+pub fn replication_statuses_map(s: &str) -> HashMap<String, ReplicationStatusType> {
     let mut targets = HashMap::new();
     let rep_stat_matches = REPL_STATUS_REGEX.captures_iter(s).map(|c| c.extract());
     for (_, [arn, status]) in rep_stat_matches {
         if arn.is_empty() {
             continue;
         }
-        let status = StatusType::from(status);
+        let status = ReplicationStatusType::from(status);
         targets.insert(arn.to_string(), status);
     }
     targets
@@ -829,10 +459,10 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map,
         replica_timestamp: prev_state.replica_timestamp,
         replica_status: prev_state.replica_status.clone(),
-        targets: replication_statuses_map(&repl_statuses),
+        targets: replication_statuses_map(&repl_statuses.clone().unwrap_or_default()),
         replication_status_internal: repl_statuses,
         replication_timestamp: rinfos.replication_timestamp,
-        purge_targets: version_purge_statuses_map(&vpurge_statuses),
+        purge_targets: version_purge_statuses_map(&vpurge_statuses.clone().unwrap_or_default()),
         version_purge_status_internal: vpurge_statuses,
 
         ..Default::default()

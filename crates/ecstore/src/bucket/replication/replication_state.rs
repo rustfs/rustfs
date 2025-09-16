@@ -1,4 +1,5 @@
 use crate::error::Error;
+use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,8 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
-
-use crate::bucket::replication::{ReplicatedTargetInfo, ReplicationType, StatusType};
 
 /// Exponential Moving Average with thread-safe interior mutability
 #[derive(Debug)]
@@ -48,7 +47,6 @@ impl ExponentialMovingAverage {
     }
 
     pub fn update_exponential_moving_average(&self, now: SystemTime) {
-        // Simulate EWMA update logic from Go version
         if let Ok(mut last_update_guard) = self.last_update.try_lock() {
             let last_update = *last_update_guard;
             if let Ok(duration) = now.duration_since(last_update) {
@@ -239,7 +237,7 @@ impl ReplStat {
         arn: String,
         size: i64,
         duration: Duration,
-        status: StatusType,
+        status: ReplicationStatusType,
         op_type: ReplicationType,
         endpoint: String,
         secure: bool,
@@ -259,9 +257,9 @@ impl ReplStat {
         self.failed = false;
 
         match status {
-            StatusType::Completed => self.completed = true,
-            StatusType::Pending => self.pending = true,
-            StatusType::Failed => self.failed = true,
+            ReplicationStatusType::Completed => self.completed = true,
+            ReplicationStatusType::Pending => self.pending = true,
+            ReplicationStatusType::Failed => self.failed = true,
             _ => {}
         }
     }
@@ -712,7 +710,7 @@ impl ReplicationStats {
         // Start moving average calculation task
         let cache_clone = Arc::clone(&self.cache);
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(2));
+            let mut interval = interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 Self::update_moving_avg_static(&cache_clone).await;
@@ -748,7 +746,7 @@ impl ReplicationStats {
         let now = SystemTime::now();
 
         let cache_read = cache.read().await;
-        for stats in cache_read.values() {
+        for (_bucket, stats) in cache_read.iter() {
             for stat in stats.stats.values() {
                 // Now we can update the moving averages using interior mutability
                 stat.xfer_rate_lrg.measure.update_exponential_moving_average(now);
@@ -807,11 +805,17 @@ impl ReplicationStats {
     }
 
     /// Update replication statistics
-    pub async fn update(&self, bucket: &str, ri: &ReplicatedTargetInfo, status: StatusType, prev_status: StatusType) {
+    pub async fn update(
+        &self,
+        bucket: &str,
+        ri: &ReplicatedTargetInfo,
+        status: ReplicationStatusType,
+        prev_status: ReplicationStatusType,
+    ) {
         let mut rs = ReplStat::new();
 
         match status {
-            StatusType::Pending => {
+            ReplicationStatusType::Pending => {
                 if ri.op_type.is_data_replication() && prev_status != status {
                     rs.set(
                         ri.arn.clone(),
@@ -825,7 +829,7 @@ impl ReplicationStats {
                     );
                 }
             }
-            StatusType::Completed => {
+            ReplicationStatusType::Completed => {
                 if ri.op_type.is_data_replication() {
                     rs.set(
                         ri.arn.clone(),
@@ -839,8 +843,8 @@ impl ReplicationStats {
                     );
                 }
             }
-            StatusType::Failed => {
-                if ri.op_type.is_data_replication() && prev_status == StatusType::Pending {
+            ReplicationStatusType::Failed => {
+                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending {
                     rs.set(
                         ri.arn.clone(),
                         ri.size,
@@ -853,7 +857,7 @@ impl ReplicationStats {
                     );
                 }
             }
-            StatusType::Replica => {
+            ReplicationStatusType::Replica => {
                 if ri.op_type == ReplicationType::Object {
                     rs.set(
                         ri.arn.clone(),
@@ -1164,7 +1168,12 @@ mod tests {
         };
 
         stats
-            .update("test-bucket", &target_info, StatusType::Completed, StatusType::Pending)
+            .update(
+                "test-bucket",
+                &target_info,
+                ReplicationStatusType::Completed,
+                ReplicationStatusType::Pending,
+            )
             .await;
 
         let bucket_stats = stats.get("test-bucket").await;

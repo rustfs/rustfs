@@ -12,25 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::{metadata::BucketMetadata, replication::StatusType};
+use crate::bucket::metadata::BucketMetadata;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
-
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+use aws_sdk_s3::operation::head_bucket::HeadBucketError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
 };
-use aws_sdk_s3::{Client as S3Client, Config as S3Config, Error as S3Error, operation::head_object::HeadObjectOutput};
+use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
-use http::{HeaderMap, HeaderName, HeaderValue};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
     AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, RUSTFS_BUCKET_REPLICATION_CHECK,
-    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_FORCE_DELETE,
-    is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header,
+    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_ETAG,
+    RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_BUCKET_SOURCE_VERSION_ID, RUSTFS_FORCE_DELETE, is_amz_header, is_minio_header,
+    is_rustfs_header, is_standard_header, is_storageclass_header,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,7 +56,6 @@ use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::replication::ObjectOpts;
 use crate::bucket::replication::ReplicationConfigurationExt;
-use crate::bucket::replication::ReplicationType;
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
@@ -224,9 +227,11 @@ impl BucketTargetSys {
     }
 
     pub async fn is_offline(&self, url: &Url) -> bool {
-        let health_map = self.h_mutex.read().await;
-        if let Some(health) = health_map.get(url.host_str().unwrap_or("")) {
-            return !health.online;
+        {
+            let health_map = self.h_mutex.read().await;
+            if let Some(health) = health_map.get(url.host_str().unwrap_or("")) {
+                return !health.online;
+            }
         }
         // Initialize health check if not exists
         self.init_hc(url).await;
@@ -291,7 +296,9 @@ impl BucketTargetSys {
     }
 
     async fn check_endpoint_health(&self, _endpoint: &str) -> bool {
-        todo!()
+        true
+        // TODO: Health check
+
         // // Simple health check implementation
         // // In a real implementation, you would make actual HTTP requests
         // match self
@@ -383,8 +390,6 @@ impl BucketTargetSys {
     }
 
     pub async fn set_target(&self, bucket: &str, target: &BucketTarget, update: bool) -> Result<(), BucketTargetError> {
-        warn!("set target: {} {} {}", bucket, target.arn, target.endpoint);
-
         if !target.target_type.is_valid() && !update {
             return Err(BucketTargetError::BucketRemoteArnTypeInvalid {
                 bucket: bucket.to_string(),
@@ -407,7 +412,6 @@ impl BucketTargetSys {
                 });
             }
             Err(e) => {
-                warn!("check target bucket exists error: {}", e);
                 return Err(BucketTargetError::RemoteTargetConnectionErr {
                     bucket: target.target_bucket.clone(),
                     access_key: target.credentials.as_ref().map(|c| c.access_key.clone()).unwrap_or_default(),
@@ -418,20 +422,18 @@ impl BucketTargetSys {
         }
 
         if target.target_type == BucketTargetType::ReplicationService {
-            warn!("replication service target: {} {}", target.arn, target.endpoint);
-
             if !BucketVersioningSys::enabled(bucket).await {
                 return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
                     bucket: bucket.to_string(),
                 });
             }
 
-            let versioning = target_client.get_bucket_versioning(bucket).await.map_err(|e| {
-                warn!("get bucket versioning error: {}", e);
-                BucketTargetError::BucketReplicationSourceNotVersioned {
+            let versioning = target_client
+                .get_bucket_versioning(&target.target_bucket)
+                .await
+                .map_err(|_e| BucketTargetError::BucketReplicationSourceNotVersioned {
                     bucket: bucket.to_string(),
-                }
-            })?;
+                })?;
 
             if versioning.is_none() {
                 return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
@@ -449,7 +451,6 @@ impl BucketTargetSys {
                 if existing_target.target_type.to_string() == target.target_type.to_string() {
                     if existing_target.arn == target.arn {
                         if !update {
-                            warn!("target already exists1: {} {}", existing_target.arn, target.arn);
                             return Err(BucketTargetError::BucketRemoteAlreadyExists {
                                 bucket: existing_target.target_bucket.clone(),
                             });
@@ -459,7 +460,6 @@ impl BucketTargetSys {
                         break;
                     }
                     if existing_target.endpoint == target.endpoint {
-                        warn!("target already exists2: {} {}", existing_target.endpoint, target.endpoint);
                         return Err(BucketTargetError::BucketRemoteAlreadyExists {
                             bucket: existing_target.target_bucket.clone(),
                         });
@@ -505,7 +505,7 @@ impl BucketTargetSys {
                     ..Default::default()
                 }) {
                     if rule == arn_str || config.role == arn_str {
-                        let arn_remotes_map = self.arn_remotes_map.write().await;
+                        let arn_remotes_map = self.arn_remotes_map.read().await;
                         if arn_remotes_map.get(arn_str).is_some() {
                             return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
                                 bucket: bucket.to_string(),
@@ -629,15 +629,21 @@ impl BucketTargetSys {
             .provider_name("bucket_target_sys")
             .build();
 
+        let endpoint = if target.secure {
+            format!("https://{}", target.endpoint)
+        } else {
+            format!("http://{}", target.endpoint)
+        };
+
         let config = S3Config::builder()
-            .endpoint_url(target.endpoint.clone())
+            .endpoint_url(endpoint.clone())
             .credentials_provider(SharedCredentialsProvider::new(creds))
             .region(SdkRegion::new(target.region.clone()))
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .build();
 
         Ok(TargetClient {
-            endpoint: target.endpoint.clone(),
+            endpoint,
             credentials: target.credentials.clone(),
             bucket: target.target_bucket.clone(),
             storage_class: target.storage_class.clone(),
@@ -717,7 +723,7 @@ impl BucketTargetSys {
             let cli = match self.get_remote_target_client_internal(target).await {
                 Ok(cli) => cli,
                 Err(e) => {
-                    error!("set bucket target:{} error:{}", bucket, e);
+                    warn!("get_remote_target_client_internal error:{}", e);
                     continue;
                 }
             };
@@ -737,7 +743,6 @@ impl BucketTargetSys {
     // getRemoteARN gets existing ARN for an endpoint or generates a new one.
     pub async fn get_remote_arn(&self, bucket: &str, target: Option<&BucketTarget>, depl_id: &str) -> (String, bool) {
         let Some(target) = target else {
-            warn!("get remote arn: target not found: {}", bucket);
             return (String::new(), false);
         };
 
@@ -761,11 +766,9 @@ impl BucketTargetSys {
         }
 
         if !target.target_type.is_valid() {
-            warn!("get remote arn: target type invalid: {}", bucket);
             return (String::new(), false);
         }
         let arn = generate_arn(target, depl_id);
-        warn!("get remote arn: generated arn: {}", arn);
         (arn, false)
     }
 }
@@ -791,7 +794,7 @@ pub struct RemoveObjectOptions {
     pub governance_bypass: bool,
     pub replication_delete_marker: bool,
     pub replication_mtime: Option<OffsetDateTime>,
-    pub replication_status: StatusType,
+    pub replication_status: ReplicationStatusType,
     pub replication_request: bool,
     pub replication_validity_check: bool,
 }
@@ -800,7 +803,7 @@ pub struct RemoveObjectOptions {
 pub struct AdvancedPutOptions {
     pub source_version_id: String,
     pub source_etag: String,
-    pub replication_status: StatusType,
+    pub replication_status: ReplicationStatusType,
     pub source_mtime: OffsetDateTime,
     pub replication_request: bool,
     pub retention_timestamp: OffsetDateTime,
@@ -814,7 +817,7 @@ impl Default for AdvancedPutOptions {
         Self {
             source_version_id: "".to_string(),
             source_etag: "".to_string(),
-            replication_status: StatusType::Pending,
+            replication_status: ReplicationStatusType::Pending,
             source_mtime: OffsetDateTime::now_utc(),
             replication_request: false,
             retention_timestamp: OffsetDateTime::now_utc(),
@@ -982,6 +985,22 @@ impl PutObjectOptions {
             header.insert(k.clone(), v.clone());
         }
 
+        if !self.internal.source_version_id.is_empty() {
+            header.insert(
+                RUSTFS_BUCKET_SOURCE_VERSION_ID,
+                HeaderValue::from_str(&self.internal.source_version_id).expect("err"),
+            );
+        }
+        if self.internal.source_etag.is_empty() {
+            header.insert(RUSTFS_BUCKET_SOURCE_ETAG, HeaderValue::from_str(&self.internal.source_etag).expect("err"));
+        }
+        if self.internal.source_mtime.unix_timestamp() != 0 {
+            header.insert(
+                RUSTFS_BUCKET_SOURCE_MTIME,
+                HeaderValue::from_str(&self.internal.source_mtime.unix_timestamp().to_string()).expect("err"),
+            );
+        }
+
         header
     }
 
@@ -1010,6 +1029,56 @@ pub struct PutObjectPartOptions {
 }
 
 #[derive(Debug)]
+pub struct S3ClientError {
+    pub error: String,
+    pub status_code: Option<StatusCode>,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+impl S3ClientError {
+    pub fn new(value: impl Into<String>) -> Self {
+        S3ClientError {
+            error: value.into(),
+            status_code: None,
+            code: None,
+            message: None,
+        }
+    }
+
+    pub fn add_message(self, message: impl Into<String>) -> Self {
+        S3ClientError {
+            error: format!("{}: {}", message.into(), self.error),
+            status_code: self.status_code,
+            code: self.code,
+            message: self.message,
+        }
+    }
+}
+
+impl<T: aws_sdk_s3::error::ProvideErrorMetadata> From<T> for S3ClientError {
+    fn from(value: T) -> Self {
+        S3ClientError {
+            error: format!(
+                "{}: {}",
+                value.code().map(String::from).unwrap_or("unknown code".into()),
+                value.message().map(String::from).unwrap_or("missing reason".into()),
+            ),
+            status_code: None,
+            code: None,
+            message: None,
+        }
+    }
+}
+
+impl std::error::Error for S3ClientError {}
+
+impl std::fmt::Display for S3ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+#[derive(Debug)]
 pub struct TargetClient {
     pub endpoint: String,
     pub credentials: Option<Credentials>,
@@ -1030,21 +1099,33 @@ impl TargetClient {
         Url::parse(&format!("{scheme}://{}", self.endpoint)).unwrap()
     }
 
-    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3Error> {
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3ClientError> {
         match self.client.head_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(true),
-            Err(e) => Err(e.into()),
+            Err(e) => match e {
+                SdkError::ServiceError(oe) => match oe.into_err() {
+                    HeadBucketError::NotFound(_) => Ok(false),
+                    other => Err(other.into()),
+                },
+
+                _ => Err(e.into()),
+            },
         }
     }
 
-    pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<BucketVersioningStatus>, S3Error> {
+    pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<BucketVersioningStatus>, S3ClientError> {
         match self.client.get_bucket_versioning().bucket(bucket).send().await {
             Ok(res) => Ok(res.status),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub async fn head_object(&self, bucket: &str, object: &str, version_id: Option<String>) -> Result<HeadObjectOutput, S3Error> {
+    pub async fn head_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+    ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
         match self
             .client
             .head_object()
@@ -1055,7 +1136,7 @@ impl TargetClient {
             .await
         {
             Ok(res) => Ok(res),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1066,12 +1147,12 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectOptions,
-    ) -> Result<(), S3Error> {
+    ) -> Result<(), S3ClientError> {
         let headers = opts.header();
 
-        match self
-            .client
-            .put_object()
+        let builder = self.client.put_object();
+
+        match builder
             .bucket(bucket)
             .key(object)
             .content_length(size)
@@ -1081,6 +1162,7 @@ impl TargetClient {
                 for (k, v) in &headers {
                     req.headers_mut().insert(k.clone(), v.clone());
                 }
+
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
             .send()
@@ -1091,7 +1173,12 @@ impl TargetClient {
         }
     }
 
-    pub async fn create_multipart_upload(&self, bucket: &str, object: &str, _opts: &PutObjectOptions) -> Result<String, S3Error> {
+    pub async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        _opts: &PutObjectOptions,
+    ) -> Result<String, S3ClientError> {
         match self.client.create_multipart_upload().bucket(bucket).key(object).send().await {
             Ok(res) => Ok(res.upload_id.unwrap_or_default()),
             Err(e) => Err(e.into()),
@@ -1108,7 +1195,7 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectPartOptions,
-    ) -> Result<UploadPartOutput, S3Error> {
+    ) -> Result<UploadPartOutput, S3ClientError> {
         let headers = opts.custom_header.clone();
 
         match self
@@ -1142,7 +1229,7 @@ impl TargetClient {
         upload_id: &str,
         parts: Vec<CompletedPart>,
         opts: &PutObjectOptions,
-    ) -> Result<CompleteMultipartUploadOutput, S3Error> {
+    ) -> Result<CompleteMultipartUploadOutput, S3ClientError> {
         let multipart_upload = CompletedMultipartUpload::builder().set_parts(Some(parts)).build();
 
         let headers = opts.header();
@@ -1175,7 +1262,7 @@ impl TargetClient {
         object: &str,
         version_id: Option<String>,
         opts: RemoveObjectOptions,
-    ) -> Result<(), S3Error> {
+    ) -> Result<(), S3ClientError> {
         let mut headers = HeaderMap::new();
         if opts.force_delete {
             headers.insert(RUSTFS_FORCE_DELETE, "true".parse().unwrap());
@@ -1222,7 +1309,7 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_res) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

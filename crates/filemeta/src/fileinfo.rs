@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use crate::{ReplicationState, ReplicationStatusType, VersionPurgeStatusType};
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
@@ -201,7 +202,7 @@ pub struct FileInfo {
     // MarkDeleted marks this version as deleted
     pub mark_deleted: bool,
     // ReplicationState - Internal replication state to be passed back in ObjectInfo
-    // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
+    pub replication_state_internal: Option<ReplicationState>,
     pub data: Option<Bytes>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
@@ -469,6 +470,29 @@ impl FileInfo {
         self.mark_deleted == other.mark_deleted
         // TODO: Add replication_state comparison when implemented
         // && self.replication_state == other.replication_state
+    }
+
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.replication_state_internal
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+    pub fn replication_status(&self) -> ReplicationStatusType {
+        self.replication_state_internal
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        if self.deleted {
+            self.replication_state_internal
+                .as_ref()
+                .map(|v| v.composite_replication_status())
+                .unwrap_or(ReplicationStatusType::Empty)
+        } else {
+            ReplicationStatusType::Empty
+        }
     }
 }
 

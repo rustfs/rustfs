@@ -345,21 +345,43 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         info!("delete_versions");
-        let opts = serde_json::to_string(&opts)?;
+
+        let opts = match serde_json::to_string(&opts) {
+            Ok(opts) => opts,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
         let mut versions_str = Vec::with_capacity(versions.len());
         for file_info_versions in versions.iter() {
-            versions_str.push(serde_json::to_string(file_info_versions)?);
+            versions_str.push(match serde_json::to_string(file_info_versions) {
+                Ok(versions_str) => versions_str,
+                Err(err) => {
+                    let mut errors = Vec::with_capacity(versions.len());
+                    for _ in 0..versions.len() {
+                        errors.push(Some(Error::other(err.to_string())));
+                    }
+                    return errors;
+                }
+            });
         }
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        let mut client = match node_service_time_out_client(&self.addr).await {
+            Ok(client) => client,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
+
         let request = Request::new(DeleteVersionsRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
@@ -368,11 +390,27 @@ impl DiskAPI for RemoteDisk {
         });
 
         // TODO: use Error not string
-        let response = client.delete_versions(request).await?.into_inner();
+
+        let response = match client.delete_versions(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
+
+        let response = response.into_inner();
         if !response.success {
-            return Err(response.error.unwrap_or_default().into());
+            let mut errors = Vec::with_capacity(versions.len());
+            for _ in 0..versions.len() {
+                errors.push(Some(Error::other(response.error.clone().map(|e| e.error_info).unwrap_or_default())));
+            }
+            return errors;
         }
-        let errors = response
+        response
             .errors
             .iter()
             .map(|error| {
@@ -382,9 +420,7 @@ impl DiskAPI for RemoteDisk {
                     Some(Error::other(error.to_string()))
                 }
             })
-            .collect();
-
-        Ok(errors)
+            .collect()
     }
 
     #[tracing::instrument(skip(self))]

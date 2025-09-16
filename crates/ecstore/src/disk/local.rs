@@ -2331,12 +2331,7 @@ impl DiskAPI for LocalDisk {
         self.delete_file(&volume_dir, &xl_path, true, false).await
     }
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        _opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, _opts: DeleteOptions) -> Vec<Option<Error>> {
         let mut errs = Vec::with_capacity(versions.len());
         for _ in 0..versions.len() {
             errs.push(None);
@@ -2350,7 +2345,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        Ok(errs)
+        errs
     }
 
     #[tracing::instrument(skip(self))]

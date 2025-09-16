@@ -1,9 +1,7 @@
 use crate::StorageAPI;
 use crate::bucket::replication::MrfReplicateEntry;
-use crate::bucket::replication::ObjectInfoExt as _;
 use crate::bucket::replication::ReplicateDecision;
 use crate::bucket::replication::ReplicateObjectInfo;
-use crate::bucket::replication::ReplicationType;
 use crate::bucket::replication::ReplicationWorkerOperation;
 use crate::bucket::replication::ResyncDecision;
 use crate::bucket::replication::ResyncOpts;
@@ -27,6 +25,9 @@ use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
 
 use lazy_static::lazy_static;
+use rustfs_filemeta::ReplicatedTargetInfo;
+use rustfs_filemeta::ReplicationStatusType;
+use rustfs_filemeta::ReplicationType;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -38,6 +39,8 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
+use tracing::warn;
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -315,10 +318,20 @@ impl<S: StorageAPI> ReplicationPool<S> {
         let mut workers = self.workers.write().await;
 
         if (check_old > 0 && workers.len() != check_old) || n == workers.len() || n < 1 {
+            warn!(
+                "resize_workers: skipping resize - check_old_mismatch={}, same_size={}, invalid_n={}",
+                check_old > 0 && workers.len() != check_old,
+                n == workers.len(),
+                n < 1
+            );
             return;
         }
 
         // Add workers if needed
+        if workers.len() < n {
+            info!("resize_workers: adding workers from {} to {}", workers.len(), n);
+        }
+
         while workers.len() < n {
             let (tx, rx) = mpsc::channel(10000);
             workers.push(tx);
@@ -347,7 +360,6 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         }
                         ReplicationOperation::Delete(del_info) => {
                             stats.inc_q(&del_info.bucket, 0, true, del_info.op_type).await;
-
                             // Perform actual delete replication (placeholder)
                             replicate_delete(del_info.as_ref().clone(), storage.clone()).await;
 
@@ -363,6 +375,10 @@ impl<S: StorageAPI> ReplicationPool<S> {
         }
 
         // Remove workers if needed
+        if workers.len() > n {
+            warn!("resize_workers: removing workers from {} to {}", workers.len(), n);
+        }
+
         while workers.len() > n {
             if let Some(worker) = workers.pop() {
                 drop(worker); // Closing the channel will terminate the worker
@@ -492,8 +508,10 @@ impl<S: StorageAPI> ReplicationPool<S> {
             let hash = hasher.finish();
 
             let lrg_workers = self.lrg_workers.read().await;
+
             if !lrg_workers.is_empty() {
                 let index = (hash as usize) % lrg_workers.len();
+
                 if let Some(worker) = lrg_workers.get(index) {
                     if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
                         // Queue to MRF if worker is busy
@@ -504,6 +522,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         let existing = lrg_workers.len();
                         if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
                             let workers = std::cmp::min(existing + 1, max_l_workers);
+
                             drop(lrg_workers);
                             self.resize_lrg_workers(workers, existing).await;
                         }
@@ -514,6 +533,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         }
 
         // Handle regular sized objects
+
         let ch = match ri.op_type {
             ReplicationType::Heal | ReplicationType::ExistingObject => Some(self.mrf_replica_tx.clone()),
             _ => self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await,
@@ -531,27 +551,33 @@ impl<S: StorageAPI> ReplicationPool<S> {
                 match priority {
                     ReplicationPriority::Fast => {
                         // Log warning about unable to keep up
-                        eprintln!("Warning: Unable to keep up with incoming traffic");
+                        info!("Warning: Unable to keep up with incoming traffic");
                     }
                     ReplicationPriority::Slow => {
-                        eprintln!(
+                        info!(
                             "Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto"
                         );
                     }
                     ReplicationPriority::Auto => {
                         let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                        if self.active_workers() < max_w as i32 {
+                        let active_workers = self.active_workers();
+
+                        if active_workers < max_w as i32 {
                             let workers = self.workers.read().await;
                             let new_count = std::cmp::min(workers.len() + 1, max_w);
                             let existing = workers.len();
+
                             drop(workers);
                             self.resize_workers(new_count, existing).await;
                         }
 
                         let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                        if self.active_mrf_workers() < max_mrf_workers as i32 {
+                        let active_mrf = self.active_mrf_workers();
+
+                        if active_mrf < max_mrf_workers as i32 {
                             let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
                             let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
+
                             self.resize_failed_workers(new_mrf).await;
                         }
                     }
@@ -576,10 +602,10 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
                 match priority {
                     ReplicationPriority::Fast => {
-                        eprintln!("Warning: Unable to keep up with incoming deletes");
+                        info!("Warning: Unable to keep up with incoming deletes");
                     }
                     ReplicationPriority::Slow => {
-                        eprintln!(
+                        info!(
                             "Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto"
                         );
                     }
@@ -768,7 +794,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
                 Ok(meta) => meta,
                 Err(err) => {
                     if !matches!(err, EcstoreError::VolumeNotFound) {
-                        eprintln!("Error loading resync metadata for bucket {bucket}: {err:?}");
+                        warn!("Error loading resync metadata for bucket {bucket}: {err:?}");
                     }
                     continue;
                 }
@@ -787,7 +813,6 @@ impl<S: StorageAPI> ReplicationPool<S> {
                     ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncStarted | ResyncStatusType::ResyncPending => {
                         // Note: This would spawn a resync task in a real implementation
                         // For now, we just log the resync request
-                        println!("Resync requested for bucket: {}, arn: {}, resync_id: {}", bucket, arn, stats.resync_id);
 
                         let ctx = cancellation_token.clone();
                         let bucket_clone = bucket.clone();
@@ -880,7 +905,7 @@ pub type DynReplicationPool = dyn ReplicationPoolTrait + Send + Sync;
 #[async_trait::async_trait]
 pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
-    async fn queue_replica_delete(&self, ri: DeletedObjectReplicationInfo);
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn init_resync(
         self: Arc<Self>,
@@ -896,7 +921,7 @@ impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
         self.queue_replica_task(ri).await;
     }
 
-    async fn queue_replica_delete(&self, ri: DeletedObjectReplicationInfo) {
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) {
         self.queue_replica_delete_task(ri).await;
     }
 
@@ -940,8 +965,8 @@ pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
 }
 
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
-    let tgt_statuses = replication_statuses_map(&oi.replication_status_internal);
-    let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal);
+    let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
+    let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
     let tm = oi
         .user_defined
         .get(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"))
@@ -964,7 +989,7 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
         version_purge_status_internal: oi.version_purge_status_internal,
         version_purge_status: oi.version_purge_status,
 
-        replication_state: rstate,
+        replication_state: Some(rstate),
         op_type,
         dsc: dsc.clone(),
         target_statuses: tgt_statuses,
@@ -985,5 +1010,26 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
         replicate_object(ri, o).await
     } else if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
         pool.queue_replica_task(ri).await;
+    }
+}
+
+pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
+    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        pool.queue_replica_delete_task(dv.clone()).await;
+    }
+
+    if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, GLOBAL_REPLICATION_STATS.get()) {
+        for (k, _v) in rs.targets.iter() {
+            let ri = ReplicatedTargetInfo {
+                arn: k.clone(),
+                size: 0,
+                duration: Duration::default(),
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            };
+            stats
+                .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
+                .await;
+        }
     }
 }
