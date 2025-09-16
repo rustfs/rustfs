@@ -39,6 +39,13 @@ url = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 figment = { version = "0.10", features = ["json", "env"] }
+rumqttc = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = "6.1.0"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

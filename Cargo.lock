@@ -6133,8 +6133,12 @@ version = "0.0.5"
 dependencies = [
  "async-trait",
  "chrono",
+ "dashmap",
  "figment",
+ "once_cell",
+ "parking_lot",
  "reqwest",
+ "rumqttc",
  "rustfs-targets",
  "serde",
  "serde_json",
@@ -6142,6 +6146,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-core",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]

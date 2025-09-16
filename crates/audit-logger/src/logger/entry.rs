@@ -12,97 +12,171 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#![allow(dead_code)]
+use super::config::AuditConfig;
+use super::dispatch::{AuditManager, AuditResult};
+use crate::entry::audit::AuditLogEntry;
+use once_cell::sync::OnceCell;
+use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
-use chrono::{DateTime, Utc};
-use serde::Serialize;
-use std::collections::HashMap;
-use uuid::Uuid;
+/// Global audit logger instance
+static AUDIT_LOGGER: OnceCell<Arc<AuditLogger>> = OnceCell::new();
 
-///A Trait for a log entry that can be serialized and sent
-pub trait Loggable: Serialize + Send + Sync + 'static {
-    fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
+/// Global audit logger for thread-safe, high-performance audit logging
+pub struct AuditLogger {
+    manager: AuditManager,
+    enabled: parking_lot::RwLock<bool>,
+}
+
+impl AuditLogger {
+    /// Create a new audit logger with the given configuration
+    fn new(config: Option<AuditConfig>) -> Self {
+        let manager = AuditManager::new();
+        let enabled = config.as_ref().map(|c| c.enabled).unwrap_or(true);
+
+        let logger = Self {
+            manager,
+            enabled: parking_lot::RwLock::new(enabled),
+        };
+
+        // Load configuration if provided
+        if let Some(config) = config {
+            let manager_clone = logger.manager.clone(); // Clone the Arc inside
+            tokio::spawn(async move {
+                if let Err(e) = manager_clone.load_config(&config).await {
+                    error!("Failed to load audit configuration: {}", e);
+                }
+            });
+        }
+
+        logger
+    }
+
+    /// Initialize the global audit logger with configuration
+    pub fn initialize(config: Option<AuditConfig>) -> AuditResult<()> {
+        let logger = Arc::new(Self::new(config));
+        
+        AUDIT_LOGGER.set(logger)
+            .map_err(|_| super::dispatch::AuditError::Configuration("Audit logger already initialized".to_string()))?;
+        
+        info!("Global audit logger initialized");
+        Ok(())
+    }
+
+    /// Get the global audit logger instance
+    pub fn instance() -> Option<Arc<AuditLogger>> {
+        AUDIT_LOGGER.get().cloned()
+    }
+
+    /// Log an audit entry asynchronously
+    pub async fn log(&self, entry: Arc<AuditLogEntry>) -> AuditResult<()> {
+        if !*self.enabled.read() {
+            debug!("Audit logging disabled, skipping entry");
+            return Ok(());
+        }
+
+        self.manager.log(entry).await
+    }
+
+    /// Enable audit logging
+    pub fn enable(&self) {
+        *self.enabled.write() = true;
+        info!("Audit logging enabled");
+    }
+
+    /// Disable audit logging
+    pub fn disable(&self) {
+        *self.enabled.write() = false;
+        info!("Audit logging disabled");
+    }
+
+    /// Check if audit logging is enabled
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.read()
+    }
+
+    /// Get the audit manager for advanced operations
+    pub fn manager(&self) -> &AuditManager {
+        &self.manager
+    }
+
+    /// Reload configuration
+    pub async fn reload_config(&self, config: &AuditConfig) -> AuditResult<()> {
+        info!("Reloading audit configuration");
+        
+        // Update enabled state
+        *self.enabled.write() = config.enabled;
+        
+        // Reload target configurations
+        self.manager.load_config(config).await?;
+        
+        info!("Audit configuration reloaded successfully");
+        Ok(())
+    }
+
+    /// Shutdown the audit logger gracefully
+    pub async fn shutdown(&self) -> AuditResult<()> {
+        info!("Shutting down audit logger");
+        self.manager.shutdown().await
     }
 }
 
-/// Standard log entries
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct LogEntry {
-    pub deployment_id: String,
-    pub level: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trace: Option<Trace>,
-    pub time: DateTime<Utc>,
-    pub request_id: String,
+/// Initialize the global audit logger
+pub fn initialize(config: Option<AuditConfig>) -> AuditResult<()> {
+    AuditLogger::initialize(config)
 }
 
-impl Loggable for LogEntry {}
-
-/// Audit log entry
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct AuditEntry {
-    pub version: String,
-    pub deployment_id: String,
-    pub time: DateTime<Utc>,
-    pub trigger: String,
-    pub api: ApiDetails,
-    pub remote_host: String,
-    pub request_id: String,
-    pub user_agent: String,
-    pub access_key: String,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub tags: HashMap<String, String>,
+/// Get the global audit logger instance
+pub fn audit_logger() -> Option<Arc<AuditLogger>> {
+    AuditLogger::instance()
 }
 
-impl Loggable for AuditEntry {}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Trace {
-    pub message: String,
-    pub source: Vec<String>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub variables: HashMap<String, String>,
+/// Convenience function to log an audit entry using the global logger
+pub async fn log_audit(entry: Arc<AuditLogEntry>) -> AuditResult<()> {
+    match audit_logger() {
+        Some(logger) => logger.log(entry).await,
+        None => {
+            warn!("Audit logger not initialized, dropping log entry");
+            Ok(())
+        }
+    }
 }
 
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ApiDetails {
-    pub name: String,
-    pub bucket: String,
-    pub object: String,
-    pub status: String,
-    pub status_code: u16,
-    pub time_to_first_byte: String,
-    pub time_to_response: String,
+/// Convenience function to create and log an audit entry
+pub async fn log_audit_entry(entry: AuditLogEntry) -> AuditResult<()> {
+    log_audit(Arc::new(entry)).await
 }
 
-// Helper functions to create entries
-impl AuditEntry {
-    pub fn new(api_name: &str, bucket: &str, object: &str) -> Self {
-        AuditEntry {
-            version: "1".to_string(),
-            deployment_id: "global-deployment-id".to_string(),
-            time: Utc::now(),
-            trigger: "incoming".to_string(),
-            api: ApiDetails {
-                name: api_name.to_string(),
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-                status: "OK".to_string(),
-                status_code: 200,
-                time_to_first_byte: "10ms".to_string(),
-                time_to_response: "50ms".to_string(),
-            },
-            remote_host: "127.0.0.1".to_string(),
-            request_id: Uuid::new_v4().to_string(),
-            user_agent: "Rust-Client/1.0".to_string(),
-            access_key: "minioadmin".to_string(),
-            tags: HashMap::new(),
+/// Enable global audit logging
+pub fn enable_audit_logging() {
+    if let Some(logger) = audit_logger() {
+        logger.enable();
+    } else {
+        warn!("Audit logger not initialized, cannot enable");
+    }
+}
+
+/// Disable global audit logging
+pub fn disable_audit_logging() {
+    if let Some(logger) = audit_logger() {
+        logger.disable();
+    } else {
+        warn!("Audit logger not initialized, cannot disable");
+    }
+}
+
+/// Check if global audit logging is enabled
+pub fn is_audit_logging_enabled() -> bool {
+    audit_logger().map(|logger| logger.is_enabled()).unwrap_or(false)
+}
+
+/// Shutdown the global audit logger
+pub async fn shutdown_audit_logger() -> AuditResult<()> {
+    match audit_logger() {
+        Some(logger) => logger.shutdown().await,
+        None => {
+            warn!("Audit logger not initialized, nothing to shutdown");
+            Ok(())
         }
     }
 }
