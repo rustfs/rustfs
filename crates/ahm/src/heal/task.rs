@@ -340,7 +340,7 @@ impl HealTask {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     // Check if this is a "File not found" error during delete operations
-                    let error_msg = format!("{}", e);
+                    let error_msg = format!("{e}");
                     if error_msg.contains("File not found") || error_msg.contains("not found") {
                         info!(
                             "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",
@@ -395,7 +395,7 @@ impl HealTask {
             }
             Err(e) => {
                 // Check if this is a "File not found" error during delete operations
-                let error_msg = format!("{}", e);
+                let error_msg = format!("{e}");
                 if error_msg.contains("File not found") || error_msg.contains("not found") {
                     info!(
                         "Object {}/{} not found during heal - likely deleted intentionally, treating as successful",

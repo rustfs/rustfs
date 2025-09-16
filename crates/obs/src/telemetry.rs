@@ -580,7 +580,7 @@ mod tests {
 
         for env_value in production_envs {
             let is_production = env_value.to_lowercase() == "production";
-            assert!(is_production, "Should detect '{}' as production environment", env_value);
+            assert!(is_production, "Should detect '{env_value}' as production environment");
         }
     }
 
@@ -591,7 +591,7 @@ mod tests {
 
         for env_value in non_production_envs {
             let is_production = env_value.to_lowercase() == "production";
-            assert!(!is_production, "Should not detect '{}' as production environment", env_value);
+            assert!(!is_production, "Should not detect '{env_value}' as production environment");
         }
     }
 
@@ -674,8 +674,7 @@ mod tests {
 
             assert_eq!(
                 filter_variant, expected_variant,
-                "Log level '{}' should map to '{}'",
-                input_level, expected_variant
+                "Log level '{input_level}' should map to '{expected_variant}'"
             );
         }
     }

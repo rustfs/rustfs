@@ -1322,7 +1322,7 @@ impl Operation for ProfileHandler {
                     error!("Failed to build profiler report: {}", e);
                     return Ok(S3Response::new((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from(format!("Failed to build profile report: {}", e)),
+                        Body::from(format!("Failed to build profile report: {e}")),
                     )));
                 }
             };
@@ -1353,7 +1353,7 @@ impl Operation for ProfileHandler {
                             error!("Failed to generate flamegraph: {}", e);
                             return Ok(S3Response::new((
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to generate flamegraph: {}", e)),
+                                Body::from(format!("Failed to generate flamegraph: {e}")),
                             )));
                         }
                     };

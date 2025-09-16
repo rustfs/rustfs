@@ -27,7 +27,7 @@ mod tests {
         let mut guards = Vec::new();
         for i in 0..100 {
             let bucket = format!("test-bucket-{}", i % 10); // Reuse some bucket names
-            let object = format!("test-object-{}", i);
+            let object = format!("test-object-{i}");
 
             let guard = manager
                 .acquire_write_lock(bucket.as_str(), object.as_str(), "test-owner")
@@ -53,10 +53,7 @@ mod tests {
             0.0
         };
 
-        println!(
-            "Pool stats - Hits: {}, Misses: {}, Releases: {}, Pool size: {}",
-            hits, misses, releases, pool_size
-        );
+        println!("Pool stats - Hits: {hits}, Misses: {misses}, Releases: {releases}, Pool size: {pool_size}");
         println!("Hit rate: {:.2}%", hit_rate * 100.0);
 
         // We should see some pool activity
@@ -82,7 +79,7 @@ mod tests {
             .expect("Failed to acquire second read lock");
 
         let duration = start.elapsed();
-        println!("Two read locks on different objects took: {:?}", duration);
+        println!("Two read locks on different objects took: {duration:?}");
 
         // Should be very fast since no contention
         assert!(duration < Duration::from_millis(10), "Read locks should be fast with no contention");
@@ -103,7 +100,7 @@ mod tests {
             .expect("Failed to acquire second read lock on same object");
 
         let duration = start.elapsed();
-        println!("Two read locks on same object took: {:?}", duration);
+        println!("Two read locks on same object took: {duration:?}");
 
         // Should still be fast since read locks are compatible
         assert!(duration < Duration::from_millis(10), "Compatible read locks should be fast");
@@ -132,7 +129,7 @@ mod tests {
             .expect("Failed to acquire second read lock");
         let second_duration = start.elapsed();
 
-        println!("First lock: {:?}, Second lock: {:?}", first_duration, second_duration);
+        println!("First lock: {first_duration:?}, Second lock: {second_duration:?}");
 
         // Both should be very fast (sub-millisecond typically)
         assert!(first_duration < Duration::from_millis(10));
@@ -157,7 +154,7 @@ mod tests {
         let result = manager.acquire_locks_batch(batch).await;
         let duration = start.elapsed();
 
-        println!("Batch operation took: {:?}", duration);
+        println!("Batch operation took: {duration:?}");
 
         assert!(result.all_acquired, "All locks should be acquired");
         assert_eq!(result.successful_locks.len(), 3);

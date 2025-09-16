@@ -241,7 +241,7 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
         if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
     } else if let Ok(ip) = raw_host.parse::<IpAddr>() {
         // Pure IP (no ports)
-        if ip.is_ipv6() { format!("[{}]", ip) } else { ip.to_string() }
+        if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() }
     } else {
         // The domain name may not be able to resolve directly to IP, remove the port
         raw_host.split(':').next().unwrap_or(raw_host).to_string()

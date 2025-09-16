@@ -261,31 +261,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    // Parallelize initialization tasks for better network performance
-    let bucket_metadata_task = tokio::spawn({
-        let store = store.clone();
-        let buckets = buckets.clone();
-        async move {
-            init_bucket_metadata_sys(store, buckets).await;
-        }
-    });
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
-    let iam_init_task = tokio::spawn({
-        let store = store.clone();
-        async move { init_iam_sys(store).await }
-    });
+    init_iam_sys(store.clone()).await.map_err(Error::other)?;
 
-    let notification_config_task = tokio::spawn({
-        let buckets = buckets.clone();
-        async move {
-            add_bucket_notification_configuration(buckets).await;
-        }
-    });
-
-    // Wait for all parallel initialization tasks to complete
-    bucket_metadata_task.await.map_err(Error::other)?;
-    iam_init_task.await.map_err(Error::other)??;
-    notification_config_task.await.map_err(Error::other)?;
+    add_bucket_notification_configuration(buckets.clone()).await;
 
     // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
