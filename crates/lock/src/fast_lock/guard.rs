@@ -409,14 +409,14 @@ mod tests {
         // Acquire multiple guards and verify unique IDs
         let mut guards = Vec::new();
         for i in 0..100 {
-            let object_name = format!("object_{}", i);
+            let object_name = format!("object_{i}");
             let guard = manager
                 .acquire_write_lock("bucket", object_name.as_str(), "owner")
                 .await
                 .expect("Failed to acquire lock");
 
             let guard_id = guard.guard_id();
-            assert!(guard_ids.insert(guard_id), "Guard ID {} is not unique", guard_id);
+            assert!(guard_ids.insert(guard_id), "Guard ID {guard_id} is not unique");
             guards.push(guard);
         }
 
@@ -501,7 +501,7 @@ mod tests {
 
             let handle = tokio::spawn(async move {
                 for i in 0..10 {
-                    let object_name = format!("obj_{}_{}", task_id, i);
+                    let object_name = format!("obj_{task_id}_{i}");
 
                     // Acquire lock
                     let mut guard = match manager.acquire_write_lock("bucket", object_name.as_str(), "owner").await {
@@ -535,7 +535,7 @@ mod tests {
         let blocked = double_release_blocked.load(Ordering::SeqCst);
 
         // Should have many successful releases and all double releases blocked
-        assert!(successes > 150, "Expected many successful releases, got {}", successes);
+        assert!(successes > 150, "Expected many successful releases, got {successes}");
         assert_eq!(blocked, successes, "All double releases should be blocked");
 
         // Verify no active guards remain
@@ -567,7 +567,7 @@ mod tests {
         // Acquire multiple locks for the same object to ensure they're in the same shard
         let mut guards = Vec::new();
         for i in 0..10 {
-            let owner_name = format!("owner_{}", i);
+            let owner_name = format!("owner_{i}");
             let guard = manager
                 .acquire_read_lock("bucket", "shared_object", owner_name.as_str())
                 .await
@@ -586,7 +586,7 @@ mod tests {
         let cleaned = shard.adaptive_cleanup();
 
         // Should clean very little due to active guards
-        assert!(cleaned <= 5, "Should be conservative with active guards, cleaned: {}", cleaned);
+        assert!(cleaned <= 5, "Should be conservative with active guards, cleaned: {cleaned}");
 
         // Locks should be protected by active guards
         let remaining_locks = shard.lock_count();
@@ -809,7 +809,7 @@ mod tests {
             let manager_clone = manager.clone();
             let handle = tokio::spawn(async move {
                 let _guard = manager_clone
-                    .acquire_read_lock("bucket", format!("object-{}", i), "background")
+                    .acquire_read_lock("bucket", format!("object-{i}"), "background")
                     .await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             });
@@ -842,7 +842,7 @@ mod tests {
 
         // High priority should generally perform reasonably well
         // This is more of a performance validation than a strict requirement
-        println!("High priority: {:?}, Normal: {:?}", high_priority_duration, normal_duration);
+        println!("High priority: {high_priority_duration:?}, Normal: {normal_duration:?}");
 
         // Both operations should complete in reasonable time (less than 100ms in test environment)
         // This validates that the priority system isn't causing severe degradation
@@ -858,7 +858,7 @@ mod tests {
         let mut _guards = Vec::new();
         for i in 0..100 {
             if let Ok(guard) = manager
-                .acquire_write_lock("bucket", format!("load-object-{}", i), "loader")
+                .acquire_write_lock("bucket", format!("load-object-{i}"), "loader")
                 .await
             {
                 _guards.push(guard);
@@ -909,8 +909,8 @@ mod tests {
                 // Try to acquire all locks for this "query"
                 for obj_id in 0..objects_per_query {
                     let bucket = "databend";
-                    let object = format!("table_partition_{}_{}", query_id, obj_id);
-                    let owner = format!("query_{}", query_id);
+                    let object = format!("table_partition_{query_id}_{obj_id}");
+                    let owner = format!("query_{query_id}");
 
                     match manager_clone.acquire_high_priority_read_lock(bucket, object, owner).await {
                         Ok(guard) => query_locks.push(guard),
@@ -935,8 +935,8 @@ mod tests {
             let manager_clone = manager.clone();
             let handle = tokio::spawn(async move {
                 let bucket = "databend";
-                let object = format!("write_target_{}", write_id);
-                let owner = format!("writer_{}", write_id);
+                let object = format!("write_target_{write_id}");
+                let owner = format!("writer_{write_id}");
 
                 match manager_clone.acquire_write_lock(bucket, object, owner).await {
                     Ok(_guard) => {
@@ -988,7 +988,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let bucket = "test";
                 let object = format!("extreme_load_object_{}", i % 20); // Force some contention
-                let owner = format!("user_{}", i);
+                let owner = format!("user_{i}");
 
                 // Mix of read and write locks to create realistic contention
                 let result = if i % 3 == 0 {
@@ -1066,8 +1066,8 @@ mod tests {
                             };
 
                             let bucket = "datacenter-shared";
-                            let object = format!("table_{}_{}_partition_{}", table_id, client_id, table_idx);
-                            let owner = format!("client_{}_query_{}", client_id, query_id);
+                            let object = format!("table_{table_id}_{client_id}_partition_{table_idx}");
+                            let owner = format!("client_{client_id}_query_{query_id}");
 
                             // Mix of operations - mostly reads with some writes
                             let lock_result = if table_idx == 0 && query_id % 7 == 0 {
@@ -1129,10 +1129,10 @@ mod tests {
         }
 
         println!("\n=== Multi-Client Datacenter Simulation Results ===");
-        println!("Total execution time: {:?}", total_time);
-        println!("Total clients: {}", num_clients);
-        println!("Queries per client: {}", queries_per_client);
-        println!("Total queries executed: {}", total_queries);
+        println!("Total execution time: {total_time:?}");
+        println!("Total clients: {num_clients}");
+        println!("Queries per client: {queries_per_client}");
+        println!("Total queries executed: {total_queries}");
         println!(
             "Successful queries: {} ({:.1}%)",
             successful_queries,
@@ -1179,8 +1179,7 @@ mod tests {
         // Performance assertion - should complete in reasonable time
         assert!(
             total_time < std::time::Duration::from_secs(120),
-            "Multi-client test took too long: {:?}",
-            total_time
+            "Multi-client test took too long: {total_time:?}"
         );
     }
 
@@ -1209,8 +1208,8 @@ mod tests {
                     client_attempts += 1;
 
                     let bucket = "hot-data";
-                    let object = format!("popular_table_{}", obj_id);
-                    let owner = format!("thundering_client_{}", client_id);
+                    let object = format!("popular_table_{obj_id}");
+                    let owner = format!("thundering_client_{client_id}");
 
                     // Simulate different access patterns
                     let result = match obj_id % 3 {
@@ -1265,12 +1264,12 @@ mod tests {
         let success_rate = total_successes as f64 / total_attempts as f64;
 
         println!("\n=== Thundering Herd Scenario Results ===");
-        println!("Concurrent clients: {}", num_concurrent_clients);
-        println!("Hot objects: {}", hot_objects);
-        println!("Total attempts: {}", total_attempts);
-        println!("Total successes: {}", total_successes);
+        println!("Concurrent clients: {num_concurrent_clients}");
+        println!("Hot objects: {hot_objects}");
+        println!("Total attempts: {total_attempts}");
+        println!("Total successes: {total_successes}");
         println!("Success rate: {:.1}%", success_rate * 100.0);
-        println!("Total time: {:?}", total_time);
+        println!("Total time: {total_time:?}");
         println!(
             "Average time per operation: {:.1}ms",
             total_time.as_millis() as f64 / total_attempts as f64
@@ -1286,8 +1285,7 @@ mod tests {
         // Should handle this volume in reasonable time
         assert!(
             total_time < std::time::Duration::from_secs(180),
-            "Thundering herd test took too long: {:?}",
-            total_time
+            "Thundering herd test took too long: {total_time:?}"
         );
     }
 
@@ -1314,7 +1312,7 @@ mod tests {
                     for op_id in 0..operations_per_transaction {
                         let bucket = "oltp-data";
                         let object = format!("record_{}_{}", oltp_id * 10 + tx_id, op_id);
-                        let owner = format!("oltp_{}_{}", oltp_id, tx_id);
+                        let owner = format!("oltp_{oltp_id}_{tx_id}");
 
                         // OLTP is mostly writes
                         let result = manager_clone.acquire_write_lock(bucket, object, owner).await;
@@ -1358,7 +1356,7 @@ mod tests {
                             table_id % 20, // Some overlap between queries
                             query_id
                         );
-                        let owner = format!("olap_{}_{}", olap_id, query_id);
+                        let owner = format!("olap_{olap_id}_{query_id}");
 
                         // OLAP is mostly reads with high priority
                         let result = manager_clone.acquire_critical_read_lock(bucket, object, owner).await;
@@ -1408,7 +1406,7 @@ mod tests {
         let olap_success_rate = olap_successes as f64 / olap_attempts as f64;
 
         println!("\n=== Mixed Workload Stress Test Results ===");
-        println!("Total time: {:?}", total_time);
+        println!("Total time: {total_time:?}");
         println!(
             "OLTP: {}/{} transactions succeeded ({:.1}%)",
             oltp_successes,

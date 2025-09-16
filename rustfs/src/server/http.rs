@@ -65,26 +65,15 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
             Method::HEAD,
             Method::OPTIONS,
         ])
-        .allow_headers([
-            http::header::CONTENT_TYPE,
-            http::header::AUTHORIZATION,
-            http::header::ACCEPT,
-            http::header::ORIGIN,
-            // Note: X_AMZ_* headers are custom and may need to be defined
-            // http::header::X_AMZ_CONTENT_SHA256,
-            // http::header::X_AMZ_DATE,
-            // http::header::X_AMZ_SECURITY_TOKEN,
-            // http::header::X_AMZ_USER_AGENT,
-            http::header::RANGE,
-        ]);
+        .allow_headers(Any);
 
     match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any),
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
         Some(origins_str) => {
             let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
             if origins.is_empty() {
                 warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any)
+                cors_layer.allow_origin(Any).expose_headers(Any)
             } else {
                 // Parse origins with proper error handling
                 let mut valid_origins = Vec::new();
@@ -101,16 +90,16 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
 
                 if valid_origins.is_empty() {
                     warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any)
+                    cors_layer.allow_origin(Any).expose_headers(Any)
                 } else {
                     info!("Endpoint CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins))
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
                 }
             }
         }
         None => {
             debug!("No CORS origins configured for endpoint, using permissive CORS");
-            cors_layer.allow_origin(Any)
+            cors_layer.allow_origin(Any).expose_headers(Any)
         }
     }
 }
@@ -128,7 +117,6 @@ pub async fn start_http_server(
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
-    let _server_address = server_addr.to_string();
 
     // The listening address and port are obtained from the parameters
     let listener = {
@@ -199,7 +187,7 @@ pub async fn start_http_server(
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
         // When console runs on separate port, disable console routes on main endpoint
-        let console_on_endpoint = false; // Console will run separately
+        let console_on_endpoint = opt.console_enable; // Console will run separately
         b.set_route(admin::make_admin_route(console_on_endpoint)?);
 
         if !opt.server_domains.is_empty() {

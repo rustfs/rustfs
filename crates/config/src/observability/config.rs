@@ -29,7 +29,70 @@ pub const ENV_OBS_LOG_ROTATION_SIZE_MB: &str = "RUSTFS_OBS_LOG_ROTATION_SIZE_MB"
 pub const ENV_OBS_LOG_ROTATION_TIME: &str = "RUSTFS_OBS_LOG_ROTATION_TIME";
 pub const ENV_OBS_LOG_KEEP_FILES: &str = "RUSTFS_OBS_LOG_KEEP_FILES";
 
+/// Log pool capacity for async logging
+pub const ENV_OBS_LOG_POOL_CAPA: &str = "RUSTFS_OBS_LOG_POOL_CAPA";
+
+/// Log message capacity for async logging
+pub const ENV_OBS_LOG_MESSAGE_CAPA: &str = "RUSTFS_OBS_LOG_MESSAGE_CAPA";
+
+/// Log flush interval in milliseconds for async logging
+pub const ENV_OBS_LOG_FLUSH_MS: &str = "RUSTFS_OBS_LOG_FLUSH_MS";
+
+/// Default values for log pool
+pub const DEFAULT_OBS_LOG_POOL_CAPA: usize = 10240;
+
+/// Default values for message capacity
+pub const DEFAULT_OBS_LOG_MESSAGE_CAPA: usize = 32768;
+
+/// Default values for flush interval in milliseconds
+pub const DEFAULT_OBS_LOG_FLUSH_MS: u64 = 200;
+
+/// Audit logger queue capacity environment variable key
 pub const ENV_AUDIT_LOGGER_QUEUE_CAPACITY: &str = "RUSTFS_AUDIT_LOGGER_QUEUE_CAPACITY";
 
-// Default values for observability configuration
+/// Default values for observability configuration
 pub const DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY: usize = 10000;
+
+/// Default values for observability configuration
+// ### Supported Environment Values
+// - `production` - Secure file-only logging
+// - `development` - Full debugging with stdout
+// - `test` - Test environment with stdout support
+// - `staging` - Staging environment with stdout support
+pub const DEFAULT_OBS_ENVIRONMENT_PRODUCTION: &str = "production";
+pub const DEFAULT_OBS_ENVIRONMENT_DEVELOPMENT: &str = "development";
+pub const DEFAULT_OBS_ENVIRONMENT_TEST: &str = "test";
+pub const DEFAULT_OBS_ENVIRONMENT_STAGING: &str = "staging";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_env_keys() {
+        assert_eq!(ENV_OBS_ENDPOINT, "RUSTFS_OBS_ENDPOINT");
+        assert_eq!(ENV_OBS_USE_STDOUT, "RUSTFS_OBS_USE_STDOUT");
+        assert_eq!(ENV_OBS_SAMPLE_RATIO, "RUSTFS_OBS_SAMPLE_RATIO");
+        assert_eq!(ENV_OBS_METER_INTERVAL, "RUSTFS_OBS_METER_INTERVAL");
+        assert_eq!(ENV_OBS_SERVICE_NAME, "RUSTFS_OBS_SERVICE_NAME");
+        assert_eq!(ENV_OBS_SERVICE_VERSION, "RUSTFS_OBS_SERVICE_VERSION");
+        assert_eq!(ENV_OBS_ENVIRONMENT, "RUSTFS_OBS_ENVIRONMENT");
+        assert_eq!(ENV_OBS_LOGGER_LEVEL, "RUSTFS_OBS_LOGGER_LEVEL");
+        assert_eq!(ENV_OBS_LOCAL_LOGGING_ENABLED, "RUSTFS_OBS_LOCAL_LOGGING_ENABLED");
+        assert_eq!(ENV_OBS_LOG_DIRECTORY, "RUSTFS_OBS_LOG_DIRECTORY");
+        assert_eq!(ENV_OBS_LOG_FILENAME, "RUSTFS_OBS_LOG_FILENAME");
+        assert_eq!(ENV_OBS_LOG_ROTATION_SIZE_MB, "RUSTFS_OBS_LOG_ROTATION_SIZE_MB");
+        assert_eq!(ENV_OBS_LOG_ROTATION_TIME, "RUSTFS_OBS_LOG_ROTATION_TIME");
+        assert_eq!(ENV_OBS_LOG_KEEP_FILES, "RUSTFS_OBS_LOG_KEEP_FILES");
+        assert_eq!(ENV_AUDIT_LOGGER_QUEUE_CAPACITY, "RUSTFS_AUDIT_LOGGER_QUEUE_CAPACITY");
+    }
+
+    #[test]
+    fn test_default_values() {
+        assert_eq!(DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY, 10000);
+        assert_eq!(DEFAULT_OBS_ENVIRONMENT_PRODUCTION, "production");
+        assert_eq!(DEFAULT_OBS_ENVIRONMENT_DEVELOPMENT, "development");
+        assert_eq!(DEFAULT_OBS_ENVIRONMENT_TEST, "test");
+        assert_eq!(DEFAULT_OBS_ENVIRONMENT_STAGING, "staging");
+    }
+}

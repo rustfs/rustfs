@@ -2430,7 +2430,7 @@ impl SetDisks {
                 .map_err(|e| {
                     let elapsed = start_time.elapsed();
                     error!("Failed to acquire write lock for heal operation after {:?}: {:?}", elapsed, e);
-                    DiskError::other(format!("Failed to acquire write lock for heal operation: {:?}", e))
+                    DiskError::other(format!("Failed to acquire write lock for heal operation: {e:?}"))
                 })?;
             let elapsed = start_time.elapsed();
             info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
@@ -3045,7 +3045,7 @@ impl SetDisks {
             .fast_lock_manager
             .acquire_write_lock("", object, self.locker_owner.as_str())
             .await
-            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {:?}", e)))?;
+            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {e:?}")))?;
 
         let disks = {
             let disks = self.disks.read().await;
@@ -5594,7 +5594,7 @@ impl StorageAPI for SetDisks {
                 self.fast_lock_manager
                     .acquire_write_lock("", object, self.locker_owner.as_str())
                     .await
-                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {:?}", e)))?,
+                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {e:?}")))?,
             )
         } else {
             None

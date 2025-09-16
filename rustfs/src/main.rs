@@ -41,6 +41,8 @@ use rustfs_ahm::{
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_config::DEFAULT_UPDATE_CHECK;
+use rustfs_config::ENV_UPDATE_CHECK;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
@@ -74,6 +76,18 @@ use tracing::{debug, error, info, instrument, warn};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const LOGO: &str = r#"
+
+░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
+░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
+░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
+
+"#;
+
 #[instrument]
 fn print_server_info() {
     let current_year = chrono::Utc::now().year();
@@ -96,6 +110,9 @@ async fn main() -> Result<()> {
 
     // Initialize Observability
     let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
+
+    // print startup logo
+    info!("{}", LOGO);
 
     // Store in global storage
     set_global_guard(guard).map_err(Error::other)?;
@@ -135,6 +152,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     set_global_rustfs_port(server_port);
 
     set_global_addr(&opt.address).await;
+
+    // Wait for DNS initialization to complete before network-heavy operations
+    dns_init.await.map_err(Error::other)?;
 
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
@@ -230,9 +250,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize event notifier
     init_event_notifier().await;
 
-    // Wait for DNS initialization to complete before network-heavy operations
-    dns_init.await.map_err(Error::other)?;
-
     let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -244,31 +261,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    // Parallelize initialization tasks for better network performance
-    let bucket_metadata_task = tokio::spawn({
-        let store = store.clone();
-        let buckets = buckets.clone();
-        async move {
-            init_bucket_metadata_sys(store, buckets).await;
-        }
-    });
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
-    let iam_init_task = tokio::spawn({
-        let store = store.clone();
-        async move { init_iam_sys(store).await }
-    });
+    init_iam_sys(store.clone()).await.map_err(Error::other)?;
 
-    let notification_config_task = tokio::spawn({
-        let buckets = buckets.clone();
-        async move {
-            add_bucket_notification_configuration(buckets).await;
-        }
-    });
-
-    // Wait for all parallel initialization tasks to complete
-    bucket_metadata_task.await.map_err(Error::other)?;
-    iam_init_task.await.map_err(Error::other)??;
-    notification_config_task.await.map_err(Error::other)?;
+    add_bucket_notification_configuration(buckets.clone()).await;
 
     // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
@@ -313,41 +310,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // initialize bucket replication pool
     init_bucket_replication_pool().await;
 
-    // Async update check with timeout (optional)
-    tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
-
-        // Add timeout to prevent hanging network calls
-        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
-            Ok(Ok(result)) => {
-                if result.update_available {
-                    if let Some(latest) = &result.latest_version {
-                        info!(
-                            "🚀 Version check: New version available: {} -> {} (current: {})",
-                            result.current_version, latest.version, result.current_version
-                        );
-                        if let Some(notes) = &latest.release_notes {
-                            info!("📝 Release notes: {}", notes);
-                        }
-                        if let Some(url) = &latest.download_url {
-                            info!("🔗 Download URL: {}", url);
-                        }
-                    }
-                } else {
-                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
-                }
-            }
-            Ok(Err(UpdateCheckError::HttpError(e))) => {
-                debug!("Version check: network error (this is normal): {}", e);
-            }
-            Ok(Err(e)) => {
-                debug!("Version check: failed (this is normal): {}", e);
-            }
-            Err(_) => {
-                debug!("Version check: timeout after 30 seconds (this is normal)");
-            }
-        }
-    });
+    init_update_check();
 
     // if opt.console_enable {
     //     debug!("console is enabled");
@@ -463,6 +426,53 @@ async fn init_event_notifier() {
     } else {
         info!("Event notifier system initialized successfully.");
     }
+}
+
+fn init_update_check() {
+    let update_check_enable = std::env::var(ENV_UPDATE_CHECK)
+        .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
+        .parse::<bool>()
+        .unwrap_or(DEFAULT_UPDATE_CHECK);
+
+    if !update_check_enable {
+        return;
+    }
+
+    // Async update check with timeout
+    tokio::spawn(async {
+        use crate::update::{UpdateCheckError, check_updates};
+
+        // Add timeout to prevent hanging network calls
+        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+            Ok(Ok(result)) => {
+                if result.update_available {
+                    if let Some(latest) = &result.latest_version {
+                        info!(
+                            "🚀 Version check: New version available: {} -> {} (current: {})",
+                            result.current_version, latest.version, result.current_version
+                        );
+                        if let Some(notes) = &latest.release_notes {
+                            info!("📝 Release notes: {}", notes);
+                        }
+                        if let Some(url) = &latest.download_url {
+                            info!("🔗 Download URL: {}", url);
+                        }
+                    }
+                } else {
+                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
+                }
+            }
+            Ok(Err(UpdateCheckError::HttpError(e))) => {
+                debug!("Version check: network error (this is normal): {}", e);
+            }
+            Ok(Err(e)) => {
+                debug!("Version check: failed (this is normal): {}", e);
+            }
+            Err(_) => {
+                debug!("Version check: timeout after 30 seconds (this is normal)");
+            }
+        }
+    });
 }
 
 #[instrument(skip_all)]

@@ -123,7 +123,7 @@ derive_builder = "0.20.2"
 enumset = "1.1.10"
 flatbuffers = "25.2.10"
 flate2 = "1.1.2"
-flexi_logger = { version = "0.31.2", features = ["trc", "dont_minimize_extra_stacks"] }
+flexi_logger = { version = "0.31.2", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
 form_urlencoded = "1.2.2"
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -209,8 +209,8 @@ rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-minio-preview.3" }
 schemars = "1.0.4"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = { version = "1.0.143", features = ["raw_value"] }
+serde = { version = "1.0.223", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
 sha1 = "0.10.6"

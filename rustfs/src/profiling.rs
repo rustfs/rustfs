@@ -23,7 +23,7 @@ pub fn init_profiler() -> Result<(), Box<dyn std::error::Error>> {
         .frequency(1000)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
-        .map_err(|e| format!("Failed to build profiler guard: {}", e))?;
+        .map_err(|e| format!("Failed to build profiler guard: {e}"))?;
 
     PROFILER_GUARD
         .set(Arc::new(Mutex::new(guard)))

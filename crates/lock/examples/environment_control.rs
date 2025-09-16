@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Lock system status: {}", if manager.is_disabled() { "DISABLED" } else { "ENABLED" });
 
     match std::env::var("RUSTFS_ENABLE_LOCKS") {
-        Ok(value) => println!("RUSTFS_ENABLE_LOCKS set to: {}", value),
+        Ok(value) => println!("RUSTFS_ENABLE_LOCKS set to: {value}"),
         Err(_) => println!("RUSTFS_ENABLE_LOCKS not set (defaults to enabled)"),
     }
 
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Lock acquired successfully! Disabled: {}", guard.is_disabled());
         }
         Err(e) => {
-            println!("Failed to acquire lock: {:?}", e);
+            println!("Failed to acquire lock: {e:?}");
         }
     }
 
