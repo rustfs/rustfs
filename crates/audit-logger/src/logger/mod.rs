@@ -129,7 +129,7 @@ mod tests {
         let config = AuditConfig {
             targets: vec![
                 AuditTargetConfig::new("webhook-audit".to_string(), "webhook".to_string())
-                    .with_args(serde_json::json!({"endpoint": "https://httpbin.org/post"}))
+                    .with_args(serde_json::json!({"endpoint": "http://localhost:8080/audit-webhook"}))
                     .with_enabled(false), // Disabled for testing
             ],
             enabled: true,

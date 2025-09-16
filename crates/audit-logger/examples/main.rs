@@ -91,15 +91,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn create_sample_config() -> AuditConfig {
     let mut config = AuditConfig::default();
 
-    // Add a webhook target
+    // Add a webhook target (using localhost to avoid external dependencies)
     let webhook_args = serde_json::json!({
-        "endpoint": "https://httpbin.org/post",
+        "endpoint": "http://localhost:8080/audit-webhook",
         "auth_token": "test-token"
     });
 
     let webhook_target = AuditTargetConfig::new("webhook-1".to_string(), "webhook".to_string())
         .with_args(webhook_args)
-        .with_enabled(true)
+        .with_enabled(false) // Disabled to avoid network calls to localhost
         .with_batch_size(5);
 
     // Add an MQTT target (this will fail to connect but shows the configuration)
