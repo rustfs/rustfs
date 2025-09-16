@@ -280,7 +280,6 @@ impl ObjectVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::AuditEntry;
     use std::collections::HashMap;
 

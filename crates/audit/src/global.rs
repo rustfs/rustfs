@@ -327,7 +327,7 @@ mod tests {
     use crate::global::list_audit_targets;
     use crate::registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetStatus};
     use crate::{
-        AuditEntry, AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetStatus, get_audit_stats,
+        AuditEntry, get_audit_stats,
         is_audit_system_initialized, s3_events, start_audit_system,
     };
     use async_trait::async_trait;

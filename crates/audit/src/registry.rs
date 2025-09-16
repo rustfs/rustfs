@@ -424,7 +424,6 @@ impl Default for AuditTargetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_test;
 
     // Mock target for testing
     struct MockTarget {

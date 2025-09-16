@@ -449,7 +449,6 @@ mod tests {
     use crate::TargetStatus;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tokio_test;
 
     // Mock target for testing
     struct MockTarget {
