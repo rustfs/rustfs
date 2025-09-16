@@ -14,19 +14,19 @@
 
 use crate::store::Key;
 use crate::target::{ChannelTargetType, EntityTarget, TargetType};
-use crate::{StoreError, Target, TargetLog, arn::TargetID, error::TargetError, store::Store};
+use crate::{arn::TargetID, error::TargetError, store::Store, StoreError, Target, TargetLog};
 use async_trait::async_trait;
+use rumqttc::{mqttbytes::Error as MqttBytesError, ConnectionError};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
-use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::sync::Arc;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::{Mutex, OnceCell, mpsc};
+use tokio::sync::{mpsc, Mutex, OnceCell};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 use urlencoding;
@@ -129,7 +129,7 @@ where
             let specific_queue_path = base_path.join(unique_dir_name);
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
             let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::targets::AUDIT_STORE_EXTENSION,
+                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
                 TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
             };
 
