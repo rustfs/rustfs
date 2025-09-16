@@ -29,9 +29,28 @@ pub const ENV_OBS_LOG_ROTATION_SIZE_MB: &str = "RUSTFS_OBS_LOG_ROTATION_SIZE_MB"
 pub const ENV_OBS_LOG_ROTATION_TIME: &str = "RUSTFS_OBS_LOG_ROTATION_TIME";
 pub const ENV_OBS_LOG_KEEP_FILES: &str = "RUSTFS_OBS_LOG_KEEP_FILES";
 
+/// Log pool capacity for async logging
+pub const ENV_OBS_LOG_POOL_CAPA: &str = "RUSTFS_OBS_LOG_POOL_CAPA";
+
+/// Log message capacity for async logging
+pub const ENV_OBS_LOG_MESSAGE_CAPA: &str = "RUSTFS_OBS_LOG_MESSAGE_CAPA";
+
+/// Log flush interval in milliseconds for async logging
+pub const ENV_OBS_LOG_FLUSH_MS: &str = "RUSTFS_OBS_LOG_FLUSH_MS";
+
+/// Default values for log pool
+pub const DEFAULT_OBS_LOG_POOL_CAPA: usize = 10240;
+
+/// Default values for message capacity
+pub const DEFAULT_OBS_LOG_MESSAGE_CAPA: usize = 32768;
+
+/// Default values for flush interval in milliseconds
+pub const DEFAULT_OBS_LOG_FLUSH_MS: u64 = 200;
+
+/// Audit logger queue capacity environment variable key
 pub const ENV_AUDIT_LOGGER_QUEUE_CAPACITY: &str = "RUSTFS_AUDIT_LOGGER_QUEUE_CAPACITY";
 
-// Default values for observability configuration
+/// Default values for observability configuration
 pub const DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY: usize = 10000;
 
 /// Default values for observability configuration

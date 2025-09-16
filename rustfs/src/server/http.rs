@@ -65,26 +65,15 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
             Method::HEAD,
             Method::OPTIONS,
         ])
-        .allow_headers([
-            http::header::CONTENT_TYPE,
-            http::header::AUTHORIZATION,
-            http::header::ACCEPT,
-            http::header::ORIGIN,
-            // Note: X_AMZ_* headers are custom and may need to be defined
-            // http::header::X_AMZ_CONTENT_SHA256,
-            // http::header::X_AMZ_DATE,
-            // http::header::X_AMZ_SECURITY_TOKEN,
-            // http::header::X_AMZ_USER_AGENT,
-            http::header::RANGE,
-        ]);
+        .allow_headers(Any);
 
     match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any),
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
         Some(origins_str) => {
             let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
             if origins.is_empty() {
                 warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any)
+                cors_layer.allow_origin(Any).expose_headers(Any)
             } else {
                 // Parse origins with proper error handling
                 let mut valid_origins = Vec::new();
@@ -101,16 +90,16 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
 
                 if valid_origins.is_empty() {
                     warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any)
+                    cors_layer.allow_origin(Any).expose_headers(Any)
                 } else {
                     info!("Endpoint CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins))
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
                 }
             }
         }
         None => {
             debug!("No CORS origins configured for endpoint, using permissive CORS");
-            cors_layer.allow_origin(Any)
+            cors_layer.allow_origin(Any).expose_headers(Any)
         }
     }
 }
