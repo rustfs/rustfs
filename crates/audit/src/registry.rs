@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Target registry and factory for audit system
-
 use crate::entity::AuditEntry;
 use crate::error::{AuditError, AuditResult, TargetError, TargetResult};
 use async_trait::async_trait;

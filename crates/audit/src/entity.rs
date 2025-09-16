@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Audit log entities and event types
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -282,6 +281,8 @@ impl ObjectVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AuditEntry;
+    use std::collections::HashMap;
 
     #[test]
     fn test_audit_entry_creation() {

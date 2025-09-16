@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Global audit logger for easy integration
-
 use crate::entity::AuditEntry;
 use crate::error::{AuditError, AuditResult};
 use crate::registry::{AuditTargetFactory, TargetRegistry};
@@ -187,6 +186,7 @@ pub fn create_s3_audit_entry(event: &str, api_name: &str, bucket: Option<&str>, 
 /// Convenience functions for common S3 operations
 pub mod s3_events {
     use super::*;
+    use crate::{AuditEntry, create_s3_audit_entry};
 
     /// Create audit entry for GetObject
     pub fn get_object(bucket: &str, object: &str) -> AuditEntry {
@@ -325,8 +325,14 @@ pub fn is_audit_system_initialized() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::global::list_audit_targets;
     use crate::registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetStatus};
+    use crate::{
+        AuditEntry, AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetStatus, get_audit_stats,
+        is_audit_system_initialized, s3_events, start_audit_system,
+    };
     use async_trait::async_trait;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock target for testing

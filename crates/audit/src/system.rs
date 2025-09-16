@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Core audit system for high-performance log dispatch
-
 use crate::entity::AuditEntry;
 use crate::error::{AuditError, AuditResult};
 use crate::registry::{AuditTargetConfig, TargetRegistry, TargetStatus};

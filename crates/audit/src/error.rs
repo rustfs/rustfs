@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Error types for the audit system
-
 use thiserror::Error;
 
 /// Main error type for audit operations

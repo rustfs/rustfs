@@ -34,11 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "timeout_ms": 5000
         }),
     });
-    
+
     // 2. Initialize global audit system
     let factory = Arc::new(DefaultAuditTargetFactory::new());
     initialize_audit_logger(factory, config).await?;
-    
+
     // 3. Log S3 operations
     let audit_entry = s3_events::get_object("my-bucket", "my-file.txt")
         .with_request_context(
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
             Some(150_000_000), // 150ms
         );
-    
+
     log_audit_entry(audit_entry).await?;
     Ok(())
 }
@@ -69,12 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   "targets": [
     {
       "id": "audit-webhook-1",
-      "target_type": "webhook", 
+      "target_type": "webhook",
       "enabled": true,
       "args": {
         "url": "https://audit.company.com/webhook",
         "method": "POST",
-        "headers": {"Authorization": "Bearer token"},
+        "headers": {
+          "Authorization": "Bearer token"
+        },
         "timeout_ms": 2000,
         "retries": 3
       }
@@ -82,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
       "id": "audit-mqtt-1",
       "target_type": "mqtt",
-      "enabled": true, 
+      "enabled": true,
       "args": {
         "broker_url": "mqtts://mqtt.company.com:8883",
         "topic": "rustfs/audit",
@@ -93,7 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
   ],
   "redaction": {
-    "headers_blacklist": ["Authorization", "Cookie", "X-Api-Key"]
+    "headers_blacklist": [
+      "Authorization",
+      "Cookie",
+      "X-Api-Key"
+    ]
   },
   "performance": {
     "batch_size": 50,
@@ -105,23 +111,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Webhook Target Configuration
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `url` | String | Yes | HTTP endpoint URL |
-| `method` | String | No | HTTP method (default: POST) |
-| `headers` | Object | No | Custom HTTP headers |
-| `timeout_ms` | Number | No | Request timeout (default: 5000) |
-| `retries` | Number | No | Retry attempts (default: 3) |
+| Field        | Type   | Required | Description                     |
+|--------------|--------|----------|---------------------------------|
+| `url`        | String | Yes      | HTTP endpoint URL               |
+| `method`     | String | No       | HTTP method (default: POST)     |
+| `headers`    | Object | No       | Custom HTTP headers             |
+| `timeout_ms` | Number | No       | Request timeout (default: 5000) |
+| `retries`    | Number | No       | Retry attempts (default: 3)     |
 
 ### MQTT Target Configuration
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `broker_url` | String | Yes | MQTT broker URL (mqtt:// or mqtts://) |
-| `topic` | String | Yes | MQTT topic to publish to |
-| `qos` | Number | No | Quality of Service level (default: 1) |
-| `username` | String | No | MQTT username |
-| `password` | String | No | MQTT password |
+| Field        | Type   | Required | Description                           |
+|--------------|--------|----------|---------------------------------------|
+| `broker_url` | String | Yes      | MQTT broker URL (mqtt:// or mqtts://) |
+| `topic`      | String | Yes      | MQTT topic to publish to              |
+| `qos`        | Number | No       | Quality of Service level (default: 1) |
+| `username`   | String | No       | MQTT username                         |
+| `password`   | String | No       | MQTT password                         |
 
 ## S3 Compatible Audit Log Format
 
@@ -225,9 +231,10 @@ cargo run --example basic_usage
 ```
 
 This will demonstrate:
+
 - System initialization
 - Logging various S3 operations
-- Statistics reporting  
+- Statistics reporting
 - Target status monitoring
 - Graceful shutdown
 
