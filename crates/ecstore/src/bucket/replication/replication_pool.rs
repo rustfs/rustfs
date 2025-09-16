@@ -38,6 +38,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -762,6 +763,8 @@ impl<S: StorageAPI> ReplicationPool<S> {
         // Make sure only one node running resync on the cluster
         // Note: Leader lock implementation would be needed here
         // let _lock_guard = global_leader_lock.get_lock().await?;
+
+        warn!("Loading resync metadata for buckets: {:?}", buckets);
 
         for bucket in buckets {
             let meta = match load_bucket_resync_metadata(bucket, self.storage.clone()).await {
