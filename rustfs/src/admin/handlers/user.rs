@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    admin::{router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_condition_values, get_session_token},
+    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    auth::{check_key_valid, get_session_token},
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -27,10 +27,7 @@ use rustfs_madmin::{
     AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity,
     user::{ImportIAMResult, SRSessionPolicy, SRSvcAccCreate},
 };
-use rustfs_policy::policy::{
-    Args,
-    action::{Action, AdminAction},
-};
+use rustfs_policy::policy::action::{Action, AdminAction};
 
 use rustfs_utils::path::path_join_buf;
 use s3s::{
@@ -121,23 +118,14 @@ impl Operation for AddUser {
         }
 
         let deny_only = ak == cred.access_key;
-        let conditions = get_condition_values(&req.headers, &cred);
-        if !iam_store
-            .is_allowed(&Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: Action::AdminAction(AdminAction::CreateUserAdminAction),
-                bucket: "",
-                conditions: &conditions,
-                is_owner: owner,
-                object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
-                deny_only,
-            })
-            .await
-        {
-            return Err(s3_error!(AccessDenied, "access denied"));
-        }
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            deny_only,
+            vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
+        )
+        .await?;
 
         iam_store
             .create_user(ak, &args)
@@ -179,6 +167,18 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InvalidArgument, "can't change status of self"));
         }
 
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
+        )
+        .await?;
+
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
@@ -207,6 +207,22 @@ pub struct ListUsers {}
 #[async_trait::async_trait]
 impl Operation for ListUsers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
+        )
+        .await?;
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: BucketQuery =
@@ -238,13 +254,6 @@ impl Operation for ListUsers {
         let data = serde_json::to_vec(&users)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
 
-        // let Some(input_cred) = req.credentials else {
-        //     return Err(s3_error!(InvalidRequest, "get cred failed"));
-        // };
-
-        // let body = encrypt_data(input_cred.secret_key.expose().as_bytes(), &data)
-        //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("encrypt_data err {}", e)))?;
-
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
@@ -256,6 +265,22 @@ pub struct RemoveUser {}
 #[async_trait::async_trait]
 impl Operation for RemoveUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
+        )
+        .await?;
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -272,6 +297,13 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
+        let sys_cred = get_global_action_cred()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+
+        if ak == sys_cred.access_key || ak == cred.access_key || cred.parent_user == ak {
+            return Err(s3_error!(InvalidArgument, "can't remove self"));
+        }
+
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
@@ -285,28 +317,20 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "can't remove temp user"));
         }
 
-        let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
-
-        let (cred, _owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let sys_cred = get_global_action_cred()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
-
-        if ak == sys_cred.access_key || ak == cred.access_key {
-            warn!(
-                "can't remove self or system access key {}, {}, {}",
-                ak, sys_cred.access_key, cred.access_key
-            );
-            return Err(s3_error!(InvalidArgument, "can't remove self"));
+        let (is_service_account, _) = iam_store
+            .is_service_account(ak)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("is_service_account err {e}")))?;
+        if is_service_account {
+            return Err(s3_error!(InvalidArgument, "can't remove service account"));
         }
 
         iam_store
             .delete_user(ak, true)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {e}")))?;
+
+        // TODO: IAMChangeHook
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -347,23 +371,14 @@ impl Operation for GetUserInfo {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let deny_only = ak == cred.access_key;
-        let conditions = get_condition_values(&req.headers, &cred);
-        if !iam_store
-            .is_allowed(&Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: Action::AdminAction(AdminAction::GetUserAdminAction),
-                bucket: "",
-                conditions: &conditions,
-                is_owner: owner,
-                object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
-                deny_only,
-            })
-            .await
-        {
-            return Err(s3_error!(AccessDenied, "access denied"));
-        }
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            deny_only,
+            vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
+        )
+        .await?;
 
         let info = iam_store
             .get_user_info(ak)
@@ -408,8 +423,11 @@ impl Operation for ExportIam {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
+            .await?;
 
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -612,8 +630,11 @@ impl Operation for ImportIam {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
+            .await?;
 
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {

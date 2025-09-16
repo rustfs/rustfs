@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
@@ -39,7 +39,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -321,7 +321,7 @@ impl ExpiryState {
         let mut state = GLOBAL_ExpiryState.write().await;
 
         while state.tasks_tx.len() < n {
-            let (tx, rx) = mpsc::channel(10000);
+            let (tx, rx) = mpsc::channel(1000);
             let api = api.clone();
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             state.tasks_tx.push(tx);
@@ -432,7 +432,7 @@ pub struct TransitionState {
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
-        let (tx1, rx1) = bounded(100000);
+        let (tx1, rx1) = bounded(1000);
         let (tx2, rx2) = bounded(1);
         Arc::new(Self {
             transition_tx: tx1,
@@ -467,8 +467,12 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let mut n = 10; //globalAPIConfig.getTransitionWorkers();
-        let tw = 10; //globalILMConfig.getTransitionWorkers(); 
+        let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+        let mut n = max_workers;
+        let tw = 8; //globalILMConfig.getTransitionWorkers(); 
         if tw > 0 {
             n = tw;
         }
@@ -561,8 +565,18 @@ impl TransitionState {
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
         if n == 0 {
-            n = 100;
+            let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+            n = max_workers;
         }
+        // Allow environment override of maximum workers
+        let absolute_max = std::env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(32);
+        n = std::cmp::min(n, absolute_max);
 
         let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
         while num_workers < n {
@@ -585,16 +599,22 @@ impl TransitionState {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = num_cpus::get() / 2;
+    let mut workers = std::env::var("RUSTFS_MAX_EXPIRY_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 16));
     //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_EXPIRATION_WORKERS") {
+    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
             workers = num_expirations;
         }
     }
 
     if workers == 0 {
-        workers = 100;
+        workers = std::env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8);
     }
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
@@ -686,7 +706,14 @@ pub async fn expire_transitioned_object(
         //transitionLogIf(ctx, err);
     }
 
-    let dobj = api.delete_object(&oi.bucket, &oi.name, opts).await?;
+    let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
+        Ok(obj) => obj,
+        Err(e) => {
+            error!("Failed to delete transitioned object {}/{}: {:?}", oi.bucket, oi.name, e);
+            // Return the original object info if deletion fails
+            oi.clone()
+        }
+    };
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
@@ -945,10 +972,17 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 
     // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
 
-    let mut dobj = api
-        .delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts)
-        .await
-        .unwrap();
+    //debug!("lc_event.action: {:?}", lc_event.action);
+    //debug!("opts: {:?}", opts);
+    let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
+        Ok(obj) => obj,
+        Err(e) => {
+            error!("Failed to delete object {}/{}: {:?}", oi.bucket, oi.name, e);
+            // Return the original object info if deletion fails
+            oi.clone()
+        }
+    };
+    //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
     }

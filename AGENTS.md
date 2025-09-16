@@ -1,4 +1,4 @@
-# RustFS Project Cursor Rules
+# RustFS Project AI Agents Rules
 
 ## 🚨🚨🚨 CRITICAL DEVELOPMENT RULES - ZERO TOLERANCE 🚨🚨🚨
 
@@ -35,6 +35,195 @@
 - **Code review requirement**: At least one approval needed
 - **Automated reversal**: Direct commits to main will be automatically reverted
 
+## 🎯 Core Development Principles (HIGHEST PRIORITY)
+
+### Philosophy
+
+#### Core Beliefs
+
+- **Incremental progress over big bangs** - Small changes that compile and pass tests
+- **Learning from existing code** - Study and plan before implementing
+- **Pragmatic over dogmatic** - Adapt to project reality
+- **Clear intent over clever code** - Be boring and obvious
+
+#### Simplicity Means
+
+- Single responsibility per function/class
+- Avoid premature abstractions
+- No clever tricks - choose the boring solution
+- If you need to explain it, it's too complex
+
+### Process
+
+#### 1. Planning & Staging
+
+Break complex work into 3-5 stages. Document in `IMPLEMENTATION_PLAN.md`:
+
+```markdown
+## Stage N: [Name]
+**Goal**: [Specific deliverable]
+**Success Criteria**: [Testable outcomes]
+**Tests**: [Specific test cases]
+**Status**: [Not Started|In Progress|Complete]
+```
+
+- Update status as you progress
+- Remove file when all stages are done
+
+#### 2. Implementation Flow
+
+1. **Understand** - Study existing patterns in codebase
+2. **Test** - Write test first (red)
+3. **Implement** - Minimal code to pass (green)
+4. **Refactor** - Clean up with tests passing
+5. **Commit** - With clear message linking to plan
+
+#### 3. When Stuck (After 3 Attempts)
+
+**CRITICAL**: Maximum 3 attempts per issue, then STOP.
+
+1. **Document what failed**:
+   - What you tried
+   - Specific error messages
+   - Why you think it failed
+
+2. **Research alternatives**:
+   - Find 2-3 similar implementations
+   - Note different approaches used
+
+3. **Question fundamentals**:
+   - Is this the right abstraction level?
+   - Can this be split into smaller problems?
+   - Is there a simpler approach entirely?
+
+4. **Try different angle**:
+   - Different library/framework feature?
+   - Different architectural pattern?
+   - Remove abstraction instead of adding?
+
+### Technical Standards
+
+#### Architecture Principles
+
+- **Composition over inheritance** - Use dependency injection
+- **Interfaces over singletons** - Enable testing and flexibility
+- **Explicit over implicit** - Clear data flow and dependencies
+- **Test-driven when possible** - Never disable tests, fix them
+
+#### Code Quality
+
+- **Every commit must**:
+  - Compile successfully
+  - Pass all existing tests
+  - Include tests for new functionality
+  - Follow project formatting/linting
+
+- **Before committing**:
+  - Run formatters/linters
+  - Self-review changes
+  - Ensure commit message explains "why"
+
+#### Error Handling
+
+- Fail fast with descriptive messages
+- Include context for debugging
+- Handle errors at appropriate level
+- Never silently swallow exceptions
+
+### Decision Framework
+
+When multiple valid approaches exist, choose based on:
+
+1. **Testability** - Can I easily test this?
+2. **Readability** - Will someone understand this in 6 months?
+3. **Consistency** - Does this match project patterns?
+4. **Simplicity** - Is this the simplest solution that works?
+5. **Reversibility** - How hard to change later?
+
+### Project Integration
+
+#### Learning the Codebase
+
+- Find 3 similar features/components
+- Identify common patterns and conventions
+- Use same libraries/utilities when possible
+- Follow existing test patterns
+
+#### Tooling
+
+- Use project's existing build system
+- Use project's test framework
+- Use project's formatter/linter settings
+- Don't introduce new tools without strong justification
+
+### Quality Gates
+
+#### Definition of Done
+
+- [ ] Tests written and passing
+- [ ] Code follows project conventions
+- [ ] No linter/formatter warnings
+- [ ] Commit messages are clear
+- [ ] Implementation matches plan
+- [ ] No TODOs without issue numbers
+
+#### Test Guidelines
+
+- Test behavior, not implementation
+- One assertion per test when possible
+- Clear test names describing scenario
+- Use existing test utilities/helpers
+- Tests should be deterministic
+
+### Important Reminders
+
+**NEVER**:
+
+- Use `--no-verify` to bypass commit hooks
+- Disable tests instead of fixing them
+- Commit code that doesn't compile
+- Make assumptions - verify with existing code
+
+**ALWAYS**:
+
+- Commit working code incrementally
+- Update plan documentation as you go
+- Learn from existing implementations
+- Stop after 3 failed attempts and reassess
+
+## 🚫 Competitor Keywords Prohibition
+
+### Strictly Forbidden Keywords
+
+**CRITICAL**: The following competitor keywords are absolutely forbidden in any code, documentation, comments, or project files:
+
+- **minio** (and any variations like MinIO, MINIO)
+- **aws-s3** (when referring to competing implementations)
+- **ceph** (and any variations like Ceph, CEPH)
+- **swift** (OpenStack Swift)
+- **glusterfs** (and any variations like GlusterFS, Gluster)
+- **seaweedfs** (and any variations like SeaweedFS, Seaweed)
+- **garage** (and any variations like Garage)
+- **zenko** (and any variations like Zenko)
+- **scality** (and any variations like Scality)
+
+### Enforcement
+
+- **Code Review**: All PRs will be checked for competitor keywords
+- **Automated Scanning**: CI/CD pipeline will scan for forbidden keywords
+- **Immediate Rejection**: Any PR containing competitor keywords will be immediately rejected
+- **Documentation**: All documentation must use generic terms like "S3-compatible storage" instead of specific competitor names
+
+### Acceptable Alternatives
+
+Instead of competitor names, use these generic terms:
+
+- "S3-compatible storage system"
+- "Object storage solution"
+- "Distributed storage platform"
+- "Cloud storage service"
+- "Storage backend"
+
 ## Project Overview
 
 RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API. The project adopts a modular architecture, supporting erasure coding storage, multi-tenant management, observability, and other enterprise-level features.
@@ -66,15 +255,6 @@ RustFS is a high-performance distributed object storage system written in Rust, 
 - Use `#[error("description")]` attributes for clear error messages
 - Support error downcasting when needed through `other()` helper methods
 - Implement `Clone` for errors when required by the domain logic
-- **Current module error types:**
-  - `ecstore::error::StorageError` - Storage layer errors
-  - `ecstore::disk::error::DiskError` - Disk operation errors
-  - `iam::error::Error` - Identity and access management errors
-  - `policy::error::Error` - Policy-related errors
-  - `crypto::error::Error` - Cryptographic operation errors
-  - `filemeta::error::Error` - File metadata errors
-  - `rustfs::error::ApiError` - API layer errors
-  - Module-specific error types for specialized functionality
 
 ## Code Style Guidelines
 
@@ -145,48 +325,6 @@ make pre-commit
 make setup-hooks
 ```
 
-#### 🔒 Automated Pre-commit Hooks
-
-This project includes a pre-commit hook that automatically runs before each commit to ensure:
-
-- ✅ Code is properly formatted (`cargo fmt --all --check`)
-- ✅ No clippy warnings (`cargo clippy --all-targets --all-features -- -D warnings`)
-- ✅ Code compiles successfully (`cargo check --all-targets`)
-
-**Setting Up Pre-commit Hooks** (MANDATORY for all developers):
-
-Run this command once after cloning the repository:
-
-```bash
-make setup-hooks
-```
-
-Or manually:
-
-```bash
-chmod +x .git/hooks/pre-commit
-```
-
-#### 🚫 Commit Prevention
-
-If your code doesn't meet the formatting requirements, the pre-commit hook will:
-
-1. **Block the commit** and show clear error messages
-2. **Provide exact commands** to fix the issues
-3. **Guide you through** the resolution process
-
-Example output when formatting fails:
-
-```
-❌ Code formatting check failed!
-💡 Please run 'cargo fmt --all' to format your code before committing.
-
-🔧 Quick fix:
-   cargo fmt --all
-   git add .
-   git commit
-```
-
 ### 3. Naming Conventions
 
 - Use `snake_case` for functions, variables, modules
@@ -207,40 +345,6 @@ Example output when formatting fails:
   - Required for API boundaries (function signatures, public struct fields)
   - Needed to resolve ambiguity between multiple possible types
 
-**Good examples (prefer these):**
-
-```rust
-// Compiler can infer the type
-let items = vec![1, 2, 3, 4];
-let config = Config::default();
-let result = process_data(&input);
-
-// Iterator chains with clear context
-let filtered: Vec<_> = items.iter().filter(|&&x| x > 2).collect();
-```
-
-**Avoid unnecessary explicit types:**
-
-```rust
-// Unnecessary - type is obvious
-let items: Vec<i32> = vec![1, 2, 3, 4];
-let config: Config = Config::default();
-let result: ProcessResult = process_data(&input);
-```
-
-**When explicit types are beneficial:**
-
-```rust
-// API boundaries - always specify types
-pub fn process_data(input: &[u8]) -> Result<ProcessResult, Error> { ... }
-
-// Ambiguous cases - explicit type needed
-let value: f64 = "3.14".parse().unwrap();
-
-// Complex generic types - explicit for clarity
-let cache: HashMap<String, Arc<Mutex<CacheEntry>>> = HashMap::new();
-```
-
 ### 5. Documentation Comments
 
 - Public APIs must have documentation comments
@@ -259,469 +363,94 @@ let cache: HashMap<String, Arc<Mutex<CacheEntry>>> = HashMap::new();
 
 ## Asynchronous Programming Guidelines
 
-### 1. Trait Definition
-
-```rust
-#[async_trait::async_trait]
-pub trait StorageAPI: Send + Sync {
-    async fn get_object(&self, bucket: &str, object: &str) -> Result<ObjectInfo>;
-}
-```
-
-### 2. Error Handling
-
-```rust
-// Use ? operator to propagate errors
-async fn example_function() -> Result<()> {
-    let data = read_file("path").await?;
-    process_data(data).await?;
-    Ok(())
-}
-```
-
-### 3. Concurrency Control
-
+- Comprehensive use of `tokio` async runtime
+- Prioritize `async/await` syntax
+- Use `async-trait` for async methods in traits
+- Avoid blocking operations, use `spawn_blocking` when necessary
 - Use `Arc` and `Mutex`/`RwLock` for shared state management
 - Prioritize async locks from `tokio::sync`
 - Avoid holding locks for long periods
 
 ## Logging and Tracing Guidelines
 
-### 1. Tracing Usage
-
-```rust
-#[tracing::instrument(skip(self, data))]
-async fn process_data(&self, data: &[u8]) -> Result<()> {
-    info!("Processing {} bytes", data.len());
-    // Implementation logic
-}
-```
-
-### 2. Log Levels
-
-- `error!`: System errors requiring immediate attention
-- `warn!`: Warning information that may affect functionality
-- `info!`: Important business information
-- `debug!`: Debug information for development use
-- `trace!`: Detailed execution paths
-
-### 3. Structured Logging
-
-```rust
-info!(
-    counter.rustfs_api_requests_total = 1_u64,
-    key_request_method = %request.method(),
-    key_request_uri_path = %request.uri().path(),
-    "API request processed"
-);
-```
+- Use `#[tracing::instrument(skip(self, data))]` for function tracing
+- Log levels: `error!` (system errors), `warn!` (warnings), `info!` (business info), `debug!` (development), `trace!` (detailed paths)
+- Use structured logging with key-value pairs for better observability
 
 ## Error Handling Guidelines
 
-### 1. Error Type Definition
-
-```rust
-// Use thiserror for module-specific error types
-#[derive(thiserror::Error, Debug)]
-pub enum MyError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Storage error: {0}")]
-    Storage(#[from] ecstore::error::StorageError),
-
-    #[error("Custom error: {message}")]
-    Custom { message: String },
-
-    #[error("File not found: {path}")]
-    FileNotFound { path: String },
-
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
-}
-
-// Provide Result type alias for the module
-pub type Result<T> = core::result::Result<T, MyError>;
-```
-
-### 2. Error Helper Methods
-
-```rust
-impl MyError {
-    /// Create error from any compatible error type
-    pub fn other<E>(error: E) -> Self
-    where
-        E: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        MyError::Io(std::io::Error::other(error))
-    }
-}
-```
-
-### 3. Error Conversion Between Modules
-
-```rust
-// Convert between different module error types
-impl From<ecstore::error::StorageError> for MyError {
-    fn from(e: ecstore::error::StorageError) -> Self {
-        match e {
-            ecstore::error::StorageError::FileNotFound => {
-                MyError::FileNotFound { path: "unknown".to_string() }
-            }
-            _ => MyError::Storage(e),
-        }
-    }
-}
-
-// Provide reverse conversion when needed
-impl From<MyError> for ecstore::error::StorageError {
-    fn from(e: MyError) -> Self {
-        match e {
-            MyError::FileNotFound { .. } => ecstore::error::StorageError::FileNotFound,
-            MyError::Storage(e) => e,
-            _ => ecstore::error::StorageError::other(e),
-        }
-    }
-}
-```
-
-### 4. Error Context and Propagation
-
-```rust
-// Use ? operator for clean error propagation
-async fn example_function() -> Result<()> {
-    let data = read_file("path").await?;
-    process_data(data).await?;
-    Ok(())
-}
-
-// Add context to errors
-fn process_with_context(path: &str) -> Result<()> {
-    std::fs::read(path)
-        .map_err(|e| MyError::Custom {
-            message: format!("Failed to read {}: {}", path, e)
-        })?;
-    Ok(())
-}
-```
-
-### 5. API Error Conversion (S3 Example)
-
-```rust
-// Convert storage errors to API-specific errors
-use s3s::{S3Error, S3ErrorCode};
-
-#[derive(Debug)]
-pub struct ApiError {
-    pub code: S3ErrorCode,
-    pub message: String,
-    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl From<ecstore::error::StorageError> for ApiError {
-    fn from(err: ecstore::error::StorageError) -> Self {
-        let code = match &err {
-            ecstore::error::StorageError::BucketNotFound(_) => S3ErrorCode::NoSuchBucket,
-            ecstore::error::StorageError::ObjectNotFound(_, _) => S3ErrorCode::NoSuchKey,
-            ecstore::error::StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyExists,
-            ecstore::error::StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
-            ecstore::error::StorageError::MethodNotAllowed => S3ErrorCode::MethodNotAllowed,
-            ecstore::error::StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
-            _ => S3ErrorCode::InternalError,
-        };
-
-        ApiError {
-            code,
-            message: err.to_string(),
-            source: Some(Box::new(err)),
-        }
-    }
-}
-
-impl From<ApiError> for S3Error {
-    fn from(err: ApiError) -> Self {
-        let mut s3e = S3Error::with_message(err.code, err.message);
-        if let Some(source) = err.source {
-            s3e.set_source(source);
-        }
-        s3e
-    }
-}
-```
-
-### 6. Error Handling Best Practices
-
-#### Pattern Matching and Error Classification
-
-```rust
-// Use pattern matching for specific error handling
-async fn handle_storage_operation() -> Result<()> {
-    match storage.get_object("bucket", "key").await {
-        Ok(object) => process_object(object),
-        Err(ecstore::error::StorageError::ObjectNotFound(bucket, key)) => {
-            warn!("Object not found: {}/{}", bucket, key);
-            create_default_object(bucket, key).await
-        }
-        Err(ecstore::error::StorageError::BucketNotFound(bucket)) => {
-            error!("Bucket not found: {}", bucket);
-            Err(MyError::Custom {
-                message: format!("Bucket {} does not exist", bucket)
-            })
-        }
-        Err(e) => {
-            error!("Storage operation failed: {}", e);
-            Err(MyError::Storage(e))
-        }
-    }
-}
-```
-
-#### Error Aggregation and Reporting
-
-```rust
-// Collect and report multiple errors
-pub fn validate_configuration(config: &Config) -> Result<()> {
-    let mut errors = Vec::new();
-
-    if config.bucket_name.is_empty() {
-        errors.push("Bucket name cannot be empty");
-    }
-
-    if config.region.is_empty() {
-        errors.push("Region must be specified");
-    }
-
-    if !errors.is_empty() {
-        return Err(MyError::Custom {
-            message: format!("Configuration validation failed: {}", errors.join(", "))
-        });
-    }
-
-    Ok(())
-}
-```
-
-#### Contextual Error Information
-
-```rust
-// Add operation context to errors
-#[tracing::instrument(skip(self))]
-async fn upload_file(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
-    self.storage
-        .put_object(bucket, key, data)
-        .await
-        .map_err(|e| MyError::Custom {
-            message: format!("Failed to upload {}/{}: {}", bucket, key, e)
-        })
-}
-```
+- Use `thiserror` for module-specific error types
+- Support error chains and context information through `#[from]` and `#[source]` attributes
+- Use `Result<T>` type aliases for consistency within each module
+- Error conversion between modules should use explicit `From` implementations
+- Follow the pattern: `pub type Result<T> = core::result::Result<T, Error>`
+- Use `#[error("description")]` attributes for clear error messages
+- Support error downcasting when needed through `other()` helper methods
+- Implement `Clone` for errors when required by the domain logic
 
 ## Performance Optimization Guidelines
-
-### 1. Memory Management
 
 - Use `Bytes` instead of `Vec<u8>` for zero-copy operations
 - Avoid unnecessary cloning, use reference passing
 - Use `Arc` for sharing large objects
-
-### 2. Concurrency Optimization
-
-```rust
-// Use join_all for concurrent operations
-let futures = disks.iter().map(|disk| disk.operation());
-let results = join_all(futures).await;
-```
-
-### 3. Caching Strategy
-
+- Use `join_all` for concurrent operations
 - Use `LazyLock` for global caching
 - Implement LRU cache to avoid memory leaks
 
 ## Testing Guidelines
-
-### 1. Unit Tests
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_case::test_case;
-
-    #[tokio::test]
-    async fn test_async_function() {
-        let result = async_function().await;
-        assert!(result.is_ok());
-    }
-
-    #[test_case("input1", "expected1")]
-    #[test_case("input2", "expected2")]
-    fn test_with_cases(input: &str, expected: &str) {
-        assert_eq!(function(input), expected);
-    }
-
-    #[test]
-    fn test_error_conversion() {
-        use ecstore::error::StorageError;
-
-        let storage_err = StorageError::BucketNotFound("test-bucket".to_string());
-        let api_err: ApiError = storage_err.into();
-
-        assert_eq!(api_err.code, S3ErrorCode::NoSuchBucket);
-        assert!(api_err.message.contains("test-bucket"));
-        assert!(api_err.source.is_some());
-    }
-
-    #[test]
-    fn test_error_types() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let my_err = MyError::Io(io_err);
-
-        // Test error matching
-        match my_err {
-            MyError::Io(_) => {}, // Expected
-            _ => panic!("Unexpected error type"),
-        }
-    }
-
-    #[test]
-    fn test_error_context() {
-        let result = process_with_context("nonexistent_file.txt");
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        match err {
-            MyError::Custom { message } => {
-                assert!(message.contains("Failed to read"));
-                assert!(message.contains("nonexistent_file.txt"));
-            }
-            _ => panic!("Expected Custom error"),
-        }
-    }
-}
-```
-
-### 2. Integration Tests
-
-- Use `e2e_test` module for end-to-end testing
-- Simulate real storage environments
-
-### 3. Test Quality Standards
 
 - Write meaningful test cases that verify actual functionality
 - Avoid placeholder or debug content like "debug 111", "test test", etc.
 - Use descriptive test names that clearly indicate what is being tested
 - Each test should have a clear purpose and verify specific behavior
 - Test data should be realistic and representative of actual use cases
+- Use `e2e_test` module for end-to-end testing
+- Simulate real storage environments
 
 ## Cross-Platform Compatibility Guidelines
 
-### 1. CPU Architecture Compatibility
-
 - **Always consider multi-platform and different CPU architecture compatibility** when writing code
 - Support major architectures: x86_64, aarch64 (ARM64), and other target platforms
-- Use conditional compilation for architecture-specific code:
-
-```rust
-#[cfg(target_arch = "x86_64")]
-fn optimized_x86_64_function() { /* x86_64 specific implementation */ }
-
-#[cfg(target_arch = "aarch64")]
-fn optimized_aarch64_function() { /* ARM64 specific implementation */ }
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn generic_function() { /* Generic fallback implementation */ }
-```
-
-### 2. Platform-Specific Dependencies
-
+- Use conditional compilation for architecture-specific code
 - Use feature flags for platform-specific dependencies
 - Provide fallback implementations for unsupported platforms
 - Test on multiple architectures in CI/CD pipeline
-
-### 3. Endianness Considerations
-
 - Use explicit byte order conversion when dealing with binary data
 - Prefer `to_le_bytes()`, `from_le_bytes()` for consistent little-endian format
-- Use `byteorder` crate for complex binary format handling
-
-### 4. SIMD and Performance Optimizations
-
 - Use portable SIMD libraries like `wide` or `packed_simd`
 - Provide fallback implementations for non-SIMD architectures
-- Use runtime feature detection when appropriate
 
 ## Security Guidelines
 
-### 1. Memory Safety
-
 - Disable `unsafe` code (workspace.lints.rust.unsafe_code = "deny")
 - Use `rustls` instead of `openssl`
-
-### 2. Authentication and Authorization
-
-```rust
-// Use IAM system for permission checks
-let identity = iam.authenticate(&access_key, &secret_key).await?;
-iam.authorize(&identity, &action, &resource).await?;
-```
+- Use IAM system for permission checks
+- Validate input parameters properly
+- Implement appropriate permission checks
+- Avoid information leakage
 
 ## Configuration Management Guidelines
 
-### 1. Environment Variables
-
-- Use `RUSTFS_` prefix
+- Use `RUSTFS_` prefix for environment variables
 - Support both configuration files and environment variables
 - Provide reasonable default values
-
-### 2. Configuration Structure
-
-```rust
-#[derive(Debug, Deserialize, Clone)]
-pub struct Config {
-    pub address: String,
-    pub volumes: String,
-    #[serde(default)]
-    pub console_enable: bool,
-}
-```
+- Use `serde` for configuration serialization/deserialization
 
 ## Dependency Management Guidelines
 
-### 1. Workspace Dependencies
-
 - Manage versions uniformly at workspace level
 - Use `workspace = true` to inherit configuration
-
-### 2. Feature Flags
-
-```rust
-[features]
-default = ["file"]
-gpu = ["dep:nvml-wrapper"]
-kafka = ["dep:rdkafka"]
-```
+- Use feature flags for optional dependencies
+- Don't introduce new tools without strong justification
 
 ## Deployment and Operations Guidelines
 
-### 1. Containerization
-
 - Provide Dockerfile and docker-compose configuration
 - Support multi-stage builds to optimize image size
-
-### 2. Observability
-
 - Integrate OpenTelemetry for distributed tracing
 - Support Prometheus metrics collection
 - Provide Grafana dashboards
-
-### 3. Health Checks
-
-```rust
-// Implement health check endpoint
-async fn health_check() -> Result<HealthStatus> {
-    // Check component status
-}
-```
+- Implement health check endpoints
 
 ## Code Review Checklist
 
@@ -765,49 +494,11 @@ async fn health_check() -> Result<HealthStatus> {
 - [ ] Commit titles should be concise and in English, avoid Chinese
 - [ ] Is PR description provided in copyable markdown format for easy copying?
 
-## Common Patterns and Best Practices
+### 7. Competitor Keywords Check
 
-### 1. Resource Management
-
-```rust
-// Use RAII pattern for resource management
-pub struct ResourceGuard {
-    resource: Resource,
-}
-
-impl Drop for ResourceGuard {
-    fn drop(&mut self) {
-        // Clean up resources
-    }
-}
-```
-
-### 2. Dependency Injection
-
-```rust
-// Use dependency injection pattern
-pub struct Service {
-    config: Arc<Config>,
-    storage: Arc<dyn StorageAPI>,
-}
-```
-
-### 3. Graceful Shutdown
-
-```rust
-// Implement graceful shutdown
-async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
-    tokio::select! {
-        _ = shutdown_rx.recv() => {
-            info!("Received shutdown signal");
-            // Perform cleanup operations
-        }
-        _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {
-            warn!("Shutdown timeout reached");
-        }
-    }
-}
-```
+- [ ] No competitor keywords found in code, comments, or documentation
+- [ ] All references use generic terms like "S3-compatible storage"
+- [ ] No specific competitor product names mentioned
 
 ## Domain-Specific Guidelines
 
@@ -829,17 +520,15 @@ async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
 - Support version control and migration
 - Implement metadata caching
 
-These rules should serve as guiding principles when developing the RustFS project, ensuring code quality, performance, and maintainability.
+## Branch Management and Development Workflow
 
-### 4. Code Operations
-
-#### Branch Management
+### Branch Management
 
 - **🚨 CRITICAL: NEVER modify code directly on main or master branch - THIS IS ABSOLUTELY FORBIDDEN 🚨**
 - **⚠️ ANY DIRECT COMMITS TO MASTER/MAIN WILL BE REJECTED AND MUST BE REVERTED IMMEDIATELY ⚠️**
 - **🔒 ALL CHANGES MUST GO THROUGH PULL REQUESTS - NO DIRECT COMMITS TO MAIN UNDER ANY CIRCUMSTANCES 🔒**
 - **Always work on feature branches - NO EXCEPTIONS**
-- Always check the .cursorrules file before starting to ensure you understand the project guidelines
+- Always check the AGENTS.md file before starting to ensure you understand the project guidelines
 - **MANDATORY workflow for ALL changes:**
    1. `git checkout main` (switch to main branch)
    2. `git pull` (get latest changes)
@@ -862,7 +551,7 @@ These rules should serve as guiding principles when developing the RustFS projec
   - Direct pushes to main should be blocked by repository settings
   - Any accidental direct commits to main must be immediately reverted via PR
 
-#### Development Workflow
+### Development Workflow
 
 ## 🎯 **Core Development Principles**
 
@@ -901,27 +590,29 @@ These rules should serve as guiding principles when developing the RustFS projec
   - Testing information and verification steps
 - **Provide PR descriptions in copyable markdown format** enclosed in code blocks for easy one-click copying
 
-## 🚫 AI 文档生成限制
+## 🚫 AI Documentation Generation Restrictions
 
-### 禁止生成总结文档
+### Forbidden Summary Documents
 
-- **严格禁止创建任何形式的AI生成总结文档**
-- **不得创建包含大量表情符号、详细格式化表格和典型AI风格的文档**
-- **不得在项目中生成以下类型的文档：**
-  - 基准测试总结文档（BENCHMARK*.md）
-  - 实现对比分析文档（IMPLEMENTATION_COMPARISON*.md）
-  - 性能分析报告文档
-  - 架构总结文档
-  - 功能对比文档
-  - 任何带有大量表情符号和格式化内容的文档
-- **如果需要文档，请只在用户明确要求时创建，并保持简洁实用的风格**
-- **文档应当专注于实际需要的信息，避免过度格式化和装饰性内容**
-- **任何发现的AI生成总结文档都应该立即删除**
+- **Strictly forbidden to create any form of AI-generated summary documents**
+- **Do not create documents containing large amounts of emoji, detailed formatting tables and typical AI style**
+- **Do not generate the following types of documents in the project:**
+  - Benchmark summary documents (BENCHMARK*.md)
+  - Implementation comparison analysis documents (IMPLEMENTATION_COMPARISON*.md)
+  - Performance analysis report documents
+  - Architecture summary documents
+  - Feature comparison documents
+  - Any documents with large amounts of emoji and formatted content
+- **If documentation is needed, only create when explicitly requested by the user, and maintain a concise and practical style**
+- **Documentation should focus on actually needed information, avoiding excessive formatting and decorative content**
+- **Any discovered AI-generated summary documents should be immediately deleted**
 
-### 允许的文档类型
+### Allowed Documentation Types
 
-- README.md（项目介绍，保持简洁）
-- 技术文档（仅在明确需要时创建）
-- 用户手册（仅在明确需要时创建）
-- API文档（从代码生成）
-- 变更日志（CHANGELOG.md）
+- README.md (project introduction, keep concise)
+- Technical documentation (only create when explicitly needed)
+- User manual (only create when explicitly needed)
+- API documentation (generated from code)
+- Changelog (CHANGELOG.md)
+
+These rules should serve as guiding principles when developing the RustFS project, ensuring code quality, performance, and maintainability.

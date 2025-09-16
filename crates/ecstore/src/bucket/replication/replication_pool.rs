@@ -13,7 +13,6 @@ use crate::bucket::replication::replicate_object;
 use crate::disk::BUCKET_META_PREFIX;
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
@@ -915,20 +914,29 @@ impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
 }
 
 lazy_static! {
-    pub static ref GLOBAL_REPLICATION_POOL: OnceLock<Arc<DynReplicationPool>> = OnceLock::new();
-    pub static ref GLOBAL_REPLICATION_STATS: OnceLock<Arc<ReplicationStats>> = OnceLock::new();
+    pub static ref GLOBAL_REPLICATION_POOL: tokio::sync::OnceCell<Arc<DynReplicationPool>> = tokio::sync::OnceCell::new();
+    pub static ref GLOBAL_REPLICATION_STATS: tokio::sync::OnceCell<Arc<ReplicationStats>> = tokio::sync::OnceCell::new();
 }
 
 /// Initializes background replication with the given options
 pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
-    let stats = Arc::new(ReplicationStats::new());
-    let pool = ReplicationPool::new(ReplicationPoolOpts::default(), stats.clone(), storage).await;
+    let stats = GLOBAL_REPLICATION_STATS
+        .get_or_init(|| async {
+            let stats = Arc::new(ReplicationStats::new());
+            stats.start_background_tasks().await;
+            stats
+        })
+        .await;
 
-    // Set global instances - use trait object to store in global
-    GLOBAL_REPLICATION_POOL.set(pool.clone() as Arc<DynReplicationPool>).unwrap();
-    GLOBAL_REPLICATION_STATS.set(stats.clone()).unwrap();
+    let _pool = GLOBAL_REPLICATION_POOL
+        .get_or_init(|| async {
+            let pool = ReplicationPool::new(ReplicationPoolOpts::default(), stats.clone(), storage).await;
+            pool as Arc<DynReplicationPool>
+        })
+        .await;
 
-    stats.start_background_tasks().await;
+    assert!(GLOBAL_REPLICATION_STATS.get().is_some());
+    assert!(GLOBAL_REPLICATION_POOL.get().is_some());
 }
 
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {

@@ -36,6 +36,17 @@ pub fn default_parity_count(drive: usize) -> usize {
 pub const RRS: &str = "REDUCED_REDUNDANCY";
 pub const STANDARD: &str = "STANDARD";
 
+// AWS S3 Storage Classes
+pub const DEEP_ARCHIVE: &str = "DEEP_ARCHIVE";
+pub const EXPRESS_ONEZONE: &str = "EXPRESS_ONEZONE";
+pub const GLACIER: &str = "GLACIER";
+pub const GLACIER_IR: &str = "GLACIER_IR";
+pub const INTELLIGENT_TIERING: &str = "INTELLIGENT_TIERING";
+pub const ONEZONE_IA: &str = "ONEZONE_IA";
+pub const OUTPOSTS: &str = "OUTPOSTS";
+pub const SNOW: &str = "SNOW";
+pub const STANDARD_IA: &str = "STANDARD_IA";
+
 // Standard constants for config info storage class
 pub const CLASS_STANDARD: &str = "standard";
 pub const CLASS_RRS: &str = "rrs";
@@ -111,6 +122,15 @@ impl Config {
             RRS => {
                 if self.initialized {
                     Some(self.rrs.parity)
+                } else {
+                    None
+                }
+            }
+            // All these storage classes use standard parity configuration
+            STANDARD | DEEP_ARCHIVE | EXPRESS_ONEZONE | GLACIER | GLACIER_IR | INTELLIGENT_TIERING | ONEZONE_IA | OUTPOSTS
+            | SNOW | STANDARD_IA => {
+                if self.initialized {
+                    Some(self.standard.parity)
                 } else {
                     None
                 }

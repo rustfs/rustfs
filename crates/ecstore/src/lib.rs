@@ -16,6 +16,7 @@
 extern crate core;
 
 pub mod admin_server_info;
+pub mod batch_processor;
 pub mod bitrot;
 pub mod bucket;
 pub mod cache_value;
@@ -28,6 +29,7 @@ pub mod disks_layout;
 pub mod endpoints;
 pub mod erasure_coding;
 pub mod error;
+pub mod file_cache;
 pub mod global;
 pub mod lock_utils;
 pub mod metrics_realtime;

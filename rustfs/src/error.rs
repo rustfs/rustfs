@@ -81,6 +81,8 @@ impl From<StorageError> for ApiError {
             StorageError::DataMovementOverwriteErr(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectExistsAsDirectory(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::InvalidPart(_, _, _) => S3ErrorCode::InvalidPart,
+            StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
+            StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
             _ => S3ErrorCode::InternalError,
         };
 

@@ -15,7 +15,7 @@
 use anyhow::Result;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability},
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
@@ -616,6 +616,7 @@ impl ServerHandler for RustfsMcpServer {
             server_info: Implementation {
                 name: "rustfs-mcp-server".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
             },
         }
     }

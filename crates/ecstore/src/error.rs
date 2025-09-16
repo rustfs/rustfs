@@ -148,6 +148,9 @@ pub enum StorageError {
     #[error("Specified part could not be found. PartNumber {0}, Expected {1}, got {2}")]
     InvalidPart(usize, String, String),
 
+    #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
+    EntityTooSmall(usize, i64, i64),
+
     #[error("Invalid version id: {0}/{1}-{2}")]
     InvalidVersionID(String, String, String),
     #[error("invalid data movement operation, source and destination pool are the same for : {0}/{1}-{2}")]
@@ -187,6 +190,9 @@ pub enum StorageError {
 
     #[error("Lock error: {0}")]
     Lock(#[from] rustfs_lock::LockError),
+
+    #[error("Precondition failed")]
+    PreconditionFailed,
 }
 
 impl StorageError {
@@ -405,6 +411,7 @@ impl Clone for StorageError {
             // StorageError::InsufficientWriteQuorum => StorageError::InsufficientWriteQuorum,
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
+            StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
@@ -416,6 +423,7 @@ impl Clone for StorageError {
             StorageError::Lock(e) => StorageError::Lock(e.clone()),
             StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
             StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
+            StorageError::PreconditionFailed => StorageError::PreconditionFailed,
         }
     }
 }
@@ -481,6 +489,8 @@ impl StorageError {
             StorageError::Lock(_) => 0x38,
             StorageError::InsufficientReadQuorum(_, _) => 0x39,
             StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
+            StorageError::PreconditionFailed => 0x3B,
+            StorageError::EntityTooSmall(_, _, _) => 0x3C,
         }
     }
 
@@ -548,6 +558,7 @@ impl StorageError {
             0x38 => Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string()))),
             0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
             0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
+            0x3B => Some(StorageError::PreconditionFailed),
             _ => None,
         }
     }

@@ -37,26 +37,27 @@ pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
 lazy_static! {
-static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
-pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
-pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
-pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
-pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
-pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
-pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
-pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
-pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
-pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
-pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
-pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();
-//pub static ref GLOBAL_RemoteTargetTransport
-static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
-pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
-pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
-pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
-pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
-pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
+    static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
+    static ref GLOBAL_RUSTFS_EXTERNAL_PORT: OnceLock<u16> = OnceLock::new();
+    pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
+    pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
+    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
+    pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
+    pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
+    pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
+    pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();
+    //pub static ref GLOBAL_RemoteTargetTransport
+    static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
+    pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
+    pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
+    pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
+    pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
+    pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
 }
 
 // Global cancellation token for background services (data scanner and auto heal)
@@ -106,6 +107,22 @@ pub fn global_rustfs_port() -> u16 {
 /// Set the global rustfs port
 pub fn set_global_rustfs_port(value: u16) {
     GLOBAL_RUSTFS_PORT.set(value).expect("set_global_rustfs_port fail");
+}
+
+/// Get the global rustfs external port
+pub fn global_rustfs_external_port() -> u16 {
+    if let Some(p) = GLOBAL_RUSTFS_EXTERNAL_PORT.get() {
+        *p
+    } else {
+        rustfs_config::DEFAULT_PORT
+    }
+}
+
+/// Set the global rustfs external port
+pub fn set_global_rustfs_external_port(value: u16) {
+    GLOBAL_RUSTFS_EXTERNAL_PORT
+        .set(value)
+        .expect("set_global_rustfs_external_port fail");
 }
 
 /// Get the global rustfs port

@@ -21,6 +21,7 @@ use crate::error::ApiError;
 use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;
+use crate::storage::options::get_complete_multipart_upload_opts;
 use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_opts, parse_copy_source_range};
 use bytes::Bytes;
 use chrono::DateTime;
@@ -62,7 +63,7 @@ use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+use rustfs_ecstore::set_disk::{DEFAULT_READ_BUFFER_SIZE, is_valid_storage_class};
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::CompletePart;
 use rustfs_ecstore::store_api::DeleteBucketOptions;
@@ -74,6 +75,7 @@ use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
+use rustfs_notify::global::notifier_instance;
 use rustfs_policy::auth;
 use rustfs_policy::policy::action::Action;
 use rustfs_policy::policy::action::S3Action;
@@ -84,6 +86,7 @@ use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
 use rustfs_targets::EventName;
+use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
@@ -261,7 +264,7 @@ impl FS {
 
                 // Asynchronous call will not block the response of the current request
                 tokio::spawn(async move {
-                    rustfs_notify::global::notifier_instance().notify(event_args).await;
+                    notifier_instance().notify(event_args).await;
                 });
             }
         }
@@ -289,6 +292,22 @@ impl FS {
         Ok(S3Response::new(output))
     }
 }
+
+/// Helper function to get store and validate bucket exists
+async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
+    let Some(store) = new_object_layer_fn() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+
+    // Validate bucket exists
+    store
+        .get_bucket_info(bucket, &BucketOptions::default())
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(store)
+}
+
 #[async_trait::async_trait]
 impl S3 for FS {
     #[tracing::instrument(
@@ -334,7 +353,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -480,7 +499,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -680,7 +699,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(DeleteBucketOutput {}))
@@ -755,7 +774,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -840,7 +859,7 @@ impl S3 for FS {
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
                 };
-                rustfs_notify::global::notifier_instance().notify(event_args).await;
+                notifier_instance().notify(event_args).await;
             }
         });
 
@@ -925,9 +944,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
@@ -960,11 +977,11 @@ impl S3 for FS {
             }
         }
 
-        let mut content_length = info.size as i64;
+        let mut content_length = info.size;
 
         let content_range = if let Some(rs) = rs {
             let total_size = info.get_actual_size().map_err(ApiError::from)?;
-            let (start, length) = rs.get_offset_length(total_size as i64).map_err(ApiError::from)?;
+            let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
             content_length = length;
             Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
         } else {
@@ -1005,7 +1022,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1127,7 +1144,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1212,15 +1229,17 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
+        let max_keys = match max_keys {
+            Some(v) if v > 0 && v <= 1000 => v,
+            None => 1000,
+            _ => return Err(s3_error!(InvalidArgument, "max-keys must be between 1 and 1000")),
+        };
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
             .list_objects_v2(
@@ -1307,9 +1326,7 @@ impl S3 for FS {
         let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
         let delimiter = delimiter.filter(|v| !v.is_empty());
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
             .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
@@ -1382,8 +1399,7 @@ impl S3 for FS {
         let input = req.input;
 
         if let Some(ref storage_class) = input.storage_class {
-            let is_valid = ["STANDARD", "REDUCED_REDUNDANCY"].contains(&storage_class.as_str());
-            if !is_valid {
+            if !is_valid_storage_class(storage_class.as_str()) {
                 return Err(s3_error!(InvalidStorageClass));
             }
         }
@@ -1421,9 +1437,7 @@ impl S3 for FS {
 
         // let mut reader = PutObjReader::new(body, content_length as usize);
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+        let store = get_validated_store(&bucket).await?;
 
         let mut metadata = metadata.unwrap_or_default();
 
@@ -1509,7 +1523,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1525,8 +1539,16 @@ impl S3 for FS {
             key,
             tagging,
             version_id,
+            storage_class,
             ..
         } = req.input.clone();
+
+        // Validate storage class if provided
+        if let Some(ref storage_class) = storage_class {
+            if !is_valid_storage_class(storage_class.as_str()) {
+                return Err(s3_error!(InvalidStorageClass));
+            }
+        }
 
         // mc cp step 3
 
@@ -1587,7 +1609,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1867,7 +1889,15 @@ impl S3 for FS {
         };
 
         let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = max_parts.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
+        let max_parts = match max_parts {
+            Some(parts) => {
+                if !(1..=1000).contains(&parts) {
+                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
+                }
+                parts as usize
+            }
+            None => 1000,
+        };
 
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
@@ -1890,6 +1920,20 @@ impl S3 for FS {
                     })
                     .collect(),
             ),
+            owner: Some(RUSTFS_OWNER.to_owned()),
+            initiator: Some(Initiator {
+                id: RUSTFS_OWNER.id.clone(),
+                display_name: RUSTFS_OWNER.display_name.clone(),
+            }),
+            is_truncated: Some(res.is_truncated),
+            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
+            max_parts: res.max_parts.try_into().ok(),
+            part_number_marker: res.part_number_marker.try_into().ok(),
+            storage_class: if res.storage_class.is_empty() {
+                None
+            } else {
+                Some(res.storage_class.into())
+            },
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1980,7 +2024,7 @@ impl S3 for FS {
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
-        let opts = &ObjectOptions::default();
+        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
 
         let mut uploaded_parts = Vec::new();
 
@@ -2113,6 +2157,41 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // Validate tag_set length doesn't exceed 10
+        if tagging.tag_set.len() > 10 {
+            return Err(s3_error!(InvalidArgument, "Object tags cannot be greater than 10"));
+        }
+
+        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
+        for tag in &tagging.tag_set {
+            let key = tag
+                .key
+                .as_ref()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| s3_error!(InvalidTag, "Tag key cannot be empty"))?;
+
+            if key.len() > 128 {
+                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
+            }
+
+            let value = tag
+                .value
+                .as_ref()
+                .ok_or_else(|| s3_error!(InvalidTag, "Tag value cannot be null"))?;
+
+            if value.is_empty() {
+                return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
+            }
+
+            if value.len() > 256 {
+                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
+            }
+
+            if !tag_keys.insert(key) {
+                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
+            }
+        }
+
         let tags = encode_tags(tagging.tag_set);
 
         // TODO: getOpts
@@ -2144,7 +2223,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
@@ -2211,7 +2290,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
@@ -2746,13 +2825,10 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                warn!("get_notification_config err {:?}", err);
-                None
-            }
-        };
+        let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
+            warn!("get_notification_config err {:?}", err);
+            None
+        });
 
         // TODO: valid target list
 
@@ -2788,20 +2864,56 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        //  Verify that the bucket exists
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
+        //  Persist the new notification configuration
         let data = try_!(serialize(&notification_configuration));
-
         metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
-        // TODO: event notice add rule
+        // Determine region (BucketInfo has no region field) -> use global region or default
+        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| req.region.clone().unwrap_or_default());
 
-        Ok(S3Response::new(PutBucketNotificationConfigurationOutput::default()))
+        // Purge old rules and resolve new rules in parallel
+        let clear_rules = notifier_instance().clear_bucket_notification_rules(&bucket);
+        let parse_rules = async {
+            let mut event_rules = Vec::new();
+
+            process_queue_configurations(
+                &mut event_rules,
+                notification_configuration.queue_configurations.clone(),
+                TargetID::from_str,
+            );
+            process_topic_configurations(
+                &mut event_rules,
+                notification_configuration.topic_configurations.clone(),
+                TargetID::from_str,
+            );
+            process_lambda_configurations(
+                &mut event_rules,
+                notification_configuration.lambda_function_configurations.clone(),
+                TargetID::from_str,
+            );
+
+            event_rules
+        };
+
+        let (clear_result, event_rules) = tokio::join!(clear_rules, parse_rules);
+
+        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+
+        // Add a new notification rule
+        notifier_instance()
+            .add_event_specific_rules(&bucket, &region, &event_rules)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
+
+        Ok(S3Response::new(PutBucketNotificationConfigurationOutput {}))
     }
 
     async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
@@ -2948,7 +3060,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3126,7 +3238,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3205,7 +3317,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3266,7 +3378,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3341,10 +3453,88 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            rustfs_notify::global::notifier_instance().notify(event_args).await;
+            notifier_instance().notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
+    }
+}
+
+/// Auxiliary functions: extract prefixes and suffixes
+fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFilter>) -> (String, String) {
+    if let Some(filter) = filter {
+        if let Some(filter_rules) = &filter.key {
+            let mut prefix = String::new();
+            let mut suffix = String::new();
+            if let Some(rules) = &filter_rules.filter_rules {
+                for rule in rules {
+                    if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
+                        match name.as_str() {
+                            "prefix" => prefix = value.clone(),
+                            "suffix" => suffix = value.clone(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return (prefix, suffix);
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Auxiliary functions: Handle configuration
+pub(crate) fn process_queue_configurations<F>(
+    event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
+    configurations: Option<Vec<QueueConfiguration>>,
+    target_id_parser: F,
+) where
+    F: Fn(&str) -> Result<TargetID, TargetIDError>,
+{
+    if let Some(configs) = configurations {
+        for cfg in configs {
+            let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
+            let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
+            let target_ids = vec![target_id_parser(&cfg.queue_arn).ok()].into_iter().flatten().collect();
+            event_rules.push((events, prefix, suffix, target_ids));
+        }
+    }
+}
+
+pub(crate) fn process_topic_configurations<F>(
+    event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
+    configurations: Option<Vec<TopicConfiguration>>,
+    target_id_parser: F,
+) where
+    F: Fn(&str) -> Result<TargetID, TargetIDError>,
+{
+    if let Some(configs) = configurations {
+        for cfg in configs {
+            let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
+            let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
+            let target_ids = vec![target_id_parser(&cfg.topic_arn).ok()].into_iter().flatten().collect();
+            event_rules.push((events, prefix, suffix, target_ids));
+        }
+    }
+}
+
+pub(crate) fn process_lambda_configurations<F>(
+    event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
+    configurations: Option<Vec<LambdaFunctionConfiguration>>,
+    target_id_parser: F,
+) where
+    F: Fn(&str) -> Result<TargetID, TargetIDError>,
+{
+    if let Some(configs) = configurations {
+        for cfg in configs {
+            let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
+            let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
+            let target_ids = vec![target_id_parser(&cfg.lambda_function_arn).ok()]
+                .into_iter()
+                .flatten()
+                .collect();
+            event_rules.push((events, prefix, suffix, target_ids));
+        }
     }
 }
 

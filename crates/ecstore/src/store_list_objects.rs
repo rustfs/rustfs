@@ -616,7 +616,7 @@ impl ECStore {
         Ok(result)
     }
 
-    // 读所有
+    // Read all
     async fn list_merged(
         &self,
         rx: CancellationToken,
@@ -981,7 +981,7 @@ async fn gather_results(
             }
         }
 
-        if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && entry.is_object_dir() {
+        if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && !entry.is_object_dir() {
             continue;
         }
 

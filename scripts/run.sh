@@ -46,6 +46,7 @@ export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"
+export RUSTFS_EXTERNAL_ADDRESS=":9020"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
@@ -63,6 +64,9 @@ export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # Whether to enable local logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
+export RUSTFS_OBS_LOG_POOL_CAPA=10240
+export RUSTFS_OBS_LOG_MESSAGE_CAPA=32768
+export RUSTFS_OBS_LOG_FLUSH_MS=300
 
 export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs"
 export RUSTFS_SINKS_FILE_BUFFER_SIZE=12

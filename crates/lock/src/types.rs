@@ -532,7 +532,10 @@ pub type Timestamp = u64;
 
 /// Get current timestamp
 pub fn current_timestamp() -> Timestamp {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 /// Convert timestamp to system time
@@ -542,7 +545,7 @@ pub fn timestamp_to_system_time(timestamp: Timestamp) -> SystemTime {
 
 /// Convert system time to timestamp
 pub fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
-    time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
 }
 
 /// Deadlock detection result structure
@@ -685,7 +688,7 @@ mod tests {
         let converted = timestamp_to_system_time(timestamp);
 
         // Allow for small time differences
-        let diff = now.duration_since(converted).unwrap();
+        let diff = now.duration_since(converted).unwrap_or(Duration::ZERO);
         assert!(diff < Duration::from_secs(1));
     }
 

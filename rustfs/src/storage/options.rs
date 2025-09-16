@@ -16,7 +16,8 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectOptions};
+
+use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
@@ -106,6 +107,32 @@ pub async fn get_opts(
     Ok(opts)
 }
 
+fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> Result<()> {
+    if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
+        let mut preconditions = HTTPPreconditions::default();
+        if let Some(if_none_match) = headers.get("If-None-Match") {
+            preconditions.if_none_match = Some(
+                if_none_match
+                    .to_str()
+                    .map_err(|_| StorageError::other("Invalid If-None-Match header"))?
+                    .to_string(),
+            );
+        }
+        if let Some(if_match) = headers.get("If-Match") {
+            preconditions.if_match = Some(
+                if_match
+                    .to_str()
+                    .map_err(|_| StorageError::other("Invalid If-Match header"))?
+                    .to_string(),
+            );
+        }
+
+        opts.http_preconditions = Some(preconditions);
+    }
+
+    Ok(())
+}
+
 /// Creates options for putting an object in a bucket.
 pub async fn put_opts(
     bucket: &str,
@@ -142,6 +169,14 @@ pub async fn put_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
+
+    Ok(opts)
+}
+
+pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
+    let mut opts = ObjectOptions::default();
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
 }
 
@@ -669,13 +704,13 @@ mod tests {
     #[test]
     fn test_extract_metadata_from_mime_unicode_values() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-amz-meta-chinese", HeaderValue::from_bytes("测试值".as_bytes()).unwrap());
+        headers.insert("x-amz-meta-chinese", HeaderValue::from_bytes("test-value".as_bytes()).unwrap());
         headers.insert("x-rustfs-meta-emoji", HeaderValue::from_bytes("🚀".as_bytes()).unwrap());
 
         let mut metadata = HashMap::new();
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata.get("chinese"), Some(&"测试值".to_string()));
+        assert_eq!(metadata.get("chinese"), Some(&"test-value".to_string()));
         assert_eq!(metadata.get("emoji"), Some(&"🚀".to_string()));
     }
 
@@ -758,7 +793,7 @@ mod tests {
     fn test_extract_metadata_from_mime_with_various_data_formats() {
         let test_cases = vec![
             ("data.parquet", "application/vnd.apache.parquet"),
-            ("data.PARQUET", "application/vnd.apache.parquet"), // 测试大小写不敏感
+            ("data.PARQUET", "application/vnd.apache.parquet"), // Test case insensitive
             ("file.avro", "application/avro"),
             ("file.orc", "application/orc"),
             ("file.feather", "application/feather"),
@@ -766,7 +801,7 @@ mod tests {
             ("file.json", "application/json"),
             ("file.csv", "text/csv"),
             ("file.txt", "text/plain"),
-            ("file.unknownext", "application/octet-stream"), // 使用真正未知的扩展名
+            ("file.unknownext", "application/octet-stream"), // Use truly unknown extension
         ];
 
         for (filename, expected_content_type) in test_cases {
@@ -791,31 +826,31 @@ mod tests {
         let mut metadata = HashMap::new();
         extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("test.parquet"));
 
-        // 应该保留现有的 content-type，不被覆盖
+        // Should preserve existing content-type, not overwrite
         assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
     }
 
     #[test]
     fn test_detect_content_type_from_object_name() {
-        // 测试 Parquet 文件（我们的自定义处理）
+        // Test Parquet files (our custom handling)
         assert_eq!(detect_content_type_from_object_name("test.parquet"), "application/vnd.apache.parquet");
         assert_eq!(detect_content_type_from_object_name("TEST.PARQUET"), "application/vnd.apache.parquet");
 
-        // 测试其他自定义数据格式
+        // Test other custom data formats
         assert_eq!(detect_content_type_from_object_name("data.avro"), "application/avro");
         assert_eq!(detect_content_type_from_object_name("data.orc"), "application/orc");
         assert_eq!(detect_content_type_from_object_name("data.feather"), "application/feather");
         assert_eq!(detect_content_type_from_object_name("data.arrow"), "application/arrow");
 
-        // 测试标准格式（mime_guess 处理）
+        // Test standard formats (mime_guess handling)
         assert_eq!(detect_content_type_from_object_name("data.json"), "application/json");
         assert_eq!(detect_content_type_from_object_name("data.csv"), "text/csv");
         assert_eq!(detect_content_type_from_object_name("data.txt"), "text/plain");
 
-        // 测试真正未知的格式（使用一个 mime_guess 不认识的扩展名）
+        // Test truly unknown format (using extension mime_guess doesn't recognize)
         assert_eq!(detect_content_type_from_object_name("unknown.unknownext"), "application/octet-stream");
 
-        // 测试没有扩展名的文件
+        // Test files without extension
         assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
     }
 

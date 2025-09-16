@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth;
 pub mod console;
 pub mod handlers;
 pub mod router;
@@ -20,16 +21,16 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    bucket_meta, group, policies, pools, rebalance,
+    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    bucket_meta,
+    event::{
+        GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
+        SetBucketNotification,
+    },
+    group, policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
-
-use crate::admin::handlers::event::{
-    GetBucketNotification, ListNotificationTargets, RemoveBucketNotification, RemoveNotificationTarget, SetBucketNotification,
-    SetNotificationTarget,
-};
-use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
@@ -40,6 +41,9 @@ const ADMIN_PREFIX: &str = "/rustfs/admin";
 
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
+
+    // Health check endpoint for monitoring and orchestration
+    r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
@@ -214,6 +218,21 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
+    // Performance profiling endpoints (available on all platforms, with platform-specific responses)
+    #[cfg(not(target_os = "windows"))]
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
+        AdminOperation(&handlers::ProfileHandler {}),
+    )?;
+
+    #[cfg(not(target_os = "windows"))]
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
+        AdminOperation(&handlers::ProfileStatusHandler {}),
+    )?;
+
     Ok(r)
 }
 
@@ -371,14 +390,14 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-list").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/list").as_str(),
         AdminOperation(&ListNotificationTargets {}),
     )?;
 
     r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-set").as_str(),
-        AdminOperation(&SetNotificationTarget {}),
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}").as_str(),
+        AdminOperation(&NotificationTarget {}),
     )?;
 
     // Remove notification target
@@ -388,8 +407,14 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     // * `target_name` - A unique name for a Target, such as "1".
     r.insert(
         Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/reset").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+    // arns
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
     )?;
 
     r.insert(
