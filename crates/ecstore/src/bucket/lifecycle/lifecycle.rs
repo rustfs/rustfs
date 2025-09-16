@@ -585,12 +585,8 @@ impl LifecycleCalculate for LifecycleExpiration {
             return None;
         }
         match self.days {
-            Some(days) => {
-                Some(expected_expiry_time(obj.mod_time.unwrap(), days))
-            }
-            None => {
-                None
-            }
+            Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
+            None => None,
         }
     }
 }
@@ -626,9 +622,7 @@ impl LifecycleCalculate for Transition {
         }
 
         match self.days {
-            Some(days) => {
-                Some(expected_expiry_time(obj.mod_time.unwrap(), days))
-            }
+            Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
             None => obj.mod_time,
         }
     }

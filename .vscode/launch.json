@@ -93,7 +93,9 @@
               "--skip",
               "test_lifecycle_expiry_basic",
               "--skip",
-              "test_lifecycle_expiry_deletemarker"
+              "test_lifecycle_expiry_deletemarker",
+              //"--skip",
+              //"test_lifecycle_transition_basic",
             ],
             "cwd": "${workspaceFolder}",
             //"stopAtEntry": false,

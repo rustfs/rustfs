@@ -4446,11 +4446,11 @@ impl StorageAPI for SetDisks {
             }
             return Err(to_object_err(ERR_METHOD_NOT_ALLOWED, vec![bucket, object]));
         }*/
-        if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp()
+        /*if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
             || opts.transition.etag != extract_etag(&fi.metadata)
         {
             return Err(to_object_err(Error::from(DiskError::FileNotFound), vec![bucket, object]));
-        }
+        }*/
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
         }
