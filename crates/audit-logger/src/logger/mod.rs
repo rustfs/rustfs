@@ -122,27 +122,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_target_registry_operations() {
-        let factory = Arc::new(DefaultAuditTargetFactory::new());
-        let registry = TargetRegistry::new(factory);
+    async fn test_integration_flow_example() {
+        // This test demonstrates the typical integration flow as described in the issue
+        
+        // 1. Load config and register targets on startup
+        let config = AuditConfig {
+            targets: vec![
+                AuditTargetConfig::new("webhook-audit".to_string(), "webhook".to_string())
+                    .with_args(serde_json::json!({"endpoint": "https://httpbin.org/post"}))
+                    .with_enabled(false), // Disabled for testing
+            ],
+            enabled: true,
+            global_batch_size: 10,
+            default_queue_size: 1000,
+            max_concurrent_targets: 16,
+        };
 
-        // Test adding a target (this will fail due to invalid config, but tests the flow)
-        let invalid_config = AuditTargetConfig::new("test".to_string(), "webhook".to_string());
-        let result = registry.add_target(invalid_config).await;
-        assert!(result.is_err()); // Should fail due to missing endpoint
+        // 2. Initialize audit system
+        let manager = AuditManager::new();
+        manager.load_config(&config).await.expect("Should load config");
 
-        // Test with valid config (but httpbin.org might not be accessible)
-        let valid_config = AuditTargetConfig::new("test-webhook".to_string(), "webhook".to_string())
-            .with_args(serde_json::json!({"endpoint": "https://httpbin.org/post"}))
-            .with_enabled(false); // Disabled so it doesn't actually try to send
+        // 3. Log collection entry (simulating S3 operation)
+        let audit_entry = AuditLogEntry::new()
+            .set_version("1.0".to_string())
+            .set_deployment_id(Some("rustfs-prod".to_string()))
+            .set_event("s3:GetObject".to_string())
+            .set_entry_type(Some("S3".to_string()))
+            .set_api(
+                ApiDetails::new()
+                    .set_name(Some("GetObject".to_string()))
+                    .set_bucket(Some("user-data".to_string()))
+                    .set_object(Some("documents/report.pdf".to_string()))
+                    .set_status(Some("OK".to_string()))
+                    .set_status_code(Some(200))
+                    .set_input_bytes(0)
+                    .set_output_bytes(2048576) // 2MB
+            )
+            .set_remote_host(Some("203.0.113.10".to_string()))
+            .set_user_agent(Some("MinIO (linux; amd64) minio-go/v7.0.0".to_string()))
+            .set_access_key(Some("AKIAIOSFODNN7EXAMPLE".to_string()));
 
-        let result = registry.add_target(valid_config).await;
+        let result = manager.log(Arc::new(audit_entry)).await;
         assert!(result.is_ok());
 
-        // Check that target was added
-        let statuses = registry.get_all_target_statuses();
+        // Verify target status
+        let statuses = manager.registry().get_all_target_statuses();
         assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].id, "test-webhook");
+        assert_eq!(statuses[0].id, "webhook-audit");
         assert_eq!(statuses[0].kind, "webhook");
+        assert!(!statuses[0].enabled); // Should be disabled as configured
+
+        // Test enabling target
+        manager.registry().enable_target("webhook-audit").expect("Should enable");
+        let status = manager.registry().get_target_status("webhook-audit").unwrap();
+        assert!(status.enabled);
+
+        // Clean shutdown
+        manager.shutdown().await.expect("Should shutdown cleanly");
     }
 }

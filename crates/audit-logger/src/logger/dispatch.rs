@@ -19,7 +19,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Error types for audit system operations
@@ -165,7 +165,6 @@ impl TargetWrapper {
 pub struct TargetRegistry {
     targets: DashMap<String, Arc<TargetWrapper>>,
     factory: Arc<dyn AuditTargetFactory>,
-    semaphore: Arc<Semaphore>,
 }
 
 impl TargetRegistry {
@@ -174,7 +173,6 @@ impl TargetRegistry {
         Self {
             targets: DashMap::new(),
             factory,
-            semaphore: Arc::new(Semaphore::new(16)), // Default max concurrent targets
         }
     }
 
