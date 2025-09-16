@@ -152,14 +152,14 @@ pub mod performance_comparison {
 
         for i in 0..1000 {
             let guard = fast_manager
-                .acquire_write_lock("bucket", format!("object_{}", i), owner)
+                .acquire_write_lock("bucket", format!("object_{i}"), owner)
                 .await
                 .expect("Failed to acquire fast lock");
             guards.push(guard);
         }
 
         let fast_duration = start.elapsed();
-        println!("Fast lock: 1000 acquisitions in {:?}", fast_duration);
+        println!("Fast lock: 1000 acquisitions in {fast_duration:?}");
 
         // Release all
         drop(guards);

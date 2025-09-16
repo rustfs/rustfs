@@ -430,7 +430,7 @@ mod test {
         match get_host_ip(invalid_host.clone()).await {
             Ok(ips) => {
                 // Depending on DNS resolver behavior, it might return empty set or error
-                assert!(ips.is_empty(), "Expected empty IP set for invalid domain, got: {:?}", ips);
+                assert!(ips.is_empty(), "Expected empty IP set for invalid domain, got: {ips:?}");
             }
             Err(_) => {
                 error!("Expected error for invalid domain");

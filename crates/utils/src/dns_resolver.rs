@@ -396,7 +396,7 @@ mod tests {
         // Test cache stats (note: moka cache might not immediately reflect changes)
         let (total, _weighted_size) = resolver.cache_stats().await;
         // Cache should have at least the entry we just added (might be 0 due to async nature)
-        assert!(total <= 1, "Cache should have at most 1 entry, got {}", total);
+        assert!(total <= 1, "Cache should have at most 1 entry, got {total}");
     }
 
     #[tokio::test]
@@ -407,12 +407,12 @@ mod tests {
         match resolver.resolve("localhost").await {
             Ok(ips) => {
                 assert!(!ips.is_empty());
-                println!("Resolved localhost to: {:?}", ips);
+                println!("Resolved localhost to: {ips:?}");
             }
             Err(e) => {
                 // In some test environments, even localhost might fail
                 // This is acceptable as long as our error handling works
-                println!("DNS resolution failed (might be expected in test environments): {}", e);
+                println!("DNS resolution failed (might be expected in test environments): {e}");
             }
         }
     }
@@ -428,7 +428,7 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(e) = result {
-            println!("Expected error for invalid domain: {}", e);
+            println!("Expected error for invalid domain: {e}");
             // Should be AllAttemptsFailed since both system and public DNS should fail
             assert!(matches!(e, DnsError::AllAttemptsFailed { .. }));
         }
@@ -464,10 +464,10 @@ mod tests {
         match resolve_domain("localhost").await {
             Ok(ips) => {
                 assert!(!ips.is_empty());
-                println!("Global resolver resolved localhost to: {:?}", ips);
+                println!("Global resolver resolved localhost to: {ips:?}");
             }
             Err(e) => {
-                println!("Global resolver DNS resolution failed (might be expected in test environments): {}", e);
+                println!("Global resolver DNS resolution failed (might be expected in test environments): {e}");
             }
         }
     }
