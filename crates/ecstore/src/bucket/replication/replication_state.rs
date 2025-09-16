@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
+use tracing::warn;
 
 use crate::bucket::replication::{ReplicatedTargetInfo, ReplicationType, StatusType};
 
@@ -748,7 +749,9 @@ impl ReplicationStats {
         let now = SystemTime::now();
 
         let cache_read = cache.read().await;
-        for stats in cache_read.values() {
+        for (bucket, stats) in cache_read.iter() {
+            warn!("Updating moving average for bucket: {bucket}");
+
             for stat in stats.stats.values() {
                 // Now we can update the moving averages using interior mutability
                 stat.xfer_rate_lrg.measure.update_exponential_moving_average(now);

@@ -340,9 +340,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     // print server info
     print_server_info();
 
-    // initialize bucket replication pool
-    init_background_replication(store.clone()).await;
-
     init_update_check();
 
     // if opt.console_enable {
