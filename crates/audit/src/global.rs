@@ -19,7 +19,7 @@ use crate::registry::{AuditTargetFactory, TargetRegistry};
 use crate::system::{AuditConfig, AuditStats, AuditSystem};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Global audit logger instance
 static AUDIT_LOGGER: OnceCell<Arc<AuditLogger>> = OnceCell::new();
@@ -185,7 +185,6 @@ pub fn create_s3_audit_entry(event: &str, api_name: &str, bucket: Option<&str>, 
 
 /// Convenience functions for common S3 operations
 pub mod s3_events {
-    use super::*;
     use crate::{AuditEntry, create_s3_audit_entry};
 
     /// Create audit entry for GetObject

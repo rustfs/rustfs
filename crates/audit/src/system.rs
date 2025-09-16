@@ -15,11 +15,10 @@
 //! Core audit system for high-performance log dispatch
 use crate::entity::AuditEntry;
 use crate::error::{AuditError, AuditResult};
-use crate::registry::{AuditTargetConfig, TargetRegistry, TargetStatus};
+use crate::registry::{AuditTargetConfig, TargetRegistry};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock as AsyncRwLock, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -446,6 +445,7 @@ impl Default for PerformanceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TargetStatus;
     use crate::registry::{AuditTarget, AuditTargetFactory};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize};

@@ -239,14 +239,11 @@ impl From<reqwest::Error> for TargetError {
 impl From<rumqttc::ClientError> for TargetError {
     fn from(err: rumqttc::ClientError) -> Self {
         match err {
-            rumqttc::ClientError::Io(io_err) => TargetError::Connection {
-                message: format!("MQTT I/O error: {}", io_err),
+            rumqttc::ClientError::TryRequest(req_err) => TargetError::Connection {
+                message: format!("MQTT request error: {:?}", req_err),
             },
-            rumqttc::ClientError::Tls(tls_err) => TargetError::Connection {
-                message: format!("MQTT TLS error: {}", tls_err),
-            },
-            _ => TargetError::Protocol {
-                message: format!("MQTT protocol error: {}", err),
+            rumqttc::ClientError::Request(req_err) => TargetError::Connection {
+                message: format!("MQTT request error: {:?}", req_err),
             },
         }
     }
