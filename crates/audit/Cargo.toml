@@ -42,7 +42,7 @@ thiserror = { workspace = true }
 rumqttc = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
-dashmap = "6.1.0"
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

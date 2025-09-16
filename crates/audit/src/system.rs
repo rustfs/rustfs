@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock as AsyncRwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock as AsyncRwLock};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the audit system
@@ -445,10 +445,10 @@ impl Default for PerformanceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TargetStatus;
     use crate::registry::{AuditTarget, AuditTargetFactory};
+    use crate::TargetStatus;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_test;
 
     // Mock target for testing
