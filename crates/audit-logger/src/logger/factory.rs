@@ -168,11 +168,7 @@ impl WebhookTarget {
             .ok_or_else(|| TargetError::InvalidConfig("Missing endpoint".to_string()))?
             .to_string();
 
-        let auth_token = config
-            .args
-            .get("auth_token")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let auth_token = config.args.get("auth_token").and_then(|v| v.as_str()).map(|s| s.to_string());
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -194,8 +190,7 @@ impl WebhookTarget {
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig("Missing endpoint".to_string()))?;
 
-        url::Url::parse(endpoint)
-            .map_err(|e| TargetError::InvalidConfig(format!("Invalid endpoint URL: {}", e)))?;
+        url::Url::parse(endpoint).map_err(|e| TargetError::InvalidConfig(format!("Invalid endpoint URL: {}", e)))?;
 
         Ok(())
     }
@@ -204,10 +199,11 @@ impl WebhookTarget {
 #[async_trait]
 impl AuditTarget for WebhookTarget {
     async fn send(&self, entry: Arc<AuditLogEntry>) -> TargetResult<()> {
-        let json = serde_json::to_string(&*entry)
-            .map_err(|e| TargetError::Serialization(e.to_string()))?;
+        let json = serde_json::to_string(&*entry).map_err(|e| TargetError::Serialization(e.to_string()))?;
 
-        let mut request = self.client.post(&self.endpoint)
+        let mut request = self
+            .client
+            .post(&self.endpoint)
             .header("Content-Type", "application/json")
             .body(json);
 
@@ -215,7 +211,9 @@ impl AuditTarget for WebhookTarget {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
 
-        request.send().await
+        request
+            .send()
+            .await
             .map_err(|e| TargetError::Network(e.to_string()))?
             .error_for_status()
             .map_err(|e| TargetError::OperationFailed(e.to_string()))?;
@@ -225,10 +223,11 @@ impl AuditTarget for WebhookTarget {
 
     async fn send_batch(&self, entries: Vec<Arc<AuditLogEntry>>) -> TargetResult<()> {
         let batch_data: Vec<_> = entries.iter().map(|entry| &**entry).collect();
-        let json = serde_json::to_string(&batch_data)
-            .map_err(|e| TargetError::Serialization(e.to_string()))?;
+        let json = serde_json::to_string(&batch_data).map_err(|e| TargetError::Serialization(e.to_string()))?;
 
-        let mut request = self.client.post(&self.endpoint)
+        let mut request = self
+            .client
+            .post(&self.endpoint)
             .header("Content-Type", "application/json")
             .body(json);
 
@@ -236,7 +235,9 @@ impl AuditTarget for WebhookTarget {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
 
-        request.send().await
+        request
+            .send()
+            .await
             .map_err(|e| TargetError::Network(e.to_string()))?
             .error_for_status()
             .map_err(|e| TargetError::OperationFailed(e.to_string()))?;
@@ -277,11 +278,7 @@ impl MqttTarget {
             .ok_or_else(|| TargetError::InvalidConfig("Missing topic".to_string()))?
             .to_string();
 
-        let port = config
-            .args
-            .get("port")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1883) as u16;
+        let port = config.args.get("port").and_then(|v| v.as_u64()).unwrap_or(1883) as u16;
 
         let mut mqttoptions = rumqttc::MqttOptions::new(&config.id, broker, port);
         mqttoptions.set_keep_alive(std::time::Duration::from_secs(5));
@@ -329,8 +326,7 @@ impl MqttTarget {
 #[async_trait]
 impl AuditTarget for MqttTarget {
     async fn send(&self, entry: Arc<AuditLogEntry>) -> TargetResult<()> {
-        let json = serde_json::to_string(&*entry)
-            .map_err(|e| TargetError::Serialization(e.to_string()))?;
+        let json = serde_json::to_string(&*entry).map_err(|e| TargetError::Serialization(e.to_string()))?;
 
         self.client
             .publish(&self.topic, rumqttc::QoS::AtLeastOnce, false, json)

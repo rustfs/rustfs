@@ -21,8 +21,8 @@ pub mod factory;
 pub use config::{AuditConfig, AuditTargetConfig, TargetStatus};
 pub use dispatch::{AuditError, AuditManager, AuditResult, AuditSystem, TargetRegistry};
 pub use entry::{
-    audit_logger, disable_audit_logging, enable_audit_logging, initialize, 
-    is_audit_logging_enabled, log_audit, log_audit_entry, shutdown_audit_logger, AuditLogger
+    AuditLogger, audit_logger, disable_audit_logging, enable_audit_logging, initialize, is_audit_logging_enabled, log_audit,
+    log_audit_entry, shutdown_audit_logger,
 };
 pub use factory::{AuditTarget, AuditTargetFactory, DefaultAuditTargetFactory, TargetResult};
 
@@ -45,7 +45,7 @@ pub trait Target: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::audit::{AuditLogEntry, ApiDetails};
+    use crate::entry::audit::{ApiDetails, AuditLogEntry};
     use std::sync::Arc;
     use tokio;
 
@@ -65,7 +65,7 @@ mod tests {
 
         let json = serde_json::to_string(&config).expect("Should serialize");
         let deserialized: AuditConfig = serde_json::from_str(&json).expect("Should deserialize");
-        
+
         assert_eq!(config.targets.len(), deserialized.targets.len());
         assert_eq!(config.enabled, deserialized.enabled);
         assert_eq!(config.global_batch_size, deserialized.global_batch_size);
@@ -74,7 +74,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_manager_creation() {
         let manager = AuditManager::new();
-        
+
         // Should have empty registry initially
         let statuses = manager.registry().get_all_target_statuses();
         assert!(statuses.is_empty());
@@ -83,19 +83,19 @@ mod tests {
     #[tokio::test]
     async fn test_target_config_validation() {
         let factory = DefaultAuditTargetFactory::new();
-        
+
         // Test valid webhook config
         let valid_webhook = AuditTargetConfig::new("webhook-test".to_string(), "webhook".to_string())
             .with_args(serde_json::json!({"endpoint": "https://example.com/webhook"}));
-        
+
         assert!(factory.validate_config(&valid_webhook).is_ok());
-        
+
         // Test invalid webhook config (missing endpoint)
-        let invalid_webhook = AuditTargetConfig::new("webhook-test".to_string(), "webhook".to_string())
-            .with_args(serde_json::json!({}));
-        
+        let invalid_webhook =
+            AuditTargetConfig::new("webhook-test".to_string(), "webhook".to_string()).with_args(serde_json::json!({}));
+
         assert!(factory.validate_config(&invalid_webhook).is_err());
-        
+
         // Test unsupported type
         let unsupported = AuditTargetConfig::new("unsupported".to_string(), "file".to_string());
         assert!(factory.validate_config(&unsupported).is_err());
@@ -112,7 +112,7 @@ mod tests {
                     .set_bucket(Some("test-bucket".to_string()))
                     .set_object(Some("test-object".to_string()))
                     .set_status(Some("OK".to_string()))
-                    .set_status_code(Some(200))
+                    .set_status_code(Some(200)),
             );
 
         assert_eq!(entry.version, "1.0");
@@ -124,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn test_integration_flow_example() {
         // This test demonstrates the typical integration flow as described in the issue
-        
+
         // 1. Load config and register targets on startup
         let config = AuditConfig {
             targets: vec![
@@ -156,7 +156,7 @@ mod tests {
                     .set_status(Some("OK".to_string()))
                     .set_status_code(Some(200))
                     .set_input_bytes(0)
-                    .set_output_bytes(2048576) // 2MB
+                    .set_output_bytes(2048576), // 2MB
             )
             .set_remote_host(Some("203.0.113.10".to_string()))
             .set_user_agent(Some("MinIO (linux; amd64) minio-go/v7.0.0".to_string()))

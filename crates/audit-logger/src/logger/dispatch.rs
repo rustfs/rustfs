@@ -16,10 +16,10 @@ use super::config::{AuditConfig, AuditTargetConfig, TargetStatus};
 use super::factory::{AuditTarget, AuditTargetFactory, DefaultAuditTargetFactory, TargetError};
 use crate::entry::audit::AuditLogEntry;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// Error types for audit system operations
@@ -111,8 +111,14 @@ impl TargetWrapper {
                         return Err(AuditError::Target(e));
                     }
 
-                    warn!("Target {} failed (attempt {}/{}): {}, retrying in {:?}",
-                          self.target.id(), attempts, max_retry, e, retry_interval);
+                    warn!(
+                        "Target {} failed (attempt {}/{}): {}, retrying in {:?}",
+                        self.target.id(),
+                        attempts,
+                        max_retry,
+                        e,
+                        retry_interval
+                    );
                     tokio::time::sleep(retry_interval).await;
                 }
             }
@@ -341,7 +347,8 @@ impl AuditSystem {
 
     /// Log an audit entry asynchronously
     pub async fn log(&self, entry: Arc<AuditLogEntry>) -> AuditResult<()> {
-        self.tx.send(entry)
+        self.tx
+            .send(entry)
             .map_err(|_| AuditError::Channel("Failed to send log entry".to_string()))?;
         Ok(())
     }

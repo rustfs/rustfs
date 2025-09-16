@@ -23,8 +23,10 @@ pub use constants::env::*;
 #[cfg(feature = "constants")]
 pub use constants::tls::*;
 #[cfg(feature = "audit")]
-pub mod audit;
+mod audit;
 #[cfg(feature = "notify")]
 pub mod notify;
 #[cfg(feature = "observability")]
 pub mod observability;
+#[cfg(feature = "targets")]
+pub mod targets;

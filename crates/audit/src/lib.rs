@@ -84,7 +84,7 @@
 //!   "targets": [
 //!     {
 //!       "id": "audit-webhook-1",
-//!       "target_type": "webhook", 
+//!       "target_type": "webhook",
 //!       "enabled": true,
 //!       "args": {
 //!         "url": "https://audit.company.com/webhook",
@@ -97,7 +97,7 @@
 //!     {
 //!       "id": "audit-mqtt-1",
 //!       "target_type": "mqtt",
-//!       "enabled": true, 
+//!       "enabled": true,
 //!       "args": {
 //!         "broker_url": "mqtts://mqtt.company.com:8883",
 //!         "topic": "rustfs/audit",
@@ -125,12 +125,12 @@ pub mod registry;
 pub mod system;
 
 // Re-export main types for easy access
-pub use entity::{AuditEntry, ApiDetails, ObjectVersion};
+pub use entity::{ApiDetails, AuditEntry, ObjectVersion};
 pub use error::{AuditError, AuditResult, TargetError, TargetResult};
 pub use global::{
-    audit_logger, close_audit_system, create_s3_audit_entry, get_audit_stats, 
-    initialize_audit_logger, is_audit_system_initialized, log_audit, log_audit_entry,
-    pause_audit_system, resume_audit_system, s3_events, start_audit_system, AuditLogger
+    AuditLogger, audit_logger, close_audit_system, create_s3_audit_entry, get_audit_stats, initialize_audit_logger,
+    is_audit_system_initialized, log_audit, log_audit_entry, pause_audit_system, resume_audit_system, s3_events,
+    start_audit_system,
 };
 pub use registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetRegistry, TargetStatus};
 pub use system::{AuditConfig, AuditStats, AuditSystem, PerformanceConfig, RedactionConfig};
@@ -165,14 +165,14 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
             }),
         }
     }
-    
+
     fn validate_config(&self, config: &AuditTargetConfig) -> TargetResult<()> {
         if config.id.is_empty() {
             return Err(TargetError::InvalidConfig {
                 message: "Target ID cannot be empty".to_string(),
             });
         }
-        
+
         match config.target_type.as_str() {
             "webhook" => WebhookAuditTarget::validate_config(config),
             "mqtt" => MqttAuditTarget::validate_config(config),
@@ -181,7 +181,7 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
             }),
         }
     }
-    
+
     fn supported_types(&self) -> Vec<&'static str> {
         vec!["webhook", "mqtt"]
     }
@@ -209,43 +209,35 @@ impl WebhookAuditTarget {
     /// Create from configuration
     async fn from_config(config: &AuditTargetConfig) -> TargetResult<Self> {
         Self::validate_config(config)?;
-        
+
         let args = &config.args;
-        let url = args.get("url")
+        let url = args
+            .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig {
                 message: "Missing 'url' field".to_string(),
             })?
             .to_string();
-        
-        let method = args.get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("POST")
-            .to_string();
-        
-        let timeout_ms = args.get("timeout_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5000);
-        
-        let retries = args.get("retries")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3) as u32;
-        
-        let headers = args.get("headers")
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            });
-        
+
+        let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
+
+        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000);
+
+        let retries = args.get("retries").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+
+        let headers = args.get("headers").and_then(|v| v.as_object()).map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        });
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| TargetError::InitializationFailed {
                 message: format!("Failed to create HTTP client: {}", e),
             })?;
-        
+
         Ok(Self {
             id: config.id.clone(),
             url,
@@ -257,34 +249,36 @@ impl WebhookAuditTarget {
             enabled: std::sync::Arc::new(parking_lot::RwLock::new(config.enabled)),
         })
     }
-    
+
     /// Validate configuration
     fn validate_config(config: &AuditTargetConfig) -> TargetResult<()> {
         let args = &config.args;
-        
+
         // Check required fields
-        let url = args.get("url")
+        let url = args
+            .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig {
                 message: "Missing 'url' field".to_string(),
             })?;
-        
+
         // Validate URL
-        url::Url::parse(url)
-            .map_err(|e| TargetError::InvalidConfig {
-                message: format!("Invalid URL '{}': {}", url, e),
-            })?;
-        
+        url::Url::parse(url).map_err(|e| TargetError::InvalidConfig {
+            message: format!("Invalid URL '{}': {}", url, e),
+        })?;
+
         // Validate method if specified
         if let Some(method) = args.get("method").and_then(|v| v.as_str()) {
             match method.to_uppercase().as_str() {
                 "GET" | "POST" | "PUT" | "PATCH" => {}
-                _ => return Err(TargetError::InvalidConfig {
-                    message: format!("Unsupported HTTP method: {}", method),
-                }),
+                _ => {
+                    return Err(TargetError::InvalidConfig {
+                        message: format!("Unsupported HTTP method: {}", method),
+                    });
+                }
             }
         }
-        
+
         Ok(())
     }
 }
@@ -295,34 +289,34 @@ impl AuditTarget for WebhookAuditTarget {
         if !*self.enabled.read() {
             return Err(TargetError::Disabled);
         }
-        
-        let json = entry.to_json()
-            .map_err(|e| TargetError::Serialization {
-                message: e.to_string(),
-            })?;
-        
-        let mut request = self.client
+
+        let json = entry
+            .to_json()
+            .map_err(|e| TargetError::Serialization { message: e.to_string() })?;
+
+        let mut request = self
+            .client
             .request(
-                reqwest::Method::from_bytes(self.method.as_bytes())
-                    .map_err(|e| TargetError::InvalidConfig {
-                        message: format!("Invalid HTTP method: {}", e),
-                    })?,
+                reqwest::Method::from_bytes(self.method.as_bytes()).map_err(|e| TargetError::InvalidConfig {
+                    message: format!("Invalid HTTP method: {}", e),
+                })?,
                 &self.url,
             )
             .header("Content-Type", "application/json")
             .body(json);
-        
+
         // Add custom headers
         if let Some(ref headers) = self.headers {
             for (key, value) in headers {
                 request = request.header(key, value);
             }
         }
-        
+
         // Execute request with retries
         let mut last_error = None;
         for attempt in 0..=self.retries {
-            match request.try_clone()
+            match request
+                .try_clone()
                 .ok_or_else(|| TargetError::OperationFailed {
                     message: "Failed to clone request".to_string(),
                 })?
@@ -342,50 +336,50 @@ impl AuditTarget for WebhookAuditTarget {
                     last_error = Some(TargetError::from(e));
                 }
             }
-            
+
             // Wait before retry (except on last attempt)
             if attempt < self.retries {
                 tokio::time::sleep(std::time::Duration::from_millis(1000 * (attempt as u64 + 1))).await;
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| TargetError::OperationFailed {
             message: "Unknown error".to_string(),
         }))
     }
-    
+
     async fn start(&self) -> TargetResult<()> {
         *self.enabled.write() = true;
         Ok(())
     }
-    
+
     async fn pause(&self) -> TargetResult<()> {
         *self.enabled.write() = false;
         Ok(())
     }
-    
+
     async fn resume(&self) -> TargetResult<()> {
         *self.enabled.write() = true;
         Ok(())
     }
-    
+
     async fn close(&self) -> TargetResult<()> {
         *self.enabled.write() = false;
         Ok(())
     }
-    
+
     fn id(&self) -> &str {
         &self.id
     }
-    
+
     fn target_type(&self) -> &str {
         "webhook"
     }
-    
+
     fn is_enabled(&self) -> bool {
         *self.enabled.read()
     }
-    
+
     fn status(&self) -> TargetStatus {
         TargetStatus {
             id: self.id.clone(),
@@ -414,37 +408,37 @@ impl MqttAuditTarget {
     /// Create from configuration
     async fn from_config(config: &AuditTargetConfig) -> TargetResult<Self> {
         Self::validate_config(config)?;
-        
+
         let args = &config.args;
-        let broker_url = args.get("broker_url")
+        let broker_url = args
+            .get("broker_url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig {
                 message: "Missing 'broker_url' field".to_string(),
             })?;
-        
-        let topic = args.get("topic")
+
+        let topic = args
+            .get("topic")
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig {
                 message: "Missing 'topic' field".to_string(),
             })?
             .to_string();
-        
+
         // Parse broker URL
-        let url = url::Url::parse(broker_url)
-            .map_err(|e| TargetError::InvalidConfig {
-                message: format!("Invalid broker URL: {}", e),
-            })?;
-        
-        let host = url.host_str()
-            .ok_or_else(|| TargetError::InvalidConfig {
-                message: "Missing host in broker URL".to_string(),
-            })?;
-        
+        let url = url::Url::parse(broker_url).map_err(|e| TargetError::InvalidConfig {
+            message: format!("Invalid broker URL: {}", e),
+        })?;
+
+        let host = url.host_str().ok_or_else(|| TargetError::InvalidConfig {
+            message: "Missing host in broker URL".to_string(),
+        })?;
+
         let port = url.port().unwrap_or(1883);
-        
+
         let mut mqttoptions = rumqttc::MqttOptions::new(&config.id, host, port);
         mqttoptions.set_keep_alive(std::time::Duration::from_secs(30));
-        
+
         // Set credentials if provided
         if let (Some(username), Some(password)) = (
             args.get("username").and_then(|v| v.as_str()),
@@ -452,14 +446,12 @@ impl MqttAuditTarget {
         ) {
             mqttoptions.set_credentials(username, password);
         }
-        
+
         // Configure QoS
-        let _qos = args.get("qos")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
-        
+        let _qos = args.get("qos").and_then(|v| v.as_u64()).unwrap_or(1);
+
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqttoptions, 10);
-        
+
         // Start event loop in background
         tokio::spawn(async move {
             loop {
@@ -472,7 +464,7 @@ impl MqttAuditTarget {
                 }
             }
         });
-        
+
         Ok(Self {
             id: config.id.clone(),
             topic,
@@ -480,30 +472,30 @@ impl MqttAuditTarget {
             enabled: std::sync::Arc::new(parking_lot::RwLock::new(config.enabled)),
         })
     }
-    
+
     /// Validate configuration
     fn validate_config(config: &AuditTargetConfig) -> TargetResult<()> {
         let args = &config.args;
-        
+
         // Check required fields
-        let broker_url = args.get("broker_url")
+        let broker_url = args
+            .get("broker_url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig {
                 message: "Missing 'broker_url' field".to_string(),
             })?;
-        
+
         args.get("topic")
             .and_then(|v| v.as_str())
             .ok_or_else(|| TargetError::InvalidConfig {
                 message: "Missing 'topic' field".to_string(),
             })?;
-        
+
         // Validate broker URL
-        url::Url::parse(broker_url)
-            .map_err(|e| TargetError::InvalidConfig {
-                message: format!("Invalid broker URL '{}': {}", broker_url, e),
-            })?;
-        
+        url::Url::parse(broker_url).map_err(|e| TargetError::InvalidConfig {
+            message: format!("Invalid broker URL '{}': {}", broker_url, e),
+        })?;
+
         Ok(())
     }
 }
@@ -514,52 +506,51 @@ impl AuditTarget for MqttAuditTarget {
         if !*self.enabled.read() {
             return Err(TargetError::Disabled);
         }
-        
-        let json = entry.to_json()
-            .map_err(|e| TargetError::Serialization {
-                message: e.to_string(),
-            })?;
-        
+
+        let json = entry
+            .to_json()
+            .map_err(|e| TargetError::Serialization { message: e.to_string() })?;
+
         self.client
             .publish(&self.topic, rumqttc::QoS::AtLeastOnce, false, json)
             .await
             .map_err(|e| TargetError::from(e))?;
-        
+
         Ok(())
     }
-    
+
     async fn start(&self) -> TargetResult<()> {
         *self.enabled.write() = true;
         Ok(())
     }
-    
+
     async fn pause(&self) -> TargetResult<()> {
         *self.enabled.write() = false;
         Ok(())
     }
-    
+
     async fn resume(&self) -> TargetResult<()> {
         *self.enabled.write() = true;
         Ok(())
     }
-    
+
     async fn close(&self) -> TargetResult<()> {
         *self.enabled.write() = false;
         Ok(())
     }
-    
+
     fn id(&self) -> &str {
         &self.id
     }
-    
+
     fn target_type(&self) -> &str {
         "mqtt"
     }
-    
+
     fn is_enabled(&self) -> bool {
         *self.enabled.read()
     }
-    
+
     fn status(&self) -> TargetStatus {
         TargetStatus {
             id: self.id.clone(),

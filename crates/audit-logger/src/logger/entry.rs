@@ -55,10 +55,11 @@ impl AuditLogger {
     /// Initialize the global audit logger with configuration
     pub fn initialize(config: Option<AuditConfig>) -> AuditResult<()> {
         let logger = Arc::new(Self::new(config));
-        
-        AUDIT_LOGGER.set(logger)
+
+        AUDIT_LOGGER
+            .set(logger)
             .map_err(|_| super::dispatch::AuditError::Configuration("Audit logger already initialized".to_string()))?;
-        
+
         info!("Global audit logger initialized");
         Ok(())
     }
@@ -103,13 +104,13 @@ impl AuditLogger {
     /// Reload configuration
     pub async fn reload_config(&self, config: &AuditConfig) -> AuditResult<()> {
         info!("Reloading audit configuration");
-        
+
         // Update enabled state
         *self.enabled.write() = config.enabled;
-        
+
         // Reload target configurations
         self.manager.load_config(config).await?;
-        
+
         info!("Audit configuration reloaded successfully");
         Ok(())
     }

@@ -154,12 +154,7 @@ impl AuditEntry {
     }
 
     /// Create audit entry for an S3 operation
-    pub fn for_s3_operation(
-        event: &str,
-        api_name: &str,
-        bucket: Option<&str>,
-        object: Option<&str>,
-    ) -> Self {
+    pub fn for_s3_operation(event: &str, api_name: &str, bucket: Option<&str>, object: Option<&str>) -> Self {
         let mut entry = Self::new();
         entry.event = event.to_string();
         entry.event_type = Some("S3".to_string());
@@ -216,12 +211,7 @@ impl AuditEntry {
     }
 
     /// Set request/response sizes
-    pub fn with_byte_counts(
-        mut self,
-        request_bytes: u64,
-        response_bytes: u64,
-        response_header_bytes: Option<u64>,
-    ) -> Self {
+    pub fn with_byte_counts(mut self, request_bytes: u64, response_bytes: u64, response_header_bytes: Option<u64>) -> Self {
         self.api.request_bytes = request_bytes;
         self.api.response_bytes = response_bytes;
         self.api.response_header_bytes = response_header_bytes;
@@ -295,12 +285,7 @@ mod tests {
 
     #[test]
     fn test_audit_entry_creation() {
-        let entry = AuditEntry::for_s3_operation(
-            "s3:GetObject",
-            "GetObject",
-            Some("test-bucket"),
-            Some("test-object.txt"),
-        );
+        let entry = AuditEntry::for_s3_operation("s3:GetObject", "GetObject", Some("test-bucket"), Some("test-object.txt"));
 
         assert_eq!(entry.event, "s3:GetObject");
         assert_eq!(entry.event_type, Some("S3".to_string()));
@@ -311,13 +296,8 @@ mod tests {
 
     #[test]
     fn test_audit_entry_json_serialization() {
-        let mut entry = AuditEntry::for_s3_operation(
-            "s3:PutObject",
-            "PutObject", 
-            Some("my-bucket"),
-            Some("my-file.txt"),
-        );
-        
+        let mut entry = AuditEntry::for_s3_operation("s3:PutObject", "PutObject", Some("my-bucket"), Some("my-file.txt"));
+
         entry = entry
             .with_request_context(
                 Some("192.168.1.100".to_string()),

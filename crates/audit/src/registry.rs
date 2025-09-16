@@ -22,8 +22,8 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustfs_targets::{EventName, Target, TargetLog};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -73,10 +73,10 @@ pub struct TargetStatus {
 pub trait AuditTargetFactory: Send + Sync {
     /// Create a new target from configuration
     async fn create_target(&self, config: &AuditTargetConfig) -> TargetResult<Box<dyn AuditTarget>>;
-    
+
     /// Validate target configuration
     fn validate_config(&self, config: &AuditTargetConfig) -> TargetResult<()>;
-    
+
     /// Get supported target types
     fn supported_types(&self) -> Vec<&'static str>;
 }
@@ -86,28 +86,28 @@ pub trait AuditTargetFactory: Send + Sync {
 pub trait AuditTarget: Send + Sync {
     /// Send audit entry to target
     async fn send(&self, entry: Arc<AuditEntry>) -> TargetResult<()>;
-    
+
     /// Start the target
     async fn start(&self) -> TargetResult<()>;
-    
+
     /// Pause the target (stop accepting new entries)
     async fn pause(&self) -> TargetResult<()>;
-    
+
     /// Resume the target
     async fn resume(&self) -> TargetResult<()>;
-    
+
     /// Stop the target gracefully
     async fn close(&self) -> TargetResult<()>;
-    
+
     /// Get target ID
     fn id(&self) -> &str;
-    
+
     /// Get target type
     fn target_type(&self) -> &str;
-    
+
     /// Check if target is enabled
     fn is_enabled(&self) -> bool;
-    
+
     /// Get current status
     fn status(&self) -> TargetStatus;
 }
@@ -139,16 +139,16 @@ impl TargetWrapper {
             config,
         }
     }
-    
+
     async fn send_with_retry(&self, entry: Arc<AuditEntry>) -> TargetResult<()> {
         if !*self.enabled.read() {
             return Err(TargetError::Disabled);
         }
-        
+
         if !*self.running.read() {
             return Err(TargetError::ShuttingDown);
         }
-        
+
         match self.target.send(entry).await {
             Ok(()) => {
                 self.success_count.fetch_add(1, Ordering::Relaxed);
@@ -163,7 +163,7 @@ impl TargetWrapper {
             }
         }
     }
-    
+
     fn get_status(&self) -> TargetStatus {
         TargetStatus {
             id: self.target.id().to_string(),
@@ -178,7 +178,7 @@ impl TargetWrapper {
             queue_size: None, // TODO: implement queue size tracking
         }
     }
-    
+
     async fn start(&self) -> TargetResult<()> {
         if *self.enabled.read() {
             self.target.start().await?;
@@ -187,14 +187,14 @@ impl TargetWrapper {
         }
         Ok(())
     }
-    
+
     async fn pause(&self) -> TargetResult<()> {
         self.target.pause().await?;
         *self.running.write() = false;
         info!("Target {} paused", self.target.id());
         Ok(())
     }
-    
+
     async fn resume(&self) -> TargetResult<()> {
         if *self.enabled.read() {
             self.target.resume().await?;
@@ -203,18 +203,18 @@ impl TargetWrapper {
         }
         Ok(())
     }
-    
+
     async fn close(&self) -> TargetResult<()> {
         self.target.close().await?;
         *self.running.write() = false;
         info!("Target {} closed", self.target.id());
         Ok(())
     }
-    
+
     fn enable(&self) {
         *self.enabled.write() = true;
     }
-    
+
     fn disable(&self) {
         *self.enabled.write() = false;
     }
@@ -234,35 +234,33 @@ impl TargetRegistry {
             factory,
         }
     }
-    
+
     /// Add a new target
     pub async fn add_target(&self, config: AuditTargetConfig) -> AuditResult<()> {
         let target_id = config.id.clone();
-        
+
         if self.targets.contains_key(&target_id) {
             return Err(AuditError::config(format!("Target '{}' already exists", target_id)));
         }
-        
+
         // Validate configuration
-        self.factory.validate_config(&config)
-            .map_err(AuditError::Target)?;
-        
+        self.factory.validate_config(&config).map_err(AuditError::Target)?;
+
         // Create target
-        let target = self.factory.create_target(&config).await
-            .map_err(AuditError::Target)?;
-        
+        let target = self.factory.create_target(&config).await.map_err(AuditError::Target)?;
+
         let wrapper = Arc::new(TargetWrapper::new(target, config));
-        
+
         // Start target if enabled
         if wrapper.config.enabled {
             wrapper.start().await.map_err(AuditError::Target)?;
         }
-        
+
         self.targets.insert(target_id.clone(), wrapper);
         info!("Added target '{}'", target_id);
         Ok(())
     }
-    
+
     /// Remove a target
     pub async fn remove_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some((_, wrapper)) = self.targets.remove(target_id) {
@@ -275,7 +273,7 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Enable a target
     pub fn enable_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some(wrapper) = self.targets.get(target_id) {
@@ -288,7 +286,7 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Disable a target
     pub fn disable_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some(wrapper) = self.targets.get(target_id) {
@@ -301,7 +299,7 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Start a target
     pub async fn start_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some(wrapper) = self.targets.get(target_id) {
@@ -312,7 +310,7 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Pause a target
     pub async fn pause_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some(wrapper) = self.targets.get(target_id) {
@@ -323,7 +321,7 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Resume a target
     pub async fn resume_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some(wrapper) = self.targets.get(target_id) {
@@ -334,7 +332,7 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Close a target
     pub async fn close_target(&self, target_id: &str) -> AuditResult<()> {
         if let Some(wrapper) = self.targets.get(target_id) {
@@ -345,23 +343,21 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Get target status
     pub fn get_target_status(&self, target_id: &str) -> Option<TargetStatus> {
         self.targets.get(target_id).map(|wrapper| wrapper.get_status())
     }
-    
+
     /// List all targets
     pub fn list_targets(&self) -> Vec<TargetStatus> {
-        self.targets.iter()
-            .map(|entry| entry.value().get_status())
-            .collect()
+        self.targets.iter().map(|entry| entry.value().get_status()).collect()
     }
-    
+
     /// Dispatch audit entry to all enabled targets
     pub async fn dispatch(&self, entry: Arc<AuditEntry>) -> Vec<TargetResult<()>> {
         let mut results = Vec::new();
-        
+
         for target_wrapper in self.targets.iter() {
             let wrapper = target_wrapper.value();
             if *wrapper.enabled.read() && *wrapper.running.read() {
@@ -372,26 +368,26 @@ impl TargetRegistry {
                 results.push(result);
             }
         }
-        
+
         if results.is_empty() {
             warn!("No enabled targets available for audit dispatch");
         }
-        
+
         results
     }
-    
+
     /// Close all targets
     pub async fn close_all(&self) -> AuditResult<()> {
         let mut errors = Vec::new();
-        
+
         for target_wrapper in self.targets.iter() {
             if let Err(e) = target_wrapper.value().close().await {
                 errors.push(e);
             }
         }
-        
+
         self.targets.clear();
-        
+
         if errors.is_empty() {
             info!("All targets closed successfully");
             Ok(())
@@ -401,19 +397,15 @@ impl TargetRegistry {
             })
         }
     }
-    
+
     /// Get count of enabled targets
     pub fn enabled_target_count(&self) -> usize {
-        self.targets.iter()
-            .filter(|entry| *entry.value().enabled.read())
-            .count()
+        self.targets.iter().filter(|entry| *entry.value().enabled.read()).count()
     }
-    
+
     /// Get count of running targets
     pub fn running_target_count(&self) -> usize {
-        self.targets.iter()
-            .filter(|entry| *entry.value().running.read())
-            .count()
+        self.targets.iter().filter(|entry| *entry.value().running.read()).count()
     }
 }
 
@@ -437,7 +429,7 @@ impl Default for AuditTargetConfig {
 mod tests {
     use super::*;
     use tokio_test;
-    
+
     // Mock target for testing
     struct MockTarget {
         id: String,
@@ -445,7 +437,7 @@ mod tests {
         enabled: bool,
         fail_on_send: bool,
     }
-    
+
     #[async_trait]
     impl AuditTarget for MockTarget {
         async fn send(&self, _entry: Arc<AuditEntry>) -> TargetResult<()> {
@@ -455,16 +447,30 @@ mod tests {
                 Ok(())
             }
         }
-        
-        async fn start(&self) -> TargetResult<()> { Ok(()) }
-        async fn pause(&self) -> TargetResult<()> { Ok(()) }
-        async fn resume(&self) -> TargetResult<()> { Ok(()) }
-        async fn close(&self) -> TargetResult<()> { Ok(()) }
-        
-        fn id(&self) -> &str { &self.id }
-        fn target_type(&self) -> &str { &self.target_type }
-        fn is_enabled(&self) -> bool { self.enabled }
-        
+
+        async fn start(&self) -> TargetResult<()> {
+            Ok(())
+        }
+        async fn pause(&self) -> TargetResult<()> {
+            Ok(())
+        }
+        async fn resume(&self) -> TargetResult<()> {
+            Ok(())
+        }
+        async fn close(&self) -> TargetResult<()> {
+            Ok(())
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn target_type(&self) -> &str {
+            &self.target_type
+        }
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+
         fn status(&self) -> TargetStatus {
             TargetStatus {
                 id: self.id.clone(),
@@ -480,9 +486,9 @@ mod tests {
             }
         }
     }
-    
+
     struct MockFactory;
-    
+
     #[async_trait]
     impl AuditTargetFactory for MockFactory {
         async fn create_target(&self, config: &AuditTargetConfig) -> TargetResult<Box<dyn AuditTarget>> {
@@ -493,24 +499,24 @@ mod tests {
                 fail_on_send: false,
             }))
         }
-        
+
         fn validate_config(&self, config: &AuditTargetConfig) -> TargetResult<()> {
             if config.id.is_empty() {
                 return Err(TargetError::invalid_config("ID cannot be empty"));
             }
             Ok(())
         }
-        
+
         fn supported_types(&self) -> Vec<&'static str> {
             vec!["mock"]
         }
     }
-    
+
     #[tokio::test]
     async fn test_target_registry_operations() {
         let factory = Arc::new(MockFactory);
         let registry = TargetRegistry::new(factory);
-        
+
         // Add target
         let config = AuditTargetConfig {
             id: "test-target".to_string(),
@@ -518,50 +524,50 @@ mod tests {
             enabled: true,
             args: serde_json::Value::Object(serde_json::Map::new()),
         };
-        
+
         registry.add_target(config).await.unwrap();
-        
+
         // Check target exists
         let status = registry.get_target_status("test-target").unwrap();
         assert_eq!(status.id, "test-target");
         assert_eq!(status.target_type, "mock");
         assert!(status.enabled);
-        
+
         // List targets
         let targets = registry.list_targets();
         assert_eq!(targets.len(), 1);
-        
+
         // Disable target
         registry.disable_target("test-target").unwrap();
         let status = registry.get_target_status("test-target").unwrap();
         assert!(!status.enabled);
-        
+
         // Remove target
         registry.remove_target("test-target").await.unwrap();
         assert!(registry.get_target_status("test-target").is_none());
     }
-    
+
     #[tokio::test]
     async fn test_target_dispatch() {
         let factory = Arc::new(MockFactory);
         let registry = TargetRegistry::new(factory);
-        
+
         let config = AuditTargetConfig {
             id: "test-target".to_string(),
             target_type: "mock".to_string(),
             enabled: true,
             args: serde_json::Value::Object(serde_json::Map::new()),
         };
-        
+
         registry.add_target(config).await.unwrap();
-        
+
         let entry = Arc::new(AuditEntry::for_s3_operation(
             "s3:GetObject",
             "GetObject",
             Some("test-bucket"),
             Some("test-object"),
         ));
-        
+
         let results = registry.dispatch(entry).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());

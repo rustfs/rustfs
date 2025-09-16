@@ -15,9 +15,8 @@
 //! Basic usage example for the RustFS audit system
 
 use rustfs_audit::{
-    initialize_audit_logger, log_audit_entry, s3_events,
-    AuditConfig, AuditTargetConfig, DefaultAuditTargetFactory,
-    get_audit_stats, list_audit_targets, close_audit_system
+    AuditConfig, AuditTargetConfig, DefaultAuditTargetFactory, close_audit_system, get_audit_stats, initialize_audit_logger,
+    list_audit_targets, log_audit_entry, s3_events,
 };
 use std::sync::Arc;
 use tracing_subscriber;
@@ -84,11 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("/user-data/documents/report.pdf".to_string()),
             Some("s3.example.com".to_string()),
         )
-        .with_auth_context(
-            Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            None,
-            None,
-        )
+        .with_auth_context(Some("AKIAIOSFODNN7EXAMPLE".to_string()), None, None)
         .with_response_status(
             Some("OK".to_string()),
             Some(200),
@@ -108,11 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("/user-uploads/photos/vacation.jpg".to_string()),
             Some("s3.example.com".to_string()),
         )
-        .with_auth_context(
-            Some("AKIAI44QH8DHBEXAMPLE".to_string()),
-            None,
-            None,
-        )
+        .with_auth_context(Some("AKIAI44QH8DHBEXAMPLE".to_string()), None, None)
         .with_response_status(
             Some("Created".to_string()),
             Some(201),
@@ -132,11 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("/new-project-bucket".to_string()),
             Some("s3.example.com".to_string()),
         )
-        .with_auth_context(
-            Some("AKIA6ODQ552EXAMPLE".to_string()),
-            None,
-            None,
-        )
+        .with_auth_context(Some("AKIA6ODQ552EXAMPLE".to_string()), None, None)
         .with_response_status(
             Some("Created".to_string()),
             Some(201),
@@ -155,11 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("/big-data/datasets/logs-2024.tar.gz".to_string()),
             Some("s3.example.com".to_string()),
         )
-        .with_auth_context(
-            Some("AKIAYVP4CIPPEREXAMPLE".to_string()),
-            None,
-            None,
-        )
+        .with_auth_context(Some("AKIAYVP4CIPPEREXAMPLE".to_string()), None, None)
         .with_response_status(
             Some("OK".to_string()),
             Some(200),
@@ -192,8 +175,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match list_audit_targets() {
         Ok(targets) => {
             for target in targets {
-                println!("  • {} ({}): enabled={}, running={}", 
-                    target.id, target.target_type, target.enabled, target.running);
+                println!(
+                    "  • {} ({}): enabled={}, running={}",
+                    target.id, target.target_type, target.enabled, target.running
+                );
                 if let Some(error) = &target.last_error {
                     println!("    Last error: {}", error);
                 }
@@ -212,11 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some("/temp-bucket/old-file.txt".to_string()),
             Some("s3.example.com".to_string()),
         )
-        .with_auth_context(
-            Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            Some("admin".to_string()),
-            None,
-        );
+        .with_auth_context(Some("AKIAIOSFODNN7EXAMPLE".to_string()), Some("admin".to_string()), None);
 
     match sample_entry.to_json_pretty() {
         Ok(json) => {

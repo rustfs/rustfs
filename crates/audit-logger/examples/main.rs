@@ -14,10 +14,7 @@
 
 //! Example demonstrating the RustFS audit system usage
 
-use rustfs_audit_logger::{
-    audit_logger, initialize, log_audit_entry, AuditConfig, AuditLogEntry, AuditTargetConfig,
-    ApiDetails,
-};
+use rustfs_audit_logger::{ApiDetails, AuditConfig, AuditLogEntry, AuditTargetConfig, audit_logger, initialize, log_audit_entry};
 use tokio;
 
 #[tokio::main]
@@ -69,8 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let statuses = logger.manager().registry().get_all_target_statuses();
         println!("\nTarget Statuses:");
         for status in statuses {
-            println!("  Target {}: enabled={}, running={}, success_count={}, error_count={}",
-                status.id, status.enabled, status.running, status.success_count, status.error_count);
+            println!(
+                "  Target {}: enabled={}, running={}, success_count={}, error_count={}",
+                status.id, status.enabled, status.running, status.success_count, status.error_count
+            );
             if let Some(error) = &status.last_error {
                 println!("    Last error: {}", error);
             }

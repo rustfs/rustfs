@@ -19,10 +19,10 @@ use crate::error::{AuditError, AuditResult};
 use crate::registry::{AuditTargetConfig, TargetRegistry, TargetStatus};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, RwLock as AsyncRwLock};
+use tokio::sync::{RwLock as AsyncRwLock, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the audit system
@@ -118,7 +118,7 @@ impl AuditSystem {
     pub fn new(registry: Arc<TargetRegistry>, config: AuditConfig) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        
+
         let stats = Arc::new(RwLock::new(AuditStats {
             entries_processed: 0,
             entries_dropped: 0,
@@ -128,18 +128,18 @@ impl AuditSystem {
             start_time: chrono::Utc::now(),
             last_activity: None,
         }));
-        
+
         let config_arc = Arc::new(AsyncRwLock::new(config.clone()));
-        
+
         // Start worker task
         let worker_registry = registry.clone();
         let worker_config = config_arc.clone();
         let worker_stats = stats.clone();
-        
+
         tokio::spawn(async move {
             Self::worker_task(worker_registry, worker_config, worker_stats, cmd_rx, shutdown_rx).await;
         });
-        
+
         Self {
             cmd_tx,
             registry,
@@ -148,7 +148,7 @@ impl AuditSystem {
             shutdown_tx: Arc::new(AsyncRwLock::new(Some(shutdown_tx))),
         }
     }
-    
+
     /// Log an audit entry
     pub async fn log(&self, entry: Arc<AuditEntry>) -> AuditResult<()> {
         // Check if system is enabled
@@ -156,47 +156,49 @@ impl AuditSystem {
             debug!("Audit system disabled, dropping entry");
             return Ok(());
         }
-        
+
         // Apply header redaction
         let mut entry = (*entry).clone();
         let blacklist = &self.config.read().await.redaction.headers_blacklist;
         entry.redact_headers(blacklist);
-        
+
         // Send to worker
-        self.cmd_tx.send(AuditCommand::LogEntry(Arc::new(entry)))
+        self.cmd_tx
+            .send(AuditCommand::LogEntry(Arc::new(entry)))
             .map_err(|_| AuditError::channel("Failed to send audit entry to worker"))?;
-        
+
         Ok(())
     }
-    
+
     /// Get system statistics
     pub async fn get_stats(&self) -> AuditResult<AuditStats> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(AuditCommand::GetStats(tx))
+        self.cmd_tx
+            .send(AuditCommand::GetStats(tx))
             .map_err(|_| AuditError::channel("Failed to request stats"))?;
-        
+
         rx.await.map_err(|_| AuditError::channel("Failed to receive stats"))
     }
-    
+
     /// Update system configuration
     pub async fn update_config(&self, new_config: AuditConfig) -> AuditResult<()> {
         *self.config.write().await = new_config;
         info!("Audit system configuration updated");
         Ok(())
     }
-    
+
     /// Get current configuration
     pub async fn get_config(&self) -> AuditConfig {
         self.config.read().await.clone()
     }
-    
+
     /// Start the audit system
     pub async fn start(&self) -> AuditResult<()> {
         info!("Starting audit system");
         // System is automatically started when created
         Ok(())
     }
-    
+
     /// Pause audit logging
     pub async fn pause(&self) -> AuditResult<()> {
         let mut config = self.config.write().await;
@@ -204,7 +206,7 @@ impl AuditSystem {
         info!("Audit system paused");
         Ok(())
     }
-    
+
     /// Resume audit logging
     pub async fn resume(&self) -> AuditResult<()> {
         let mut config = self.config.write().await;
@@ -212,33 +214,33 @@ impl AuditSystem {
         info!("Audit system resumed");
         Ok(())
     }
-    
+
     /// Shutdown the audit system gracefully
     pub async fn close(&self) -> AuditResult<()> {
         info!("Shutting down audit system");
-        
+
         // Send shutdown command
         if let Err(_) = self.cmd_tx.send(AuditCommand::Shutdown) {
             warn!("Failed to send shutdown command to worker");
         }
-        
+
         // Trigger shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.write().await.take() {
             let _ = shutdown_tx.send(());
         }
-        
+
         // Close all targets
         self.registry.close_all().await?;
-        
+
         info!("Audit system shutdown complete");
         Ok(())
     }
-    
+
     /// Get target registry
     pub fn registry(&self) -> &Arc<TargetRegistry> {
         &self.registry
     }
-    
+
     /// Worker task for processing audit entries
     async fn worker_task(
         registry: Arc<TargetRegistry>,
@@ -248,13 +250,11 @@ impl AuditSystem {
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
         info!("Audit system worker started");
-        
+
         let mut batch = Vec::new();
-        let batch_timeout = Duration::from_millis(
-            config.read().await.performance.batch_timeout_ms
-        );
+        let batch_timeout = Duration::from_millis(config.read().await.performance.batch_timeout_ms);
         let mut last_flush = Instant::now();
-        
+
         loop {
             tokio::select! {
                 // Process commands
@@ -262,14 +262,14 @@ impl AuditSystem {
                     match cmd {
                         Some(AuditCommand::LogEntry(entry)) => {
                             batch.push(entry);
-                            
+
                             // Update queue size
                             {
                                 let mut s = stats.write();
                                 s.current_queue_size = batch.len();
                                 s.last_activity = Some(chrono::Utc::now());
                             }
-                            
+
                             // Check if we should flush the batch
                             let batch_size = config.read().await.performance.batch_size;
                             if batch.len() >= batch_size || last_flush.elapsed() >= batch_timeout {
@@ -295,7 +295,7 @@ impl AuditSystem {
                         }
                     }
                 }
-                
+
                 // Periodic batch flush
                 _ = tokio::time::sleep(batch_timeout) => {
                     if !batch.is_empty() && last_flush.elapsed() >= batch_timeout {
@@ -303,7 +303,7 @@ impl AuditSystem {
                         last_flush = Instant::now();
                     }
                 }
-                
+
                 // Shutdown signal
                 _ = &mut shutdown_rx => {
                     info!("Worker received shutdown signal");
@@ -311,41 +311,35 @@ impl AuditSystem {
                 }
             }
         }
-        
+
         // Flush remaining entries
         if !batch.is_empty() {
             Self::flush_batch(&registry, &stats, &mut batch).await;
         }
-        
+
         info!("Audit system worker stopped");
     }
-    
+
     /// Flush a batch of audit entries
-    async fn flush_batch(
-        registry: &Arc<TargetRegistry>,
-        stats: &Arc<RwLock<AuditStats>>,
-        batch: &mut Vec<Arc<AuditEntry>>,
-    ) {
+    async fn flush_batch(registry: &Arc<TargetRegistry>, stats: &Arc<RwLock<AuditStats>>, batch: &mut Vec<Arc<AuditEntry>>) {
         if batch.is_empty() {
             return;
         }
-        
+
         let start_time = Instant::now();
         let batch_size = batch.len();
-        
+
         // Dispatch to all targets concurrently
         let mut tasks = Vec::new();
         for entry in batch.drain(..) {
             let registry_clone = registry.clone();
-            tasks.push(tokio::spawn(async move {
-                registry_clone.dispatch(entry).await
-            }));
+            tasks.push(tokio::spawn(async move { registry_clone.dispatch(entry).await }));
         }
-        
+
         // Wait for all dispatches to complete
         let mut success_count = 0;
         let mut error_count = 0;
-        
+
         for task in tasks {
             match task.await {
                 Ok(results) => {
@@ -365,7 +359,7 @@ impl AuditSystem {
                 }
             }
         }
-        
+
         // Update statistics
         let processing_time = start_time.elapsed();
         {
@@ -373,7 +367,7 @@ impl AuditSystem {
             s.entries_processed += success_count;
             s.entries_dropped += error_count;
             s.current_queue_size = 0;
-            
+
             // Update average processing time (simple moving average)
             let new_time_ns = processing_time.as_nanos() as u64 / batch_size as u64;
             if s.avg_processing_time_ns == 0 {
@@ -382,7 +376,7 @@ impl AuditSystem {
                 s.avg_processing_time_ns = (s.avg_processing_time_ns * 9 + new_time_ns) / 10;
             }
         }
-        
+
         debug!(
             "Processed batch of {} entries in {:?} (success: {}, errors: {})",
             batch_size, processing_time, success_count, error_count
@@ -396,11 +390,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_blacklist() -> Vec<String> {
-    vec![
-        "Authorization".to_string(),
-        "Cookie".to_string(),
-        "X-Api-Key".to_string(),
-    ]
+    vec!["Authorization".to_string(), "Cookie".to_string(), "X-Api-Key".to_string()]
 }
 
 fn default_channel_buffer() -> usize {
@@ -461,14 +451,14 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio_test;
-    
+
     // Mock target for testing
     struct MockTarget {
         id: String,
         counter: Arc<AtomicUsize>,
         should_fail: Arc<AtomicBool>,
     }
-    
+
     #[async_trait]
     impl AuditTarget for MockTarget {
         async fn send(&self, _entry: Arc<AuditEntry>) -> crate::error::TargetResult<()> {
@@ -479,16 +469,30 @@ mod tests {
                 Ok(())
             }
         }
-        
-        async fn start(&self) -> crate::error::TargetResult<()> { Ok(()) }
-        async fn pause(&self) -> crate::error::TargetResult<()> { Ok(()) }
-        async fn resume(&self) -> crate::error::TargetResult<()> { Ok(()) }
-        async fn close(&self) -> crate::error::TargetResult<()> { Ok(()) }
-        
-        fn id(&self) -> &str { &self.id }
-        fn target_type(&self) -> &str { "mock" }
-        fn is_enabled(&self) -> bool { true }
-        
+
+        async fn start(&self) -> crate::error::TargetResult<()> {
+            Ok(())
+        }
+        async fn pause(&self) -> crate::error::TargetResult<()> {
+            Ok(())
+        }
+        async fn resume(&self) -> crate::error::TargetResult<()> {
+            Ok(())
+        }
+        async fn close(&self) -> crate::error::TargetResult<()> {
+            Ok(())
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn target_type(&self) -> &str {
+            "mock"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
         fn status(&self) -> TargetStatus {
             TargetStatus {
                 id: self.id.clone(),
@@ -504,12 +508,12 @@ mod tests {
             }
         }
     }
-    
+
     struct MockFactory {
         counter: Arc<AtomicUsize>,
         should_fail: Arc<AtomicBool>,
     }
-    
+
     #[async_trait]
     impl AuditTargetFactory for MockFactory {
         async fn create_target(&self, config: &AuditTargetConfig) -> crate::error::TargetResult<Box<dyn AuditTarget>> {
@@ -519,28 +523,28 @@ mod tests {
                 should_fail: self.should_fail.clone(),
             }))
         }
-        
+
         fn validate_config(&self, _config: &AuditTargetConfig) -> crate::error::TargetResult<()> {
             Ok(())
         }
-        
+
         fn supported_types(&self) -> Vec<&'static str> {
             vec!["mock"]
         }
     }
-    
+
     #[tokio::test]
     async fn test_audit_system_basic_operations() {
         let counter = Arc::new(AtomicUsize::new(0));
         let should_fail = Arc::new(AtomicBool::new(false));
-        
+
         let factory = Arc::new(MockFactory {
             counter: counter.clone(),
             should_fail: should_fail.clone(),
         });
-        
+
         let registry = Arc::new(TargetRegistry::new(factory));
-        
+
         // Add a mock target
         let config = AuditTargetConfig {
             id: "test-target".to_string(),
@@ -549,52 +553,52 @@ mod tests {
             args: serde_json::Value::Object(serde_json::Map::new()),
         };
         registry.add_target(config).await.unwrap();
-        
+
         let audit_config = AuditConfig::default();
         let system = AuditSystem::new(registry, audit_config);
-        
+
         // Log some entries
         for i in 0..5 {
             let entry = Arc::new(AuditEntry::for_s3_operation(
                 "s3:GetObject",
-                "GetObject", 
+                "GetObject",
                 Some("test-bucket"),
                 Some(&format!("test-object-{}", i)),
             ));
             system.log(entry).await.unwrap();
         }
-        
+
         // Wait a bit for processing
         tokio::time::sleep(Duration::from_millis(200)).await;
-        
+
         // Check that entries were processed
         let stats = system.get_stats().await.unwrap();
         assert!(stats.entries_processed > 0);
-        
+
         // Verify target received entries
         assert!(counter.load(Ordering::Relaxed) > 0);
-        
+
         // Shutdown system
         system.close().await.unwrap();
     }
-    
+
     #[tokio::test]
     async fn test_audit_system_pause_resume() {
         let counter = Arc::new(AtomicUsize::new(0));
         let should_fail = Arc::new(AtomicBool::new(false));
-        
+
         let factory = Arc::new(MockFactory {
             counter: counter.clone(),
             should_fail: should_fail.clone(),
         });
-        
+
         let registry = Arc::new(TargetRegistry::new(factory));
         let audit_config = AuditConfig::default();
         let system = AuditSystem::new(registry, audit_config);
-        
+
         // Pause system
         system.pause().await.unwrap();
-        
+
         // Try to log entry (should be dropped)
         let entry = Arc::new(AuditEntry::for_s3_operation(
             "s3:GetObject",
@@ -603,16 +607,16 @@ mod tests {
             Some("test-object"),
         ));
         system.log(entry).await.unwrap();
-        
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         // Should not have processed any entries
         let stats = system.get_stats().await.unwrap();
         assert_eq!(stats.entries_processed, 0);
-        
+
         // Resume and try again
         system.resume().await.unwrap();
-        
+
         let entry = Arc::new(AuditEntry::for_s3_operation(
             "s3:PutObject",
             "PutObject",
@@ -620,9 +624,9 @@ mod tests {
             Some("test-object-2"),
         ));
         system.log(entry).await.unwrap();
-        
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         system.close().await.unwrap();
     }
 }

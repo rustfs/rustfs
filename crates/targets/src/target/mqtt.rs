@@ -129,7 +129,7 @@ where
             let specific_queue_path = base_path.join(unique_dir_name);
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
             let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
+                TargetType::AuditLog => rustfs_config::targets::AUDIT_STORE_EXTENSION,
                 TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
             };
 

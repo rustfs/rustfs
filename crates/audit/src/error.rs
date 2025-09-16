@@ -21,37 +21,37 @@ use thiserror::Error;
 pub enum AuditError {
     #[error("Target error: {0}")]
     Target(#[from] TargetError),
-    
+
     #[error("Target not found: {id}")]
     TargetNotFound { id: String },
-    
+
     #[error("System not initialized")]
     SystemNotInitialized,
-    
+
     #[error("Configuration error: {message}")]
     Configuration { message: String },
-    
+
     #[error("Persistence error: {message}")]
     Persistence { message: String },
-    
+
     #[error("Serialization error: {source}")]
     Serialization {
         #[from]
         source: serde_json::Error,
     },
-    
+
     #[error("Channel error: {message}")]
     Channel { message: String },
-    
+
     #[error("Shutdown error: {message}")]
     Shutdown { message: String },
-    
+
     #[error("Timeout error: operation timed out after {timeout_ms}ms")]
     Timeout { timeout_ms: u64 },
-    
+
     #[error("Rate limit exceeded: {message}")]
     RateLimit { message: String },
-    
+
     #[error("Validation error: {field} - {message}")]
     Validation { field: String, message: String },
 }
@@ -61,40 +61,40 @@ pub enum AuditError {
 pub enum TargetError {
     #[error("Unsupported target type: {target_type}")]
     UnsupportedType { target_type: String },
-    
+
     #[error("Invalid configuration: {message}")]
     InvalidConfig { message: String },
-    
+
     #[error("Target initialization failed: {message}")]
     InitializationFailed { message: String },
-    
+
     #[error("Target operation failed: {message}")]
     OperationFailed { message: String },
-    
+
     #[error("Network error: {message}")]
     Network { message: String },
-    
+
     #[error("Authentication error: {message}")]
     Authentication { message: String },
-    
+
     #[error("Connection error: {message}")]
     Connection { message: String },
-    
+
     #[error("Protocol error: {message}")]
     Protocol { message: String },
-    
+
     #[error("Serialization error: {message}")]
     Serialization { message: String },
-    
+
     #[error("Target is disabled")]
     Disabled,
-    
+
     #[error("Target is shutting down")]
     ShuttingDown,
-    
+
     #[error("Queue full: {current_size}/{max_size}")]
     QueueFull { current_size: usize, max_size: usize },
-    
+
     #[error("Retry limit exceeded: {attempts}/{max_attempts}")]
     RetryLimitExceeded { attempts: u32, max_attempts: u32 },
 }
@@ -106,25 +106,19 @@ pub type TargetResult<T> = Result<T, TargetError>;
 impl AuditError {
     /// Create a configuration error
     pub fn config<S: Into<String>>(message: S) -> Self {
-        AuditError::Configuration {
-            message: message.into(),
-        }
+        AuditError::Configuration { message: message.into() }
     }
-    
+
     /// Create a persistence error
     pub fn persistence<S: Into<String>>(message: S) -> Self {
-        AuditError::Persistence {
-            message: message.into(),
-        }
+        AuditError::Persistence { message: message.into() }
     }
-    
+
     /// Create a channel error
     pub fn channel<S: Into<String>>(message: S) -> Self {
-        AuditError::Channel {
-            message: message.into(),
-        }
+        AuditError::Channel { message: message.into() }
     }
-    
+
     /// Create a validation error
     pub fn validation<S: Into<String>>(field: S, message: S) -> Self {
         AuditError::Validation {
@@ -132,12 +126,12 @@ impl AuditError {
             message: message.into(),
         }
     }
-    
+
     /// Create a timeout error
     pub fn timeout(timeout_ms: u64) -> Self {
         AuditError::Timeout { timeout_ms }
     }
-    
+
     /// Check if error is recoverable (can retry)
     pub fn is_recoverable(&self) -> bool {
         match self {
@@ -149,7 +143,7 @@ impl AuditError {
             _ => false,
         }
     }
-    
+
     /// Check if error is due to configuration issues
     pub fn is_config_error(&self) -> bool {
         matches!(
@@ -165,32 +159,24 @@ impl AuditError {
 impl TargetError {
     /// Create an invalid config error
     pub fn invalid_config<S: Into<String>>(message: S) -> Self {
-        TargetError::InvalidConfig {
-            message: message.into(),
-        }
+        TargetError::InvalidConfig { message: message.into() }
     }
-    
+
     /// Create a network error
     pub fn network<S: Into<String>>(message: S) -> Self {
-        TargetError::Network {
-            message: message.into(),
-        }
+        TargetError::Network { message: message.into() }
     }
-    
+
     /// Create an operation failed error
     pub fn operation_failed<S: Into<String>>(message: S) -> Self {
-        TargetError::OperationFailed {
-            message: message.into(),
-        }
+        TargetError::OperationFailed { message: message.into() }
     }
-    
+
     /// Create an initialization failed error
     pub fn initialization_failed<S: Into<String>>(message: S) -> Self {
-        TargetError::InitializationFailed {
-            message: message.into(),
-        }
+        TargetError::InitializationFailed { message: message.into() }
     }
-    
+
     /// Check if the error indicates the target should be disabled
     pub fn should_disable_target(&self) -> bool {
         match self {
@@ -201,7 +187,7 @@ impl TargetError {
             _ => false,
         }
     }
-    
+
     /// Check if error is temporary and retryable
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -270,36 +256,36 @@ impl From<rumqttc::ClientError> for TargetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_error_creation() {
         let config_err = AuditError::config("Invalid target ID");
         assert!(config_err.is_config_error());
         assert!(!config_err.is_recoverable());
-        
+
         let network_err = AuditError::Target(TargetError::network("Connection refused"));
         assert!(network_err.is_recoverable());
         assert!(!network_err.is_config_error());
     }
-    
+
     #[test]
     fn test_target_error_classification() {
         let invalid_config = TargetError::invalid_config("Missing endpoint");
         assert!(invalid_config.should_disable_target());
         assert!(!invalid_config.is_retryable());
-        
+
         let network_error = TargetError::network("Timeout");
         assert!(!network_error.should_disable_target());
         assert!(network_error.is_retryable());
     }
-    
+
     #[test]
     fn test_error_display() {
         let err = AuditError::TargetNotFound {
             id: "webhook-1".to_string(),
         };
         assert_eq!(err.to_string(), "Target not found: webhook-1");
-        
+
         let target_err = TargetError::QueueFull {
             current_size: 1000,
             max_size: 1000,
