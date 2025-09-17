@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 
 /// The default configuration collection of webhooks，
 /// Initialized only once during the program life cycle, enabling high-performance lazy loading.
-pub static DEFAULT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
+pub static DEFAULT_NOTIFY_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
@@ -70,7 +70,7 @@ pub static DEFAULT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
 });
 
 /// MQTT's default configuration collection
-pub static DEFAULT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
+pub static DEFAULT_NOTIFY_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
