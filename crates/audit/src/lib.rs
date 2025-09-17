@@ -18,36 +18,29 @@
 //!
 //! ## Features
 //!
-//! - **Multi-Target Dispatch**: Send audit logs to MQTT, Webhook, and other configurable targets
+//! - **Multi-Target Dispatch**: Integrates with `rustfs-targets` for MQTT, Webhook, and extensible targets
 //! - **High Performance**: Async processing with batching and concurrent dispatch (3k EPS/node, P99 < 30ms)
-//! - **S3 Compatible**: Audit log format matches AWS S3 and MinIO audit logs
-//! - **Hot Reload**: Runtime configuration updates without restart
-//! - **Error Isolation**: Individual target failures don't affect other targets
-//! - **Header Redaction**: Configurable sensitive header masking for security
+//! - **S3 Compatible**: Audit log format matches AWS S3 and MinIO audit logs exactly
+//! - **Configuration Integration**: Uses `rustfs-config` constants and `rustfs-ecstore` for persistence
+//! - **Environment Priority**: ENV > file instance > file default configuration precedence
+//! - **Hot Reload**: Runtime configuration updates from `.rustfs.sys` without restart
+//! - **Error Isolation**: Individual target failures don't affect other targets or main S3 operations
+//! - **Header Redaction**: Configurable sensitive header masking for security compliance
 //! - **Global Integration**: OnceCell-based singleton for easy system-wide integration
 //!
 //! ## Basic Usage
 //!
 //! ```rust
 //! use rustfs_audit::{
-//!     initialize_audit_logger, log_audit_entry, s3_events,
-//!     AuditConfig, AuditTargetConfig, DefaultAuditTargetFactory
+//!     initialize_audit_system, log_audit_entry, s3_events,
+//!     AuditConfig, load_config_from_env_and_ecstore
 //! };
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // 1. Create configuration
-//!     let mut config = AuditConfig::default();
-//!     config.targets.push(AuditTargetConfig {
-//!         id: "webhook-audit".to_string(),
-//!         target_type: "webhook".to_string(),
-//!         enabled: true,
-//!         args: serde_json::json!({
-//!             "url": "http://localhost:8080/audit",
-//!             "timeout_ms": 5000
-//!         }),
-//!     });
+//!     // 1. Load configuration with ENV precedence
+//!     let config = load_config_from_env_and_ecstore().await?;
 //!     
 //!     // 2. Initialize global audit system
 //!     let factory = Arc::new(DefaultAuditTargetFactory::new());
@@ -118,6 +111,7 @@
 //! }
 //! ```
 
+pub mod config;
 pub mod entity;
 pub mod error;
 pub mod global;
@@ -126,16 +120,14 @@ pub mod system;
 pub mod targets;
 
 // Re-export main types for easy access
-pub use entity::{ApiDetails, AuditEntry, ObjectVersion};
+pub use config::{AuditConfig, AuditTargetConfig, load_config_from_env_and_ecstore, load_config_with_prefix, PerformanceConfig, RedactionConfig};
+pub use entity::{ApiDetails, AuditEntry, ObjectVersion, s3_events};
 pub use error::{AuditError, AuditResult, TargetError, TargetResult};
 pub use global::{
-    AuditLogger, audit_logger, close_audit_system, create_s3_audit_entry, get_audit_stats, initialize_audit_logger,
-    is_audit_system_initialized, list_audit_targets, log_audit, log_audit_entry, pause_audit_system, resume_audit_system,
-    s3_events, start_audit_system,
+    AuditLogger, audit_logger, initialize_audit_system, log_audit_entry,
 };
-pub use registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetRegistry, TargetStatus};
-pub use system::{AuditConfig, AuditStats, AuditSystem, PerformanceConfig, RedactionConfig};
-pub use targets::{DefaultAuditTargetFactory, MqttAuditTarget, WebhookAuditTarget};
+pub use registry::{DefaultAuditTargetFactory, TargetRegistry, TargetState, TargetStats, AuditTargetFactory};
+pub use system::{AuditStats, AuditSystem};
 
 // Re-export rustfs-targets types for convenience
 pub use rustfs_targets::{EventName, Target, TargetLog};

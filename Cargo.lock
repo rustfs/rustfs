@@ -6074,6 +6074,7 @@ dependencies = [
  "parking_lot",
  "reqwest",
  "rumqttc",
+ "rustfs-config",
  "rustfs-ecstore",
  "rustfs-targets",
  "serde",

@@ -28,6 +28,7 @@ categories = ["web-programming", "development-tools::profiling", "asynchronous",
 [dependencies]
 rustfs-targets = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-config = { workspace = true, features = ["audit", "constants"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
