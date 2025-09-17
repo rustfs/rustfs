@@ -1209,6 +1209,7 @@ impl S3 for FS {
             name: v2.name,
             prefix: v2.prefix,
             max_keys: v2.max_keys,
+            common_prefixes: v2.common_prefixes,
             ..Default::default()
         }))
     }
