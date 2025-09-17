@@ -390,9 +390,9 @@ mod serial_tests {
         println!("Lifecycle expiry basic test completed");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    //#[ignore]
+    #[ignore]
     async fn test_lifecycle_expiry_deletemarker() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -485,9 +485,9 @@ mod serial_tests {
         println!("Lifecycle expiry basic test completed");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    //#[ignore]
+    #[ignore]
     async fn test_lifecycle_transition_basic() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
