@@ -18,12 +18,11 @@
 //! It integrates with existing RustFS configuration constants and persistence infrastructure.
 
 use crate::error::AuditError;
-use rustfs_config::audit::{webhook::*, mqtt::*};
+use rustfs_config::audit::{mqtt::*, webhook::*};
 use rustfs_config::*;
-use rustfs_config::{EnableState, ENABLE_KEY};
+use rustfs_config::ENABLE_KEY;
 use rustfs_ecstore::config::audit::{DEFAULT_AUDIT_MQTT_KVS, DEFAULT_AUDIT_WEBHOOK_KVS};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
 use tracing::{debug, info, warn};
 
@@ -119,7 +118,7 @@ impl ConfigLoader {
     }
 
     /// Load configuration with precedence: ENV > file instance > file default
-    /// 
+    ///
     /// This method:
     /// 1. Loads default configuration from DEFAULT_AUDIT_*_KVS templates
     /// 2. Overlays file-based instance configuration
@@ -280,13 +279,19 @@ impl ConfigLoader {
 
         if let Ok(keep_alive) = env::var(ENV_AUDIT_MQTT_KEEP_ALIVE_INTERVAL) {
             if let Ok(interval_ms) = keep_alive.trim_end_matches('s').parse::<u64>() {
-                args.insert("keep_alive_ms".to_string(), serde_json::Value::Number(serde_json::Number::from(interval_ms * 1000)));
+                args.insert(
+                    "keep_alive_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(interval_ms * 1000)),
+                );
             }
         }
 
         if let Ok(reconnect) = env::var(ENV_AUDIT_MQTT_RECONNECT_INTERVAL) {
             if let Ok(interval_ms) = reconnect.trim_end_matches('s').parse::<u64>() {
-                args.insert("reconnect_interval_ms".to_string(), serde_json::Value::Number(serde_json::Number::from(interval_ms * 1000)));
+                args.insert(
+                    "reconnect_interval_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(interval_ms * 1000)),
+                );
             }
         }
 
@@ -310,7 +315,8 @@ impl ConfigLoader {
 
     /// Check if a target is enabled in KVS
     fn is_enabled_from_kvs(&self, kvs: &rustfs_ecstore::config::KVS) -> bool {
-        kvs.0.iter()
+        kvs.0
+            .iter()
             .find(|kv| kv.key == ENABLE_KEY)
             .map(|kv| kv.value.to_lowercase() == "on" || kv.value.to_lowercase() == "true")
             .unwrap_or(false)
@@ -335,7 +341,10 @@ impl ConfigLoader {
                 }
                 WEBHOOK_HTTP_TIMEOUT => {
                     if let Ok(timeout_ms) = kv.value.trim_end_matches('s').parse::<u64>() {
-                        args.insert("timeout_ms".to_string(), serde_json::Value::Number(serde_json::Number::from(timeout_ms * 1000)));
+                        args.insert(
+                            "timeout_ms".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(timeout_ms * 1000)),
+                        );
                     }
                 }
                 WEBHOOK_MAX_RETRY => {
@@ -453,7 +462,7 @@ mod tests {
         // Should have webhook target from environment
         let webhook = config.targets.iter().find(|t| t.kind == "webhook");
         assert!(webhook.is_some());
-        
+
         let webhook = webhook.unwrap();
         assert_eq!(webhook.id, "env-webhook");
         assert!(webhook.enabled);
@@ -476,7 +485,7 @@ mod tests {
         // Should have MQTT target from environment
         let mqtt = config.targets.iter().find(|t| t.kind == "mqtt");
         assert!(mqtt.is_some());
-        
+
         let mqtt = mqtt.unwrap();
         assert_eq!(mqtt.id, "env-mqtt");
         assert!(mqtt.enabled);
@@ -498,7 +507,7 @@ mod tests {
         let webhook = config.targets.iter().find(|t| t.kind == "webhook");
         assert!(webhook.is_some());
 
-        // Clean up environment  
+        // Clean up environment
         env::remove_var("CUSTOM_AUDIT_WEBHOOK_ENABLED");
         env::remove_var("CUSTOM_AUDIT_WEBHOOK_ENDPOINT");
     }

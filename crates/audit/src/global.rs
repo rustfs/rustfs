@@ -16,7 +16,8 @@
 use crate::entity::AuditEntry;
 use crate::error::{AuditError, AuditResult};
 use crate::registry::{AuditTargetFactory, TargetRegistry};
-use crate::system::{AuditConfig, AuditStats, AuditSystem};
+use crate::system::{AuditStats, AuditSystem};
+use crate::{AuditConfig, AuditTargetConfig};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -103,7 +104,7 @@ impl AuditLogger {
     }
 
     /// Add a new target
-    pub async fn add_target(&self, config: crate::registry::AuditTargetConfig) -> AuditResult<()> {
+    pub async fn add_target(&self, config: crate::AuditTargetConfig) -> AuditResult<()> {
         self.registry.add_target(config).await
     }
 
@@ -269,7 +270,7 @@ pub async fn get_audit_stats() -> AuditResult<AuditStats> {
 }
 
 /// Add a target to the global system
-pub async fn add_audit_target(config: crate::registry::AuditTargetConfig) -> AuditResult<()> {
+pub async fn add_audit_target(config: crate::AuditTargetConfig) -> AuditResult<()> {
     match audit_logger() {
         Some(logger) => logger.add_target(config).await,
         None => Err(AuditError::SystemNotInitialized),

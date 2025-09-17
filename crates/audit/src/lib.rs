@@ -120,13 +120,13 @@ pub mod system;
 pub mod targets;
 
 // Re-export main types for easy access
-pub use config::{AuditConfig, AuditTargetConfig, load_config_from_env_and_ecstore, load_config_with_prefix, PerformanceConfig, RedactionConfig};
+pub use config::{
+    AuditConfig, AuditTargetConfig, PerformanceConfig, RedactionConfig, load_config_from_env_and_ecstore, load_config_with_prefix,
+};
 pub use entity::{ApiDetails, AuditEntry, ObjectVersion, s3_events};
 pub use error::{AuditError, AuditResult, TargetError, TargetResult};
-pub use global::{
-    AuditLogger, audit_logger, initialize_audit_system, log_audit_entry,
-};
-pub use registry::{DefaultAuditTargetFactory, TargetRegistry, TargetState, TargetStats, AuditTargetFactory};
+pub use global::{AuditLogger, audit_logger, initialize_audit_system, log_audit_entry};
+pub use registry::{AuditTargetFactory, DefaultAuditTargetFactory, RegistryStats, TargetRegistry, TargetState, TargetStats};
 pub use system::{AuditStats, AuditSystem};
 
 // Re-export rustfs-targets types for convenience

@@ -21,7 +21,8 @@ pub use mqtt::MqttAuditTarget;
 pub use webhook::WebhookAuditTarget;
 
 use crate::error::{TargetError, TargetResult};
-use crate::registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory};
+use crate::registry::{AuditTarget, AuditTargetFactory};
+use crate::AuditTargetConfig;
 use async_trait::async_trait;
 
 /// Default audit target factory that supports webhook and MQTT targets

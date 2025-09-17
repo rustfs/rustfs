@@ -18,14 +18,17 @@
 //! rustfs-targets infrastructure, supporting MQTT, Webhook, and extensible target types.
 
 use crate::config::AuditTargetConfig;
-use crate::entity::AuditEntry;
+use crate::entity::AuditEntry;  
 use crate::error::AuditError;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use rustfs_targets::{Target, TargetLog, EventName};
-use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use rustfs_targets::{
+    arn::TargetID, EntityTarget, EventName, Store, StoreError, Target, TargetError, TargetLog,
+    store::Key,
+};
+
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -71,6 +74,7 @@ pub enum TargetState {
 }
 
 /// Mock target implementation for cases where rustfs-targets is not available
+#[derive(Debug, Clone)]
 pub struct MockTarget {
     id: String,
     target_type: String,
@@ -79,29 +83,50 @@ pub struct MockTarget {
 
 impl MockTarget {
     pub fn new(id: String, target_type: String, config: serde_json::Value) -> Self {
-        Self {
-            id,
-            target_type,
-            config,
-        }
+        Self { id, target_type, config }
     }
 }
 
 #[async_trait]
-impl Target for MockTarget {
-    async fn init(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+impl Target<AuditEntry> for MockTarget {
+    fn id(&self) -> TargetID {
+        TargetID::from_str(&self.id).unwrap_or_default()
+    }
+
+    async fn is_active(&self) -> Result<bool, TargetError> {
+        Ok(true)
+    }
+
+    async fn save(&self, event: Arc<EntityTarget<AuditEntry>>) -> Result<(), TargetError> {
+        debug!("Mock target {} saving audit entry: {:?}", self.id, event.object_name);
+        Ok(())
+    }
+
+    async fn send_from_store(&self, _key: Key) -> Result<(), TargetError> {
+        debug!("Mock target {} sending from store", self.id);
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), TargetError> {
+        debug!("Closing mock target: {}", self.id);
+        Ok(())
+    }
+
+    async fn init(&self) -> Result<(), TargetError> {
         debug!("Initializing mock target: {} ({})", self.id, self.target_type);
         Ok(())
     }
 
-    async fn save(&self, log: &TargetLog<AuditEntry>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Mock target {} saving {} audit entries", self.id, log.records.len());
-        Ok(())
+    fn store(&self) -> Option<&(dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send + Sync)> {
+        None
     }
 
-    async fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Closing mock target: {}", self.id);
-        Ok(())
+    fn clone_dyn(&self) -> Box<dyn Target<AuditEntry> + Send + Sync> {
+        Box::new(self.clone())
+    }
+    
+    fn is_enabled(&self) -> bool {
+        true
     }
 }
 
@@ -114,7 +139,7 @@ pub struct AuditTargetWrapper {
     /// Whether target is enabled
     pub enabled: bool,
     /// Underlying rustfs-targets Target implementation
-    pub target: Box<dyn Target + Send + Sync>,
+    pub target: Box<dyn Target<AuditEntry> + Send + Sync>,
     /// Target lifecycle state
     pub state: Arc<RwLock<TargetState>>,
     /// Performance statistics
@@ -126,12 +151,7 @@ pub struct AuditTargetWrapper {
 
 impl AuditTargetWrapper {
     /// Create a new audit target wrapper
-    pub fn new(
-        id: String,
-        kind: String,
-        enabled: bool,
-        target: Box<dyn Target + Send + Sync>,
-    ) -> Self {
+    pub fn new(id: String, kind: String, enabled: bool, target: Box<dyn Target + Send + Sync>) -> Self {
         Self {
             id,
             kind,
@@ -147,7 +167,7 @@ impl AuditTargetWrapper {
     /// Start the target
     pub async fn start(&self) -> Result<(), AuditError> {
         debug!("Starting audit target: {}", self.id);
-        
+
         match self.target.init().await {
             Ok(_) => {
                 *self.state.write().await = TargetState::Running;
@@ -173,7 +193,7 @@ impl AuditTargetWrapper {
     /// Resume the target (start accepting logs again)
     pub async fn resume(&self) -> Result<(), AuditError> {
         debug!("Resuming audit target: {}", self.id);
-        
+
         let current_state = self.state.read().await.clone();
         match current_state {
             TargetState::Paused => {
@@ -199,7 +219,7 @@ impl AuditTargetWrapper {
     /// Stop the target and clean up resources
     pub async fn stop(&self) -> Result<(), AuditError> {
         debug!("Stopping audit target: {}", self.id);
-        
+
         match self.target.close().await {
             Ok(_) => {
                 *self.state.write().await = TargetState::Stopped;
@@ -235,7 +255,7 @@ impl AuditTargetWrapper {
                 let stats = self.stats.clone();
 
                 let result = target.save(&target_log).await;
-                
+
                 match result {
                     Ok(_) => {
                         success_counter.fetch_add(1, Ordering::Relaxed);
@@ -277,7 +297,7 @@ impl AuditTargetWrapper {
         if !self.enabled {
             return false;
         }
-        
+
         let state = self.state.read().await;
         matches!(*state, TargetState::Running)
     }
@@ -297,11 +317,11 @@ impl AuditTargetWrapper {
 #[async_trait]
 pub trait AuditTargetFactory: Send + Sync {
     /// Create a target from configuration
-    async fn create_target(&self, config: &AuditTargetConfig) -> Result<Box<dyn Target + Send + Sync>, AuditError>;
-    
+    async fn create_target(&self, config: &AuditTargetConfig) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, AuditError>;
+
     /// Validate target configuration
     fn validate_config(&self, config: &AuditTargetConfig) -> Result<(), AuditError>;
-    
+
     /// List supported target types
     fn supported_types(&self) -> Vec<String>;
 }
@@ -317,12 +337,12 @@ impl DefaultAuditTargetFactory {
 
 #[async_trait]
 impl AuditTargetFactory for DefaultAuditTargetFactory {
-    async fn create_target(&self, config: &AuditTargetConfig) -> Result<Box<dyn Target + Send + Sync>, AuditError> {
+    async fn create_target(&self, config: &AuditTargetConfig) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, AuditError> {
         debug!("Creating audit target: {} ({})", config.id, config.kind);
-        
+
         // Validate configuration first
         self.validate_config(config)?;
-        
+
         match config.kind.as_str() {
             "webhook" | "mqtt" => {
                 // For now, create mock targets since rustfs-targets integration may need to be built
@@ -330,9 +350,7 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
                 let target = MockTarget::new(config.id.clone(), config.kind.clone(), config.args.clone());
                 Ok(Box::new(target))
             }
-            _ => {
-                Err(AuditError::UnsupportedTargetType(config.kind.clone()))
-            }
+            _ => Err(AuditError::UnsupportedTargetType(config.kind.clone())),
         }
     }
 
@@ -345,30 +363,34 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
         // Validate that target_type is AuditLog for audit targets
         if let Some(target_type) = config.args.get("target_type") {
             if target_type != "AuditLog" {
-                return Err(AuditError::ConfigurationError(
-                    format!("Target {} must have target_type 'AuditLog', got '{}'", config.id, target_type)
-                ));
+                return Err(AuditError::ConfigurationError(format!(
+                    "Target {} must have target_type 'AuditLog', got '{}'",
+                    config.id, target_type
+                )));
             }
         } else {
-            return Err(AuditError::ConfigurationError(
-                format!("Target {} missing required 'target_type' field", config.id)
-            ));
+            return Err(AuditError::ConfigurationError(format!(
+                "Target {} missing required 'target_type' field",
+                config.id
+            )));
         }
 
         // Target-specific validation
         match config.kind.as_str() {
             "webhook" => {
                 if config.args.get("url").is_none() {
-                    return Err(AuditError::ConfigurationError(
-                        format!("Webhook target {} missing required 'url' field", config.id)
-                    ));
+                    return Err(AuditError::ConfigurationError(format!(
+                        "Webhook target {} missing required 'url' field",
+                        config.id
+                    )));
                 }
             }
             "mqtt" => {
                 if config.args.get("broker_url").is_none() || config.args.get("topic").is_none() {
-                    return Err(AuditError::ConfigurationError(
-                        format!("MQTT target {} missing required 'broker_url' or 'topic' fields", config.id)
-                    ));
+                    return Err(AuditError::ConfigurationError(format!(
+                        "MQTT target {} missing required 'broker_url' or 'topic' fields",
+                        config.id
+                    )));
                 }
             }
             _ => {} // Other validations can be added here
@@ -411,17 +433,12 @@ impl TargetRegistry {
     /// Add a target to the registry
     pub async fn add_target(&self, config: AuditTargetConfig) -> Result<(), AuditError> {
         info!("Adding audit target: {} ({})", config.id, config.kind);
-        
+
         // Create the target using the factory
         let target = self.factory.create_target(&config).await?;
-        
+
         // Create wrapper
-        let wrapper = Arc::new(AuditTargetWrapper::new(
-            config.id.clone(),
-            config.kind.clone(),
-            config.enabled,
-            target,
-        ));
+        let wrapper = Arc::new(AuditTargetWrapper::new(config.id.clone(), config.kind.clone(), config.enabled, target));
 
         // Initialize the target if enabled
         if config.enabled {
@@ -430,7 +447,7 @@ impl TargetRegistry {
 
         // Add to registry
         self.targets.insert(config.id.clone(), wrapper);
-        
+
         info!("Successfully added audit target: {}", config.id);
         Ok(())
     }
@@ -438,7 +455,7 @@ impl TargetRegistry {
     /// Remove a target from the registry
     pub async fn remove_target(&self, target_id: &str) -> Result<(), AuditError> {
         info!("Removing audit target: {}", target_id);
-        
+
         if let Some((_, wrapper)) = self.targets.remove(target_id) {
             // Stop the target gracefully
             if let Err(e) = wrapper.stop().await {
@@ -454,7 +471,7 @@ impl TargetRegistry {
     /// Enable a target
     pub async fn enable_target(&self, target_id: &str) -> Result<(), AuditError> {
         debug!("Enabling audit target: {}", target_id);
-        
+
         if let Some(wrapper) = self.targets.get(target_id) {
             // Update enabled flag and start target
             let wrapper = wrapper.value();
@@ -471,7 +488,7 @@ impl TargetRegistry {
     /// Disable a target
     pub async fn disable_target(&self, target_id: &str) -> Result<(), AuditError> {
         debug!("Disabling audit target: {}", target_id);
-        
+
         if let Some(wrapper) = self.targets.get(target_id) {
             let wrapper = wrapper.value();
             wrapper.pause().await;
@@ -494,14 +511,14 @@ impl TargetRegistry {
     /// Get all target IDs and their states
     pub async fn list_targets(&self) -> Vec<(String, TargetState, TargetStats)> {
         let mut result = Vec::new();
-        
+
         for entry in self.targets.iter() {
             let wrapper = entry.value();
             let state = wrapper.get_state().await;
             let stats = wrapper.get_stats().await;
             result.push((entry.key().clone(), state, stats));
         }
-        
+
         result
     }
 
@@ -520,15 +537,13 @@ impl TargetRegistry {
     /// Dispatch audit entries to all enabled targets concurrently
     pub async fn dispatch_to_all(&self, entries: Vec<AuditEntry>) -> Vec<Result<(), AuditError>> {
         let mut tasks = Vec::new();
-        
+
         // Collect all enabled targets
         for entry in self.targets.iter() {
             let wrapper = entry.value().clone();
             if wrapper.is_enabled().await {
                 let entries_clone = entries.clone();
-                tasks.push(tokio::spawn(async move {
-                    wrapper.dispatch(entries_clone).await
-                }));
+                tasks.push(tokio::spawn(async move { wrapper.dispatch(entries_clone).await }));
             }
         }
 
@@ -553,7 +568,7 @@ impl TargetRegistry {
     /// Start all targets in the registry
     pub async fn start(&self) -> Result<(), AuditError> {
         info!("Starting audit target registry");
-        
+
         let mut errors = Vec::new();
         for entry in self.targets.iter() {
             let wrapper = entry.value();
@@ -565,7 +580,7 @@ impl TargetRegistry {
         }
 
         *self.state.write().await = TargetState::Running;
-        
+
         if errors.is_empty() {
             info!("Successfully started audit target registry");
             Ok(())
@@ -579,11 +594,11 @@ impl TargetRegistry {
     /// Pause all targets in the registry
     pub async fn pause(&self) {
         info!("Pausing audit target registry");
-        
+
         for entry in self.targets.iter() {
             entry.value().pause().await;
         }
-        
+
         *self.state.write().await = TargetState::Paused;
         info!("Paused audit target registry");
     }
@@ -591,7 +606,7 @@ impl TargetRegistry {
     /// Resume all targets in the registry
     pub async fn resume(&self) -> Result<(), AuditError> {
         info!("Resuming audit target registry");
-        
+
         let mut errors = Vec::new();
         for entry in self.targets.iter() {
             let wrapper = entry.value();
@@ -603,7 +618,7 @@ impl TargetRegistry {
         }
 
         *self.state.write().await = TargetState::Running;
-        
+
         if errors.is_empty() {
             info!("Successfully resumed audit target registry");
             Ok(())
@@ -617,7 +632,7 @@ impl TargetRegistry {
     /// Stop all targets and close the registry
     pub async fn close(&self) -> Result<(), AuditError> {
         info!("Closing audit target registry");
-        
+
         let mut errors = Vec::new();
         for entry in self.targets.iter() {
             if let Err(e) = entry.value().stop().await {
@@ -628,7 +643,7 @@ impl TargetRegistry {
         // Clear all targets
         self.targets.clear();
         *self.state.write().await = TargetState::Stopped;
-        
+
         if errors.is_empty() {
             info!("Successfully closed audit target registry");
             Ok(())
@@ -652,10 +667,7 @@ impl TargetRegistry {
 
 /// Get current timestamp in seconds since Unix epoch
 fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 #[cfg(test)]
@@ -668,16 +680,16 @@ mod tests {
     async fn test_target_registry_creation() {
         let factory = Arc::new(DefaultAuditTargetFactory::new());
         let registry = TargetRegistry::new(factory);
-        
+
         assert_eq!(registry.targets.len(), 0);
         assert!(matches!(registry.get_state().await, TargetState::Stopped));
     }
 
-    #[tokio::test]  
+    #[tokio::test]
     async fn test_factory_supported_types() {
         let factory = DefaultAuditTargetFactory::new();
         let types = factory.supported_types();
-        
+
         assert!(types.contains(&"webhook".to_string()));
         assert!(types.contains(&"mqtt".to_string()));
     }
@@ -685,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn test_factory_config_validation() {
         let factory = DefaultAuditTargetFactory::new();
-        
+
         // Valid webhook config
         let valid_webhook = AuditTargetConfig {
             id: "test-webhook".to_string(),
@@ -696,9 +708,9 @@ mod tests {
                 "url": "https://example.com/webhook"
             }),
         };
-        
+
         assert!(factory.validate_config(&valid_webhook).is_ok());
-        
+
         // Invalid config (missing target_type)
         let invalid_config = AuditTargetConfig {
             id: "test-invalid".to_string(),
@@ -708,9 +720,9 @@ mod tests {
                 "url": "https://example.com/webhook"
             }),
         };
-        
+
         assert!(factory.validate_config(&invalid_config).is_err());
-        
+
         // Invalid config (wrong target_type)
         let wrong_type_config = AuditTargetConfig {
             id: "test-wrong".to_string(),
@@ -721,7 +733,7 @@ mod tests {
                 "url": "https://example.com/webhook"
             }),
         };
-        
+
         assert!(factory.validate_config(&wrong_type_config).is_err());
     }
 
