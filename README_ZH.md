@@ -86,6 +86,8 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 4. **创建存储桶**：使用控制台为您的对象创建新的存储桶。
 5. **上传对象**：您可以直接通过控制台上传文件，或使用 S3 兼容的 API 与您的 RustFS 实例交互。
 
+**注意**：如果你想通过 `https` 来访问 RustFS 实例，请参考 [TLS 配置文档](https://docs.rustfs.com/zh/integration/tls-configured.html)
+
 ## 文档
 
 有关详细文档，包括配置选项、API 参考和高级用法，请访问我们的[文档](https://docs.rustfs.com)。
