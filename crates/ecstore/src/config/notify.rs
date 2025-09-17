@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::config::{KV, KVS};
-use rustfs_config::notify::{
+use rustfs_config::{COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState};
+use rustfs_config::{
     MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL,
     MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
     WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_config::{COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState};
 use std::sync::LazyLock;
 
 /// The default configuration collection of webhooks，

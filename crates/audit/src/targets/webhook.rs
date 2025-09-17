@@ -20,8 +20,8 @@ use crate::registry::{AuditTarget, AuditTargetConfig, TargetStatus};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, error};
@@ -63,11 +63,7 @@ impl WebhookAuditTarget {
             })?
             .to_string();
 
-        let method = args
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("POST")
-            .to_uppercase();
+        let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_uppercase();
 
         // Validate HTTP method
         match method.as_str() {
@@ -85,11 +81,7 @@ impl WebhookAuditTarget {
             .unwrap_or(5000)
             .clamp(100, 60000); // Clamp between 100ms and 60s
 
-        let retries = args
-            .get("retries")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3)
-            .clamp(0, 10) as u32; // Reasonable retry limit
+        let retries = args.get("retries").and_then(|v| v.as_u64()).unwrap_or(3).clamp(0, 10) as u32; // Reasonable retry limit
 
         let headers = args.get("headers").and_then(|v| v.as_object()).map(|obj| {
             obj.iter()
@@ -172,10 +164,7 @@ impl WebhookAuditTarget {
         if let Some(timeout_ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
             if timeout_ms < 100 || timeout_ms > 60000 {
                 return Err(TargetError::InvalidConfig {
-                    message: format!(
-                        "timeout_ms must be between 100 and 60000, got {}",
-                        timeout_ms
-                    ),
+                    message: format!("timeout_ms must be between 100 and 60000, got {}", timeout_ms),
                 });
             }
         }
@@ -193,10 +182,7 @@ impl WebhookAuditTarget {
         if let Some(target_type) = args.get("target_type").and_then(|v| v.as_str()) {
             if target_type != "AuditLog" {
                 return Err(TargetError::InvalidConfig {
-                    message: format!(
-                        "target_type must be 'AuditLog', got '{}'",
-                        target_type
-                    ),
+                    message: format!("target_type must be 'AuditLog', got '{}'", target_type),
                 });
             }
         }
@@ -215,10 +201,9 @@ impl WebhookAuditTarget {
             let mut request = self
                 .client
                 .request(
-                    reqwest::Method::from_bytes(self.method.as_bytes())
-                        .map_err(|e| TargetError::InvalidConfig {
-                            message: format!("Invalid HTTP method: {}", e),
-                        })?,
+                    reqwest::Method::from_bytes(self.method.as_bytes()).map_err(|e| TargetError::InvalidConfig {
+                        message: format!("Invalid HTTP method: {}", e),
+                    })?,
                     &self.url,
                 )
                 .header("Content-Type", "application/json")
@@ -258,14 +243,15 @@ impl WebhookAuditTarget {
                         return Ok(());
                     } else {
                         let status = response.status();
-                        let error_msg = format!("HTTP error: {} {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown"));
-                        
+                        let error_msg =
+                            format!("HTTP error: {} {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown"));
+
                         // For 4xx errors, don't retry (client errors)
                         if status.is_client_error() {
                             self.record_error(&error_msg);
                             return Err(TargetError::OperationFailed { message: error_msg });
                         }
-                        
+
                         last_error = Some(TargetError::OperationFailed { message: error_msg });
                     }
                 }
@@ -281,12 +267,7 @@ impl WebhookAuditTarget {
             // Wait before retry with exponential backoff
             if attempt < self.retries {
                 let backoff_ms = (100 * (1 << attempt)).min(5000); // Cap at 5 seconds
-                debug!(
-                    "Webhook {} failed on attempt {}, retrying in {}ms",
-                    self.id,
-                    attempt + 1,
-                    backoff_ms
-                );
+                debug!("Webhook {} failed on attempt {}, retrying in {}ms", self.id, attempt + 1, backoff_ms);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
@@ -297,7 +278,7 @@ impl WebhookAuditTarget {
         });
 
         self.record_error(&final_error.to_string());
-        
+
         Err(TargetError::RetryLimitExceeded {
             attempts: self.retries + 1,
             max_attempts: self.retries + 1,
@@ -316,12 +297,10 @@ impl WebhookAuditTarget {
     fn update_min_time(&self, duration_nanos: u64) {
         let mut current_min = self.min_request_time.load(Ordering::Relaxed);
         while current_min > duration_nanos {
-            match self.min_request_time.compare_exchange_weak(
-                current_min,
-                duration_nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .min_request_time
+                .compare_exchange_weak(current_min, duration_nanos, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(new_current) => current_min = new_current,
             }
@@ -332,12 +311,10 @@ impl WebhookAuditTarget {
     fn update_max_time(&self, duration_nanos: u64) {
         let mut current_max = self.max_request_time.load(Ordering::Relaxed);
         while current_max < duration_nanos {
-            match self.max_request_time.compare_exchange_weak(
-                current_max,
-                duration_nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .max_request_time
+                .compare_exchange_weak(current_max, duration_nanos, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(new_current) => current_max = new_current,
             }
@@ -348,11 +325,7 @@ impl WebhookAuditTarget {
     pub fn get_avg_request_time_ns(&self) -> u64 {
         let total = self.total_request_time.load(Ordering::Relaxed);
         let count = self.success_count.load(Ordering::Relaxed);
-        if count > 0 {
-            total / count
-        } else {
-            0
-        }
+        if count > 0 { total / count } else { 0 }
     }
 
     /// Get performance metrics
@@ -360,11 +333,7 @@ impl WebhookAuditTarget {
         let min = self.min_request_time.load(Ordering::Relaxed);
         let max = self.max_request_time.load(Ordering::Relaxed);
         let avg = self.get_avg_request_time_ns();
-        (
-            if min == u64::MAX { 0 } else { min },
-            max,
-            avg,
-        )
+        (if min == u64::MAX { 0 } else { min }, max, avg)
     }
 }
 

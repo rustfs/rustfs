@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, RwLock as AsyncRwLock};
+use tokio::sync::{RwLock as AsyncRwLock, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the audit system
@@ -106,6 +106,7 @@ pub struct AuditSystem {
     /// System configuration
     config: Arc<AsyncRwLock<AuditConfig>>,
     /// System statistics
+    #[allow(dead_code)]
     stats: Arc<RwLock<AuditStats>>,
     /// Shutdown signal
     shutdown_tx: Arc<AsyncRwLock<Option<oneshot::Sender<()>>>>,
@@ -445,8 +446,8 @@ impl Default for PerformanceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{AuditTarget, AuditTargetFactory};
     use crate::TargetStatus;
+    use crate::registry::{AuditTarget, AuditTargetFactory};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

@@ -14,11 +14,11 @@
 
 //! Target implementations for audit logging
 
-pub mod webhook;
 pub mod mqtt;
+pub mod webhook;
 
-pub use webhook::WebhookAuditTarget;
 pub use mqtt::MqttAuditTarget;
+pub use webhook::WebhookAuditTarget;
 
 use crate::error::{TargetError, TargetResult};
 use crate::registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory};
@@ -42,7 +42,9 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
             &config.target_type
         } else {
             // Check if using the spec'd "kind" field in args
-            config.args.get("kind")
+            config
+                .args
+                .get("kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&config.target_type)
         };
@@ -73,7 +75,9 @@ impl AuditTargetFactory for DefaultAuditTargetFactory {
         let target_type = if config.target_type == "webhook" || config.target_type == "mqtt" {
             &config.target_type
         } else {
-            config.args.get("kind")
+            config
+                .args
+                .get("kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&config.target_type)
         };

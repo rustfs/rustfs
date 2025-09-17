@@ -20,8 +20,8 @@ use crate::registry::{AuditTarget, AuditTargetConfig, TargetStatus};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -47,7 +47,7 @@ pub struct MqttAuditTarget {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ConnectionState {
+pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
@@ -80,11 +80,9 @@ impl MqttAuditTarget {
             message: format!("Invalid broker URL: {}", e),
         })?;
 
-        let host = url
-            .host_str()
-            .ok_or_else(|| TargetError::InvalidConfig {
-                message: "Missing host in broker URL".to_string(),
-            })?;
+        let host = url.host_str().ok_or_else(|| TargetError::InvalidConfig {
+            message: "Missing host in broker URL".to_string(),
+        })?;
 
         let port = match url.scheme() {
             "mqtt" => url.port().unwrap_or(1883),
@@ -100,10 +98,10 @@ impl MqttAuditTarget {
         let mut mqttoptions = MqttOptions::new(&config.id, host, port);
         mqttoptions.set_keep_alive(Duration::from_secs(30));
         mqttoptions.set_clean_session(true);
-        
+
         // Set max packet size to handle large audit entries
         mqttoptions.set_max_packet_size(1024 * 1024, 1024 * 1024); // 1MB
-        
+
         // Configure TLS for mqtts
         if url.scheme() == "mqtts" {
             // For now, skip TLS configuration - would need proper setup in production
@@ -143,16 +141,16 @@ impl MqttAuditTarget {
 
         // Create client with enhanced buffer size
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, 100);
-        
+
         let connection_state = Arc::new(RwLock::new(ConnectionState::Disconnected));
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
-        
+
         // Start enhanced event loop with better error handling and reconnection
         let state_clone = connection_state.clone();
         let target_id = config.id.clone();
         let mut reconnect_attempts = 0u32;
         const MAX_RECONNECT_ATTEMPTS: u32 = 10;
-        
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -182,18 +180,18 @@ impl MqttAuditTarget {
                             Err(e) => {
                                 let error_msg = format!("MQTT connection error: {}", e);
                                 *state_clone.write() = ConnectionState::Error(error_msg.clone());
-                                
+
                                 reconnect_attempts += 1;
                                 if reconnect_attempts <= MAX_RECONNECT_ATTEMPTS {
                                     let backoff_secs = (2_u64.pow(reconnect_attempts.min(6))).min(60);
                                     warn!(
-                                        "MQTT target {} connection failed (attempt {}), retrying in {}s: {}", 
+                                        "MQTT target {} connection failed (attempt {}), retrying in {}s: {}",
                                         target_id, reconnect_attempts, backoff_secs, e
                                     );
                                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                                 } else {
                                     error!(
-                                        "MQTT target {} failed after {} attempts, giving up: {}", 
+                                        "MQTT target {} failed after {} attempts, giving up: {}",
                                         target_id, MAX_RECONNECT_ATTEMPTS, e
                                     );
                                     tokio::time::sleep(Duration::from_secs(60)).await; // Wait before trying again
@@ -251,10 +249,7 @@ impl MqttAuditTarget {
             "mqtt" | "mqtts" => {}
             scheme => {
                 return Err(TargetError::InvalidConfig {
-                    message: format!(
-                        "Unsupported MQTT scheme '{}', use mqtt:// or mqtts://",
-                        scheme
-                    ),
+                    message: format!("Unsupported MQTT scheme '{}', use mqtt:// or mqtts://", scheme),
                 });
             }
         }
@@ -272,10 +267,7 @@ impl MqttAuditTarget {
         if let Some(timeout_ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
             if timeout_ms < 100 || timeout_ms > 60000 {
                 return Err(TargetError::InvalidConfig {
-                    message: format!(
-                        "timeout_ms must be between 100 and 60000, got {}",
-                        timeout_ms
-                    ),
+                    message: format!("timeout_ms must be between 100 and 60000, got {}", timeout_ms),
                 });
             }
         }
@@ -293,10 +285,7 @@ impl MqttAuditTarget {
         if let Some(target_type) = args.get("target_type").and_then(|v| v.as_str()) {
             if target_type != "AuditLog" {
                 return Err(TargetError::InvalidConfig {
-                    message: format!(
-                        "target_type must be 'AuditLog', got '{}'",
-                        target_type
-                    ),
+                    message: format!("target_type must be 'AuditLog', got '{}'", target_type),
                 });
             }
         }
@@ -336,11 +325,7 @@ impl MqttAuditTarget {
 
         self.queue_size.fetch_add(1, Ordering::Relaxed);
 
-        match self
-            .client
-            .publish(&self.topic, self.qos, false, payload)
-            .await
-        {
+        match self.client.publish(&self.topic, self.qos, false, payload).await {
             Ok(()) => {
                 self.success_count.fetch_add(1, Ordering::Relaxed);
                 *self.last_success_time.write() = Some(chrono::Utc::now());
@@ -404,10 +389,10 @@ impl AuditTarget for MqttAuditTarget {
     async fn close(&self) -> TargetResult<()> {
         *self.running.write() = false;
         *self.enabled.write() = false;
-        
+
         // Signal shutdown to event loop
         let _ = self.shutdown_tx.send(());
-        
+
         debug!("MQTT target {} closed", self.id);
         Ok(())
     }
@@ -427,7 +412,7 @@ impl AuditTarget for MqttAuditTarget {
     fn status(&self) -> TargetStatus {
         let connection_state = self.get_connection_state();
         let is_connected = matches!(connection_state, ConnectionState::Connected);
-        
+
         TargetStatus {
             id: self.id.clone(),
             target_type: "mqtt".to_string(),

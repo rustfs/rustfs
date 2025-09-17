@@ -126,16 +126,16 @@ pub mod system;
 pub mod targets;
 
 // Re-export main types for easy access
-pub use entity::{AuditEntry, ApiDetails, ObjectVersion};
+pub use entity::{ApiDetails, AuditEntry, ObjectVersion};
 pub use error::{AuditError, AuditResult, TargetError, TargetResult};
 pub use global::{
-    audit_logger, close_audit_system, create_s3_audit_entry, get_audit_stats, 
-    initialize_audit_logger, is_audit_system_initialized, list_audit_targets, log_audit, log_audit_entry,
-    pause_audit_system, resume_audit_system, s3_events, start_audit_system, AuditLogger
+    AuditLogger, audit_logger, close_audit_system, create_s3_audit_entry, get_audit_stats, initialize_audit_logger,
+    is_audit_system_initialized, list_audit_targets, log_audit, log_audit_entry, pause_audit_system, resume_audit_system,
+    s3_events, start_audit_system,
 };
 pub use registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetRegistry, TargetStatus};
 pub use system::{AuditConfig, AuditStats, AuditSystem, PerformanceConfig, RedactionConfig};
-pub use targets::{DefaultAuditTargetFactory, WebhookAuditTarget, MqttAuditTarget};
+pub use targets::{DefaultAuditTargetFactory, MqttAuditTarget, WebhookAuditTarget};
 
 // Re-export rustfs-targets types for convenience
 pub use rustfs_targets::{EventName, Target, TargetLog};

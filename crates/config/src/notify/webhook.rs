@@ -12,26 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{COMMENT_KEY, ENABLE_KEY};
-
-// Webhook Keys
-pub const WEBHOOK_ENDPOINT: &str = "endpoint";
-pub const WEBHOOK_AUTH_TOKEN: &str = "auth_token";
-pub const WEBHOOK_QUEUE_LIMIT: &str = "queue_limit";
-pub const WEBHOOK_QUEUE_DIR: &str = "queue_dir";
-pub const WEBHOOK_CLIENT_CERT: &str = "client_cert";
-pub const WEBHOOK_CLIENT_KEY: &str = "client_key";
-
 /// A list of all valid configuration keys for a webhook target.
 pub const NOTIFY_WEBHOOK_KEYS: &[&str] = &[
-    ENABLE_KEY,
-    WEBHOOK_ENDPOINT,
-    WEBHOOK_AUTH_TOKEN,
-    WEBHOOK_QUEUE_LIMIT,
-    WEBHOOK_QUEUE_DIR,
-    WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY,
-    COMMENT_KEY,
+    crate::ENABLE_KEY,
+    crate::WEBHOOK_ENDPOINT,
+    crate::WEBHOOK_AUTH_TOKEN,
+    crate::WEBHOOK_QUEUE_LIMIT,
+    crate::WEBHOOK_QUEUE_DIR,
+    crate::WEBHOOK_CLIENT_CERT,
+    crate::WEBHOOK_CLIENT_KEY,
+    crate::COMMENT_KEY,
 ];
 
 // Webhook Environment Variables

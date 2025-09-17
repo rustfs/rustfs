@@ -326,10 +326,7 @@ mod tests {
     use super::*;
     use crate::global::list_audit_targets;
     use crate::registry::{AuditTarget, AuditTargetConfig, AuditTargetFactory, TargetStatus};
-    use crate::{
-        AuditEntry, get_audit_stats,
-        is_audit_system_initialized, s3_events, start_audit_system,
-    };
+    use crate::{AuditEntry, get_audit_stats, is_audit_system_initialized, s3_events, start_audit_system};
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
