@@ -148,7 +148,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         server_address = %server_address,
         ip = %server_addr.ip(),
         port = %server_port,
-        ersion = %version::get_version(),
+        version = %version::get_version(),
         "Starting RustFS server at {}",
         &server_address
     );
@@ -223,7 +223,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                 target: "rustfs::main::run",
                 external_address = %external_addr,
                 external_port = %external_port,
-                "Using external address {} for endpoint access", external_addr);
+                "Using external address {} for endpoint access", external_addr
+            );
             rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
             set_global_addr(&opt.external_address).await;
             (external_addr.ip(), external_port)
@@ -304,7 +305,8 @@ async fn run(opt: config::Opt) -> Result<()> {
         target: "rustfs::main::run",
         enable_scanner = enable_scanner,
         enable_heal = enable_heal,
-        "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal);
+        "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
+    );
 
     // Initialize heal manager and scanner based on environment variables
     if enable_heal || enable_scanner {
