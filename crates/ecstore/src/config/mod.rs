@@ -225,9 +225,13 @@ pub fn init() {
     // New: Loading default configurations for notify_webhook and notify_mqtt
     // Referring subsystem names through constants to improve the readability and maintainability of the code
     kvs.insert(NOTIFY_WEBHOOK_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_WEBHOOK_KVS.clone());
-    kvs.insert(AUDIT_WEBHOOK_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
+    #[allow(clippy::borrow_interior_mutable_const)]
+    let audit_webhook_kvs = audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone();
+    kvs.insert(AUDIT_WEBHOOK_SUB_SYS.to_owned(), audit_webhook_kvs);
     kvs.insert(NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MQTT_KVS.clone());
-    kvs.insert(AUDIT_MQTT_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MQTT_KVS.clone());
+    #[allow(clippy::borrow_interior_mutable_const)]
+    let audit_mqtt_kvs = audit::DEFAULT_AUDIT_MQTT_KVS.clone();
+    kvs.insert(AUDIT_MQTT_SUB_SYS.to_owned(), audit_mqtt_kvs);
 
     // Register all default configurations
     register_default_kvs(kvs)

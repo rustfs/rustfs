@@ -6063,32 +6063,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustfs-audit"
-version = "0.0.5"
-dependencies = [
- "async-trait",
- "chrono",
- "dashmap",
- "once_cell",
- "parking_lot",
- "reqwest",
- "rumqttc",
- "rustfs-config",
- "rustfs-ecstore",
- "rustfs-targets",
- "serde",
- "serde_json",
- "thiserror 2.0.16",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-core",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "rustfs-checksums"
 version = "0.0.5"
 dependencies = [
