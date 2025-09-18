@@ -13,6 +13,7 @@
 //  limitations under the License.
 
 use crate::error::{AuditError, AuditResult};
+use crate::observability;
 use crate::registry::AuditRegistry;
 use rustfs_audit_logger::AuditLogEntry;
 use rustfs_ecstore::config::Config;
@@ -32,6 +33,7 @@ pub enum AuditSystemState {
 }
 
 /// Main audit system that manages target lifecycle and audit log dispatch
+#[derive(Clone)]
 pub struct AuditSystem {
     registry: Arc<Mutex<AuditRegistry>>,
     state: Arc<RwLock<AuditSystemState>>,
@@ -73,6 +75,9 @@ impl AuditSystem {
         drop(state);
 
         info!("Starting audit system");
+
+        // Record system start
+        observability::record_system_start();
 
         // Store configuration
         {
@@ -205,6 +210,8 @@ impl AuditSystem {
 
     /// Dispatches an audit log entry to all active targets
     pub async fn dispatch(&self, entry: Arc<AuditLogEntry>) -> AuditResult<()> {
+        let start_time = std::time::Instant::now();
+        
         let state = self.state.read().await;
         
         match *state {
@@ -261,16 +268,30 @@ impl AuditSystem {
         let results = futures::future::join_all(tasks).await;
         
         let mut errors = Vec::new();
+        let mut success_count = 0;
+        
         for (target_id, result) in results {
-            if let Err(e) = result {
-                error!(target_id = %target_id, error = %e, "Failed to dispatch audit log to target");
-                errors.push(e);
+            match result {
+                Ok(_) => {
+                    success_count += 1;
+                    observability::record_target_success();
+                }
+                Err(e) => {
+                    error!(target_id = %target_id, error = %e, "Failed to dispatch audit log to target");
+                    errors.push(e);
+                    observability::record_target_failure();
+                }
             }
         }
 
-        if !errors.is_empty() {
+        let dispatch_time = start_time.elapsed();
+        
+        if errors.is_empty() {
+            observability::record_audit_success(dispatch_time);
+        } else {
+            observability::record_audit_failure(dispatch_time);
             // Log errors but don't fail the entire dispatch
-            warn!(error_count = errors.len(), "Some audit targets failed to receive log entry");
+            warn!(error_count = errors.len(), success_count = success_count, "Some audit targets failed to receive log entry");
         }
 
         Ok(())
@@ -353,6 +374,9 @@ impl AuditSystem {
     pub async fn reload_config(&self, new_config: Config) -> AuditResult<()> {
         info!("Reloading audit system configuration");
         
+        // Record config reload
+        observability::record_config_reload();
+        
         // Store new configuration
         {
             let mut config_guard = self.config.write().await;
@@ -387,5 +411,20 @@ impl AuditSystem {
                 Err(e)
             }
         }
+    }
+
+    /// Gets current audit system metrics
+    pub async fn get_metrics(&self) -> crate::observability::AuditMetricsReport {
+        crate::observability::get_metrics_report().await
+    }
+
+    /// Validates system performance against requirements
+    pub async fn validate_performance(&self) -> crate::observability::PerformanceValidation {
+        crate::observability::validate_performance().await
+    }
+
+    /// Resets all metrics
+    pub async fn reset_metrics(&self) {
+        crate::observability::reset_metrics().await;
     }
 }

@@ -20,10 +20,12 @@
 
 pub mod error;
 pub mod global;
+pub mod observability;
 pub mod registry;
 pub mod system;
 
 pub use error::{AuditError, AuditResult};
+pub use observability::{AuditMetrics, AuditMetricsReport, PerformanceValidation};
 pub use registry::AuditRegistry;
 pub use system::AuditSystem;
 
