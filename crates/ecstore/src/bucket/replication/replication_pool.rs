@@ -313,16 +313,42 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
     /// Resizes the regular workers pool
     pub async fn resize_workers(&self, n: usize, check_old: usize) {
+        warn!(
+            "resize_workers: called with n={}, check_old={}",
+            n, check_old
+        );
+
         let mut workers = self.workers.write().await;
+        warn!(
+            "resize_workers: current workers count={}",
+            workers.len()
+        );
 
         if (check_old > 0 && workers.len() != check_old) || n == workers.len() || n < 1 {
+            warn!(
+                "resize_workers: skipping resize - check_old_mismatch={}, same_size={}, invalid_n={}",
+                check_old > 0 && workers.len() != check_old,
+                n == workers.len(),
+                n < 1
+            );
             return;
         }
 
         // Add workers if needed
+        if workers.len() < n {
+            warn!(
+                "resize_workers: adding workers from {} to {}",
+                workers.len(), n
+            );
+        }
+
         while workers.len() < n {
             let (tx, rx) = mpsc::channel(10000);
             workers.push(tx);
+            warn!(
+                "resize_workers: created new worker {}/{}",
+                workers.len(), n
+            );
 
             let active_counter = self.active_workers.clone();
             let stats = self.stats.clone();
@@ -364,11 +390,27 @@ impl<S: StorageAPI> ReplicationPool<S> {
         }
 
         // Remove workers if needed
+        if workers.len() > n {
+            warn!(
+                "resize_workers: removing workers from {} to {}",
+                workers.len(), n
+            );
+        }
+
         while workers.len() > n {
             if let Some(worker) = workers.pop() {
+                warn!(
+                    "resize_workers: removed worker, remaining: {}",
+                    workers.len()
+                );
                 drop(worker); // Closing the channel will terminate the worker
             }
         }
+
+        warn!(
+            "resize_workers: completed - final workers count={}",
+            workers.len()
+        );
     }
 
     /// Resizes the failed workers pool
@@ -483,8 +525,14 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
+        warn!(
+            "queue_replica_task: bucket={}, object={}, size={}, op_type={:?}",
+            ri.bucket, ri.name, ri.size, ri.op_type
+        );
+
         // If object is large, queue it to a static set of large workers
         if ri.size >= MIN_LARGE_OBJ_SIZE {
+            warn!("queue_replica_task: handling large object (size={} >= {})", ri.size, MIN_LARGE_OBJ_SIZE);
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
@@ -493,10 +541,18 @@ impl<S: StorageAPI> ReplicationPool<S> {
             let hash = hasher.finish();
 
             let lrg_workers = self.lrg_workers.read().await;
+            warn!("queue_replica_task: large workers count={}, hash={}", lrg_workers.len(), hash);
+
             if !lrg_workers.is_empty() {
                 let index = (hash as usize) % lrg_workers.len();
+                warn!("queue_replica_task: selected large worker index={}", index);
+
                 if let Some(worker) = lrg_workers.get(index) {
                     if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
+                        warn!(
+                            "queue_replica_task: large worker busy, queuing to MRF - bucket={}, object={}",
+                            ri.bucket, ri.name
+                        );
                         // Queue to MRF if worker is busy
                         let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
 
@@ -505,29 +561,56 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         let existing = lrg_workers.len();
                         if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
                             let workers = std::cmp::min(existing + 1, max_l_workers);
+                            warn!("queue_replica_task: resizing large workers from {} to {}", existing, workers);
                             drop(lrg_workers);
                             self.resize_lrg_workers(workers, existing).await;
                         }
+                    } else {
+                        warn!(
+                            "queue_replica_task: successfully queued large object to worker - bucket={}, object={}",
+                            ri.bucket, ri.name
+                        );
                     }
                 }
+            } else {
+                warn!(
+                    "queue_replica_task: no large workers available - bucket={}, object={}",
+                    ri.bucket, ri.name
+                );
             }
             return;
         }
 
         // Handle regular sized objects
+        warn!("queue_replica_task: handling regular object (size={})", ri.size);
+
         let ch = match ri.op_type {
-            ReplicationType::Heal | ReplicationType::ExistingObject => Some(self.mrf_replica_tx.clone()),
-            _ => self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await,
+            ReplicationType::Heal | ReplicationType::ExistingObject => {
+                warn!("queue_replica_task: using MRF channel for op_type={:?}", ri.op_type);
+                Some(self.mrf_replica_tx.clone())
+            }
+            _ => {
+                warn!("queue_replica_task: getting worker channel for regular object");
+                self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await
+            }
         };
 
         if let Some(channel) = ch {
             if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
+                warn!(
+                    "queue_replica_task: regular worker busy, queuing to MRF - bucket={}, object={}",
+                    ri.bucket, ri.name
+                );
                 // Queue to MRF if all workers are busy
                 let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
 
                 // Try to scale up workers based on priority
                 let priority = self.priority.read().await.clone();
                 let max_workers = *self.max_workers.read().await;
+                warn!(
+                    "queue_replica_task: scaling workers based on priority={:?}, max_workers={}",
+                    priority, max_workers
+                );
 
                 match priority {
                     ReplicationPriority::Fast => {
@@ -541,24 +624,47 @@ impl<S: StorageAPI> ReplicationPool<S> {
                     }
                     ReplicationPriority::Auto => {
                         let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                        if self.active_workers() < max_w as i32 {
+                        let active_workers = self.active_workers();
+                        warn!("queue_replica_task: auto scaling - active_workers={}, max_w={}", active_workers, max_w);
+
+                        if active_workers < max_w as i32 {
                             let workers = self.workers.read().await;
                             let new_count = std::cmp::min(workers.len() + 1, max_w);
                             let existing = workers.len();
+                            warn!("queue_replica_task: resizing regular workers from {} to {}", existing, new_count);
                             drop(workers);
                             self.resize_workers(new_count, existing).await;
                         }
 
                         let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                        if self.active_mrf_workers() < max_mrf_workers as i32 {
+                        let active_mrf = self.active_mrf_workers();
+                        warn!(
+                            "queue_replica_task: checking MRF workers - active_mrf={}, max_mrf={}",
+                            active_mrf, max_mrf_workers
+                        );
+
+                        if active_mrf < max_mrf_workers as i32 {
                             let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
                             let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
+                            warn!("queue_replica_task: resizing MRF workers from {} to {}", current_mrf, new_mrf);
                             self.resize_failed_workers(new_mrf).await;
                         }
                     }
                 }
+            } else {
+                warn!(
+                    "queue_replica_task: successfully queued regular object to worker - bucket={}, object={}",
+                    ri.bucket, ri.name
+                );
             }
+        } else {
+            warn!(
+                "queue_replica_task: no worker channel available - bucket={}, object={}, op_type={:?}",
+                ri.bucket, ri.name, ri.op_type
+            );
         }
+
+        warn!("queue_replica_task: completed processing - bucket={}, object={}", ri.bucket, ri.name);
     }
 
     /// Queues a replica delete task
@@ -943,6 +1049,7 @@ pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
 }
 
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
+    warn!("schedule_replication {} {}", oi.bucket, oi.name);
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal);
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal);
     let tm = oi
@@ -985,8 +1092,10 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
         ri.checksum = oi.checksum
     }
     if dsc.is_synchronous() {
+        warn!("schedule_replication synchronous");
         replicate_object(ri, o).await
     } else if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        warn!("schedule_replication asynchronous");
         pool.queue_replica_task(ri).await;
     }
 }
