@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod reliant;
+//! Object encryption service implementation
 
-// Common utilities for all E2E tests
-#[cfg(test)]
-pub mod common;
+mod ciphers;
+pub mod service;
 
-// KMS-specific test modules
-#[cfg(test)]
-mod kms;
+pub use service::ObjectEncryptionService;
