@@ -18,13 +18,33 @@
 //! It integrates with existing RustFS configuration constants and persistence infrastructure.
 
 use crate::error::AuditError;
-use rustfs_config::audit::{mqtt::*, webhook::*};
-use rustfs_config::*;
 use rustfs_config::ENABLE_KEY;
-use rustfs_ecstore::config::audit::{DEFAULT_AUDIT_MQTT_KVS, DEFAULT_AUDIT_WEBHOOK_KVS};
 use serde::{Deserialize, Serialize};
 use std::env;
 use tracing::{debug, info, warn};
+
+// Environment variable constants for audit configuration
+const ENV_AUDIT_WEBHOOK_ENABLE: &str = "RUSTFS_AUDIT_WEBHOOK_ENABLE";
+const ENV_AUDIT_WEBHOOK_ENDPOINT: &str = "RUSTFS_AUDIT_WEBHOOK_ENDPOINT";
+const ENV_AUDIT_WEBHOOK_AUTH_TOKEN: &str = "RUSTFS_AUDIT_WEBHOOK_AUTH_TOKEN";
+const ENV_AUDIT_WEBHOOK_CLIENT_CERT: &str = "RUSTFS_AUDIT_WEBHOOK_CLIENT_CERT";
+const ENV_AUDIT_WEBHOOK_CLIENT_KEY: &str = "RUSTFS_AUDIT_WEBHOOK_CLIENT_KEY";
+const ENV_AUDIT_WEBHOOK_BATCH_SIZE: &str = "RUSTFS_AUDIT_WEBHOOK_BATCH_SIZE";
+const ENV_AUDIT_WEBHOOK_QUEUE_SIZE: &str = "RUSTFS_AUDIT_WEBHOOK_QUEUE_SIZE";
+const ENV_AUDIT_WEBHOOK_MAX_RETRY: &str = "RUSTFS_AUDIT_WEBHOOK_MAX_RETRY";
+const ENV_AUDIT_WEBHOOK_HTTP_TIMEOUT: &str = "RUSTFS_AUDIT_WEBHOOK_HTTP_TIMEOUT";
+
+const ENV_AUDIT_MQTT_ENABLE: &str = "RUSTFS_AUDIT_MQTT_ENABLE";
+const ENV_AUDIT_MQTT_BROKER: &str = "RUSTFS_AUDIT_MQTT_BROKER";
+const ENV_AUDIT_MQTT_TOPIC: &str = "RUSTFS_AUDIT_MQTT_TOPIC";
+const ENV_AUDIT_MQTT_QOS: &str = "RUSTFS_AUDIT_MQTT_QOS";
+const ENV_AUDIT_MQTT_USERNAME: &str = "RUSTFS_AUDIT_MQTT_USERNAME";
+const ENV_AUDIT_MQTT_PASSWORD: &str = "RUSTFS_AUDIT_MQTT_PASSWORD";
+const ENV_AUDIT_MQTT_TLS_CA_CERT: &str = "RUSTFS_AUDIT_MQTT_TLS_CA_CERT";
+const ENV_AUDIT_MQTT_TLS_CLIENT_CERT: &str = "RUSTFS_AUDIT_MQTT_TLS_CLIENT_CERT";
+const ENV_AUDIT_MQTT_TLS_CLIENT_KEY: &str = "RUSTFS_AUDIT_MQTT_TLS_CLIENT_KEY";
+const ENV_AUDIT_MQTT_TIMEOUT_MS: &str = "RUSTFS_AUDIT_MQTT_TIMEOUT_MS";
+const ENV_AUDIT_MQTT_MAX_RETRY: &str = "RUSTFS_AUDIT_MQTT_MAX_RETRY";
 
 /// Main audit configuration structure integrating with RustFS config infrastructure
 #[derive(Debug, Clone, Serialize, Deserialize)]

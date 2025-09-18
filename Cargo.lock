@@ -5981,7 +5981,6 @@ dependencies = [
  "rust-embed",
  "rustfs-ahm",
  "rustfs-appauth",
- "rustfs-audit",
  "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",

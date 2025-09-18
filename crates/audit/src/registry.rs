@@ -18,14 +18,11 @@
 //! rustfs-targets infrastructure, supporting MQTT, Webhook, and extensible target types.
 
 use crate::config::AuditTargetConfig;
-use crate::entity::AuditEntry;  
+use crate::entity::AuditEntry;
 use crate::error::AuditError;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use rustfs_targets::{
-    arn::TargetID, EntityTarget, EventName, Store, StoreError, Target, TargetError, TargetLog,
-    store::Key,
-};
+use rustfs_targets::{EntityTarget, EventName, Store, StoreError, Target, TargetError, TargetLog, arn::TargetID, store::Key};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,7 +121,7 @@ impl Target<AuditEntry> for MockTarget {
     fn clone_dyn(&self) -> Box<dyn Target<AuditEntry> + Send + Sync> {
         Box::new(self.clone())
     }
-    
+
     fn is_enabled(&self) -> bool {
         true
     }

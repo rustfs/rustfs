@@ -15,7 +15,8 @@
 //! Core audit system for high-performance log dispatch
 use crate::entity::AuditEntry;
 use crate::error::{AuditError, AuditResult};
-use crate::registry::{AuditTargetConfig, TargetRegistry};
+use crate::registry::TargetRegistry;
+use crate::{AuditConfig, AuditTargetConfig};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
