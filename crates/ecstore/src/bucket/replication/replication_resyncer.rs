@@ -1339,15 +1339,23 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
+    warn!(
+        "replicate_object: starting replication - bucket={}, object={}, size={}, op_type={:?}",
+        bucket, object, roi.size, roi.op_type
+    );
+
     let cfg = match get_replication_config(&bucket).await {
-        Ok(Some(config)) => config,
+        Ok(Some(config)) => {
+            warn!("replicate_object: got replication config for bucket: {}", bucket);
+            config
+        },
         Ok(None) => {
-            warn!("No replication config found for bucket: {}", bucket);
+            warn!("replicate_object: no replication config found for bucket: {}", bucket);
             // TODO: SendEvent
             return;
         }
         Err(err) => {
-            error!("Failed to get replication config for bucket {}: {}", bucket, err);
+            error!("replicate_object: failed to get replication config for bucket {}: {}", bucket, err);
             // TODO: SendEvent
             return;
         }
@@ -1360,16 +1368,31 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         ..Default::default()
     });
 
+    warn!(
+        "replicate_object: filtered target ARNs count={} for bucket={}, object={}",
+        tgt_arns.len(), bucket, object
+    );
+
     // TODO: NSLOCK
 
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
+        warn!(
+            "replicate_object: processing target ARN={} for bucket={}, object={}",
+            arn, bucket, object
+        );
+
         let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &arn).await else {
-            error!("failed to get target for bucket:{} arn:{}", bucket, arn);
+            error!("replicate_object: failed to get target client for bucket:{} arn:{}", bucket, arn);
             // TODO: SendEvent
             continue;
         };
+
+        warn!(
+            "replicate_object: got target client for bucket={}, arn={}, endpoint={}",
+            bucket, arn, tgt_client.endpoint
+        );
 
         let roi_clone = roi.clone();
         let storage_clone = storage.clone();
@@ -1387,11 +1410,22 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         targets: Vec::with_capacity(join_set.len()),
     };
 
+    warn!(
+        "replicate_object: waiting for {} replication tasks to complete - bucket={}, object={}",
+        join_set.len(), bucket, object
+    );
+
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(tgt_info) => rinfos.targets.push(tgt_info),
+            Ok(tgt_info) => {
+                warn!(
+                    "replicate_object: task completed successfully - bucket={}, object={}, arn={}, status={:?}",
+                    bucket, object, tgt_info.arn, tgt_info.replication_status
+                );
+                rinfos.targets.push(tgt_info);
+            },
             Err(e) => {
-                error!("Task failed: {}", e);
+                error!("replicate_object: task failed - bucket={}, object={}, error={}", bucket, object, e);
                 // TODO: SendEvent
             }
         }
@@ -1401,7 +1435,16 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     let new_replication_internal = rinfos.replication_status_internal();
     let mut object_info = roi.to_object_info();
 
+    warn!(
+        "replicate_object: replication results - bucket={}, object={}, status={:?}, internal_status={:?}",
+        bucket, object, replication_status, new_replication_internal
+    );
+
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
+        warn!(
+            "replicate_object: updating object metadata - bucket={}, object={}, old_status={:?}, new_status={:?}",
+            bucket, object, roi.replication_status_internal, new_replication_internal
+        );
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
             ..Default::default()
@@ -1419,9 +1462,23 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     // TODO: send event
 
     if rinfos.replication_status() != StatusType::Completed {
+        warn!(
+            "replicate_object: replication incomplete - bucket={}, object={}, final_status={:?}",
+            bucket, object, rinfos.replication_status()
+        );
         // TODO: update stats
         // pool
+    } else {
+        warn!(
+            "replicate_object: replication completed successfully - bucket={}, object={}",
+            bucket, object
+        );
     }
+
+    warn!(
+        "replicate_object: finished processing - bucket={}, object={}",
+        bucket, object
+    );
 }
 
 trait ReplicateObjectInfoExt {
