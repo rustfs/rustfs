@@ -16,6 +16,7 @@
 members = [
     "rustfs", # Core file system implementation
     "crates/appauth", # Application authentication and authorization
+    "crates/audit", # Audit target management system with multi-target fan-out
     "crates/audit-logger", # Audit logging system for file operations
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management

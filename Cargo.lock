@@ -6128,6 +6128,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-audit"
+version = "0.0.5"
+dependencies = [
+ "async-trait",
+ "futures",
+ "once_cell",
+ "rumqttc",
+ "rustfs-audit-logger",
+ "rustfs-config",
+ "rustfs-ecstore",
+ "rustfs-targets",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.16",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "rustfs-audit-logger"
 version = "0.0.5"
 dependencies = [

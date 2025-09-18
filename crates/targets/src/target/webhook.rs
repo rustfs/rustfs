@@ -153,7 +153,13 @@ where
         let queue_store = if !args.queue_dir.is_empty() {
             let queue_dir =
                 PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
+            
+            let extension = match args.target_type {
+                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
+                TargetType::NotifyEvent => STORE_EXTENSION,
+            };
+            
+            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);

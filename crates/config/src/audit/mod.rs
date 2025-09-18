@@ -13,12 +13,19 @@
 //  limitations under the License.
 
 //! Audit configuration module
-//! //! This module defines the configuration for audit systems, including
-//! webhook and other audit-related settings.
+//! This module defines the configuration for audit systems, including
+//! webhook and MQTT audit-related settings.
+
+// --- Audit subsystem identifiers ---
 pub const AUDIT_WEBHOOK_SUB_SYS: &str = "audit_webhook";
+pub const AUDIT_MQTT_SUB_SYS: &str = "audit_mqtt";
 
 pub const AUDIT_STORE_EXTENSION: &str = ".audit";
 
+// --- Audit route prefix ---
+pub const AUDIT_ROUTE_PREFIX: &str = "audit_";
+
+// --- Webhook configuration keys ---
 pub const WEBHOOK_ENDPOINT: &str = "endpoint";
 pub const WEBHOOK_AUTH_TOKEN: &str = "auth_token";
 pub const WEBHOOK_CLIENT_CERT: &str = "client_cert";
@@ -29,3 +36,14 @@ pub const WEBHOOK_QUEUE_DIR: &str = "queue_dir";
 pub const WEBHOOK_MAX_RETRY: &str = "max_retry";
 pub const WEBHOOK_RETRY_INTERVAL: &str = "retry_interval";
 pub const WEBHOOK_HTTP_TIMEOUT: &str = "http_timeout";
+
+// --- MQTT configuration keys ---
+pub const MQTT_BROKER: &str = "broker";
+pub const MQTT_TOPIC: &str = "topic";
+pub const MQTT_USERNAME: &str = "username";
+pub const MQTT_PASSWORD: &str = "password";
+pub const MQTT_QOS: &str = "qos";
+pub const MQTT_KEEP_ALIVE_INTERVAL: &str = "keep_alive_interval";
+pub const MQTT_RECONNECT_INTERVAL: &str = "reconnect_interval";
+pub const MQTT_QUEUE_DIR: &str = "queue_dir";
+pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
