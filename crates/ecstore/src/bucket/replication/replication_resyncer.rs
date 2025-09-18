@@ -1525,7 +1525,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
-            error!("replicate_object_ext: target is offline - bucket={}, object={}, arn={}", bucket, object, tgt_client.arn);
+            error!(
+                "replicate_object_ext: target is offline - bucket={}, object={}, arn={}",
+                bucket, object, tgt_client.arn
+            );
             // TODO: send event
             return rinfo;
         }
@@ -1589,16 +1592,22 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     bucket, object, size
                 );
                 size
-            },
+            }
             Err(e) => {
-                error!("replicate_object_ext: failed to get actual size - bucket={}, object={}, arn={}, error={}", bucket, object, tgt_client.arn, e);
+                error!(
+                    "replicate_object_ext: failed to get actual size - bucket={}, object={}, arn={}, error={}",
+                    bucket, object, tgt_client.arn, e
+                );
                 // TODO: send event
                 return rinfo;
             }
         };
 
         if tgt_client.bucket.is_empty() {
-            error!("replicate_object_ext: target bucket is empty - bucket={}, object={}, arn={}", bucket, object, tgt_client.arn);
+            error!(
+                "replicate_object_ext: target bucket is empty - bucket={}, object={}, arn={}",
+                bucket, object, tgt_client.arn
+            );
             // TODO: send event
             return rinfo;
         }
@@ -1620,9 +1629,12 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     bucket, object, is_mp, tgt_client.storage_class
                 );
                 (put_opts, is_mp)
-            },
+            }
             Err(e) => {
-                error!("replicate_object_ext: failed to get replication options - bucket={}, object={}, arn={}, error={}", bucket, object, tgt_client.arn, e);
+                error!(
+                    "replicate_object_ext: failed to get replication options - bucket={}, object={}, arn={}, error={}",
+                    bucket, object, tgt_client.arn, e
+                );
                 // TODO: send event
                 return rinfo;
             }
@@ -1636,11 +1648,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         );
 
         if let Some(err) = if is_multipart {
-            warn!(
-                "replicate_object_ext: using multipart replication - bucket={}, object={}",
-                bucket, object
-            );
-            replicate_object_with_multipart(tgt_client.clone(), &bucket, &object, gr.stream, &object_info, put_opts)
+            warn!("replicate_object_ext: using multipart replication - bucket={}, object={}", bucket, object);
+            replicate_object_with_multipart(tgt_client.clone(), &tgt_client.bucket, &object, gr.stream, &object_info, put_opts)
                 .await
                 .err()
         } else {
@@ -1661,7 +1670,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             };
             let reader = ByteStream::from(body);
             tgt_client
-                .put_object(&bucket, &object, size, reader, &put_opts)
+                .put_object(&tgt_client.bucket, &object, size, reader, &put_opts)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
                 .err()
@@ -1669,7 +1678,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             rinfo.replication_status = StatusType::Failed;
             rinfo.error = Some(err.to_string());
 
-            error!("replicate_object_ext: failed to replicate object - bucket={}, object={}, error={}", bucket, object, err);
+            error!(
+                "replicate_object_ext: failed to replicate object - bucket={}, object={}, error={}",
+                bucket, object, err
+            );
             // TODO: check offline
             return rinfo;
         }
@@ -1837,9 +1849,16 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
             if let Some(err) = if is_multipart {
-                replicate_object_with_multipart(tgt_client.clone(), &bucket, &object, gr.stream, &object_info, put_opts)
-                    .await
-                    .err()
+                replicate_object_with_multipart(
+                    tgt_client.clone(),
+                    &tgt_client.bucket,
+                    &object,
+                    gr.stream,
+                    &object_info,
+                    put_opts,
+                )
+                .await
+                .err()
             } else {
                 let body = match gr.read_all().await {
                     Ok(body) => body,
@@ -1853,7 +1872,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 };
                 let reader = ByteStream::from(body);
                 tgt_client
-                    .put_object(&bucket, &object, size, reader, &put_opts)
+                    .put_object(&tgt_client.bucket, &object, size, reader, &put_opts)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
                     .err()
@@ -2016,18 +2035,37 @@ async fn replicate_object_with_multipart(
     object_info: &ObjectInfo,
     opts: PutObjectOptions,
 ) -> std::io::Result<()> {
+    warn!(
+        "replicate_object_with_multipart: starting multipart upload - bucket={}, object={}, parts_count={}",
+        bucket, object, object_info.parts.len()
+    );
+
     let mut attempts = 1;
     let upload_id = loop {
+        warn!(
+            "replicate_object_with_multipart: creating multipart upload attempt {} - bucket={}, object={}",
+            attempts, bucket, object
+        );
+
         match cli.create_multipart_upload(bucket, object, &opts).await {
             Ok(id) => {
+                warn!(
+                    "replicate_object_with_multipart: successfully created multipart upload - bucket={}, object={}, upload_id={}",
+                    bucket, object, id
+                );
                 break id;
             }
             Err(e) => {
                 attempts += 1;
                 if attempts > 3 {
-                    error!("failed to create multipart upload for bucket:{} object:{} error:{}", bucket, object, e);
+                    error!("replicate_object_with_multipart: failed to create multipart upload after 3 attempts - bucket={}, object={}, error={}", bucket, object, e);
                     return Err(std::io::Error::other(e.to_string()));
                 }
+
+                warn!(
+                    "replicate_object_with_multipart: create multipart upload failed, retrying - bucket={}, object={}, attempt={}, error={}",
+                    bucket, object, attempts, e
+                );
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -2037,9 +2075,18 @@ async fn replicate_object_with_multipart(
     };
 
     let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
+    warn!(
+        "replicate_object_with_multipart: starting to upload parts - bucket={}, object={}, total_parts={}",
+        bucket, object, object_info.parts.len()
+    );
 
     let mut reader = reader;
-    for part_info in object_info.parts.iter() {
+    for (idx, part_info) in object_info.parts.iter().enumerate() {
+        warn!(
+            "replicate_object_with_multipart: uploading part {}/{} - bucket={}, object={}, part_number={}, size={}",
+            idx + 1, object_info.parts.len(), bucket, object, part_info.number, part_info.size
+        );
+
         let mut chunk = vec![0u8; part_info.size];
         AsyncReadExt::read_exact(&mut *reader, &mut chunk).await?;
 
@@ -2056,13 +2103,24 @@ async fn replicate_object_with_multipart(
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        let etag = object_part.e_tag.unwrap_or_default();
+        warn!(
+            "replicate_object_with_multipart: part uploaded successfully - bucket={}, object={}, part_number={}, etag={}",
+            bucket, object, part_info.number, etag
+        );
+
         uploaded_parts.push(
             CompletedPart::builder()
                 .part_number(part_info.number as i32)
-                .e_tag(object_part.e_tag.unwrap_or_default())
+                .e_tag(etag)
                 .build(),
         );
     }
+
+    warn!(
+        "replicate_object_with_multipart: all parts uploaded, completing multipart upload - bucket={}, object={}, upload_id={}, parts_count={}",
+        bucket, object, upload_id, uploaded_parts.len()
+    );
 
     let mut user_metadata = HashMap::new();
 
@@ -2086,7 +2144,19 @@ async fn replicate_object_with_multipart(
         },
     )
     .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    .map_err(|e| {
+        error!(
+            "replicate_object_with_multipart: failed to complete multipart upload - bucket={}, object={}, upload_id={}, error={}",
+            bucket, object, upload_id, e
+        );
+        std::io::Error::other(e.to_string())
+    })?;
+
+    warn!(
+        "replicate_object_with_multipart: successfully completed multipart upload - bucket={}, object={}, upload_id={}",
+        bucket, object, upload_id
+    );
+
     Ok(())
 }
 
