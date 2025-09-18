@@ -148,6 +148,7 @@ impl ScannerItem {
             to_del.push(ObjectToDelete {
                 object_name: obj.name,
                 version_id: obj.version_id,
+                ..Default::default()
             });
         }
 

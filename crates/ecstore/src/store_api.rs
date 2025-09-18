@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
-use crate::bucket::replication::{self, ReplicationState};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
@@ -25,7 +24,9 @@ use crate::{
 };
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo};
+use rustfs_filemeta::{
+    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
@@ -440,10 +441,10 @@ pub struct ObjectInfo {
     pub inlined: bool,
     pub metadata_only: bool,
     pub version_only: bool,
-    pub replication_status_internal: String,
-    pub replication_status: replication::StatusType,
-    pub version_purge_status_internal: String,
-    pub version_purge_status: replication::VersionPurgeStatusType,
+    pub replication_status_internal: Option<String>,
+    pub replication_status: ReplicationStatusType,
+    pub version_purge_status_internal: Option<String>,
+    pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
     pub checksum: Vec<u8>,
 }
@@ -940,7 +941,22 @@ pub struct ListPartsInfo {
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,
+    pub delete_marker_replication_status: Option<String>,
+    pub version_purge_status: Option<VersionPurgeStatusType>,
+    pub version_purge_statuses: Option<String>,
+    pub replicate_decision_str: Option<String>,
 }
+
+impl ObjectToDelete {
+    pub fn replication_state(&self) -> ReplicationState {
+        ReplicationState {
+            replication_status_internal: self.delete_marker_replication_status.clone(),
+            replica_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,

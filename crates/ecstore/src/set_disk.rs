@@ -3991,6 +3991,7 @@ impl StorageAPI for SetDisks {
                 name: dobj.object_name.clone(),
                 version_id: dobj.version_id,
                 idx: i,
+                replication_state: Some(dobj.replication_state()),
                 ..Default::default()
             };
 

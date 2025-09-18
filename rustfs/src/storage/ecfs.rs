@@ -29,12 +29,18 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
-use rustfs_ecstore::bucket::replication::ReplicationType;
-use rustfs_ecstore::bucket::replication::StatusType;
+use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
+use rustfs_ecstore::bucket::replication::check_replicate_delete;
 use rustfs_ecstore::bucket::replication::get_must_replicate_options;
 use rustfs_ecstore::bucket::replication::must_replicate;
 use rustfs_ecstore::bucket::replication::schedule_replication;
+use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
+use rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_filemeta::ReplicationStatusType;
+use rustfs_filemeta::ReplicationType;
+use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_s3select_api::query::Context;
 use rustfs_s3select_api::query::Query;
@@ -712,7 +718,11 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        warn!("delete_object: req  headers {:?}", &req.headers);
+
         let metadata = extract_metadata(&req.headers);
+
+        warn!("delete_object: metadata {:?}", &metadata);
 
         let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
@@ -722,13 +732,50 @@ impl S3 for FS {
         let dobj = ObjectToDelete {
             object_name: key.clone(),
             version_id,
+            ..Default::default()
         };
 
-        let objects: Vec<ObjectToDelete> = vec![dobj];
+        let mut objects: Vec<ObjectToDelete> = vec![dobj];
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        let has_replication_rules = has_replication_rules(&bucket, &objects).await;
+
+        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
+
+        for object in objects.iter_mut() {
+            if has_replication_rules {
+                let opts = ObjectOptions {
+                    version_id: object.version_id.map(|v| v.to_string()),
+                    versioned: version_cfg.prefix_enabled(&object.object_name),
+                    version_suspended: version_cfg.suspended(),
+                    ..Default::default()
+                };
+
+                let (oji, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                    Ok(o) => (o, None),
+                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+                };
+
+                let replicate_decision = check_replicate_delete(&bucket, &object, &oji, &opts, gerr).await;
+                if replicate_decision.replicate_any() {
+                    if object.version_id.is_some() {
+                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+                        object.version_purge_statuses = Some(replicate_decision.pending_status());
+                    } else {
+                        object.delete_marker_replication_status = Some(replicate_decision.pending_status());
+                    }
+
+                    object.replicate_decision_str = Some(replicate_decision.to_string());
+                }
+            }
+        }
+
+        warn!("delete_object: delete_objects {}/ {:?}", &bucket, &objects);
+        warn!("delete_object: opts {:?}", &opts);
+
         let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
 
         // TODO: let errors;
@@ -737,6 +784,7 @@ impl S3 for FS {
             if let Some((a, b)) = dobjs
                 .iter()
                 .map(|v| {
+                    warn!("delete_object: result {}/{} {:?}", &bucket, &v.object_name, &v);
                     let delete_marker = { if v.delete_marker { Some(true) } else { None } };
 
                     let version_id = v.version_id.clone();
@@ -795,6 +843,7 @@ impl S3 for FS {
                 ObjectToDelete {
                     object_name: v.key.clone(),
                     version_id,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -1477,10 +1526,10 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let repoptions =
-            get_must_replicate_options(&mt2, "".to_string(), StatusType::Empty, ReplicationType::Object, opts.clone());
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
-        // warn!("dsc {}", &dsc.replicate_any().clone());
+        warn!("put object must_replicate {}", &dsc.replicate_any().clone());
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
             let now: DateTime<Utc> = Utc::now();
@@ -1497,10 +1546,11 @@ impl S3 for FS {
         let event_info = obj_info.clone();
         let e_tag = obj_info.etag.clone();
 
-        let repoptions = get_must_replicate_options(&mt2, "".to_string(), StatusType::Empty, ReplicationType::Object, opts);
+        let repoptions =
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
-
+        warn!("put object schedule_replication {}", &dsc.replicate_any().clone());
         if dsc.replicate_any() {
             schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
@@ -2052,7 +2102,7 @@ impl S3 for FS {
 
         let mt2 = HashMap::new();
         let repoptions =
-            get_must_replicate_options(&mt2, "".to_string(), StatusType::Empty, ReplicationType::Object, opts.clone());
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
@@ -3536,6 +3586,23 @@ pub(crate) fn process_lambda_configurations<F>(
             event_rules.push((events, prefix, suffix, target_ids));
         }
     }
+}
+
+pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
+    let (cfg, _created) = match get_replication_config(bucket).await {
+        Ok(replication_config) => replication_config,
+        Err(err) => {
+            error!("get_replication_config failed, {}", err.to_string());
+            return false;
+        }
+    };
+
+    for object in objects {
+        if cfg.has_active_rules(&object.object_name, true) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

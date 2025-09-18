@@ -3,7 +3,6 @@ use crate::bucket::replication::MrfReplicateEntry;
 use crate::bucket::replication::ObjectInfoExt as _;
 use crate::bucket::replication::ReplicateDecision;
 use crate::bucket::replication::ReplicateObjectInfo;
-use crate::bucket::replication::ReplicationType;
 use crate::bucket::replication::ReplicationWorkerOperation;
 use crate::bucket::replication::ResyncDecision;
 use crate::bucket::replication::ResyncOpts;
@@ -27,6 +26,7 @@ use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
 
 use lazy_static::lazy_static;
+use rustfs_filemeta::ReplicationType;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -313,16 +313,10 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
     /// Resizes the regular workers pool
     pub async fn resize_workers(&self, n: usize, check_old: usize) {
-        warn!(
-            "resize_workers: called with n={}, check_old={}",
-            n, check_old
-        );
+        warn!("resize_workers: called with n={}, check_old={}", n, check_old);
 
         let mut workers = self.workers.write().await;
-        warn!(
-            "resize_workers: current workers count={}",
-            workers.len()
-        );
+        warn!("resize_workers: current workers count={}", workers.len());
 
         if (check_old > 0 && workers.len() != check_old) || n == workers.len() || n < 1 {
             warn!(
@@ -336,19 +330,13 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         // Add workers if needed
         if workers.len() < n {
-            warn!(
-                "resize_workers: adding workers from {} to {}",
-                workers.len(), n
-            );
+            warn!("resize_workers: adding workers from {} to {}", workers.len(), n);
         }
 
         while workers.len() < n {
             let (tx, rx) = mpsc::channel(10000);
             workers.push(tx);
-            warn!(
-                "resize_workers: created new worker {}/{}",
-                workers.len(), n
-            );
+            warn!("resize_workers: created new worker {}/{}", workers.len(), n);
 
             let active_counter = self.active_workers.clone();
             let stats = self.stats.clone();
@@ -357,6 +345,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
+                    warn!("resize_workers: received operation");
                     active_counter.fetch_add(1, Ordering::SeqCst);
 
                     match operation {
@@ -365,6 +354,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
                                 .inc_q(&obj_info.bucket, obj_info.size, obj_info.delete_marker, obj_info.op_type)
                                 .await;
 
+                            warn!("resize_workers: replicating object {} {}", obj_info.bucket, obj_info.name);
                             // Perform actual replication (placeholder)
                             replicate_object(obj_info.as_ref().clone(), storage.clone()).await;
 
@@ -391,26 +381,17 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         // Remove workers if needed
         if workers.len() > n {
-            warn!(
-                "resize_workers: removing workers from {} to {}",
-                workers.len(), n
-            );
+            warn!("resize_workers: removing workers from {} to {}", workers.len(), n);
         }
 
         while workers.len() > n {
             if let Some(worker) = workers.pop() {
-                warn!(
-                    "resize_workers: removed worker, remaining: {}",
-                    workers.len()
-                );
+                warn!("resize_workers: removed worker, remaining: {}", workers.len());
                 drop(worker); // Closing the channel will terminate the worker
             }
         }
 
-        warn!(
-            "resize_workers: completed - final workers count={}",
-            workers.len()
-        );
+        warn!("resize_workers: completed - final workers count={}", workers.len());
     }
 
     /// Resizes the failed workers pool
@@ -1050,8 +1031,8 @@ pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
 
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
     warn!("schedule_replication {} {}", oi.bucket, oi.name);
-    let tgt_statuses = replication_statuses_map(&oi.replication_status_internal);
-    let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal);
+    let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
+    let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
     let tm = oi
         .user_defined
         .get(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"))

@@ -1,4 +1,5 @@
 use crate::error::Error;
+use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,8 +9,6 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
 use tracing::warn;
-
-use crate::bucket::replication::{ReplicatedTargetInfo, ReplicationType, StatusType};
 
 /// Exponential Moving Average with thread-safe interior mutability
 #[derive(Debug)]
@@ -240,7 +239,7 @@ impl ReplStat {
         arn: String,
         size: i64,
         duration: Duration,
-        status: StatusType,
+        status: ReplicationStatusType,
         op_type: ReplicationType,
         endpoint: String,
         secure: bool,
@@ -260,9 +259,9 @@ impl ReplStat {
         self.failed = false;
 
         match status {
-            StatusType::Completed => self.completed = true,
-            StatusType::Pending => self.pending = true,
-            StatusType::Failed => self.failed = true,
+            ReplicationStatusType::Completed => self.completed = true,
+            ReplicationStatusType::Pending => self.pending = true,
+            ReplicationStatusType::Failed => self.failed = true,
             _ => {}
         }
     }
@@ -810,11 +809,17 @@ impl ReplicationStats {
     }
 
     /// Update replication statistics
-    pub async fn update(&self, bucket: &str, ri: &ReplicatedTargetInfo, status: StatusType, prev_status: StatusType) {
+    pub async fn update(
+        &self,
+        bucket: &str,
+        ri: &ReplicatedTargetInfo,
+        status: ReplicationStatusType,
+        prev_status: ReplicationStatusType,
+    ) {
         let mut rs = ReplStat::new();
 
         match status {
-            StatusType::Pending => {
+            ReplicationStatusType::Pending => {
                 if ri.op_type.is_data_replication() && prev_status != status {
                     rs.set(
                         ri.arn.clone(),
@@ -828,7 +833,7 @@ impl ReplicationStats {
                     );
                 }
             }
-            StatusType::Completed => {
+            ReplicationStatusType::Completed => {
                 if ri.op_type.is_data_replication() {
                     rs.set(
                         ri.arn.clone(),
@@ -842,8 +847,8 @@ impl ReplicationStats {
                     );
                 }
             }
-            StatusType::Failed => {
-                if ri.op_type.is_data_replication() && prev_status == StatusType::Pending {
+            ReplicationStatusType::Failed => {
+                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending {
                     rs.set(
                         ri.arn.clone(),
                         ri.size,
@@ -856,7 +861,7 @@ impl ReplicationStats {
                     );
                 }
             }
-            StatusType::Replica => {
+            ReplicationStatusType::Replica => {
                 if ri.op_type == ReplicationType::Object {
                     rs.set(
                         ri.arn.clone(),
@@ -1167,7 +1172,12 @@ mod tests {
         };
 
         stats
-            .update("test-bucket", &target_info, StatusType::Completed, StatusType::Pending)
+            .update(
+                "test-bucket",
+                &target_info,
+                ReplicationStatusType::Completed,
+                ReplicationStatusType::Pending,
+            )
             .await;
 
         let bucket_stats = stats.get("test-bucket").await;

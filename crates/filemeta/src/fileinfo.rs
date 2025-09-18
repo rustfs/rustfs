@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ReplicationState;
 use crate::error::{Error, Result};
 use bytes::Bytes;
 use rmp_serde::Serializer;
@@ -201,7 +202,7 @@ pub struct FileInfo {
     // MarkDeleted marks this version as deleted
     pub mark_deleted: bool,
     // ReplicationState - Internal replication state to be passed back in ObjectInfo
-    // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
+    pub replication_state: Option<ReplicationState>,
     pub data: Option<Bytes>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,

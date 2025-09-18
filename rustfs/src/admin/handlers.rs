@@ -977,7 +977,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(S3Error::with_message(S3ErrorCode::IncorrectEndpoint, "Same target".to_string()));
         }
 
-        remote_target.target_bucket = bucket.clone();
+        remote_target.source_bucket = bucket.clone();
 
         let bucket_target_sys = BucketTargetSys::get();
 

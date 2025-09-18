@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::ReplicationRuleExt as _;
-use super::ReplicationType;
 use crate::bucket::tagging::decode_tags_to_map;
+use rustfs_filemeta::ReplicationType;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;
