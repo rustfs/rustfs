@@ -65,6 +65,7 @@ use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
+// KMS is now managed dynamically via API
 use s3s::s3_error;
 use std::io::{Error, Result};
 use std::str::FromStr;
@@ -267,6 +268,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     ecconfig::init();
     // config system configuration
     GLOBAL_CONFIG_SYS.init(store.clone()).await?;
+
+    // Initialize KMS system if enabled
+    init_kms_system(&opt).await?;
 
     // Initialize event notifier
     init_event_notifier().await;
@@ -585,4 +589,97 @@ async fn shutdown_event_notifier() {
     // Call the shutdown function from the rustfs_notify module
     system.shutdown().await;
     info!("Event notifier system shut down successfully.");
+}
+
+/// Initialize KMS system and configure if enabled
+#[instrument(skip(opt))]
+async fn init_kms_system(opt: &config::Opt) -> Result<()> {
+    println!("CLAUDE DEBUG: init_kms_system called!");
+    info!("CLAUDE DEBUG: init_kms_system called!");
+    info!("Initializing KMS service manager...");
+    info!(
+        "CLAUDE DEBUG: KMS configuration - kms_enable: {}, kms_backend: {}, kms_key_dir: {:?}, kms_default_key_id: {:?}",
+        opt.kms_enable, opt.kms_backend, opt.kms_key_dir, opt.kms_default_key_id
+    );
+
+    // Initialize global KMS service manager (starts in NotConfigured state)
+    let service_manager = rustfs_kms::init_global_kms_service_manager();
+
+    // If KMS is enabled in configuration, configure and start the service
+    if opt.kms_enable {
+        info!("KMS is enabled, configuring and starting service...");
+
+        // Create KMS configuration from command line options
+        let kms_config = match opt.kms_backend.as_str() {
+            "local" => {
+                let key_dir = opt
+                    .kms_key_dir
+                    .as_ref()
+                    .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
+
+                rustfs_kms::config::KmsConfig {
+                    backend: rustfs_kms::config::KmsBackend::Local,
+                    backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
+                        key_dir: std::path::PathBuf::from(key_dir),
+                        master_key: None,
+                        file_permissions: Some(0o600),
+                    }),
+                    default_key_id: opt.kms_default_key_id.clone(),
+                    timeout: std::time::Duration::from_secs(30),
+                    retry_attempts: 3,
+                    enable_cache: true,
+                    cache_config: rustfs_kms::config::CacheConfig::default(),
+                }
+            }
+            "vault" => {
+                let vault_address = opt
+                    .kms_vault_address
+                    .as_ref()
+                    .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
+                let vault_token = opt
+                    .kms_vault_token
+                    .as_ref()
+                    .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+
+                rustfs_kms::config::KmsConfig {
+                    backend: rustfs_kms::config::KmsBackend::Vault,
+                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
+                        address: vault_address.clone(),
+                        auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                            token: vault_token.clone(),
+                        },
+                        namespace: None,
+                        mount_path: "transit".to_string(),
+                        kv_mount: "secret".to_string(),
+                        key_path_prefix: "rustfs/kms/keys".to_string(),
+                        tls: None,
+                    }),
+                    default_key_id: opt.kms_default_key_id.clone(),
+                    timeout: std::time::Duration::from_secs(30),
+                    retry_attempts: 3,
+                    enable_cache: true,
+                    cache_config: rustfs_kms::config::CacheConfig::default(),
+                }
+            }
+            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", opt.kms_backend))),
+        };
+
+        // Configure the KMS service
+        service_manager
+            .configure(kms_config)
+            .await
+            .map_err(|e| Error::other(format!("Failed to configure KMS: {}", e)))?;
+
+        // Start the KMS service
+        service_manager
+            .start()
+            .await
+            .map_err(|e| Error::other(format!("Failed to start KMS: {}", e)))?;
+
+        info!("KMS service configured and started successfully");
+    } else {
+        info!("KMS service manager initialized. KMS is ready for dynamic configuration via API.");
+    }
+
+    Ok(())
 }

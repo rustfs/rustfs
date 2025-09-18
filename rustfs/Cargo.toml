@@ -30,6 +30,9 @@ documentation = "https://docs.rustfs.com/"
 name = "rustfs"
 path = "src/main.rs"
 
+[features]
+default = []
+
 [lints]
 workspace = true
 
@@ -52,12 +55,14 @@ rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-protos = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-kms = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
 axum-extra = { workspace = true }
 axum-server = { workspace = true, features = ["tls-rustls"] }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -69,10 +74,12 @@ hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
 matchit = { workspace = true }
+md5.workspace = true
 mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
+rand.workspace = true
 reqwest = { workspace = true }
 rustls.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
@@ -126,6 +133,11 @@ mimalloc = "0.1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
+
+[dev-dependencies]
+serial_test = "3.1"
+uuid = { workspace = true, features = ["v4"] }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 http.workspace = true
