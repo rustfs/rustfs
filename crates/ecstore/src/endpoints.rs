@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
-use tracing::{error, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
@@ -251,6 +251,7 @@ impl PoolEndpointList {
                             return Err(Error::other(format!("host '{host}' cannot resolve: {e}")));
                         }
                     };
+                    warn!("host '{}' resolved to ips {:?} for endpoint '{}'", host, ips, ep.to_string());
                     host_ip_cache.insert(host.clone(), ips);
                     host_ip_cache.get(&host).unwrap()
                 };
