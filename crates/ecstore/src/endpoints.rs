@@ -13,13 +13,12 @@
 // limitations under the License.
 
 use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
-use tracing::{error, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     global::global_rustfs_port,
-    // utils::net::{self, XHost},
 };
 use std::io::{Error, Result};
 use std::{
@@ -242,15 +241,32 @@ impl PoolEndpointList {
 
                 let host = ep.url.host().unwrap();
                 let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
+                    info!(
+                        target: "rustfs::ecstore::endpoints",
+                        host = %host,
+                        endpoint = %ep.to_string(),
+                        from = "cache",
+                        "Create pool endpoints host '{}' found in cache for endpoint '{}'", host, ep.to_string()
+                    );
                     set
                 } else {
                     let ips = match get_host_ip(host.clone()).await {
                         Ok(ips) => ips,
                         Err(e) => {
-                            error!("host {} not found, error:{}", host, e);
+                            error!("Create pool endpoints host {} not found, error:{}", host, e);
                             return Err(Error::other(format!("host '{host}' cannot resolve: {e}")));
                         }
                     };
+                    info!(
+                        target: "rustfs::ecstore::endpoints",
+                        host = %host,
+                        endpoint = %ep.to_string(),
+                        from = "get_host_ip",
+                        "Create pool endpoints host '{}' resolved to ips {:?} for endpoint '{}'",
+                        host,
+                        ips,
+                        ep.to_string()
+                    );
                     host_ip_cache.insert(host.clone(), ips);
                     host_ip_cache.get(&host).unwrap()
                 };
