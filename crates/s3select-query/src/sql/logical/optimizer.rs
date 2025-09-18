@@ -26,7 +26,6 @@ use datafusion::{
         propagate_empty_relation::PropagateEmptyRelation, push_down_filter::PushDownFilter, push_down_limit::PushDownLimit,
         replace_distinct_aggregate::ReplaceDistinctWithAggregate, scalar_subquery_to_join::ScalarSubqueryToJoin,
         simplify_expressions::SimplifyExpressions, single_distinct_to_groupby::SingleDistinctToGroupBy,
-        unwrap_cast_in_comparison::UnwrapCastInComparison,
     },
 };
 use rustfs_s3select_api::{
@@ -66,7 +65,6 @@ impl Default for DefaultLogicalOptimizer {
         let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
             // df default rules start
             Arc::new(SimplifyExpressions::new()),
-            Arc::new(UnwrapCastInComparison::new()),
             Arc::new(ReplaceDistinctWithAggregate::new()),
             Arc::new(EliminateJoin::new()),
             Arc::new(DecorrelatePredicateSubquery::new()),
@@ -91,7 +89,6 @@ impl Default for DefaultLogicalOptimizer {
             // The previous optimizations added expressions and projections,
             // that might benefit from the following rules
             Arc::new(SimplifyExpressions::new()),
-            Arc::new(UnwrapCastInComparison::new()),
             Arc::new(CommonSubexprEliminate::new()),
             // PushDownProjection can pushdown Projections through Limits, do PushDownLimit again.
             Arc::new(PushDownLimit::new()),
