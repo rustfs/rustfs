@@ -1348,7 +1348,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         Ok(Some(config)) => {
             warn!("replicate_object: got replication config for bucket: {}", bucket);
             config
-        },
+        }
         Ok(None) => {
             warn!("replicate_object: no replication config found for bucket: {}", bucket);
             // TODO: SendEvent
@@ -1370,7 +1370,9 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
 
     warn!(
         "replicate_object: filtered target ARNs count={} for bucket={}, object={}",
-        tgt_arns.len(), bucket, object
+        tgt_arns.len(),
+        bucket,
+        object
     );
 
     // TODO: NSLOCK
@@ -1378,10 +1380,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        warn!(
-            "replicate_object: processing target ARN={} for bucket={}, object={}",
-            arn, bucket, object
-        );
+        warn!("replicate_object: processing target ARN={} for bucket={}, object={}", arn, bucket, object);
 
         let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &arn).await else {
             error!("replicate_object: failed to get target client for bucket:{} arn:{}", bucket, arn);
@@ -1412,7 +1411,9 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
 
     warn!(
         "replicate_object: waiting for {} replication tasks to complete - bucket={}, object={}",
-        join_set.len(), bucket, object
+        join_set.len(),
+        bucket,
+        object
     );
 
     while let Some(result) = join_set.join_next().await {
@@ -1423,7 +1424,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
                     bucket, object, tgt_info.arn, tgt_info.replication_status
                 );
                 rinfos.targets.push(tgt_info);
-            },
+            }
             Err(e) => {
                 error!("replicate_object: task failed - bucket={}, object={}, error={}", bucket, object, e);
                 // TODO: SendEvent
@@ -1464,7 +1465,9 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     if rinfos.replication_status() != StatusType::Completed {
         warn!(
             "replicate_object: replication incomplete - bucket={}, object={}, final_status={:?}",
-            bucket, object, rinfos.replication_status()
+            bucket,
+            object,
+            rinfos.replication_status()
         );
         // TODO: update stats
         // pool
@@ -1475,10 +1478,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         );
     }
 
-    warn!(
-        "replicate_object: finished processing - bucket={}, object={}",
-        bucket, object
-    );
+    warn!("replicate_object: finished processing - bucket={}, object={}", bucket, object);
 }
 
 trait ReplicateObjectInfoExt {
@@ -1491,6 +1491,11 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
     async fn replicate_object<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let bucket = self.bucket.clone();
         let object = self.name.clone();
+
+        warn!(
+            "replicate_object_ext: starting object replication - bucket={}, object={}, arn={}",
+            bucket, object, tgt_client.arn
+        );
 
         let replication_action = ReplicationAction::All;
         let mut rinfo = ReplicatedTargetInfo {
@@ -1509,6 +1514,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             && !self.existing_obj_resync.is_empty()
             && self.existing_obj_resync.must_resync_target(&tgt_client.arn)
         {
+            warn!(
+                "replicate_object_ext: object already completed and resync required - bucket={}, object={}, arn={}",
+                bucket, object, tgt_client.arn
+            );
             rinfo.replication_status = StatusType::Completed;
             rinfo.replication_resynced = true;
 
@@ -1516,13 +1525,23 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
-            error!("target is offline for bucket:{} arn:{}", bucket, tgt_client.arn);
+            error!("replicate_object_ext: target is offline - bucket={}, object={}, arn={}", bucket, object, tgt_client.arn);
             // TODO: send event
             return rinfo;
         }
 
+        warn!(
+            "replicate_object_ext: target is online, proceeding with replication - bucket={}, object={}, arn={}",
+            bucket, object, tgt_client.arn
+        );
+
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+
+        warn!(
+            "replicate_object_ext: getting object reader - bucket={}, object={}, versioned={}, version_suspended={}",
+            bucket, object, versioned, version_suspended
+        );
 
         let mut gr = match storage
             .get_object_reader(
@@ -1552,23 +1571,42 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         };
 
         let object_info = gr.object_info.clone();
+        warn!(
+            "replicate_object_ext: got object info - bucket={}, object={}, size={}, etag={:?}",
+            bucket, object, object_info.size, object_info.etag
+        );
 
         rinfo.prev_replication_status = object_info.target_replication_status(&tgt_client.arn);
+        warn!(
+            "replicate_object_ext: previous replication status - bucket={}, object={}, arn={}, status={:?}",
+            bucket, object, tgt_client.arn, rinfo.prev_replication_status
+        );
 
         let size = match object_info.get_actual_size() {
-            Ok(size) => size,
+            Ok(size) => {
+                warn!(
+                    "replicate_object_ext: got actual size - bucket={}, object={}, size={}",
+                    bucket, object, size
+                );
+                size
+            },
             Err(e) => {
-                error!("failed to get actual size for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                error!("replicate_object_ext: failed to get actual size - bucket={}, object={}, arn={}, error={}", bucket, object, tgt_client.arn, e);
                 // TODO: send event
                 return rinfo;
             }
         };
 
         if tgt_client.bucket.is_empty() {
-            error!("target bucket is empty for bucket:{} arn:{}", bucket, tgt_client.arn);
+            error!("replicate_object_ext: target bucket is empty - bucket={}, object={}, arn={}", bucket, object, tgt_client.arn);
             // TODO: send event
             return rinfo;
         }
+
+        warn!(
+            "replicate_object_ext: preparing replication - bucket={}, object={}, target_bucket={}, size={}",
+            bucket, object, tgt_client.bucket, size
+        );
 
         rinfo.replication_status = StatusType::Completed;
         rinfo.replication_resynced = true;
@@ -1576,9 +1614,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.replication_action = replication_action;
 
         let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
-            Ok((put_opts, is_mp)) => (put_opts, is_mp),
+            Ok((put_opts, is_mp)) => {
+                warn!(
+                    "replicate_object_ext: got replication options - bucket={}, object={}, is_multipart={}, storage_class={}",
+                    bucket, object, is_mp, tgt_client.storage_class
+                );
+                (put_opts, is_mp)
+            },
             Err(e) => {
-                error!("failed to put replication opts for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                error!("replicate_object_ext: failed to get replication options - bucket={}, object={}, arn={}, error={}", bucket, object, tgt_client.arn, e);
                 // TODO: send event
                 return rinfo;
             }
@@ -1586,11 +1630,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         // TODO:bandwidth
 
+        warn!(
+            "replicate_object_ext: starting actual replication - bucket={}, object={}, is_multipart={}",
+            bucket, object, is_multipart
+        );
+
         if let Some(err) = if is_multipart {
+            warn!(
+                "replicate_object_ext: using multipart replication - bucket={}, object={}",
+                bucket, object
+            );
             replicate_object_with_multipart(tgt_client.clone(), &bucket, &object, gr.stream, &object_info, put_opts)
                 .await
                 .err()
         } else {
+            warn!(
+                "replicate_object_ext: using single-part replication - bucket={}, object={}",
+                bucket, object
+            );
             // TODO: use stream
             let body = match gr.read_all().await {
                 Ok(body) => body,
@@ -1612,12 +1669,16 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             rinfo.replication_status = StatusType::Failed;
             rinfo.error = Some(err.to_string());
 
-            error!("failed to replicate object for bucket:{} object:{} error:{}", bucket, object, err);
+            error!("replicate_object_ext: failed to replicate object - bucket={}, object={}, error={}", bucket, object, err);
             // TODO: check offline
             return rinfo;
         }
 
         rinfo.replication_status = StatusType::Completed;
+        warn!(
+            "replicate_object_ext: successfully completed replication - bucket={}, object={}, arn={}",
+            bucket, object, tgt_client.arn
+        );
 
         rinfo
     }
@@ -1625,6 +1686,11 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
     async fn replicate_all<S: StorageAPI>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let bucket = self.bucket.clone();
         let object = self.name.clone();
+
+        warn!(
+            "replicate_all_ext: starting all replication - bucket={}, object={}, arn={}",
+            bucket, object, tgt_client.arn
+        );
 
         let mut replication_action = ReplicationAction::Metadata;
         let mut rinfo = ReplicatedTargetInfo {
