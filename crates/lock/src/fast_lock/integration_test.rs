@@ -53,9 +53,7 @@ mod tests {
             0.0
         };
 
-        println!(
-            "Pool stats - Hits: {hits}, Misses: {misses}, Releases: {releases}, Pool size: {pool_size}"
-        );
+        println!("Pool stats - Hits: {hits}, Misses: {misses}, Releases: {releases}, Pool size: {pool_size}");
         println!("Hit rate: {:.2}%", hit_rate * 100.0);
 
         // We should see some pool activity

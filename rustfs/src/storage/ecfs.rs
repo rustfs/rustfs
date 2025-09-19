@@ -759,7 +759,7 @@ impl S3 for FS {
                     Err(e) => (ObjectInfo::default(), Some(e.to_string())),
                 };
 
-                let replicate_decision = check_replicate_delete(&bucket, &object, &oji, &opts, gerr).await;
+                let replicate_decision = check_replicate_delete(&bucket, object, &oji, &opts, gerr).await;
                 if replicate_decision.replicate_any() {
                     if object.version_id.is_some() {
                         object.version_purge_status = Some(VersionPurgeStatusType::Pending);

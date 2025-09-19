@@ -330,7 +330,7 @@ pub struct ReplicateObjectInfo {
     pub delete_marker: bool,
     pub version_purge_status_internal: Option<String>,
     pub version_purge_status: VersionPurgeStatusType,
-    pub replication_state: ReplicationState,
+    pub replication_state: Option<ReplicationState>,
     pub op_type: ReplicationType,
     pub event_type: String,
     pub dsc: ReplicateDecision,

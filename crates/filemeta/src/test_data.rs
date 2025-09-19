@@ -67,7 +67,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     let delete_marker = MetaDeleteMarker {
         version_id: Some(delete_version_id),
         mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312260)?), // 1 minute later
-        meta_sys: None,
+        meta_sys: HashMap::new(),
     };
 
     let delete_file_version = FileMetaVersion {
@@ -151,7 +151,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
             let delete_marker = MetaDeleteMarker {
                 version_id: Some(delete_version_id),
                 mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312200 + i * 60 + 30)?),
-                meta_sys: None,
+                meta_sys: HashMap::new(),
             };
 
             let delete_file_version = FileMetaVersion {

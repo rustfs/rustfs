@@ -15,6 +15,7 @@
 use crate::error::{Error, Result};
 use crate::fileinfo::{ErasureAlgo, ErasureInfo, FileInfo, FileInfoVersions, ObjectPartInfo, RawFileInfo};
 use crate::filemeta_inline::InlineData;
+use crate::{ReplicationStatusType, VersionPurgeStatusType};
 use byteorder::ByteOrder;
 use bytes::Bytes;
 use rustfs_utils::http::headers::{
@@ -575,10 +576,97 @@ impl FileMeta {
         }
 
         let mut update_version = fi.mark_deleted;
-        /*if fi.version_purge_status().is_empty()
+        if fi.version_purge_status().is_empty()
+            && (fi.delete_marker_replication_status() == ReplicationStatusType::Replica
+                || fi.delete_marker_replication_status() == ReplicationStatusType::Empty)
         {
             update_version = fi.mark_deleted;
-        }*/
+        } else {
+            if fi.deleted
+                && fi.version_purge_status() != VersionPurgeStatusType::Complete
+                && (!fi.version_purge_status().is_empty() || fi.delete_marker_replication_status().is_empty())
+            {
+                update_version = true;
+            }
+
+            if !fi.version_purge_status().is_empty() && fi.version_purge_status() != VersionPurgeStatusType::Complete {
+                update_version = true;
+            }
+        }
+
+        if fi.deleted {
+            if !fi.delete_marker_replication_status().is_empty() {
+                if let Some(delete_marker) = ventry.delete_marker.as_mut() {
+                    if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
+                        delete_marker.meta_sys.insert(
+                            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-status"),
+                            fi.replication_state_internal
+                                .as_ref()
+                                .map(|v| v.replica_status.clone())
+                                .unwrap_or_default()
+                                .as_str()
+                                .as_bytes()
+                                .to_vec(),
+                        );
+                        delete_marker.meta_sys.insert(
+                            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-timestamp"),
+                            fi.replication_state_internal
+                                .as_ref()
+                                .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
+                                .unwrap_or_default()
+                                .as_bytes()
+                                .to_vec(),
+                        );
+                    } else {
+                        delete_marker.meta_sys.insert(
+                            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status"),
+                            fi.replication_state_internal
+                                .as_ref()
+                                .map(|v| v.replication_status_internal.clone().unwrap_or_default())
+                                .unwrap_or_default()
+                                .as_bytes()
+                                .to_vec(),
+                        );
+                        delete_marker.meta_sys.insert(
+                            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"),
+                            fi.replication_state_internal
+                                .as_ref()
+                                .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
+                                .unwrap_or_default()
+                                .as_bytes()
+                                .to_vec(),
+                        );
+                    }
+                }
+            }
+
+            if !fi.version_purge_status().is_empty() {
+                if let Some(delete_marker) = ventry.delete_marker.as_mut() {
+                    delete_marker.meta_sys.insert(
+                        VERSION_PURGE_STATUS_KEY.to_string(),
+                        fi.replication_state_internal
+                            .as_ref()
+                            .map(|v| v.version_purge_status_internal.clone().unwrap_or_default())
+                            .unwrap_or_default()
+                            .as_bytes()
+                            .to_vec(),
+                    );
+                }
+            }
+
+            if let Some(delete_marker) = ventry.delete_marker.as_mut() {
+                for (k, v) in fi
+                    .replication_state_internal
+                    .as_ref()
+                    .map(|v| v.reset_statuses_map.clone())
+                    .unwrap_or_default()
+                {
+                    delete_marker.meta_sys.insert(k.clone(), v.clone().as_bytes().to_vec());
+                }
+            }
+        }
+
+        // ???
         if fi.transition_status == TRANSITION_COMPLETE {
             update_version = false;
         }
@@ -591,22 +679,111 @@ impl FileMeta {
             match ver.header.version_type {
                 VersionType::Invalid | VersionType::Legacy => return Err(Error::other("invalid file meta version")),
                 VersionType::Delete => {
-                    self.versions.remove(i);
-                    if fi.deleted && fi.version_id.is_none() {
-                        self.add_version_filemata(ventry)?;
+                    if update_version {
+                        let mut v = self.get_idx(i)?;
+                        if v.delete_marker.is_none() {
+                            v.delete_marker = Some(MetaDeleteMarker {
+                                version_id: fi.version_id,
+                                mod_time: fi.mod_time,
+                                meta_sys: HashMap::new(),
+                            });
+                        }
+
+                        if let Some(delete_marker) = v.delete_marker.as_mut() {
+                            if !fi.delete_marker_replication_status().is_empty() {
+                                if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
+                                    delete_marker.meta_sys.insert(
+                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-status"),
+                                        fi.replication_state_internal
+                                            .as_ref()
+                                            .map(|v| v.replica_status.clone())
+                                            .unwrap_or_default()
+                                            .as_str()
+                                            .as_bytes()
+                                            .to_vec(),
+                                    );
+                                    delete_marker.meta_sys.insert(
+                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-timestamp"),
+                                        fi.replication_state_internal
+                                            .as_ref()
+                                            .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
+                                            .unwrap_or_default()
+                                            .as_bytes()
+                                            .to_vec(),
+                                    );
+                                } else {
+                                    delete_marker.meta_sys.insert(
+                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status"),
+                                        fi.replication_state_internal
+                                            .as_ref()
+                                            .map(|v| v.replication_status_internal.clone().unwrap_or_default())
+                                            .unwrap_or_default()
+                                            .as_bytes()
+                                            .to_vec(),
+                                    );
+                                    delete_marker.meta_sys.insert(
+                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"),
+                                        fi.replication_state_internal
+                                            .as_ref()
+                                            .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
+                                            .unwrap_or_default()
+                                            .as_bytes()
+                                            .to_vec(),
+                                    );
+                                }
+                            }
+
+                            for (k, v) in fi
+                                .replication_state_internal
+                                .as_ref()
+                                .map(|v| v.reset_statuses_map.clone())
+                                .unwrap_or_default()
+                            {
+                                delete_marker.meta_sys.insert(k.clone(), v.clone().as_bytes().to_vec());
+                            }
+                        }
+
+                        self.set_idx(i, v)?;
                         return Ok(None);
+                    }
+                    self.versions.remove(i);
+
+                    if (fi.mark_deleted && fi.version_purge_status() != VersionPurgeStatusType::Complete)
+                        || (fi.deleted && fi.version_id.is_none())
+                    {
+                        self.add_version_filemata(ventry)?;
                     }
 
                     return Ok(None);
                 }
                 VersionType::Object => {
                     if update_version && !fi.deleted {
-                        let v = self.get_idx(i)?;
+                        let mut v = self.get_idx(i)?;
 
-                        self.versions.remove(i);
+                        if let Some(obj) = v.object.as_mut() {
+                            obj.meta_sys.insert(
+                                VERSION_PURGE_STATUS_KEY.to_string(),
+                                fi.replication_state_internal
+                                    .as_ref()
+                                    .map(|v| v.version_purge_status_internal.clone().unwrap_or_default())
+                                    .unwrap_or_default()
+                                    .as_bytes()
+                                    .to_vec(),
+                            );
+                            for (k, v) in fi
+                                .replication_state_internal
+                                .as_ref()
+                                .map(|v| v.reset_statuses_map.clone())
+                                .unwrap_or_default()
+                            {
+                                obj.meta_sys.insert(k.clone(), v.clone().as_bytes().to_vec());
+                            }
+                        }
 
-                        let a = v.object.map(|v| v.data_dir).unwrap_or_default();
-                        return Ok(a);
+                        let old_dir = v.object.as_ref().map(|v| v.data_dir).unwrap_or_default();
+                        self.set_idx(i, v)?;
+
+                        return Ok(old_dir);
                     }
                 }
             }
@@ -641,29 +818,35 @@ impl FileMeta {
         let obj_version_id = obj.version_id;
         let obj_data_dir = obj.data_dir;
 
-        if fi.expire_restored {
+        let mut err = if fi.expire_restored {
             obj.remove_restore_hdrs();
-            self.set_idx(i, ver)?;
+            self.set_idx(i, ver).err()
         } else if fi.transition_status == TRANSITION_COMPLETE {
             obj.set_transition(fi);
             obj.reset_inline_data();
-            self.set_idx(i, ver)?;
+            self.set_idx(i, ver).err()
         } else {
             self.versions.remove(i);
 
             let (free_version, to_free) = obj.init_free_version(fi);
 
             if to_free {
-                self.add_version_filemata(free_version)?;
+                self.add_version_filemata(free_version).err()
+            } else {
+                None
             }
-        }
+        };
 
         if fi.deleted {
-            self.add_version_filemata(ventry)?;
+            err = self.add_version_filemata(ventry).err();
         }
 
         if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
             return Ok(None);
+        }
+
+        if let Some(e) = err {
+            return Err(e);
         }
 
         Ok(obj_data_dir)
@@ -1642,17 +1825,15 @@ impl MetaObject {
                 free_entry.delete_marker = Some(MetaDeleteMarker {
                     version_id: Some(vid),
                     mod_time: self.mod_time,
-                    meta_sys: Some(HashMap::<String, Vec<u8>>::new()),
+                    meta_sys: HashMap::<String, Vec<u8>>::new(),
                 });
 
-                free_entry
-                    .delete_marker
-                    .as_mut()
-                    .unwrap()
+                let delete_marker = free_entry.delete_marker.as_mut().unwrap();
+
+                delete_marker
                     .meta_sys
-                    .as_mut()
-                    .unwrap()
                     .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{FREE_VERSION}"), vec![]);
+
                 let tier_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}");
                 let tier_obj_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}");
                 let tier_obj_vid_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}");
@@ -1660,14 +1841,7 @@ impl MetaObject {
                 let aa = [tier_key, tier_obj_key, tier_obj_vid_key];
                 for (k, v) in &self.meta_sys {
                     if aa.contains(k) {
-                        free_entry
-                            .delete_marker
-                            .as_mut()
-                            .unwrap()
-                            .meta_sys
-                            .as_mut()
-                            .unwrap()
-                            .insert(k.clone(), v.clone());
+                        delete_marker.meta_sys.insert(k.clone(), v.clone());
                     }
                 }
                 return (free_entry, true);
@@ -1737,19 +1911,16 @@ pub struct MetaDeleteMarker {
     #[serde(rename = "MTime")]
     pub mod_time: Option<OffsetDateTime>, // Object delete marker modified time
     #[serde(rename = "MetaSys")]
-    pub meta_sys: Option<HashMap<String, Vec<u8>>>, // Delete marker internal metadata
+    pub meta_sys: HashMap<String, Vec<u8>>, // Delete marker internal metadata
 }
 
 impl MetaDeleteMarker {
     pub fn free_version(&self) -> bool {
-        self.meta_sys
-            .as_ref()
-            .map(|v| v.get(FREE_VERSION_META_HEADER).is_some())
-            .unwrap_or_default()
+        self.meta_sys.contains_key(FREE_VERSION_META_HEADER)
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, _all_parts: bool) -> FileInfo {
-        let metadata = self.meta_sys.clone().unwrap_or_default();
+        let metadata = self.meta_sys.clone();
 
         FileInfo {
             version_id: self.version_id.filter(|&vid| !vid.is_nil()),
@@ -1895,7 +2066,7 @@ impl From<FileInfo> for MetaDeleteMarker {
         Self {
             version_id: value.version_id,
             mod_time: value.mod_time,
-            meta_sys: None,
+            meta_sys: HashMap::new(),
         }
     }
 }
@@ -2794,7 +2965,7 @@ mod test {
             let delete_marker = MetaDeleteMarker {
                 version_id: Some(Uuid::new_v4()),
                 mod_time: Some(OffsetDateTime::now_utc()),
-                meta_sys: None,
+                meta_sys: HashMap::new(),
             };
 
             let delete_version = FileMetaVersion {

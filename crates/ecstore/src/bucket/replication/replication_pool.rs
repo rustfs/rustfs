@@ -1055,7 +1055,7 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
         version_purge_status_internal: oi.version_purge_status_internal,
         version_purge_status: oi.version_purge_status,
 
-        replication_state: rstate,
+        replication_state: Some(rstate),
         op_type,
         dsc: dsc.clone(),
         target_statuses: tgt_statuses,

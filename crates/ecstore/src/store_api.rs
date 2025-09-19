@@ -966,7 +966,7 @@ pub struct DeletedObject {
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication
-    pub replication_state: ReplicationState,
+    pub replication_state: Option<ReplicationState>,
 }
 
 #[derive(Debug, Default, Clone)]

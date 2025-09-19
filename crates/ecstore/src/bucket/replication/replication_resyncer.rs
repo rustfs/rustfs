@@ -430,7 +430,7 @@ impl ReplicationResyncer {
                                 object_name: roi.name.clone(),
                                 delete_marker_version_id: dm_version_id.map(|v| v.to_string()),
                                 version_id: version_id.map(|v| v.to_string()),
-                                replication_state: roi.replication_state,
+                                replication_state: roi.replication_state.clone(),
                                 delete_marker: roi.delete_marker,
                                 delete_marker_mtime: roi.mod_time,
                             },
@@ -648,7 +648,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         delete_marker: oi.delete_marker,
         version_purge_status_internal: oi.version_purge_status_internal.clone(),
         version_purge_status: oi.version_purge_status,
-        replication_state,
+        replication_state: Some(replication_state),
         op_type: ReplicationType::Heal,
         event_type: "".to_string(),
         dsc,
@@ -1150,7 +1150,15 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     };
 
-    let dsc = match parse_replicate_decision(&bucket, &dobj.delete_object.replication_state.replicate_decision_str) {
+    let dsc = match parse_replicate_decision(
+        &bucket,
+        &dobj
+            .delete_object
+            .replication_state
+            .as_ref()
+            .map(|v| v.replicate_decision_str.clone())
+            .unwrap_or_default(),
+    ) {
         Ok(dsc) => dsc,
         Err(err) => {
             error!("Failed to parse replicate decision for bucket {}: {}", bucket, err);
@@ -1209,12 +1217,22 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
     let (replication_status, prev_status) = if dobj.delete_object.version_id.is_none() {
         (
             rinfos.replication_status(),
-            dobj.delete_object.replication_state.composite_replication_status(),
+            dobj.delete_object
+                .replication_state
+                .as_ref()
+                .map(|v| v.composite_replication_status())
+                .unwrap_or(ReplicationStatusType::Empty),
         )
     } else {
         (
             ReplicationStatusType::from(rinfos.version_purge_status()),
-            ReplicationStatusType::from(dobj.delete_object.replication_state.composite_version_purge_status()),
+            ReplicationStatusType::from(
+                dobj.delete_object
+                    .replication_state
+                    .as_ref()
+                    .map(|v| v.composite_version_purge_status())
+                    .unwrap_or(VersionPurgeStatusType::Empty),
+            ),
         )
     };
 
@@ -1224,7 +1242,11 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     }
 
-    let mut drs = get_replication_state(&rinfos, &dobj.delete_object.replication_state, dobj.delete_object.version_id);
+    let mut drs = get_replication_state(
+        &rinfos,
+        &dobj.delete_object.replication_state.clone().unwrap_or_default(),
+        dobj.delete_object.version_id,
+    );
     if replication_status != prev_status {
         drs.replica_timestamp = Some(OffsetDateTime::now_utc());
     }
@@ -1261,7 +1283,12 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         dobj.delete_object.version_id.clone().unwrap_or_default()
     };
 
-    let mut rinfo = dobj.delete_object.replication_state.target_state(&tgt_client.arn);
+    let mut rinfo = dobj
+        .delete_object
+        .replication_state
+        .clone()
+        .unwrap_or_default()
+        .target_state(&tgt_client.arn);
     rinfo.op_type = dobj.op_type;
     rinfo.endpoint = tgt_client.endpoint.clone();
     rinfo.secure = tgt_client.secure;

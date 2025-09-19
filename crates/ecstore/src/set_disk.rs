@@ -3991,7 +3991,7 @@ impl StorageAPI for SetDisks {
                 name: dobj.object_name.clone(),
                 version_id: dobj.version_id,
                 idx: i,
-                replication_state: Some(dobj.replication_state()),
+                replication_state_internal: Some(dobj.replication_state()),
                 ..Default::default()
             };
 
@@ -4032,12 +4032,14 @@ impl StorageAPI for SetDisks {
                     delete_marker_version_id: vr.version_id.map(|v| v.to_string()),
                     delete_marker_mtime: vr.mod_time,
                     object_name: vr.name.clone(),
+                    replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
                 }
             } else {
                 del_objects[i] = DeletedObject {
                     object_name: vr.name.clone(),
                     version_id: vr.version_id.map(|v| v.to_string()),
+                    replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
                 }
             }
