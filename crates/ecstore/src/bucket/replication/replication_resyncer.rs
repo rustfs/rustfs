@@ -428,8 +428,8 @@ impl ReplicationResyncer {
                         let doi = DeletedObjectReplicationInfo {
                             delete_object: DeletedObject {
                                 object_name: roi.name.clone(),
-                                delete_marker_version_id: dm_version_id.map(|v| v.to_string()),
-                                version_id: version_id.map(|v| v.to_string()),
+                                delete_marker_version_id: dm_version_id,
+                                version_id,
                                 replication_state: roi.replication_state.clone(),
                                 delete_marker: roi.delete_marker,
                                 delete_marker_mtime: roi.mod_time,
@@ -1134,7 +1134,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         Some(version_id.to_owned())
     } else {
-        dobj.delete_object.version_id.clone()
+        dobj.delete_object.version_id
     };
 
     let _rcfg = match get_replication_config(&bucket).await {
@@ -1246,7 +1246,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
     let mut drs = get_replication_state(
         &rinfos,
         &dobj.delete_object.replication_state.clone().unwrap_or_default(),
-        dobj.delete_object.version_id,
+        dobj.delete_object.version_id.map(|v| v.to_string()),
     );
     if replication_status != prev_status {
         drs.replica_timestamp = Some(OffsetDateTime::now_utc());
@@ -1257,7 +1257,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
             &bucket,
             &dobj.delete_object.object_name,
             ObjectOptions {
-                version_id,
+                version_id: version_id.map(|v| v.to_string()),
                 mod_time: dobj.delete_object.delete_marker_mtime,
                 delete_replication: Some(drs),
                 versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
@@ -1281,7 +1281,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
     } else {
-        dobj.delete_object.version_id.clone().unwrap_or_default()
+        dobj.delete_object.version_id.unwrap_or_default()
     };
 
     let mut rinfo = dobj
@@ -1317,7 +1317,11 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    let version_id = if version_id.is_empty() { None } else { Some(version_id) };
+    let version_id = if version_id.is_nil() {
+        None
+    } else {
+        Some(version_id.to_string())
+    };
 
     if dobj.delete_object.delete_marker_version_id.is_some() {
         let _resp = match tgt_client

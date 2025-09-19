@@ -41,6 +41,8 @@ use rustfs_ecstore::bucket::replication::must_replicate;
 use rustfs_ecstore::bucket::replication::schedule_replication;
 use rustfs_ecstore::bucket::replication::schedule_replication_delete;
 use rustfs_ecstore::bucket::versioning::VersioningApi;
+use rustfs_ecstore::disk::error::DiskError;
+use rustfs_ecstore::disk::error_reduce::is_all_buckets_not_found;
 use rustfs_ecstore::error::is_err_bucket_not_found;
 use rustfs_ecstore::error::is_err_object_not_found;
 use rustfs_ecstore::error::is_err_version_not_found;
@@ -103,7 +105,6 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
-use rustfs_utils::http::AMZ_OBJECT_LOCK_LEGAL_HOLD;
 use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_utils::path::is_dir_object;
@@ -760,14 +761,14 @@ impl S3 for FS {
             ));
         }
 
-        let mut vid = opts.version_id.clone();
+        // let mut vid = opts.version_id.clone();
 
         if replica {
             opts.set_replica_status(ReplicationStatusType::Replica);
 
-            if opts.version_purge_status().is_empty() {
-                vid = None;
-            }
+            // if opts.version_purge_status().is_empty() {
+            //     vid = None;
+            // }
         }
 
         let Some(store) = new_object_layer_fn() else {
@@ -878,17 +879,9 @@ impl S3 for FS {
             schedule_replication_delete(DeletedObjectReplicationInfo {
                 delete_object: rustfs_ecstore::store_api::DeletedObject {
                     delete_marker: obj_info.delete_marker,
-                    delete_marker_version_id: if obj_info.delete_marker {
-                        obj_info.version_id.map(|v| v.to_string())
-                    } else {
-                        None
-                    },
+                    delete_marker_version_id: if obj_info.delete_marker { obj_info.version_id } else { None },
                     object_name: key.clone(),
-                    version_id: if obj_info.delete_marker {
-                        None
-                    } else {
-                        obj_info.version_id.map(|v| v.to_string())
-                    },
+                    version_id: if obj_info.delete_marker { None } else { obj_info.version_id },
                     delete_marker_mtime: obj_info.mod_time,
                     replication_state: Some(obj_info.replication_state()),
                     ..Default::default()
@@ -975,7 +968,7 @@ impl S3 for FS {
 
         #[derive(Default, Clone)]
         struct DeleteResult {
-            delete_object: Option<DeletedObject>,
+            delete_object: Option<rustfs_ecstore::store_api::DeletedObject>,
             error: Option<Error>,
         }
 
@@ -987,13 +980,13 @@ impl S3 for FS {
         for (idx, object) in delete.objects.iter().enumerate() {
             // TODO: check auth
             if let Some(version_id) = object.version_id.clone() {
-                let vid = match Uuid::parse_str(&version_id) {
+                let _vid = match Uuid::parse_str(&version_id) {
                     Ok(v) => v,
                     Err(err) => {
                         delete_results[idx].error = Some(Error {
                             code: Some("NoSuchVersion".to_string()),
                             key: Some(object.key.clone()),
-                            message: Some("Invalid version id".to_string()),
+                            message: Some(err.to_string()),
                             version_id: Some(version_id),
                         });
 
@@ -1034,7 +1027,7 @@ impl S3 for FS {
                     &bucket,
                     &ObjectToDelete {
                         object_name: object.object_name.clone(),
-                        version_id: object.version_id.clone(),
+                        version_id: object.version_id,
                         ..Default::default()
                     },
                     &goi,
@@ -1058,10 +1051,10 @@ impl S3 for FS {
             object_to_delete.push(object);
         }
 
-        let (dobjs, errs) = store
+        let (mut dobjs, errs) = store
             .delete_objects(
                 &bucket,
-                object_to_delete,
+                object_to_delete.clone(),
                 ObjectOptions {
                     version_suspended: version_cfg.suspended(),
                     ..Default::default()
@@ -1069,28 +1062,100 @@ impl S3 for FS {
             )
             .await;
 
-        // TODO: XXXXX
+        if is_all_buckets_not_found(
+            &errs
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.clone().into()))
+                .collect::<Vec<Option<DiskError>>>() as &[Option<DiskError>],
+        ) {
+            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+        }
 
-        let deleted = dobjs
+        for (i, err) in errs.into_iter().enumerate() {
+            let obj = dobjs[i].clone();
+
+            // let replication_state = obj.replication_state.clone().unwrap_or_default();
+
+            // let obj_to_del = ObjectToDelete {
+            //     object_name: decode_dir_object(dobjs[i].object_name.as_str()),
+            //     version_id: obj.version_id,
+            //     delete_marker_replication_status: replication_state.replication_status_internal.clone(),
+            //     version_purge_status: Some(obj.version_purge_status()),
+            //     version_purge_statuses: replication_state.version_purge_status_internal.clone(),
+            //     replicate_decision_str: Some(replication_state.replicate_decision_str.clone()),
+            // };
+
+            let Some(didx) = object_to_delete_index.get(&obj.object_name) else {
+                continue;
+            };
+
+            if err.is_none()
+                || err
+                    .clone()
+                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
+            {
+                if replicate_deletes {
+                    dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
+                }
+                delete_results[*didx].delete_object = Some(dobjs[i].clone());
+                continue;
+            }
+
+            if let Some(err) = err {
+                delete_results[*didx].error = Some(Error {
+                    code: Some(err.to_string()),
+                    key: Some(object_to_delete[i].object_name.clone()),
+                    message: Some(err.to_string()),
+                    version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
+                });
+            }
+        }
+
+        let deleted = delete_results
             .iter()
+            .filter_map(|v| v.delete_object.clone())
             .map(|v| DeletedObject {
                 delete_marker: { if v.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: v.delete_marker_version_id.clone(),
+                delete_marker_version_id: v.delete_marker_version_id.map(|v| v.to_string()),
                 key: Some(v.object_name.clone()),
-                version_id: v.version_id.clone(),
+                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
+                    None
+                } else {
+                    v.version_id.map(|v| v.to_string())
+                },
             })
             .collect();
 
-        // TODO: let errors;
-        for err in errs.iter().flatten() {
-            warn!("delete_objects err  {:?}", err);
-        }
+        let errors = delete_results.iter().filter_map(|v| v.error.clone()).collect::<Vec<Error>>();
 
         let output = DeleteObjectsOutput {
             deleted: Some(deleted),
-            // errors,
+            errors: Some(errors),
             ..Default::default()
         };
+
+        for dobjs in delete_results.iter() {
+            if let Some(dobj) = &dobjs.delete_object {
+                if replicate_deletes
+                    && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
+                        || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+                {
+                    let mut dobj = dobj.clone();
+                    if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
+                        dobj.version_id = Some(Uuid::nil());
+                    }
+
+                    let deleted_object = DeletedObjectReplicationInfo {
+                        delete_object: dobj,
+                        bucket: bucket.clone(),
+                        event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                        ..Default::default()
+                    };
+                    schedule_replication_delete(deleted_object).await;
+                }
+            }
+        }
+
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
             for dobj in dobjs {

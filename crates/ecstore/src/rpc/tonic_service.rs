@@ -1301,28 +1301,22 @@ impl Node for NodeService {
                     }));
                 }
             };
-            match disk.delete_versions(&request.volume, versions, opts).await {
-                Ok(errors) => {
-                    let errors = errors
-                        .into_iter()
-                        .map(|error| match error {
-                            Some(e) => e.to_string(),
-                            None => "".to_string(),
-                        })
-                        .collect();
 
-                    Ok(tonic::Response::new(DeleteVersionsResponse {
-                        success: true,
-                        errors,
-                        error: None,
-                    }))
-                }
-                Err(err) => Ok(tonic::Response::new(DeleteVersionsResponse {
-                    success: false,
-                    errors: Vec::new(),
-                    error: Some(err.into()),
-                })),
-            }
+            let errors = disk
+                .delete_versions(&request.volume, versions, opts)
+                .await
+                .into_iter()
+                .map(|error| match error {
+                    Some(e) => e.to_string(),
+                    None => "".to_string(),
+                })
+                .collect();
+
+            Ok(tonic::Response::new(DeleteVersionsResponse {
+                success: true,
+                errors,
+                error: None,
+            }))
         } else {
             Ok(tonic::Response::new(DeleteVersionsResponse {
                 success: false,

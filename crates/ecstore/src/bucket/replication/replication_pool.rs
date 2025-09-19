@@ -1,6 +1,5 @@
 use crate::StorageAPI;
 use crate::bucket::replication::MrfReplicateEntry;
-use crate::bucket::replication::ObjectInfoExt as _;
 use crate::bucket::replication::ReplicateDecision;
 use crate::bucket::replication::ReplicateObjectInfo;
 use crate::bucket::replication::ReplicationWorkerOperation;
@@ -1093,7 +1092,7 @@ pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
     }
 
     if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, GLOBAL_REPLICATION_STATS.get()) {
-        for (k, v) in rs.targets.iter() {
+        for (k, _v) in rs.targets.iter() {
             let ri = ReplicatedTargetInfo {
                 arn: k.clone(),
                 size: 0,

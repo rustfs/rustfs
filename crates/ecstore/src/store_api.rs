@@ -390,6 +390,13 @@ impl ObjectOptions {
             .map(|v| v.composite_version_purge_status())
             .unwrap_or(VersionPurgeStatusType::Empty)
     }
+
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        self.delete_replication
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1012,14 +1019,30 @@ impl ObjectToDelete {
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,
-    pub delete_marker_version_id: Option<String>,
+    pub delete_marker_version_id: Option<Uuid>,
     pub object_name: String,
-    pub version_id: Option<String>,
+    pub version_id: Option<Uuid>,
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication
     pub replication_state: Option<ReplicationState>,
     pub found: bool,
+}
+
+impl DeletedObject {
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.replication_state
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        self.replication_state
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
