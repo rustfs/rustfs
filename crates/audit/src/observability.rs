@@ -21,28 +21,28 @@
 //! - Error rate monitoring
 //! - Queue depth monitoring
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::info;
 
 /// Metrics collector for audit system observability
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AuditMetrics {
     // Performance metrics
     total_events_processed: AtomicU64,
     total_events_failed: AtomicU64,
     total_dispatch_time_ns: AtomicU64,
-    
+
     // Target metrics
     target_success_count: AtomicU64,
     target_failure_count: AtomicU64,
-    
+
     // System metrics
     config_reload_count: AtomicU64,
     system_start_count: AtomicU64,
-    
+
     // Performance tracking
     last_reset_time: Arc<RwLock<Instant>>,
 }
@@ -65,13 +65,15 @@ impl AuditMetrics {
     /// Records a successful event dispatch
     pub fn record_event_success(&self, dispatch_time: Duration) {
         self.total_events_processed.fetch_add(1, Ordering::Relaxed);
-        self.total_dispatch_time_ns.fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
+        self.total_dispatch_time_ns
+            .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Records a failed event dispatch
     pub fn record_event_failure(&self, dispatch_time: Duration) {
         self.total_events_failed.fetch_add(1, Ordering::Relaxed);
-        self.total_dispatch_time_ns.fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
+        self.total_dispatch_time_ns
+            .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Records a successful target operation
@@ -100,9 +102,8 @@ impl AuditMetrics {
     pub async fn get_events_per_second(&self) -> f64 {
         let reset_time = *self.last_reset_time.read().await;
         let elapsed = reset_time.elapsed();
-        let total_events = self.total_events_processed.load(Ordering::Relaxed) +
-            self.total_events_failed.load(Ordering::Relaxed);
-        
+        let total_events = self.total_events_processed.load(Ordering::Relaxed) + self.total_events_failed.load(Ordering::Relaxed);
+
         if elapsed.as_secs_f64() > 0.0 {
             total_events as f64 / elapsed.as_secs_f64()
         } else {
@@ -112,10 +113,9 @@ impl AuditMetrics {
 
     /// Gets the average dispatch latency in milliseconds
     pub fn get_average_latency_ms(&self) -> f64 {
-        let total_events = self.total_events_processed.load(Ordering::Relaxed) +
-            self.total_events_failed.load(Ordering::Relaxed);
+        let total_events = self.total_events_processed.load(Ordering::Relaxed) + self.total_events_failed.load(Ordering::Relaxed);
         let total_time_ns = self.total_dispatch_time_ns.load(Ordering::Relaxed);
-        
+
         if total_events > 0 {
             (total_time_ns as f64 / total_events as f64) / 1_000_000.0 // Convert ns to ms
         } else {
@@ -125,10 +125,9 @@ impl AuditMetrics {
 
     /// Gets the error rate as a percentage
     pub fn get_error_rate(&self) -> f64 {
-        let total_events = self.total_events_processed.load(Ordering::Relaxed) +
-            self.total_events_failed.load(Ordering::Relaxed);
+        let total_events = self.total_events_processed.load(Ordering::Relaxed) + self.total_events_failed.load(Ordering::Relaxed);
         let failed_events = self.total_events_failed.load(Ordering::Relaxed);
-        
+
         if total_events > 0 {
             (failed_events as f64 / total_events as f64) * 100.0
         } else {
@@ -138,10 +137,9 @@ impl AuditMetrics {
 
     /// Gets target success rate as a percentage
     pub fn get_target_success_rate(&self) -> f64 {
-        let total_ops = self.target_success_count.load(Ordering::Relaxed) +
-            self.target_failure_count.load(Ordering::Relaxed);
+        let total_ops = self.target_success_count.load(Ordering::Relaxed) + self.target_failure_count.load(Ordering::Relaxed);
         let success_ops = self.target_success_count.load(Ordering::Relaxed);
-        
+
         if total_ops > 0 {
             (success_ops as f64 / total_ops as f64) * 100.0
         } else {
@@ -158,10 +156,10 @@ impl AuditMetrics {
         self.target_failure_count.store(0, Ordering::Relaxed);
         self.config_reload_count.store(0, Ordering::Relaxed);
         self.system_start_count.store(0, Ordering::Relaxed);
-        
+
         let mut reset_time = self.last_reset_time.write().await;
         *reset_time = Instant::now();
-        
+
         info!("Audit metrics reset");
     }
 
@@ -184,7 +182,7 @@ impl AuditMetrics {
         let eps = self.get_events_per_second().await;
         let avg_latency_ms = self.get_average_latency_ms();
         let error_rate = self.get_error_rate();
-        
+
         let mut validation = PerformanceValidation {
             meets_eps_requirement: eps >= 3000.0,
             meets_latency_requirement: avg_latency_ms <= 30.0,
@@ -218,7 +216,9 @@ impl AuditMetrics {
         }
 
         if validation.meets_eps_requirement && validation.meets_latency_requirement && validation.meets_error_rate_requirement {
-            validation.recommendations.push("All performance requirements are met.".to_string());
+            validation
+                .recommendations
+                .push("All performance requirements are met.".to_string());
         }
 
         validation
@@ -283,11 +283,7 @@ impl PerformanceValidation {
 
     /// Formats the validation as a human-readable string
     pub fn format(&self) -> String {
-        let status = if self.all_requirements_met() {
-            "✅ PASS"
-        } else {
-            "❌ FAIL"
-        };
+        let status = if self.all_requirements_met() { "✅ PASS" } else { "❌ FAIL" };
 
         let mut result = format!(
             "Performance Requirements Validation: {}\n\

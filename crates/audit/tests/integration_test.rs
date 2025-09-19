@@ -34,21 +34,21 @@ async fn test_audit_registry_creation() {
 async fn test_config_parsing_webhook() {
     let mut config = Config(HashMap::new());
     let mut audit_webhook_section = HashMap::new();
-    
+
     // Create default configuration
     let mut default_kvs = KVS::new();
     default_kvs.insert("enable".to_string(), "on".to_string());
     default_kvs.insert("endpoint".to_string(), "http://localhost:3020/webhook".to_string());
-    
+
     audit_webhook_section.insert("_".to_string(), default_kvs);
     config.0.insert("audit_webhook".to_string(), audit_webhook_section);
 
     let mut registry = AuditRegistry::new();
-    
+
     // This should not fail even if server storage is not initialized
     // as it's an integration test
     let result = registry.create_targets_from_config(&config).await;
-    
+
     // We expect this to fail due to server storage not being initialized
     // but the parsing should work correctly
     match result {
@@ -68,19 +68,19 @@ async fn test_config_parsing_webhook() {
 #[test]
 fn test_event_name_parsing() {
     use rustfs_targets::EventName;
-    
+
     // Test basic event name parsing
     let event = EventName::parse("s3:ObjectCreated:Put").unwrap();
     assert_eq!(event, EventName::ObjectCreatedPut);
-    
+
     let event = EventName::parse("s3:ObjectAccessed:*").unwrap();
     assert_eq!(event, EventName::ObjectAccessedAll);
-    
+
     // Test event name expansion
     let expanded = EventName::ObjectCreatedAll.expand();
     assert!(expanded.contains(&EventName::ObjectCreatedPut));
     assert!(expanded.contains(&EventName::ObjectCreatedPost));
-    
+
     // Test event name mask
     let mask = EventName::ObjectCreatedPut.mask();
     assert!(mask > 0);
@@ -100,7 +100,7 @@ fn test_enable_value_parsing() {
         ("no", false),
         ("invalid", false),
     ];
-    
+
     for (input, expected) in test_cases {
         let result = matches!(input.to_lowercase().as_str(), "1" | "on" | "true" | "yes");
         assert_eq!(result, expected, "Failed for input: {}", input);

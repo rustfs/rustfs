@@ -6255,7 +6255,7 @@ dependencies = [
 name = "rustfs-audit"
 version = "0.0.5"
 dependencies = [
- "async-trait",
+ "chrono",
  "futures",
  "once_cell",
  "rumqttc",

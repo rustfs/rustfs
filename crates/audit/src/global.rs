@@ -12,10 +12,10 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::error::AuditResult;
-use crate::system::AuditSystem;
+use crate::AuditEntry;
+use crate::AuditResult;
+use crate::AuditSystem;
 use once_cell::sync::OnceCell;
-use rustfs_audit_logger::AuditLogEntry;
 use rustfs_ecstore::config::Config;
 use std::sync::Arc;
 use tracing::{error, warn};
@@ -70,7 +70,7 @@ pub async fn resume_audit_system() -> AuditResult<()> {
 }
 
 /// Dispatch an audit log entry to all targets
-pub async fn dispatch_audit_log(entry: Arc<AuditLogEntry>) -> AuditResult<()> {
+pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
     if let Some(system) = audit_system() {
         if system.is_running().await {
             system.dispatch(entry).await
@@ -108,7 +108,7 @@ pub struct AuditLogger;
 
 impl AuditLogger {
     /// Log an audit entry
-    pub async fn log(entry: AuditLogEntry) {
+    pub async fn log(entry: AuditEntry) {
         if let Err(e) = dispatch_audit_log(Arc::new(entry)).await {
             error!(error = %e, "Failed to dispatch audit log entry");
         }

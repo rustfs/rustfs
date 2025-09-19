@@ -18,17 +18,16 @@
 //! configuration management, and hot reload functionality. It is modeled after the notify system
 //! but specifically designed for audit logging requirements.
 
+pub mod entity;
 pub mod error;
 pub mod global;
 pub mod observability;
 pub mod registry;
 pub mod system;
 
+pub use entity::{ApiDetails, AuditEntry, LogRecord, ObjectVersion};
 pub use error::{AuditError, AuditResult};
+pub use global::*;
 pub use observability::{AuditMetrics, AuditMetricsReport, PerformanceValidation};
 pub use registry::AuditRegistry;
 pub use system::AuditSystem;
-
-// Re-export commonly used types from dependencies
-pub use rustfs_audit_logger::{AuditLogEntry, ApiDetails};
-pub use rustfs_targets::{EventName, Target, TargetError, TargetType};

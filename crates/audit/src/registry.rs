@@ -12,17 +12,20 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::error::{AuditError, AuditResult};
-use futures::stream::FuturesUnordered;
+use crate::AuditEntry;
+use crate::{AuditError, AuditResult};
 use futures::StreamExt;
-use rustfs_audit_logger::AuditLogEntry;
-use rustfs_config::audit::{AUDIT_ROUTE_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_SIZE, WEBHOOK_RETRY_INTERVAL};
+use futures::stream::FuturesUnordered;
+use rustfs_config::audit::{
+    AUDIT_ROUTE_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT,
+    MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT,
+    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_SIZE,
+    WEBHOOK_RETRY_INTERVAL,
+};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::target::{mqtt::MQTTArgs, webhook::WebhookArgs, ChannelTargetType, TargetType};
+use rustfs_targets::target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs};
 use rustfs_targets::{Target, TargetError};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +35,7 @@ use url::Url;
 /// Registry for managing audit targets
 pub struct AuditRegistry {
     /// Storage for created targets
-    targets: HashMap<String, Box<dyn Target<AuditLogEntry> + Send + Sync>>,
+    targets: HashMap<String, Box<dyn Target<AuditEntry> + Send + Sync>>,
 }
 
 impl Default for AuditRegistry {
@@ -44,9 +47,7 @@ impl Default for AuditRegistry {
 impl AuditRegistry {
     /// Creates a new AuditRegistry
     pub fn new() -> Self {
-        Self {
-            targets: HashMap::new(),
-        }
+        Self { targets: HashMap::new() }
     }
 
     /// Creates all audit targets from system configuration and environment variables.
@@ -61,21 +62,16 @@ impl AuditRegistry {
     pub async fn create_targets_from_config(
         &mut self,
         config: &Config,
-    ) -> AuditResult<Vec<Box<dyn Target<AuditLogEntry> + Send + Sync>>> {
-        // Collect only environment variables with the relevant prefix to reduce memory usage  
-        let all_env: Vec<(String, String)> = std::env::vars()
-            .filter(|(key, _)| key.starts_with(ENV_PREFIX))
-            .collect();
+    ) -> AuditResult<Vec<Box<dyn Target<AuditEntry> + Send + Sync>>> {
+        // Collect only environment variables with the relevant prefix to reduce memory usage
+        let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
 
         // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
         let mut final_config = config.clone();
 
         // Supported target types for audit
-        let target_types = vec![
-            ChannelTargetType::Webhook.as_str(),
-            ChannelTargetType::Mqtt.as_str(),
-        ];
+        let target_types = vec![ChannelTargetType::Webhook.as_str(), ChannelTargetType::Mqtt.as_str()];
 
         // 1. Traverse all target types and process them
         for target_type in target_types {
@@ -119,7 +115,7 @@ impl AuditRegistry {
                 let (field_name, instance_id) = if let Some(last_underscore) = suffix.rfind('_') {
                     let potential_field = &suffix[1..last_underscore]; // Skip leading _
                     let potential_instance = &suffix[last_underscore + 1..];
-                    
+
                     // Check if the part before the last underscore is a valid field
                     if valid_fields.contains(&potential_field.to_lowercase()) {
                         (potential_field.to_lowercase(), potential_instance.to_lowercase())
@@ -152,11 +148,8 @@ impl AuditRegistry {
             debug!(?env_overrides, "Completed environment variable analysis");
 
             // 4. Determine all instance IDs that need to be processed
-            let mut all_instance_ids: HashSet<String> = file_configs
-                .keys()
-                .filter(|k| *k != DEFAULT_DELIMITER)
-                .cloned()
-                .collect();
+            let mut all_instance_ids: HashSet<String> =
+                file_configs.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
             all_instance_ids.extend(instance_ids_from_env);
             debug!(?all_instance_ids, "Determined all instance IDs");
 
@@ -188,7 +181,7 @@ impl AuditRegistry {
 
                 if enabled {
                     info!(instance_id = %id, "Creating audit target");
-                    
+
                     // Create task for concurrent execution
                     let target_type_clone = target_type.to_string();
                     let id_clone = id.clone();
@@ -201,9 +194,10 @@ impl AuditRegistry {
                     });
 
                     tasks.push(task);
-                    
+
                     // Update final config with successful instance
-                    final_config.0
+                    final_config
+                        .0
                         .entry(section_name.clone())
                         .or_default()
                         .insert(id, merged_config);
@@ -220,17 +214,15 @@ impl AuditRegistry {
 
         while let Some(task_result) = tasks.next().await {
             match task_result {
-                Ok((target_type, id, result, _final_config)) => {
-                    match result {
-                        Ok(target) => {
-                            info!(target_type = %target_type, instance_id = %id, "Created audit target successfully");
-                            successful_targets.push(target);
-                        }
-                        Err(e) => {
-                            error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create audit target");
-                        }
+                Ok((target_type, id, result, _final_config)) => match result {
+                    Ok(target) => {
+                        info!(target_type = %target_type, instance_id = %id, "Created audit target successfully");
+                        successful_targets.push(target);
                     }
-                }
+                    Err(e) => {
+                        error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create audit target");
+                    }
+                },
                 Err(e) => {
                     error!(error = %e, "Task execution failed");
                 }
@@ -256,17 +248,17 @@ impl AuditRegistry {
     }
 
     /// Adds a target to the registry
-    pub fn add_target(&mut self, id: String, target: Box<dyn Target<AuditLogEntry> + Send + Sync>) {
+    pub fn add_target(&mut self, id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) {
         self.targets.insert(id, target);
     }
 
     /// Removes a target from the registry
-    pub fn remove_target(&mut self, id: &str) -> Option<Box<dyn Target<AuditLogEntry> + Send + Sync>> {
+    pub fn remove_target(&mut self, id: &str) -> Option<Box<dyn Target<AuditEntry> + Send + Sync>> {
         self.targets.remove(id)
     }
 
     /// Gets a target from the registry
-    pub fn get_target(&self, id: &str) -> Option<&(dyn Target<AuditLogEntry> + Send + Sync)> {
+    pub fn get_target(&self, id: &str) -> Option<&(dyn Target<AuditEntry> + Send + Sync)> {
         self.targets.get(id).map(|t| t.as_ref())
     }
 
@@ -278,7 +270,7 @@ impl AuditRegistry {
     /// Closes all targets and clears the registry
     pub async fn close_all(&mut self) -> AuditResult<()> {
         let mut errors = Vec::new();
-        
+
         for (id, target) in self.targets.drain() {
             if let Err(e) = target.close().await {
                 error!(target_id = %id, error = %e, "Failed to close audit target");
@@ -299,22 +291,16 @@ async fn create_audit_target(
     target_type: &str,
     id: &str,
     config: &KVS,
-) -> Result<Box<dyn Target<AuditLogEntry> + Send + Sync>, TargetError> {
+) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
     match target_type {
-        "webhook" => {
+        val if val == ChannelTargetType::Webhook.as_str() => {
             let args = parse_webhook_args(id, config)?;
-            let target = rustfs_targets::target::webhook::WebhookTarget::new(
-                id.to_string(),
-                args,
-            )?;
+            let target = rustfs_targets::target::webhook::WebhookTarget::new(id.to_string(), args)?;
             Ok(Box::new(target))
         }
-        "mqtt" => {
+        val if val == ChannelTargetType::Mqtt.as_str() => {
             let args = parse_mqtt_args(id, config)?;
-            let target = rustfs_targets::target::mqtt::MQTTTarget::new(
-                id.to_string(),
-                args,
-            )?;
+            let target = rustfs_targets::target::mqtt::MQTTTarget::new(id.to_string(), args)?;
             Ok(Box::new(target))
         }
         _ => Err(TargetError::Configuration(format!("Unknown target type: {}", target_type))),
@@ -335,7 +321,9 @@ fn get_webhook_valid_fields() -> HashSet<String> {
         WEBHOOK_MAX_RETRY.to_string(),
         WEBHOOK_RETRY_INTERVAL.to_string(),
         WEBHOOK_HTTP_TIMEOUT.to_string(),
-    ].into_iter().collect()
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Gets valid field names for MQTT configuration
@@ -351,24 +339,28 @@ fn get_mqtt_valid_fields() -> HashSet<String> {
         MQTT_RECONNECT_INTERVAL.to_string(),
         MQTT_QUEUE_DIR.to_string(),
         MQTT_QUEUE_LIMIT.to_string(),
-    ].into_iter().collect()
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Parses webhook arguments from KVS configuration
-fn parse_webhook_args(id: &str, config: &KVS) -> Result<WebhookArgs, TargetError> {
-    let endpoint = config.lookup(WEBHOOK_ENDPOINT)
+fn parse_webhook_args(_id: &str, config: &KVS) -> Result<WebhookArgs, TargetError> {
+    let endpoint = config
+        .lookup(WEBHOOK_ENDPOINT)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| TargetError::Configuration("webhook endpoint is required".to_string()))?;
-    
-    let endpoint_url = Url::parse(&endpoint)
-        .map_err(|e| TargetError::Configuration(format!("invalid webhook endpoint URL: {}", e)))?;
+
+    let endpoint_url =
+        Url::parse(&endpoint).map_err(|e| TargetError::Configuration(format!("invalid webhook endpoint URL: {}", e)))?;
 
     let args = WebhookArgs {
         enable: true, // Already validated as enabled
         endpoint: endpoint_url,
         auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
         queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or_default(),
-        queue_limit: config.lookup(WEBHOOK_QUEUE_SIZE)
+        queue_limit: config
+            .lookup(WEBHOOK_QUEUE_SIZE)
             .and_then(|s| s.parse().ok())
             .unwrap_or(100000),
         client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
@@ -381,19 +373,21 @@ fn parse_webhook_args(id: &str, config: &KVS) -> Result<WebhookArgs, TargetError
 }
 
 /// Parses MQTT arguments from KVS configuration  
-fn parse_mqtt_args(id: &str, config: &KVS) -> Result<MQTTArgs, TargetError> {
-    let broker = config.lookup(MQTT_BROKER)
+fn parse_mqtt_args(_id: &str, config: &KVS) -> Result<MQTTArgs, TargetError> {
+    let broker = config
+        .lookup(MQTT_BROKER)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| TargetError::Configuration("MQTT broker is required".to_string()))?;
-    
-    let broker_url = Url::parse(&broker)
-        .map_err(|e| TargetError::Configuration(format!("invalid MQTT broker URL: {}", e)))?;
 
-    let topic = config.lookup(MQTT_TOPIC)
+    let broker_url = Url::parse(&broker).map_err(|e| TargetError::Configuration(format!("invalid MQTT broker URL: {}", e)))?;
+
+    let topic = config
+        .lookup(MQTT_TOPIC)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| TargetError::Configuration("MQTT topic is required".to_string()))?;
 
-    let qos = config.lookup(MQTT_QOS)
+    let qos = config
+        .lookup(MQTT_QOS)
         .and_then(|s| s.parse::<u8>().ok())
         .and_then(|q| match q {
             0 => Some(rumqttc::QoS::AtMostOnce),
@@ -410,16 +404,12 @@ fn parse_mqtt_args(id: &str, config: &KVS) -> Result<MQTTArgs, TargetError> {
         qos,
         username: config.lookup(MQTT_USERNAME).unwrap_or_default(),
         password: config.lookup(MQTT_PASSWORD).unwrap_or_default(),
-        max_reconnect_interval: parse_duration(
-            &config.lookup(MQTT_RECONNECT_INTERVAL).unwrap_or_else(|| "5s".to_string())
-        ).unwrap_or(Duration::from_secs(5)),
-        keep_alive: parse_duration(
-            &config.lookup(MQTT_KEEP_ALIVE_INTERVAL).unwrap_or_else(|| "60s".to_string())
-        ).unwrap_or(Duration::from_secs(60)),
+        max_reconnect_interval: parse_duration(&config.lookup(MQTT_RECONNECT_INTERVAL).unwrap_or_else(|| "5s".to_string()))
+            .unwrap_or(Duration::from_secs(5)),
+        keep_alive: parse_duration(&config.lookup(MQTT_KEEP_ALIVE_INTERVAL).unwrap_or_else(|| "60s".to_string()))
+            .unwrap_or(Duration::from_secs(60)),
         queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or_default(),
-        queue_limit: config.lookup(MQTT_QUEUE_LIMIT)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100000),
+        queue_limit: config.lookup(MQTT_QUEUE_LIMIT).and_then(|s| s.parse().ok()).unwrap_or(100000),
         target_type: TargetType::AuditLog,
     };
 
