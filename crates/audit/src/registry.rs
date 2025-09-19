@@ -16,13 +16,13 @@ use crate::AuditEntry;
 use crate::{AuditError, AuditResult};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use rustfs_config::audit::{
-    AUDIT_ROUTE_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT,
-    MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_SIZE,
-    WEBHOOK_RETRY_INTERVAL,
+use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
+use rustfs_config::{
+    DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs};
 use rustfs_targets::{Target, TargetError};
@@ -316,7 +316,7 @@ fn get_webhook_valid_fields() -> HashSet<String> {
         WEBHOOK_CLIENT_CERT.to_string(),
         WEBHOOK_CLIENT_KEY.to_string(),
         WEBHOOK_BATCH_SIZE.to_string(),
-        WEBHOOK_QUEUE_SIZE.to_string(),
+        WEBHOOK_QUEUE_LIMIT.to_string(),
         WEBHOOK_QUEUE_DIR.to_string(),
         WEBHOOK_MAX_RETRY.to_string(),
         WEBHOOK_RETRY_INTERVAL.to_string(),
@@ -360,7 +360,7 @@ fn parse_webhook_args(_id: &str, config: &KVS) -> Result<WebhookArgs, TargetErro
         auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
         queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or_default(),
         queue_limit: config
-            .lookup(WEBHOOK_QUEUE_SIZE)
+            .lookup(WEBHOOK_QUEUE_LIMIT)
             .and_then(|s| s.parse().ok())
             .unwrap_or(100000),
         client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
