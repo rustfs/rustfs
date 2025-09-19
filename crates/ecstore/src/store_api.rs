@@ -14,6 +14,7 @@
 
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::replication::REPLICATION_RESET;
+use crate::bucket::replication::REPLICATION_STATUS;
 use crate::bucket::replication::{ReplicateDecision, replication_statuses_map, version_purge_statuses_map};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::disk::DiskStore;
@@ -366,6 +367,10 @@ impl ObjectOptions {
         };
         if self.version_id.is_none() {
             rs.replication_status_internal = dsc.pending_status();
+            rs.targets = replication_statuses_map(rs.replication_status_internal.as_deref().unwrap_or_default());
+        } else {
+            rs.version_purge_status_internal = dsc.pending_status();
+            rs.purge_targets = version_purge_statuses_map(rs.version_purge_status_internal.as_deref().unwrap_or_default());
         }
 
         self.delete_replication = Some(rs)
@@ -396,6 +401,22 @@ impl ObjectOptions {
             .as_ref()
             .map(|v| v.composite_replication_status())
             .unwrap_or(ReplicationStatusType::Empty)
+    }
+
+    pub fn put_replication_state(&self) -> ReplicationState {
+        let rs = match self
+            .user_defined
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_STATUS}").as_str())
+        {
+            Some(v) => v.to_string(),
+            None => return ReplicationState::default(),
+        };
+
+        ReplicationState {
+            replication_status_internal: Some(rs.to_string()),
+            targets: replication_statuses_map(rs.as_str()),
+            ..Default::default()
+        }
     }
 }
 

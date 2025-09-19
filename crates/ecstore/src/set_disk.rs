@@ -3723,7 +3723,7 @@ impl ObjectIO for SetDisks {
             }
         }
 
-        fi.is_latest = true;
+        fi.replication_state_internal = Some(opts.put_replication_state());
 
         // TODO: version support
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))

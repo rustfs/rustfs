@@ -657,6 +657,8 @@ impl BucketTargetSys {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .build();
 
+        warn!("TargetClient config: {:?}", config);
+
         Ok(TargetClient {
             endpoint,
             credentials: target.credentials.clone(),
@@ -1097,7 +1099,7 @@ impl TargetClient {
             Ok(_) => Ok(true),
             Err(e) => {
                 let merr = extract_minio_error(e.raw_response());
-
+                println!("head bucket error: {:?}", e);
                 match e {
                     SdkError::ServiceError(oe) => match oe.into_err() {
                         HeadBucketError::NotFound(_) => Ok(false),
@@ -1468,20 +1470,20 @@ mod tests {
         // Create a test target configuration for localhost:8000 with minioadmin credentials
         let target = BucketTarget {
             source_bucket: "source-bucket".to_string(),
-            endpoint: "127.0.0.1:8000".to_string(),
+            endpoint: "play.rustfs.com".to_string(),
             credentials: Some(Credentials {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
+                access_key: "rustfsadmin".to_string(),
+                secret_key: "rustfsadmin".to_string(),
                 session_token: None,
                 expiration: None,
             }),
-            target_bucket: "test-bucket".to_string(),
-            secure: false,
+            target_bucket: "dada".to_string(),
+            secure: true,
             path: "".to_string(),
             api: "s3v4".to_string(),
-            arn: "arn:rustfs:replication::test:bucket/test-bucket".to_string(),
+            arn: "arn:rustfs:replication::test:bucket/dada".to_string(),
             target_type: BucketTargetType::ReplicationService,
-            region: "cn-north-1".to_string(),
+            region: "us-east-1".to_string(),
             bandwidth_limit: 0,
             replication_sync: false,
             storage_class: "STANDARD".to_string(),
@@ -1505,15 +1507,15 @@ mod tests {
         match result {
             Ok(client) => {
                 // Verify the client was created with correct configuration
-                assert_eq!(client.endpoint, "http://127.0.0.1:8000");
-                assert_eq!(client.bucket, "test-bucket");
-                assert!(!client.secure);
-                assert_eq!(client.arn, "arn:rustfs:replication::test:bucket/test-bucket");
+                assert_eq!(client.endpoint, "https://play.rustfs.com");
+                assert_eq!(client.bucket, "dada");
+                assert!(client.secure);
+                assert_eq!(client.arn, "arn:rustfs:replication::test:bucket/dada");
 
                 // Verify credentials are set
                 if let Some(creds) = &client.credentials {
-                    assert_eq!(creds.access_key, "minioadmin");
-                    assert_eq!(creds.secret_key, "minioadmin");
+                    assert_eq!(creds.access_key, "rustfsadmin");
+                    assert_eq!(creds.secret_key, "rustfsadmin");
                 }
 
                 println!("Successfully created target client for localhost:8000");

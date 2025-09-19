@@ -1087,6 +1087,7 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
 }
 
 pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
+    warn!("schedule_replication_delete {:?}", dv);
     if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
         pool.queue_replica_delete_task(dv.clone()).await;
     }

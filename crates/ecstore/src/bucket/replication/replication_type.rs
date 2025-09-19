@@ -30,6 +30,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const REPLICATION_RESET: &str = "replication-reset";
+pub const REPLICATION_STATUS: &str = "replication-status";
 
 // ReplicateQueued - replication being queued trail
 pub const REPLICATE_QUEUED: &str = "replicate:queue";

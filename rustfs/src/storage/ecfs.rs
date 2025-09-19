@@ -958,6 +958,8 @@ impl S3 for FS {
         )
         .await;
 
+        warn!("delete_objects: replicate_deletes {:?}", replicate_deletes);
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1136,6 +1138,12 @@ impl S3 for FS {
 
         for dobjs in delete_results.iter() {
             if let Some(dobj) = &dobjs.delete_object {
+                warn!(
+                    "delete_objects: dobj {:?},{:?}",
+                    dobj.delete_marker_replication_status(),
+                    dobj.version_purge_status()
+                );
+
                 if replicate_deletes
                     && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
                         || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
