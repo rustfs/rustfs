@@ -47,6 +47,12 @@ pub struct AuditMetrics {
     last_reset_time: Arc<RwLock<Instant>>,
 }
 
+impl Default for AuditMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuditMetrics {
     /// Creates a new metrics collector
     pub fn new() -> Self {

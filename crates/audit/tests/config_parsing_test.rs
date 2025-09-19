@@ -179,7 +179,7 @@ fn test_url_validation() {
         "tcp://localhost:1883",
     ];
 
-    let invalid_urls = vec![
+    let invalid_urls = [
         "",
         "not-a-url",
         "http://",

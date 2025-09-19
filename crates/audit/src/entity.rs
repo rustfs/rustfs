@@ -193,6 +193,7 @@ pub struct AuditEntry {
 
 impl AuditEntry {
     /// Create a new AuditEntry with required fields
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         version: String,
         deployment_id: Option<String>,
