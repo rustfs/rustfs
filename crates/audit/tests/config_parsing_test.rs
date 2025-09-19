@@ -157,12 +157,12 @@ fn test_duration_parsing_formats() {
 fn parse_duration_test(s: &str) -> Option<std::time::Duration> {
     use std::time::Duration;
 
-    if let Some(stripped) = s.strip_suffix('s') {
+    if let Some(stripped) = s.strip_suffix("ms") {
+        stripped.parse::<u64>().ok().map(Duration::from_millis)
+    } else if let Some(stripped) = s.strip_suffix('s') {
         stripped.parse::<u64>().ok().map(Duration::from_secs)
     } else if let Some(stripped) = s.strip_suffix('m') {
         stripped.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60))
-    } else if let Some(stripped) = s.strip_suffix("ms") {
-        stripped.parse::<u64>().ok().map(Duration::from_millis)
     } else {
         s.parse::<u64>().ok().map(Duration::from_secs)
     }

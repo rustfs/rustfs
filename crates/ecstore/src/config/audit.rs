@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 #[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit webhook settings.
-pub const DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
+pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
@@ -87,7 +87,7 @@ pub const DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
 #[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit MQTT settings.
-pub const DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
+pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
