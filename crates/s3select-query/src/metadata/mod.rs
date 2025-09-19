@@ -61,7 +61,7 @@ impl MetadataProvider {
         Self {
             provider,
             current_session_table_provider,
-            config_options: session.inner().config_options().clone(),
+            config_options: session.inner().config_options().as_ref().clone(),
             session,
             func_manager,
         }

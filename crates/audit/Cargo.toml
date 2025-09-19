@@ -29,7 +29,6 @@ categories = ["web-programming", "development-tools", "asynchronous", "api-bindi
 rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "constants"] }
 rustfs-ecstore = { workspace = true }
-rustfs-audit-logger = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
