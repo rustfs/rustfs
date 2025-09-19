@@ -345,12 +345,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         info!("delete_versions");
         let opts = serde_json::to_string(&opts)?;
         let mut versions_str = Vec::with_capacity(versions.len());
@@ -384,7 +379,7 @@ impl DiskAPI for RemoteDisk {
             })
             .collect();
 
-        Ok(errors)
+        errors
     }
 
     #[tracing::instrument(skip(self))]

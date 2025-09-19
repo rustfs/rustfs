@@ -29,13 +29,21 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use http::StatusCode;
 use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::object_lock::objectlock_sys::BucketObjectLockSys;
+use rustfs_ecstore::bucket::replication::DeletedObjectReplicationInfo;
+use rustfs_ecstore::bucket::replication::REPLICATE_INCOMING_DELETE;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::bucket::replication::check_replicate_delete;
 use rustfs_ecstore::bucket::replication::get_must_replicate_options;
 use rustfs_ecstore::bucket::replication::must_replicate;
 use rustfs_ecstore::bucket::replication::schedule_replication;
+use rustfs_ecstore::bucket::replication::schedule_replication_delete;
 use rustfs_ecstore::bucket::versioning::VersioningApi;
+use rustfs_ecstore::error::is_err_bucket_not_found;
+use rustfs_ecstore::error::is_err_object_not_found;
+use rustfs_ecstore::error::is_err_version_not_found;
 use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_filemeta::ReplicationStatusType;
@@ -94,8 +102,11 @@ use rustfs_rio::WarpReader;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
+use rustfs_utils::http::AMZ_OBJECT_LOCK_LEGAL_HOLD;
 use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_utils::path::is_dir_object;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
 use s3s::S3;
@@ -713,100 +724,199 @@ impl S3 for FS {
 
     /// Delete an object
     #[tracing::instrument(level = "debug", skip(self, req))]
-    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+    async fn delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
 
         warn!("delete_object: req  headers {:?}", &req.headers);
 
+        let replica = req
+            .headers
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .map(|v| v.to_str().unwrap_or_default() == ReplicationStatusType::Replica.as_str())
+            .unwrap_or_default();
+
+        if replica {
+            authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
+            return Ok(S3Response::new(DeleteObjectOutput::default()));
+        }
+
         let metadata = extract_metadata(&req.headers);
 
         warn!("delete_object: metadata {:?}", &metadata);
 
-        let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
+        let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
-        let dobj = ObjectToDelete {
-            object_name: key.clone(),
-            version_id,
-            ..Default::default()
-        };
+        // TODO: check object lock
 
-        let mut objects: Vec<ObjectToDelete> = vec![dobj];
+        let lock_cfg = BucketObjectLockSys::get(&bucket).await;
+        if lock_cfg.is_some() && opts.delete_prefix {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("force-delete is forbidden on Object Locking enabled buckets".into()),
+                "force-delete is forbidden on Object Locking enabled buckets",
+            ));
+        }
+
+        let mut vid = opts.version_id.clone();
+
+        if replica {
+            opts.set_replica_status(ReplicationStatusType::Replica);
+
+            if opts.version_purge_status().is_empty() {
+                vid = None;
+            }
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let has_replication_rules = has_replication_rules(&bucket, &objects).await;
+        let obj_info = match store.delete_object(&bucket, &key, opts).await {
+            Ok(obj) => obj,
+            Err(err) => {
+                //
 
-        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
-
-        for object in objects.iter_mut() {
-            if has_replication_rules {
-                let opts = ObjectOptions {
-                    version_id: object.version_id.map(|v| v.to_string()),
-                    versioned: version_cfg.prefix_enabled(&object.object_name),
-                    version_suspended: version_cfg.suspended(),
-                    ..Default::default()
-                };
-
-                let (oji, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
-                    Ok(o) => (o, None),
-                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
-                };
-
-                let replicate_decision = check_replicate_delete(&bucket, object, &oji, &opts, gerr).await;
-                if replicate_decision.replicate_any() {
-                    if object.version_id.is_some() {
-                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
-                        object.version_purge_statuses = Some(replicate_decision.pending_status());
-                    } else {
-                        object.delete_marker_replication_status = Some(replicate_decision.pending_status());
-                    }
-
-                    object.replicate_decision_str = Some(replicate_decision.to_string());
+                if is_err_bucket_not_found(&err) {
+                    return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
                 }
-            }
-        }
 
-        warn!("delete_object: delete_objects {}/ {:?}", &bucket, &objects);
-        warn!("delete_object: opts {:?}", &opts);
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    // TODO: send event
 
-        let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
+                    return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+                }
 
-        // TODO: let errors;
-
-        let (delete_marker, version_id) = {
-            if let Some((a, b)) = dobjs
-                .iter()
-                .map(|v| {
-                    warn!("delete_object: result {}/{} {:?}", &bucket, &v.object_name, &v);
-                    let delete_marker = { if v.delete_marker { Some(true) } else { None } };
-
-                    let version_id = v.version_id.clone();
-
-                    (delete_marker, version_id)
-                })
-                .next()
-            {
-                (a, b)
-            } else {
-                (None, None)
+                return Err(ApiError::from(err).into());
             }
         };
-        let del_version_id = version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+
+        if obj_info.name.is_empty() {
+            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+        }
+
+        // // TODO: send event
+
+        // let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
+        // let dobj = ObjectToDelete {
+        //     object_name: key.clone(),
+        //     version_id,
+        //     ..Default::default()
+        // };
+
+        // let mut objects: Vec<ObjectToDelete> = vec![dobj];
+
+        // let Some(store) = new_object_layer_fn() else {
+        //     return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        // };
+
+        // let has_replication_rules = has_replication_rules(&bucket, &objects).await;
+
+        // let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
+
+        // for object in objects.iter_mut() {
+        //     if has_replication_rules {
+        //         let opts = ObjectOptions {
+        //             version_id: object.version_id.map(|v| v.to_string()),
+        //             versioned: version_cfg.prefix_enabled(&object.object_name),
+        //             version_suspended: version_cfg.suspended(),
+        //             ..Default::default()
+        //         };
+
+        //         let (oji, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+        //             Ok(o) => (o, None),
+        //             Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+        //         };
+
+        //         let replicate_decision = check_replicate_delete(&bucket, object, &oji, &opts, gerr).await;
+        //         if replicate_decision.replicate_any() {
+        //             if object.version_id.is_some() {
+        //                 object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+        //                 object.version_purge_statuses = replicate_decision.pending_status();
+        //             } else {
+        //                 object.delete_marker_replication_status = replicate_decision.pending_status();
+        //             }
+
+        //             object.replicate_decision_str = Some(replicate_decision.to_string());
+        //         }
+        //     }
+        // }
+
+        // warn!("delete_object: delete_objects {}/ {:?}", &bucket, &objects);
+        // warn!("delete_object: opts {:?}", &opts);
+
+        // let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
+
+        // // TODO: let errors;
+
+        // let (delete_marker, version_id) = {
+        //     if let Some((a, b)) = dobjs
+        //         .iter()
+        //         .map(|v| {
+        //             warn!("delete_object: result {}/{} {:?}", &bucket, &v.object_name, &v);
+        //             let delete_marker = { if v.delete_marker { Some(true) } else { None } };
+
+        //             let version_id = v.version_id.clone();
+
+        //             (delete_marker, version_id)
+        //         })
+        //         .next()
+        //     {
+        //         (a, b)
+        //     } else {
+        //         (None, None)
+        //     }
+        // };
+        // let del_version_id = version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+
+        if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.version_purge_status == VersionPurgeStatusType::Pending
+        {
+            warn!("delete_object: schedule_replication_delete");
+            schedule_replication_delete(DeletedObjectReplicationInfo {
+                delete_object: rustfs_ecstore::store_api::DeletedObject {
+                    delete_marker: obj_info.delete_marker,
+                    delete_marker_version_id: if obj_info.delete_marker {
+                        obj_info.version_id.map(|v| v.to_string())
+                    } else {
+                        None
+                    },
+                    object_name: key.clone(),
+                    version_id: if obj_info.delete_marker {
+                        None
+                    } else {
+                        obj_info.version_id.map(|v| v.to_string())
+                    },
+                    delete_marker_mtime: obj_info.mod_time,
+                    replication_state: Some(obj_info.replication_state()),
+                    ..Default::default()
+                },
+                bucket: bucket.clone(),
+                event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                ..Default::default()
+            })
+            .await;
+        }
+
+        let delete_marker = obj_info.delete_marker;
+        let version_id = obj_info.version_id;
+
         let output = DeleteObjectOutput {
-            delete_marker,
-            version_id,
+            delete_marker: Some(delete_marker),
+            version_id: version_id.map(|v| v.to_string()),
             ..Default::default()
         };
 
+        let event_name = if delete_marker {
+            EventName::ObjectRemovedDeleteMarkerCreated
+        } else {
+            EventName::ObjectRemovedDelete
+        };
+
         let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectRemovedDelete,
+            event_name,
             bucket_name: bucket.clone(),
             object: rustfs_ecstore::store_api::ObjectInfo {
                 name: key,
@@ -815,7 +925,7 @@ impl S3 for FS {
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: del_version_id,
+            version_id: version_id.map(|v| v.to_string()).unwrap_or_default(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
@@ -831,34 +941,135 @@ impl S3 for FS {
     /// Delete multiple objects
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        // info!("delete_objects args {:?}", req.input);
+        warn!("delete_objects: req  headers {:?}", &req.headers);
 
         let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
-        let objects: Vec<ObjectToDelete> = delete
-            .objects
-            .iter()
-            .map(|v| {
-                let version_id = v.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
-                ObjectToDelete {
+        if delete.objects.is_empty() || delete.objects.len() > 1000 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "No objects to delete or too many objects to delete".to_string(),
+            ));
+        }
+
+        let replicate_deletes = has_replication_rules(
+            &bucket,
+            &delete
+                .objects
+                .iter()
+                .map(|v| ObjectToDelete {
                     object_name: v.key.clone(),
-                    version_id,
                     ..Default::default()
-                }
-            })
-            .collect();
+                })
+                .collect::<Vec<ObjectToDelete>>(),
+        )
+        .await;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let metadata = extract_metadata(&req.headers);
+        let has_lock_enable = BucketObjectLockSys::get(&bucket).await.is_some();
 
-        let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
+        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
 
-        let (dobjs, errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
+        #[derive(Default, Clone)]
+        struct DeleteResult {
+            delete_object: Option<DeletedObject>,
+            error: Option<Error>,
+        }
+
+        let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
+
+        let mut object_to_delete = Vec::new();
+        let mut object_to_delete_index = HashMap::new();
+
+        for (idx, object) in delete.objects.iter().enumerate() {
+            // TODO: check auth
+            if let Some(version_id) = object.version_id.clone() {
+                let vid = match Uuid::parse_str(&version_id) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        delete_results[idx].error = Some(Error {
+                            code: Some("NoSuchVersion".to_string()),
+                            key: Some(object.key.clone()),
+                            message: Some("Invalid version id".to_string()),
+                            version_id: Some(version_id),
+                        });
+
+                        continue;
+                    }
+                };
+            };
+
+            let mut object = ObjectToDelete {
+                object_name: object.key.clone(),
+                version_id: object.version_id.clone().map(|v| Uuid::parse_str(&v).unwrap()),
+                ..Default::default()
+            };
+
+            let opts = ObjectOptions {
+                version_id: object.version_id.map(|v| v.to_string()),
+                versioned: version_cfg.prefix_enabled(&object.object_name),
+                version_suspended: version_cfg.suspended(),
+                ..Default::default()
+            };
+
+            let mut goi = ObjectInfo::default();
+            let mut gerr = None;
+
+            if replicate_deletes || object.version_id.is_some() && has_lock_enable {
+                (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                    Ok(res) => (res, None),
+                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+                };
+            }
+
+            if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                object.version_id = Some(Uuid::nil());
+            }
+
+            if replicate_deletes {
+                let dsc = check_replicate_delete(
+                    &bucket,
+                    &ObjectToDelete {
+                        object_name: object.object_name.clone(),
+                        version_id: object.version_id.clone(),
+                        ..Default::default()
+                    },
+                    &goi,
+                    &opts,
+                    gerr.clone(),
+                )
+                .await;
+                if dsc.replicate_any() {
+                    if object.version_id.is_some() {
+                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+                        object.version_purge_statuses = dsc.pending_status();
+                    } else {
+                        object.delete_marker_replication_status = dsc.pending_status();
+                    }
+                    object.replicate_decision_str = Some(dsc.to_string());
+                }
+            }
+
+            // TODO: Retention
+            object_to_delete_index.insert(object.object_name.clone(), idx);
+            object_to_delete.push(object);
+        }
+
+        let (dobjs, errs) = store
+            .delete_objects(
+                &bucket,
+                object_to_delete,
+                ObjectOptions {
+                    version_suspended: version_cfg.suspended(),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // TODO: XXXXX
 
         let deleted = dobjs
             .iter()
@@ -1536,7 +1747,7 @@ impl S3 for FS {
             let formatted_time = now.to_rfc3339();
             opts.user_defined.insert(k, formatted_time);
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            opts.user_defined.insert(k, dsc.pending_status());
+            opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
 
         let obj_info = store

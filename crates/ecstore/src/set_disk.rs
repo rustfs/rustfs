@@ -18,6 +18,7 @@
 use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::extract_etag, transition_api::ReaderImpl};
@@ -3940,7 +3941,7 @@ impl StorageAPI for SetDisks {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
         // 默认返回值
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
@@ -4077,25 +4078,39 @@ impl StorageAPI for SetDisks {
                 if let Some(disk) = disk {
                     disk.delete_versions(bucket, vers, DeleteOptions::default()).await
                 } else {
-                    Err(DiskError::DiskNotFound)
+                    let errs = Vec::with_capacity(vers.len());
+                    for _ in 0..vers.len() {
+                        errs.push(Some(DiskError::DiskNotFound));
+                    }
+                    errs
                 }
             });
         }
 
         let results = join_all(futures).await;
 
-        for errs in results.into_iter().flatten() {
-            // TODO: handle err reduceWriteQuorumErrs
-            for err in errs.iter().flatten() {
-                warn!("result err {:?}", err);
+        // 每个磁盘, 删除所有对象
+        for result in results {
+            // 所有对象的删除结果
+            for idx in 0..vers.len() {
+                if let Some(err) = result[idx] {
+                    del_errs[idx] = Some(err);
+                }
             }
         }
 
-        Ok((del_objects, del_errs))
+        // for errs in results.into_iter().flatten() {
+        //     // TODO: handle err reduceWriteQuorumErrs
+        //     for err in errs.iter().flatten() {
+        //         warn!("result err {:?}", err);
+        //     }
+        // }
+
+        (del_objects, del_errs)
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+    async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
         let _lock_guard = if !opts.delete_prefix {
             Some(
@@ -4115,12 +4130,30 @@ impl StorageAPI for SetDisks {
             return Ok(ObjectInfo::default());
         }
 
-        let (oi, write_quorum) = match self.get_object_info_and_quorum(bucket, object, &opts).await {
-            Ok((oi, wq)) => (oi, wq),
-            Err(e) => {
-                return Err(to_object_err(e, vec![bucket, object]));
-            }
+        let (mut oi, write_quorum, gerr) = match self.get_object_info_and_quorum(bucket, object, &opts).await {
+            Ok((oi, wq)) => (oi, wq, None),
+            Err(e) => (ObjectInfo::default(), 0, Some(e)),
         };
+
+        let otd = ObjectToDelete {
+            object_name: object.to_string(),
+            version_id: opts
+                .version_id
+                .clone()
+                .map(|v| Uuid::parse_str(v.as_str()).ok().unwrap_or_default()),
+            ..Default::default()
+        };
+
+        let dsc = check_replicate_delete(bucket, &otd, &oi, &opts, gerr.map(|e| e.to_string())).await;
+
+        if dsc.replicate_any() {
+            opts.set_delete_replication_state(dsc);
+            oi.replication_decision = opts
+                .delete_replication
+                .as_ref()
+                .map(|v| v.replicate_decision_str.clone())
+                .unwrap_or_default();
+        }
 
         let mark_delete = oi.version_id.is_some();
 

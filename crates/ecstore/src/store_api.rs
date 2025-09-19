@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::replication::REPLICATION_RESET;
+use crate::bucket::replication::{ReplicateDecision, replication_statuses_map, version_purge_statuses_map};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
@@ -356,15 +358,39 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 }
 
-// impl Default for ObjectOptions {
-//     fn default() -> Self {
-//         Self {
-//             max_parity: Default::default(),
-//             mod_time: OffsetDateTime::UNIX_EPOCH,
-//             part_number: Default::default(),
-//         }
-//     }
-// }
+impl ObjectOptions {
+    pub fn set_delete_replication_state(&mut self, dsc: ReplicateDecision) {
+        let mut rs = ReplicationState {
+            replicate_decision_str: dsc.to_string(),
+            ..Default::default()
+        };
+        if self.version_id.is_none() {
+            rs.replication_status_internal = dsc.pending_status();
+        }
+
+        self.delete_replication = Some(rs)
+    }
+
+    pub fn set_replica_status(&mut self, status: ReplicationStatusType) {
+        if let Some(rs) = self.delete_replication.as_mut() {
+            rs.replica_status = status;
+            rs.replica_timestamp = Some(OffsetDateTime::now_utc());
+        } else {
+            self.delete_replication = Some(ReplicationState {
+                replica_status: status,
+                replica_timestamp: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+        }
+    }
+
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.delete_replication
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketOptions {
@@ -784,6 +810,32 @@ impl ObjectInfo {
 
         objects
     }
+
+    pub fn replication_state(&self) -> ReplicationState {
+        ReplicationState {
+            replication_status_internal: self.replication_status_internal.clone(),
+            version_purge_status_internal: self.version_purge_status_internal.clone(),
+            replicate_decision_str: self.replication_decision.clone(),
+            targets: replication_statuses_map(self.replication_status_internal.clone().unwrap_or_default().as_str()),
+            purge_targets: version_purge_statuses_map(self.version_purge_status_internal.clone().unwrap_or_default().as_str()),
+            reset_statuses_map: self
+                .user_defined
+                .iter()
+                .filter_map(|(k, v)| {
+                    if k.starts_with(&format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}")) {
+                        Some((
+                            k.trim_start_matches(&format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}-"))
+                                .to_string(),
+                            v.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -967,6 +1019,7 @@ pub struct DeletedObject {
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication
     pub replication_state: Option<ReplicationState>,
+    pub found: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1083,7 +1136,7 @@ pub trait StorageAPI: ObjectIO + Debug {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>);
 
     // TransitionObject TODO:
     // RestoreTransitionedObject TODO:

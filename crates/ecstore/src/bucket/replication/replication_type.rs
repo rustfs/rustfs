@@ -133,14 +133,14 @@ impl ReplicateDecision {
     }
 
     /// Returns a stringified representation of internal replication status with all targets marked as `PENDING`
-    pub fn pending_status(&self) -> String {
+    pub fn pending_status(&self) -> Option<String> {
         let mut result = String::new();
         for target in self.targets_map.values() {
             if target.replicate {
                 result.push_str(&format!("{}={};", target.arn, ReplicationStatusType::Pending.as_str()));
             }
         }
-        result
+        if result.is_empty() { None } else { Some(result) }
     }
 }
 

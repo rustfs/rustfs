@@ -433,6 +433,7 @@ impl ReplicationResyncer {
                                 replication_state: roi.replication_state.clone(),
                                 delete_marker: roi.delete_marker,
                                 delete_marker_mtime: roi.mod_time,
+                                ..Default::default()
                             },
                             bucket: roi.bucket.clone(),
                             event_type: REPLICATE_EXISTING_DELETE.to_string(),

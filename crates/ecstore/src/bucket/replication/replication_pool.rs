@@ -26,6 +26,8 @@ use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
 
 use lazy_static::lazy_static;
+use rustfs_filemeta::ReplicatedTargetInfo;
+use rustfs_filemeta::ReplicationStatusType;
 use rustfs_filemeta::ReplicationType;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use time::OffsetDateTime;
@@ -650,6 +652,10 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
     /// Queues a replica delete task
     pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) {
+        warn!(
+            "queue_replica_delete_task: bucket={}, object={}, op_type={:?}",
+            doi.bucket, doi.delete_object.object_name, doi.op_type
+        );
         let ch = match doi.op_type {
             ReplicationType::Heal | ReplicationType::ExistingObject => Some(self.mrf_replica_tx.clone()),
             _ => self.get_worker_ch(&doi.bucket, &doi.delete_object.object_name, 0).await,
@@ -970,7 +976,7 @@ pub type DynReplicationPool = dyn ReplicationPoolTrait + Send + Sync;
 #[async_trait::async_trait]
 pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
-    async fn queue_replica_delete(&self, ri: DeletedObjectReplicationInfo);
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn init_resync(
         self: Arc<Self>,
@@ -986,7 +992,7 @@ impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
         self.queue_replica_task(ri).await;
     }
 
-    async fn queue_replica_delete(&self, ri: DeletedObjectReplicationInfo) {
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) {
         self.queue_replica_delete_task(ri).await;
     }
 
@@ -1078,5 +1084,26 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
     } else if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
         warn!("schedule_replication asynchronous");
         pool.queue_replica_task(ri).await;
+    }
+}
+
+pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
+    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        pool.queue_replica_delete_task(dv.clone()).await;
+    }
+
+    if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, GLOBAL_REPLICATION_STATS.get()) {
+        for (k, v) in rs.targets.iter() {
+            let ri = ReplicatedTargetInfo {
+                arn: k.clone(),
+                size: 0,
+                duration: Duration::default(),
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            };
+            stats
+                .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
+                .await;
+        }
     }
 }
