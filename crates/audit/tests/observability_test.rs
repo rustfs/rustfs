@@ -36,7 +36,7 @@ async fn test_metrics_collection() {
     let report = metrics.generate_report().await;
     assert_eq!(report.total_events_processed, 2);
     assert_eq!(report.total_events_failed, 1);
-    assert_eq!(report.error_rate_percent, 33.333333333333336); // 1/3 * 100
+    assert_eq!(report.error_rate_percent, 33.33333333333333); // 1/3 * 100
     assert_eq!(report.average_latency_ms, 20.0); // (10+20+30)/3
 }
 
@@ -50,7 +50,7 @@ async fn test_target_metrics() {
     metrics.record_target_failure();
 
     let success_rate = metrics.get_target_success_rate();
-    assert_eq!(success_rate, 66.66666666666667); // 2/3 * 100
+    assert_eq!(success_rate, 66.66666666666666); // 2/3 * 100
 }
 
 #[tokio::test]
