@@ -365,7 +365,10 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         }
                         ReplicationOperation::Delete(del_info) => {
                             stats.inc_q(&del_info.bucket, 0, true, del_info.op_type).await;
-                            warn!("resize_workers: replicating delete {} {}", del_info.bucket, del_info.delete_object.object_name);
+                            warn!(
+                                "resize_workers: replicating delete {} {}",
+                                del_info.bucket, del_info.delete_object.object_name
+                            );
                             // Perform actual delete replication (placeholder)
                             replicate_delete(del_info.as_ref().clone(), storage.clone()).await;
 

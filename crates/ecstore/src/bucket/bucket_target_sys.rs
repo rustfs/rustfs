@@ -18,6 +18,7 @@ use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -26,8 +27,9 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
 
+use aws_smithy_runtime_api::client::result::ServiceError;
 use aws_smithy_runtime_api::http::Response;
-use http::{HeaderMap, HeaderName, HeaderValue};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_utils::http::{
@@ -1033,24 +1035,44 @@ pub struct PutObjectPartOptions {
 }
 
 #[derive(Debug)]
-pub struct S3ClientError(String);
+pub struct S3ClientError {
+    pub error: String,
+    pub status_code: Option<StatusCode>,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
 impl S3ClientError {
     pub fn new(value: impl Into<String>) -> Self {
-        S3ClientError(value.into())
+        S3ClientError {
+            error: value.into(),
+            status_code: None,
+            code: None,
+            message: None,
+        }
     }
 
     pub fn add_message(self, message: impl Into<String>) -> Self {
-        S3ClientError(format!("{}: {}", message.into(), self.0))
+        S3ClientError {
+            error: format!("{}: {}", message.into(), self.error),
+            status_code: self.status_code,
+            code: self.code,
+            message: self.message,
+        }
     }
 }
 
 impl<T: aws_sdk_s3::error::ProvideErrorMetadata> From<T> for S3ClientError {
     fn from(value: T) -> Self {
-        S3ClientError(format!(
-            "{}: {}",
-            value.code().map(String::from).unwrap_or("unknown code".into()),
-            value.message().map(String::from).unwrap_or("missing reason".into()),
-        ))
+        S3ClientError {
+            error: format!(
+                "{}: {}",
+                value.code().map(String::from).unwrap_or("unknown code".into()),
+                value.message().map(String::from).unwrap_or("missing reason".into()),
+            ),
+            status_code: None,
+            code: None,
+            message: None,
+        }
     }
 }
 
@@ -1058,7 +1080,7 @@ impl std::error::Error for S3ClientError {}
 
 impl std::fmt::Display for S3ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.error)
     }
 }
 
@@ -1144,7 +1166,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<HeadObjectOutput, S3ClientError> {
+    ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
         match self
             .client
             .head_object()
@@ -1157,11 +1179,15 @@ impl TargetClient {
             Ok(res) => Ok(res),
             Err(e) => {
                 let merr = extract_minio_error(e.raw_response());
-                warn!("head object error: {:?}", e);
+                error!("head object error: {:?}", e);
                 if let Some(m) = merr {
-                    Err(S3ClientError::new(m))
+                    let new_service_err = ServiceError::builder()
+                        .source(HeadObjectError::unhandled(std::io::Error::other(m)))
+                        // .raw(service_err.into_raw())
+                        .build();
+                    Err(SdkError::ServiceError(new_service_err))
                 } else {
-                    Err(e.into())
+                    Err(e)
                 }
             }
         }

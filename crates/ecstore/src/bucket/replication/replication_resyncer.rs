@@ -1374,7 +1374,21 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         {
             Ok(resp) => resp,
             Err(e) => {
-                error!("failed to stat object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
+                error!(
+                    "failed to stat object for bucket:{}/{}-{:?} arn:{}",
+                    dobj.bucket,
+                    dobj.delete_object.object_name,
+                    version_id.clone(),
+                    tgt_client.arn
+                );
+                error!("error: {}", e);
+
+                if let SdkError::ServiceError(service_err) = e {
+                    if let HeadObjectError::NotFound(service_err) = service_err.into_err() {
+                        rinfo.replication_status = ReplicationStatusType::Completed;
+                        return rinfo;
+                    }
+                }
 
                 // TODO: check reponse error
 

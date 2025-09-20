@@ -1151,6 +1151,8 @@ impl S3 for FS {
                     dobj.version_purge_status()
                 );
 
+                error!("delete_objects: dobj dobjs {:?}", dobj);
+
                 if replicate_deletes
                     && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
                         || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
