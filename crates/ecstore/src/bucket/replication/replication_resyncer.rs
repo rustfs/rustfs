@@ -1137,8 +1137,16 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         dobj.delete_object.version_id
     };
 
+    warn!(
+        "Starting replicate_delete for bucket: {}, object: {}, version_id: {:?}, target_arn: {}",
+        bucket, dobj.delete_object.object_name, version_id, dobj.target_arn
+    );
+
     let _rcfg = match get_replication_config(&bucket).await {
-        Ok(Some(config)) => config,
+        Ok(Some(config)) => {
+            warn!("Got replication config for bucket: {}", bucket);
+            config
+        }
         Ok(None) => {
             warn!("No replication config found for bucket: {}", bucket);
             // TODO: SendEvent
@@ -1160,7 +1168,14 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
             .map(|v| v.replicate_decision_str.clone())
             .unwrap_or_default(),
     ) {
-        Ok(dsc) => dsc,
+        Ok(dsc) => {
+            warn!(
+                "Parsed replicate decision for bucket: {}, found {} targets",
+                bucket,
+                dsc.targets_map.len()
+            );
+            dsc
+        }
         Err(err) => {
             error!("Failed to parse replicate decision for bucket {}: {}", bucket, err);
             // TODO: SendEvent
@@ -1178,15 +1193,21 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
 
     let mut join_set = JoinSet::new();
 
+    warn!("Starting to process replication targets for bucket: {}", bucket);
+
     // Process each target
     for (_, tgt_entry) in dsc.targets_map.iter() {
+        warn!("Processing target ARN: {} for bucket: {}", tgt_entry.arn, bucket);
+
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
+            warn!("Skipping target ARN: {} (replicate=false)", tgt_entry.arn);
             continue;
         }
 
         // If dobj.TargetArn is not empty string, this is a case of specific target being re-synced.
         if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+            warn!("Skipping target ARN: {} (not matching target_arn: {})", tgt_entry.arn, dobj.target_arn);
             continue;
         }
 
@@ -1198,6 +1219,8 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
             continue;
         };
 
+        warn!("Got target client for bucket: {}, ARN: {}", bucket, tgt_entry.arn);
+
         let dobj_clone = dobj.clone();
 
         // Spawn task in the join set
@@ -1207,13 +1230,25 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
     // Collect all results
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(tgt_info) => rinfos.targets.push(tgt_info),
+            Ok(tgt_info) => {
+                warn!(
+                    "Replication task completed for ARN: {}, status: {:?}",
+                    tgt_info.arn, tgt_info.replication_status
+                );
+                rinfos.targets.push(tgt_info);
+            }
             Err(e) => {
                 error!("Task failed: {}", e);
                 // TODO: SendEvent
             }
         }
     }
+
+    warn!(
+        "Completed processing all replication targets for bucket: {}, total targets: {}",
+        bucket,
+        rinfos.targets.len()
+    );
 
     let (replication_status, prev_status) = if dobj.delete_object.version_id.is_none() {
         (
@@ -1252,6 +1287,11 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         drs.replica_timestamp = Some(OffsetDateTime::now_utc());
     }
 
+    warn!(
+        "Performing final delete operation for bucket: {}, object: {}, version_id: {:?}, replication_status: {:?}",
+        bucket, dobj.delete_object.object_name, version_id, replication_status
+    );
+
     match storage
         .delete_object(
             &bucket,
@@ -1268,6 +1308,10 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         .await
     {
         Ok(_) => {
+            warn!(
+                "Successfully completed replicate_delete for bucket: {}, object: {}",
+                bucket, dobj.delete_object.object_name
+            );
             // TODO: send event
         }
         Err(e) => {

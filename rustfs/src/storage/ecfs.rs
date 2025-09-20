@@ -1038,6 +1038,7 @@ impl S3 for FS {
                 )
                 .await;
                 if dsc.replicate_any() {
+                    warn!("delete_objects replicate_any: dsc {:?}", dsc);
                     if object.version_id.is_some() {
                         object.version_purge_status = Some(VersionPurgeStatusType::Pending);
                         object.version_purge_statuses = dsc.pending_status();
@@ -1045,6 +1046,8 @@ impl S3 for FS {
                         object.delete_marker_replication_status = dsc.pending_status();
                     }
                     object.replicate_decision_str = Some(dsc.to_string());
+                } else {
+                    warn!("delete_objects replicate_any: not replicate_any");
                 }
             }
 
@@ -1097,7 +1100,10 @@ impl S3 for FS {
                     .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
             {
                 if replicate_deletes {
+                    warn!("delete_objects replicate_any 2: dobjs[i] {:?}", object_to_delete[i].replication_state());
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
+                } else {
+                    warn!("delete_objects replicate_any 2: not replicate_any");
                 }
                 delete_results[*didx].delete_object = Some(dobjs[i].clone());
                 continue;
@@ -1139,7 +1145,8 @@ impl S3 for FS {
         for dobjs in delete_results.iter() {
             if let Some(dobj) = &dobjs.delete_object {
                 warn!(
-                    "delete_objects: dobj {:?},{:?}",
+                    "delete_objects: dobj {:?},{:?},{:?}",
+                    replicate_deletes,
                     dobj.delete_marker_replication_status(),
                     dobj.version_purge_status()
                 );

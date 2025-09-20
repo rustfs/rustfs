@@ -1031,7 +1031,10 @@ impl ObjectToDelete {
     pub fn replication_state(&self) -> ReplicationState {
         ReplicationState {
             replication_status_internal: self.delete_marker_replication_status.clone(),
-            replica_status: ReplicationStatusType::Pending,
+            version_purge_status_internal: self.version_purge_statuses.clone(),
+            replicate_decision_str: self.replicate_decision_str.clone().unwrap_or_default(),
+            targets: replication_statuses_map(self.delete_marker_replication_status.as_deref().unwrap_or_default()),
+            purge_targets: version_purge_statuses_map(self.version_purge_statuses.as_deref().unwrap_or_default()),
             ..Default::default()
         }
     }
