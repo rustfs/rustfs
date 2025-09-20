@@ -18,7 +18,8 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use byteorder::ByteOrder;
@@ -1368,43 +1369,43 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     };
 
     if dobj.delete_object.delete_marker_version_id.is_some() {
-        let _resp = match tgt_client
+        if let Err(e) = tgt_client
             .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
             .await
         {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(
-                    "failed to stat object for bucket:{}/{}-{:?} arn:{}",
-                    dobj.bucket,
-                    dobj.delete_object.object_name,
-                    version_id.clone(),
-                    tgt_client.arn
-                );
-                error!("error: {}", e);
+            error!(
+                "failed to stat object for bucket:{}/{}-{:?} arn:{}",
+                dobj.bucket,
+                dobj.delete_object.object_name,
+                version_id.clone(),
+                tgt_client.arn
+            );
+            error!("error: {:?}", e);
 
-                if let SdkError::ServiceError(service_err) = e {
-                    if let HeadObjectError::NotFound(service_err) = service_err.into_err() {
-                        rinfo.replication_status = ReplicationStatusType::Completed;
-                        return rinfo;
-                    }
+            if let SdkError::ServiceError(service_err) = &e {
+                if !service_err.err().is_not_found() {
+                    error!("return error: {}", service_err.err());
+                    rinfo.replication_status = ReplicationStatusType::Failed;
+                    rinfo.error = Some(e.to_string());
+
+                    return rinfo;
                 }
-
-                // TODO: check reponse error
-
-                rinfo.replication_status = ReplicationStatusType::Failed;
-                rinfo.error = Some(e.to_string());
-
-                return rinfo;
             }
         };
     }
 
+    warn!(
+        "removing object start for bucket:{}/{}-{:?} arn:{}",
+        dobj.bucket,
+        dobj.delete_object.object_name,
+        version_id.clone(),
+        tgt_client.arn
+    );
     match tgt_client
         .remove_object(
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
-            version_id,
+            version_id.clone(),
             RemoveObjectOptions {
                 force_delete: false,
                 governance_bypass: false,
@@ -1418,7 +1419,13 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
-            info!("removed object for bucket:{} arn:{}", dobj.bucket, tgt_client.arn);
+            warn!(
+                "removed object done for bucket:{}/{}-{:?} arn:{}",
+                dobj.bucket,
+                dobj.delete_object.object_name,
+                version_id.clone(),
+                tgt_client.arn
+            );
             if dobj.delete_object.version_id.is_none() {
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {

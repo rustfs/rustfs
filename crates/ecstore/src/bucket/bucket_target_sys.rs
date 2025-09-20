@@ -1178,17 +1178,18 @@ impl TargetClient {
         {
             Ok(res) => Ok(res),
             Err(e) => {
-                let merr = extract_minio_error(e.raw_response());
+                // let merr = extract_minio_error(e.raw_response());
                 error!("head object error: {:?}", e);
-                if let Some(m) = merr {
-                    let new_service_err = ServiceError::builder()
-                        .source(HeadObjectError::unhandled(std::io::Error::other(m)))
-                        // .raw(service_err.into_raw())
-                        .build();
-                    Err(SdkError::ServiceError(new_service_err))
-                } else {
-                    Err(e)
-                }
+                Err(e)
+                // if let Some(m) = merr {
+                //     let new_service_err = ServiceError::builder()
+                //         .source(HeadObjectError::unhandled(std::io::Error::other(m)))
+                //         .raw(service_err.into_raw())
+                //         .build();
+                //     Err(SdkError::ServiceError(new_service_err))
+                // } else {
+                //     Err(e)
+                // }
             }
         }
     }
@@ -1377,6 +1378,8 @@ impl TargetClient {
             headers.insert(RUSTFS_BUCKET_REPLICATION_CHECK, "true".parse().unwrap());
         }
 
+        warn!("do remove object: {:?}/{:?}-{:?} \n{:?}", bucket, object, version_id, headers);
+
         match self
             .client
             .delete_object()
@@ -1396,7 +1399,7 @@ impl TargetClient {
             Ok(_) => Ok(()),
             Err(e) => {
                 let merr = extract_minio_error(e.raw_response());
-                warn!("remove object error: {:?}", e);
+                error!("remove object error: {:?}", e);
                 if let Some(m) = merr {
                     Err(S3ClientError::new(m))
                 } else {

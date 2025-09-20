@@ -4197,15 +4197,15 @@ impl StorageAPI for SetDisks {
 
         if opts.version_id.is_some() {
             if version_found && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                mark_delete = true;
+                mark_delete = false;
             }
 
             if opts.version_purge_status().is_empty() && opts.delete_marker_replication_status().is_empty() {
-                mark_delete = true;
+                mark_delete = false;
             }
 
             if opts.version_purge_status() != VersionPurgeStatusType::Complete {
-                mark_delete = true;
+                mark_delete = false;
             }
 
             if version_found && (goi.version_purge_status.is_empty() || !goi.delete_marker) {
