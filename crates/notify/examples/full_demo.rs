@@ -16,11 +16,11 @@ mod base;
 
 use base::{LogLevel, init_logger};
 use rustfs_config::EnableState::On;
-use rustfs_config::notify::{
-    DEFAULT_TARGET, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
-    NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+use rustfs_config::notify::{DEFAULT_TARGET, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::{
+    DEFAULT_LIMIT, ENABLE_KEY, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_config::{DEFAULT_LIMIT, ENABLE_KEY};
 use rustfs_ecstore::config::{Config, KV, KVS};
 use rustfs_notify::{BucketNotificationConfig, Event, NotificationError};
 use rustfs_notify::{initialize, notification_system};
