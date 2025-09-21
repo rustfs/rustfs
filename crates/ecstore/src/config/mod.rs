@@ -30,7 +30,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
-
 pub static GLOBAL_STORAGE_CLASS: LazyLock<OnceLock<storageclass::Config>> = LazyLock::new(OnceLock::new);
 pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
 pub static GLOBAL_SERVER_CONFIG: LazyLock<OnceLock<Config>> = LazyLock::new(OnceLock::new);

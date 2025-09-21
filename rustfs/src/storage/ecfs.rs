@@ -1854,20 +1854,26 @@ impl S3 for FS {
             .await
             .is_err()
         {
-            bucket_infos.retain(|info| {
-                let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+            bucket_infos = futures::stream::iter(bucket_infos)
+                .filter_map(|info| async {
+                    let mut req_clone = req.clone();
+                    let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                    req_info.bucket = Some(info.name.clone());
 
-                req_info.bucket = Some(info.name.clone());
-
-                futures::executor::block_on(async {
-                    authorize_request(&mut req, Action::S3Action(S3Action::ListBucketAction))
+                    if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
                         .await
                         .is_ok()
-                        || authorize_request(&mut req, Action::S3Action(S3Action::GetBucketLocationAction))
+                        || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
                             .await
                             .is_ok()
+                    {
+                        Some(info)
+                    } else {
+                        None
+                    }
                 })
-            });
+                .collect()
+                .await;
         }
 
         let buckets: Vec<Bucket> = bucket_infos

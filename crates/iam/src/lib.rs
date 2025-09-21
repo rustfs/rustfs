@@ -19,7 +19,6 @@ use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
 use tracing::{debug, instrument};
-
 pub mod cache;
 pub mod error;
 pub mod manager;
