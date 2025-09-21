@@ -90,8 +90,12 @@ async fn test_audit_log_dispatch_performance() {
     let system = AuditSystem::new();
 
     // Create minimal config
-    let config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
-    let _ = system.start(config).await;
+    let config = rustfs_ecstore::config::Config(HashMap::new());
+    let start_result = system.start(config).await;
+    if start_result.is_err() {
+        println!("AuditSystem failed to start: {:?}", start_result);
+        return; // 或 assert!(false, "AuditSystem failed to start");
+    }
 
     use chrono::Utc;
     use rustfs_targets::EventName;
