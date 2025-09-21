@@ -102,7 +102,7 @@ pub fn load_all_certs_from_directory(
         let path = entry.path();
 
         if path.is_dir() {
-            let domain_name = path
+            let domain_name: &str = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| certs_error(format!("invalid domain name directory:{path:?}")))?;

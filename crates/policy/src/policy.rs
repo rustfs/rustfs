@@ -17,6 +17,7 @@ mod doc;
 mod effect;
 mod function;
 mod id;
+pub mod opa;
 #[allow(clippy::module_inception)]
 mod policy;
 mod principal;
