@@ -186,7 +186,11 @@ RustFS is a high-performance distributed object storage software built with Rust
 - `crates/rio/src/encrypt_reader.rs` - Streaming encryption for large files
 
 ## Code Style and Safety Requirements
-- Communicate with me in Chinese, but only English can be used in code files
+- **Language Requirements:**
+  - Communicate with me in Chinese, but **only English can be used in code files**
+  - Code comments, function names, variable names, and all text in source files must be in English only
+  - No Chinese characters, emojis, or non-ASCII characters are allowed in any source code files
+  - This includes comments, strings, documentation, and any other text within code files
 - **Safety-Critical Rules:**
   - `unsafe_code = "deny"` enforced at workspace level
   - Never use `unwrap()`, `expect()`, or panic-inducing code except in tests

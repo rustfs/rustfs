@@ -18,14 +18,23 @@ use crate::encryption::ciphers::{create_cipher, generate_iv};
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
+use zeroize::Zeroize;
 
 /// Data key for object encryption
+/// SECURITY: This struct automatically zeros sensitive key material when dropped
 #[derive(Debug, Clone)]
 pub struct DataKey {
-    /// 256-bit encryption key
+    /// 256-bit encryption key - automatically zeroed on drop
     pub plaintext_key: [u8; 32],
-    /// 96-bit nonce for GCM mode
+    /// 96-bit nonce for GCM mode - not secret so no need to zero
     pub nonce: [u8; 12],
+}
+
+// SECURITY: Implement Drop to automatically zero sensitive key material
+impl Drop for DataKey {
+    fn drop(&mut self) {
+        self.plaintext_key.zeroize();
+    }
 }
 use base64::Engine;
 use rand::random;
@@ -500,6 +509,8 @@ impl ObjectEncryptionService {
             headers.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
         } else if metadata.algorithm == "AES256" {
             headers.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+            // For SSE-S3, we still need to store the key ID for internal use
+            headers.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
         } else {
             headers.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
             headers.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());

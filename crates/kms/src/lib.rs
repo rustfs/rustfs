@@ -36,23 +36,21 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use rustfs_kms::{KmsManager, KmsConfig, ObjectEncryptionService};
+//! use rustfs_kms::{KmsConfig, init_global_kms_service_manager};
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create local KMS configuration
+//!     // Initialize global KMS service manager
+//!     let service_manager = init_global_kms_service_manager();
+//!
+//!     // Configure with local backend
 //!     let config = KmsConfig::local(PathBuf::from("./kms_keys"));
-//!     
-//!     // Initialize KMS manager
-//!     let kms_manager = KmsManager::new(config).await?;
-//!     
-//!     // Create encryption service
-//!     let encryption_service = ObjectEncryptionService::new(kms_manager);
-//!     
-//!     // Initialize global services
-//!     rustfs_kms::init_global_services(encryption_service).await?;
-//!     
+//!     service_manager.configure(config).await?;
+//!
+//!     // Start the KMS service
+//!     service_manager.start().await?;
+//!
 //!     Ok(())
 //! }
 //! ```
@@ -114,31 +112,31 @@ pub fn shutdown_global_services() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn test_global_service_lifecycle() {
+        // Test service manager initialization
+        let manager = init_global_kms_service_manager();
+
+        // Test initial status
+        let status = manager.get_status().await;
+        assert_eq!(status, KmsServiceStatus::NotConfigured);
+
+        // Test configuration and start
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = KmsConfig::local(temp_dir.path().to_path_buf());
-        let backend = Arc::new(
-            crate::backends::local::LocalKmsBackend::new(config.clone())
-                .await
-                .expect("local backend should initialize"),
-        );
-        let kms_manager = KmsManager::new(backend, config);
-        let service = ObjectEncryptionService::new(kms_manager);
 
-        // Test initialization
-        init_global_services(service).await.expect("Failed to init global services");
+        manager.configure(config).await.expect("Configuration should succeed");
+        manager.start().await.expect("Start should succeed");
+
+        // Test that encryption service is now available
         assert!(get_global_encryption_service().await.is_some());
 
         // Test health check
         assert!(is_encryption_service_healthy().await);
 
-        // Test shutdown
-        shutdown_global_services();
-        // Note: The service is still accessible after shutdown, but marked as None internally
+        // Test stop
+        manager.stop().await.expect("Stop should succeed");
     }
 }

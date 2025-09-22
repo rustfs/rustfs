@@ -19,7 +19,7 @@ use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_kms::{get_global_kms_service_manager, types::*};
+use rustfs_kms::{KmsError, get_global_kms_service_manager, types::*};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -125,11 +125,15 @@ impl Operation for CreateKmsKeyHandler {
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
+        // Extract key name from tags if provided
+        let tags = request.tags.unwrap_or_default();
+        let key_name = tags.get("name").cloned();
+
         let kms_request = CreateKeyRequest {
-            key_name: None,
+            key_name,
             key_usage: request.key_usage.unwrap_or(KeyUsage::EncryptDecrypt),
             description: request.description,
-            tags: request.tags.unwrap_or_default(),
+            tags,
             origin: Some("AWS_KMS".to_string()),
             policy: None,
         };
@@ -177,6 +181,7 @@ impl Operation for CreateKmsKeyHandler {
 pub struct DeleteKmsKeyRequest {
     pub key_id: String,
     pub pending_window_in_days: Option<u32>,
+    pub force_immediate: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,9 +235,15 @@ impl Operation for DeleteKmsKeyHandler {
                 headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
                 return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
             };
+
+            // Extract pending_window_in_days and force_immediate from query parameters
+            let pending_window_in_days = query_params.get("pending_window_in_days").and_then(|s| s.parse::<u32>().ok());
+            let force_immediate = query_params.get("force_immediate").and_then(|s| s.parse::<bool>().ok());
+
             DeleteKmsKeyRequest {
                 key_id: key_id.clone(),
-                pending_window_in_days: None,
+                pending_window_in_days,
+                force_immediate,
             }
         } else {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
@@ -269,15 +280,15 @@ impl Operation for DeleteKmsKeyHandler {
         let kms_request = DeleteKeyRequest {
             key_id: request.key_id.clone(),
             pending_window_in_days: request.pending_window_in_days,
-            force_immediate: None,
+            force_immediate: request.force_immediate,
         };
 
         match manager.delete_key(kms_request).await {
             Ok(kms_response) => {
-                info!("Scheduled deletion for KMS key: {}", kms_response.key_id);
+                info!("Successfully deleted KMS key: {}", kms_response.key_id);
                 let response = DeleteKmsKeyResponse {
                     success: true,
-                    message: "Key scheduled for deletion".to_string(),
+                    message: "Key deleted successfully".to_string(),
                     key_id: kms_response.key_id,
                     deletion_date: kms_response.deletion_date,
                 };
@@ -292,6 +303,11 @@ impl Operation for DeleteKmsKeyHandler {
             }
             Err(e) => {
                 error!("Failed to delete KMS key {}: {}", request.key_id, e);
+                let status = match &e {
+                    KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
+                    KmsError::InvalidOperation { .. } | KmsError::ValidationError { .. } => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
                 let response = DeleteKmsKeyResponse {
                     success: false,
                     message: format!("Failed to delete key: {}", e),
@@ -305,7 +321,7 @@ impl Operation for DeleteKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-                Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
+                Ok(S3Response::with_headers((status, Body::from(data)), headers))
             }
         }
     }
@@ -660,6 +676,12 @@ impl Operation for DescribeKmsKeyHandler {
             }
             Err(e) => {
                 error!("Failed to describe KMS key {}: {}", key_id, e);
+                let status = match &e {
+                    KmsError::KeyNotFound { .. } => StatusCode::NOT_FOUND,
+                    KmsError::InvalidOperation { .. } => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+
                 let response = DescribeKmsKeyResponse {
                     success: false,
                     message: format!("Failed to describe key: {}", e),
@@ -672,7 +694,7 @@ impl Operation for DescribeKmsKeyHandler {
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-                Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
+                Ok(S3Response::with_headers((status, Body::from(data)), headers))
             }
         }
     }

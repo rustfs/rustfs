@@ -262,6 +262,7 @@ uuid = { version = "1.18.1", features = [
     "macro-diagnostics",
 ] }
 wildmatch = { version = "2.5.0", features = ["serde"] }
+zeroize = { version = "1.8.1", features = ["derive"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "5.1.1"

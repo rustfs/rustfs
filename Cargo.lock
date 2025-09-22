@@ -6536,6 +6536,7 @@ dependencies = [
  "url",
  "uuid",
  "vaultrs",
+ "zeroize",
 ]
 
 [[package]]

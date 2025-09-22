@@ -56,6 +56,8 @@ struct VaultKeyData {
     description: Option<String>,
     /// Key metadata
     metadata: HashMap<String, String>,
+    /// Key tags
+    tags: HashMap<String, String>,
     /// Encrypted key material (base64 encoded)
     encrypted_key_material: String,
 }
@@ -163,16 +165,36 @@ impl VaultKmsClient {
         Ok(())
     }
 
+    async fn store_key_metadata(&self, key_id: &str, request: &CreateKeyRequest) -> Result<()> {
+        debug!("Storing key metadata for {}, input tags: {:?}", key_id, request.tags);
+
+        let key_data = VaultKeyData {
+            algorithm: "AES_256".to_string(),
+            usage: request.key_usage.clone(),
+            created_at: chrono::Utc::now(),
+            status: KeyStatus::Active,
+            version: 1,
+            description: request.description.clone(),
+            metadata: HashMap::new(),
+            tags: request.tags.clone(),
+            encrypted_key_material: String::new(), // Not used for transit keys
+        };
+
+        debug!("VaultKeyData tags before storage: {:?}", key_data.tags);
+        self.store_key_data(key_id, &key_data).await
+    }
+
     /// Retrieve key data from Vault
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
         let path = self.key_path(key_id);
 
         let secret: VaultKeyData = kv2::read(&self.client, &self.kv_mount, &path).await.map_err(|e| match e {
             vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
+            vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
             _ => KmsError::backend_error(format!("Failed to read key from Vault: {}", e)),
         })?;
 
-        debug!("Retrieved key {} from Vault", key_id);
+        debug!("Retrieved key {} from Vault, tags: {:?}", key_id, secret.tags);
         Ok(secret)
     }
 
@@ -188,8 +210,30 @@ impl VaultKmsClient {
                 // No keys exist yet
                 Ok(Vec::new())
             }
+            Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => {
+                // Path doesn't exist - no keys exist yet
+                debug!("Key path doesn't exist in Vault (404), returning empty list");
+                Ok(Vec::new())
+            }
             Err(e) => Err(KmsError::backend_error(format!("Failed to list keys in Vault: {}", e))),
         }
+    }
+
+    /// Physically delete a key from Vault storage
+    async fn delete_key(&self, key_id: &str) -> Result<()> {
+        let path = self.key_path(key_id);
+
+        // For this specific key path, we can safely delete the metadata
+        // since each key has its own unique path under the prefix
+        kv2::delete_metadata(&self.client, &self.kv_mount, &path)
+            .await
+            .map_err(|e| match e {
+                vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+                _ => KmsError::backend_error(format!("Failed to delete key metadata from Vault: {}", e)),
+            })?;
+
+        debug!("Permanently deleted key {} metadata from Vault at path {}", key_id, path);
+        Ok(())
     }
 }
 
@@ -278,6 +322,7 @@ impl KmsClient for VaultKmsClient {
             version: 1,
             description: None,
             metadata: HashMap::new(),
+            tags: HashMap::new(),
             encrypted_key_material: encrypted_material,
         };
 
@@ -290,6 +335,7 @@ impl KmsClient for VaultKmsClient {
             algorithm: key_data.algorithm.clone(),
             usage: key_data.usage,
             status: key_data.status,
+            description: None, // This method doesn't receive description parameter
             metadata: key_data.metadata.clone(),
             created_at: key_data.created_at,
             rotated_at: None,
@@ -313,6 +359,7 @@ impl KmsClient for VaultKmsClient {
             status: key_data.status,
             version: key_data.version,
             metadata: key_data.metadata,
+            tags: key_data.tags,
             created_at: key_data.created_at,
             rotated_at: None,
             created_by: None,
@@ -423,6 +470,7 @@ impl KmsClient for VaultKmsClient {
             algorithm: key_data.algorithm,
             usage: key_data.usage,
             status: key_data.status,
+            description: None, // Rotate preserves existing description (would need key lookup)
             metadata: key_data.metadata,
             created_at: key_data.created_at,
             rotated_at: Some(chrono::Utc::now()),
@@ -436,15 +484,22 @@ impl KmsClient for VaultKmsClient {
     async fn health_check(&self) -> Result<()> {
         debug!("Performing Vault health check");
 
-        // Try to list keys to verify connectivity
+        // Use list_vault_keys but handle the case where no keys exist (which is normal)
         match self.list_vault_keys().await {
             Ok(_) => {
-                debug!("Vault health check passed");
+                debug!("Vault health check passed - successfully listed keys");
                 Ok(())
             }
             Err(e) => {
-                warn!("Vault health check failed: {}", e);
-                Err(e)
+                // Check if the error is specifically about "no keys found" or 404
+                let error_msg = e.to_string();
+                if error_msg.contains("status code 404") || error_msg.contains("No such key") {
+                    debug!("Vault health check passed - 404 error is expected when no keys exist yet");
+                    Ok(())
+                } else {
+                    warn!("Vault health check failed: {}", e);
+                    Err(e)
+                }
             }
         }
     }
@@ -472,14 +527,37 @@ impl VaultKmsBackend {
         let client = VaultKmsClient::new(vault_config).await?;
         Ok(Self { client })
     }
+
+    /// Update key metadata in Vault storage
+    async fn update_key_metadata_in_storage(&self, key_id: &str, metadata: &KeyMetadata) -> Result<()> {
+        // Get the current key data from Vault
+        let mut key_data = self.client.get_key_data(key_id).await?;
+
+        // Update the status based on the new metadata
+        key_data.status = match metadata.key_state {
+            KeyState::Enabled => KeyStatus::Active,
+            KeyState::Disabled => KeyStatus::Disabled,
+            KeyState::PendingDeletion => KeyStatus::PendingDeletion,
+            KeyState::Unavailable => KeyStatus::Deleted,
+            KeyState::PendingImport => KeyStatus::Disabled, // Treat as disabled until import completes
+        };
+
+        // Update the key data in Vault storage
+        self.client.store_key_data(key_id, &key_data).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl KmsBackend for VaultKmsBackend {
     async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
-        let key_id = request.key_name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let key_id = request.key_name.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        // Create key in Vault transit engine
         let _master_key = self.client.create_key(&key_id, "AES_256", None).await?;
+
+        // Also store key metadata in KV store with tags
+        self.client.store_key_metadata(&key_id, &request).await?;
 
         let metadata = KeyMetadata {
             key_id: key_id.clone(),
@@ -490,6 +568,7 @@ impl KmsBackend for VaultKmsBackend {
             deletion_date: None,
             origin: "VAULT".to_string(),
             key_manager: "VAULT".to_string(),
+            tags: request.tags,
         };
 
         Ok(CreateKeyResponse {
@@ -539,13 +618,16 @@ impl KmsBackend for VaultKmsBackend {
 
         Ok(GenerateDataKeyResponse {
             key_id: request.key_id,
-            plaintext_key: data_key.plaintext.unwrap_or_default(),
-            ciphertext_blob: data_key.ciphertext,
+            plaintext_key: data_key.plaintext.clone().unwrap_or_default(),
+            ciphertext_blob: data_key.ciphertext.clone(),
         })
     }
 
     async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse> {
         let key_info = self.client.describe_key(&request.key_id, None).await?;
+
+        // Also get key metadata from KV store to retrieve tags
+        let key_data = self.client.get_key_data(&request.key_id).await?;
 
         let metadata = KeyMetadata {
             key_id: key_info.key_id,
@@ -561,6 +643,7 @@ impl KmsBackend for VaultKmsBackend {
             deletion_date: None,
             origin: "VAULT".to_string(),
             key_manager: "VAULT".to_string(),
+            tags: key_data.tags,
         };
 
         Ok(DescribeKeyResponse { key_metadata: metadata })
@@ -586,11 +669,23 @@ impl KmsBackend for VaultKmsBackend {
         };
 
         let deletion_date = if request.force_immediate.unwrap_or(false) {
-            // For Vault, we'll disable the key rather than physical deletion
-            // Physical deletion in Vault requires special permissions and is irreversible
-            key_metadata.key_state = KeyState::PendingDeletion;
-            key_metadata.deletion_date = Some(chrono::Utc::now());
-            None
+            // Check if key is already in PendingDeletion state
+            if key_metadata.key_state == KeyState::PendingDeletion {
+                // Force immediate deletion: physically delete the key from Vault storage
+                self.client.delete_key(key_id).await?;
+
+                // Return empty deletion_date to indicate key was permanently deleted
+                None
+            } else {
+                // For non-pending keys, mark as PendingDeletion
+                key_metadata.key_state = KeyState::PendingDeletion;
+                key_metadata.deletion_date = Some(chrono::Utc::now());
+
+                // Update the key metadata in Vault storage to reflect the new state
+                self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
+
+                None
+            }
         } else {
             // Schedule for deletion (default 30 days)
             let days = request.pending_window_in_days.unwrap_or(30);
@@ -603,6 +698,9 @@ impl KmsBackend for VaultKmsBackend {
             let deletion_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
             key_metadata.key_state = KeyState::PendingDeletion;
             key_metadata.deletion_date = Some(deletion_date);
+
+            // Update the key metadata in Vault storage to reflect the new state
+            self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
 
             Some(deletion_date.to_rfc3339())
         };

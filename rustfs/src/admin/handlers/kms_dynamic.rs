@@ -15,12 +15,15 @@
 //! KMS dynamic configuration admin API handlers
 
 use super::Operation;
+use crate::admin::auth::validate_admin_request;
+use crate::auth::{check_key_valid, get_session_token};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_kms::{
     ConfigureKmsRequest, ConfigureKmsResponse, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
     StartKmsResponse, StopKmsResponse, get_global_kms_service_manager,
 };
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::{error, info, warn};
 
@@ -30,6 +33,22 @@ pub struct ConfigureKmsHandler;
 #[async_trait::async_trait]
 impl Operation for ConfigureKmsHandler {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         let body = req
             .input
             .store_all_unlimited()
@@ -107,6 +126,22 @@ pub struct StartKmsHandler;
 #[async_trait::async_trait]
 impl Operation for StartKmsHandler {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         let body = req
             .input
             .store_all_unlimited()
@@ -226,7 +261,23 @@ pub struct StopKmsHandler;
 
 #[async_trait::async_trait]
 impl Operation for StopKmsHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         info!("Stopping KMS service");
 
         let service_manager = match get_global_kms_service_manager() {
@@ -278,7 +329,23 @@ pub struct GetKmsStatusHandler;
 
 #[async_trait::async_trait]
 impl Operation for GetKmsStatusHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         info!("Getting KMS service status");
 
         let service_manager = match get_global_kms_service_manager() {
@@ -337,6 +404,22 @@ pub struct ReconfigureKmsHandler;
 #[async_trait::async_trait]
 impl Operation for ReconfigureKmsHandler {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         let body = req
             .input
             .store_all_unlimited()
