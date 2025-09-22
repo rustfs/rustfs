@@ -408,17 +408,17 @@ impl AuditSystem {
     }
 
     /// Gets current audit system metrics
-    pub async fn get_metrics(&self) -> crate::observability::AuditMetricsReport {
-        crate::observability::get_metrics_report().await
+    pub async fn get_metrics(&self) -> observability::AuditMetricsReport {
+        observability::get_metrics_report().await
     }
 
     /// Validates system performance against requirements
-    pub async fn validate_performance(&self) -> crate::observability::PerformanceValidation {
-        crate::observability::validate_performance().await
+    pub async fn validate_performance(&self) -> observability::PerformanceValidation {
+        observability::validate_performance().await
     }
 
     /// Resets all metrics
     pub async fn reset_metrics(&self) {
-        crate::observability::reset_metrics().await;
+        observability::reset_metrics().await;
     }
 }

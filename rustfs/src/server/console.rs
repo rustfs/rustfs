@@ -324,6 +324,18 @@ pub async fn start_console_server(opt: &Opt, shutdown_rx: tokio::sync::broadcast
         protocol, console_addr.port()
     );
 
+    println!(
+        "Console WebUI available at: {}://{}:{}/rustfs/console/index.html",
+        protocol,
+        local_ip,
+        console_addr.port()
+    );
+    println!(
+        "Console WebUI (localhost): {}://127.0.0.1:{}/rustfs/console/index.html",
+        protocol,
+        console_addr.port()
+    );
+
     // Handle connections based on TLS availability using axum-server
     if let Some(tls_config) = tls_config {
         handle_tls_connections(console_addr, app, tls_config, shutdown_rx).await

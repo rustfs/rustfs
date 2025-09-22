@@ -23,6 +23,9 @@ pub enum AuditError {
     #[error("Configuration error: {0}")]
     Configuration(String),
 
+    #[error("config not loaded")]
+    ConfigNotLoaded,
+
     #[error("Target error: {0}")]
     Target(#[from] rustfs_targets::TargetError),
 

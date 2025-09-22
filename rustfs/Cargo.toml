@@ -39,6 +39,7 @@ rustfs-zip = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-appauth = { workspace = true }
+rustfs-audit = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-common = { workspace = true }
