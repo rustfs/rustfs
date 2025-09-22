@@ -106,6 +106,30 @@ pub struct Opt {
 
     #[arg(long, env = "RUSTFS_REGION")]
     pub region: Option<String>,
+
+    /// Enable KMS encryption for server-side encryption
+    #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ENABLE")]
+    pub kms_enable: bool,
+
+    /// KMS backend type (local or vault)
+    #[arg(long, default_value_t = String::from("local"), env = "RUSTFS_KMS_BACKEND")]
+    pub kms_backend: String,
+
+    /// KMS key directory for local backend
+    #[arg(long, env = "RUSTFS_KMS_KEY_DIR")]
+    pub kms_key_dir: Option<String>,
+
+    /// Vault address for vault backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_ADDRESS")]
+    pub kms_vault_address: Option<String>,
+
+    /// Vault token for vault backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_TOKEN")]
+    pub kms_vault_token: Option<String>,
+
+    /// Default KMS key ID for encryption
+    #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
+    pub kms_default_key_id: Option<String>,
 }
 
 // lazy_static::lazy_static! {

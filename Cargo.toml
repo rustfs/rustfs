@@ -39,6 +39,7 @@ members = [
     "crates/zip", # ZIP file handling and compression
     "crates/ahm", # Asynchronous Hash Map for concurrent data structures
     "crates/mcp", # MCP server for S3 operations
+    "crates/kms", # Key Management Service
 ]
 resolver = "2"
 
@@ -85,6 +86,7 @@ rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
+rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 anyhow = "1.0.99"
 arc-swap = "1.7.1"
@@ -149,6 +151,7 @@ local-ip-address = "0.6.5"
 lz4 = "1.28.1"
 matchit = "0.8.4"
 md-5 = "0.10.6"
+md5 = "0.7.0"
 mime_guess = "2.0.5"
 moka = { version = "0.12.10", features = ["future"] }
 netif = "0.1.6"
@@ -259,6 +262,7 @@ uuid = { version = "1.18.1", features = [
     "macro-diagnostics",
 ] }
 wildmatch = { version = "2.5.0", features = ["serde"] }
+zeroize = { version = "1.8.1", features = ["derive"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "5.1.1"

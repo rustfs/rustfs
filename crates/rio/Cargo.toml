@@ -43,6 +43,7 @@ futures.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
 serde_json.workspace = true
 md-5 = { workspace = true }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }

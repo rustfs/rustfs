@@ -12,12 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod reliant;
+//! KMS (Key Management Service) End-to-End Tests
+//!
+//! This module contains comprehensive end-to-end tests for RustFS KMS functionality,
+//! including tests for both Local and Vault backends.
 
-// Common utilities for all E2E tests
+// KMS-specific common utilities
 #[cfg(test)]
 pub mod common;
 
-// KMS-specific test modules
 #[cfg(test)]
-mod kms;
+mod kms_local_test;
+
+#[cfg(test)]
+mod kms_vault_test;
+
+#[cfg(test)]
+mod kms_comprehensive_test;
+
+#[cfg(test)]
+mod multipart_encryption_test;
+
+#[cfg(test)]
+mod kms_edge_cases_test;
+
+#[cfg(test)]
+mod kms_fault_recovery_test;
+
+#[cfg(test)]
+mod test_runner;
+
+#[cfg(test)]
+mod bucket_default_encryption_test;

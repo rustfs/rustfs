@@ -27,7 +27,7 @@ use handlers::{
         GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
         SetBucketNotification,
     },
-    group, policies, pools, rebalance,
+    group, kms, kms_dynamic, kms_keys, policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
@@ -231,6 +231,111 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
         AdminOperation(&handlers::ProfileStatusHandler {}),
+    )?;
+
+    // KMS management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/create-key").as_str(),
+        AdminOperation(&kms::CreateKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/describe-key").as_str(),
+        AdminOperation(&kms::DescribeKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/list-keys").as_str(),
+        AdminOperation(&kms::ListKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/generate-data-key").as_str(),
+        AdminOperation(&kms::GenerateDataKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
+        AdminOperation(&kms::KmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/config").as_str(),
+        AdminOperation(&kms::KmsConfigHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/clear-cache").as_str(),
+        AdminOperation(&kms::KmsClearCacheHandler {}),
+    )?;
+
+    // KMS Dynamic Configuration APIs
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
+        AdminOperation(&kms_dynamic::ConfigureKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/start").as_str(),
+        AdminOperation(&kms_dynamic::StartKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/stop").as_str(),
+        AdminOperation(&kms_dynamic::StopKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/service-status").as_str(),
+        AdminOperation(&kms_dynamic::GetKmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/reconfigure").as_str(),
+        AdminOperation(&kms_dynamic::ReconfigureKmsHandler {}),
+    )?;
+
+    // KMS key management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::CreateKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
+        AdminOperation(&kms_keys::DeleteKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
+        AdminOperation(&kms_keys::CancelKmsKeyDeletionHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::ListKmsKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
+        AdminOperation(&kms_keys::DescribeKmsKeyHandler {}),
     )?;
 
     Ok(r)
