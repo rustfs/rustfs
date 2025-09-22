@@ -62,21 +62,6 @@ struct VaultKeyData {
     encrypted_key_material: String,
 }
 
-/// Data key stored in Vault with encryption
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct VaultDataKey {
-    /// Plaintext key (temporarily stored for generation response)
-    plaintext: Vec<u8>,
-    /// Encrypted key material
-    ciphertext: Vec<u8>,
-    /// Key specification
-    key_spec: String,
-    /// Creation timestamp
-    created_at: chrono::DateTime<chrono::Utc>,
-    /// Associated metadata
-    metadata: HashMap<String, String>,
-}
-
 impl VaultKmsClient {
     /// Create a new Vault KMS client
     pub async fn new(config: VaultConfig) -> Result<Self> {

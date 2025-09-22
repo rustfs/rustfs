@@ -43,19 +43,8 @@ pub struct CreateKeyApiResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DescribeKeyApiRequest {
-    pub key_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct DescribeKeyApiResponse {
     pub key_metadata: KeyMetadata,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListKeysApiRequest {
-    pub limit: Option<u32>,
-    pub marker: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,34 +90,6 @@ pub struct KmsConfigResponse {
     pub cache_max_keys: usize,
     pub cache_ttl_seconds: u64,
     pub default_key_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncryptApiRequest {
-    pub key_id: String,
-    pub plaintext: String, // Base64 encoded
-    pub encryption_context: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncryptApiResponse {
-    pub ciphertext: String, // Base64 encoded
-    pub key_id: String,
-    pub key_version: u32,
-    pub algorithm: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DecryptApiRequest {
-    pub ciphertext: String, // Base64 encoded
-    pub encryption_context: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DecryptApiResponse {
-    pub plaintext: String, // Base64 encoded
-    pub key_id: String,
-    pub encryption_algorithm: Option<String>,
 }
 
 fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {

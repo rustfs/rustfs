@@ -460,14 +460,6 @@ impl Operation for CancelKmsKeyDeletionHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ListKmsKeysRequest {
-    pub limit: Option<u32>,
-    pub marker: Option<String>,
-    pub status_filter: Option<KeyState>,
-    pub usage_filter: Option<KeyUsage>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ListKmsKeysResponse {
     pub success: bool,
     pub message: String,
@@ -578,11 +570,6 @@ impl Operation for ListKmsKeysHandler {
             }
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DescribeKmsKeyRequest {
-    pub key_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
