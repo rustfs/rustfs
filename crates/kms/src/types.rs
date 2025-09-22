@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// Data encryption key (DEK) used for encrypting object data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub struct DataKey {
     /// Key version
     pub version: u32,
     /// Plaintext key material (only available during generation)
+    /// SECURITY: This field is manually zeroed when dropped
     pub plaintext: Option<Vec<u8>>,
     /// Encrypted key material (ciphertext)
     pub ciphertext: Vec<u8>,
@@ -56,7 +58,7 @@ impl DataKey {
     pub fn clear_plaintext(&mut self) {
         if let Some(ref mut plaintext) = self.plaintext {
             // Zero out the memory before dropping
-            plaintext.fill(0);
+            plaintext.zeroize();
         }
         self.plaintext = None;
     }
@@ -81,6 +83,8 @@ pub struct MasterKey {
     pub usage: KeyUsage,
     /// Key status
     pub status: KeyStatus,
+    /// Key description
+    pub description: Option<String>,
     /// Associated metadata
     pub metadata: HashMap<String, String>,
     /// Key creation timestamp
@@ -100,6 +104,28 @@ impl MasterKey {
             algorithm,
             usage: KeyUsage::EncryptDecrypt,
             status: KeyStatus::Active,
+            description: None,
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+            rotated_at: None,
+            created_by,
+        }
+    }
+
+    /// Create a new master key with description
+    pub fn new_with_description(
+        key_id: String,
+        algorithm: String,
+        created_by: Option<String>,
+        description: Option<String>,
+    ) -> Self {
+        Self {
+            key_id,
+            version: 1,
+            algorithm,
+            usage: KeyUsage::EncryptDecrypt,
+            status: KeyStatus::Active,
+            description,
             metadata: HashMap::new(),
             created_at: Utc::now(),
             rotated_at: None,
@@ -147,6 +173,8 @@ pub struct KeyInfo {
     pub version: u32,
     /// Associated metadata
     pub metadata: HashMap<String, String>,
+    /// Key tags
+    pub tags: HashMap<String, String>,
     /// Key creation timestamp
     pub created_at: DateTime<Utc>,
     /// Key last rotation timestamp
@@ -159,12 +187,13 @@ impl From<MasterKey> for KeyInfo {
     fn from(master_key: MasterKey) -> Self {
         Self {
             key_id: master_key.key_id,
-            description: None,
+            description: master_key.description,
             algorithm: master_key.algorithm,
             usage: master_key.usage,
             status: master_key.status,
             version: master_key.version,
-            metadata: master_key.metadata,
+            metadata: master_key.metadata.clone(),
+            tags: master_key.metadata,
             created_at: master_key.created_at,
             rotated_at: master_key.rotated_at,
             created_by: master_key.created_by,
@@ -511,6 +540,8 @@ pub struct KeyMetadata {
     pub origin: String,
     /// Key manager
     pub key_manager: String,
+    /// Key tags
+    pub tags: HashMap<String, String>,
 }
 
 /// Key state enumeration
@@ -703,4 +734,11 @@ pub struct CancelKeyDeletionResponse {
     pub key_id: String,
     /// Key metadata
     pub key_metadata: KeyMetadata,
+}
+
+// SECURITY: Implement Drop to automatically zero sensitive data when DataKey is dropped
+impl Drop for DataKey {
+    fn drop(&mut self) {
+        self.clear_plaintext();
+    }
 }

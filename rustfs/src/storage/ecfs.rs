@@ -1604,6 +1604,41 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
+        // TDD: Get bucket default encryption configuration
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        tracing::debug!("TDD: bucket_sse_config={:?}", bucket_sse_config);
+
+        // TDD: Determine effective encryption configuration (request overrides bucket default)
+        let original_sse = server_side_encryption.clone();
+        let effective_sse = server_side_encryption.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                tracing::debug!("TDD: Processing bucket SSE config: {:?}", config);
+                config.rules.first().and_then(|rule| {
+                    tracing::debug!("TDD: Processing SSE rule: {:?}", rule);
+                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                        tracing::debug!("TDD: Found SSE default: {:?}", sse);
+                        match sse.sse_algorithm.as_str() {
+                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
+                        }
+                    })
+                })
+            })
+        });
+        tracing::debug!("TDD: effective_sse={:?} (original={:?})", effective_sse, original_sse);
+
+        let _original_kms_key_id = ssekms_key_id.clone();
+        let effective_kms_key_id = ssekms_key_id.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| sse.kms_master_key_id.clone())
+                })
+            })
+        });
+
         let mut metadata = metadata.unwrap_or_default();
 
         extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, Some(&key));
@@ -1612,8 +1647,8 @@ impl S3 for FS {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        // Store SSE information in metadata for GET responses
-        if let Some(sse) = &server_side_encryption {
+        // TDD: Store effective SSE information in metadata for GET responses
+        if let Some(sse) = &effective_sse {
             metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
         }
         if let Some(sse_alg) = &sse_customer_algorithm {
@@ -1625,7 +1660,7 @@ impl S3 for FS {
         if let Some(sse_md5) = &sse_customer_key_md5 {
             metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
         }
-        if let Some(kms_key_id) = &ssekms_key_id {
+        if let Some(kms_key_id) = &effective_kms_key_id {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
@@ -1733,10 +1768,10 @@ impl S3 for FS {
 
         let output = PutObjectOutput {
             e_tag,
-            server_side_encryption,
+            server_side_encryption: effective_sse, // TDD: Return effective encryption config
             sse_customer_algorithm,
             sse_customer_key_md5,
-            ssekms_key_id,
+            ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
             ..Default::default()
         };
 
@@ -1798,8 +1833,43 @@ impl S3 for FS {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        // Store SSE information in metadata for multipart upload
-        if let Some(sse) = &server_side_encryption {
+        // TDD: Get bucket SSE configuration for multipart upload
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        tracing::debug!("TDD: Got bucket SSE config for multipart: {:?}", bucket_sse_config);
+
+        // TDD: Determine effective encryption (request parameters override bucket defaults)
+        let original_sse = server_side_encryption.clone();
+        let effective_sse = server_side_encryption.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                tracing::debug!("TDD: Processing bucket SSE config for multipart: {:?}", config);
+                config.rules.first().and_then(|rule| {
+                    tracing::debug!("TDD: Processing SSE rule for multipart: {:?}", rule);
+                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                        tracing::debug!("TDD: Found SSE default for multipart: {:?}", sse);
+                        match sse.sse_algorithm.as_str() {
+                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
+                        }
+                    })
+                })
+            })
+        });
+        tracing::debug!("TDD: effective_sse for multipart={:?} (original={:?})", effective_sse, original_sse);
+
+        let _original_kms_key_id = ssekms_key_id.clone();
+        let effective_kms_key_id = ssekms_key_id.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| sse.kms_master_key_id.clone())
+                })
+            })
+        });
+
+        // Store effective SSE information in metadata for multipart upload
+        if let Some(sse) = &effective_sse {
             metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
         }
         if let Some(sse_alg) = &sse_customer_algorithm {
@@ -1811,7 +1881,7 @@ impl S3 for FS {
         if let Some(sse_md5) = &sse_customer_key_md5 {
             metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
         }
-        if let Some(kms_key_id) = &ssekms_key_id {
+        if let Some(kms_key_id) = &effective_kms_key_id {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
@@ -1836,9 +1906,9 @@ impl S3 for FS {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id),
-            server_side_encryption,
+            server_side_encryption: effective_sse, // TDD: Return effective encryption config
             sse_customer_algorithm,
-            ssekms_key_id,
+            ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
             ..Default::default()
         };
 
@@ -2332,18 +2402,67 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // TDD: Get multipart info to extract encryption configuration before completing
+        tracing::info!(
+            "TDD: Attempting to get multipart info for bucket={}, key={}, upload_id={}",
+            bucket,
+            key,
+            upload_id
+        );
+        let multipart_info = store
+            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        tracing::info!("TDD: Got multipart info successfully");
+        tracing::info!("TDD: Multipart info metadata: {:?}", multipart_info.user_defined);
+
+        // TDD: Extract encryption information from multipart upload metadata
+        let server_side_encryption = multipart_info
+            .user_defined
+            .get("x-amz-server-side-encryption")
+            .map(|s| ServerSideEncryption::from(s.clone()));
+        tracing::info!(
+            "TDD: Raw encryption from metadata: {:?} -> parsed: {:?}",
+            multipart_info.user_defined.get("x-amz-server-side-encryption"),
+            server_side_encryption
+        );
+
+        let ssekms_key_id = multipart_info
+            .user_defined
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .cloned();
+
+        tracing::info!(
+            "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
+            server_side_encryption,
+            ssekms_key_id
+        );
+
         let obj_info = store
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(ApiError::from)?;
 
+        tracing::info!(
+            "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
+            server_side_encryption,
+            ssekms_key_id
+        );
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone(),
             location: Some("us-east-1".to_string()),
+            server_side_encryption, // TDD: Return encryption info
+            ssekms_key_id,          // TDD: Return KMS key ID if present
             ..Default::default()
         };
+        tracing::info!(
+            "TDD: Created output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption,
+            output.ssekms_key_id
+        );
 
         let mt2 = HashMap::new();
         let repoptions =
@@ -2356,6 +2475,11 @@ impl S3 for FS {
             let objectlayer = new_object_layer_fn();
             schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
         }
+        tracing::info!(
+            "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption,
+            output.ssekms_key_id
+        );
         Ok(S3Response::new(output))
     }
 

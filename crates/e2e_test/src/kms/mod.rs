@@ -41,3 +41,6 @@ mod kms_fault_recovery_test;
 
 #[cfg(test)]
 mod test_runner;
+
+#[cfg(test)]
+mod bucket_default_encryption_test;

@@ -49,6 +49,7 @@ struct StoredMasterKey {
     algorithm: String,
     usage: KeyUsage,
     status: KeyStatus,
+    description: Option<String>,
     metadata: HashMap<String, String>,
     created_at: chrono::DateTime<chrono::Utc>,
     rotated_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -140,6 +141,7 @@ impl LocalKmsClient {
             algorithm: stored_key.algorithm,
             usage: stored_key.usage,
             status: stored_key.status,
+            description: stored_key.description,
             metadata: stored_key.metadata,
             created_at: stored_key.created_at,
             rotated_at: stored_key.rotated_at,
@@ -168,6 +170,7 @@ impl LocalKmsClient {
             algorithm: master_key.algorithm.clone(),
             usage: master_key.usage.clone(),
             status: master_key.status.clone(),
+            description: master_key.description.clone(),
             metadata: master_key.metadata.clone(),
             created_at: master_key.created_at,
             rotated_at: master_key.rotated_at,
@@ -370,7 +373,7 @@ impl KmsClient for LocalKmsClient {
             .map(|ctx| ctx.principal.clone())
             .unwrap_or_else(|| "local-kms".to_string());
 
-        let master_key = MasterKey::new(key_id.to_string(), algorithm.to_string(), Some(created_by));
+        let master_key = MasterKey::new_with_description(key_id.to_string(), algorithm.to_string(), Some(created_by), None);
 
         // Save to disk
         self.save_master_key(&master_key, &key_material).await?;
@@ -593,7 +596,26 @@ impl KmsBackend for LocalKmsBackend {
     async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         let key_id = request.key_name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let _master_key = self.client.create_key(&key_id, "AES_256", None).await?;
+        // Create master key with description directly
+        let _master_key = {
+            // Generate key material
+            let key_material = LocalKmsClient::generate_key_material();
+
+            let master_key = MasterKey::new_with_description(
+                key_id.clone(),
+                "AES_256".to_string(),
+                Some("local-kms".to_string()),
+                request.description.clone(),
+            );
+
+            // Save to disk and cache
+            self.client.save_master_key(&master_key, &key_material).await?;
+
+            let mut cache = self.client.key_cache.write().await;
+            cache.insert(key_id.clone(), master_key.clone());
+
+            master_key
+        };
 
         let metadata = KeyMetadata {
             key_id: key_id.clone(),
@@ -604,6 +626,7 @@ impl KmsBackend for LocalKmsBackend {
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
+            tags: request.tags,
         };
 
         Ok(CreateKeyResponse {
@@ -654,8 +677,8 @@ impl KmsBackend for LocalKmsBackend {
 
         Ok(GenerateDataKeyResponse {
             key_id: request.key_id,
-            plaintext_key: data_key.plaintext.unwrap_or_default(),
-            ciphertext_blob: data_key.ciphertext,
+            plaintext_key: data_key.plaintext.clone().unwrap_or_default(),
+            ciphertext_blob: data_key.ciphertext.clone(),
         })
     }
 
@@ -676,6 +699,7 @@ impl KmsBackend for LocalKmsBackend {
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
+            tags: key_info.tags,
         };
 
         Ok(DescribeKeyResponse { key_metadata: metadata })
@@ -691,21 +715,44 @@ impl KmsBackend for LocalKmsBackend {
         // unless a pending window is specified
         let key_id = &request.key_id;
 
-        // First, check if the key exists and get its metadata
-        let describe_request = DescribeKeyRequest { key_id: key_id.clone() };
-        let mut key_metadata = match self.describe_key(describe_request).await {
-            Ok(response) => response.key_metadata,
-            Err(_) => {
-                return Err(crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)));
-            }
-        };
+        // First, load the key from disk to get the master key
+        let mut master_key = self
+            .client
+            .load_master_key(key_id)
+            .await
+            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)))?;
 
-        let deletion_date = if request.force_immediate.unwrap_or(false) {
-            // For immediate deletion, mark as pending deletion and set deletion date to now
-            // In a real implementation, you might want to actually delete the key file
-            key_metadata.key_state = KeyState::PendingDeletion;
-            key_metadata.deletion_date = Some(chrono::Utc::now());
-            None
+        let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
+            // For immediate deletion, actually delete the key from filesystem
+            let key_path = self.client.master_key_path(key_id);
+            tokio::fs::remove_file(&key_path)
+                .await
+                .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to delete key file: {}", e)))?;
+
+            // Remove from cache
+            let mut cache = self.client.key_cache.write().await;
+            cache.remove(key_id);
+
+            info!("Immediately deleted key: {}", key_id);
+
+            // Return success response for immediate deletion
+            let key_metadata = KeyMetadata {
+                key_id: master_key.key_id.clone(),
+                description: master_key.description.clone(),
+                key_usage: master_key.usage,
+                key_state: KeyState::PendingDeletion, // AWS KMS compatibility
+                creation_date: master_key.created_at,
+                deletion_date: Some(chrono::Utc::now()),
+                key_manager: "CUSTOMER".to_string(),
+                origin: "AWS_KMS".to_string(),
+                tags: master_key.metadata,
+            };
+
+            return Ok(DeleteKeyResponse {
+                key_id: key_id.clone(),
+                deletion_date: None, // No deletion date for immediate deletion
+                key_metadata,
+            });
         } else {
             // Schedule for deletion (default 30 days)
             let days = request.pending_window_in_days.unwrap_or(30);
@@ -716,15 +763,52 @@ impl KmsBackend for LocalKmsBackend {
             }
 
             let deletion_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
-            key_metadata.key_state = KeyState::PendingDeletion;
-            key_metadata.deletion_date = Some(deletion_date);
+            master_key.status = KeyStatus::PendingDeletion;
 
-            Some(deletion_date.to_rfc3339())
+            (Some(deletion_date.to_rfc3339()), Some(deletion_date))
+        };
+
+        // Save the updated key to disk - preserve existing key material!
+        // Load the stored key from disk to get the existing key material
+        let key_path = self.client.master_key_path(key_id);
+        let content = tokio::fs::read(&key_path)
+            .await
+            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to read key file: {}", e)))?;
+        let stored_key: crate::backends::local::StoredMasterKey = serde_json::from_slice(&content)
+            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to parse stored key: {}", e)))?;
+
+        // Decrypt the existing key material to preserve it
+        let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
+            let nonce = aes_gcm::Nonce::from_slice(&stored_key.nonce);
+            cipher
+                .decrypt(nonce, stored_key.encrypted_key_material.as_ref())
+                .map_err(|e| crate::error::KmsError::cryptographic_error("decrypt", e.to_string()))?
+        } else {
+            stored_key.encrypted_key_material
+        };
+
+        self.client.save_master_key(&master_key, &existing_key_material).await?;
+
+        // Update cache
+        let mut cache = self.client.key_cache.write().await;
+        cache.insert(key_id.to_string(), master_key.clone());
+
+        // Convert master_key to KeyMetadata for response
+        let key_metadata = KeyMetadata {
+            key_id: master_key.key_id.clone(),
+            description: master_key.description.clone(),
+            key_usage: master_key.usage,
+            key_state: KeyState::PendingDeletion,
+            creation_date: master_key.created_at,
+            deletion_date: deletion_date_dt,
+            key_manager: "CUSTOMER".to_string(),
+            origin: "AWS_KMS".to_string(),
+            tags: master_key.metadata,
         };
 
         Ok(DeleteKeyResponse {
             key_id: key_id.clone(),
-            deletion_date,
+            deletion_date: deletion_date_str,
             key_metadata,
         })
     }
@@ -732,16 +816,14 @@ impl KmsBackend for LocalKmsBackend {
     async fn cancel_key_deletion(&self, request: CancelKeyDeletionRequest) -> Result<CancelKeyDeletionResponse> {
         let key_id = &request.key_id;
 
-        // Check if the key exists and is pending deletion
-        let describe_request = DescribeKeyRequest { key_id: key_id.clone() };
-        let mut key_metadata = match self.describe_key(describe_request).await {
-            Ok(response) => response.key_metadata,
-            Err(_) => {
-                return Err(crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)));
-            }
-        };
+        // Load the key from disk to get the master key
+        let mut master_key = self
+            .client
+            .load_master_key(key_id)
+            .await
+            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)))?;
 
-        if key_metadata.key_state != KeyState::PendingDeletion {
+        if master_key.status != KeyStatus::PendingDeletion {
             return Err(crate::error::KmsError::invalid_key_state(format!(
                 "Key {} is not pending deletion",
                 key_id
@@ -749,8 +831,28 @@ impl KmsBackend for LocalKmsBackend {
         }
 
         // Cancel the deletion by resetting the state
-        key_metadata.key_state = KeyState::Enabled;
-        key_metadata.deletion_date = None;
+        master_key.status = KeyStatus::Active;
+
+        // Save the updated key to disk - this is the missing critical step!
+        let key_material = LocalKmsClient::generate_key_material();
+        self.client.save_master_key(&master_key, &key_material).await?;
+
+        // Update cache
+        let mut cache = self.client.key_cache.write().await;
+        cache.insert(key_id.to_string(), master_key.clone());
+
+        // Convert master_key to KeyMetadata for response
+        let key_metadata = KeyMetadata {
+            key_id: master_key.key_id.clone(),
+            description: master_key.description.clone(),
+            key_usage: master_key.usage,
+            key_state: KeyState::Enabled,
+            creation_date: master_key.created_at,
+            deletion_date: None,
+            key_manager: "CUSTOMER".to_string(),
+            origin: "AWS_KMS".to_string(),
+            tags: master_key.metadata,
+        };
 
         Ok(CancelKeyDeletionResponse {
             key_id: key_id.clone(),
@@ -845,7 +947,7 @@ mod tests {
             DecryptRequest::new(data_key.ciphertext.clone()).with_context("bucket".to_string(), "test-bucket".to_string());
 
         let decrypted = client.decrypt(&decrypt_request, None).await.expect("Failed to decrypt");
-        assert_eq!(decrypted, data_key.plaintext.expect("No plaintext"));
+        assert_eq!(decrypted, data_key.plaintext.clone().expect("No plaintext"));
     }
 
     #[tokio::test]

@@ -55,6 +55,7 @@ impl KmsCache {
     /// Put key metadata into cache
     pub async fn put_key_metadata(&mut self, key_id: &str, metadata: &KeyMetadata) {
         self.key_metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
+        self.key_metadata_cache.run_pending_tasks().await;
     }
 
     /// Get data key from cache
@@ -70,6 +71,7 @@ impl KmsCache {
             key_spec: KeySpec::Aes256, // Default to AES-256
         };
         self.data_key_cache.insert(key_id.to_string(), cached_key).await;
+        self.data_key_cache.run_pending_tasks().await;
     }
 
     /// Remove key metadata from cache
@@ -160,6 +162,7 @@ mod tests {
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
+            tags: std::collections::HashMap::new(),
         };
 
         // Put and get metadata
@@ -209,6 +212,7 @@ mod tests {
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
+            tags: std::collections::HashMap::new(),
         };
 
         cache.put_key_metadata("ttl-test-key", &metadata).await;
@@ -239,6 +243,7 @@ mod tests {
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
+            tags: std::collections::HashMap::new(),
         };
 
         cache.put_key_metadata("contains-test", &metadata).await;

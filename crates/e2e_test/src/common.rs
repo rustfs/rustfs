@@ -45,17 +45,59 @@ pub fn workspace_root() -> PathBuf {
 }
 
 /// Resolve the RustFS binary relative to the workspace.
+/// Always builds the binary to ensure it's up to date.
 pub fn rustfs_binary_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
+
+    // Always build the binary to ensure it's up to date
+    info!("Building RustFS binary to ensure it's up to date...");
+    build_rustfs_binary();
 
     let mut binary_path = workspace_root();
     binary_path.push("target");
     let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
     binary_path.push(profile_dir);
     binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+
+    info!("Using RustFS binary at {:?}", binary_path);
     binary_path
+}
+
+/// Build the RustFS binary using cargo
+fn build_rustfs_binary() {
+    let workspace = workspace_root();
+    info!("Building RustFS binary from workspace: {:?}", workspace);
+
+    let _profile = if cfg!(debug_assertions) {
+        info!("Building in debug mode");
+        "dev"
+    } else {
+        info!("Building in release mode");
+        "release"
+    };
+
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
+
+    if !cfg!(debug_assertions) {
+        cmd.arg("--release");
+    }
+
+    info!(
+        "Executing: cargo build --bin rustfs {}",
+        if cfg!(debug_assertions) { "" } else { "--release" }
+    );
+
+    let output = cmd.output().expect("Failed to execute cargo build command");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("Failed to build RustFS binary. Error: {}", stderr);
+    }
+
+    info!("✅ RustFS binary built successfully");
 }
 
 fn awscurl_binary_path() -> PathBuf {
@@ -261,6 +303,7 @@ pub async fn execute_awscurl(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut args = vec![
+        "--fail-with-body",
         "--service",
         "s3",
         "--region",

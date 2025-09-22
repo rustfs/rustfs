@@ -103,6 +103,34 @@ pub struct KmsConfigResponse {
     pub default_key_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EncryptApiRequest {
+    pub key_id: String,
+    pub plaintext: String, // Base64 encoded
+    pub encryption_context: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EncryptApiResponse {
+    pub ciphertext: String, // Base64 encoded
+    pub key_id: String,
+    pub key_version: u32,
+    pub algorithm: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DecryptApiRequest {
+    pub ciphertext: String, // Base64 encoded
+    pub encryption_context: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DecryptApiResponse {
+    pub plaintext: String, // Base64 encoded
+    pub key_id: String,
+    pub encryption_algorithm: Option<String>,
+}
+
 fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
     if let Some(query) = uri.query() {
@@ -160,11 +188,15 @@ impl Operation for CreateKeyHandler {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
+        // Extract key name from tags if provided
+        let tags = request.tags.unwrap_or_default();
+        let key_name = tags.get("name").cloned();
+
         let kms_request = rustfs_kms::types::CreateKeyRequest {
-            key_name: None,
+            key_name,
             key_usage: request.key_usage.unwrap_or(KeyUsage::EncryptDecrypt),
             description: request.description,
-            tags: request.tags.unwrap_or_default(),
+            tags,
             origin: Some("AWS_KMS".to_string()),
             policy: None,
         };
