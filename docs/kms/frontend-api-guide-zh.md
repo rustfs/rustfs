@@ -1331,7 +1331,7 @@ console.log('详细状态:', detailedStatus);
 
 **BackendType（后端类型）**:
 - `"local"` - 本地文件系统后端
-- `"vault"` - HashiCorp Vault后端
+- `"vault"` - Vault后端
 
 **KeyUsage（密钥用途）**:
 - `"ENCRYPT_DECRYPT"` - 加密解密

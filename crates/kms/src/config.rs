@@ -23,7 +23,7 @@ use url::Url;
 /// KMS backend types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KmsBackend {
-    /// HashiCorp Vault backend (recommended for production)
+    /// Vault backend (recommended for production)
     Vault,
     /// Local file-based backend for development and testing only
     Local,

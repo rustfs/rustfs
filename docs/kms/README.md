@@ -4,7 +4,7 @@ The RustFS Key Management Service (KMS) provides end-to-end key orchestration, e
 
 ## Highlights
 
-- **Multiple backends** – plug in HashiCorp Vault for production or use the Local filesystem backend for development and CI.
+- **Multiple backends** – plug in Vault for production or use the Local filesystem backend for development and CI.
 - **Envelope encryption** – master keys protect data-encryption keys (DEKs); DEKs protect object payloads with AES-256-GCM streaming.
 - **S3 compatibility** – works transparently with `SSE-S3`, `SSE-KMS`, and `SSE-C` headers so existing tools continue to function.
 - **Dynamic lifecycle** – configure, rotate, or swap backends at runtime by calling the admin REST API; no server restart is required.
@@ -50,7 +50,7 @@ The RustFS Key Management Service (KMS) provides end-to-end key orchestration, e
 | Backend | When to use | Key storage | Authentication | Notes |
 |---------|-------------|-------------|----------------|-------|
 | Local   | Development, CI, integration tests | JSON-encoded key blobs on disk | none | Simple, fast to bootstrap, not secure for production. |
-| Vault   | Production or pre-production | HashiCorp Vault Transit & KV engines | token or AppRole | Supports rotation, audit logging, sealed-state recovery, TLS. |
+| Vault   | Production or pre-production | Vault Transit & KV engines | token or AppRole | Supports rotation, audit logging, sealed-state recovery, TLS. |
 
 Refer to [configuration.md](configuration.md) for static configuration details and [dynamic-configuration-guide.md](dynamic-configuration-guide.md) for the runtime workflow.
 

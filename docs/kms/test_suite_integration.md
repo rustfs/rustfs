@@ -12,7 +12,7 @@ RustFS ships with an extensive set of automated tests that exercise the KMS stac
 
 | Requirement | Purpose |
 |-------------|---------|
-| `vault` binary (>=1.15) | Required for Vault end-to-end tests. Install from HashiCorp releases. |
+| `vault` binary (>=1.15) | Required for Vault end-to-end tests. Install from Vault releases. |
 | `awscurl` (optional) | Debugging helper to hit admin endpoints. |
 | `openssl`, `md5` | Used by SSE-C helpers during tests. |
 | Local ports | Tests bind ephemeral ports (ensure `127.0.0.1:<random>` is free). |

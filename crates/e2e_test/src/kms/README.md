@@ -122,7 +122,7 @@ export RUST_LOG=debug
 
 测试会自动查找以下二进制文件：
 - `../../target/debug/rustfs` - RustFS服务器
-- `vault` - HashiCorp Vault (需要在PATH中)
+- `vault` - Vault (需要在PATH中)
 - `/Users/dandan/Library/Python/3.9/bin/awscurl` - AWS签名工具
 
 ## 📋 测试流程说明
