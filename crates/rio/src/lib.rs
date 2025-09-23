@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Default encryption block size - aligned with system default read buffer size (1MB)
+pub const DEFAULT_ENCRYPTION_BLOCK_SIZE: usize = 1024 * 1024;
+
 mod limit_reader;
 
 pub use limit_reader::LimitReader;
@@ -81,3 +84,27 @@ impl Reader for crate::HardLimitReader {}
 impl Reader for crate::EtagReader {}
 impl<R> Reader for crate::CompressReader<R> where R: Reader {}
 impl<R> Reader for crate::EncryptReader<R> where R: Reader {}
+impl<R> Reader for crate::DecryptReader<R> where R: Reader {}
+impl EtagResolvable for Box<dyn Reader> {
+    fn try_resolve_etag(&mut self) -> Option<String> {
+        self.as_mut().try_resolve_etag()
+    }
+}
+
+impl HashReaderDetector for Box<dyn Reader> {
+    fn is_hash_reader(&self) -> bool {
+        self.as_ref().is_hash_reader()
+    }
+
+    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
+        self.as_mut().as_hash_reader_mut()
+    }
+}
+
+impl TryGetIndex for Box<dyn Reader> {
+    fn try_get_index(&self) -> Option<&compress_index::Index> {
+        self.as_ref().try_get_index()
+    }
+}
+
+impl Reader for Box<dyn Reader> {}

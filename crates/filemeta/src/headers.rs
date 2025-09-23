@@ -35,3 +35,18 @@ pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 pub const AMZ_DECODED_CONTENT_LENGTH: &str = "X-Amz-Decoded-Content-Length";
 
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
+
+// Server-side encryption headers
+pub const AMZ_SERVER_SIDE_ENCRYPTION: &str = "x-amz-server-side-encryption";
+pub const AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+pub const AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT: &str = "x-amz-server-side-encryption-context";
+pub const AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM: &str = "x-amz-server-side-encryption-customer-algorithm";
+pub const AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY: &str = "x-amz-server-side-encryption-customer-key";
+pub const AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5: &str = "x-amz-server-side-encryption-customer-key-md5";
+
+// SSE-C copy source headers
+pub const AMZ_COPY_SOURCE_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM: &str =
+    "x-amz-copy-source-server-side-encryption-customer-algorithm";
+pub const AMZ_COPY_SOURCE_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY: &str = "x-amz-copy-source-server-side-encryption-customer-key";
+pub const AMZ_COPY_SOURCE_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5: &str =
+    "x-amz-copy-source-server-side-encryption-customer-key-md5";

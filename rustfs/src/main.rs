@@ -28,16 +28,16 @@ mod version;
 // Ensure the correct path for parse_license is imported
 use crate::admin::console::init_console_cfg;
 use crate::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_console_server, start_http_server, stop_audit_system, wait_for_shutdown,
+    init_event_notifier, shutdown_event_notifier, start_audit_system, start_console_server, start_http_server, stop_audit_system,
+    wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
-    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, scanner::data_scanner::ScannerConfig,
+    shutdown_ahm_services, Scanner,
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
@@ -48,20 +48,21 @@ use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
-    StorageAPI,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
-    store::ECStore,
     store::init_local_disks,
+    store::ECStore,
     update_erasure_type,
+    StorageAPI,
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
+// KMS is now managed dynamically via API
 use s3s::s3_error;
 use std::io::{Error, Result};
 use std::str::FromStr;
@@ -265,6 +266,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // config system configuration
     GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
+    // Initialize KMS system if enabled
+    init_kms_system(&opt).await?;
+
     // Initialize event notifier
     init_event_notifier().await;
     // Start the audit system
@@ -449,7 +453,7 @@ fn init_update_check() {
 
     // Async update check with timeout
     tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
+        use crate::update::{check_updates, UpdateCheckError};
 
         // Add timeout to prevent hanging network calls
         match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
@@ -528,4 +532,97 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
             }
         }
     }
+}
+
+/// Initialize KMS system and configure if enabled
+#[instrument(skip(opt))]
+async fn init_kms_system(opt: &config::Opt) -> Result<()> {
+    println!("CLAUDE DEBUG: init_kms_system called!");
+    info!("CLAUDE DEBUG: init_kms_system called!");
+    info!("Initializing KMS service manager...");
+    info!(
+        "CLAUDE DEBUG: KMS configuration - kms_enable: {}, kms_backend: {}, kms_key_dir: {:?}, kms_default_key_id: {:?}",
+        opt.kms_enable, opt.kms_backend, opt.kms_key_dir, opt.kms_default_key_id
+    );
+
+    // Initialize global KMS service manager (starts in NotConfigured state)
+    let service_manager = rustfs_kms::init_global_kms_service_manager();
+
+    // If KMS is enabled in configuration, configure and start the service
+    if opt.kms_enable {
+        info!("KMS is enabled, configuring and starting service...");
+
+        // Create KMS configuration from command line options
+        let kms_config = match opt.kms_backend.as_str() {
+            "local" => {
+                let key_dir = opt
+                    .kms_key_dir
+                    .as_ref()
+                    .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
+
+                rustfs_kms::config::KmsConfig {
+                    backend: rustfs_kms::config::KmsBackend::Local,
+                    backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
+                        key_dir: std::path::PathBuf::from(key_dir),
+                        master_key: None,
+                        file_permissions: Some(0o600),
+                    }),
+                    default_key_id: opt.kms_default_key_id.clone(),
+                    timeout: std::time::Duration::from_secs(30),
+                    retry_attempts: 3,
+                    enable_cache: true,
+                    cache_config: rustfs_kms::config::CacheConfig::default(),
+                }
+            }
+            "vault" => {
+                let vault_address = opt
+                    .kms_vault_address
+                    .as_ref()
+                    .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
+                let vault_token = opt
+                    .kms_vault_token
+                    .as_ref()
+                    .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+
+                rustfs_kms::config::KmsConfig {
+                    backend: rustfs_kms::config::KmsBackend::Vault,
+                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
+                        address: vault_address.clone(),
+                        auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                            token: vault_token.clone(),
+                        },
+                        namespace: None,
+                        mount_path: "transit".to_string(),
+                        kv_mount: "secret".to_string(),
+                        key_path_prefix: "rustfs/kms/keys".to_string(),
+                        tls: None,
+                    }),
+                    default_key_id: opt.kms_default_key_id.clone(),
+                    timeout: std::time::Duration::from_secs(30),
+                    retry_attempts: 3,
+                    enable_cache: true,
+                    cache_config: rustfs_kms::config::CacheConfig::default(),
+                }
+            }
+            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", opt.kms_backend))),
+        };
+
+        // Configure the KMS service
+        service_manager
+            .configure(kms_config)
+            .await
+            .map_err(|e| Error::other(format!("Failed to configure KMS: {}", e)))?;
+
+        // Start the KMS service
+        service_manager
+            .start()
+            .await
+            .map_err(|e| Error::other(format!("Failed to start KMS: {}", e)))?;
+
+        info!("KMS service configured and started successfully");
+    } else {
+        info!("KMS service manager initialized. KMS is ready for dynamic configuration via API.");
+    }
+
+    Ok(())
 }

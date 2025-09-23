@@ -162,7 +162,14 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  echo "🧪 Building Docker image for prerelease: $version"
+                  # TODO: 临时修改 - 当前允许 alpha 版本也创建 latest 标签
+                  # 等版本稳定后，需要移除下面这行，恢复原有逻辑（只有稳定版本才创建 latest）
+                  if [[ "$version" == *"alpha"* ]]; then
+                    create_latest=true
+                    echo "🧪 Building Docker image for prerelease: $version (临时允许创建 latest 标签)"
+                  else
+                    echo "🧪 Building Docker image for prerelease: $version"
+                  fi
                 else
                   build_type="release"
                   create_latest=true
@@ -208,7 +215,14 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                echo "🧪 Building with prerelease version: $input_version"
+                # TODO: 临时修改 - 当前允许 alpha 版本也创建 latest 标签
+                # 等版本稳定后，需要移除下面的 if 块，恢复原有逻辑
+                if [[ "$input_version" == *"alpha"* ]]; then
+                  create_latest=true
+                  echo "🧪 Building with prerelease version: $input_version (临时允许创建 latest 标签)"
+                else
+                  echo "🧪 Building with prerelease version: $input_version"
+                fi
                 ;;
               # Release versions (match after prereleases, more general)
               v[0-9]*|[0-9]*.*.*)
@@ -316,7 +330,9 @@ jobs:
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
-            # Stable release
+            # TODO: 临时修改 - 当前 alpha 版本也会创建 latest 标签
+            # 等版本稳定后，这里的逻辑保持不变，但上游的 CREATE_LATEST 设置需要恢复
+            # Stable release (以及临时的 alpha 版本)
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
@@ -413,7 +429,13 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              echo "🚫 Latest tag NOT created for prerelease"
+              # TODO: 临时修改 - alpha 版本当前会创建 latest 标签
+              # 等版本稳定后，需要恢复下面的提示信息
+              if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tag has been created for alpha version (临时措施)"
+              else
+                echo "🚫 Latest tag NOT created for prerelease"
+              fi
               ;;
             *)
               echo "❌ Unexpected build type: $BUILD_TYPE"
