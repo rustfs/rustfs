@@ -20,13 +20,13 @@
 
 use bytes::Bytes;
 use futures::{Future, StreamExt};
-use http::{
-    request::{Builder, Request}, HeaderValue, Response,
-    StatusCode,
-};
 use http::{HeaderMap, HeaderName};
+use http::{
+    HeaderValue, Response, StatusCode,
+    request::{Builder, Request},
+};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
-use hyper_util::{client::legacy::connect::HttpConnector, client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use md5::Digest;
 use md5::Md5;
 use rand::Rng;
@@ -45,7 +45,7 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
 use tracing::{debug, error};
-use url::{form_urlencoded, Url};
+use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::client::bucket_cache::BucketLocationCache;
@@ -66,12 +66,12 @@ use rustfs_rio::HashReader;
 use rustfs_utils::{
     net::get_endpoint_url,
     retry::{
-        is_http_status_retryable, is_s3code_retryable, RetryTimer, DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY,
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
     },
 };
-use s3s::dto::ReplicationStatus;
 use s3s::S3ErrorCode;
-use s3s::{dto::Owner, Body};
+use s3s::dto::ReplicationStatus;
+use s3s::{Body, dto::Owner};
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 

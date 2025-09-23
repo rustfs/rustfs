@@ -17,7 +17,9 @@ use crate::AuditRegistry;
 use crate::observability;
 use crate::{AuditError, AuditResult};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::Target;
+use rustfs_targets::store::{Key, Store};
+use rustfs_targets::target::EntityTarget;
+use rustfs_targets::{StoreError, Target, TargetError};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -93,10 +95,26 @@ impl AuditSystem {
 
                 // Initialize all targets
                 for target in targets {
+                    let target_id = target.id().to_string();
                     if let Err(e) = target.init().await {
-                        error!(target_id = %target.id(), error = %e, "Failed to initialize audit target");
+                        error!(target_id = %target_id, error = %e, "Failed to initialize audit target");
                     } else {
-                        registry.add_target(target.id().to_string(), target);
+                        // After successful initialization, if enabled and there is a store, start the send from storage task
+                        if target.is_enabled() {
+                            if let Some(store) = target.store() {
+                                info!(target_id = %target_id, "Start audit stream processing for target");
+                                let store_clone: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send> =
+                                    store.boxed_clone();
+                                let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
+                                self.start_audit_stream_with_batching(store_clone, target_arc);
+                                info!(target_id = %target_id, "Audit stream processing started");
+                            } else {
+                                info!(target_id = %target_id, "No store configured, skip audit stream processing");
+                            }
+                        } else {
+                            info!(target_id = %target_id, "Target disabled, skip audit stream processing");
+                        }
+                        registry.add_target(target_id, target);
                     }
                 }
 
@@ -209,6 +227,7 @@ impl AuditSystem {
         match *state {
             AuditSystemState::Running => {
                 // Continue with dispatch
+                info!("Dispatching audit log entry");
             }
             AuditSystemState::Paused => {
                 // Skip dispatch when paused
@@ -292,8 +311,7 @@ impl AuditSystem {
     }
 
     pub async fn dispatch_batch(&self, entries: Vec<Arc<AuditEntry>>) -> AuditResult<()> {
-        use std::time::Instant;
-        let start_time = Instant::now();
+        let start_time = std::time::Instant::now();
 
         let state = self.state.read().await;
         if *state != AuditSystemState::Running {
@@ -357,6 +375,81 @@ impl AuditSystem {
         );
 
         Ok(())
+    }
+
+    // New: Audit flow background tasks, based on send_from_store, including retries and exponential backoffs
+    fn start_audit_stream_with_batching(
+        &self,
+        store: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send>,
+        target: Arc<dyn Target<AuditEntry> + Send + Sync>,
+    ) {
+        let state = self.state.clone();
+
+        tokio::spawn(async move {
+            use std::time::Duration;
+            use tokio::time::sleep;
+
+            info!("Starting audit stream for target: {}", target.id());
+
+            const MAX_RETRIES: usize = 5;
+            const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+            loop {
+                match *state.read().await {
+                    AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {}
+                    _ => {
+                        info!("Audit stream stopped for target: {}", target.id());
+                        break;
+                    }
+                }
+
+                let keys: Vec<Key> = store.list();
+                if keys.is_empty() {
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+
+                for key in keys {
+                    let mut retries = 0usize;
+                    let mut success = false;
+
+                    while retries < MAX_RETRIES && !success {
+                        match target.send_from_store(key.clone()).await {
+                            Ok(_) => {
+                                info!("Successfully sent audit entry, target: {}, key: {}", target.id(), key.to_string());
+                                observability::record_target_success();
+                                success = true;
+                            }
+                            Err(e) => {
+                                match &e {
+                                    TargetError::NotConnected => {
+                                        warn!("Target {} not connected, retrying...", target.id());
+                                    }
+                                    TargetError::Timeout(_) => {
+                                        warn!("Timeout sending to target {}, retrying...", target.id());
+                                    }
+                                    _ => {
+                                        error!("Permanent error for target {}: {}", target.id(), e);
+                                        observability::record_target_failure();
+                                        break;
+                                    }
+                                }
+                                retries += 1;
+                                let backoff = BASE_RETRY_DELAY * (1 << retries);
+                                sleep(backoff).await;
+                            }
+                        }
+                    }
+
+                    if retries >= MAX_RETRIES && !success {
+                        warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
+                        observability::record_target_failure();
+                    }
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+        });
     }
 
     /// Enables a specific target
@@ -458,9 +551,25 @@ impl AuditSystem {
 
                 // Initialize all new targets
                 for target in targets {
+                    let target_id = target.id().to_string();
                     if let Err(e) = target.init().await {
-                        error!(target_id = %target.id(), error = %e, "Failed to initialize reloaded audit target");
+                        error!(target_id = %target_id, error = %e, "Failed to initialize reloaded audit target");
                     } else {
+                        // Same starts the storage stream after a heavy load
+                        if target.is_enabled() {
+                            if let Some(store) = target.store() {
+                                info!(target_id = %target_id, "Start audit stream processing for target (reload)");
+                                let store_clone: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send> =
+                                    store.boxed_clone();
+                                let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
+                                self.start_audit_stream_with_batching(store_clone, target_arc);
+                                info!(target_id = %target_id, "Audit stream processing started (reload)");
+                            } else {
+                                info!(target_id = %target_id, "No store configured, skip audit stream processing (reload)");
+                            }
+                        } else {
+                            info!(target_id = %target_id, "Target disabled, skip audit stream processing (reload)");
+                        }
                         registry.add_target(target.id().to_string(), target);
                     }
                 }
