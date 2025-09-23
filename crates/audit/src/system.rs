@@ -291,6 +291,74 @@ impl AuditSystem {
         Ok(())
     }
 
+    pub async fn dispatch_batch(&self, entries: Vec<Arc<AuditEntry>>) -> AuditResult<()> {
+        use std::time::Instant;
+        let start_time = Instant::now();
+
+        let state = self.state.read().await;
+        if *state != AuditSystemState::Running {
+            return Err(AuditError::NotInitialized("Audit system is not running".to_string()));
+        }
+        drop(state);
+
+        let registry = self.registry.lock().await;
+        let target_ids = registry.list_targets();
+
+        if target_ids.is_empty() {
+            warn!("No audit targets configured for batch dispatch");
+            return Ok(());
+        }
+
+        let mut tasks = Vec::new();
+        for target_id in target_ids {
+            if let Some(target) = registry.get_target(&target_id) {
+                let entries_clone: Vec<_> = entries.iter().map(|e| Arc::clone(e)).collect();
+                let target_id_clone = target_id.clone();
+
+                let task = async move {
+                    let mut success_count = 0;
+                    let mut errors = Vec::new();
+                    for entry in entries_clone {
+                        let entity_target = rustfs_targets::target::EntityTarget {
+                            object_name: entry.api.name.clone().unwrap_or_default(),
+                            bucket_name: entry.api.bucket.clone().unwrap_or_default(),
+                            event_name: rustfs_targets::EventName::ObjectCreatedPut,
+                            data: (*entry).clone(),
+                        };
+                        match target.save(Arc::new(entity_target)).await {
+                            Ok(_) => success_count += 1,
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                    (target_id_clone, success_count, errors)
+                };
+                tasks.push(task);
+            }
+        }
+
+        let results = futures::future::join_all(tasks).await;
+        let mut total_success = 0;
+        let mut total_errors = 0;
+        for (_target_id, success_count, errors) in results {
+            total_success += success_count;
+            total_errors += errors.len();
+            for e in errors {
+                error!("Batch dispatch error: {:?}", e);
+            }
+        }
+
+        let dispatch_time = start_time.elapsed();
+        info!(
+            "Batch dispatched {} entries, success: {}, errors: {}, time: {:?}",
+            entries.len(),
+            total_success,
+            total_errors,
+            dispatch_time
+        );
+
+        Ok(())
+    }
+
     /// Enables a specific target
     pub async fn enable_target(&self, target_id: &str) -> AuditResult<()> {
         // This would require storing enabled/disabled state per target

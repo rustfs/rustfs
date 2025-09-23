@@ -57,7 +57,7 @@ atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
 axum-extra = { workspace = true }
-axum-server = { workspace = true, features = ["tls-rustls"] }
+axum-server = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -75,7 +75,7 @@ opentelemetry = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 reqwest = { workspace = true }
-rustls.workspace = true
+rustls = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 serde.workspace = true
@@ -94,7 +94,7 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tokio-stream.workspace = true
-tokio-rustls = { workspace = true, features = ["default"] }
+tokio-rustls = { workspace = true }
 tokio-tar = { workspace = true }
 tonic = { workspace = true }
 tower.workspace = true

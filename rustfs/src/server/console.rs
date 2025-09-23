@@ -74,7 +74,7 @@ async fn setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<Ru
     debug!("Found TLS directory for console, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
