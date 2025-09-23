@@ -28,16 +28,16 @@ mod version;
 // Ensure the correct path for parse_license is imported
 use crate::admin::console::init_console_cfg;
 use crate::server::{
-    init_event_notifier, shutdown_event_notifier, start_audit_system, start_console_server, start_http_server, stop_audit_system,
-    wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    start_audit_system, start_console_server, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::{
-    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, scanner::data_scanner::ScannerConfig,
-    shutdown_ahm_services, Scanner,
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
+    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
@@ -48,14 +48,14 @@ use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
+    StorageAPI,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
-    store::init_local_disks,
     store::ECStore,
+    store::init_local_disks,
     update_erasure_type,
-    StorageAPI,
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_notify::global::notifier_instance;
@@ -453,7 +453,7 @@ fn init_update_check() {
 
     // Async update check with timeout
     tokio::spawn(async {
-        use crate::update::{check_updates, UpdateCheckError};
+        use crate::update::{UpdateCheckError, check_updates};
 
         // Add timeout to prevent hanging network calls
         match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
