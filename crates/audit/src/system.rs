@@ -330,7 +330,7 @@ impl AuditSystem {
         let mut tasks = Vec::new();
         for target_id in target_ids {
             if let Some(target) = registry.get_target(&target_id) {
-                let entries_clone: Vec<_> = entries.iter().map(|e| Arc::clone(e)).collect();
+                let entries_clone: Vec<_> = entries.iter().map(Arc::clone).collect();
                 let target_id_clone = target_id.clone();
 
                 let task = async move {
