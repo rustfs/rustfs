@@ -101,8 +101,8 @@ impl BucketNotificationConfig {
                 for target_id in target_id_set {
                     // Construct the ARN string for this target_id and self.region
                     let arn_to_check = target_id.to_arn(&self.region); // Assuming TargetID has to_arn
-                    if !arn_list.contains(&arn_to_check.to_arn_string()) {
-                        return Err(BucketNotificationConfigError::ArnNotFound(arn_to_check.to_arn_string()));
+                    if !arn_list.contains(&arn_to_check.to_string()) {
+                        return Err(BucketNotificationConfigError::ArnNotFound(arn_to_check.to_string()));
                     }
                 }
             }

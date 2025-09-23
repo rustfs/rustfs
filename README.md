@@ -74,9 +74,9 @@ To get started with RustFS, follow these steps:
 
 1. **One-click installation script (Option 1)​​**
 
-   ```bash
-   curl -O  https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
-   ```
+  ```bash
+  curl -O  https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
+  ```
 
 2. **Docker Quick Start (Option 2)​​**
 
@@ -90,6 +90,14 @@ To get started with RustFS, follow these steps:
    # Specific version
    docker run -d -p 9000:9000 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.45
    ```
+
+  For docker installation, you can also run the container with docker compose. With the `docker-compose.yml` file under root directory, running the command:
+
+  ```
+  docker compose --profile observability up -d
+  ```
+  
+  **NOTE**: You should be better to have a look for `docker-compose.yaml` file. Because, several services contains in the file. Grafan,prometheus,jaeger containers will be launched using docker compose file, which is helpful for rustfs observability. If you want to start redis as well as nginx container, you can specify the corresponding profiles.
 
 3. **Build from Source (Option 3) - Advanced Users**
 
@@ -127,6 +135,8 @@ To get started with RustFS, follow these steps:
 4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
 5. **Create a Bucket**: Use the console to create a new bucket for your objects.
 6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
+
+**NOTE**: If you want to access RustFS instance with `https`, you can refer to [TLS configuration docs](https://docs.rustfs.com/integration/tls-configured.html).
 
 ## Documentation
 

@@ -42,3 +42,13 @@ serial_test = { workspace = true }
 aws-sdk-s3.workspace = true
 aws-config = { workspace = true }
 async-trait = { workspace = true }
+rustfs-kms.workspace = true
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+md5 = "0.7.0"
+tempfile = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }

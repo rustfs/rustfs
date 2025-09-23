@@ -616,6 +616,7 @@ impl ServerHandler for RustfsMcpServer {
             server_info: Implementation {
                 name: "rustfs-mcp-server".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
             },
         }
     }

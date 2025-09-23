@@ -16,7 +16,6 @@
 members = [
     "rustfs", # Core file system implementation
     "crates/appauth", # Application authentication and authorization
-    "crates/audit-logger", # Audit logging system for file operations
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
     "crates/crypto", # Cryptography and security features
@@ -40,6 +39,7 @@ members = [
     "crates/zip", # ZIP file handling and compression
     "crates/ahm", # Asynchronous Hash Map for concurrent data structures
     "crates/mcp", # MCP server for S3 operations
+    "crates/kms", # Key Management Service
 ]
 resolver = "2"
 
@@ -64,7 +64,6 @@ all = "warn"
 rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
-rustfs-audit-logger = { path = "crates/audit-logger", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
@@ -87,6 +86,7 @@ rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
+rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 anyhow = "1.0.99"
 arc-swap = "1.7.1"
@@ -98,40 +98,43 @@ async-trait = "0.1.89"
 async-compression = { version = "0.4.19" }
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.6" }
-aws-sdk-s3 = "1.101.0"
+aws-sdk-s3 = "1.106.0"
 axum = "0.8.4"
+axum-extra = "0.10.1"
+axum-server = "0.7.2"
 base64-simd = "0.8.0"
 base64 = "0.22.1"
 brotli = "8.0.2"
 bytes = { version = "1.10.1", features = ["serde"] }
-bytesize = "2.0.1"
+bytesize = "2.1.0"
 byteorder = "1.5.0"
 cfg-if = "1.0.3"
-crc-fast = "1.5.0"
+crc-fast = "1.3.0"
 chacha20poly1305 = { version = "0.10.1" }
-chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.46", features = ["derive", "env"] }
-const-str = { version = "0.6.4", features = ["std", "proc"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.47", features = ["derive", "env"] }
+const-str = { version = "0.7.0", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.7", features = ["html_reports"] }
+crossbeam-queue = "0.3.12"
 dashmap = "6.1.0"
-datafusion = "46.0.1"
+datafusion = "50.0.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
 flatbuffers = "25.2.10"
 flate2 = "1.1.2"
-flexi_logger = { version = "0.31.2", features = ["trc", "dont_minimize_extra_stacks"] }
+flexi_logger = { version = "0.31.2", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
 form_urlencoded = "1.2.2"
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 glob = "0.3.3"
-hex = "0.4.3"
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
+hickory-resolver = { version = "0.25.2", features = ["tls-ring"] }
 hmac = "0.12.1"
 hyper = "1.7.0"
-hyper-util = { version = "0.1.16", features = [
+hyper-util = { version = "0.1.17", features = [
     "tokio",
     "server-auto",
     "server-graceful",
@@ -139,7 +142,7 @@ hyper-util = { version = "0.1.16", features = [
 hyper-rustls = "0.27.7"
 http = "1.3.1"
 http-body = "1.0.1"
-humantime = "2.2.0"
+humantime = "2.3.0"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 jsonwebtoken = "9.3.1"
 lazy_static = "1.5.0"
@@ -148,13 +151,15 @@ local-ip-address = "0.6.5"
 lz4 = "1.28.1"
 matchit = "0.8.4"
 md-5 = "0.10.6"
+md5 = "0.7.0"
 mime_guess = "2.0.5"
+moka = { version = "0.12.10", features = ["future"] }
 netif = "0.1.6"
 nix = { version = "0.30.1", features = ["fs"] }
 nu-ansi-term = "0.50.1"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
-object_store = "0.11.2"
+object_store = "0.12.3"
 once_cell = "1.21.3"
 opentelemetry = { version = "0.30.0" }
 opentelemetry-appender-tracing = { version = "0.30.1", features = [
@@ -193,11 +198,11 @@ reqwest = { version = "0.12.23", default-features = false, features = [
     "json",
     "blocking",
 ] }
-rmcp = { version = "0.6.1" }
+rmcp = { version = "0.6.4" }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rsa = "0.9.8"
-rumqttc = { version = "0.24" }
+rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.7.2" }
 rustfs-rsc = "2025.506.1"
 rustls = { version = "0.23.31" }
@@ -205,8 +210,8 @@ rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-minio-preview.3" }
 schemars = "1.0.4"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = { version = "1.0.143", features = ["raw_value"] }
+serde = { version = "1.0.225", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
 sha1 = "0.10.6"
@@ -214,17 +219,18 @@ sha2 = "0.10.9"
 shadow-rs = { version = "1.3.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
-snafu = "0.8.8"
+smartstring = "1.0.1"
+snafu = "0.8.9"
 snap = "1.1.1"
 socket2 = "0.6.0"
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.37.0"
-sysctl = "0.6.0"
-tempfile = "3.21.0"
+sysctl = "0.7.1"
+tempfile = "3.22.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thiserror = "2.0.16"
-time = { version = "0.3.42", features = [
+time = { version = "0.3.43", features = [
     "std",
     "parsing",
     "formatting",
@@ -232,14 +238,14 @@ time = { version = "0.3.42", features = [
     "serde",
 ] }
 tokio = { version = "1.47.1", features = ["fs", "rt-multi-thread"] }
-tokio-rustls = { version = "0.26.2", default-features = false }
+tokio-rustls = { version = "0.26.3", default-features = false }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
 tokio-test = "0.4.4"
 tokio-util = { version = "0.7.16", features = ["io", "compat"] }
-tonic = { version = "0.14.1", features = ["gzip"] }
-tonic-prost = { version = "0.14.1" }
-tonic-prost-build = { version = "0.14.1" }
+tonic = { version = "0.14.2", features = ["gzip"] }
+tonic-prost = { version = "0.14.2" }
+tonic-prost-build = { version = "0.14.2" }
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
@@ -250,20 +256,20 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.7"
 urlencoding = "2.1.3"
-uuid = { version = "1.18.0", features = [
+uuid = { version = "1.18.1", features = [
     "v4",
     "fast-rng",
     "macro-diagnostics",
 ] }
-wildmatch = { version = "2.4.0", features = ["serde"] }
+wildmatch = { version = "2.5.0", features = ["serde"] }
+zeroize = { version = "1.8.1", features = ["derive"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "2.4.2"
+zip = "5.1.1"
 zstd = "0.13.3"
 
-
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "rustfs-audit-logger", "tokio-test"]
+ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "tokio-test"]
 
 [profile.wasm-dev]
 inherits = "dev"

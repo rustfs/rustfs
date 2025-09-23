@@ -69,7 +69,7 @@ impl EventNotifier {
         target_list_guard
             .keys()
             .iter()
-            .map(|target_id| target_id.to_arn(region).to_arn_string())
+            .map(|target_id| target_id.to_arn(region).to_string())
             .collect()
     }
 

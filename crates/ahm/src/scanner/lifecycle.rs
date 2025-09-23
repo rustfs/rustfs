@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use time::OffsetDateTime;
 
 use crate::error::Result;
 use rustfs_common::data_usage::SizeSummary;
@@ -33,6 +32,7 @@ use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_filemeta::FileInfo;
 use s3s::dto::BucketLifecycleConfiguration as LifecycleConfig;
+use time::OffsetDateTime;
 use tracing::info;
 
 static SCANNER_EXCESS_OBJECT_VERSIONS: AtomicU64 = AtomicU64::new(100);
@@ -187,8 +187,11 @@ impl ScannerItem {
     async fn apply_lifecycle(&mut self, oi: &ObjectInfo) -> (IlmAction, i64) {
         let size = oi.size;
         if self.lifecycle.is_none() {
+            info!("apply_lifecycle: No lifecycle config for object: {}", oi.name);
             return (IlmAction::NoneAction, size);
         }
+
+        info!("apply_lifecycle: Lifecycle config exists for object: {}", oi.name);
 
         let (olcfg, rcfg) = if self.bucket != ".minio.sys" {
             (
@@ -199,36 +202,61 @@ impl ScannerItem {
             (None, None)
         };
 
+        info!("apply_lifecycle: Evaluating lifecycle for object: {}", oi.name);
+
+        let lifecycle = match self.lifecycle.as_ref() {
+            Some(lc) => lc,
+            None => {
+                info!("No lifecycle configuration found for object: {}", oi.name);
+                return (IlmAction::NoneAction, 0);
+            }
+        };
+
         let lc_evt = eval_action_from_lifecycle(
-            self.lifecycle.as_ref().unwrap(),
+            lifecycle,
             olcfg
                 .as_ref()
                 .and_then(|(c, _)| c.rule.as_ref().and_then(|r| r.default_retention.clone())),
             rcfg.clone(),
-            oi,
+            oi, // Pass oi directly
         )
         .await;
 
-        info!("lifecycle: {} Initial scan: {}", oi.name, lc_evt.action);
+        info!("lifecycle: {} Initial scan: {} (action: {:?})", oi.name, lc_evt.action, lc_evt.action);
 
         let mut new_size = size;
         match lc_evt.action {
             IlmAction::DeleteVersionAction | IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                info!("apply_lifecycle: Object {} marked for version deletion, new_size=0", oi.name);
                 new_size = 0;
             }
             IlmAction::DeleteAction => {
+                info!("apply_lifecycle: Object {} marked for deletion", oi.name);
                 if let Some(vcfg) = &self.versioning {
                     if !vcfg.is_enabled() {
+                        info!("apply_lifecycle: Versioning disabled, setting new_size=0");
                         new_size = 0;
                     }
                 } else {
+                    info!("apply_lifecycle: No versioning config, setting new_size=0");
                     new_size = 0;
                 }
             }
-            _ => (),
+            IlmAction::NoneAction => {
+                info!("apply_lifecycle: No action for object {}", oi.name);
+            }
+            _ => {
+                info!("apply_lifecycle: Other action {:?} for object {}", lc_evt.action, oi.name);
+            }
         }
 
-        apply_lifecycle_action(&lc_evt, &LcEventSrc::Scanner, oi).await;
+        if lc_evt.action != IlmAction::NoneAction {
+            info!("apply_lifecycle: Applying lifecycle action {:?} for object {}", lc_evt.action, oi.name);
+            apply_lifecycle_action(&lc_evt, &LcEventSrc::Scanner, oi).await;
+        } else {
+            info!("apply_lifecycle: Skipping lifecycle action for object {} as no action is needed", oi.name);
+        }
+
         (lc_evt.action, new_size)
     }
 }

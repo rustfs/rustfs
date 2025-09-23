@@ -40,7 +40,7 @@ rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-flexi_logger = { workspace = true, features = ["trc", "kv"] }
+flexi_logger = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
@@ -61,6 +61,7 @@ reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
+
 
 # Only enable kafka features and related dependencies on Linux
 [target.'cfg(target_os = "linux")'.dependencies]

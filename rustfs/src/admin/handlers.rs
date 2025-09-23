@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::router::Operation;
+use crate::admin::auth::validate_admin_request;
 use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
@@ -45,6 +46,7 @@ use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::action::Action;
+use rustfs_policy::policy::action::AdminAction;
 use rustfs_policy::policy::action::S3Action;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_utils::path::path_join;
@@ -71,6 +73,9 @@ use tracing::{error, info, warn};
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
+pub mod kms;
+pub mod kms_dynamic;
+pub mod kms_keys;
 pub mod policies;
 pub mod pools;
 pub mod rebalance;
@@ -79,6 +84,8 @@ pub mod sts;
 pub mod tier;
 pub mod trace;
 pub mod user;
+#[cfg(not(target_os = "windows"))]
+use pprof::protos::Message;
 use urlencoding::decode;
 
 #[allow(dead_code)]
@@ -88,6 +95,28 @@ pub struct AccountInfo {
     pub account_name: String,
     pub server: rustfs_madmin::BackendInfo,
     pub policy: BucketPolicy,
+}
+
+/// Health check handler for endpoint monitoring
+pub struct HealthCheckHandler {}
+
+#[async_trait::async_trait]
+impl Operation for HealthCheckHandler {
+    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        use serde_json::json;
+
+        let health_info = json!({
+            "status": "ok",
+            "service": "rustfs-endpoint",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "version": env!("CARGO_PKG_VERSION")
+        });
+
+        let body = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
+        let response_body = Body::from(body);
+
+        Ok(S3Response::new((StatusCode::OK, response_body)))
+    }
 }
 
 pub struct AccountInfoHandler {}
@@ -300,7 +329,23 @@ pub struct ServerInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        )
+        .await?;
+
         let info = get_server_info(true).await;
 
         let data = serde_json::to_vec(&info)
@@ -328,8 +373,24 @@ pub struct StorageInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for StorageInfoHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StorageInfoHandler");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -353,8 +414,24 @@ pub struct DataUsageInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DataUsageInfoHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle DataUsageInfoHandler");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DataUsageInfoAdminAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -365,6 +442,16 @@ impl Operation for DataUsageInfoHandler {
             s3_error!(InternalError, "load_data_usage_from_backend failed")
         })?;
 
+        // If no valid data exists, attempt real-time collection
+        if info.objects_total_count == 0 && info.buckets_count == 0 {
+            info!("No data usage statistics found, attempting real-time collection");
+
+            if let Err(e) = collect_realtime_data_usage(&mut info, store.clone()).await {
+                warn!("Failed to collect real-time data usage: {}", e);
+            }
+        }
+
+        // Set capacity information
         let sinfo = store.storage_info().await;
         info.total_capacity = get_total_usable_capacity(&sinfo.disks, &sinfo) as u64;
         info.total_free_capacity = get_total_usable_capacity_free(&sinfo.disks, &sinfo) as u64;
@@ -844,7 +931,7 @@ impl Operation for SetRemoteTargetHandler {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
-        let _is_owner = true; // 先按 true 处理，后期根据请求决定
+        let _is_owner = true; // Treat as true for now, decide based on request later
         let body = _req.input.store_all_unlimited().await.unwrap();
         debug!("Request body received, size: {} bytes", body.len());
 
@@ -901,7 +988,7 @@ impl Operation for SetRemoteTargetHandler {
                     match sys.set_target(bucket, &remote_target, false, false).await {
                         Ok(_) => {
                             {
-                                //todo 各种持久化的工作
+                                //todo various persistence work
                                 let targets = sys.list_targets(Some(bucket), None).await;
                                 info!("targets is {}", targets.len());
                                 match serde_json::to_vec(&targets) {
@@ -919,7 +1006,7 @@ impl Operation for SetRemoteTargetHandler {
                                         // }
                                     }
                                     Err(e) => {
-                                        error!("序列化失败{}", e);
+                                        error!("Serialization failed: {}", e);
                                     }
                                 }
                             }
@@ -1090,6 +1177,252 @@ impl Operation for RemoveRemoteTargetHandler {
         // }
 
         return Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))));
+    }
+}
+
+/// Real-time data collection function
+async fn collect_realtime_data_usage(
+    info: &mut rustfs_common::data_usage::DataUsageInfo,
+    store: Arc<rustfs_ecstore::store::ECStore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Get bucket list and collect basic statistics
+    let buckets = store
+        .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+        .await?;
+
+    info.buckets_count = buckets.len() as u64;
+    info.last_update = Some(std::time::SystemTime::now());
+
+    let mut total_objects = 0u64;
+    let mut total_size = 0u64;
+
+    // For each bucket, try to get object count
+    for bucket_info in buckets {
+        let bucket_name = &bucket_info.name;
+
+        // Skip system buckets
+        if bucket_name.starts_with('.') {
+            continue;
+        }
+
+        // Try to count objects in this bucket
+        let (object_count, bucket_size) = count_bucket_objects(&store, bucket_name).await.unwrap_or((0, 0));
+
+        total_objects += object_count;
+        total_size += bucket_size;
+
+        let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
+            objects_count: object_count,
+            size: bucket_size,
+            versions_count: object_count, // Simplified: assume 1 version per object
+            ..Default::default()
+        };
+
+        info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
+        info.bucket_sizes.insert(bucket_name.clone(), bucket_size);
+    }
+
+    info.objects_total_count = total_objects;
+    info.objects_total_size = total_size;
+    info.versions_total_count = total_objects; // Simplified
+
+    Ok(())
+}
+
+/// Helper function to count objects in a bucket
+async fn count_bucket_objects(
+    store: &Arc<rustfs_ecstore::store::ECStore>,
+    bucket_name: &str,
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    // Use list_objects_v2 to get actual object count
+    match store
+        .clone()
+        .list_objects_v2(
+            bucket_name,
+            "",    // prefix
+            None,  // continuation_token
+            None,  // delimiter
+            1000,  // max_keys - limit for performance
+            false, // fetch_owner
+            None,  // start_after
+        )
+        .await
+    {
+        Ok(result) => {
+            let object_count = result.objects.len() as u64;
+            let total_size = result.objects.iter().map(|obj| obj.size as u64).sum();
+            Ok((object_count, total_size))
+        }
+        Err(e) => {
+            warn!("Failed to list objects in bucket {}: {}", bucket_name, e);
+            Ok((0, 0))
+        }
+    }
+}
+
+pub struct ProfileHandler {}
+#[async_trait::async_trait]
+impl Operation for ProfileHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        #[cfg(target_os = "windows")]
+        {
+            return Ok(S3Response::new((
+                StatusCode::NOT_IMPLEMENTED,
+                Body::from("CPU profiling is not supported on Windows platform".to_string()),
+            )));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            use crate::profiling;
+
+            if !profiling::is_profiler_enabled() {
+                return Ok(S3Response::new((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Body::from("Profiler not enabled. Set RUSTFS_ENABLE_PROFILING=true to enable profiling".to_string()),
+                )));
+            }
+
+            let queries = extract_query_params(&req.uri);
+            let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
+            let format = queries.get("format").cloned().unwrap_or_else(|| "protobuf".to_string());
+
+            if seconds > 300 {
+                return Ok(S3Response::new((
+                    StatusCode::BAD_REQUEST,
+                    Body::from("Profile duration cannot exceed 300 seconds".to_string()),
+                )));
+            }
+
+            let guard = match profiling::get_profiler_guard() {
+                Some(guard) => guard,
+                None => {
+                    return Ok(S3Response::new((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Body::from("Profiler not initialized".to_string()),
+                    )));
+                }
+            };
+
+            info!("Starting CPU profile collection for {} seconds", seconds);
+
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+
+            let guard_lock = match guard.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    error!("Failed to acquire profiler guard lock");
+                    return Ok(S3Response::new((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from("Failed to acquire profiler lock".to_string()),
+                    )));
+                }
+            };
+
+            let report = match guard_lock.report().build() {
+                Ok(report) => report,
+                Err(e) => {
+                    error!("Failed to build profiler report: {}", e);
+                    return Ok(S3Response::new((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from(format!("Failed to build profile report: {e}")),
+                    )));
+                }
+            };
+
+            info!("CPU profile collection completed");
+
+            match format.as_str() {
+                "protobuf" | "pb" => {
+                    let profile = report.pprof().unwrap();
+                    let mut body = Vec::new();
+                    if let Err(e) = profile.write_to_vec(&mut body) {
+                        error!("Failed to serialize protobuf profile: {}", e);
+                        return Ok(S3Response::new((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Body::from("Failed to serialize profile".to_string()),
+                        )));
+                    }
+
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+                }
+                "flamegraph" | "svg" => {
+                    let mut flamegraph_buf = Vec::new();
+                    match report.flamegraph(&mut flamegraph_buf) {
+                        Ok(()) => (),
+                        Err(e) => {
+                            error!("Failed to generate flamegraph: {}", e);
+                            return Ok(S3Response::new((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from(format!("Failed to generate flamegraph: {e}")),
+                            )));
+                        }
+                    };
+
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, "image/svg+xml".parse().unwrap());
+                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(flamegraph_buf)), headers))
+                }
+                _ => Ok(S3Response::new((
+                    StatusCode::BAD_REQUEST,
+                    Body::from("Unsupported format. Use 'protobuf' or 'flamegraph'".to_string()),
+                ))),
+            }
+        }
+    }
+}
+
+pub struct ProfileStatusHandler {}
+#[async_trait::async_trait]
+impl Operation for ProfileStatusHandler {
+    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        use std::collections::HashMap;
+
+        #[cfg(target_os = "windows")]
+        let status = HashMap::from([
+            ("enabled", "false"),
+            ("status", "not_supported"),
+            ("platform", "windows"),
+            ("message", "CPU profiling is not supported on Windows platform"),
+        ]);
+
+        #[cfg(not(target_os = "windows"))]
+        let status = {
+            use crate::profiling;
+
+            if profiling::is_profiler_enabled() {
+                HashMap::from([
+                    ("enabled", "true"),
+                    ("status", "running"),
+                    ("supported_formats", "protobuf, flamegraph"),
+                    ("max_duration_seconds", "300"),
+                    ("endpoint", "/rustfs/admin/debug/pprof/profile"),
+                ])
+            } else {
+                HashMap::from([
+                    ("enabled", "false"),
+                    ("status", "disabled"),
+                    ("message", "Set RUSTFS_ENABLE_PROFILING=true to enable profiling"),
+                ])
+            }
+        };
+
+        match serde_json::to_string(&status) {
+            Ok(json) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                Ok(S3Response::with_headers((StatusCode::OK, Body::from(json)), headers))
+            }
+            Err(e) => {
+                error!("Failed to serialize status: {}", e);
+                Ok(S3Response::new((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Body::from("Failed to serialize status".to_string()),
+                )))
+            }
+        }
     }
 }
 

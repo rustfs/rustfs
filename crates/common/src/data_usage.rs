@@ -192,7 +192,7 @@ pub struct ReplTargetSizeSummary {
     pub failed_count: usize,
 }
 
-// ===== 缓存相关数据结构 =====
+// ===== Cache-related data structures =====
 
 /// Data usage hash for path-based caching
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

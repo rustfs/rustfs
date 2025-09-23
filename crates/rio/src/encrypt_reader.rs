@@ -119,6 +119,13 @@ where
                     header[5] = ((crc >> 8) & 0xFF) as u8;
                     header[6] = ((crc >> 16) & 0xFF) as u8;
                     header[7] = ((crc >> 24) & 0xFF) as u8;
+                    println!(
+                        "encrypt block header typ=0 len={} header={:?} plaintext_len={} ciphertext_len={}",
+                        clen,
+                        header,
+                        plaintext_len,
+                        ciphertext.len()
+                    );
                     let mut out = Vec::with_capacity(8 + int_len + ciphertext.len());
                     out.extend_from_slice(&header);
                     let mut plaintext_len_buf = vec![0u8; int_len];
@@ -219,121 +226,153 @@ where
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
-        // Serve from buffer if any
-        if *this.buffer_pos < this.buffer.len() {
-            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len() - *this.buffer_pos);
-            buf.put_slice(&this.buffer[*this.buffer_pos..*this.buffer_pos + to_copy]);
-            *this.buffer_pos += to_copy;
-            if *this.buffer_pos == this.buffer.len() {
-                this.buffer.clear();
-                *this.buffer_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-        if *this.finished {
-            return Poll::Ready(Ok(()));
-        }
-        // Read header (8 bytes), support partial header read
-        while !*this.header_done && *this.header_read < 8 {
-            let mut temp = [0u8; 8];
-            let mut temp_buf = ReadBuf::new(&mut temp[0..8 - *this.header_read]);
-            match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    let n = temp_buf.filled().len();
-                    if n == 0 {
-                        break;
-                    }
-                    this.header_buf[*this.header_read..*this.header_read + n].copy_from_slice(&temp_buf.filled()[..n]);
-                    *this.header_read += n;
+
+        loop {
+            // Serve buffered plaintext first
+            if *this.buffer_pos < this.buffer.len() {
+                let to_copy = std::cmp::min(buf.remaining(), this.buffer.len() - *this.buffer_pos);
+                buf.put_slice(&this.buffer[*this.buffer_pos..*this.buffer_pos + to_copy]);
+                *this.buffer_pos += to_copy;
+                if *this.buffer_pos == this.buffer.len() {
+                    this.buffer.clear();
+                    *this.buffer_pos = 0;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                return Poll::Ready(Ok(()));
             }
-            if *this.header_read < 8 {
+
+            if *this.finished {
+                return Poll::Ready(Ok(()));
+            }
+
+            // Read header (8 bytes)
+            while !*this.header_done && *this.header_read < 8 {
+                let mut temp = [0u8; 8];
+                let mut temp_buf = ReadBuf::new(&mut temp[0..8 - *this.header_read]);
+                match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        let n = temp_buf.filled().len();
+                        if n == 0 {
+                            *this.finished = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        this.header_buf[*this.header_read..*this.header_read + n].copy_from_slice(&temp_buf.filled()[..n]);
+                        *this.header_read += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                }
+
+                if *this.header_read < 8 {
+                    return Poll::Pending;
+                }
+            }
+
+            if !*this.header_done && *this.header_read == 8 {
+                *this.header_done = true;
+            }
+
+            if !*this.header_done {
                 return Poll::Pending;
             }
-        }
-        if !*this.header_done && *this.header_read == 8 {
-            *this.header_done = true;
-        }
-        if !*this.header_done {
-            return Poll::Pending;
-        }
-        let typ = this.header_buf[0];
-        let len = (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
-        let crc = (this.header_buf[4] as u32)
-            | ((this.header_buf[5] as u32) << 8)
-            | ((this.header_buf[6] as u32) << 16)
-            | ((this.header_buf[7] as u32) << 24);
-        *this.header_read = 0;
-        *this.header_done = false;
-        if typ == 0xFF {
-            *this.finished = true;
-            return Poll::Ready(Ok(()));
-        }
-        // Read ciphertext block (len bytes), support partial read
-        if this.ciphertext_buf.is_none() {
-            *this.ciphertext_len = len - 4; // 4 bytes for CRC32
-            *this.ciphertext_buf = Some(vec![0u8; *this.ciphertext_len]);
-            *this.ciphertext_read = 0;
-        }
-        let ciphertext_buf = this.ciphertext_buf.as_mut().unwrap();
-        while *this.ciphertext_read < *this.ciphertext_len {
-            let mut temp_buf = ReadBuf::new(&mut ciphertext_buf[*this.ciphertext_read..]);
-            match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    let n = temp_buf.filled().len();
-                    if n == 0 {
-                        break;
+
+            let typ = this.header_buf[0];
+            let len =
+                (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
+            let crc = (this.header_buf[4] as u32)
+                | ((this.header_buf[5] as u32) << 8)
+                | ((this.header_buf[6] as u32) << 16)
+                | ((this.header_buf[7] as u32) << 24);
+
+            *this.header_read = 0;
+            *this.header_done = false;
+
+            if typ == 0xFF {
+                *this.finished = true;
+                continue;
+            }
+
+            tracing::debug!(typ = typ, len = len, "decrypt block header");
+
+            if len == 0 {
+                tracing::warn!("encountered zero-length encrypted block, treating as end of stream");
+                *this.finished = true;
+                this.ciphertext_buf.take();
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                continue;
+            }
+
+            let Some(payload_len) = len.checked_sub(4) else {
+                tracing::error!("invalid encrypted block length: typ={} len={} header={:?}", typ, len, this.header_buf);
+                return Poll::Ready(Err(std::io::Error::other("Invalid encrypted block length")));
+            };
+
+            if this.ciphertext_buf.is_none() {
+                *this.ciphertext_buf = Some(vec![0u8; payload_len]);
+                *this.ciphertext_len = payload_len;
+                *this.ciphertext_read = 0;
+            }
+
+            let ciphertext_buf = this.ciphertext_buf.as_mut().unwrap();
+            while *this.ciphertext_read < *this.ciphertext_len {
+                let mut temp_buf = ReadBuf::new(&mut ciphertext_buf[*this.ciphertext_read..]);
+                match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        let n = temp_buf.filled().len();
+                        if n == 0 {
+                            break;
+                        }
+                        *this.ciphertext_read += n;
                     }
-                    *this.ciphertext_read += n;
-                }
-                Poll::Ready(Err(e)) => {
-                    this.ciphertext_buf.take();
-                    *this.ciphertext_read = 0;
-                    *this.ciphertext_len = 0;
-                    return Poll::Ready(Err(e));
+                    Poll::Ready(Err(e)) => {
+                        this.ciphertext_buf.take();
+                        *this.ciphertext_read = 0;
+                        *this.ciphertext_len = 0;
+                        return Poll::Ready(Err(e));
+                    }
                 }
             }
-        }
-        if *this.ciphertext_read < *this.ciphertext_len {
-            return Poll::Pending;
-        }
-        // Parse uvarint for plaintext length
-        let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(&ciphertext_buf[0..16]);
-        let ciphertext = &ciphertext_buf[uvarint_len as usize..];
 
-        // Decrypt
-        let cipher = Aes256Gcm::new_from_slice(this.key).expect("key");
-        let nonce = Nonce::from_slice(this.nonce);
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| std::io::Error::other(format!("decrypt error: {e}")))?;
-        if plaintext.len() != plaintext_len as usize {
+            if *this.ciphertext_read < *this.ciphertext_len {
+                return Poll::Pending;
+            }
+
+            let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(&ciphertext_buf[0..16]);
+            let ciphertext = &ciphertext_buf[uvarint_len as usize..];
+
+            let cipher = Aes256Gcm::new_from_slice(this.key).expect("key");
+            let nonce = Nonce::from_slice(this.nonce);
+            let plaintext = cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| std::io::Error::other(format!("decrypt error: {e}")))?;
+
+            if plaintext.len() != plaintext_len as usize {
+                this.ciphertext_buf.take();
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                return Poll::Ready(Err(std::io::Error::other("Plaintext length mismatch")));
+            }
+
+            let actual_crc = crc32fast::hash(&plaintext);
+            if actual_crc != crc {
+                this.ciphertext_buf.take();
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                return Poll::Ready(Err(std::io::Error::other("CRC32 mismatch")));
+            }
+
+            *this.buffer = plaintext;
+            *this.buffer_pos = 0;
             this.ciphertext_buf.take();
             *this.ciphertext_read = 0;
             *this.ciphertext_len = 0;
-            return Poll::Ready(Err(std::io::Error::other("Plaintext length mismatch")));
+
+            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            buf.put_slice(&this.buffer[..to_copy]);
+            *this.buffer_pos += to_copy;
+            return Poll::Ready(Ok(()));
         }
-        // CRC32 check
-        let actual_crc = crc32fast::hash(&plaintext);
-        if actual_crc != crc {
-            this.ciphertext_buf.take();
-            *this.ciphertext_read = 0;
-            *this.ciphertext_len = 0;
-            return Poll::Ready(Err(std::io::Error::other("CRC32 mismatch")));
-        }
-        *this.buffer = plaintext;
-        *this.buffer_pos = 0;
-        // Clear block state for next block
-        this.ciphertext_buf.take();
-        *this.ciphertext_read = 0;
-        *this.ciphertext_len = 0;
-        let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
-        buf.put_slice(&this.buffer[..to_copy]);
-        *this.buffer_pos += to_copy;
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -356,6 +395,15 @@ where
 
     fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
         self.inner.as_hash_reader_mut()
+    }
+}
+
+impl<R> TryGetIndex for DecryptReader<R>
+where
+    R: TryGetIndex,
+{
+    fn try_get_index(&self) -> Option<&Index> {
+        self.inner.try_get_index()
     }
 }
 

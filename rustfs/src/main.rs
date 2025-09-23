@@ -18,13 +18,20 @@ mod config;
 mod error;
 // mod grpc;
 pub mod license;
+#[cfg(not(target_os = "windows"))]
+mod profiling;
 mod server;
 mod storage;
 mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_http_server, wait_for_shutdown};
+use crate::admin::console::init_console_cfg;
+use crate::server::{
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_console_server, start_http_server,
+    wait_for_shutdown,
+};
+use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
@@ -34,6 +41,9 @@ use rustfs_ahm::{
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_config::DEFAULT_UPDATE_CHECK;
+use rustfs_config::ENV_UPDATE_CHECK;
+use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
@@ -51,15 +61,32 @@ use rustfs_ecstore::{
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
+use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
+// KMS is now managed dynamically via API
+use s3s::s3_error;
 use std::io::{Error, Result};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const LOGO: &str = r#"
+
+░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
+░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
+░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
+
+"#;
 
 #[instrument]
 fn print_server_info() {
@@ -84,8 +111,15 @@ async fn main() -> Result<()> {
     // Initialize Observability
     let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
 
+    // print startup logo
+    info!("{}", LOGO);
+
     // Store in global storage
     set_global_guard(guard).map_err(Error::other)?;
+
+    // Initialize performance profiling if enabled
+    #[cfg(not(target_os = "windows"))]
+    profiling::start_profiling_if_enabled();
 
     // Run parameters
     run(opt).await
@@ -95,6 +129,13 @@ async fn main() -> Result<()> {
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
+    // // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
+    // let dns_init = tokio::spawn(async {
+    //     if let Err(e) = rustfs_utils::dns_resolver::init_global_dns_resolver().await {
+    //         warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
+    //     }
+    // });
+
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
     }
@@ -103,7 +144,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
-    debug!("server_address {}", &server_address);
+    info!(
+        target: "rustfs::main::run",
+        server_address = %server_address,
+        ip = %server_addr.ip(),
+        port = %server_port,
+        version = %version::get_version(),
+        "Starting RustFS server at {}",
+        &server_address
+    );
 
     // Set up AK and SK
     rustfs_ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
@@ -112,12 +161,17 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     set_global_addr(&opt.address).await;
 
+    // // Wait for DNS initialization to complete before network-heavy operations
+    // dns_init.await.map_err(Error::other)?;
+
     // For RPC
-    let (endpoint_pools, setup_type) =
-        EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone()).map_err(Error::other)?;
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
+        .await
+        .map_err(Error::other)?;
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
+            target: "rustfs::main::run",
             "Formatting {}st pool, {} set(s), {} drives per set.",
             i + 1,
             eps.set_count,
@@ -131,12 +185,20 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
+            target: "rustfs::main::run",
+            id = i,
+            set_count = eps.set_count,
+            drives_per_set = eps.drives_per_set,
+            cmd = ?eps.cmd_line,
             "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
             i, eps.set_count, eps.drives_per_set, eps.cmd_line
         );
 
         for ep in eps.endpoints.as_ref().iter() {
-            info!("  - {}", ep);
+            info!(
+                target: "rustfs::main::run",
+                "  - endpoint: {}", ep
+            );
         }
     }
 
@@ -145,6 +207,52 @@ async fn run(opt: config::Opt) -> Result<()> {
     state_manager.update(ServiceState::Starting);
 
     let shutdown_tx = start_http_server(&opt, state_manager.clone()).await?;
+    // Start console server if enabled
+    let console_shutdown_tx = shutdown_tx.clone();
+    if opt.console_enable && !opt.console_address.is_empty() {
+        // Deal with port mapping issues for virtual machines like docker
+        let (external_addr, external_port) = if !opt.external_address.is_empty() {
+            let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
+            let external_port = external_addr.port();
+            if external_port != server_port {
+                warn!(
+                    "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
+                    external_port, server_port
+                );
+            }
+            info!(
+                target: "rustfs::main::run",
+                external_address = %external_addr,
+                external_port = %external_port,
+                "Using external address {} for endpoint access", external_addr
+            );
+            rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
+            set_global_addr(&opt.external_address).await;
+            (external_addr.ip(), external_port)
+        } else {
+            (server_addr.ip(), server_port)
+        };
+        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
+        // init console configuration
+        init_console_cfg(external_addr, external_port);
+
+        let opt_clone = opt.clone();
+        tokio::spawn(async move {
+            let console_shutdown_rx = console_shutdown_tx.subscribe();
+            if let Err(e) = start_console_server(&opt_clone, console_shutdown_rx).await {
+                error!("Console server failed to start: {}", e);
+            }
+        });
+    } else {
+        info!("Console server is disabled.");
+        info!("You can access the RustFS API at {}", &opt.address);
+        info!("For more information, visit https://rustfs.com/docs/");
+        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
+        info!(
+            "Current console address is set to: '{}' ,console enable is set to: '{}'",
+            &opt.console_address, &opt.console_enable
+        );
+    }
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
@@ -161,6 +269,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // config system configuration
     GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
+    // Initialize KMS system if enabled
+    init_kms_system(&opt).await?;
+
     // Initialize event notifier
     init_event_notifier().await;
 
@@ -172,34 +283,216 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(Error::other)?;
 
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+    // Collect bucket names into a vector
+    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    init_bucket_metadata_sys(store.clone(), buckets).await;
+    init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
-    init_iam_sys(store.clone()).await?;
+    init_iam_sys(store.clone()).await.map_err(Error::other)?;
 
+    add_bucket_notification_configuration(buckets.clone()).await;
+
+    // Initialize the global notification system
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys failed {:?}", &err);
         Error::other(err)
     })?;
 
+    // Create a cancellation token for AHM services
     let _ = create_ahm_services_cancel_token();
 
-    // Initialize heal manager with channel processor
-    let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-    let heal_manager = init_heal_manager(heal_storage, None).await?;
+    // Check environment variables to determine if scanner and heal should be enabled
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
 
-    let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-    scanner.start().await?;
+    info!(
+        target: "rustfs::main::run",
+        enable_scanner = enable_scanner,
+        enable_heal = enable_heal,
+        "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
+    );
+
+    // Initialize heal manager and scanner based on environment variables
+    if enable_heal || enable_scanner {
+        if enable_heal {
+            // Initialize heal manager with channel processor
+            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+            let heal_manager = init_heal_manager(heal_storage, None).await?;
+
+            if enable_scanner {
+                info!(target: "rustfs::main::run","Starting scanner with heal manager...");
+                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
+                scanner.start().await?;
+            } else {
+                info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
+            }
+        } else if enable_scanner {
+            info!("Starting scanner without heal manager...");
+            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
+            scanner.start().await?;
+        }
+    } else {
+        info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
+    }
+
+    // print server info
     print_server_info();
+    // initialize bucket replication pool
     init_bucket_replication_pool().await;
 
-    // Async update check (optional)
+    init_update_check();
+
+    // Perform hibernation for 1 second
+    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+    // listen to the shutdown signal
+    match wait_for_shutdown().await {
+        #[cfg(unix)]
+        ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
+            handle_shutdown(&state_manager, &shutdown_tx).await;
+        }
+        #[cfg(not(unix))]
+        ShutdownSignal::CtrlC => {
+            handle_shutdown(&state_manager, &shutdown_tx).await;
+        }
+    }
+
+    info!(target: "rustfs::main::run","server is stopped state: {:?}", state_manager.current_state());
+    Ok(())
+}
+
+/// Parse a boolean environment variable with default value
+///
+/// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
+/// false if set to false/0/no/off/disabled
+fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
+    std::env::var(var_name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<bool>()
+        .unwrap_or(default)
+}
+
+/// Handles the shutdown process of the server
+async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Shutdown signal received in main thread"
+    );
+    // update the status to stopping first
+    state_manager.update(ServiceState::Stopping);
+
+    // Check environment variables to determine what services need to be stopped
+    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
+    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
+
+    // Stop background services based on what was enabled
+    if enable_scanner || enable_heal {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Stopping background services (data scanner and auto heal)..."
+        );
+        shutdown_background_services();
+
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Stopping AHM services..."
+        );
+        shutdown_ahm_services();
+    } else {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Background services were disabled, skipping AHM shutdown"
+        );
+    }
+
+    // Stop the notification system
+    shutdown_event_notifier().await;
+
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Server is stopping..."
+    );
+    let _ = shutdown_tx.send(());
+
+    // Wait for the worker thread to complete the cleaning work
+    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+
+    // the last updated status is stopped
+    state_manager.update(ServiceState::Stopped);
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Server stopped current "
+    );
+}
+
+#[instrument]
+async fn init_event_notifier() {
+    info!(
+        target: "rustfs::main::init_event_notifier",
+        "Initializing event notifier..."
+    );
+
+    // 1. Get the global configuration loaded by ecstore
+    let server_config = match GLOBAL_SERVER_CONFIG.get() {
+        Some(config) => config.clone(), // Clone the config to pass ownership
+        None => {
+            error!("Event notifier initialization failed: Global server config not loaded.");
+            return;
+        }
+    };
+
+    info!(
+        target: "rustfs::main::init_event_notifier",
+        "Global server configuration loaded successfully"
+    );
+    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
+    if server_config
+        .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
+        .is_none()
+        || server_config
+            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+            .is_none()
+    {
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "'notify' subsystem not configured, skipping event notifier initialization."
+        );
+        return;
+    }
+
+    info!(
+        target: "rustfs::main::init_event_notifier",
+        "Event notifier configuration found, proceeding with initialization."
+    );
+
+    // 3. Initialize the notification system asynchronously with a global configuration
+    // Use direct await for better error handling and faster initialization
+    if let Err(e) = rustfs_notify::initialize(server_config).await {
+        error!("Failed to initialize event notifier system: {}", e);
+    } else {
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "Event notifier system initialized successfully."
+        );
+    }
+}
+
+fn init_update_check() {
+    let update_check_enable = std::env::var(ENV_UPDATE_CHECK)
+        .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
+        .parse::<bool>()
+        .unwrap_or(DEFAULT_UPDATE_CHECK);
+
+    if !update_check_enable {
+        return;
+    }
+
+    // Async update check with timeout
     tokio::spawn(async {
         use crate::update::{UpdateCheckError, check_updates};
 
-        match check_updates().await {
-            Ok(result) => {
+        // Add timeout to prevent hanging network calls
+        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
+            Ok(Ok(result)) => {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
@@ -217,102 +510,67 @@ async fn run(opt: config::Opt) -> Result<()> {
                     debug!("✅ Version check: Current version is up to date: {}", result.current_version);
                 }
             }
-            Err(UpdateCheckError::HttpError(e)) => {
+            Ok(Err(UpdateCheckError::HttpError(e))) => {
                 debug!("Version check: network error (this is normal): {}", e);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!("Version check: failed (this is normal): {}", e);
+            }
+            Err(_) => {
+                debug!("Version check: timeout after 30 seconds (this is normal)");
             }
         }
     });
-
-    // Perform hibernation for 1 second
-    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
-    // listen to the shutdown signal
-    match wait_for_shutdown().await {
-        #[cfg(unix)]
-        ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
-        }
-        #[cfg(not(unix))]
-        ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
-        }
-    }
-
-    info!("server is stopped state: {:?}", state_manager.current_state());
-    Ok(())
 }
 
-/// Handles the shutdown process of the server
-async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
-    info!("Shutdown signal received in main thread");
-    // update the status to stopping first
-    state_manager.update(ServiceState::Stopping);
-
-    // Stop background services (data scanner and auto heal) gracefully
-    info!("Stopping background services (data scanner and auto heal)...");
-    shutdown_background_services();
-
-    // Stop AHM services gracefully
-    info!("Stopping AHM services...");
-    shutdown_ahm_services();
-
-    // Stop the notification system
-    shutdown_event_notifier().await;
-
-    info!("Server is stopping...");
-    let _ = shutdown_tx.send(());
-
-    // Wait for the worker thread to complete the cleaning work
-    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
-
-    // the last updated status is stopped
-    state_manager.update(ServiceState::Stopped);
-    info!("Server stopped current ");
-}
-
-#[instrument]
-pub(crate) async fn init_event_notifier() {
-    info!("Initializing event notifier...");
-
-    // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_SERVER_CONFIG.get() {
-        Some(config) => config.clone(), // Clone the config to pass ownership
-        None => {
-            error!("Event notifier initialization failed: Global server config not loaded.");
-            return;
+#[instrument(skip_all)]
+async fn add_bucket_notification_configuration(buckets: Vec<String>) {
+    let region_opt = rustfs_ecstore::global::get_global_region();
+    let region = match region_opt {
+        Some(ref r) if !r.is_empty() => r,
+        _ => {
+            warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
+            ""
         }
     };
+    for bucket in buckets.iter() {
+        let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
+            warn!("get_notification_config err {:?}", err);
+            None
+        });
 
-    info!("Global server configuration loaded successfully. config: {:?}", server_config);
-    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    if server_config
-        .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
-        .is_none()
-        || server_config
-            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-            .is_none()
-    {
-        info!("'notify' subsystem not configured, skipping event notifier initialization.");
-        return;
-    }
+        match has_notification_config {
+            Some(cfg) => {
+                info!(
+                    target: "rustfs::main::add_bucket_notification_configuration",
+                    bucket = %bucket,
+                    "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
 
-    info!("Event notifier configuration found, proceeding with initialization.");
+                let mut event_rules = Vec::new();
+                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), TargetID::from_str);
+                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), TargetID::from_str);
+                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), TargetID::from_str);
 
-    // 3. Initialize the notification system asynchronously with a global configuration
-    // Put it into a separate task to avoid blocking the main initialization process
-    tokio::spawn(async move {
-        if let Err(e) = rustfs_notify::initialize(server_config).await {
-            error!("Failed to initialize event notifier system: {}", e);
-        } else {
-            info!("Event notifier system initialized successfully.");
+                if let Err(e) = notifier_instance()
+                    .add_event_specific_rules(bucket, region, &event_rules)
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
+                {
+                    error!("Failed to add rules for bucket '{}': {:?}", bucket, e);
+                }
+            }
+            None => {
+                info!(
+                    target: "rustfs::main::add_bucket_notification_configuration",
+                    bucket = %bucket,
+                    "Bucket '{}' has no existing notification configuration.", bucket);
+            }
         }
-    });
+    }
 }
 
 /// Shuts down the event notifier system gracefully
-pub async fn shutdown_event_notifier() {
+async fn shutdown_event_notifier() {
     info!("Shutting down event notifier system...");
 
     if !rustfs_notify::is_notification_system_initialized() {
@@ -331,4 +589,97 @@ pub async fn shutdown_event_notifier() {
     // Call the shutdown function from the rustfs_notify module
     system.shutdown().await;
     info!("Event notifier system shut down successfully.");
+}
+
+/// Initialize KMS system and configure if enabled
+#[instrument(skip(opt))]
+async fn init_kms_system(opt: &config::Opt) -> Result<()> {
+    println!("CLAUDE DEBUG: init_kms_system called!");
+    info!("CLAUDE DEBUG: init_kms_system called!");
+    info!("Initializing KMS service manager...");
+    info!(
+        "CLAUDE DEBUG: KMS configuration - kms_enable: {}, kms_backend: {}, kms_key_dir: {:?}, kms_default_key_id: {:?}",
+        opt.kms_enable, opt.kms_backend, opt.kms_key_dir, opt.kms_default_key_id
+    );
+
+    // Initialize global KMS service manager (starts in NotConfigured state)
+    let service_manager = rustfs_kms::init_global_kms_service_manager();
+
+    // If KMS is enabled in configuration, configure and start the service
+    if opt.kms_enable {
+        info!("KMS is enabled, configuring and starting service...");
+
+        // Create KMS configuration from command line options
+        let kms_config = match opt.kms_backend.as_str() {
+            "local" => {
+                let key_dir = opt
+                    .kms_key_dir
+                    .as_ref()
+                    .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
+
+                rustfs_kms::config::KmsConfig {
+                    backend: rustfs_kms::config::KmsBackend::Local,
+                    backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
+                        key_dir: std::path::PathBuf::from(key_dir),
+                        master_key: None,
+                        file_permissions: Some(0o600),
+                    }),
+                    default_key_id: opt.kms_default_key_id.clone(),
+                    timeout: std::time::Duration::from_secs(30),
+                    retry_attempts: 3,
+                    enable_cache: true,
+                    cache_config: rustfs_kms::config::CacheConfig::default(),
+                }
+            }
+            "vault" => {
+                let vault_address = opt
+                    .kms_vault_address
+                    .as_ref()
+                    .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
+                let vault_token = opt
+                    .kms_vault_token
+                    .as_ref()
+                    .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+
+                rustfs_kms::config::KmsConfig {
+                    backend: rustfs_kms::config::KmsBackend::Vault,
+                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
+                        address: vault_address.clone(),
+                        auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                            token: vault_token.clone(),
+                        },
+                        namespace: None,
+                        mount_path: "transit".to_string(),
+                        kv_mount: "secret".to_string(),
+                        key_path_prefix: "rustfs/kms/keys".to_string(),
+                        tls: None,
+                    }),
+                    default_key_id: opt.kms_default_key_id.clone(),
+                    timeout: std::time::Duration::from_secs(30),
+                    retry_attempts: 3,
+                    enable_cache: true,
+                    cache_config: rustfs_kms::config::CacheConfig::default(),
+                }
+            }
+            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", opt.kms_backend))),
+        };
+
+        // Configure the KMS service
+        service_manager
+            .configure(kms_config)
+            .await
+            .map_err(|e| Error::other(format!("Failed to configure KMS: {}", e)))?;
+
+        // Start the KMS service
+        service_manager
+            .start()
+            .await
+            .map_err(|e| Error::other(format!("Failed to start KMS: {}", e)))?;
+
+        info!("KMS service configured and started successfully");
+    } else {
+        info!("KMS service manager initialized. KMS is ready for dynamic configuration via API.");
+    }
+
+    Ok(())
 }

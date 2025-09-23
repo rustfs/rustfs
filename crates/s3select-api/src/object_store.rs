@@ -19,19 +19,10 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
-use object_store::Attributes;
-use object_store::GetOptions;
-use object_store::GetResult;
-use object_store::ListResult;
-use object_store::MultipartUpload;
-use object_store::ObjectMeta;
-use object_store::ObjectStore;
-use object_store::PutMultipartOpts;
-use object_store::PutOptions;
-use object_store::PutPayload;
-use object_store::PutResult;
-use object_store::path::Path;
-use object_store::{Error as o_Error, Result};
+use object_store::{
+    Attributes, Error as o_Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+};
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
 use rustfs_ecstore::StorageAPI;
@@ -102,7 +93,7 @@ impl ObjectStore for EcObjectStore {
         unimplemented!()
     }
 
-    async fn put_multipart_opts(&self, _location: &Path, _opts: PutMultipartOpts) -> Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(&self, _location: &Path, _opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
         unimplemented!()
     }
 
@@ -122,7 +113,7 @@ impl ObjectStore for EcObjectStore {
         let meta = ObjectMeta {
             location: location.clone(),
             last_modified: Utc::now(),
-            size: reader.object_info.size as usize,
+            size: reader.object_info.size as u64,
             e_tag: reader.object_info.etag,
             version: None,
         };
@@ -151,12 +142,12 @@ impl ObjectStore for EcObjectStore {
         Ok(GetResult {
             payload,
             meta,
-            range: 0..reader.object_info.size as usize,
+            range: 0..reader.object_info.size as u64,
             attributes,
         })
     }
 
-    async fn get_ranges(&self, _location: &Path, _ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+    async fn get_ranges(&self, _location: &Path, _ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         unimplemented!()
     }
 
@@ -175,7 +166,7 @@ impl ObjectStore for EcObjectStore {
         Ok(ObjectMeta {
             location: location.clone(),
             last_modified: Utc::now(),
-            size: info.size as usize,
+            size: info.size as u64,
             e_tag: info.etag,
             version: None,
         })
@@ -185,7 +176,7 @@ impl ObjectStore for EcObjectStore {
         unimplemented!()
     }
 
-    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         unimplemented!()
     }
 

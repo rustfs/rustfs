@@ -14,10 +14,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{bucket::metadata_sys::get_replication_config, config::com::read_config, store::ECStore};
+use crate::{bucket::metadata_sys::get_replication_config, config::com::read_config, store::ECStore, store_api::StorageAPI};
 use rustfs_common::data_usage::{BucketTargetUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, SizeSummary};
 use rustfs_utils::path::SLASH_SEPARATOR;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::error::Error;
 
@@ -61,12 +61,13 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
 
 /// Load data usage info from backend storage
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    let buf: Vec<u8> = match read_config(store, &DATA_USAGE_OBJ_NAME_PATH).await {
+    let buf: Vec<u8> = match read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
         Ok(data) => data,
         Err(e) => {
             error!("Failed to read data usage info from backend: {}", e);
             if e == crate::error::Error::ConfigNotFound {
-                return Ok(DataUsageInfo::default());
+                warn!("Data usage config not found, building basic statistics");
+                return build_basic_data_usage_info(store).await;
             }
             return Err(Error::other(e));
         }
@@ -75,9 +76,22 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     let mut data_usage_info: DataUsageInfo =
         serde_json::from_slice(&buf).map_err(|e| Error::other(format!("Failed to deserialize data usage info: {e}")))?;
 
-    warn!("Loaded data usage info from backend {:?}", &data_usage_info);
+    info!("Loaded data usage info from backend with {} buckets", data_usage_info.buckets_count);
 
-    // Handle backward compatibility like original code
+    // Validate data and supplement if empty
+    if data_usage_info.buckets_count == 0 || data_usage_info.buckets_usage.is_empty() {
+        warn!("Loaded data is empty, supplementing with basic statistics");
+        if let Ok(basic_info) = build_basic_data_usage_info(store.clone()).await {
+            data_usage_info.buckets_count = basic_info.buckets_count;
+            data_usage_info.buckets_usage = basic_info.buckets_usage;
+            data_usage_info.bucket_sizes = basic_info.bucket_sizes;
+            data_usage_info.objects_total_count = basic_info.objects_total_count;
+            data_usage_info.objects_total_size = basic_info.objects_total_size;
+            data_usage_info.last_update = basic_info.last_update;
+        }
+    }
+
+    // Handle backward compatibility
     if data_usage_info.buckets_usage.is_empty() {
         data_usage_info.buckets_usage = data_usage_info
             .bucket_sizes
@@ -102,6 +116,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
             .collect();
     }
 
+    // Handle replication info
     for (bucket, bui) in &data_usage_info.buckets_usage {
         if bui.replicated_size_v1 > 0
             || bui.replication_failed_count_v1 > 0
@@ -123,6 +138,73 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
                     );
                 }
             }
+        }
+    }
+
+    Ok(data_usage_info)
+}
+
+/// Build basic data usage info with real object counts
+async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let mut data_usage_info = DataUsageInfo::default();
+
+    // Get bucket list
+    match store.list_bucket(&crate::store_api::BucketOptions::default()).await {
+        Ok(buckets) => {
+            data_usage_info.buckets_count = buckets.len() as u64;
+            data_usage_info.last_update = Some(std::time::SystemTime::now());
+
+            let mut total_objects = 0u64;
+            let mut total_size = 0u64;
+
+            for bucket_info in buckets {
+                if bucket_info.name.starts_with('.') {
+                    continue; // Skip system buckets
+                }
+
+                // Try to get actual object count for this bucket
+                let (object_count, bucket_size) = match store
+                    .clone()
+                    .list_objects_v2(
+                        &bucket_info.name,
+                        "",    // prefix
+                        None,  // continuation_token
+                        None,  // delimiter
+                        100,   // max_keys - small limit for performance
+                        false, // fetch_owner
+                        None,  // start_after
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        let count = result.objects.len() as u64;
+                        let size = result.objects.iter().map(|obj| obj.size as u64).sum();
+                        (count, size)
+                    }
+                    Err(_) => (0, 0),
+                };
+
+                total_objects += object_count;
+                total_size += bucket_size;
+
+                let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
+                    size: bucket_size,
+                    objects_count: object_count,
+                    versions_count: object_count, // Simplified
+                    delete_markers_count: 0,
+                    ..Default::default()
+                };
+
+                data_usage_info.buckets_usage.insert(bucket_info.name.clone(), bucket_usage);
+                data_usage_info.bucket_sizes.insert(bucket_info.name, bucket_size);
+            }
+
+            data_usage_info.objects_total_count = total_objects;
+            data_usage_info.objects_total_size = total_size;
+            data_usage_info.versions_total_count = total_objects;
+        }
+        Err(e) => {
+            warn!("Failed to list buckets for basic data usage info: {}", e);
         }
     }
 

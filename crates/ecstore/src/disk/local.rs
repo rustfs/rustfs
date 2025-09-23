@@ -41,18 +41,21 @@ use tokio::time::interval;
 
 use crate::erasure_coding::bitrot_verify;
 use bytes::Bytes;
-use path_absolutize::Absolutize;
+// use path_absolutize::Absolutize;  // Replaced with direct path operations for better performance
+use crate::file_cache::{get_global_file_cache, prefetch_metadata_patterns, read_metadata_cached};
+use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     get_file_info, read_xl_meta_no_data,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::SeekFrom;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{
     fs::Metadata,
@@ -101,6 +104,9 @@ pub struct LocalDisk {
     pub major: u64,
     pub minor: u64,
     pub nrrequests: u64,
+    // Performance optimization fields
+    path_cache: Arc<ParkingLotRwLock<HashMap<String, PathBuf>>>,
+    current_dir: Arc<OnceLock<PathBuf>>,
     // pub id: Mutex<Option<Uuid>>,
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
@@ -130,8 +136,9 @@ impl Debug for LocalDisk {
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!("Creating local disk");
-        let root = match PathBuf::from(ep.get_file_path()).absolutize() {
-            Ok(path) => path.into_owned(),
+        // Use optimized path resolution instead of absolutize() for better performance
+        let root = match std::fs::canonicalize(ep.get_file_path()) {
+            Ok(path) => path,
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     return Err(DiskError::VolumeNotFound);
@@ -144,10 +151,8 @@ impl LocalDisk {
             // TODO: 删除 tmp 数据
         }
 
-        let format_path = Path::new(RUSTFS_META_BUCKET)
-            .join(Path::new(super::FORMAT_CONFIG_FILE))
-            .absolutize_virtually(&root)?
-            .into_owned();
+        // Use optimized path resolution instead of absolutize_virtually
+        let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
         debug!("format_path: {:?}", format_path);
         let (format_data, format_meta) = read_file_exists(&format_path).await?;
 
@@ -227,6 +232,8 @@ impl LocalDisk {
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
+            path_cache: Arc::new(ParkingLotRwLock::new(HashMap::with_capacity(2048))),
+            current_dir: Arc::new(OnceLock::new()),
             exit_signal: None,
         };
         let (info, _root) = get_disk_info(root).await?;
@@ -351,19 +358,178 @@ impl LocalDisk {
         self.make_volumes(defaults).await
     }
 
+    // Optimized path resolution with caching
     pub fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
-        Ok(path.as_ref().absolutize_virtually(&self.root)?.into_owned())
+        let path_ref = path.as_ref();
+        let path_str = path_ref.to_string_lossy();
+
+        // Fast cache read
+        {
+            let cache = self.path_cache.read();
+            if let Some(cached_path) = cache.get(path_str.as_ref()) {
+                return Ok(cached_path.clone());
+            }
+        }
+
+        // Calculate absolute path without using path_absolutize for better performance
+        let abs_path = if path_ref.is_absolute() {
+            path_ref.to_path_buf()
+        } else {
+            self.root.join(path_ref)
+        };
+
+        // Normalize path components to avoid filesystem calls
+        let normalized = self.normalize_path_components(&abs_path);
+
+        // Cache the result
+        {
+            let mut cache = self.path_cache.write();
+
+            // Simple cache size control
+            if cache.len() >= 4096 {
+                // Clear half the cache - simple eviction strategy
+                let keys_to_remove: Vec<_> = cache.keys().take(cache.len() / 2).cloned().collect();
+                for key in keys_to_remove {
+                    cache.remove(&key);
+                }
+            }
+
+            cache.insert(path_str.into_owned(), normalized.clone());
+        }
+
+        Ok(normalized)
     }
 
+    // Lightweight path normalization without filesystem calls
+    fn normalize_path_components(&self, path: &Path) -> PathBuf {
+        let mut result = PathBuf::new();
+
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(name) => {
+                    result.push(name);
+                }
+                std::path::Component::ParentDir => {
+                    result.pop();
+                }
+                std::path::Component::CurDir => {
+                    // Ignore current directory components
+                }
+                std::path::Component::RootDir => {
+                    result.push(component);
+                }
+                std::path::Component::Prefix(_prefix) => {
+                    result.push(component);
+                }
+            }
+        }
+
+        result
+    }
+
+    // Highly optimized object path generation
     pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        let dir = Path::new(&bucket);
-        let file_path = Path::new(&key);
-        self.resolve_abs_path(dir.join(file_path))
+        // For high-frequency paths, use faster string concatenation
+        let cache_key = if key.is_empty() {
+            bucket.to_string()
+        } else {
+            // Use with_capacity to pre-allocate, reducing memory reallocations
+            let mut path_str = String::with_capacity(bucket.len() + key.len() + 1);
+            path_str.push_str(bucket);
+            path_str.push('/');
+            path_str.push_str(key);
+            path_str
+        };
+
+        // Fast path: directly calculate based on root, avoiding cache lookup overhead for simple cases
+        Ok(self.root.join(&cache_key))
     }
 
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
-        let dir = Path::new(&bucket);
-        self.resolve_abs_path(dir)
+        Ok(self.root.join(bucket))
+    }
+
+    // Batch path generation with single lock acquisition
+    pub fn get_object_paths_batch(&self, requests: &[(String, String)]) -> Result<Vec<PathBuf>> {
+        let mut results = Vec::with_capacity(requests.len());
+        let mut cache_misses = Vec::new();
+
+        // First attempt to get all paths from cache
+        {
+            let cache = self.path_cache.read();
+            for (i, (bucket, key)) in requests.iter().enumerate() {
+                let cache_key = format!("{bucket}/{key}");
+                if let Some(cached_path) = cache.get(&cache_key) {
+                    results.push((i, cached_path.clone()));
+                } else {
+                    cache_misses.push((i, bucket, key, cache_key));
+                }
+            }
+        }
+
+        // Handle cache misses
+        if !cache_misses.is_empty() {
+            let mut new_entries = Vec::new();
+            for (i, _bucket, _key, cache_key) in cache_misses {
+                let path = self.root.join(&cache_key);
+                results.push((i, path.clone()));
+                new_entries.push((cache_key, path));
+            }
+
+            // Batch update cache
+            {
+                let mut cache = self.path_cache.write();
+                for (key, path) in new_entries {
+                    cache.insert(key, path);
+                }
+            }
+        }
+
+        // Sort results back to original order
+        results.sort_by_key(|(i, _)| *i);
+        Ok(results.into_iter().map(|(_, path)| path).collect())
+    }
+
+    // Optimized metadata reading with caching
+    pub async fn read_metadata_cached(&self, path: PathBuf) -> Result<Arc<FileMeta>> {
+        read_metadata_cached(path).await
+    }
+
+    // Smart prefetching for related files
+    pub async fn read_version_with_prefetch(
+        &self,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: &ReadOptions,
+    ) -> Result<FileInfo> {
+        let file_path = self.get_object_path(volume, path)?;
+
+        // Async prefetch related files, don't block current read
+        if let Some(parent) = file_path.parent() {
+            prefetch_metadata_patterns(parent, &[super::STORAGE_FORMAT_FILE, "part.1", "part.2", "part.meta"]).await;
+        }
+
+        // Main read logic
+        let file_dir = self.get_bucket_path(volume)?;
+        let (data, _) = self.read_raw(volume, file_dir, file_path, opts.read_data).await?;
+
+        get_file_info(&data, volume, path, version_id, FileInfoOpts { data: opts.read_data })
+            .await
+            .map_err(|_e| DiskError::Unexpected)
+    }
+
+    // Batch metadata reading for multiple objects
+    pub async fn read_metadata_batch(&self, requests: Vec<(String, String)>) -> Result<Vec<Option<Arc<FileMeta>>>> {
+        let paths: Vec<PathBuf> = requests
+            .iter()
+            .map(|(bucket, key)| self.get_object_path(bucket, &format!("{}/{}", key, super::STORAGE_FORMAT_FILE)))
+            .collect::<Result<Vec<_>>>()?;
+
+        let cache = get_global_file_cache();
+        let results = cache.get_metadata_batch(paths).await;
+
+        Ok(results.into_iter().map(|r| r.ok()).collect())
     }
 
     // /// Write to the filesystem atomically.
@@ -549,7 +715,15 @@ impl LocalDisk {
     }
 
     async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // TODO: support timeout
+        // Try to use cached file content reading for better performance, with safe fallback
+        let path = file_path.as_ref().to_path_buf();
+
+        // First, try the cache
+        if let Ok(bytes) = get_global_file_cache().get_file_content(path.clone()).await {
+            return Ok(bytes.to_vec());
+        }
+
+        // Fallback to direct read if cache fails
         let (data, _) = self.read_metadata_with_dmtime(file_path.as_ref()).await?;
         Ok(data)
     }
@@ -1823,6 +1997,17 @@ impl DiskAPI for LocalDisk {
             }
         };
 
+        // CLAUDE DEBUG: Check if inline data is being preserved
+        tracing::info!(
+            "CLAUDE DEBUG: rename_data - Adding version to xlmeta. fi.data.is_some()={}, fi.inline_data()={}, fi.size={}",
+            fi.data.is_some(),
+            fi.inline_data(),
+            fi.size
+        );
+        if let Some(ref data) = fi.data {
+            tracing::info!("CLAUDE DEBUG: rename_data - FileInfo has inline data: {} bytes", data.len());
+        }
+
         xlmeta.add_version(fi.clone())?;
 
         if xlmeta.versions.len() <= 10 {
@@ -1830,6 +2015,10 @@ impl DiskAPI for LocalDisk {
         }
 
         let new_dst_buf = xlmeta.marshal_msg()?;
+        tracing::info!(
+            "CLAUDE DEBUG: rename_data - Marshaled xlmeta, new_dst_buf size: {} bytes",
+            new_dst_buf.len()
+        );
 
         self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
             .await?;
