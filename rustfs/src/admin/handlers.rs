@@ -30,7 +30,7 @@ use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
-use rustfs_ecstore::data_usage::load_data_usage_from_backend;
+use rustfs_ecstore::data_usage::{compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
@@ -442,13 +442,38 @@ impl Operation for DataUsageInfoHandler {
             s3_error!(InternalError, "load_data_usage_from_backend failed")
         })?;
 
-        // If no valid data exists, attempt real-time collection
-        if info.objects_total_count == 0 && info.buckets_count == 0 {
+        let last_update_age = info.last_update.and_then(|ts| ts.elapsed().ok());
+        let data_missing = info.objects_total_count == 0 && info.buckets_count == 0;
+        let stale = last_update_age
+            .map(|elapsed| elapsed > std::time::Duration::from_secs(300))
+            .unwrap_or(true);
+
+        if data_missing {
             info!("No data usage statistics found, attempting real-time collection");
 
             if let Err(e) = collect_realtime_data_usage(&mut info, store.clone()).await {
                 warn!("Failed to collect real-time data usage: {}", e);
+            } else if let Err(e) = store_data_usage_in_backend(info.clone(), store.clone()).await {
+                warn!("Failed to persist refreshed data usage: {}", e);
             }
+        } else if stale {
+            info!(
+                "Data usage statistics are stale (last update {:?} ago), refreshing asynchronously",
+                last_update_age
+            );
+
+            let mut info_for_refresh = info.clone();
+            let store_for_refresh = store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = collect_realtime_data_usage(&mut info_for_refresh, store_for_refresh.clone()).await {
+                    warn!("Background data usage refresh failed: {}", e);
+                    return;
+                }
+
+                if let Err(e) = store_data_usage_in_backend(info_for_refresh, store_for_refresh).await {
+                    warn!("Background data usage persistence failed: {}", e);
+                }
+            });
         }
 
         // Set capacity information
@@ -1192,9 +1217,17 @@ async fn collect_realtime_data_usage(
 
     info.buckets_count = buckets.len() as u64;
     info.last_update = Some(std::time::SystemTime::now());
+    info.buckets_usage.clear();
+    info.bucket_sizes.clear();
+    info.objects_total_count = 0;
+    info.objects_total_size = 0;
+    info.versions_total_count = 0;
+    info.delete_markers_total_count = 0;
 
     let mut total_objects = 0u64;
+    let mut total_versions = 0u64;
     let mut total_size = 0u64;
+    let mut total_delete_markers = 0u64;
 
     // For each bucket, try to get object count
     for bucket_info in buckets {
@@ -1205,59 +1238,28 @@ async fn collect_realtime_data_usage(
             continue;
         }
 
-        // Try to count objects in this bucket
-        let (object_count, bucket_size) = count_bucket_objects(&store, bucket_name).await.unwrap_or((0, 0));
+        match compute_bucket_usage(store.clone(), bucket_name).await {
+            Ok(bucket_usage) => {
+                total_objects = total_objects.saturating_add(bucket_usage.objects_count);
+                total_versions = total_versions.saturating_add(bucket_usage.versions_count);
+                total_size = total_size.saturating_add(bucket_usage.size);
+                total_delete_markers = total_delete_markers.saturating_add(bucket_usage.delete_markers_count);
 
-        total_objects += object_count;
-        total_size += bucket_size;
-
-        let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
-            objects_count: object_count,
-            size: bucket_size,
-            versions_count: object_count, // Simplified: assume 1 version per object
-            ..Default::default()
-        };
-
-        info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
-        info.bucket_sizes.insert(bucket_name.clone(), bucket_size);
+                info.buckets_usage.insert(bucket_name.clone(), bucket_usage.clone());
+                info.bucket_sizes.insert(bucket_name.clone(), bucket_usage.size);
+            }
+            Err(e) => {
+                warn!("Failed to compute bucket usage for {}: {}", bucket_name, e);
+            }
+        }
     }
 
     info.objects_total_count = total_objects;
     info.objects_total_size = total_size;
-    info.versions_total_count = total_objects; // Simplified
+    info.versions_total_count = total_versions;
+    info.delete_markers_total_count = total_delete_markers;
 
     Ok(())
-}
-
-/// Helper function to count objects in a bucket
-async fn count_bucket_objects(
-    store: &Arc<rustfs_ecstore::store::ECStore>,
-    bucket_name: &str,
-) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
-    // Use list_objects_v2 to get actual object count
-    match store
-        .clone()
-        .list_objects_v2(
-            bucket_name,
-            "",    // prefix
-            None,  // continuation_token
-            None,  // delimiter
-            1000,  // max_keys - limit for performance
-            false, // fetch_owner
-            None,  // start_after
-        )
-        .await
-    {
-        Ok(result) => {
-            let object_count = result.objects.len() as u64;
-            let total_size = result.objects.iter().map(|obj| obj.size as u64).sum();
-            Ok((object_count, total_size))
-        }
-        Err(e) => {
-            warn!("Failed to list objects in bucket {}: {}", bucket_name, e);
-            Ok((0, 0))
-        }
-    }
 }
 
 pub struct ProfileHandler {}

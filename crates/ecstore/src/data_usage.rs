@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use crate::{bucket::metadata_sys::get_replication_config, config::com::read_config, store::ECStore, store_api::StorageAPI};
-use rustfs_common::data_usage::{BucketTargetUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, SizeSummary};
+use rustfs_common::data_usage::{
+    BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, SizeSummary,
+};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use tracing::{error, info, warn};
 
@@ -144,6 +146,77 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     Ok(data_usage_info)
 }
 
+/// Calculate accurate bucket usage statistics by enumerating objects through the object layer.
+pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Result<BucketUsageInfo, Error> {
+    let mut continuation: Option<String> = None;
+    let mut objects_count: u64 = 0;
+    let mut versions_count: u64 = 0;
+    let mut total_size: u64 = 0;
+    let mut delete_markers: u64 = 0;
+
+    loop {
+        let result = store
+            .clone()
+            .list_objects_v2(
+                bucket_name,
+                "", // prefix
+                continuation.clone(),
+                None,  // delimiter
+                1000,  // max_keys
+                false, // fetch_owner
+                None,  // start_after
+            )
+            .await?;
+
+        for object in result.objects.iter() {
+            if object.is_dir {
+                continue;
+            }
+
+            if object.delete_marker {
+                delete_markers = delete_markers.saturating_add(1);
+                continue;
+            }
+
+            let object_size = object.size.max(0) as u64;
+            objects_count = objects_count.saturating_add(1);
+            total_size = total_size.saturating_add(object_size);
+
+            let detected_versions = if object.num_versions > 0 {
+                object.num_versions as u64
+            } else {
+                1
+            };
+            versions_count = versions_count.saturating_add(detected_versions);
+        }
+
+        if !result.is_truncated {
+            break;
+        }
+
+        continuation = result.next_continuation_token.clone();
+        if continuation.is_none() {
+            warn!(
+                "Bucket {} listing marked truncated but no continuation token returned; stopping early",
+                bucket_name
+            );
+            break;
+        }
+    }
+
+    if versions_count == 0 {
+        versions_count = objects_count;
+    }
+
+    let mut usage = BucketUsageInfo::default();
+    usage.size = total_size;
+    usage.objects_count = objects_count;
+    usage.versions_count = versions_count;
+    usage.delete_markers_count = delete_markers;
+
+    Ok(usage)
+}
+
 /// Build basic data usage info with real object counts
 async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let mut data_usage_info = DataUsageInfo::default();
@@ -152,56 +225,40 @@ async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInf
     match store.list_bucket(&crate::store_api::BucketOptions::default()).await {
         Ok(buckets) => {
             data_usage_info.buckets_count = buckets.len() as u64;
-            data_usage_info.last_update = Some(std::time::SystemTime::now());
+            data_usage_info.last_update = Some(SystemTime::now());
 
             let mut total_objects = 0u64;
+            let mut total_versions = 0u64;
             let mut total_size = 0u64;
+            let mut total_delete_markers = 0u64;
 
             for bucket_info in buckets {
                 if bucket_info.name.starts_with('.') {
                     continue; // Skip system buckets
                 }
 
-                // Try to get actual object count for this bucket
-                let (object_count, bucket_size) = match store
-                    .clone()
-                    .list_objects_v2(
-                        &bucket_info.name,
-                        "",    // prefix
-                        None,  // continuation_token
-                        None,  // delimiter
-                        100,   // max_keys - small limit for performance
-                        false, // fetch_owner
-                        None,  // start_after
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        let count = result.objects.len() as u64;
-                        let size = result.objects.iter().map(|obj| obj.size as u64).sum();
-                        (count, size)
+                match compute_bucket_usage(store.clone(), &bucket_info.name).await {
+                    Ok(bucket_usage) => {
+                        total_objects = total_objects.saturating_add(bucket_usage.objects_count);
+                        total_versions = total_versions.saturating_add(bucket_usage.versions_count);
+                        total_size = total_size.saturating_add(bucket_usage.size);
+                        total_delete_markers = total_delete_markers.saturating_add(bucket_usage.delete_markers_count);
+
+                        data_usage_info
+                            .buckets_usage
+                            .insert(bucket_info.name.clone(), bucket_usage.clone());
+                        data_usage_info.bucket_sizes.insert(bucket_info.name, bucket_usage.size);
                     }
-                    Err(_) => (0, 0),
-                };
-
-                total_objects += object_count;
-                total_size += bucket_size;
-
-                let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
-                    size: bucket_size,
-                    objects_count: object_count,
-                    versions_count: object_count, // Simplified
-                    delete_markers_count: 0,
-                    ..Default::default()
-                };
-
-                data_usage_info.buckets_usage.insert(bucket_info.name.clone(), bucket_usage);
-                data_usage_info.bucket_sizes.insert(bucket_info.name, bucket_size);
+                    Err(e) => {
+                        warn!("Failed to compute bucket usage for {}: {}", bucket_info.name, e);
+                    }
+                }
             }
 
             data_usage_info.objects_total_count = total_objects;
+            data_usage_info.versions_total_count = total_versions;
             data_usage_info.objects_total_size = total_size;
-            data_usage_info.versions_total_count = total_objects;
+            data_usage_info.delete_markers_total_count = total_delete_markers;
         }
         Err(e) => {
             warn!("Failed to list buckets for basic data usage info: {}", e);

@@ -22,7 +22,10 @@ use ecstore::{
     disk::{Disk, DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
-use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
+use rustfs_ecstore::{
+    self as ecstore, StorageAPI,
+    data_usage::{compute_bucket_usage, store_data_usage_in_backend},
+};
 use rustfs_filemeta::{MetacacheReader, VersionType};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -40,7 +43,7 @@ use crate::{
     get_ahm_services_cancel_token,
 };
 
-use rustfs_common::data_usage::{BucketUsageInfo, DataUsageInfo, SizeSummary};
+use rustfs_common::data_usage::{DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
@@ -289,10 +292,16 @@ impl Scanner {
                             enabled: bucket_info.versioning,
                         });
 
-                        // Count objects in this bucket
-                        let actual_objects = self.count_objects_in_bucket(&ecstore, bucket_name).await;
-                        total_objects_scanned += actual_objects;
-                        debug!("Counted {} objects in bucket {} (actual count)", actual_objects, bucket_name);
+                        // Count objects in this bucket using object layer to avoid filesystem inconsistencies
+                        match compute_bucket_usage(ecstore.clone(), bucket_name).await {
+                            Ok(bucket_usage) => {
+                                total_objects_scanned = total_objects_scanned.saturating_add(bucket_usage.objects_count);
+                                debug!("Counted {} objects in bucket {} (actual count)", bucket_usage.objects_count, bucket_name);
+                            }
+                            Err(e) => {
+                                warn!("Failed to compute usage for bucket {}: {}", bucket_name, e);
+                            }
+                        }
 
                         // Process objects for lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
@@ -370,34 +379,28 @@ impl Scanner {
                         continue;
                     }
 
-                    // Get object count for this bucket
-                    let bucket_objects = self.count_objects_in_bucket(ecstore, bucket_name).await;
+                    match compute_bucket_usage(ecstore.clone(), bucket_name).await {
+                        Ok(bucket_usage) => {
+                            let bucket_objects = bucket_usage.objects_count;
 
-                    // Create or update bucket data usage info
-                    let bucket_data = data_usage_guard.entry(bucket_name.clone()).or_insert_with(|| {
-                        let mut info = DataUsageInfo::new();
-                        info.objects_total_count = bucket_objects;
-                        info.buckets_count = 1;
+                            // Create or update bucket data usage info
+                            let bucket_data = data_usage_guard.entry(bucket_name.clone()).or_insert_with(DataUsageInfo::new);
 
-                        // Add bucket to buckets_usage
-                        let bucket_usage = BucketUsageInfo {
-                            size: bucket_objects * 1024, // Estimate 1KB per object
-                            objects_count: bucket_objects,
-                            object_size_histogram: HashMap::new(),
-                            ..Default::default()
-                        };
-                        info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
-                        info
-                    });
+                            bucket_data.objects_total_count = bucket_objects;
+                            bucket_data.versions_total_count = bucket_usage.versions_count;
+                            bucket_data.delete_markers_total_count = bucket_usage.delete_markers_count;
+                            bucket_data.objects_total_size = bucket_usage.size;
+                            bucket_data.buckets_count = 1;
+                            bucket_data.last_update = Some(SystemTime::now());
+                            bucket_data.buckets_usage.insert(bucket_name.clone(), bucket_usage.clone());
+                            bucket_data.bucket_sizes.insert(bucket_name.clone(), bucket_usage.size);
 
-                    // Update existing bucket data
-                    bucket_data.objects_total_count = bucket_objects;
-                    if let Some(bucket_usage) = bucket_data.buckets_usage.get_mut(bucket_name) {
-                        bucket_usage.objects_count = bucket_objects;
-                        bucket_usage.size = bucket_objects * 1024; // Estimate 1KB per object
+                            debug!("Updated data usage for bucket {}: {} objects", bucket_name, bucket_objects);
+                        }
+                        Err(e) => {
+                            warn!("Failed to compute usage for bucket {}: {}", bucket_name, e);
+                        }
                     }
-
-                    debug!("Updated data usage for bucket {}: {} objects", bucket_name, bucket_objects);
                 }
 
                 debug!("Data usage statistics updated for {} buckets", buckets_len);
@@ -483,63 +486,6 @@ impl Scanner {
         }
 
         Ok(())
-    }
-    async fn count_objects_in_bucket(&self, ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>, bucket_name: &str) -> u64 {
-        // Use filesystem scanning approach
-
-        // Get first disk path for scanning
-        let mut total_objects = 0u64;
-
-        for pool in &ecstore.pools {
-            for set_disks in &pool.disk_set {
-                let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
-                if let Some(disk) = disks.first() {
-                    let bucket_path = disk.path().join(bucket_name);
-                    if bucket_path.exists() {
-                        if let Ok(entries) = std::fs::read_dir(&bucket_path) {
-                            let object_count = entries
-                                .filter_map(|entry| entry.ok())
-                                .filter(|entry| {
-                                    if let Ok(file_type) = entry.file_type() {
-                                        file_type.is_dir()
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .filter(|entry| {
-                                    // Skip hidden/system directories
-                                    if let Some(name) = entry.file_name().to_str() {
-                                        !name.starts_with('.')
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .count() as u64;
-
-                            debug!(
-                                "Filesystem scan found {} objects in bucket {} on disk {:?}",
-                                object_count,
-                                bucket_name,
-                                disk.path()
-                            );
-                            total_objects = object_count; // Use count from first disk
-                            break;
-                        }
-                    }
-                }
-            }
-            if total_objects > 0 {
-                break;
-            }
-        }
-
-        if total_objects == 0 {
-            // Fallback: assume 1 object if bucket exists
-            debug!("Using fallback count of 1 for bucket {}", bucket_name);
-            1
-        } else {
-            total_objects
-        }
     }
 
     /// Process bucket objects for lifecycle actions

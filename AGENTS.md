@@ -1,19 +1,22 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
-The workspace root defines shared dependencies in `Cargo.toml`. The service binary lives in `rustfs/` with entrypoints under `src/main.rs`. Crypto, IAM, and KMS components sit in `crates/` (notably `crates/crypto`, `crates/iam`, `crates/kms`). End-to-end fixtures are in `crates/e2e_test/` and `test_standalone/`. Operational tooling resides in `scripts/`, while deployment manifests are under `deploy/` and Docker assets at the root. Before editing, skim a crate’s README or module-level docs to confirm its responsibility.
-
-## Build, Test, and Development Commands
-Use `cargo build --release` for optimized binaries, or run `./build-rustfs.sh --dev` when iterating locally; `make build` mirrors the release pipeline. Cross-platform builds rely on `./build-rustfs.sh --platform <target>` or `make build-cross-all`. Validate code early with `cargo check --all-targets`. Run unit coverage using `cargo test --workspace --exclude e2e_test` and prefer `cargo nextest run --all --exclude e2e_test` if installed. Execute `make pre-commit` (fmt, clippy, check, test) before every push. After generating code, always run `make clippy` and ensure it completes successfully before proceeding.
-
-## Coding Style & Naming Conventions
-Formatting follows `rustfmt.toml` (130-column width, async-friendly wrapping). Adopt `snake_case` for items, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Avoid `unwrap()` and `expect()` outside tests; propagate errors with `Result` and crate-specific `thiserror` types. Keep async code non-blocking—use `tokio::task::spawn_blocking` if CPU-heavy work is unavoidable. Document public APIs with focused `///` comments that cover parameters, errors, and examples.
-
-## Testing Guidelines
-Co-locate unit tests with modules and use behavior-led names such as `handles_expired_token`. Place integration suites in `tests/` folders and exhaustive flows in `crates/e2e_test/`. For KMS validation, clear proxies and run `NO_PROXY=127.0.0.1,localhost HTTP_PROXY= HTTPS_PROXY= cargo test --package e2e_test kms:: -- --nocapture --test-threads=1`. Always finish by running `cargo test --all` to ensure coverage across crates.
-
-## Commit & Pull Request Guidelines
-Create feature branches (`feat/...`, `fix/...`, `refactor/...`) after syncing `main`; never commit directly to the protected branch. Commits must align with Conventional Commits (e.g., `feat: add kms key rotation`) and remain under 72 characters. Each commit should compile, format cleanly, pass clippy with `-D warnings`, and include relevant tests. Open pull requests with `gh pr create`, provide a concise summary, list verification commands, and wait for reviewer approval before merging.
-
 ## Communication Rules
 - Respond to the user in Chinese; use English in all other contexts.
+
+## Project Structure & Module Organization
+The workspace root hosts shared dependencies in `Cargo.toml`. The service binary lives under `rustfs/src/main.rs`, while reusable crates sit in `crates/` (`crypto`, `iam`, `kms`, and `e2e_test`). Local fixtures for standalone flows reside in `test_standalone/`, deployment manifests are under `deploy/`, Docker assets sit at the root, and automation lives in `scripts/`. Skim each crate’s README or module docs before contributing changes.
+
+## Build, Test, and Development Commands
+Run `cargo check --all-targets` for fast validation. Build release binaries via `cargo build --release` or the pipeline-aligned `make build`. Use `./build-rustfs.sh --dev` for iterative development and `./build-rustfs.sh --platform <target>` for cross-compiles. Prefer `make pre-commit` before pushing to cover formatting, clippy, checks, and tests.
+
+## Coding Style & Naming Conventions
+Formatting follows the repo `rustfmt.toml` (130-column width). Use `snake_case` for items, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Avoid `unwrap()` or `expect()` outside tests; bubble errors with `Result` and crate-specific `thiserror` types. Keep async code non-blocking and offload CPU-heavy work with `tokio::task::spawn_blocking` when necessary.
+
+## Testing Guidelines
+Co-locate unit tests with their modules and give behavior-led names such as `handles_expired_token`. Integration suites belong in each crate’s `tests/` directory, while exhaustive end-to-end scenarios live in `crates/e2e_test/`. Run `cargo test --workspace --exclude e2e_test` during iteration, `cargo nextest run --all --exclude e2e_test` when available, and finish with `cargo test --all` before requesting review. Use `NO_PROXY=127.0.0.1,localhost HTTP_PROXY= HTTPS_PROXY=` for KMS e2e tests.
+
+## Commit & Pull Request Guidelines
+Work on feature branches (e.g., `feat/...`) after syncing `main`. Follow Conventional Commits under 72 characters (e.g., `feat: add kms key rotation`). Each commit must compile, format cleanly, and pass `make pre-commit`. Open PRs with a concise summary, note verification commands, link relevant issues, and wait for reviewer approval.
+
+## Security & Configuration Tips
+Do not commit secrets or cloud credentials; prefer environment variables or vault tooling. Review IAM- and KMS-related changes with a second maintainer. Confirm proxy settings before running sensitive tests to avoid leaking traffic outside localhost.
