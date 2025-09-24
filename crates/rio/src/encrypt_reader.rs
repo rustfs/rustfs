@@ -23,6 +23,7 @@ use rustfs_utils::{put_uvarint, put_uvarint_len};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+use tracing::debug;
 
 pin_project! {
     /// A reader wrapper that encrypts data on the fly using AES-256-GCM.
@@ -119,7 +120,7 @@ where
                     header[5] = ((crc >> 8) & 0xFF) as u8;
                     header[6] = ((crc >> 16) & 0xFF) as u8;
                     header[7] = ((crc >> 24) & 0xFF) as u8;
-                    println!(
+                    debug!(
                         "encrypt block header typ=0 len={} header={:?} plaintext_len={} ciphertext_len={}",
                         clen,
                         header,
@@ -184,7 +185,10 @@ pin_project! {
         #[pin]
         pub inner: R,
         key: [u8; 32],   // AES-256-GCM key
-        nonce: [u8; 12], // 96-bit nonce for GCM
+        base_nonce: [u8; 12], // Base nonce recorded in object metadata
+        current_nonce: [u8; 12], // Active nonce for the current encrypted segment
+        multipart_mode: bool,
+        current_part: usize,
         buffer: Vec<u8>,
         buffer_pos: usize,
         finished: bool,
@@ -206,7 +210,35 @@ where
         Self {
             inner,
             key,
-            nonce,
+            base_nonce: nonce,
+            current_nonce: nonce,
+            multipart_mode: false,
+            current_part: 0,
+            buffer: Vec::new(),
+            buffer_pos: 0,
+            finished: false,
+            header_buf: [0u8; 8],
+            header_read: 0,
+            header_done: false,
+            ciphertext_buf: None,
+            ciphertext_read: 0,
+            ciphertext_len: 0,
+        }
+    }
+
+    pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12]) -> Self {
+        let first_part = 1;
+        let initial_nonce = derive_part_nonce(&base_nonce, first_part);
+
+        debug!("decrypt_reader: initialized multipart mode");
+
+        Self {
+            inner,
+            key,
+            base_nonce,
+            current_nonce: initial_nonce,
+            multipart_mode: true,
+            current_part: first_part,
             buffer: Vec::new(),
             buffer_pos: 0,
             finished: false,
@@ -287,7 +319,23 @@ where
             *this.header_done = false;
 
             if typ == 0xFF {
+                if *this.multipart_mode {
+                    debug!(
+                        next_part = *this.current_part + 1,
+                        "decrypt_reader: reached segment terminator, advancing to next part"
+                    );
+                    *this.current_part += 1;
+                    *this.current_nonce = derive_part_nonce(this.base_nonce, *this.current_part);
+                    this.ciphertext_buf.take();
+                    *this.ciphertext_read = 0;
+                    *this.ciphertext_len = 0;
+                    continue;
+                }
+
                 *this.finished = true;
+                this.ciphertext_buf.take();
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
                 continue;
             }
 
@@ -342,10 +390,16 @@ where
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
 
             let cipher = Aes256Gcm::new_from_slice(this.key).expect("key");
-            let nonce = Nonce::from_slice(this.nonce);
+            let nonce = Nonce::from_slice(this.current_nonce);
             let plaintext = cipher
                 .decrypt(nonce, ciphertext)
                 .map_err(|e| std::io::Error::other(format!("decrypt error: {e}")))?;
+
+            debug!(
+                part = *this.current_part,
+                plaintext_len = plaintext.len(),
+                "decrypt_reader: decrypted chunk"
+            );
 
             if plaintext.len() != plaintext_len as usize {
                 this.ciphertext_buf.take();
@@ -405,6 +459,16 @@ where
     fn try_get_index(&self) -> Option<&Index> {
         self.inner.try_get_index()
     }
+}
+
+fn derive_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
+    let mut nonce = *base;
+    let mut suffix = [0u8; 4];
+    suffix.copy_from_slice(&nonce[8..12]);
+    let current = u32::from_be_bytes(suffix);
+    let next = current.wrapping_add(part_number as u32);
+    nonce[8..12].copy_from_slice(&next.to_be_bytes());
+    nonce
 }
 
 #[cfg(test)]
@@ -494,5 +558,43 @@ mod tests {
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 
         assert_eq!(&decrypted, &data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_multipart_segments() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let part_one = vec![0xA5; 512 * 1024];
+        let part_two = vec![0x5A; 256 * 1024];
+
+        async fn encrypt_part(data: &[u8], key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Vec<u8> {
+            let nonce = derive_part_nonce(&base_nonce, part_number);
+            let reader = BufReader::new(Cursor::new(data.to_vec()));
+            let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+            let mut encrypted = Vec::new();
+            encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+            encrypted
+        }
+
+        let encrypted_one = encrypt_part(&part_one, key, base_nonce, 1).await;
+        let encrypted_two = encrypt_part(&part_two, key, base_nonce, 2).await;
+
+        let mut combined = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+        combined.extend_from_slice(&encrypted_one);
+        combined.extend_from_slice(&encrypted_two);
+
+        let reader = BufReader::new(Cursor::new(combined));
+        let mut decrypt_reader = DecryptReader::new_multipart(WarpReader::new(reader), key, base_nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
+        expected.extend_from_slice(&part_one);
+        expected.extend_from_slice(&part_two);
+
+        assert_eq!(decrypted, expected);
     }
 }

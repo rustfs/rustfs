@@ -44,3 +44,6 @@ mod test_runner;
 
 #[cfg(test)]
 mod bucket_default_encryption_test;
+
+#[cfg(test)]
+mod encryption_metadata_test;
