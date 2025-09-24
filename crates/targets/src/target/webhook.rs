@@ -128,7 +128,7 @@ where
         // Build HTTP client
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(rustfs_utils::user_agent::get_user_agent(rustfs_utils::user_agent::ServiceType::Basis));
+            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
 
         // Supplementary certificate processing logic
         if !args.client_cert.is_empty() && !args.client_key.is_empty() {

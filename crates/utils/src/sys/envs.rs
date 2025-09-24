@@ -29,3 +29,14 @@ pub fn get_env_str(key: &str, default: &str) -> String {
 pub fn get_env_opt_u64(key: &str) -> Option<u64> {
     env::var(key).ok().and_then(|v| v.parse().ok())
 }
+
+pub fn get_env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}

@@ -78,7 +78,10 @@ mod notify;
 pub mod sys;
 
 #[cfg(feature = "sys")]
-pub use sys::*;
+pub use sys::user_agent::*;
+
+#[cfg(feature = "sys")]
+pub use sys::envs::*;
 
 #[cfg(feature = "notify")]
 pub use notify::*;
