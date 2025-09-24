@@ -24,7 +24,11 @@ use ecstore::{
     set_disk::SetDisks,
 };
 use rustfs_ecstore::store_api::ObjectInfo;
-use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
+use rustfs_ecstore::{
+    self as ecstore,
+    StorageAPI,
+    data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
+};
 use rustfs_filemeta::{MetacacheReader, VersionType};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -613,6 +617,21 @@ impl Scanner {
             }
         });
 
+        // Trigger an immediate data usage collection so that admin APIs have fresh data after startup.
+        let scanner = self.clone_for_background();
+        tokio::spawn(async move {
+            let enable_stats = {
+                let cfg = scanner.config.read().await;
+                cfg.enable_data_usage_stats
+            };
+
+            if enable_stats {
+                if let Err(e) = scanner.collect_and_persist_data_usage().await {
+                    warn!("Initial data usage collection failed: {}", e);
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -884,13 +903,50 @@ impl Scanner {
             return Ok(());
         };
 
-        // Build data usage from ECStore directly as fallback
-        let data_usage = self.build_data_usage_from_ecstore(&ecstore).await?;
+        // Run local usage scan and aggregate snapshots; fall back to on-demand build when necessary.
+        let mut data_usage = match local_scan::scan_and_persist_local_usage(ecstore.clone()).await {
+            Ok(outcome) => {
+                info!(
+                    "Local usage scan completed: {} disks with {} snapshot entries",
+                    outcome.disk_status.len(),
+                    outcome.snapshots.len()
+                );
 
-        // Build data usage from ECStore directly for now
+                match aggregate_local_snapshots(ecstore.clone()).await {
+                    Ok((_, mut aggregated)) => {
+                        if aggregated.last_update.is_none() {
+                            aggregated.last_update = Some(SystemTime::now());
+                        }
+                        aggregated
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to aggregate local data usage snapshots, falling back to realtime collection: {}",
+                            e
+                        );
+                        self.build_data_usage_from_ecstore(&ecstore).await?
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Local usage scan failed (using realtime collection instead): {}",
+                    e
+                );
+                self.build_data_usage_from_ecstore(&ecstore).await?
+            }
+        };
+
+        // Make sure bucket counters reflect aggregated content
+        data_usage.buckets_count = data_usage.buckets_usage.len() as u64;
+        if data_usage.last_update.is_none() {
+            data_usage.last_update = Some(SystemTime::now());
+        }
+
+        // Publish to node stats manager
         self.node_scanner.update_data_usage(data_usage.clone()).await;
 
-        // Store to local cache
+        // Store to local cache for quick API responses
         {
             let mut data_usage_guard = self.data_usage_stats.lock().await;
             data_usage_guard.insert("consolidated".to_string(), data_usage.clone());
@@ -914,8 +970,10 @@ impl Scanner {
         });
 
         info!(
-            "Data usage collection completed: {} buckets, {} objects",
-            data_usage.buckets_count, data_usage.objects_total_count
+            "Data usage collection completed: {} buckets, {} objects ({} disks reporting)",
+            data_usage.buckets_count,
+            data_usage.objects_total_count,
+            data_usage.disk_usage_status.len()
         );
 
         Ok(())
@@ -2413,17 +2471,41 @@ impl Scanner {
     async fn legacy_scan_loop(&self) -> Result<()> {
         info!("Starting legacy scan loop for backward compatibility");
 
-        while !get_ahm_services_cancel_token().is_none_or(|t| t.is_cancelled()) {
-            // Update local stats in aggregator
+        loop {
+            if let Some(token) = get_ahm_services_cancel_token() {
+                if token.is_cancelled() {
+                    info!("Cancellation requested, exiting legacy scan loop");
+                    break;
+                }
+            }
+
+            let (enable_data_usage_stats, scan_interval) = {
+                let config = self.config.read().await;
+                (config.enable_data_usage_stats, config.scan_interval)
+            };
+
+            if enable_data_usage_stats {
+                if let Err(e) = self.collect_and_persist_data_usage().await {
+                    warn!("Background data usage collection failed: {}", e);
+                }
+            }
+
+            // Update local stats in aggregator after latest scan
             let local_stats = self.node_scanner.get_stats_summary().await;
             self.stats_aggregator.set_local_stats(local_stats).await;
 
-            // Sleep for scan interval
-            let config = self.config.read().await;
-            let scan_interval = config.scan_interval;
-            drop(config);
-
-            tokio::time::sleep(scan_interval).await;
+            match get_ahm_services_cancel_token() {
+                Some(token) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(scan_interval) => {}
+                        _ = token.cancelled() => {
+                            info!("Cancellation requested, exiting legacy scan loop");
+                            break;
+                        }
+                    }
+                }
+                None => tokio::time::sleep(scan_interval).await,
+            }
         }
 
         Ok(())
