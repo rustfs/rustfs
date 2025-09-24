@@ -2886,20 +2886,18 @@ dependencies = [
  "chrono",
  "flatbuffers",
  "futures",
- "md5",
+ "md5 0.8.0",
  "rand 0.9.2",
  "reqwest",
  "rmp-serde",
  "rustfs-ecstore",
  "rustfs-filemeta",
- "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-protos",
  "serde",
  "serde_json",
  "serial_test",
- "tempfile",
  "tokio",
  "tonic 0.14.2",
  "tracing",
@@ -4413,6 +4411,12 @@ name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
+name = "md5"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
 
 [[package]]
 name = "memchr"
@@ -6203,14 +6207,13 @@ dependencies = [
  "hyper-util",
  "libsystemd",
  "matchit",
- "md5",
+ "md5 0.8.0",
  "mimalloc",
  "mime_guess",
  "opentelemetry",
  "percent-encoding",
  "pin-project-lite",
  "pprof",
- "rand 0.9.2",
  "reqwest",
  "rust-embed",
  "rustfs-ahm",
@@ -6238,7 +6241,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "serial_test",
  "shadow-rs",
  "socket2 0.6.0",
  "sysctl",
@@ -6254,7 +6256,6 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
- "tracing-subscriber",
  "url",
  "urlencoding",
  "uuid",
@@ -6504,24 +6505,19 @@ name = "rustfs-kms"
 version = "0.0.5"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "async-trait",
  "base64 0.22.1",
- "bytes",
  "chacha20poly1305",
  "chrono",
- "futures",
- "md5",
+ "md5 0.8.0",
  "moka",
  "once_cell",
  "rand 0.9.2",
  "reqwest",
- "rustfs-crypto",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "test-case",
  "thiserror 2.0.16",
  "tokio",
  "tokio-test",
@@ -6713,7 +6709,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hyper 1.7.0",
- "md5",
+ "md5 0.7.0",
  "once_cell",
  "regex",
  "reqwest",
