@@ -12,11 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+    time::SystemTime,
+};
 
-use crate::{bucket::metadata_sys::get_replication_config, config::com::read_config, store::ECStore, store_api::StorageAPI};
+pub mod local_snapshot;
+pub use local_snapshot::{
+    DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
+    data_usage_dir, data_usage_state_dir, ensure_data_usage_layout, read_snapshot as read_local_snapshot, snapshot_file_name,
+    snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot,
+};
+
+use crate::{
+    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, store::ECStore, store_api::StorageAPI,
+};
 use rustfs_common::data_usage::{
-    BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, SizeSummary,
+    BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 use tracing::{error, info, warn};
@@ -146,6 +159,105 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     Ok(data_usage_info)
 }
 
+/// Aggregate usage information from local disk snapshots.
+pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskUsageStatus>, DataUsageInfo), Error> {
+    let mut aggregated = DataUsageInfo::default();
+    let mut latest_update: Option<SystemTime> = None;
+    let mut statuses: Vec<DiskUsageStatus> = Vec::new();
+
+    for (pool_idx, pool) in store.pools.iter().enumerate() {
+        for set_disks in pool.disk_set.iter() {
+            let disk_entries = {
+                let guard = set_disks.disks.read().await;
+                guard.clone()
+            };
+
+            for (disk_index, disk_opt) in disk_entries.into_iter().enumerate() {
+                let Some(disk) = disk_opt else {
+                    continue;
+                };
+
+                if !disk.is_local() {
+                    continue;
+                }
+
+                let disk_id = match disk.get_disk_id().await.map_err(Error::from)? {
+                    Some(id) => id.to_string(),
+                    None => continue,
+                };
+
+                let root = disk.path();
+                let mut status = DiskUsageStatus {
+                    disk_id: disk_id.clone(),
+                    pool_index: Some(pool_idx),
+                    set_index: Some(set_disks.set_index),
+                    disk_index: Some(disk_index),
+                    last_update: None,
+                    snapshot_exists: false,
+                };
+
+                if let Some(mut snapshot) = read_local_snapshot(root.as_path(), &disk_id).await? {
+                    status.last_update = snapshot.last_update;
+                    status.snapshot_exists = true;
+
+                    if snapshot.meta.disk_id.is_empty() {
+                        snapshot.meta.disk_id = disk_id.clone();
+                    }
+                    if snapshot.meta.pool_index.is_none() {
+                        snapshot.meta.pool_index = Some(pool_idx);
+                    }
+                    if snapshot.meta.set_index.is_none() {
+                        snapshot.meta.set_index = Some(set_disks.set_index);
+                    }
+                    if snapshot.meta.disk_index.is_none() {
+                        snapshot.meta.disk_index = Some(disk_index);
+                    }
+
+                    snapshot.recompute_totals();
+
+                    if let Some(update) = snapshot.last_update {
+                        if latest_update.is_none_or(|current| update > current) {
+                            latest_update = Some(update);
+                        }
+                    }
+
+                    aggregated.objects_total_count = aggregated.objects_total_count.saturating_add(snapshot.objects_total_count);
+                    aggregated.versions_total_count =
+                        aggregated.versions_total_count.saturating_add(snapshot.versions_total_count);
+                    aggregated.delete_markers_total_count = aggregated
+                        .delete_markers_total_count
+                        .saturating_add(snapshot.delete_markers_total_count);
+                    aggregated.objects_total_size = aggregated.objects_total_size.saturating_add(snapshot.objects_total_size);
+
+                    for (bucket, usage) in snapshot.buckets_usage.into_iter() {
+                        let bucket_size = usage.size;
+                        match aggregated.buckets_usage.entry(bucket.clone()) {
+                            Entry::Occupied(mut entry) => entry.get_mut().merge(&usage),
+                            Entry::Vacant(entry) => {
+                                entry.insert(usage.clone());
+                            }
+                        }
+
+                        aggregated
+                            .bucket_sizes
+                            .entry(bucket)
+                            .and_modify(|size| *size = size.saturating_add(bucket_size))
+                            .or_insert(bucket_size);
+                    }
+                }
+
+                statuses.push(status);
+            }
+        }
+    }
+
+    aggregated.buckets_count = aggregated.buckets_usage.len() as u64;
+    aggregated.last_update = latest_update;
+    aggregated.disk_usage_status = statuses.clone();
+
+    Ok((statuses, aggregated))
+}
+
 /// Calculate accurate bucket usage statistics by enumerating objects through the object layer.
 pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Result<BucketUsageInfo, Error> {
     let mut continuation: Option<String> = None;
@@ -208,11 +320,13 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
         versions_count = objects_count;
     }
 
-    let mut usage = BucketUsageInfo::default();
-    usage.size = total_size;
-    usage.objects_count = objects_count;
-    usage.versions_count = versions_count;
-    usage.delete_markers_count = delete_markers;
+    let usage = BucketUsageInfo {
+        size: total_size,
+        objects_count,
+        versions_count,
+        delete_markers_count: delete_markers,
+        ..Default::default()
+    };
 
     Ok(usage)
 }

@@ -18,6 +18,7 @@ pub mod histogram;
 pub mod io_monitor;
 pub mod io_throttler;
 pub mod lifecycle;
+pub mod local_scan;
 pub mod local_stats;
 pub mod metrics;
 pub mod node_scanner;

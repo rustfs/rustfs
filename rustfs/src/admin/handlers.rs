@@ -30,7 +30,9 @@ use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
-use rustfs_ecstore::data_usage::{compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend};
+use rustfs_ecstore::data_usage::{
+    aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
+};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
@@ -437,10 +439,30 @@ impl Operation for DataUsageInfoHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
-            error!("load_data_usage_from_backend failed {:?}", e);
-            s3_error!(InternalError, "load_data_usage_from_backend failed")
-        })?;
+        let (disk_statuses, mut info) = match aggregate_local_snapshots(store.clone()).await {
+            Ok((statuses, usage)) => (statuses, usage),
+            Err(err) => {
+                warn!("aggregate_local_snapshots failed: {:?}", err);
+                (
+                    Vec::new(),
+                    load_data_usage_from_backend(store.clone()).await.map_err(|e| {
+                        error!("load_data_usage_from_backend failed {:?}", e);
+                        s3_error!(InternalError, "load_data_usage_from_backend failed")
+                    })?,
+                )
+            }
+        };
+
+        let snapshots_available = disk_statuses.iter().any(|status| status.snapshot_exists);
+        if !snapshots_available {
+            if let Ok(fallback) = load_data_usage_from_backend(store.clone()).await {
+                let mut fallback_info = fallback;
+                fallback_info.disk_usage_status = disk_statuses.clone();
+                info = fallback_info;
+            }
+        } else {
+            info.disk_usage_status = disk_statuses.clone();
+        }
 
         let last_update_age = info.last_update.and_then(|ts| ts.elapsed().ok());
         let data_missing = info.objects_total_count == 0 && info.buckets_count == 0;
@@ -475,6 +497,8 @@ impl Operation for DataUsageInfoHandler {
                 }
             });
         }
+
+        info.disk_usage_status = disk_statuses;
 
         // Set capacity information
         let sinfo = store.storage_info().await;
@@ -1219,6 +1243,7 @@ async fn collect_realtime_data_usage(
     info.last_update = Some(std::time::SystemTime::now());
     info.buckets_usage.clear();
     info.bucket_sizes.clear();
+    info.disk_usage_status.clear();
     info.objects_total_count = 0;
     info.objects_total_size = 0;
     info.versions_total_count = 0;
