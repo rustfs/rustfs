@@ -97,6 +97,7 @@ fn print_server_info() {
 
 fn main() -> Result<()> {
     let mut builder = server::get_tokio_runtime_builder();
+    builder.enable_all();
     if server::print_tokio_thread_enable() {
         builder.on_thread_start(|| {
             println!(
