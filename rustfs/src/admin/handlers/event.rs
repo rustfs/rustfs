@@ -159,12 +159,6 @@ impl Operation for NotificationTarget {
             warn!("failed to read request body: {:?}", e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;
-        let mut kvs_map: HashMap<String, String> = serde_json::from_slice(&body)
-            .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
-        // If there is an enable key, add an enable key value to "on"
-        if !kvs_map.contains_key(ENABLE_KEY) {
-            kvs_map.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
-        }
 
         // 1. Get the allowed key range
         let allowed_keys: std::collections::HashSet<&str> = match target_type {

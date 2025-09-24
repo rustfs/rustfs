@@ -31,15 +31,12 @@ workspace = true
 # Core dependencies
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-futures = { workspace = true }
-bytes = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 once_cell = { workspace = true }
 
 # Cryptography
@@ -62,15 +59,11 @@ md5 = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
-vaultrs = { version = "0.7.2" }
-
-# Internal dependencies
-rustfs-crypto = { workspace = true }
+vaultrs = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
-test-case = { workspace = true }
 
 [features]
 default = []

@@ -25,7 +25,6 @@ mod storage;
 mod update;
 mod version;
 
-// Ensure the correct path for parse_license is imported
 use crate::admin::console::init_console_cfg;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
@@ -41,20 +40,20 @@ use rustfs_ahm::{
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
-use rustfs_ecstore::config as ecconfig;
-use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
-use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
+    bucket::metadata_sys,
+    bucket::metadata_sys::init_bucket_metadata_sys,
+    cmd::bucket_replication::init_bucket_replication_pool,
+    config as ecconfig,
+    config::GLOBAL_CONFIG_SYS,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -62,7 +61,6 @@ use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
-// KMS is now managed dynamically via API
 use s3s::s3_error;
 use std::io::{Error, Result};
 use std::str::FromStr;
@@ -97,8 +95,29 @@ fn print_server_info() {
     info!("Docs: https://rustfs.com/docs/");
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut builder = server::get_tokio_runtime_builder();
+    builder.enable_all();
+    if server::print_tokio_thread_enable() {
+        builder.on_thread_start(|| {
+            println!(
+                "RustFS Worker Thread running - initializing resources time: {:?}, thread id: {:?}",
+                chrono::Utc::now().to_rfc3339(),
+                std::thread::current().id()
+            );
+        });
+        builder.on_thread_stop(|| {
+            println!(
+                "RustFS Worker Thread stopping - cleaning up resources time: {:?}, thread id: {:?}",
+                chrono::Utc::now().to_rfc3339(),
+                std::thread::current().id()
+            )
+        });
+    }
+    let runtime = builder.build().expect("Failed to build Tokio runtime");
+    runtime.block_on(async_main())
+}
+async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
