@@ -457,6 +457,7 @@ impl DecentralizedStatsAggregator {
             aggregated.total_heal_triggered += summary.total_heal_triggered;
             aggregated.total_disks += summary.total_disks;
             aggregated.total_buckets += summary.total_buckets;
+            aggregated.aggregated_data_usage.merge(&summary.data_usage);
 
             // aggregate scan progress
             aggregated
@@ -569,4 +570,203 @@ pub struct CacheStatus {
     pub is_valid: bool,
     /// cache ttl
     pub ttl: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::node_scanner::{BucketScanState, ScanProgress};
+    use rustfs_common::data_usage::{BucketUsageInfo, DataUsageInfo};
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn aggregated_stats_merge_data_usage() {
+        let aggregator = DecentralizedStatsAggregator::new(DecentralizedStatsAggregatorConfig::default());
+
+        let mut data_usage = DataUsageInfo::default();
+        let bucket_usage = BucketUsageInfo {
+            objects_count: 5,
+            size: 1024,
+            ..Default::default()
+        };
+        data_usage.buckets_usage.insert("bucket".to_string(), bucket_usage);
+        data_usage.objects_total_count = 5;
+        data_usage.objects_total_size = 1024;
+
+        let summary = StatsSummary {
+            node_id: "local-node".to_string(),
+            total_objects_scanned: 10,
+            total_healthy_objects: 9,
+            total_corrupted_objects: 1,
+            total_bytes_scanned: 2048,
+            total_scan_errors: 0,
+            total_heal_triggered: 0,
+            total_disks: 2,
+            total_buckets: 1,
+            last_update: SystemTime::now(),
+            scan_progress: ScanProgress::default(),
+            data_usage: data_usage.clone(),
+        };
+
+        aggregator.set_local_stats(summary).await;
+
+        // Wait briefly to ensure async cache writes settle in high-concurrency environments
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let aggregated = aggregator.get_aggregated_stats().await.expect("aggregated stats");
+
+        assert_eq!(aggregated.node_count, 1);
+        assert!(aggregated.node_summaries.contains_key("local-node"));
+        assert_eq!(aggregated.aggregated_data_usage.objects_total_count, 5);
+        assert_eq!(
+            aggregated
+                .aggregated_data_usage
+                .buckets_usage
+                .get("bucket")
+                .expect("bucket usage present")
+                .objects_count,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregated_stats_merge_multiple_nodes() {
+        let aggregator = DecentralizedStatsAggregator::new(DecentralizedStatsAggregatorConfig::default());
+
+        let mut local_usage = DataUsageInfo::default();
+        let local_bucket = BucketUsageInfo {
+            objects_count: 3,
+            versions_count: 3,
+            size: 150,
+            ..Default::default()
+        };
+        local_usage.buckets_usage.insert("local-bucket".to_string(), local_bucket);
+        local_usage.calculate_totals();
+        local_usage.buckets_count = local_usage.buckets_usage.len() as u64;
+        local_usage.last_update = Some(SystemTime::now());
+
+        let local_progress = ScanProgress {
+            current_cycle: 1,
+            completed_disks: {
+                let mut set = std::collections::HashSet::new();
+                set.insert("disk-local".to_string());
+                set
+            },
+            completed_buckets: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "local-bucket".to_string(),
+                    BucketScanState {
+                        completed: true,
+                        last_object_key: Some("obj1".to_string()),
+                        objects_scanned: 3,
+                        scan_timestamp: SystemTime::now(),
+                    },
+                );
+                map
+            },
+            ..Default::default()
+        };
+
+        let local_summary = StatsSummary {
+            node_id: "node-local".to_string(),
+            total_objects_scanned: 30,
+            total_healthy_objects: 30,
+            total_corrupted_objects: 0,
+            total_bytes_scanned: 1500,
+            total_scan_errors: 0,
+            total_heal_triggered: 0,
+            total_disks: 1,
+            total_buckets: 1,
+            last_update: SystemTime::now(),
+            scan_progress: local_progress,
+            data_usage: local_usage.clone(),
+        };
+
+        let mut remote_usage = DataUsageInfo::default();
+        let remote_bucket = BucketUsageInfo {
+            objects_count: 5,
+            versions_count: 5,
+            size: 250,
+            ..Default::default()
+        };
+        remote_usage.buckets_usage.insert("remote-bucket".to_string(), remote_bucket);
+        remote_usage.calculate_totals();
+        remote_usage.buckets_count = remote_usage.buckets_usage.len() as u64;
+        remote_usage.last_update = Some(SystemTime::now());
+
+        let remote_progress = ScanProgress {
+            current_cycle: 2,
+            completed_disks: {
+                let mut set = std::collections::HashSet::new();
+                set.insert("disk-remote".to_string());
+                set
+            },
+            completed_buckets: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "remote-bucket".to_string(),
+                    BucketScanState {
+                        completed: true,
+                        last_object_key: Some("remote-obj".to_string()),
+                        objects_scanned: 5,
+                        scan_timestamp: SystemTime::now(),
+                    },
+                );
+                map
+            },
+            ..Default::default()
+        };
+
+        let remote_summary = StatsSummary {
+            node_id: "node-remote".to_string(),
+            total_objects_scanned: 50,
+            total_healthy_objects: 48,
+            total_corrupted_objects: 2,
+            total_bytes_scanned: 2048,
+            total_scan_errors: 1,
+            total_heal_triggered: 1,
+            total_disks: 2,
+            total_buckets: 1,
+            last_update: SystemTime::now(),
+            scan_progress: remote_progress,
+            data_usage: remote_usage.clone(),
+        };
+        let node_summaries: HashMap<_, _> = [
+            (local_summary.node_id.clone(), local_summary.clone()),
+            (remote_summary.node_id.clone(), remote_summary.clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        let aggregated = aggregator.aggregate_node_summaries(node_summaries, SystemTime::now()).await;
+
+        assert_eq!(aggregated.node_count, 2);
+        assert_eq!(aggregated.total_objects_scanned, 80);
+        assert_eq!(aggregated.total_corrupted_objects, 2);
+        assert_eq!(aggregated.total_disks, 3);
+        assert!(aggregated.node_summaries.contains_key("node-local"));
+        assert!(aggregated.node_summaries.contains_key("node-remote"));
+
+        assert_eq!(
+            aggregated.aggregated_data_usage.objects_total_count,
+            local_usage.objects_total_count + remote_usage.objects_total_count
+        );
+        assert_eq!(
+            aggregated.aggregated_data_usage.objects_total_size,
+            local_usage.objects_total_size + remote_usage.objects_total_size
+        );
+
+        let mut expected_buckets: HashSet<&str> = HashSet::new();
+        expected_buckets.insert("local-bucket");
+        expected_buckets.insert("remote-bucket");
+        let actual_buckets: HashSet<&str> = aggregated
+            .aggregated_data_usage
+            .buckets_usage
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(expected_buckets, actual_buckets);
+    }
 }

@@ -349,6 +349,7 @@ impl LocalStatsManager {
             total_buckets: stats.buckets_stats.len(),
             last_update: stats.last_update,
             scan_progress: stats.scan_progress.clone(),
+            data_usage: stats.data_usage.clone(),
         }
     }
 
@@ -427,4 +428,6 @@ pub struct StatsSummary {
     pub last_update: SystemTime,
     /// scan progress
     pub scan_progress: super::node_scanner::ScanProgress,
+    /// data usage snapshot for the node
+    pub data_usage: DataUsageInfo,
 }
