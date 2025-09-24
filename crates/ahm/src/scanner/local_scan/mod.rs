@@ -11,7 +11,6 @@ use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
 
-use rustfs_common::data_usage::BucketUsageInfo;
 use rustfs_common::data_usage::DiskUsageStatus;
 use rustfs_ecstore::data_usage::{
     LocalUsageSnapshot, LocalUsageSnapshotMeta, data_usage_state_dir, ensure_data_usage_layout, snapshot_file_name,
@@ -173,7 +172,7 @@ fn scan_disk_blocking(root: PathBuf, meta: LocalUsageSnapshotMeta, mut state: In
             continue;
         };
 
-        let Some(rel_path) = object_dir.strip_prefix(&root).ok().map(|p| normalize_path(p)) else {
+        let Some(rel_path) = object_dir.strip_prefix(&root).ok().map(normalize_path) else {
             continue;
         };
 
@@ -332,10 +331,7 @@ fn build_snapshot(
     let mut snapshot = LocalUsageSnapshot::new(meta);
 
     for usage in objects.values() {
-        let bucket_entry = snapshot
-            .buckets_usage
-            .entry(usage.bucket.clone())
-            .or_insert_with(BucketUsageInfo::default);
+        let bucket_entry = snapshot.buckets_usage.entry(usage.bucket.clone()).or_default();
 
         if usage.has_live_object {
             bucket_entry.objects_count = bucket_entry.objects_count.saturating_add(1);
@@ -478,10 +474,12 @@ mod tests {
     }
 
     #[test]
-    fn compute_object_usage_skips_non_primary_disk() {
+    fn compute_object_usage_handles_non_primary_disk() {
         let file_meta = build_file_meta_with_object(1, 2048);
-        let record = compute_object_usage("bucket", "obj", &file_meta).expect("compute usage");
-        assert!(record.is_none(), "non-primary shard should not produce record");
+        let record = compute_object_usage("bucket", "obj", &file_meta)
+            .expect("compute usage")
+            .expect("record should exist for non-primary shard");
+        assert!(record.usage.has_live_object);
     }
 
     #[test]

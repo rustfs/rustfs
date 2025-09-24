@@ -402,9 +402,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE
                             {
                                 let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
-                                if due.is_some()
-                                    && (now.unix_timestamp() >= due.unwrap().unix_timestamp())
-                                {
+                                if due.is_some() && (now.unix_timestamp() >= due.unwrap().unix_timestamp()) {
                                     events.push(Event {
                                         action: IlmAction::TransitionVersionAction,
                                         rule_id: rule.id.clone().expect("err!"),
@@ -436,9 +434,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
                             let date0 = OffsetDateTime::from(date.clone());
-                            if date0.unix_timestamp() != 0
-                                && (now.unix_timestamp() >= date0.unix_timestamp())
-                            {
+                            if date0.unix_timestamp() != 0 && (now.unix_timestamp() >= date0.unix_timestamp()) {
                                 info!("eval_inner: expiration by date - date0={:?}", date0);
                                 events.push(Event {
                                     action: IlmAction::DeleteAction,
@@ -485,9 +481,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         if let Some(ref transitions) = rule.transitions {
                             let due = transitions[0].next_due(obj);
                             if let Some(due) = due {
-                                if due.unix_timestamp() > 0
-                                    && (now.unix_timestamp() >= due.unix_timestamp())
-                                {
+                                if due.unix_timestamp() > 0 && (now.unix_timestamp() >= due.unix_timestamp()) {
                                     events.push(Event {
                                         action: IlmAction::TransitionAction,
                                         rule_id: rule.id.clone().expect("err!"),

@@ -25,8 +25,7 @@ use ecstore::{
 };
 use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_ecstore::{
-    self as ecstore,
-    StorageAPI,
+    self as ecstore, StorageAPI,
     data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
 };
 use rustfs_filemeta::{MetacacheReader, VersionType};
@@ -929,10 +928,7 @@ impl Scanner {
                 }
             }
             Err(e) => {
-                warn!(
-                    "Local usage scan failed (using realtime collection instead): {}",
-                    e
-                );
+                warn!("Local usage scan failed (using realtime collection instead): {}", e);
                 self.build_data_usage_from_ecstore(&ecstore).await?
             }
         };
