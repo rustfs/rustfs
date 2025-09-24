@@ -136,7 +136,7 @@ mimalloc = "0.1"
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 
 [dev-dependencies]
-serial_test = "3.1"
+serial_test = "3.2"
 uuid = { workspace = true, features = ["v4"] }
 tracing-subscriber = { workspace = true }
 

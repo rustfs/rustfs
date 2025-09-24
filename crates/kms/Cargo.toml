@@ -62,7 +62,7 @@ md5 = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
-vaultrs = { version = "0.7.2" }
+vaultrs = { version = "0.7.4" }
 
 # Internal dependencies
 rustfs-crypto = { workspace = true }
