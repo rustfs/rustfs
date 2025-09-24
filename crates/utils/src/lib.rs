@@ -77,5 +77,8 @@ mod notify;
 #[cfg(feature = "sys")]
 pub mod sys;
 
+#[cfg(feature = "sys")]
+pub use sys::*;
+
 #[cfg(feature = "notify")]
 pub use notify::*;

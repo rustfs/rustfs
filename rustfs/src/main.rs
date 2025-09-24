@@ -40,7 +40,12 @@ use rustfs_ahm::{
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
-use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
+use rustfs_config::{
+    DEFAULT_GLOBAL_QUEUE_INTERVAL, DEFAULT_MAX_BLOCKING_THREADS, DEFAULT_RNG_SEED, DEFAULT_THREAD_KEEP_ALIVE,
+    DEFAULT_THREAD_NAME, DEFAULT_THREAD_STACK_SIZE, DEFAULT_UPDATE_CHECK, DEFAULT_WORKER_THREADS, ENV_GLOBAL_QUEUE_INTERVAL,
+    ENV_MAX_BLOCKING_THREADS, ENV_RNG_SEED, ENV_THREAD_KEEP_ALIVE, ENV_THREAD_NAME, ENV_THREAD_STACK_SIZE, ENV_UPDATE_CHECK,
+    ENV_WORKER_THREADS,
+};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
@@ -61,6 +66,7 @@ use rustfs_iam::init_iam_sys;
 use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
+use rustfs_utils::envs::{get_env_opt_u64, get_env_str, get_env_u32, get_env_u64, get_env_usize};
 use rustfs_utils::net::parse_and_resolve_address;
 // KMS is now managed dynamically via API
 use s3s::s3_error;
@@ -97,8 +103,45 @@ fn print_server_info() {
     info!("Docs: https://rustfs.com/docs/");
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let worker_threads = get_env_usize(ENV_WORKER_THREADS, DEFAULT_WORKER_THREADS);
+    let max_blocking_threads = get_env_usize(ENV_MAX_BLOCKING_THREADS, DEFAULT_MAX_BLOCKING_THREADS);
+    let thread_stack_size = get_env_usize(ENV_THREAD_STACK_SIZE, DEFAULT_THREAD_STACK_SIZE);
+    let thread_keep_alive = get_env_u64(ENV_THREAD_KEEP_ALIVE, DEFAULT_THREAD_KEEP_ALIVE);
+    let global_queue_interval = get_env_u32(ENV_GLOBAL_QUEUE_INTERVAL, DEFAULT_GLOBAL_QUEUE_INTERVAL);
+    let thread_name = get_env_str(ENV_THREAD_NAME, DEFAULT_THREAD_NAME);
+    let rng_seed = get_env_opt_u64(ENV_RNG_SEED).or(DEFAULT_RNG_SEED);
+
+    info!(
+        target: "rustfs::main",
+        worker_threads = worker_threads,
+        max_blocking_threads = max_blocking_threads,
+        thread_stack_size = thread_stack_size,
+        thread_keep_alive = thread_keep_alive,
+        global_queue_interval = global_queue_interval,
+        thread_name = %thread_name,
+        rng_seed = ?rng_seed,
+        "Starting Tokio runtime with configured parameters"
+    );
+    let mut builder = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .thread_stack_size(thread_stack_size)
+        .thread_keep_alive(std::time::Duration::from_secs(thread_keep_alive))
+        .global_queue_interval(global_queue_interval)
+        .enable_all()
+        .thread_name(&thread_name)
+        .on_thread_start(|| info!("RustFS Worker Thread started"))
+        .on_thread_stop(|| info!("RustFS Worker thread stopped - check for leaks"));
+
+    if let Some(seed) = rng_seed {
+        builder = builder.rng_seed(tokio::util::rand::RngSeed::from_u64(seed));
+    }
+
+    let runtime = builder.build().expect("Failed to build Tokio runtime");
+    runtime.block_on(async_main())
+}
+async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
