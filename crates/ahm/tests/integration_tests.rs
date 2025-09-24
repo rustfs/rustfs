@@ -195,6 +195,7 @@ async fn test_distributed_stats_aggregation() {
         total_buckets: 5,
         last_update: std::time::SystemTime::now(),
         scan_progress: Default::default(),
+        data_usage: rustfs_common::data_usage::DataUsageInfo::default(),
     };
 
     aggregator.set_local_stats(local_stats).await;
