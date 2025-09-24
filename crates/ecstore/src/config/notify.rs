@@ -13,17 +13,16 @@
 // limitations under the License.
 
 use crate::config::{KV, KVS};
-use rustfs_config::notify::{
-    MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL,
-    MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
-    WEBHOOK_QUEUE_LIMIT,
+use rustfs_config::{
+    COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
+    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_config::{COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState};
 use std::sync::LazyLock;
 
 /// The default configuration collection of webhooks，
 /// Initialized only once during the program life cycle, enabling high-performance lazy loading.
-pub static DEFAULT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
+pub static DEFAULT_NOTIFY_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),
@@ -70,7 +69,7 @@ pub static DEFAULT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
 });
 
 /// MQTT's default configuration collection
-pub static DEFAULT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
+pub static DEFAULT_NOTIFY_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
             key: ENABLE_KEY.to_owned(),

@@ -16,6 +16,7 @@
 members = [
     "rustfs", # Core file system implementation
     "crates/appauth", # Application authentication and authorization
+    "crates/audit", # Audit target management system with multi-target fan-out
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
     "crates/crypto", # Cryptography and security features
@@ -64,6 +65,7 @@ all = "warn"
 rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
+rustfs-audit = { path = "crates/audit", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
@@ -88,7 +90,7 @@ rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
-anyhow = "1.0.99"
+anyhow = "1.0.100"
 arc-swap = "1.7.1"
 argon2 = { version = "0.5.3", features = ["std"] }
 atoi = "2.0.0"
@@ -98,10 +100,10 @@ async-trait = "0.1.89"
 async-compression = { version = "0.4.19" }
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.6" }
-aws-sdk-s3 = "1.106.0"
+aws-sdk-s3 = { version = "1.106.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
 axum = "0.8.4"
 axum-extra = "0.10.1"
-axum-server = "0.7.2"
+axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"], default-features = false }
 base64-simd = "0.8.0"
 base64 = "0.22.1"
 brotli = "8.0.2"
@@ -112,7 +114,7 @@ cfg-if = "1.0.3"
 crc-fast = "1.3.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.47", features = ["derive", "env"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.7", features = ["html_reports"] }
@@ -123,7 +125,7 @@ derive_builder = "0.20.2"
 enumset = "1.1.10"
 flatbuffers = "25.2.10"
 flate2 = "1.1.2"
-flexi_logger = { version = "0.31.2", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
+flexi_logger = { version = "0.31.3", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
 form_urlencoded = "1.2.2"
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -139,7 +141,7 @@ hyper-util = { version = "0.1.17", features = [
     "server-auto",
     "server-graceful",
 ] }
-hyper-rustls = "0.27.7"
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
 http = "1.3.1"
 http-body = "1.0.1"
 humantime = "2.3.0"
@@ -190,7 +192,7 @@ rdkafka = { version = "0.38.0", features = ["tokio"] }
 reed-solomon-simd = { version = "3.0.1" }
 regex = { version = "1.11.2" }
 reqwest = { version = "0.12.23", default-features = false, features = [
-    "rustls-tls",
+    "rustls-tls-webpki-roots",
     "charset",
     "http2",
     "system-proxy",
@@ -205,12 +207,12 @@ rsa = "0.9.8"
 rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.7.2" }
 rustfs-rsc = "2025.506.1"
-rustls = { version = "0.23.31" }
+rustls = { version = "0.23.32", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-minio-preview.3" }
 schemars = "1.0.4"
-serde = { version = "1.0.225", features = ["derive"] }
+serde = { version = "1.0.226", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
@@ -226,11 +228,11 @@ socket2 = "0.6.0"
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.37.0"
 sysctl = "0.7.1"
-tempfile = "3.22.0"
+tempfile = "3.23.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thiserror = "2.0.16"
-time = { version = "0.3.43", features = [
+time = { version = "0.3.44", features = [
     "std",
     "parsing",
     "formatting",
@@ -238,7 +240,7 @@ time = { version = "0.3.43", features = [
     "serde",
 ] }
 tokio = { version = "1.47.1", features = ["fs", "rt-multi-thread"] }
-tokio-rustls = { version = "0.26.3", default-features = false }
+tokio-rustls = { version = "0.26.3", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
 tokio-test = "0.4.4"
@@ -268,8 +270,9 @@ xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "5.1.1"
 zstd = "0.13.3"
 
+
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "tokio-test"]
+ignored = ["rustfs", "rust-i18n", "rustfs-mcp", "tokio-test", "rustfs-audit"]
 
 [profile.wasm-dev]
 inherits = "dev"

@@ -15,7 +15,7 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use crate::server::console::start_console_server;
+    use crate::server::start_console_server;
     use clap::Parser;
     use tokio::time::{Duration, timeout};
 

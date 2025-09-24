@@ -28,27 +28,24 @@ mod version;
 // Ensure the correct path for parse_license is imported
 use crate::admin::console::init_console_cfg;
 use crate::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_console_server, start_http_server,
-    wait_for_shutdown,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    start_audit_system, start_console_server, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
-use rustfs_ahm::scanner::data_scanner::ScannerConfig;
 use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
+    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
-use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_config::DEFAULT_UPDATE_CHECK;
-use rustfs_config::ENV_UPDATE_CHECK;
+use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
-use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
@@ -274,6 +271,11 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize event notifier
     init_event_notifier().await;
+    // Start the audit system
+    match start_audit_system().await {
+        Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
+        Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
+    }
 
     let buckets_list = store
         .list_bucket(&BucketOptions {
@@ -405,7 +407,21 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
     }
 
     // Stop the notification system
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Shutting down event notifier system..."
+    );
     shutdown_event_notifier().await;
+
+    // Stop the audit system
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Stopping audit system..."
+    );
+    match stop_audit_system().await {
+        Ok(_) => info!("Audit system stopped successfully."),
+        Err(e) => error!("Failed to stop audit system: {}", e),
+    }
 
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -422,58 +438,7 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
         target: "rustfs::main::handle_shutdown",
         "Server stopped current "
     );
-}
-
-#[instrument]
-async fn init_event_notifier() {
-    info!(
-        target: "rustfs::main::init_event_notifier",
-        "Initializing event notifier..."
-    );
-
-    // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_SERVER_CONFIG.get() {
-        Some(config) => config.clone(), // Clone the config to pass ownership
-        None => {
-            error!("Event notifier initialization failed: Global server config not loaded.");
-            return;
-        }
-    };
-
-    info!(
-        target: "rustfs::main::init_event_notifier",
-        "Global server configuration loaded successfully"
-    );
-    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    if server_config
-        .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
-        .is_none()
-        || server_config
-            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-            .is_none()
-    {
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "'notify' subsystem not configured, skipping event notifier initialization."
-        );
-        return;
-    }
-
-    info!(
-        target: "rustfs::main::init_event_notifier",
-        "Event notifier configuration found, proceeding with initialization."
-    );
-
-    // 3. Initialize the notification system asynchronously with a global configuration
-    // Use direct await for better error handling and faster initialization
-    if let Err(e) = rustfs_notify::initialize(server_config).await {
-        error!("Failed to initialize event notifier system: {}", e);
-    } else {
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "Event notifier system initialized successfully."
-        );
-    }
+    println!("Server stopped successfully.");
 }
 
 fn init_update_check() {
@@ -567,28 +532,6 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
             }
         }
     }
-}
-
-/// Shuts down the event notifier system gracefully
-async fn shutdown_event_notifier() {
-    info!("Shutting down event notifier system...");
-
-    if !rustfs_notify::is_notification_system_initialized() {
-        info!("Event notifier system is not initialized, nothing to shut down.");
-        return;
-    }
-
-    let system = match rustfs_notify::notification_system() {
-        Some(sys) => sys,
-        None => {
-            error!("Event notifier system is not initialized.");
-            return;
-        }
-    };
-
-    // Call the shutdown function from the rustfs_notify module
-    system.shutdown().await;
-    info!("Event notifier system shut down successfully.");
 }
 
 /// Initialize KMS system and configure if enabled
