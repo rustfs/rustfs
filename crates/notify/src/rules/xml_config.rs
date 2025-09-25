@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use super::pattern;
+use hashbrown::HashSet;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{ARN, ArnError, TargetIDError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::Read;
 use thiserror::Error;
 

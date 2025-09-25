@@ -14,6 +14,7 @@
 
 use crate::Event;
 use async_trait::async_trait;
+use hashbrown::HashSet;
 use rumqttc::QoS;
 use rustfs_config::notify::{ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS};
 use rustfs_config::{
@@ -27,7 +28,6 @@ use rustfs_targets::{
     error::TargetError,
     target::{mqtt::MQTTArgs, webhook::WebhookArgs},
 };
-use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, warn};
 use url::Url;

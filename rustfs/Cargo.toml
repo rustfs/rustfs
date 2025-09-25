@@ -70,6 +70,7 @@ clap = { workspace = true }
 datafusion = { workspace = true }
 const-str = { workspace = true }
 futures.workspace = true
+hashbrown = { workspace = true }
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true

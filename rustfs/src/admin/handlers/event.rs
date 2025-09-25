@@ -26,7 +26,6 @@ use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
-use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
@@ -470,7 +469,7 @@ impl Operation for SetBucketNotification {
 /// Get notification rules for buckets
 #[derive(Serialize)]
 struct BucketRulesResponse {
-    rules: HashMap<EventName, PatternRules>,
+    rules: hashbrown::HashMap<EventName, PatternRules>,
 }
 pub struct GetBucketNotification {}
 #[async_trait::async_trait]
@@ -491,7 +490,7 @@ impl Operation for GetBucketNotification {
 
         let rules_map = ns.notifier.get_rules_map(&query.bucket_name);
         let response = BucketRulesResponse {
-            rules: rules_map.unwrap_or_default().inner().clone(),
+            rules: rules_map.await.unwrap_or_default().inner().clone(),
         };
 
         let data = serde_json::to_vec(&response)

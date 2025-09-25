@@ -32,6 +32,7 @@ bytes = { workspace = true, optional = true }
 crc32fast = { workspace = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+hashbrown = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
@@ -83,7 +84,7 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls charac
 net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hickory-resolver", "dep:moka", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
 io = ["dep:tokio"]
 path = []
-notify = ["dep:hyper", "dep:s3s"]  # file system notification features
+notify = ["dep:hyper", "dep:s3s", "dep:hashbrown"]  # file system notification features
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex", "dep:rand"]
 crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
