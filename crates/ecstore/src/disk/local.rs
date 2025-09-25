@@ -21,6 +21,7 @@ use super::{
 };
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 
+use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::error::FileAccessDeniedWithContext;
 use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
 use crate::disk::fs::{
@@ -147,8 +148,10 @@ impl LocalDisk {
             }
         };
 
+        ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
+
         if cleanup {
-            // TODO: 删除 tmp 数据
+            // TODO: remove temporary data
         }
 
         // Use optimized path resolution instead of absolutize_virtually
@@ -1997,6 +2000,17 @@ impl DiskAPI for LocalDisk {
             }
         };
 
+        // CLAUDE DEBUG: Check if inline data is being preserved
+        tracing::info!(
+            "CLAUDE DEBUG: rename_data - Adding version to xlmeta. fi.data.is_some()={}, fi.inline_data()={}, fi.size={}",
+            fi.data.is_some(),
+            fi.inline_data(),
+            fi.size
+        );
+        if let Some(ref data) = fi.data {
+            tracing::info!("CLAUDE DEBUG: rename_data - FileInfo has inline data: {} bytes", data.len());
+        }
+
         xlmeta.add_version(fi.clone())?;
 
         if xlmeta.versions.len() <= 10 {
@@ -2004,6 +2018,10 @@ impl DiskAPI for LocalDisk {
         }
 
         let new_dst_buf = xlmeta.marshal_msg()?;
+        tracing::info!(
+            "CLAUDE DEBUG: rename_data - Marshaled xlmeta, new_dst_buf size: {} bytes",
+            new_dst_buf.len()
+        );
 
         self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
             .await?;

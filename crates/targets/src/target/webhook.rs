@@ -128,7 +128,7 @@ where
         // Build HTTP client
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(rustfs_utils::sys::get_user_agent(rustfs_utils::sys::ServiceType::Basis));
+            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
 
         // Supplementary certificate processing logic
         if !args.client_cert.is_empty() && !args.client_key.is_empty() {
@@ -153,7 +153,13 @@ where
         let queue_store = if !args.queue_dir.is_empty() {
             let queue_dir =
                 PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
+
+            let extension = match args.target_type {
+                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
+                TargetType::NotifyEvent => STORE_EXTENSION,
+            };
+
+            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);

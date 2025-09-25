@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
+
 //! Layered DNS resolution utility for Kubernetes environments
 //!
 //! This module provides robust DNS resolution with multiple fallback layers:

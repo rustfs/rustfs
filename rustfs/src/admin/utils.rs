@@ -12,6 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub fn has_space_be(s: &str) -> bool {
+pub(crate) fn has_space_be(s: &str) -> bool {
     s.trim().len() != s.len()
 }
