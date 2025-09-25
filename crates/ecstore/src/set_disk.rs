@@ -3891,7 +3891,10 @@ impl StorageAPI for SetDisks {
             .fast_lock_manager
             .acquire_write_lock("", object, self.locker_owner.as_str())
             .await
-            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
+            .map_err(|err| {
+                debug!("delete_object_version error: {:?}", err);
+                Error::other("can not get lock. please retry".to_string())
+            })?;
         //info!("delete_object_version {:?}", object);
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
