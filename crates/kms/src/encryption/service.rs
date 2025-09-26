@@ -227,7 +227,7 @@ impl ObjectEncryptionService {
                 self.kms_manager
                     .create_key(create_req)
                     .await
-                    .map_err(|e| KmsError::backend_error(format!("Failed to auto-create SSE-S3 key {}: {}", actual_key_id, e)))?;
+                    .map_err(|e| KmsError::backend_error(format!("Failed to auto-create SSE-S3 key {actual_key_id}: {e}")))?;
             }
         } else {
             // For SSE-KMS, key must exist
@@ -235,7 +235,7 @@ impl ObjectEncryptionService {
                 key_id: actual_key_id.to_string(),
             };
             self.kms_manager.describe_key(describe_req).await.map_err(|_| {
-                KmsError::invalid_operation(format!("SSE-KMS key '{}' not found. Please create it first.", actual_key_id))
+                KmsError::invalid_operation(format!("SSE-KMS key '{actual_key_id}' not found. Please create it first."))
             })?;
         }
 
@@ -250,7 +250,7 @@ impl ObjectEncryptionService {
             .kms_manager
             .generate_data_key(request)
             .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to generate data key: {}", e)))?;
+            .map_err(|e| KmsError::backend_error(format!("Failed to generate data key: {e}")))?;
 
         let plaintext_key = data_key.plaintext_key;
 
@@ -325,7 +325,7 @@ impl ObjectEncryptionService {
             .kms_manager
             .decrypt(decrypt_request)
             .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data key: {}", e)))?;
+            .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data key: {e}")))?;
 
         // Create cipher
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;
@@ -379,7 +379,7 @@ impl ObjectEncryptionService {
         // Validate key MD5 if provided
         if let Some(expected_md5) = customer_key_md5 {
             let actual_md5 = md5::compute(customer_key);
-            let actual_md5_hex = format!("{:x}", actual_md5);
+            let actual_md5_hex = format!("{actual_md5:x}");
             if actual_md5_hex != expected_md5.to_lowercase() {
                 return Err(KmsError::validation_error("Customer key MD5 mismatch"));
             }
@@ -487,12 +487,11 @@ impl ObjectEncryptionService {
                 Some(actual_value) if actual_value == expected_value => continue,
                 Some(actual_value) => {
                     return Err(KmsError::context_mismatch(format!(
-                        "Context mismatch for '{}': expected '{}', got '{}'",
-                        key, expected_value, actual_value
+                        "Context mismatch for '{key}': expected '{expected_value}', got '{actual_value}'"
                     )));
                 }
                 None => {
-                    return Err(KmsError::context_mismatch(format!("Missing context key '{}'", key)));
+                    return Err(KmsError::context_mismatch(format!("Missing context key '{key}'")));
                 }
             }
         }
@@ -562,13 +561,13 @@ impl ObjectEncryptionService {
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
         let iv = base64::engine::general_purpose::STANDARD
             .decode(iv)
-            .map_err(|e| KmsError::validation_error(format!("Invalid IV: {}", e)))?;
+            .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
         let tag = if let Some(tag_str) = headers.get("x-rustfs-encryption-tag") {
             Some(
                 base64::engine::general_purpose::STANDARD
                     .decode(tag_str)
-                    .map_err(|e| KmsError::validation_error(format!("Invalid tag: {}", e)))?,
+                    .map_err(|e| KmsError::validation_error(format!("Invalid tag: {e}")))?,
             )
         } else {
             None
@@ -577,14 +576,14 @@ impl ObjectEncryptionService {
         let encrypted_data_key = if let Some(key_str) = headers.get("x-rustfs-encryption-key") {
             base64::engine::general_purpose::STANDARD
                 .decode(key_str)
-                .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {}", e)))?
+                .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
         } else {
             Vec::new() // Empty for SSE-C
         };
 
         let encryption_context = if let Some(context_str) = headers.get("x-rustfs-encryption-context") {
             serde_json::from_str(context_str)
-                .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {}", e)))?
+                .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?
         } else {
             HashMap::new()
         };

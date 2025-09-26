@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
+use crate::StorageAPI as _;
+use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
-use crate::cmd::bucket_targets;
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::store::ECStore;
 use futures::future::join_all;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
+use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
-    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging,
+    VersioningConfiguration,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -261,7 +262,8 @@ impl BucketMetadataSys {
                     if let Some(bucket) = buckets.get(idx) {
                         let x = Arc::new(res);
                         mp.insert(bucket.clone(), x.clone());
-                        bucket_targets::init_bucket_targets(bucket, x.clone()).await;
+                        // TODO:EventNotifier,BucketTargetSys
+                        BucketTargetSys::get().set(bucket, &x).await;
                     }
                 }
                 Err(e) => {
@@ -348,6 +350,7 @@ impl BucketMetadataSys {
                 if !is_erasure().await && !is_dist_erasure().await && is_err_bucket_not_found(&err) {
                     BucketMetadata::new(bucket)
                 } else {
+                    error!("load bucket metadata failed: {}", err);
                     return Err(err);
                 }
             }

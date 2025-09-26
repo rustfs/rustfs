@@ -106,6 +106,10 @@ impl FastObjectLockManager {
         object: impl Into<Arc<str>>,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
+        // let bucket = bucket.into();
+        // let object = object.into();
+        // let owner = owner.into();
+        // error!("acquire_write_lock: bucket={:?}, object={:?}, owner={:?}", bucket, object, owner);
         let request = ObjectLockRequest::new_write(bucket, object, owner);
         self.acquire_lock(request).await
     }

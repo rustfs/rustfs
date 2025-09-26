@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{debug, info};
 
@@ -99,7 +100,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9002 if free
     let port = 9002; // for simplicity
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        .await
+        .unwrap();
 
     // init bucket metadata system
     let buckets_list = ecstore
@@ -124,7 +127,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 }
 
 /// Test helper: Create a test bucket
-async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
+async fn _create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
         .await
@@ -312,7 +315,7 @@ mod serial_tests {
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        create_test_bucket(&ecstore, bucket_name).await;
+        create_test_lock_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
         // Verify object exists initially
@@ -458,7 +461,7 @@ mod serial_tests {
         let check_result = object_exists(&ecstore, bucket_name, object_name).await;
         println!("Object exists after lifecycle processing: {check_result}");
 
-        if !check_result {
+        if check_result {
             println!("❌ Object was not deleted by lifecycle processing");
             // Let's try to get object info to see its details
             match ecstore
@@ -479,7 +482,7 @@ mod serial_tests {
             println!("✅ Object was successfully deleted by lifecycle processing");
         }
 
-        assert!(check_result);
+        assert!(!check_result);
         println!("✅ Object successfully expired");
 
         // Stop scanner
@@ -501,7 +504,7 @@ mod serial_tests {
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        create_test_bucket(&ecstore, bucket_name).await;
+        create_test_lock_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
         // Verify object exists initially

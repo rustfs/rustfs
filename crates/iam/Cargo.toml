@@ -46,5 +46,6 @@ jsonwebtoken = { workspace = true }
 tracing.workspace = true
 rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
+tokio-util.workspace = true
 
 [dev-dependencies]

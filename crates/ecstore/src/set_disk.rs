@@ -18,6 +18,7 @@
 use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::extract_etag, transition_api::ReaderImpl};
@@ -29,11 +30,12 @@ use crate::disk::{
 };
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::store_api::ListObjectVersionsInfo;
-use crate::store_api::{ListPartsInfo, ObjectToDelete};
+use crate::store_api::{ListPartsInfo, ObjectOptions, ObjectToDelete};
+use crate::store_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
@@ -50,7 +52,7 @@ use crate::{
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
-        ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        PartInfo, PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -64,16 +66,16 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, file_info_from_raw,
-    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
-    merge_file_meta_versions,
+    RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
+use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
+use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::{
     HashAlgorithm,
     crypto::{base64_decode, base64_encode, hex},
@@ -102,6 +104,7 @@ use tokio::{
     sync::mpsc::{self, Sender},
     time::interval,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -3810,7 +3813,7 @@ impl ObjectIO for SetDisks {
             }
         }
 
-        fi.is_latest = true;
+        fi.replication_state_internal = Some(opts.put_replication_state());
 
         // TODO: version support
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
@@ -3976,12 +3979,12 @@ impl StorageAPI for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        // Guard lock for single object delete-version
-        let _lock_guard = self
-            .fast_lock_manager
-            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-            .await
-            .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?;
+        // // Guard lock for single object delete-version
+        // let _lock_guard = self
+        //     .fast_lock_manager
+        //     .acquire_write_lock("", object, self.locker_owner.as_str())
+        //     .await
+        //     .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -4028,7 +4031,7 @@ impl StorageAPI for SetDisks {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
         // 默认返回值
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
@@ -4080,6 +4083,7 @@ impl StorageAPI for SetDisks {
                 name: dobj.object_name.clone(),
                 version_id: dobj.version_id,
                 idx: i,
+                replication_state_internal: Some(dobj.replication_state()),
                 ..Default::default()
             };
 
@@ -4117,15 +4121,17 @@ impl StorageAPI for SetDisks {
             if vr.deleted {
                 del_objects[i] = DeletedObject {
                     delete_marker: vr.deleted,
-                    delete_marker_version_id: vr.version_id.map(|v| v.to_string()),
+                    delete_marker_version_id: vr.version_id,
                     delete_marker_mtime: vr.mod_time,
                     object_name: vr.name.clone(),
+                    replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
                 }
             } else {
                 del_objects[i] = DeletedObject {
                     object_name: vr.name.clone(),
-                    version_id: vr.version_id.map(|v| v.to_string()),
+                    version_id: vr.version_id,
+                    replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
                 }
             }
@@ -4163,25 +4169,73 @@ impl StorageAPI for SetDisks {
                 if let Some(disk) = disk {
                     disk.delete_versions(bucket, vers, DeleteOptions::default()).await
                 } else {
-                    Err(DiskError::DiskNotFound)
+                    let mut errs = Vec::with_capacity(vers.len());
+                    for _ in 0..vers.len() {
+                        errs.push(Some(DiskError::DiskNotFound));
+                    }
+                    errs
                 }
             });
         }
 
         let results = join_all(futures).await;
 
-        for errs in results.into_iter().flatten() {
-            // TODO: handle err reduceWriteQuorumErrs
-            for err in errs.iter().flatten() {
-                warn!("result err {:?}", err);
+        let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
+
+        // 每个磁盘, 删除所有对象
+        for (disk_idx, errors) in results.into_iter().enumerate() {
+            // 所有对象的删除结果
+            for idx in 0..vers.len() {
+                if errors[idx].is_some() {
+                    for fi in vers[idx].versions.iter() {
+                        del_obj_errs[disk_idx][fi.idx] = errors[idx].clone();
+                    }
+                }
             }
         }
 
-        Ok((del_objects, del_errs))
+        for obj_idx in 0..objects.len() {
+            let mut disk_err = vec![None; disks.len()];
+
+            for disk_idx in 0..disks.len() {
+                if del_obj_errs[disk_idx][obj_idx].is_some() {
+                    disk_err[disk_idx] = del_obj_errs[disk_idx][obj_idx].clone();
+                }
+            }
+
+            let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, disks.len() / 2 + 1);
+            if let Some(err) = has_err.clone() {
+                let er = err.into();
+                if (is_err_object_not_found(&er) || is_err_version_not_found(&er)) && !del_objects[obj_idx].delete_marker {
+                    has_err = None;
+                }
+            } else {
+                del_objects[obj_idx].found = true;
+            }
+
+            if let Some(err) = has_err {
+                if del_objects[obj_idx].version_id.is_some() {
+                    del_errs[obj_idx] = Some(to_object_err(
+                        err.into(),
+                        vec![
+                            bucket,
+                            &objects[obj_idx].object_name.clone(),
+                            &objects[obj_idx].version_id.unwrap_or_default().to_string(),
+                        ],
+                    ));
+                } else {
+                    del_errs[obj_idx] = Some(to_object_err(err.into(), vec![bucket, &objects[obj_idx].object_name.clone()]));
+                }
+            }
+        }
+
+        // TODO: add_partial
+
+        (del_objects, del_errs)
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+    async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
         let _lock_guard = if !opts.delete_prefix {
             Some(
@@ -4201,16 +4255,54 @@ impl StorageAPI for SetDisks {
             return Ok(ObjectInfo::default());
         }
 
-        let (oi, write_quorum) = match self.get_object_info_and_quorum(bucket, object, &opts).await {
-            Ok((oi, wq)) => (oi, wq),
-            Err(e) => {
-                return Err(to_object_err(e, vec![bucket, object]));
-            }
+        let (mut goi, write_quorum, gerr) = match self.get_object_info_and_quorum(bucket, object, &opts).await {
+            Ok((oi, wq)) => (oi, wq, None),
+            Err(e) => (ObjectInfo::default(), 0, Some(e)),
         };
 
-        let mark_delete = oi.version_id.is_some();
+        let otd = ObjectToDelete {
+            object_name: object.to_string(),
+            version_id: opts
+                .version_id
+                .clone()
+                .map(|v| Uuid::parse_str(v.as_str()).ok().unwrap_or_default()),
+            ..Default::default()
+        };
+
+        let version_found = if opts.delete_marker { gerr.is_none() } else { true };
+
+        let dsc = check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await;
+
+        if dsc.replicate_any() {
+            opts.set_delete_replication_state(dsc);
+            goi.replication_decision = opts
+                .delete_replication
+                .as_ref()
+                .map(|v| v.replicate_decision_str.clone())
+                .unwrap_or_default();
+        }
+
+        let mut mark_delete = goi.version_id.is_some();
 
         let mut delete_marker = opts.versioned;
+
+        if opts.version_id.is_some() {
+            if version_found && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
+                mark_delete = false;
+            }
+
+            if opts.version_purge_status().is_empty() && opts.delete_marker_replication_status().is_empty() {
+                mark_delete = false;
+            }
+
+            if opts.version_purge_status() != VersionPurgeStatusType::Complete {
+                mark_delete = false;
+            }
+
+            if version_found && (goi.version_purge_status.is_empty() || !goi.delete_marker) {
+                delete_marker = false;
+            }
+        }
 
         let mod_time = if let Some(mt) = opts.mod_time {
             mt
@@ -4230,7 +4322,8 @@ impl StorageAPI for SetDisks {
                 deleted: delete_marker,
                 mark_deleted: mark_delete,
                 mod_time: Some(mod_time),
-                ..Default::default() // TODO: replication
+                replication_state_internal: opts.delete_replication.clone(),
+                ..Default::default() // TODO: Transition
             };
 
             fi.set_tier_free_version_id(&find_vid.to_string());
@@ -4257,88 +4350,27 @@ impl StorageAPI for SetDisks {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
 
         // Create a single object deletion request
-        let mut vr = FileInfo {
+        let mut dfi = FileInfo {
             name: object.to_string(),
             version_id: opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+            mark_deleted: mark_delete,
+            deleted: delete_marker,
+            mod_time: Some(mod_time),
+            replication_state_internal: opts.delete_replication.clone(),
             ..Default::default()
         };
 
-        // Handle versioning
-        let (suspended, versioned) = (opts.version_suspended, opts.versioned);
-        if opts.version_id.is_none() && (suspended || versioned) {
-            vr.mod_time = Some(OffsetDateTime::now_utc());
-            vr.deleted = true;
-            if versioned {
-                vr.version_id = Some(Uuid::new_v4());
-            }
+        dfi.set_tier_free_version_id(&find_vid.to_string());
+
+        if opts.skip_free_version {
+            dfi.set_skip_tier_free_version();
         }
 
-        let vers = vec![FileInfoVersions {
-            name: vr.name.clone(),
-            versions: vec![vr.clone()],
-            ..Default::default()
-        }];
+        self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        let disks = self.disks.read().await;
-        let disks = disks.clone();
-        let write_quorum = disks.len() / 2 + 1;
-
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errs = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            let vers = vers.clone();
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.delete_versions(bucket, vers, DeleteOptions::default()).await
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
-            });
-        }
-
-        let results = join_all(futures).await;
-
-        for result in results {
-            match result {
-                Ok(disk_errs) => {
-                    // Handle errors from disk operations
-                    for err in disk_errs.iter().flatten() {
-                        warn!("delete_object disk error: {:?}", err);
-                    }
-                    errs.push(None);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
-                }
-            }
-        }
-
-        // Check write quorum
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(to_object_err(err.into(), vec![bucket, object]));
-        }
-
-        // Create result ObjectInfo
-        let result_info = if vr.deleted {
-            ObjectInfo {
-                bucket: bucket.to_string(),
-                name: object.to_string(),
-                delete_marker: true,
-                mod_time: vr.mod_time,
-                version_id: vr.version_id,
-                ..Default::default()
-            }
-        } else {
-            ObjectInfo {
-                bucket: bucket.to_string(),
-                name: object.to_string(),
-                version_id: vr.version_id,
-                ..Default::default()
-            }
-        };
-
-        Ok(result_info)
+        Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended))
     }
 
     #[tracing::instrument(skip(self))]
@@ -4365,6 +4397,17 @@ impl StorageAPI for SetDisks {
         _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
         unimplemented!()
     }
 
@@ -4994,7 +5037,7 @@ impl StorageAPI for SetDisks {
         // Extract storage class from metadata, default to STANDARD if not found
         let storage_class = fi
             .metadata
-            .get(rustfs_filemeta::headers::AMZ_STORAGE_CLASS)
+            .get(AMZ_STORAGE_CLASS)
             .cloned()
             .unwrap_or_else(|| storageclass::STANDARD.to_string());
 

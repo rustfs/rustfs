@@ -461,7 +461,7 @@ impl AuditSystem {
             info!(target_id = %target_id, "Target enabled");
             Ok(())
         } else {
-            Err(AuditError::Configuration(format!("Target not found: {}", target_id)))
+            Err(AuditError::Configuration(format!("Target not found: {target_id}")))
         }
     }
 
@@ -474,7 +474,7 @@ impl AuditSystem {
             info!(target_id = %target_id, "Target disabled");
             Ok(())
         } else {
-            Err(AuditError::Configuration(format!("Target not found: {}", target_id)))
+            Err(AuditError::Configuration(format!("Target not found: {target_id}")))
         }
     }
 
@@ -488,7 +488,7 @@ impl AuditSystem {
             info!(target_id = %target_id, "Target removed");
             Ok(())
         } else {
-            Err(AuditError::Configuration(format!("Target not found: {}", target_id)))
+            Err(AuditError::Configuration(format!("Target not found: {target_id}")))
         }
     }
 

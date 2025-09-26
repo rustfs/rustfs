@@ -389,8 +389,8 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
         let task = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
 
-            let test_data = format!("Concurrent test data {}", i).into_bytes();
-            let object_key = format!("concurrent-test-{}", i);
+            let test_data = format!("Concurrent test data {i}").into_bytes();
+            let object_key = format!("concurrent-test-{i}");
 
             // Alternate between different encryption types
             let result = match i % 3 {
@@ -418,7 +418,7 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
                 }
                 2 => {
                     // SSE-C
-                    let key = format!("testkey{:026}", i); // 32-byte key
+                    let key = format!("testkey{i:026}"); // 32-byte key
                     let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key);
                     let key_md5 = format!("{:x}", md5::compute(&key));
 
@@ -459,9 +459,7 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
 
     assert!(
         successful_uploads >= num_concurrent - 1,
-        "Most concurrent uploads should succeed (got {}/{})",
-        successful_uploads,
-        num_concurrent
+        "Most concurrent uploads should succeed (got {successful_uploads}/{num_concurrent})"
     );
 
     info!("✅ Successfully completed {}/{} concurrent uploads", successful_uploads, num_concurrent);

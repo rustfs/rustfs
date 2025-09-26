@@ -303,7 +303,7 @@ async fn create_audit_target(
             let target = rustfs_targets::target::mqtt::MQTTTarget::new(id.to_string(), args)?;
             Ok(Box::new(target))
         }
-        _ => Err(TargetError::Configuration(format!("Unknown target type: {}", target_type))),
+        _ => Err(TargetError::Configuration(format!("Unknown target type: {target_type}"))),
     }
 }
 
@@ -352,7 +352,7 @@ fn parse_webhook_args(_id: &str, config: &KVS) -> Result<WebhookArgs, TargetErro
         .ok_or_else(|| TargetError::Configuration("webhook endpoint is required".to_string()))?;
 
     let endpoint_url =
-        Url::parse(&endpoint).map_err(|e| TargetError::Configuration(format!("invalid webhook endpoint URL: {}", e)))?;
+        Url::parse(&endpoint).map_err(|e| TargetError::Configuration(format!("invalid webhook endpoint URL: {e}")))?;
 
     let args = WebhookArgs {
         enable: true, // Already validated as enabled
@@ -379,7 +379,7 @@ fn parse_mqtt_args(_id: &str, config: &KVS) -> Result<MQTTArgs, TargetError> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| TargetError::Configuration("MQTT broker is required".to_string()))?;
 
-    let broker_url = Url::parse(&broker).map_err(|e| TargetError::Configuration(format!("invalid MQTT broker URL: {}", e)))?;
+    let broker_url = Url::parse(&broker).map_err(|e| TargetError::Configuration(format!("invalid MQTT broker URL: {e}")))?;
 
     let topic = config
         .lookup(MQTT_TOPIC)

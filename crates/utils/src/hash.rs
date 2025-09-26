@@ -109,6 +109,8 @@ use siphasher::sip::SipHasher;
 
 pub const EMPTY_STRING_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+pub const DEFAULT_SIP_HASH_KEY: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 pub fn sip_hash(key: &str, cardinality: usize, id: &[u8; 16]) -> usize {
     // Your key, must be 16 bytes
 

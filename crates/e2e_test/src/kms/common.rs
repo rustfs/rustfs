@@ -59,7 +59,7 @@ pub async fn configure_kms(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/kms/configure", base_url);
+    let url = format!("{base_url}/rustfs/admin/v3/kms/configure");
     awscurl_post(&url, config_json, access_key, secret_key).await?;
     info!("KMS configured successfully");
     Ok(())
@@ -71,7 +71,7 @@ pub async fn start_kms(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/kms/start", base_url);
+    let url = format!("{base_url}/rustfs/admin/v3/kms/start");
     awscurl_post(&url, "{}", access_key, secret_key).await?;
     info!("KMS started successfully");
     Ok(())
@@ -83,7 +83,7 @@ pub async fn get_kms_status(
     access_key: &str,
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/kms/status", base_url);
+    let url = format!("{base_url}/rustfs/admin/v3/kms/status");
     let status = awscurl_get(&url, access_key, secret_key).await?;
     info!("KMS status retrieved: {}", status);
     Ok(status)
@@ -101,7 +101,7 @@ pub async fn create_default_key(
     })
     .to_string();
 
-    let url = format!("{}/rustfs/admin/v3/kms/keys", base_url);
+    let url = format!("{base_url}/rustfs/admin/v3/kms/keys");
     let response = awscurl_post(&url, &create_key_body, access_key, secret_key).await?;
 
     // Parse response to get the actual key ID
@@ -141,7 +141,7 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
     });
 
     // Write the key to file with the specified ID as JSON
-    let key_path = format!("{}/{}.key", key_dir, key_id);
+    let key_path = format!("{key_dir}/{key_id}.key");
     let content = serde_json::to_vec_pretty(&stored_key)?;
     fs::write(&key_path, &content).await?;
 
@@ -281,13 +281,8 @@ pub async fn test_kms_key_management(
     })
     .to_string();
 
-    let create_response = awscurl_post(
-        &format!("{}/rustfs/admin/v3/kms/keys", base_url),
-        &create_key_body,
-        access_key,
-        secret_key,
-    )
-    .await?;
+    let create_response =
+        awscurl_post(&format!("{base_url}/rustfs/admin/v3/kms/keys"), &create_key_body, access_key, secret_key).await?;
 
     let create_result: serde_json::Value = serde_json::from_str(&create_response)?;
     let key_id = create_result["key_id"]
@@ -296,8 +291,7 @@ pub async fn test_kms_key_management(
     info!("Created key with ID: {}", key_id);
 
     // Test DescribeKey
-    let describe_response =
-        awscurl_get(&format!("{}/rustfs/admin/v3/kms/keys/{}", base_url, key_id), access_key, secret_key).await?;
+    let describe_response = awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await?;
 
     info!("DescribeKey response: {}", describe_response);
     let describe_result: serde_json::Value = serde_json::from_str(&describe_response)?;
@@ -306,7 +300,7 @@ pub async fn test_kms_key_management(
     info!("Successfully described key: {}", key_id);
 
     // Test ListKeys
-    let list_response = awscurl_get(&format!("{}/rustfs/admin/v3/kms/keys", base_url), access_key, secret_key).await?;
+    let list_response = awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys"), access_key, secret_key).await?;
 
     let list_result: serde_json::Value = serde_json::from_str(&list_response)?;
     let keys = list_result["keys"]
@@ -412,7 +406,7 @@ impl VaultTestEnvironment {
             let port_check = TcpStream::connect(VAULT_ADDRESS).await.is_ok();
             if port_check {
                 // Additional check by making a health request
-                if let Ok(response) = reqwest::get(&format!("{}/v1/sys/health", VAULT_URL)).await {
+                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await {
                     if response.status().is_success() {
                         info!("Vault server is ready after {} seconds", i);
                         return Ok(());
@@ -438,7 +432,7 @@ impl VaultTestEnvironment {
 
         // Enable transit secrets engine
         let enable_response = client
-            .post(format!("{}/v1/sys/mounts/{}", VAULT_URL, VAULT_TRANSIT_PATH))
+            .post(format!("{VAULT_URL}/v1/sys/mounts/{VAULT_TRANSIT_PATH}"))
             .header("X-Vault-Token", VAULT_TOKEN)
             .json(&serde_json::json!({
                 "type": "transit"
@@ -448,14 +442,14 @@ impl VaultTestEnvironment {
 
         if !enable_response.status().is_success() && enable_response.status() != 400 {
             let error_text = enable_response.text().await?;
-            return Err(format!("Failed to enable transit engine: {}", error_text).into());
+            return Err(format!("Failed to enable transit engine: {error_text}").into());
         }
 
         info!("Creating Vault encryption key");
 
         // Create encryption key
         let key_response = client
-            .post(format!("{}/v1/{}/keys/{}", VAULT_URL, VAULT_TRANSIT_PATH, VAULT_KEY_NAME))
+            .post(format!("{VAULT_URL}/v1/{VAULT_TRANSIT_PATH}/keys/{VAULT_KEY_NAME}"))
             .header("X-Vault-Token", VAULT_TOKEN)
             .json(&serde_json::json!({
                 "type": "aes256-gcm96"
@@ -465,7 +459,7 @@ impl VaultTestEnvironment {
 
         if !key_response.status().is_success() && key_response.status() != 400 {
             let error_text = key_response.text().await?;
-            return Err(format!("Failed to create encryption key: {}", error_text).into());
+            return Err(format!("Failed to create encryption key: {error_text}").into());
         }
 
         info!("Vault transit engine setup completed");
@@ -713,10 +707,10 @@ pub async fn test_all_multipart_encryption_types(
 
     // Test configurations for all encryption types
     let test_configs = vec![
-        MultipartTestConfig::new(format!("{}-no-encryption", base_object_key), part_size, total_parts, EncryptionType::None),
-        MultipartTestConfig::new(format!("{}-sse-s3", base_object_key), part_size, total_parts, EncryptionType::SSES3),
-        MultipartTestConfig::new(format!("{}-sse-kms", base_object_key), part_size, total_parts, EncryptionType::SSEKMS),
-        MultipartTestConfig::new(format!("{}-sse-c", base_object_key), part_size, total_parts, create_sse_c_config()),
+        MultipartTestConfig::new(format!("{base_object_key}-no-encryption"), part_size, total_parts, EncryptionType::None),
+        MultipartTestConfig::new(format!("{base_object_key}-sse-s3"), part_size, total_parts, EncryptionType::SSES3),
+        MultipartTestConfig::new(format!("{base_object_key}-sse-kms"), part_size, total_parts, EncryptionType::SSEKMS),
+        MultipartTestConfig::new(format!("{base_object_key}-sse-c"), part_size, total_parts, create_sse_c_config()),
     ];
 
     // Run tests for each encryption type

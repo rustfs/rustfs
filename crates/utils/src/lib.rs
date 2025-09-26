@@ -21,6 +21,9 @@ pub mod ip;
 #[cfg(feature = "net")]
 pub mod net;
 
+#[cfg(feature = "http")]
+pub mod http;
+
 #[cfg(feature = "net")]
 pub use dns_resolver::*;
 #[cfg(feature = "net")]

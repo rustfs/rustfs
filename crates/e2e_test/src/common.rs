@@ -94,7 +94,7 @@ fn build_rustfs_binary() {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Failed to build RustFS binary. Error: {}", stderr);
+        panic!("Failed to build RustFS binary. Error: {stderr}");
     }
 
     info!("✅ RustFS binary built successfully");
@@ -134,8 +134,8 @@ impl RustFSTestEnvironment {
 
         // Use a unique port for each test environment
         let port = Self::find_available_port().await?;
-        let address = format!("127.0.0.1:{}", port);
-        let url = format!("http://{}", address);
+        let address = format!("127.0.0.1:{port}");
+        let url = format!("http://{address}");
 
         Ok(Self {
             temp_dir,
@@ -152,7 +152,7 @@ impl RustFSTestEnvironment {
         let temp_dir = format!("/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
 
-        let url = format!("http://{}", address);
+        let url = format!("http://{address}");
 
         Ok(Self {
             temp_dir,
@@ -327,7 +327,7 @@ pub async fn execute_awscurl(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("awscurl failed: {}", stderr).into());
+        return Err(format!("awscurl failed: {stderr}").into());
     }
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();

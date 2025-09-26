@@ -29,6 +29,7 @@ use rustfs_ecstore::{
     data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
 };
 use rustfs_filemeta::{MetacacheReader, VersionType};
+use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -50,7 +51,6 @@ use rustfs_common::data_usage::{DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use uuid;
 
@@ -300,8 +300,13 @@ impl Scanner {
                             .map(|(c, _)| Arc::new(c));
 
                         // Get bucket versioning configuration
-                        let versioning_config = Arc::new(VersioningConfig {
-                            enabled: bucket_info.versioning,
+                        let versioning_config = Arc::new(VersioningConfiguration {
+                            status: if bucket_info.versioning {
+                                Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
+                            } else {
+                                None
+                            },
+                            ..Default::default()
                         });
 
                         let records = match bucket_objects_map.get(bucket_name) {
@@ -1825,7 +1830,16 @@ impl Scanner {
             }
         };
         let bucket_info = ecstore.get_bucket_info(bucket, &Default::default()).await.ok();
-        let versioning_config = bucket_info.map(|bi| Arc::new(VersioningConfig { enabled: bi.versioning }));
+        let versioning_config = bucket_info.map(|bi| {
+            Arc::new(VersioningConfiguration {
+                status: if bi.versioning {
+                    Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
+                } else {
+                    None
+                },
+                ..Default::default()
+            })
+        });
         let lifecycle_config = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket)
             .await
             .ok()
@@ -2651,7 +2665,7 @@ mod tests {
         // create ECStore with dynamic port
         let port = port.unwrap_or(9000);
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("Invalid server address format");
-        let ecstore = ECStore::new(server_addr, endpoint_pools)
+        let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
             .await
             .expect("Failed to create ECStore");
 

@@ -23,6 +23,7 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use std::{collections::HashMap, str::FromStr};
 use tokio::io::BufReader;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::client::{
@@ -30,7 +31,10 @@ use crate::client::{
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
-use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
+use s3s::{
+    dto::VersioningConfiguration,
+    header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID},
+};
 
 impl TransitionClient {
     pub async fn bucket_exists(&self, bucket_name: &str) -> Result<bool, std::io::Error> {
@@ -58,8 +62,14 @@ impl TransitionClient {
             .await;
 
         if let Ok(resp) = resp {
+            if resp.status() != http::StatusCode::OK {
+                return Ok(false);
+            }
+
             let b = resp.body().bytes().expect("err").to_vec();
             let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
+
+            warn!("bucket exists, resp: {:?}, resperr: {:?}", resp, resperr);
             /*if to_error_response(resperr).code == "NoSuchBucket" {
                 return Ok(false);
             }
@@ -68,6 +78,46 @@ impl TransitionClient {
             }*/
         }
         Ok(true)
+    }
+
+    pub async fn get_bucket_versioning(&self, bucket_name: &str) -> Result<VersioningConfiguration, std::io::Error> {
+        let mut query_values = HashMap::new();
+        query_values.insert("versioning".to_string(), "".to_string());
+        let resp = self
+            .execute_method(
+                http::Method::GET,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: "".to_string(),
+                    query_values,
+                    custom_header: HeaderMap::new(),
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    content_md5_base64: "".to_string(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await;
+
+        match resp {
+            Ok(resp) => {
+                let b = resp.body().bytes().expect("get bucket versioning err").to_vec();
+                let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
+
+                warn!("get bucket versioning, resp: {:?}, resperr: {:?}", resp, resperr);
+
+                Ok(VersioningConfiguration::default())
+            }
+
+            Err(err) => Err(std::io::Error::other(err)),
+        }
     }
 
     pub async fn stat_object(
@@ -131,24 +181,20 @@ impl TransitionClient {
                             ..Default::default()
                         };
                         return Ok(ObjectInfo {
-                            version_id: match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    return Err(std::io::Error::other(e));
-                                }
-                            },
+                            version_id: h
+                                .get(X_AMZ_VERSION_ID)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| Uuid::from_str(s).ok()),
                             is_delete_marker: delete_marker,
                             ..Default::default()
                         });
                         //err_resp
                     }
                     return Ok(ObjectInfo {
-                        version_id: match Uuid::from_str(h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap()) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return Err(std::io::Error::other(e));
-                            }
-                        },
+                        version_id: h
+                            .get(X_AMZ_VERSION_ID)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| Uuid::from_str(s).ok()),
                         is_delete_marker: delete_marker,
                         replication_ready: replication_ready,
                         ..Default::default()

@@ -202,22 +202,19 @@ impl AuditMetrics {
         // Generate recommendations
         if !validation.meets_eps_requirement {
             validation.recommendations.push(format!(
-                "EPS ({:.0}) is below requirement (3000). Consider optimizing target dispatch or adding more target instances.",
-                eps
+                "EPS ({eps:.0}) is below requirement (3000). Consider optimizing target dispatch or adding more target instances."
             ));
         }
 
         if !validation.meets_latency_requirement {
             validation.recommendations.push(format!(
-                "Average latency ({:.2}ms) exceeds requirement (30ms). Consider optimizing target responses or increasing timeout values.",
-                avg_latency_ms
+                "Average latency ({avg_latency_ms:.2}ms) exceeds requirement (30ms). Consider optimizing target responses or increasing timeout values."
             ));
         }
 
         if !validation.meets_error_rate_requirement {
             validation.recommendations.push(format!(
-                "Error rate ({:.2}%) exceeds recommendation (1%). Check target connectivity and configuration.",
-                error_rate
+                "Error rate ({error_rate:.2}%) exceeds recommendation (1%). Check target connectivity and configuration."
             ));
         }
 
@@ -307,7 +304,7 @@ impl PerformanceValidation {
         );
 
         for rec in &self.recommendations {
-            result.push_str(&format!("\n• {}", rec));
+            result.push_str(&format!("\n• {rec}"));
         }
 
         result

@@ -296,11 +296,11 @@ impl S3Client {
             .context(format!("Failed to resolve file path: {local_path}"))?;
 
         if !canonical_path.exists() {
-            anyhow::bail!("File does not exist: {}", local_path);
+            anyhow::bail!("File does not exist: {local_path}");
         }
 
         if !canonical_path.is_file() {
-            anyhow::bail!("Path is not a file: {}", local_path);
+            anyhow::bail!("Path is not a file: {local_path}");
         }
 
         let metadata = tokio::fs::metadata(&canonical_path)
@@ -432,7 +432,7 @@ impl S3Client {
 
         while let Some(bytes_result) = byte_stream.try_next().await.context("Failed to read object content")? {
             if total_read + bytes_result.len() > max_size {
-                anyhow::bail!("Object size exceeds maximum allowed size of {} bytes", max_size);
+                anyhow::bail!("Object size exceeds maximum allowed size of {max_size} bytes");
             }
             content.extend_from_slice(&bytes_result);
             total_read += bytes_result.len();

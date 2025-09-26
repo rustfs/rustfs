@@ -444,7 +444,7 @@ mod tests {
         let delete_marker = MetaDeleteMarker {
             version_id: Some(Uuid::new_v4()),
             mod_time: Some(OffsetDateTime::now_utc()),
-            meta_sys: None,
+            meta_sys: HashMap::new(),
         };
 
         let version = FileMetaVersion {

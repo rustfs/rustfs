@@ -20,6 +20,8 @@ use crate::{
     manager::{extract_jwt_claims, get_default_policyes},
 };
 use futures::future::join_all;
+use rustfs_ecstore::StorageAPI as _;
+use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,
@@ -28,15 +30,14 @@ use rustfs_ecstore::{
     global::get_global_action_cred,
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
-    store_list_objects::{ObjectInfoOrErr, WalkOptions},
 };
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Sender};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
@@ -144,7 +145,7 @@ impl ObjectStore {
         Ok((Self::decrypt_data(&data)?, obj))
     }
 
-    async fn list_iam_config_items(&self, prefix: &str, ctx_rx: B_Receiver<bool>, sender: Sender<StringOrErr>) {
+    async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
         // debug!("list iam config items, prefix: {}", &prefix);
 
         // TODO: Implement walk, use walk
@@ -156,7 +157,11 @@ impl ObjectStore {
         let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
 
         let path = prefix.to_owned();
-        tokio::spawn(async move { store.walk(ctx_rx, Self::BUCKET_NAME, &path, tx, WalkOptions::default()).await });
+        tokio::spawn(async move {
+            store
+                .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
+                .await
+        });
 
         let prefix = prefix.to_owned();
         tokio::spawn(async move {
@@ -190,10 +195,11 @@ impl ObjectStore {
     }
 
     async fn list_all_iamconfig_items(&self) -> Result<HashMap<String, Vec<String>>> {
-        let (ctx_tx, ctx_rx) = broadcast::channel(1);
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
-        self.list_iam_config_items(format!("{}/", *IAM_CONFIG_PREFIX).as_str(), ctx_rx, tx)
+        let ctx = CancellationToken::new();
+
+        self.list_iam_config_items(format!("{}/", *IAM_CONFIG_PREFIX).as_str(), ctx.clone(), tx)
             .await;
 
         let mut res = HashMap::new();
@@ -201,7 +207,7 @@ impl ObjectStore {
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
                 warn!("list_iam_config_items {:?}", err);
-                let _ = ctx_tx.send(true);
+                ctx.cancel();
 
                 return Err(err);
             }
@@ -215,7 +221,7 @@ impl ObjectStore {
             }
         }
 
-        let _ = ctx_tx.send(true);
+        ctx.cancel();
 
         Ok(res)
     }
@@ -477,15 +483,15 @@ impl Store for ObjectStore {
             UserType::None => "",
         };
 
-        let (ctx_tx, ctx_rx) = broadcast::channel(1);
+        let ctx = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
-        self.list_iam_config_items(base_prefix, ctx_rx, tx).await;
+        self.list_iam_config_items(base_prefix, ctx.clone(), tx).await;
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
                 warn!("list_iam_config_items {:?}", err);
-                let _ = ctx_tx.send(true);
+                let _ = ctx.cancel();
 
                 return Err(err);
             }
@@ -495,7 +501,7 @@ impl Store for ObjectStore {
                 self.load_user(&name, user_type, m).await?;
             }
         }
-        let _ = ctx_tx.send(true);
+        let _ = ctx.cancel();
         Ok(())
     }
     async fn load_secret_key(&self, name: &str, user_type: UserType) -> Result<String> {
@@ -539,15 +545,15 @@ impl Store for ObjectStore {
         Ok(())
     }
     async fn load_groups(&self, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
-        let (ctx_tx, ctx_rx) = broadcast::channel(1);
+        let ctx = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
-        self.list_iam_config_items(&IAM_CONFIG_GROUPS_PREFIX, ctx_rx, tx).await;
+        self.list_iam_config_items(&IAM_CONFIG_GROUPS_PREFIX, ctx.clone(), tx).await;
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
                 warn!("list_iam_config_items {:?}", err);
-                let _ = ctx_tx.send(true);
+                let _ = ctx.cancel();
 
                 return Err(err);
             }
@@ -557,7 +563,7 @@ impl Store for ObjectStore {
                 self.load_group(&name, m).await?;
             }
         }
-        let _ = ctx_tx.send(true);
+        let _ = ctx.cancel();
         Ok(())
     }
 
@@ -603,15 +609,15 @@ impl Store for ObjectStore {
         Ok(())
     }
     async fn load_policy_docs(&self, m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
-        let (ctx_tx, ctx_rx) = broadcast::channel(1);
+        let ctx = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
-        self.list_iam_config_items(&IAM_CONFIG_POLICIES_PREFIX, ctx_rx, tx).await;
+        self.list_iam_config_items(&IAM_CONFIG_POLICIES_PREFIX, ctx.clone(), tx).await;
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
                 warn!("list_iam_config_items {:?}", err);
-                let _ = ctx_tx.send(true);
+                let _ = ctx.cancel();
 
                 return Err(err);
             }
@@ -621,7 +627,7 @@ impl Store for ObjectStore {
                 self.load_policy_doc(&name, m).await?;
             }
         }
-        let _ = ctx_tx.send(true);
+        let _ = ctx.cancel();
         Ok(())
     }
 
@@ -678,15 +684,15 @@ impl Store for ObjectStore {
                 }
             }
         };
-        let (ctx_tx, ctx_rx) = broadcast::channel(1);
+        let ctx = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
 
-        self.list_iam_config_items(base_path, ctx_rx, tx).await;
+        self.list_iam_config_items(base_path, ctx.clone(), tx).await;
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
                 warn!("list_iam_config_items {:?}", err);
-                let _ = ctx_tx.send(true);
+                let _ = ctx.cancel();
 
                 return Err(err);
             }
@@ -696,7 +702,7 @@ impl Store for ObjectStore {
                 self.load_mapped_policy(name, user_type, is_group, m).await?;
             }
         }
-        let _ = ctx_tx.send(true);
+        let _ = ctx.cancel(); // TODO: check if this is needed
         Ok(())
     }
 

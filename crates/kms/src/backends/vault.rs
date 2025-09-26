@@ -89,10 +89,10 @@ impl VaultKmsClient {
 
         let settings = settings_builder
             .build()
-            .map_err(|e| KmsError::backend_error(format!("Failed to build Vault client settings: {}", e)))?;
+            .map_err(|e| KmsError::backend_error(format!("Failed to build Vault client settings: {e}")))?;
 
         let client =
-            VaultClient::new(settings).map_err(|e| KmsError::backend_error(format!("Failed to create Vault client: {}", e)))?;
+            VaultClient::new(settings).map_err(|e| KmsError::backend_error(format!("Failed to create Vault client: {e}")))?;
 
         info!("Successfully connected to Vault at {}", config.address);
 
@@ -144,7 +144,7 @@ impl VaultKmsClient {
 
         kv2::set(&self.client, &self.kv_mount, &path, key_data)
             .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to store key in Vault: {}", e)))?;
+            .map_err(|e| KmsError::backend_error(format!("Failed to store key in Vault: {e}")))?;
 
         debug!("Stored key {} in Vault at path {}", key_id, path);
         Ok(())
@@ -176,7 +176,7 @@ impl VaultKmsClient {
         let secret: VaultKeyData = kv2::read(&self.client, &self.kv_mount, &path).await.map_err(|e| match e {
             vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
             vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-            _ => KmsError::backend_error(format!("Failed to read key from Vault: {}", e)),
+            _ => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
         })?;
 
         debug!("Retrieved key {} from Vault, tags: {:?}", key_id, secret.tags);
@@ -200,7 +200,7 @@ impl VaultKmsClient {
                 debug!("Key path doesn't exist in Vault (404), returning empty list");
                 Ok(Vec::new())
             }
-            Err(e) => Err(KmsError::backend_error(format!("Failed to list keys in Vault: {}", e))),
+            Err(e) => Err(KmsError::backend_error(format!("Failed to list keys in Vault: {e}"))),
         }
     }
 
@@ -214,7 +214,7 @@ impl VaultKmsClient {
             .await
             .map_err(|e| match e {
                 vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
-                _ => KmsError::backend_error(format!("Failed to delete key metadata from Vault: {}", e)),
+                _ => KmsError::backend_error(format!("Failed to delete key metadata from Vault: {e}")),
             })?;
 
         debug!("Permanently deleted key {} metadata from Vault at path {}", key_id, path);
@@ -649,7 +649,7 @@ impl KmsBackend for VaultKmsBackend {
         let mut key_metadata = match self.describe_key(describe_request).await {
             Ok(response) => response.key_metadata,
             Err(_) => {
-                return Err(crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)));
+                return Err(crate::error::KmsError::key_not_found(format!("Key {key_id} not found")));
             }
         };
 
@@ -705,15 +705,12 @@ impl KmsBackend for VaultKmsBackend {
         let mut key_metadata = match self.describe_key(describe_request).await {
             Ok(response) => response.key_metadata,
             Err(_) => {
-                return Err(crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)));
+                return Err(crate::error::KmsError::key_not_found(format!("Key {key_id} not found")));
             }
         };
 
         if key_metadata.key_state != KeyState::PendingDeletion {
-            return Err(crate::error::KmsError::invalid_key_state(format!(
-                "Key {} is not pending deletion",
-                key_id
-            )));
+            return Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
 
         // Cancel the deletion by resetting the state
