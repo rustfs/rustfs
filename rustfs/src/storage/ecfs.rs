@@ -76,6 +76,7 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::client::object_api_utils::format_etag;
 use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
@@ -92,7 +93,6 @@ use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_ecstore::client::object_api_utils::format_etag;
 use rustfs_filemeta::fileinfo::ObjectPartInfo;
 use rustfs_kms::DataKey;
 use rustfs_kms::service_manager::get_global_encryption_service;
@@ -461,7 +461,7 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
-                let e_tag = _obj_info.etag.map(|etag| format_etag(&etag));
+                let e_tag = _obj_info.etag.clone().map(|etag| format_etag(&etag));
 
                 // // store.put_object(bucket, object, data, opts);
 

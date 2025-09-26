@@ -181,10 +181,16 @@ mod tests {
         assert_eq!(format_etag("6af8d12c0c74b78094884349f3c8a079"), "\"6af8d12c0c74b78094884349f3c8a079\"");
 
         // Test already quoted ETag - should not double quote
-        assert_eq!(format_etag("\"6af8d12c0c74b78094884349f3c8a079\""), "\"6af8d12c0c74b78094884349f3c8a079\"");
+        assert_eq!(
+            format_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
+            "\"6af8d12c0c74b78094884349f3c8a079\""
+        );
 
         // Test weak ETag - should keep as is
-        assert_eq!(format_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""), "W/\"6af8d12c0c74b78094884349f3c8a079\"");
+        assert_eq!(
+            format_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
+            "W/\"6af8d12c0c74b78094884349f3c8a079\""
+        );
 
         // Test empty ETag - should add quotes
         assert_eq!(format_etag(""), "\"\"");
@@ -192,14 +198,14 @@ mod tests {
         // Test malformed quote (only starting quote) - should wrap properly
         assert_eq!(format_etag("\"incomplete"), "\"\"incomplete\"");
 
-        // Test malformed quote (only ending quote) - should wrap properly  
+        // Test malformed quote (only ending quote) - should wrap properly
         assert_eq!(format_etag("incomplete\""), "\"incomplete\"\"");
     }
 
     #[test]
     fn test_extract_etag() {
         let mut metadata = HashMap::new();
-        
+
         // Test with etag field
         metadata.insert("etag".to_string(), "abc123".to_string());
         assert_eq!(extract_etag(&metadata), "\"abc123\"");
