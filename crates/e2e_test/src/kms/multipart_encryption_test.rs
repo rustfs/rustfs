@@ -419,7 +419,7 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
     // 逐字节验证数据（对于大文件更严格）
     for (i, (&actual, &expected)) in downloaded_data.iter().zip(test_data.iter()).enumerate() {
         if actual != expected {
-            panic!("大文件数据在第{}字节不匹配: 实际={}, 期待={}", i, actual, expected);
+            panic!("大文件数据在第{i}字节不匹配: 实际={actual}, 期待={expected}");
         }
     }
 

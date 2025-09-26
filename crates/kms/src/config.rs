@@ -315,7 +315,7 @@ impl KmsConfig {
             config.backend = match backend_type.to_lowercase().as_str() {
                 "local" => KmsBackend::Local,
                 "vault" => KmsBackend::Vault,
-                _ => return Err(KmsError::configuration_error(format!("Unknown KMS backend: {}", backend_type))),
+                _ => return Err(KmsError::configuration_error(format!("Unknown KMS backend: {backend_type}"))),
             };
         }
 

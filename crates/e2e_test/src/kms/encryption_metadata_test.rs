@@ -33,11 +33,10 @@ fn assert_encryption_metadata(metadata: &HashMap<String, String>, expected_size:
         "x-rustfs-encryption-context",
         "x-rustfs-encryption-original-size",
     ] {
-        assert!(metadata.contains_key(key), "expected managed encryption metadata '{}' to be present", key);
+        assert!(metadata.contains_key(key), "expected managed encryption metadata '{key}' to be present");
         assert!(
             !metadata.get(key).unwrap().is_empty(),
-            "managed encryption metadata '{}' should not be empty",
-            key
+            "managed encryption metadata '{key}' should not be empty"
         );
     }
 
@@ -84,10 +83,7 @@ fn assert_storage_encrypted(storage_root: &std::path::Path, bucket: &str, key: &
 
     assert!(
         scanned > 0,
-        "Failed to locate stored data files for bucket '{}' and key '{}' under {:?}",
-        bucket,
-        key,
-        storage_root
+        "Failed to locate stored data files for bucket '{bucket}' and key '{key}' under {storage_root:?}"
     );
     assert!(plaintext_path.is_none(), "Plaintext detected on disk at {:?}", plaintext_path.unwrap());
 }
@@ -220,7 +216,7 @@ async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(),
     assert_encryption_metadata(source_metadata, payload.len());
 
     let dest_key = "metadata-sse-kms-object-copy";
-    let copy_source = format!("{}/{}", TEST_BUCKET, source_key);
+    let copy_source = format!("{TEST_BUCKET}/{source_key}");
 
     s3_client
         .copy_object()

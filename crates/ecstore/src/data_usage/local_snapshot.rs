@@ -88,7 +88,7 @@ impl LocalUsageSnapshot {
 
 /// Build the snapshot file name `<disk-id>.json`.
 pub fn snapshot_file_name(disk_id: &str) -> String {
-    format!("{}.json", disk_id)
+    format!("{disk_id}.json")
 }
 
 /// Build the object path relative to `RUSTFS_META_BUCKET`, e.g. `datausage/<disk-id>.json`.

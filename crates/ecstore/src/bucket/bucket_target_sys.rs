@@ -1159,8 +1159,10 @@ impl TargetClient {
             .body(body)
             .customize()
             .map_request(move |mut req| {
-                for (k, v) in &headers {
-                    req.headers_mut().insert(k.clone(), v.clone());
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
                 }
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
@@ -1209,8 +1211,10 @@ impl TargetClient {
             .body(body)
             .customize()
             .map_request(move |mut req| {
-                for (k, v) in &headers {
-                    req.headers_mut().insert(k.clone(), v.clone());
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -1243,8 +1247,10 @@ impl TargetClient {
             .multipart_upload(multipart_upload)
             .customize()
             .map_request(move |mut req| {
-                for (k, v) in &headers {
-                    req.headers_mut().insert(k.clone(), v.clone());
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -1301,8 +1307,10 @@ impl TargetClient {
             .set_version_id(version_id)
             .customize()
             .map_request(move |mut req| {
-                for (k, v) in &headers {
-                    req.headers_mut().insert(k.clone(), v.clone());
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })

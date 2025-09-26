@@ -152,7 +152,7 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
     // Corrupt the default key file
     info!("🔧 Corrupting default key file");
     let key_file_path = format!("{}/{}.key", kms_env.kms_keys_dir, default_key_id);
-    let backup_key_path = format!("{}.backup", key_file_path);
+    let backup_key_path = format!("{key_file_path}.backup");
 
     // Backup the original key file
     fs::copy(&key_file_path, &backup_key_path)?;
@@ -417,8 +417,8 @@ async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error
 
     for i in 0..10 {
         let client = s3_client.clone();
-        let test_data = format!("Rapid test data {}", i).into_bytes();
-        let object_key = format!("rapid-test-{}", i);
+        let test_data = format!("Rapid test data {i}").into_bytes();
+        let object_key = format!("rapid-test-{i}");
 
         let task = tokio::spawn(async move {
             let result = client

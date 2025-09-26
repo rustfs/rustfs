@@ -39,7 +39,6 @@ use rustfs_ahm::{
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
-use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::DEFAULT_UPDATE_CHECK;
 use rustfs_config::ENV_UPDATE_CHECK;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -47,22 +46,15 @@ use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
-use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
-    bucket::metadata_sys,
-    bucket::metadata_sys::init_bucket_metadata_sys,
-    cmd::bucket_replication::init_bucket_replication_pool,
-    config as ecconfig,
-    config::GLOBAL_CONFIG_SYS,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
-    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -654,13 +646,13 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
         service_manager
             .configure(kms_config)
             .await
-            .map_err(|e| Error::other(format!("Failed to configure KMS: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
 
         // Start the KMS service
         service_manager
             .start()
             .await
-            .map_err(|e| Error::other(format!("Failed to start KMS: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
 
         info!("KMS service configured and started successfully");
     } else {

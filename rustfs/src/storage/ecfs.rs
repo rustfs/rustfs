@@ -93,8 +93,6 @@ use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_filemeta::fileinfo::ObjectPartInfo;
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_kms::DataKey;
 use rustfs_kms::service_manager::get_global_encryption_service;
 use rustfs_kms::types::{EncryptionMetadata, ObjectEncryptionContext};
@@ -109,10 +107,6 @@ use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
 use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader};
-use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_s3select_api::query::Context;
-use rustfs_s3select_api::query::Query;
-use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
@@ -213,7 +207,7 @@ async fn create_managed_encryption_material(
     let (data_key, encrypted_data_key) = service
         .create_data_key(&kms_key_candidate, &context)
         .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {}", e))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
 
     let metadata = EncryptionMetadata {
         algorithm: algorithm_str.to_string(),
@@ -252,7 +246,7 @@ async fn decrypt_managed_encryption_key(
 
     let parsed = service
         .headers_to_metadata(metadata)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {}", e))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {e}"))))?;
 
     if parsed.iv.len() != 12 {
         return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
@@ -262,7 +256,7 @@ async fn decrypt_managed_encryption_key(
     let data_key = service
         .decrypt_data_key(&parsed.encrypted_data_key, &context)
         .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
 
     let key_bytes = data_key.plaintext_key;
     let mut nonce = [0u8; 12];
@@ -1582,7 +1576,7 @@ impl S3 for FS {
                     // Decode the base64 key
                     let key_bytes = BASE64_STANDARD
                         .decode(sse_key)
-                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
+                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
 
                     // Verify key length (should be 32 bytes for AES-256)
                     if key_bytes.len() != 32 {
@@ -1601,7 +1595,7 @@ impl S3 for FS {
 
                     // Generate the same deterministic nonce from object key
                     let mut nonce = [0u8; 12];
-                    let nonce_source = format!("{}-{}", bucket, key);
+                    let nonce_source = format!("{bucket}-{key}");
                     let nonce_hash = md5::compute(nonce_source.as_bytes());
                     nonce.copy_from_slice(&nonce_hash.0[..12]);
 
@@ -2251,7 +2245,7 @@ impl S3 for FS {
             // Decode the base64 key
             let key_bytes = BASE64_STANDARD
                 .decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
 
             // Verify key length (should be 32 bytes for AES-256)
             if key_bytes.len() != 32 {
@@ -2277,7 +2271,7 @@ impl S3 for FS {
 
             // Generate a deterministic nonce from object key for consistency
             let mut nonce = [0u8; 12];
-            let nonce_source = format!("{}-{}", bucket, key);
+            let nonce_source = format!("{bucket}-{key}");
             let nonce_hash = md5::compute(nonce_source.as_bytes());
             nonce.copy_from_slice(&nonce_hash.0[..12]);
 
