@@ -71,7 +71,7 @@ use rustfs_filemeta::{
     headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     merge_file_meta_versions,
 };
-use rustfs_lock::NamespaceLockManager;
+use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
@@ -146,6 +146,21 @@ impl SetDisks {
             format,
             set_endpoints,
         })
+    }
+    fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
+        match err {
+            LockResult::Timeout => {
+                format!("{mode} lock acquisition timed out on {bucket}/{object} (owner={})", self.locker_owner)
+            }
+            LockResult::Conflict {
+                current_owner,
+                current_mode,
+            } => format!(
+                "{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {:?}",
+                current_mode
+            ),
+            LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
+        }
     }
     async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
         let rl = self.disks.read().await;
@@ -2461,25 +2476,38 @@ impl SetDisks {
 
             // Check if lock is already held
             let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
+            let mut reuse_existing_lock = false;
             if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
-                warn!("Lock already exists for object {}: {:?}", object, lock_info);
+                if lock_info.owner.as_ref() == self.locker_owner.as_str()
+                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
+                {
+                    reuse_existing_lock = true;
+                    debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
+                } else {
+                    warn!("Lock already exists for object {}: {:?}", object, lock_info);
+                }
             } else {
                 info!("No existing lock found for object {}", object);
             }
 
-            let start_time = std::time::Instant::now();
-            let lock_result = self
-                .fast_lock_manager
-                .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                .await
-                .map_err(|e| {
-                    let elapsed = start_time.elapsed();
-                    error!("Failed to acquire write lock for heal operation after {:?}: {:?}", elapsed, e);
-                    DiskError::other(format!("Failed to acquire write lock for heal operation: {e:?}"))
-                })?;
-            let elapsed = start_time.elapsed();
-            info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
-            Some(lock_result)
+            if reuse_existing_lock {
+                None
+            } else {
+                let start_time = std::time::Instant::now();
+                let lock_result = self
+                    .fast_lock_manager
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| {
+                        let elapsed = start_time.elapsed();
+                        let message = self.format_lock_error(bucket, object, "write", &e);
+                        error!("Failed to acquire write lock for heal operation after {:?}: {}", elapsed, message);
+                        DiskError::other(message)
+                    })?;
+                let elapsed = start_time.elapsed();
+                info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
+                Some(lock_result)
+            }
         } else {
             info!("Skipping lock acquisition (no_lock=true)");
             None
@@ -3079,19 +3107,14 @@ impl SetDisks {
         }
     }
 
-    async fn heal_object_dir(
+    /// Heal directory metadata assuming caller already holds the write lock for `(bucket, object)`.
+    async fn heal_object_dir_locked(
         &self,
         bucket: &str,
         object: &str,
         dry_run: bool,
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
-        let _write_lock_guard = self
-            .fast_lock_manager
-            .acquire_write_lock("", object, self.locker_owner.as_str())
-            .await
-            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {e:?}")))?;
-
         let disks = {
             let disks = self.disks.read().await;
             disks.clone()
@@ -3184,6 +3207,27 @@ impl SetDisks {
         }
 
         Ok((result, None))
+    }
+
+    #[allow(dead_code)]
+    /// Heal directory metadata after acquiring the necessary write lock.
+    async fn heal_object_dir(
+        &self,
+        bucket: &str,
+        object: &str,
+        dry_run: bool,
+        remove: bool,
+    ) -> Result<(HealResultItem, Option<DiskError>)> {
+        let _write_lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+            .await
+            .map_err(|e| {
+                let message = self.format_lock_error(bucket, object, "write", &e);
+                DiskError::other(message)
+            })?;
+
+        self.heal_object_dir_locked(bucket, object, dry_run, remove).await
     }
 
     async fn default_heal_result(
@@ -3450,9 +3494,9 @@ impl ObjectIO for SetDisks {
         let _read_lock_guard = if !opts.no_lock {
             Some(
                 self.fast_lock_manager
-                    .acquire_read_lock("", object, self.locker_owner.as_str())
+                    .acquire_read_lock(bucket, object, self.locker_owner.as_str())
                     .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "read", &e)))?,
             )
         } else {
             None
@@ -3539,9 +3583,9 @@ impl ObjectIO for SetDisks {
         let _object_lock_guard = if !opts.no_lock {
             Some(
                 self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
                     .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
             )
         } else {
             None
@@ -3835,9 +3879,9 @@ impl StorageAPI for SetDisks {
         // Guard lock for source object metadata update
         let _lock_guard = self
             .fast_lock_manager
-            .acquire_write_lock("", src_object, self.locker_owner.as_str())
+            .acquire_write_lock(src_bucket, src_object, self.locker_owner.as_str())
             .await
-            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
+            .map_err(|e| Error::other(self.format_lock_error(src_bucket, src_object, "write", &e)))?;
 
         let disks = self.get_disks_internal().await;
 
@@ -3935,9 +3979,9 @@ impl StorageAPI for SetDisks {
         // Guard lock for single object delete-version
         let _lock_guard = self
             .fast_lock_manager
-            .acquire_write_lock("", object, self.locker_owner.as_str())
+            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
             .await
-            .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
+            .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?;
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -4007,17 +4051,18 @@ impl StorageAPI for SetDisks {
         for object_name in unique_objects {
             match self
                 .fast_lock_manager
-                .acquire_write_lock("", object_name.as_str(), self.locker_owner.as_str())
+                .acquire_write_lock(bucket, object_name.as_str(), self.locker_owner.as_str())
                 .await
             {
                 Ok(guard) => {
                     _guards.insert(object_name, guard);
                 }
-                Err(_) => {
+                Err(err) => {
+                    let message = self.format_lock_error(bucket, object_name.as_str(), "write", &err);
                     // Mark all operations on this object as failed
                     for (i, dobj) in objects.iter().enumerate() {
                         if dobj.object_name == object_name {
-                            del_errs[i] = Some(Error::other("can not get lock. please retry"));
+                            del_errs[i] = Some(Error::other(message.clone()));
                         }
                     }
                 }
@@ -4141,9 +4186,9 @@ impl StorageAPI for SetDisks {
         let _lock_guard = if !opts.delete_prefix {
             Some(
                 self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
                     .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
             )
         } else {
             None
@@ -4329,9 +4374,9 @@ impl StorageAPI for SetDisks {
         let _read_lock_guard = if !opts.no_lock {
             Some(
                 self.fast_lock_manager
-                    .acquire_read_lock("", object, self.locker_owner.as_str())
+                    .acquire_read_lock(bucket, object, self.locker_owner.as_str())
                     .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "read", &e)))?,
             )
         } else {
             None
@@ -4371,9 +4416,9 @@ impl StorageAPI for SetDisks {
         let _lock_guard = if !opts.no_lock {
             Some(
                 self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
                     .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
             )
         } else {
             None
@@ -5640,18 +5685,36 @@ impl StorageAPI for SetDisks {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
         let _write_lock_guard = if !opts.no_lock {
-            Some(
-                self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {e:?}")))?,
-            )
+            let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
+            let mut skip_lock = false;
+            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
+                if lock_info.owner.as_ref() == self.locker_owner.as_str()
+                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
+                {
+                    debug!(
+                        "Reusing existing exclusive lock for heal operation on {}/{} held by {}",
+                        bucket, object, self.locker_owner
+                    );
+                    skip_lock = true;
+                }
+            }
+
+            if skip_lock {
+                None
+            } else {
+                Some(
+                    self.fast_lock_manager
+                        .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                        .await
+                        .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+                )
+            }
         } else {
             None
         };
 
         if has_suffix(object, SLASH_SEPARATOR) {
-            let (result, err) = self.heal_object_dir(bucket, object, opts.dry_run, opts.remove).await?;
+            let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
         }
 
