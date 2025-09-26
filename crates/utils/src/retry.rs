@@ -73,8 +73,11 @@ impl Stream for RetryTimer {
             //println!("\njitter: {:?}", jitter);
             //println!("sleep: {sleep:?}");
             //println!("0000: {:?}", self.random as f64 * jitter / 100_f64);
-            let sleep_ms = sleep.as_millis() as u64;
-            sleep = Duration::from_millis(sleep_ms - (sleep_ms as f64 * (self.random as f64 * jitter / 100_f64)) as u64);
+            let sleep_ms = sleep.as_millis();
+            let reduction = ((sleep_ms as f64) * (self.random as f64 * jitter / 100_f64)).round() as u128;
+            let jittered_ms = sleep_ms.saturating_sub(reduction);
+            let clamped_ms = std::cmp::min(jittered_ms.max(1), u128::from(u64::MAX));
+            sleep = Duration::from_millis(clamped_ms as u64);
         }
         //println!("sleep: {sleep:?}");
 

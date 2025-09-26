@@ -111,6 +111,9 @@ impl ObjectLockState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fast_lock::state::{ExclusiveOwnerInfo, SharedOwnerEntry};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn test_object_pool() {
@@ -142,8 +145,17 @@ mod tests {
         let mut state = ObjectLockState::new();
 
         // Modify state
-        *state.current_owner.write() = Some("test_owner".into());
-        state.shared_owners.write().push("shared_owner".into());
+        *state.current_owner.write() = Some(ExclusiveOwnerInfo {
+            owner: Arc::from("test_owner"),
+            acquired_at: SystemTime::now(),
+            lock_timeout: Duration::from_secs(30),
+        });
+        state.shared_owners.write().push(SharedOwnerEntry {
+            owner: Arc::from("shared_owner"),
+            count: 1,
+            acquired_at: SystemTime::now(),
+            lock_timeout: Duration::from_secs(30),
+        });
 
         // Reset
         state.reset_for_reuse();
