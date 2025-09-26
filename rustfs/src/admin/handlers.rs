@@ -968,11 +968,6 @@ impl Operation for GetReplicationMetricsHandler {
     }
 }
 
-#[derive(Serialize)]
-pub struct SetRemoteTargetResponse {
-    arn: String,
-}
-
 pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {

@@ -321,13 +321,9 @@ async fn test_vault_kms_key_crud(
     })
     .to_string();
 
-    let create_response = crate::common::awscurl_post(
-        &format!("{base_url}/rustfs/admin/v3/kms/keys"),
-        &create_key_body,
-        access_key,
-        secret_key,
-    )
-    .await?;
+    let create_response =
+        crate::common::awscurl_post(&format!("{base_url}/rustfs/admin/v3/kms/keys"), &create_key_body, access_key, secret_key)
+            .await?;
 
     let create_result: serde_json::Value = serde_json::from_str(&create_response)?;
     let key_id = create_result["key_id"]

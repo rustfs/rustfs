@@ -710,9 +710,7 @@ impl KmsBackend for VaultKmsBackend {
         };
 
         if key_metadata.key_state != KeyState::PendingDeletion {
-            return Err(crate::error::KmsError::invalid_key_state(format!(
-                "Key {key_id} is not pending deletion"
-            )));
+            return Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
 
         // Cancel the deletion by resetting the state

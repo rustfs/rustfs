@@ -823,9 +823,7 @@ impl KmsBackend for LocalKmsBackend {
             .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         if master_key.status != KeyStatus::PendingDeletion {
-            return Err(crate::error::KmsError::invalid_key_state(format!(
-                "Key {key_id} is not pending deletion"
-            )));
+            return Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
 
         // Cancel the deletion by resetting the state

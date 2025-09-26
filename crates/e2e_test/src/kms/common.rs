@@ -281,13 +281,8 @@ pub async fn test_kms_key_management(
     })
     .to_string();
 
-    let create_response = awscurl_post(
-        &format!("{base_url}/rustfs/admin/v3/kms/keys"),
-        &create_key_body,
-        access_key,
-        secret_key,
-    )
-    .await?;
+    let create_response =
+        awscurl_post(&format!("{base_url}/rustfs/admin/v3/kms/keys"), &create_key_body, access_key, secret_key).await?;
 
     let create_result: serde_json::Value = serde_json::from_str(&create_response)?;
     let key_id = create_result["key_id"]
@@ -296,8 +291,7 @@ pub async fn test_kms_key_management(
     info!("Created key with ID: {}", key_id);
 
     // Test DescribeKey
-    let describe_response =
-        awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await?;
+    let describe_response = awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await?;
 
     info!("DescribeKey response: {}", describe_response);
     let describe_result: serde_json::Value = serde_json::from_str(&describe_response)?;
