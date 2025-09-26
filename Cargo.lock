@@ -7726,9 +7726,9 @@ dependencies = [
 
 [[package]]
 name = "starshard"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb22225785aff2950b77f6c7b13c7ef6d8a7ecd4848aacaca40bc3765a5f583e"
+checksum = "1613ae20660b62a7cd0ba9e541130028f91ba90c2e50289f4346e00e0dae9ced"
 dependencies = [
  "fxhash",
  "hashbrown 0.16.0",

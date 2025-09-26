@@ -228,7 +228,7 @@ snafu = "0.8.9"
 snap = "1.1.1"
 socket2 = "0.6.0"
 strum = { version = "0.27.2", features = ["derive"] }
-starshard = { version = "0.2.0", features = ["rayon", "async"] }
+starshard = { version = "0.4.0", features = ["rayon", "async"] }
 sysinfo = "0.37.0"
 sysctl = "0.7.1"
 tempfile = "3.23.0"
