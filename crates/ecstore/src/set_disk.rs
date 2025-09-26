@@ -4041,34 +4041,34 @@ impl StorageAPI for SetDisks {
             del_errs.push(None)
         }
 
-        // Use fast batch locking to acquire all locks atomically
-        let mut _guards: HashMap<String, rustfs_lock::FastLockGuard> = HashMap::new();
+        // Acquire locks in batch mode (best effort, matching previous behavior)
+        let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
         let mut unique_objects: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Collect unique object names
         for dobj in &objects {
-            unique_objects.insert(dobj.object_name.clone());
+            if unique_objects.insert(dobj.object_name.clone()) {
+                batch = batch.add_write_lock(bucket, dobj.object_name.clone());
+            }
         }
 
-        // Acquire all locks in batch to prevent deadlocks
-        for object_name in unique_objects {
-            match self
-                .fast_lock_manager
-                .acquire_write_lock(bucket, object_name.as_str(), self.locker_owner.as_str())
-                .await
-            {
-                Ok(guard) => {
-                    _guards.insert(object_name, guard);
-                }
-                Err(err) => {
-                    let message = self.format_lock_error(bucket, object_name.as_str(), "write", &err);
-                    // Mark all operations on this object as failed
-                    for (i, dobj) in objects.iter().enumerate() {
-                        if dobj.object_name == object_name {
-                            del_errs[i] = Some(Error::other(message.clone()));
-                        }
-                    }
-                }
+        let batch_result = self.fast_lock_manager.acquire_locks_batch(batch).await;
+        let locked_objects: HashSet<String> = batch_result
+            .successful_locks
+            .iter()
+            .map(|key| key.object.as_ref().to_string())
+            .collect();
+        let _lock_guards = batch_result.guards;
+
+        let failed_map: HashMap<(String, String), rustfs_lock::fast_lock::LockResult> = batch_result
+            .failed_locks
+            .into_iter()
+            .map(|(key, err)| ((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), err))
+            .collect();
+
+        // Mark failures for objects that could not be locked
+        for (i, dobj) in objects.iter().enumerate() {
+            if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
+                let message = self.format_lock_error(bucket, dobj.object_name.as_str(), "write", err);
+                del_errs[i] = Some(Error::other(message));
             }
         }
 
@@ -4137,7 +4137,7 @@ impl StorageAPI for SetDisks {
             }
 
             // Only add to vers_map if we hold the lock
-            if _guards.contains_key(&dobj.object_name) {
+            if locked_objects.contains(&dobj.object_name) {
                 vers_map.insert(&dobj.object_name, v);
             }
         }
@@ -4558,7 +4558,6 @@ impl StorageAPI for SetDisks {
         };
 
         // Acquire write-lock early; hold for the whole transition operation scope
-        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
         // if !opts.no_lock {
         //     let guard_opt = self
         //         .namespace_lock
@@ -4687,7 +4686,6 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         // Acquire write-lock early for the restore operation
-        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
         // if !opts.no_lock {
         //     let guard_opt = self
         //         .namespace_lock
@@ -4772,7 +4770,6 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire write-lock for tag update (metadata write)
-        // let mut _lock_guard: Option<rustfs_lock::LockGuard> = None;
         // if !opts.no_lock {
         //     let guard_opt = self
         //         .namespace_lock
@@ -5433,7 +5430,6 @@ impl StorageAPI for SetDisks {
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        // let mut _object_lock_guard: Option<rustfs_lock::LockGuard> = None;
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             // if !opts.no_lock {
             //     let guard_opt = self
