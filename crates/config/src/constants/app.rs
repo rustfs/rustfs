@@ -170,6 +170,11 @@ pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 /// Example: --external-address ":9020"
 pub const ENV_EXTERNAL_ADDRESS: &str = "RUSTFS_EXTERNAL_ADDRESS";
 
+/// 1 KiB
+pub const KI_B: usize = 1024;
+/// 1 MiB
+pub const MI_B: usize = 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;

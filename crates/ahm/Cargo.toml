@@ -33,10 +33,10 @@ chrono = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-serial_test = "3.2.0"
+serial_test = { workspace = true }
 tracing-subscriber = { workspace = true }
-walkdir = "2.5.0"
 tempfile = { workspace = true }

@@ -40,6 +40,7 @@ services:
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_LOG_LEVEL=info
+      - RUSTFS_TLS_PATH=/opt/tls
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
     volumes:
       - rustfs_data_0:/data/rustfs0
@@ -47,6 +48,7 @@ services:
       - rustfs_data_2:/data/rustfs2
       - rustfs_data_3:/data/rustfs3
       - logs_data:/app/logs
+      - .docker/tls/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
     networks:
       - rustfs-network
     restart: unless-stopped

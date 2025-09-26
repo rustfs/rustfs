@@ -16,7 +16,7 @@ use crate::admin::console::static_handler;
 use crate::config::Opt;
 use axum::{Router, extract::Request, middleware, response::Json, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
-use http::{HeaderValue, Method, header};
+use http::{HeaderValue, Method};
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_utils::net::parse_and_resolve_address;
 use serde_json::json;
@@ -74,7 +74,7 @@ async fn setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<Ru
     debug!("Found TLS directory for console, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
@@ -230,15 +230,15 @@ async fn health_check() -> Json<serde_json::Value> {
 pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT, header::ORIGIN]);
+        .allow_headers(Any);
 
     match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any),
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
         Some(origins_str) => {
             let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
             if origins.is_empty() {
                 warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any)
+                cors_layer.allow_origin(Any).expose_headers(Any)
             } else {
                 // Parse origins with proper error handling
                 let mut valid_origins = Vec::new();
@@ -255,10 +255,10 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
 
                 if valid_origins.is_empty() {
                     warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any)
+                    cors_layer.allow_origin(Any).expose_headers(Any)
                 } else {
                     info!("Console CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins))
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
                 }
             }
         }
@@ -322,6 +322,18 @@ pub async fn start_console_server(opt: &Opt, shutdown_rx: tokio::sync::broadcast
         target: "rustfs::console::startup",
         "Console WebUI (localhost): {}://127.0.0.1:{}/rustfs/console/index.html",
         protocol, console_addr.port()
+    );
+
+    println!(
+        "Console WebUI available at: {}://{}:{}/rustfs/console/index.html",
+        protocol,
+        local_ip,
+        console_addr.port()
+    );
+    println!(
+        "Console WebUI (localhost): {}://127.0.0.1:{}/rustfs/console/index.html",
+        protocol,
+        console_addr.port()
     );
 
     // Handle connections based on TLS availability using axum-server

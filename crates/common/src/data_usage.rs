@@ -144,6 +144,20 @@ pub struct DataUsageInfo {
     pub buckets_usage: HashMap<String, BucketUsageInfo>,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
+    /// Per-disk snapshot information when available
+    #[serde(default)]
+    pub disk_usage_status: Vec<DiskUsageStatus>,
+}
+
+/// Metadata describing the status of a disk-level data usage snapshot.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct DiskUsageStatus {
+    pub disk_id: String,
+    pub pool_index: Option<usize>,
+    pub set_index: Option<usize>,
+    pub disk_index: Option<usize>,
+    pub last_update: Option<SystemTime>,
+    pub snapshot_exists: bool,
 }
 
 /// Size summary for a single object or group of objects
@@ -1126,6 +1140,8 @@ impl DataUsageInfo {
                 self.buckets_usage.insert(bucket.clone(), usage.clone());
             }
         }
+
+        self.disk_usage_status.extend(other.disk_usage_status.iter().cloned());
 
         // Recalculate totals
         self.calculate_totals();

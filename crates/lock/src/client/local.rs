@@ -87,7 +87,7 @@ impl LockClient for LocalClient {
                 current_owner,
                 current_mode,
             }) => Ok(LockResponse::failure(
-                format!("Lock conflict: resource held by {} in {:?} mode", current_owner, current_mode),
+                format!("Lock conflict: resource held by {current_owner} in {current_mode:?} mode"),
                 std::time::Duration::ZERO,
             )),
             Err(crate::fast_lock::LockResult::Acquired) => {
@@ -131,7 +131,7 @@ impl LockClient for LocalClient {
                 current_owner,
                 current_mode,
             }) => Ok(LockResponse::failure(
-                format!("Lock conflict: resource held by {} in {:?} mode", current_owner, current_mode),
+                format!("Lock conflict: resource held by {current_owner} in {current_mode:?} mode"),
                 std::time::Duration::ZERO,
             )),
             Err(crate::fast_lock::LockResult::Acquired) => {

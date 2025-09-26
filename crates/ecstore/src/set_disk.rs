@@ -2143,6 +2143,7 @@ impl SetDisks {
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
+        tracing::debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
         let total_size = fi.size as usize;
@@ -2160,28 +2161,46 @@ impl SetDisks {
 
         let (part_index, mut part_offset) = fi.to_part_offset(offset)?;
 
-        // debug!(
-        //     "get_object_with_fileinfo start offset:{}, part_index:{},part_offset:{}",
-        //     offset, part_index, part_offset
-        // );
-
         let mut end_offset = offset;
         if length > 0 {
             end_offset += length - 1
         }
 
-        let (last_part_index, _) = fi.to_part_offset(end_offset)?;
+        let (last_part_index, last_part_relative_offset) = fi.to_part_offset(end_offset)?;
+
+        tracing::debug!(
+            bucket,
+            object,
+            offset,
+            length,
+            end_offset,
+            part_index,
+            last_part_index,
+            last_part_relative_offset,
+            "Multipart read bounds"
+        );
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
+        let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
+        tracing::debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
+
         let mut total_read = 0;
-        for i in part_index..=last_part_index {
+        for current_part in part_indices {
             if total_read == length {
+                tracing::debug!(
+                    bucket,
+                    object,
+                    total_read,
+                    requested_length = length,
+                    part_index = current_part,
+                    "Stopping multipart stream early because accumulated bytes match request"
+                );
                 break;
             }
 
-            let part_number = fi.parts[i].number;
-            let part_size = fi.parts[i].size;
+            let part_number = fi.parts[current_part].number;
+            let part_size = fi.parts[current_part].size;
             let mut part_length = part_size - part_offset;
             if part_length > (length - total_read) {
                 part_length = length - total_read
@@ -2190,6 +2209,21 @@ impl SetDisks {
             let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
 
             let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
+
+            tracing::debug!(
+                bucket,
+                object,
+                part_index = current_part,
+                part_number,
+                part_offset,
+                part_size,
+                part_length,
+                read_offset,
+                till_offset,
+                total_read_before = total_read,
+                requested_length = length,
+                "Streaming multipart part"
+            );
 
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
@@ -2236,6 +2270,15 @@ impl SetDisks {
             //     part_number, part_offset, part_length, part_size
             // );
             let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            tracing::debug!(
+                bucket,
+                object,
+                part_index = current_part,
+                part_number,
+                part_length,
+                bytes_written = written,
+                "Finished decoding multipart part"
+            );
             if let Some(e) = err {
                 let de_err: DiskError = e.into();
                 let mut has_err = true;
@@ -2273,6 +2316,8 @@ impl SetDisks {
         }
 
         // debug!("read end");
+
+        tracing::debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
 
         Ok(())
     }
@@ -2430,7 +2475,7 @@ impl SetDisks {
                 .map_err(|e| {
                     let elapsed = start_time.elapsed();
                     error!("Failed to acquire write lock for heal operation after {:?}: {:?}", elapsed, e);
-                    DiskError::other(format!("Failed to acquire write lock for heal operation: {:?}", e))
+                    DiskError::other(format!("Failed to acquire write lock for heal operation: {e:?}"))
                 })?;
             let elapsed = start_time.elapsed();
             info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
@@ -3045,7 +3090,7 @@ impl SetDisks {
             .fast_lock_manager
             .acquire_write_lock("", object, self.locker_owner.as_str())
             .await
-            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {:?}", e)))?;
+            .map_err(|e| DiskError::other(format!("Failed to acquire write lock for heal directory operation: {e:?}")))?;
 
         let disks = {
             let disks = self.disks.read().await;
@@ -3462,12 +3507,13 @@ impl ObjectIO for SetDisks {
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
             // let _guard = _guard_to_hold; // keep guard alive until task ends
+            let mut writer = wd;
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
                 offset,
                 length,
-                &mut Box::new(wd),
+                &mut writer,
                 fi,
                 files,
                 &disks,
@@ -3895,7 +3941,7 @@ impl StorageAPI for SetDisks {
                 debug!("delete_object_version error: {:?}", err);
                 Error::other("can not get lock. please retry".to_string())
             })?;
-        //info!("delete_object_version {:?}", object);
+        info!("delete_object_version {:?}", object);
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -5381,6 +5427,7 @@ impl StorageAPI for SetDisks {
             }
 
             let ext_part = &curr_fi.parts[i];
+            tracing::info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
 
             if p.etag != Some(ext_part.etag.clone()) {
                 error!(
@@ -5439,6 +5486,9 @@ impl StorageAPI for SetDisks {
 
         fi.metadata
             .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), object_actual_size.to_string());
+
+        fi.metadata
+            .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
 
         if fi.is_compressed() {
             fi.metadata
@@ -5598,7 +5648,7 @@ impl StorageAPI for SetDisks {
                 self.fast_lock_manager
                     .acquire_write_lock("", object, self.locker_owner.as_str())
                     .await
-                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {:?}", e)))?,
+                    .map_err(|e| Error::other(format!("Failed to acquire write lock for heal operation: {e:?}")))?,
             )
         } else {
             None

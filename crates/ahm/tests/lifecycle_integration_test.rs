@@ -267,7 +267,10 @@ async fn create_test_tier() {
 
 /// Test helper: Check if object exists
 async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
-    ((**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await).is_ok()
+    match (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
+        Ok(info) => !info.delete_marker,
+        Err(_) => false,
+    }
 }
 
 /// Test helper: Check if object exists
@@ -392,7 +395,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore]
+    //#[ignore]
     async fn test_lifecycle_expiry_deletemarker() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -487,7 +490,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore]
+    //#[ignore]
     async fn test_lifecycle_transition_basic() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 

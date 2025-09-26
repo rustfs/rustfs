@@ -141,9 +141,9 @@ impl TransitionClient {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
         //#[cfg(feature = "ring")]
-        //let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         //#[cfg(feature = "aws-lc-rs")]
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let scheme = endpoint_url.scheme();
         let client;

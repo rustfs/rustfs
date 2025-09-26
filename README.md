@@ -136,6 +136,8 @@ To get started with RustFS, follow these steps:
 5. **Create a Bucket**: Use the console to create a new bucket for your objects.
 6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
 
+**NOTE**: If you want to access RustFS instance with `https`, you can refer to [TLS configuration docs](https://docs.rustfs.com/integration/tls-configured.html).
+
 ## Documentation
 
 For detailed documentation, including configuration options, API references, and advanced usage, please visit our [Documentation](https://docs.rustfs.com).
