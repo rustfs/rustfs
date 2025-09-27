@@ -14,14 +14,14 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use rustfs_ecstore::{disk::endpoint::Endpoint, lock_utils::create_unique_clients};
-use rustfs_lock::client::{LockClient, local::LocalClient};
+use rustfs_ecstore::disk::endpoint::Endpoint;
+use rustfs_lock::client::{LockClient, local::LocalClient, remote::RemoteClient};
 use rustfs_lock::types::{LockInfo, LockResponse, LockStats};
 use rustfs_lock::{LockId, LockMetadata, LockPriority, LockType};
 use rustfs_lock::{LockRequest, NamespaceLock, NamespaceLockManager};
 use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
 use serial_test::serial;
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tonic::Request;
 use url::Url;
@@ -36,6 +36,34 @@ fn get_cluster_endpoints() -> Vec<Endpoint> {
         set_idx: 0,
         disk_idx: 0,
     }]
+}
+
+async fn create_unique_clients(endpoints: &[Endpoint]) -> Result<Vec<Arc<dyn LockClient>>, Box<dyn Error>> {
+    let mut unique_endpoints: HashMap<String, &Endpoint> = HashMap::new();
+
+    for endpoint in endpoints {
+        if endpoint.is_local {
+            unique_endpoints.insert("local".to_string(), endpoint);
+        } else {
+            let host_port = format!(
+                "{}:{}",
+                endpoint.url.host_str().unwrap_or("localhost"),
+                endpoint.url.port().unwrap_or(9000)
+            );
+            unique_endpoints.insert(host_port, endpoint);
+        }
+    }
+
+    let mut clients = Vec::new();
+    for (_key, endpoint) in unique_endpoints {
+        if endpoint.is_local {
+            clients.push(Arc::new(LocalClient::new()) as Arc<dyn LockClient>);
+        } else {
+            clients.push(Arc::new(RemoteClient::new(endpoint.url.to_string())) as Arc<dyn LockClient>);
+        }
+    }
+
+    Ok(clients)
 }
 
 #[tokio::test]

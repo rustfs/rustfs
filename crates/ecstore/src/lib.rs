@@ -31,7 +31,6 @@ pub mod erasure_coding;
 pub mod error;
 pub mod file_cache;
 pub mod global;
-pub mod lock_utils;
 pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod pools;
