@@ -1604,12 +1604,6 @@ dependencies = [
 
 [[package]]
 name = "const-str"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "451d0640545a0553814b4c646eb549343561618838e9b42495f466131fe3ad49"
-
-[[package]]
-name = "const-str"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4d34b8f066904ed7cfa4a6f9ee96c3214aa998cb44b69ca20bd2054f47402ed"
@@ -6207,7 +6201,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "const-str 0.7.0",
+ "const-str",
  "datafusion",
  "futures",
  "http 1.3.1",
@@ -6365,7 +6359,7 @@ dependencies = [
 name = "rustfs-config"
 version = "0.0.5"
 dependencies = [
- "const-str 0.7.0",
+ "const-str",
 ]
 
 [[package]]
@@ -7058,9 +7052,9 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3s"
-version = "0.12.0-minio-preview.3"
+version = "0.12.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24c7be783f8b2bb5aba553462bf7e9ee95655bb27cbd6a0b0a93af2e719b1eec"
+checksum = "e0c7ae94d88d3d0d4ab0cb3f8e106199832b2943609680b5d75b0d7f686f6be3"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -7069,7 +7063,7 @@ dependencies = [
  "bytes",
  "bytestring",
  "chrono",
- "const-str 0.6.4",
+ "const-str",
  "crc32c",
  "crc32fast",
  "crc64fast-nvme",
@@ -7096,6 +7090,7 @@ dependencies = [
  "sha2 0.11.0-pre.5",
  "smallvec",
  "std-next",
+ "subtle",
  "sync_wrapper",
  "thiserror 2.0.16",
  "time",
