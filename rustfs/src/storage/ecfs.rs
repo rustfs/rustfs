@@ -76,6 +76,7 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::client::object_api_utils::format_etag;
 use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
@@ -460,7 +461,7 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
-                let e_tag = _obj_info.clone().etag;
+                let e_tag = _obj_info.etag.clone().map(|etag| format_etag(&etag));
 
                 // // store.put_object(bucket, object, data, opts);
 
@@ -748,7 +749,7 @@ impl S3 for FS {
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag,
+            e_tag: oi.etag.map(|etag| format_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             ..Default::default()
         };
@@ -1693,7 +1694,7 @@ impl S3 for FS {
             content_type,
             accept_ranges: Some("bytes".to_string()),
             content_range,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             metadata: Some(info.user_defined),
             server_side_encryption,
             sse_customer_algorithm,
@@ -1827,7 +1828,7 @@ impl S3 for FS {
             content_length: Some(content_length),
             content_type,
             last_modified,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             metadata: Some(metadata),
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
@@ -1978,7 +1979,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| format_etag(&etag)),
                     ..Default::default()
                 };
 
@@ -2057,7 +2058,7 @@ impl S3 for FS {
                     size: Some(v.size),
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| format_etag(&etag)),
                     ..Default::default() // TODO: another fields
                 }
             })
@@ -2334,7 +2335,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
         let event_info = obj_info.clone();
-        let e_tag = obj_info.etag.clone();
+        let e_tag = obj_info.etag.clone().map(|etag| format_etag(&etag));
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
@@ -2697,7 +2698,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let output = UploadPartOutput {
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             ..Default::default()
         };
 
@@ -2883,7 +2884,7 @@ impl S3 for FS {
 
         // Create response
         let copy_part_result = CopyPartResult {
-            e_tag: part_info.etag,
+            e_tag: part_info.etag.map(|etag| format_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
             ..Default::default()
         };
@@ -2936,7 +2937,7 @@ impl S3 for FS {
                 res.parts
                     .into_iter()
                     .map(|p| Part {
-                        e_tag: p.etag,
+                        e_tag: p.etag.map(|etag| format_etag(&etag)),
                         last_modified: p.last_mod.map(Timestamp::from),
                         part_number: Some(p.part_num as i32),
                         size: Some(p.size as i64),
@@ -3111,7 +3112,7 @@ impl S3 for FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
-            e_tag: obj_info.etag.clone(),
+            e_tag: obj_info.etag.clone().map(|etag| format_etag(&etag)),
             location: Some("us-east-1".to_string()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
