@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod append;
 mod conditional_writes;
 mod lifecycle;
 mod lock;
