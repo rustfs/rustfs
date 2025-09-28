@@ -167,8 +167,19 @@ async fn write_data_blocks<W>(
 where
     W: tokio::io::AsyncWrite + Send + Sync + Unpin,
 {
-    if get_data_block_len(en_blocks, data_blocks) < length {
-        error!("write_data_blocks get_data_block_len < length");
+    let available = get_data_block_len(en_blocks, data_blocks);
+    if available < length {
+        let block_sizes: Vec<usize> = en_blocks
+            .iter()
+            .take(data_blocks)
+            .map(|block| block.as_ref().map(|buf| buf.len()).unwrap_or(0))
+            .collect();
+        error!(
+            expected = length,
+            available,
+            ?block_sizes,
+            "write_data_blocks get_data_block_len < length"
+        );
         return Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"));
     }
 
