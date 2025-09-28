@@ -98,12 +98,18 @@ impl DisabledLockManager {
 
     /// Always succeeds - all locks acquired
     pub async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
-        let successful_locks: Vec<ObjectKey> = batch_request.requests.into_iter().map(|req| req.key).collect();
+        let successful_locks: Vec<ObjectKey> = batch_request.requests.iter().map(|req| req.key.clone()).collect();
+        let guards = batch_request
+            .requests
+            .into_iter()
+            .map(|req| FastLockGuard::new_disabled(req.key, req.mode, req.owner))
+            .collect();
 
         BatchLockResult {
             successful_locks,
             failed_locks: Vec::new(),
             all_acquired: true,
+            guards,
         }
     }
 
