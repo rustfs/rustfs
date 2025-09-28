@@ -17,12 +17,12 @@ use crate::erasure_coding::{Erasure, calc_shard_size};
 use crate::error::{Error, StorageError};
 use crate::store_api::ObjectInfo;
 use rustfs_filemeta::TRANSITION_COMPLETE;
-use rustfs_filemeta::headers::{
-    AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
-    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
-    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
-};
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::http::headers::{
+    AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+    RESERVED_METADATA_PREFIX_LOWER,
+};
 use std::collections::HashSet;
 
 /// Ensure the target object can accept append writes under current state.
@@ -37,8 +37,8 @@ pub fn validate_append_preconditions(bucket: &str, object: &str, info: &ObjectIn
 
     let encryption_headers = [
         AMZ_SERVER_SIDE_ENCRYPTION,
-        AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID,
-        AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
+        AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+        AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
         AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
         AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
         AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
@@ -46,7 +46,7 @@ pub fn validate_append_preconditions(bucket: &str, object: &str, info: &ObjectIn
 
     if encryption_headers
         .iter()
-        .any(|header| info.user_defined.contains_key(*header))
+        .any(|header| info.user_defined.contains_key(*header) || info.user_defined.contains_key(&header.to_ascii_lowercase()))
     {
         return Err(StorageError::InvalidArgument(
             bucket.to_string(),
@@ -371,8 +371,7 @@ impl InlineSpillProcessor {
                 // Update file metadata
                 fi.data_dir = Some(data_dir);
                 fi.data = None; // Remove inline data
-                fi.metadata
-                    .remove(&format!("{}inline-data", rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER));
+                fi.metadata.remove(&format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER));
 
                 // Update append state to SegmentedActive
                 let mut new_state = current_state;
@@ -392,7 +391,7 @@ impl InlineSpillProcessor {
                     meta.data = None;
                     meta.metadata = fi.metadata.clone();
                     meta.metadata
-                        .remove(&format!("{}inline-data", rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER));
+                        .remove(&format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER));
                 }
 
                 // Write updated metadata back to disks
@@ -491,7 +490,6 @@ pub fn trigger_spill_process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
     use rustfs_utils::HashAlgorithm;
 
     fn make_object_info() -> ObjectInfo {

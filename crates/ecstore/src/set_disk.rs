@@ -70,16 +70,14 @@ use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_filemeta::{
-    AppendSegment, AppendState, AppendStateKind, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries,
-    MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo, RawFileInfo, ReplicationStatusType, VersionPurgeStatusType,
-    clear_append_state, file_info_from_raw, get_append_state,
-    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
-    merge_file_meta_versions, set_append_state, validate_new_segment,
+    AppendSegment, AppendState, AppendStateKind, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry,
+    MetadataResolutionParams, ObjectPartInfo, RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, clear_append_state,
+    file_info_from_raw, get_append_state, merge_file_meta_versions, set_append_state, validate_new_segment,
 };
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
-use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::{
     HashAlgorithm,
     crypto::{base64_decode, base64_encode, hex},
