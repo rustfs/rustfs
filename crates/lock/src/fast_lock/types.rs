@@ -19,6 +19,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::fast_lock::guard::FastLockGuard;
+
 /// Object key for version-aware locking
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectKey {
@@ -340,6 +342,7 @@ pub struct BatchLockResult {
     pub successful_locks: Vec<ObjectKey>,
     pub failed_locks: Vec<(ObjectKey, LockResult)>,
     pub all_acquired: bool,
+    pub guards: Vec<FastLockGuard>,
 }
 
 #[cfg(test)]

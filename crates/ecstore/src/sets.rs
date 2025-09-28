@@ -56,8 +56,6 @@ use tokio::time::Duration;
 use tracing::warn;
 use tracing::{error, info};
 
-use crate::lock_utils::create_unique_clients;
-
 #[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
@@ -163,8 +161,6 @@ impl Sets {
                     set_drive.push(None);
                 }
             }
-
-            let _lock_clients = create_unique_clients(&set_endpoints).await?;
 
             // Note: write_quorum was used for the old lock system, no longer needed with FastLock
             let _write_quorum = set_drive_count - parity_count;
