@@ -30,12 +30,13 @@ crc32fast = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 bytes.workspace = true
-rustfs-utils = { workspace = true, features = ["hash"] }
+rustfs-utils = { workspace = true, features = ["hash","http"] }
 byteorder = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true

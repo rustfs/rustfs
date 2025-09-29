@@ -148,10 +148,75 @@ pub fn new_getobjectreader(
     Ok((get_fn, off as i64, length as i64))
 }
 
+/// Format an ETag value according to HTTP standards (wrap with quotes if not already wrapped)
+pub fn format_etag(etag: &str) -> String {
+    if etag.starts_with('"') && etag.ends_with('"') {
+        // Already properly formatted
+        etag.to_string()
+    } else if etag.starts_with("W/\"") && etag.ends_with('"') {
+        // Already a weak ETag, properly formatted
+        etag.to_string()
+    } else {
+        // Need to wrap with quotes
+        format!("\"{}\"", etag)
+    }
+}
+
 pub fn extract_etag(metadata: &HashMap<String, String>) -> String {
-    if let Some(etag) = metadata.get("etag") {
+    let etag = if let Some(etag) = metadata.get("etag") {
         etag.clone()
     } else {
         metadata["md5Sum"].clone()
+    };
+    format_etag(&etag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_etag() {
+        // Test unquoted ETag - should add quotes
+        assert_eq!(format_etag("6af8d12c0c74b78094884349f3c8a079"), "\"6af8d12c0c74b78094884349f3c8a079\"");
+
+        // Test already quoted ETag - should not double quote
+        assert_eq!(
+            format_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
+            "\"6af8d12c0c74b78094884349f3c8a079\""
+        );
+
+        // Test weak ETag - should keep as is
+        assert_eq!(
+            format_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
+            "W/\"6af8d12c0c74b78094884349f3c8a079\""
+        );
+
+        // Test empty ETag - should add quotes
+        assert_eq!(format_etag(""), "\"\"");
+
+        // Test malformed quote (only starting quote) - should wrap properly
+        assert_eq!(format_etag("\"incomplete"), "\"\"incomplete\"");
+
+        // Test malformed quote (only ending quote) - should wrap properly
+        assert_eq!(format_etag("incomplete\""), "\"incomplete\"\"");
+    }
+
+    #[test]
+    fn test_extract_etag() {
+        let mut metadata = HashMap::new();
+
+        // Test with etag field
+        metadata.insert("etag".to_string(), "abc123".to_string());
+        assert_eq!(extract_etag(&metadata), "\"abc123\"");
+
+        // Test with already quoted etag field
+        metadata.insert("etag".to_string(), "\"def456\"".to_string());
+        assert_eq!(extract_etag(&metadata), "\"def456\"");
+
+        // Test fallback to md5Sum
+        metadata.remove("etag");
+        metadata.insert("md5Sum".to_string(), "xyz789".to_string());
+        assert_eq!(extract_etag(&metadata), "\"xyz789\"");
     }
 }

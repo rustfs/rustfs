@@ -29,6 +29,33 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use http::StatusCode;
+use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::object_lock::objectlock_sys::BucketObjectLockSys;
+use rustfs_ecstore::bucket::replication::DeletedObjectReplicationInfo;
+use rustfs_ecstore::bucket::replication::REPLICATE_INCOMING_DELETE;
+use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
+use rustfs_ecstore::bucket::replication::check_replicate_delete;
+use rustfs_ecstore::bucket::replication::get_must_replicate_options;
+use rustfs_ecstore::bucket::replication::must_replicate;
+use rustfs_ecstore::bucket::replication::schedule_replication;
+use rustfs_ecstore::bucket::replication::schedule_replication_delete;
+use rustfs_ecstore::bucket::versioning::VersioningApi;
+use rustfs_ecstore::disk::error::DiskError;
+use rustfs_ecstore::disk::error_reduce::is_all_buckets_not_found;
+use rustfs_ecstore::error::is_err_bucket_not_found;
+use rustfs_ecstore::error::is_err_object_not_found;
+use rustfs_ecstore::error::is_err_version_not_found;
+use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
+use rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_filemeta::ReplicationStatusType;
+use rustfs_filemeta::ReplicationType;
+use rustfs_filemeta::VersionPurgeStatusType;
+use rustfs_s3select_api::object_store::bytes_stream;
+use rustfs_s3select_api::query::Context;
+use rustfs_s3select_api::query::Query;
+use rustfs_s3select_query::get_global_db;
+
 // use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::StreamExt;
@@ -49,16 +76,11 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
-use rustfs_ecstore::cmd::bucket_replication::get_must_replicate_options;
-use rustfs_ecstore::cmd::bucket_replication::must_replicate;
-use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
+use rustfs_ecstore::client::object_api_utils::format_etag;
 use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_ecstore::set_disk::{DEFAULT_READ_BUFFER_SIZE, is_valid_storage_class};
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::CompletePart;
@@ -72,8 +94,6 @@ use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_filemeta::fileinfo::ObjectPartInfo;
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_kms::DataKey;
 use rustfs_kms::service_manager::get_global_encryption_service;
 use rustfs_kms::types::{EncryptionMetadata, ObjectEncryptionContext};
@@ -88,13 +108,13 @@ use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
 use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader};
-use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_s3select_api::query::Context;
-use rustfs_s3select_api::query::Query;
-use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
+use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_utils::path::is_dir_object;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
 use s3s::S3;
@@ -188,7 +208,7 @@ async fn create_managed_encryption_material(
     let (data_key, encrypted_data_key) = service
         .create_data_key(&kms_key_candidate, &context)
         .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {}", e))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
 
     let metadata = EncryptionMetadata {
         algorithm: algorithm_str.to_string(),
@@ -227,7 +247,7 @@ async fn decrypt_managed_encryption_key(
 
     let parsed = service
         .headers_to_metadata(metadata)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {}", e))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {e}"))))?;
 
     if parsed.iv.len() != 12 {
         return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
@@ -237,7 +257,7 @@ async fn decrypt_managed_encryption_key(
     let data_key = service
         .decrypt_data_key(&parsed.encrypted_data_key, &context)
         .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
 
     let key_bytes = data_key.plaintext_key;
     let mut nonce = [0u8; 12];
@@ -441,7 +461,7 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
-                let e_tag = _obj_info.clone().etag;
+                let e_tag = _obj_info.etag.clone().map(|etag| format_etag(&etag));
 
                 // // store.put_object(bucket, object, data, opts);
 
@@ -729,7 +749,7 @@ impl S3 for FS {
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag,
+            e_tag: oi.etag.map(|etag| format_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             ..Default::default()
         };
@@ -967,67 +987,120 @@ impl S3 for FS {
 
     /// Delete an object
     #[tracing::instrument(level = "debug", skip(self, req))]
-    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+    async fn delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        let replica = req
+            .headers
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .map(|v| v.to_str().unwrap_or_default() == ReplicationStatusType::Replica.as_str())
+            .unwrap_or_default();
+
+        if replica {
+            authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
+        }
+
         let metadata = extract_metadata(&req.headers);
 
-        let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
+        let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
-        let dobj = ObjectToDelete {
-            object_name: key.clone(),
-            version_id,
-        };
+        // TODO: check object lock
 
-        let objects: Vec<ObjectToDelete> = vec![dobj];
+        let lock_cfg = BucketObjectLockSys::get(&bucket).await;
+        if lock_cfg.is_some() && opts.delete_prefix {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("force-delete is forbidden on Object Locking enabled buckets".into()),
+                "force-delete is forbidden on Object Locking enabled buckets",
+            ));
+        }
+
+        // let mut vid = opts.version_id.clone();
+
+        if replica {
+            opts.set_replica_status(ReplicationStatusType::Replica);
+
+            // if opts.version_purge_status().is_empty() {
+            //     vid = None;
+            // }
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
 
-        // TODO: let errors;
+        let obj_info = {
+            match store.delete_object(&bucket, &key, opts).await {
+                Ok(obj) => obj,
+                Err(err) => {
+                    if is_err_bucket_not_found(&err) {
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+                    }
 
-        let (delete_marker, version_id) = {
-            if let Some((a, b)) = dobjs
-                .iter()
-                .map(|v| {
-                    let delete_marker = { if v.delete_marker { Some(true) } else { None } };
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        // TODO: send event
 
-                    let version_id = v.version_id.clone();
+                        return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+                    }
 
-                    (delete_marker, version_id)
-                })
-                .next()
-            {
-                (a, b)
-            } else {
-                (None, None)
+                    return Err(ApiError::from(err).into());
+                }
             }
         };
-        let del_version_id = version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+
+        if obj_info.name.is_empty() {
+            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+        }
+
+        if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.version_purge_status == VersionPurgeStatusType::Pending
+        {
+            schedule_replication_delete(DeletedObjectReplicationInfo {
+                delete_object: rustfs_ecstore::store_api::DeletedObject {
+                    delete_marker: obj_info.delete_marker,
+                    delete_marker_version_id: if obj_info.delete_marker { obj_info.version_id } else { None },
+                    object_name: key.clone(),
+                    version_id: if obj_info.delete_marker { None } else { obj_info.version_id },
+                    delete_marker_mtime: obj_info.mod_time,
+                    replication_state: Some(obj_info.replication_state()),
+                    ..Default::default()
+                },
+                bucket: bucket.clone(),
+                event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                ..Default::default()
+            })
+            .await;
+        }
+
+        let delete_marker = obj_info.delete_marker;
+        let version_id = obj_info.version_id;
+
         let output = DeleteObjectOutput {
-            delete_marker,
-            version_id,
+            delete_marker: Some(delete_marker),
+            version_id: version_id.map(|v| v.to_string()),
             ..Default::default()
         };
 
+        let event_name = if delete_marker {
+            EventName::ObjectRemovedDeleteMarkerCreated
+        } else {
+            EventName::ObjectRemovedDelete
+        };
+
         let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectRemovedDelete,
+            event_name,
             bucket_name: bucket.clone(),
             object: rustfs_ecstore::store_api::ObjectInfo {
-                name: key,
-                bucket,
+                name: key.clone(),
+                bucket: bucket.clone(),
                 ..Default::default()
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: del_version_id,
+            version_id: version_id.map(|v| v.to_string()).unwrap_or_default(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
@@ -1043,54 +1116,228 @@ impl S3 for FS {
     /// Delete multiple objects
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        // info!("delete_objects args {:?}", req.input);
-
         let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
-        let objects: Vec<ObjectToDelete> = delete
-            .objects
-            .iter()
-            .map(|v| {
-                let version_id = v.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
-                ObjectToDelete {
+        if delete.objects.is_empty() || delete.objects.len() > 1000 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "No objects to delete or too many objects to delete".to_string(),
+            ));
+        }
+
+        let replicate_deletes = has_replication_rules(
+            &bucket,
+            &delete
+                .objects
+                .iter()
+                .map(|v| ObjectToDelete {
                     object_name: v.key.clone(),
-                    version_id,
-                }
-            })
-            .collect();
+                    ..Default::default()
+                })
+                .collect::<Vec<ObjectToDelete>>(),
+        )
+        .await;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let metadata = extract_metadata(&req.headers);
+        let has_lock_enable = BucketObjectLockSys::get(&bucket).await.is_some();
 
-        let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
+        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
 
-        let (dobjs, errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
+        #[derive(Default, Clone)]
+        struct DeleteResult {
+            delete_object: Option<rustfs_ecstore::store_api::DeletedObject>,
+            error: Option<Error>,
+        }
 
-        let deleted = dobjs
+        let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
+
+        let mut object_to_delete = Vec::new();
+        let mut object_to_delete_index = HashMap::new();
+
+        for (idx, object) in delete.objects.iter().enumerate() {
+            // TODO: check auth
+            if let Some(version_id) = object.version_id.clone() {
+                let _vid = match Uuid::parse_str(&version_id) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        delete_results[idx].error = Some(Error {
+                            code: Some("NoSuchVersion".to_string()),
+                            key: Some(object.key.clone()),
+                            message: Some(err.to_string()),
+                            version_id: Some(version_id),
+                        });
+
+                        continue;
+                    }
+                };
+            };
+
+            let mut object = ObjectToDelete {
+                object_name: object.key.clone(),
+                version_id: object.version_id.clone().map(|v| Uuid::parse_str(&v).unwrap()),
+                ..Default::default()
+            };
+
+            let opts = ObjectOptions {
+                version_id: object.version_id.map(|v| v.to_string()),
+                versioned: version_cfg.prefix_enabled(&object.object_name),
+                version_suspended: version_cfg.suspended(),
+                ..Default::default()
+            };
+
+            let mut goi = ObjectInfo::default();
+            let mut gerr = None;
+
+            if replicate_deletes || object.version_id.is_some() && has_lock_enable {
+                (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                    Ok(res) => (res, None),
+                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+                };
+            }
+
+            if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                object.version_id = Some(Uuid::nil());
+            }
+
+            if replicate_deletes {
+                let dsc = check_replicate_delete(
+                    &bucket,
+                    &ObjectToDelete {
+                        object_name: object.object_name.clone(),
+                        version_id: object.version_id,
+                        ..Default::default()
+                    },
+                    &goi,
+                    &opts,
+                    gerr.clone(),
+                )
+                .await;
+                if dsc.replicate_any() {
+                    if object.version_id.is_some() {
+                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+                        object.version_purge_statuses = dsc.pending_status();
+                    } else {
+                        object.delete_marker_replication_status = dsc.pending_status();
+                    }
+                    object.replicate_decision_str = Some(dsc.to_string());
+                }
+            }
+
+            // TODO: Retention
+            object_to_delete_index.insert(object.object_name.clone(), idx);
+            object_to_delete.push(object);
+        }
+
+        let (mut dobjs, errs) = {
+            store
+                .delete_objects(
+                    &bucket,
+                    object_to_delete.clone(),
+                    ObjectOptions {
+                        version_suspended: version_cfg.suspended(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        };
+
+        if is_all_buckets_not_found(
+            &errs
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.clone().into()))
+                .collect::<Vec<Option<DiskError>>>() as &[Option<DiskError>],
+        ) {
+            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+        }
+
+        for (i, err) in errs.into_iter().enumerate() {
+            let obj = dobjs[i].clone();
+
+            // let replication_state = obj.replication_state.clone().unwrap_or_default();
+
+            // let obj_to_del = ObjectToDelete {
+            //     object_name: decode_dir_object(dobjs[i].object_name.as_str()),
+            //     version_id: obj.version_id,
+            //     delete_marker_replication_status: replication_state.replication_status_internal.clone(),
+            //     version_purge_status: Some(obj.version_purge_status()),
+            //     version_purge_statuses: replication_state.version_purge_status_internal.clone(),
+            //     replicate_decision_str: Some(replication_state.replicate_decision_str.clone()),
+            // };
+
+            let Some(didx) = object_to_delete_index.get(&obj.object_name) else {
+                continue;
+            };
+
+            if err.is_none()
+                || err
+                    .clone()
+                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
+            {
+                if replicate_deletes {
+                    dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
+                }
+                delete_results[*didx].delete_object = Some(dobjs[i].clone());
+                continue;
+            }
+
+            if let Some(err) = err {
+                delete_results[*didx].error = Some(Error {
+                    code: Some(err.to_string()),
+                    key: Some(object_to_delete[i].object_name.clone()),
+                    message: Some(err.to_string()),
+                    version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
+                });
+            }
+        }
+
+        let deleted = delete_results
             .iter()
+            .filter_map(|v| v.delete_object.clone())
             .map(|v| DeletedObject {
                 delete_marker: { if v.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: v.delete_marker_version_id.clone(),
+                delete_marker_version_id: v.delete_marker_version_id.map(|v| v.to_string()),
                 key: Some(v.object_name.clone()),
-                version_id: v.version_id.clone(),
+                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
+                    None
+                } else {
+                    v.version_id.map(|v| v.to_string())
+                },
             })
             .collect();
 
-        // TODO: let errors;
-        for err in errs.iter().flatten() {
-            warn!("delete_objects err  {:?}", err);
-        }
+        let errors = delete_results.iter().filter_map(|v| v.error.clone()).collect::<Vec<Error>>();
 
         let output = DeleteObjectsOutput {
             deleted: Some(deleted),
-            // errors,
+            errors: Some(errors),
             ..Default::default()
         };
+
+        for dobjs in delete_results.iter() {
+            if let Some(dobj) = &dobjs.delete_object {
+                if replicate_deletes
+                    && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
+                        || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+                {
+                    let mut dobj = dobj.clone();
+                    if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
+                        dobj.version_id = Some(Uuid::nil());
+                    }
+
+                    let deleted_object = DeletedObjectReplicationInfo {
+                        delete_object: dobj,
+                        bucket: bucket.clone(),
+                        event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                        ..Default::default()
+                    };
+                    schedule_replication_delete(deleted_object).await;
+                }
+            }
+        }
+
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
             for dobj in dobjs {
@@ -1330,7 +1577,7 @@ impl S3 for FS {
                     // Decode the base64 key
                     let key_bytes = BASE64_STANDARD
                         .decode(sse_key)
-                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
+                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
 
                     // Verify key length (should be 32 bytes for AES-256)
                     if key_bytes.len() != 32 {
@@ -1349,7 +1596,7 @@ impl S3 for FS {
 
                     // Generate the same deterministic nonce from object key
                     let mut nonce = [0u8; 12];
-                    let nonce_source = format!("{}-{}", bucket, key);
+                    let nonce_source = format!("{bucket}-{key}");
                     let nonce_hash = md5::compute(nonce_source.as_bytes());
                     nonce.copy_from_slice(&nonce_hash.0[..12]);
 
@@ -1447,7 +1694,7 @@ impl S3 for FS {
             content_type,
             accept_ranges: Some("bytes".to_string()),
             content_range,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             metadata: Some(info.user_defined),
             server_side_encryption,
             sse_customer_algorithm,
@@ -1581,7 +1828,7 @@ impl S3 for FS {
             content_length: Some(content_length),
             content_type,
             last_modified,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             metadata: Some(metadata),
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
@@ -1732,7 +1979,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| format_etag(&etag)),
                     ..Default::default()
                 };
 
@@ -1811,7 +2058,7 @@ impl S3 for FS {
                     size: Some(v.size),
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| format_etag(&etag)),
                     ..Default::default() // TODO: another fields
                 }
             })
@@ -1999,7 +2246,7 @@ impl S3 for FS {
             // Decode the base64 key
             let key_bytes = BASE64_STANDARD
                 .decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
 
             // Verify key length (should be 32 bytes for AES-256)
             if key_bytes.len() != 32 {
@@ -2025,7 +2272,7 @@ impl S3 for FS {
 
             // Generate a deterministic nonce from object key for consistency
             let mut nonce = [0u8; 12];
-            let nonce_source = format!("{}-{}", bucket, key);
+            let nonce_source = format!("{bucket}-{key}");
             let nonce_hash = md5::compute(nonce_source.as_bytes());
             nonce.copy_from_slice(&nonce_hash.0[..12]);
 
@@ -2065,22 +2312,104 @@ impl S3 for FS {
         let mt = metadata.clone();
         let mt2 = metadata.clone();
 
+        let append_flag = req.headers.get("x-amz-object-append");
+        let append_action_header = req.headers.get("x-amz-append-action");
+        let mut append_requested = false;
+        let mut append_position: Option<i64> = None;
+        if let Some(flag_value) = append_flag {
+            let flag_str = flag_value.to_str().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-object-append header".to_string())
+            })?;
+            if flag_str.eq_ignore_ascii_case("true") {
+                append_requested = true;
+                let position_value = req.headers.get("x-amz-append-position").ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-position header required when x-amz-object-append is true".to_string(),
+                    )
+                })?;
+                let position_str = position_value.to_str().map_err(|_| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-append-position header".to_string())
+                })?;
+                let position = position_str.parse::<i64>().map_err(|_| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-position must be a non-negative integer".to_string(),
+                    )
+                })?;
+                if position < 0 {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-position must be a non-negative integer".to_string(),
+                    ));
+                }
+                append_position = Some(position);
+            } else if !flag_str.eq_ignore_ascii_case("false") {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "x-amz-object-append must be 'true' or 'false'".to_string(),
+                ));
+            }
+        }
+
+        let mut append_action: Option<String> = None;
+        if let Some(action_value) = append_action_header {
+            let action_str = action_value.to_str().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-append-action header".to_string())
+            })?;
+            append_action = Some(action_str.to_ascii_lowercase());
+        }
+
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, mt)
             .await
             .map_err(ApiError::from)?;
 
-        let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+        if append_requested {
+            opts.append_object = true;
+            opts.append_position = append_position;
+        }
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
-        // warn!("dsc {}", &dsc.replicate_any().clone());
+        if let Some(action) = append_action {
+            if append_requested {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "x-amz-object-append cannot be combined with x-amz-append-action".to_string(),
+                ));
+            }
+
+            let obj_info = match action.as_str() {
+                "complete" => store.complete_append(&bucket, &key, &opts).await,
+                "abort" => store.abort_append(&bucket, &key, &opts).await,
+                _ => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-action must be 'complete' or 'abort'".to_string(),
+                    ));
+                }
+            }
+            .map_err(ApiError::from)?;
+
+            let output = PutObjectOutput {
+                e_tag: obj_info.etag.clone(),
+                version_id: obj_info.version_id.map(|v| v.to_string()),
+                ..Default::default()
+            };
+
+            return Ok(S3Response::new(output));
+        }
+
+        let repoptions =
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
+
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
+
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
             let now: DateTime<Utc> = Utc::now();
             let formatted_time = now.to_rfc3339();
             opts.user_defined.insert(k, formatted_time);
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            opts.user_defined.insert(k, dsc.pending_status());
+            opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
 
         let obj_info = store
@@ -2088,16 +2417,15 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
         let event_info = obj_info.clone();
-        let e_tag = obj_info.etag.clone();
+        let e_tag = obj_info.etag.clone().map(|etag| format_etag(&etag));
 
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
-            let objectlayer = new_object_layer_fn();
-            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
 
         let output = PutObjectOutput {
@@ -2452,7 +2780,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let output = UploadPartOutput {
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             ..Default::default()
         };
 
@@ -2638,7 +2966,7 @@ impl S3 for FS {
 
         // Create response
         let copy_part_result = CopyPartResult {
-            e_tag: part_info.etag,
+            e_tag: part_info.etag.map(|etag| format_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
             ..Default::default()
         };
@@ -2691,7 +3019,7 @@ impl S3 for FS {
                 res.parts
                     .into_iter()
                     .map(|p| Part {
-                        e_tag: p.etag,
+                        e_tag: p.etag.map(|etag| format_etag(&etag)),
                         last_modified: p.last_mod.map(Timestamp::from),
                         part_number: Some(p.part_num as i32),
                         size: Some(p.size as i64),
@@ -2853,6 +3181,7 @@ impl S3 for FS {
         );
 
         let obj_info = store
+            .clone()
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(ApiError::from)?;
@@ -2865,7 +3194,7 @@ impl S3 for FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
-            e_tag: obj_info.etag.clone(),
+            e_tag: obj_info.etag.clone().map(|etag| format_etag(&etag)),
             location: Some("us-east-1".to_string()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
@@ -2879,14 +3208,13 @@ impl S3 for FS {
 
         let mt2 = HashMap::new();
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, opts);
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            let objectlayer = new_object_layer_fn();
-            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
         tracing::info!(
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
@@ -4369,6 +4697,22 @@ pub(crate) fn process_lambda_configurations<F>(
             event_rules.push((events, prefix, suffix, target_ids));
         }
     }
+}
+
+pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
+    let (cfg, _created) = match get_replication_config(bucket).await {
+        Ok(replication_config) => replication_config,
+        Err(_err) => {
+            return false;
+        }
+    };
+
+    for object in objects {
+        if cfg.has_active_rules(&object.object_name, true) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

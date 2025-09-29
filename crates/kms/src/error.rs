@@ -225,7 +225,7 @@ impl KmsError {
 impl From<url::ParseError> for KmsError {
     fn from(error: url::ParseError) -> Self {
         Self::ConfigurationError {
-            message: format!("Invalid URL: {}", error),
+            message: format!("Invalid URL: {error}"),
         }
     }
 }
@@ -233,7 +233,7 @@ impl From<url::ParseError> for KmsError {
 impl From<reqwest::Error> for KmsError {
     fn from(error: reqwest::Error) -> Self {
         Self::BackendError {
-            message: format!("HTTP request failed: {}", error),
+            message: format!("HTTP request failed: {error}"),
         }
     }
 }

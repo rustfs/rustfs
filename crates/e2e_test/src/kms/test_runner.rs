@@ -476,7 +476,7 @@ async fn test_kms_critical_suite() -> Result<(), Box<dyn std::error::Error + Sen
 
     let failed_count = results.iter().filter(|r| !r.success).count();
     if failed_count > 0 {
-        return Err(format!("Critical test suite failed: {} tests failed", failed_count).into());
+        return Err(format!("Critical test suite failed: {failed_count} tests failed").into());
     }
 
     info!("✅ 所有关键测试通过");
@@ -498,7 +498,7 @@ async fn test_kms_full_suite() -> Result<(), Box<dyn std::error::Error + Send + 
 
     // Allow up to 10% failure rate for non-critical tests
     if success_rate < 90.0 {
-        return Err(format!("Test suite success rate too low: {:.1}%", success_rate).into());
+        return Err(format!("Test suite success rate too low: {success_rate:.1}%").into());
     }
 
     info!("✅ 完整测试套件通过");

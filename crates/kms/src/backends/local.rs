@@ -111,7 +111,7 @@ impl LocalKmsClient {
 
     /// Get the file path for a master key
     fn master_key_path(&self, key_id: &str) -> PathBuf {
-        self.config.key_dir.join(format!("{}.key", key_id))
+        self.config.key_dir.join(format!("{key_id}.key"))
     }
 
     /// Load a master key from disk
@@ -334,12 +334,11 @@ impl KmsClient for LocalKmsClient {
                 if let Some(actual_value) = envelope.encryption_context.get(key) {
                     if actual_value != expected_value {
                         return Err(KmsError::context_mismatch(format!(
-                            "Context mismatch for key '{}': expected '{}', got '{}'",
-                            key, expected_value, actual_value
+                            "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
                         )));
                     }
                 } else {
-                    return Err(KmsError::context_mismatch(format!("Missing context key '{}'", key)));
+                    return Err(KmsError::context_mismatch(format!("Missing context key '{key}'")));
                 }
             }
         }
@@ -720,14 +719,14 @@ impl KmsBackend for LocalKmsBackend {
             .client
             .load_master_key(key_id)
             .await
-            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)))?;
+            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
             // For immediate deletion, actually delete the key from filesystem
             let key_path = self.client.master_key_path(key_id);
             tokio::fs::remove_file(&key_path)
                 .await
-                .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to delete key file: {}", e)))?;
+                .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
 
             // Remove from cache
             let mut cache = self.client.key_cache.write().await;
@@ -773,9 +772,9 @@ impl KmsBackend for LocalKmsBackend {
         let key_path = self.client.master_key_path(key_id);
         let content = tokio::fs::read(&key_path)
             .await
-            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to read key file: {}", e)))?;
+            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to read key file: {e}")))?;
         let stored_key: crate::backends::local::StoredMasterKey = serde_json::from_slice(&content)
-            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to parse stored key: {}", e)))?;
+            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
 
         // Decrypt the existing key material to preserve it
         let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
@@ -821,13 +820,10 @@ impl KmsBackend for LocalKmsBackend {
             .client
             .load_master_key(key_id)
             .await
-            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {} not found", key_id)))?;
+            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         if master_key.status != KeyStatus::PendingDeletion {
-            return Err(crate::error::KmsError::invalid_key_state(format!(
-                "Key {} is not pending deletion",
-                key_id
-            )));
+            return Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
 
         // Cancel the deletion by resetting the state

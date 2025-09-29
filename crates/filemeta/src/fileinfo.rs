@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::headers::RESERVED_METADATA_PREFIX_LOWER;
-use crate::headers::RUSTFS_HEALING;
+use crate::{ReplicationState, ReplicationStatusType, VersionPurgeStatusType};
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -202,7 +202,7 @@ pub struct FileInfo {
     // MarkDeleted marks this version as deleted
     pub mark_deleted: bool,
     // ReplicationState - Internal replication state to be passed back in ObjectInfo
-    // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
+    pub replication_state_internal: Option<ReplicationState>,
     pub data: Option<Bytes>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
@@ -470,6 +470,119 @@ impl FileInfo {
         self.mark_deleted == other.mark_deleted
         // TODO: Add replication_state comparison when implemented
         // && self.replication_state == other.replication_state
+    }
+
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.replication_state_internal
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+    pub fn replication_status(&self) -> ReplicationStatusType {
+        self.replication_state_internal
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        if self.deleted {
+            self.replication_state_internal
+                .as_ref()
+                .map(|v| v.composite_replication_status())
+                .unwrap_or(ReplicationStatusType::Empty)
+        } else {
+            ReplicationStatusType::Empty
+        }
+    }
+    /// Get the append state for this FileInfo, with migration compatibility
+    pub fn get_append_state(&self) -> crate::append::AppendState {
+        use crate::append::{AppendState, AppendStateKind, get_append_state};
+
+        // Try to load from metadata first
+        if let Ok(Some(state)) = get_append_state(&self.metadata) {
+            return state;
+        }
+
+        // Migration compatibility: determine state based on existing data
+        if self.inline_data() {
+            // Has inline data, treat as Inline state
+            AppendState {
+                state: AppendStateKind::Inline,
+                epoch: 0,
+                committed_length: self.size,
+                pending_segments: Vec::new(),
+            }
+        } else {
+            // No inline data, treat as SegmentedSealed (traditional object)
+            AppendState {
+                state: AppendStateKind::SegmentedSealed,
+                epoch: 0,
+                committed_length: self.size,
+                pending_segments: Vec::new(),
+            }
+        }
+    }
+
+    /// Set the append state for this FileInfo
+    pub fn set_append_state(&mut self, state: &crate::append::AppendState) -> crate::error::Result<()> {
+        crate::append::set_append_state(&mut self.metadata, state)
+    }
+
+    /// Check if this object supports append operations
+    pub fn is_appendable(&self) -> bool {
+        use crate::append::AppendStateKind;
+        match self.get_append_state().state {
+            AppendStateKind::Disabled => false,
+            AppendStateKind::Inline | AppendStateKind::InlinePendingSpill | AppendStateKind::SegmentedActive => true,
+            AppendStateKind::SegmentedSealed => false,
+        }
+    }
+
+    /// Check if this object has pending append operations
+    pub fn has_pending_appends(&self) -> bool {
+        use crate::append::AppendStateKind;
+        matches!(
+            self.get_append_state().state,
+            AppendStateKind::InlinePendingSpill | AppendStateKind::SegmentedActive
+        )
+    }
+
+    /// Complete all pending append operations and seal the object
+    pub fn complete_append(&mut self) -> crate::error::Result<()> {
+        let mut append_state = self.get_append_state();
+        crate::append::complete_append_operation(&mut append_state)?;
+        self.set_append_state(&append_state)?;
+
+        // Update file size to reflect completed operation
+        if append_state.state == crate::append::AppendStateKind::SegmentedSealed {
+            self.size = append_state.committed_length;
+        }
+
+        Ok(())
+    }
+
+    /// Abort all pending append operations and seal the object
+    pub fn abort_append(&mut self) -> crate::error::Result<()> {
+        let mut append_state = self.get_append_state();
+        crate::append::abort_append_operation(&mut append_state)?;
+        self.set_append_state(&append_state)?;
+
+        // Update file size to only include committed data
+        if append_state.state == crate::append::AppendStateKind::SegmentedSealed {
+            self.size = append_state.committed_length;
+        }
+
+        Ok(())
+    }
+
+    /// Check if append operations can be completed for this object
+    pub fn can_complete_append(&self) -> bool {
+        crate::append::can_complete_append(&self.get_append_state())
+    }
+
+    /// Check if append operations can be aborted for this object
+    pub fn can_abort_append(&self) -> bool {
+        crate::append::can_abort_append(&self.get_append_state())
     }
 }
 

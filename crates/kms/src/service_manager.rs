@@ -137,7 +137,7 @@ impl KmsServiceManager {
                 Ok(())
             }
             Err(e) => {
-                let err_msg = format!("Failed to create KMS backend: {}", e);
+                let err_msg = format!("Failed to create KMS backend: {e}");
                 error!("{}", err_msg);
                 let mut status = self.status.write().await;
                 *status = KmsServiceStatus::Error(err_msg.clone());
@@ -218,7 +218,7 @@ impl KmsServiceManager {
                         error!("KMS health check error: {}", e);
                         // Update status to error
                         let mut status = self.status.write().await;
-                        *status = KmsServiceStatus::Error(format!("Health check failed: {}", e));
+                        *status = KmsServiceStatus::Error(format!("Health check failed: {e}"));
                         Err(e)
                     }
                 }

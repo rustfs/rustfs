@@ -23,20 +23,23 @@ use crate::error::{
 };
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
-use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
+use crate::store_api::{
+    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions, WalkVersionsSortOrder,
+};
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
-    FileInfo, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
+    MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast::{self, Receiver as B_Receiver};
+use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -529,14 +532,15 @@ impl ECStore {
         }
 
         // cancel channel
-        let (cancel_tx, cancel_rx) = broadcast::channel(1);
+        let cancel = CancellationToken::new();
+
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
 
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
         let store = self.clone();
         let opts = o.clone();
-        let cancel_rx1 = cancel_rx.resubscribe();
+        let cancel_rx1 = cancel.clone();
         let err_tx1 = err_tx.clone();
         let job1 = tokio::spawn(async move {
             let mut opts = opts;
@@ -547,7 +551,7 @@ impl ECStore {
             }
         });
 
-        let cancel_rx2 = cancel_rx.resubscribe();
+        let cancel_rx2 = cancel.clone();
 
         let (result_tx, mut result_rx) = mpsc::channel(1);
         let err_tx2 = err_tx.clone();
@@ -559,7 +563,7 @@ impl ECStore {
             }
 
             // cancel call exit spawns
-            let _ = cancel_tx.send(true);
+            cancel.cancel();
         });
 
         let mut result = {
@@ -615,7 +619,7 @@ impl ECStore {
     // Read all
     async fn list_merged(
         &self,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
     ) -> Result<Vec<ObjectInfo>> {
@@ -631,9 +635,8 @@ impl ECStore {
 
                 inputs.push(recv);
                 let opts = opts.clone();
-
-                let rx = rx.resubscribe();
-                futures.push(set.list_path(rx, opts, send));
+                let rx_clone = rx.clone();
+                futures.push(set.list_path(rx_clone, opts, send));
             }
         }
 
@@ -695,9 +698,9 @@ impl ECStore {
     }
 
     #[allow(unused_assignments)]
-    pub async fn walk(
+    pub async fn walk_internal(
         self: Arc<Self>,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         bucket: &str,
         prefix: &str,
         result: Sender<ObjectInfoOrErr>,
@@ -711,11 +714,11 @@ impl ECStore {
         for eset in self.pools.iter() {
             for set in eset.disk_set.iter() {
                 let (mut disks, infos, _) = set.get_online_disks_with_healing_and_info(true).await;
-                let rx = rx.resubscribe();
                 let opts = opts.clone();
 
                 let (sender, list_out_rx) = mpsc::channel::<MetaCacheEntry>(1);
                 inputs.push(list_out_rx);
+                let rx_clone = rx.clone();
                 futures.push(async move {
                     let mut ask_disks = get_list_quorum(&opts.ask_disks, set.set_drive_count as i32);
                     if ask_disks == -1 {
@@ -770,7 +773,7 @@ impl ECStore {
                     let tx2 = sender.clone();
 
                     list_path_raw(
-                        rx.resubscribe(),
+                        rx_clone,
                         ListPathRawOptions {
                             disks: disks.iter().cloned().map(Some).collect(),
                             fallback_disks: fallback_disks.iter().cloned().map(Some).collect(),
@@ -936,33 +939,8 @@ impl ECStore {
     }
 }
 
-type WalkFilter = fn(&FileInfo) -> bool;
-
-#[derive(Clone, Default)]
-pub struct WalkOptions {
-    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
-    pub marker: Option<String>,               // set to skip until this object
-    pub latest_only: bool,                    // returns only latest versions for all matching objects
-    pub ask_disks: String,                    // dictates how many disks are being listed
-    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
-    pub limit: usize,                         // maximum number of items, 0 means no limit
-}
-
-#[derive(Clone, Default, PartialEq, Eq)]
-pub enum WalkVersionsSortOrder {
-    #[default]
-    Ascending,
-    Descending,
-}
-
-#[derive(Debug)]
-pub struct ObjectInfoOrErr {
-    pub item: Option<ObjectInfo>,
-    pub err: Option<Error>,
-}
-
 async fn gather_results(
-    _rx: B_Receiver<bool>,
+    _rx: CancellationToken,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     results_tx: Sender<MetaCacheEntriesSortedResult>,
@@ -1067,12 +1045,11 @@ async fn select_from(
 
 // TODO: exit when cancel
 async fn merge_entry_channels(
-    rx: B_Receiver<bool>,
+    rx: CancellationToken,
     in_channels: Vec<Receiver<MetaCacheEntry>>,
     out_channel: Sender<MetaCacheEntry>,
     read_quorum: usize,
 ) -> Result<()> {
-    let mut rx = rx;
     let mut in_channels = in_channels;
     if in_channels.len() == 1 {
         loop {
@@ -1085,7 +1062,7 @@ async fn merge_entry_channels(
                         return Ok(())
                     }
                 },
-                _ = rx.recv()=>{
+                _ = rx.cancelled()=>{
                     info!("merge_entry_channels rx.recv() cancel");
                     return Ok(())
                 },
@@ -1228,7 +1205,7 @@ async fn merge_entry_channels(
 }
 
 impl SetDisks {
-    pub async fn list_path(&self, rx: B_Receiver<bool>, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+    pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);

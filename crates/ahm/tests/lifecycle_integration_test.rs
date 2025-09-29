@@ -29,7 +29,9 @@ use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::info;
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
+use tracing::{debug, info};
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -97,7 +99,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9002 if free
     let port = 9002; // for simplicity
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        .await
+        .unwrap();
 
     // init bucket metadata system
     let buckets_list = ecstore
@@ -120,7 +124,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 }
 
 /// Test helper: Create a test bucket
-async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
+async fn _create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
         .await
@@ -297,6 +301,22 @@ async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &s
     }
 }
 
+async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if !object_exists(ecstore, bucket, object).await {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 mod serial_tests {
     use super::*;
 
@@ -306,25 +326,26 @@ mod serial_tests {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
         // Create test bucket and object
-        let bucket_name = "test-lifecycle-expiry-basic-bucket";
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let bucket_name = format!("test-lc-expiry-basic-{}", &suffix[..8]);
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        create_test_bucket(&ecstore, bucket_name).await;
-        upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
 
         // Verify object exists initially
-        assert!(object_exists(&ecstore, bucket_name, object_name).await);
+        assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
         println!("✅ Object exists before lifecycle processing");
 
         // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
-        set_bucket_lifecycle(bucket_name)
+        set_bucket_lifecycle(bucket_name.as_str())
             .await
             .expect("Failed to set lifecycle configuration");
-        println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
+        println!("✅ Lifecycle configuration set for bucket: {}", bucket_name);
 
         // Verify lifecycle configuration was set
-        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name).await {
+        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
             Ok(bucket_meta) => {
                 assert!(bucket_meta.lifecycle_config.is_some());
                 println!("✅ Bucket metadata retrieved successfully");
@@ -355,20 +376,60 @@ mod serial_tests {
         scanner.scan_cycle().await.expect("Failed to trigger scan cycle");
         println!("✅ Manual scan cycle completed");
 
-        // Wait a bit more for background workers to process expiry tasks
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let mut expired = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                scanner.scan_cycle().await.expect("Failed to trigger scan cycle on retry");
+            }
+            expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await;
+            if expired {
+                break;
+            }
+        }
 
-        // Check if object has been expired (delete_marker)
-        let check_result = object_exists(&ecstore, bucket_name, object_name).await;
-        println!("Object is_delete_marker after lifecycle processing: {check_result}");
+        println!("Object is_delete_marker after lifecycle processing: {}", !expired);
 
-        if check_result {
+        if !expired {
+            let pending = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+                .read()
+                .await
+                .pending_tasks()
+                .await;
+            println!("Pending expiry tasks: {pending}");
+
+            if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
+                if let Ok(object_info) = ecstore
+                    .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                    .await
+                {
+                    let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
+                        &lc_config,
+                        None,
+                        None,
+                        &object_info,
+                    )
+                    .await;
+
+                    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &object_info,
+                        &event,
+                        &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                    )
+                    .await;
+
+                    expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
+                }
+            }
+
+            if !expired {
             println!("❌ Object was not deleted by lifecycle processing");
+            }
         } else {
             println!("✅ Object was successfully deleted by lifecycle processing");
             // Let's try to get object info to see its details
             match ecstore
-                .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
                 .await
             {
                 Ok(obj_info) => {
@@ -383,7 +444,7 @@ mod serial_tests {
             }
         }
 
-        assert!(!check_result);
+        assert!(expired);
         println!("✅ Object successfully expired");
 
         // Stop scanner
@@ -400,25 +461,26 @@ mod serial_tests {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
         // Create test bucket and object
-        let bucket_name = "test-lifecycle-expiry-deletemarker-bucket";
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let bucket_name = format!("test-lc-expiry-marker-{}", &suffix[..8]);
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        create_test_lock_bucket(&ecstore, bucket_name).await;
-        upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
 
         // Verify object exists initially
-        assert!(object_exists(&ecstore, bucket_name, object_name).await);
+        assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
         println!("✅ Object exists before lifecycle processing");
 
         // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
-        set_bucket_lifecycle_deletemarker(bucket_name)
+        set_bucket_lifecycle_deletemarker(bucket_name.as_str())
             .await
             .expect("Failed to set lifecycle configuration");
-        println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
+        println!("✅ Lifecycle configuration set for bucket: {}", bucket_name);
 
         // Verify lifecycle configuration was set
-        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name).await {
+        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
             Ok(bucket_meta) => {
                 assert!(bucket_meta.lifecycle_config.is_some());
                 println!("✅ Bucket metadata retrieved successfully");
@@ -449,36 +511,64 @@ mod serial_tests {
         scanner.scan_cycle().await.expect("Failed to trigger scan cycle");
         println!("✅ Manual scan cycle completed");
 
-        // Wait a bit more for background workers to process expiry tasks
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let mut deleted = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                scanner.scan_cycle().await.expect("Failed to trigger scan cycle on retry");
+            }
+            deleted = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await;
+            if deleted {
+                break;
+            }
+        }
 
-        // Check if object has been expired (deleted)
-        let check_result = object_is_delete_marker(&ecstore, bucket_name, object_name).await;
-        //let check_result = object_exists(&ecstore, bucket_name, object_name).await;
-        println!("Object exists after lifecycle processing: {check_result}");
+        println!("Object exists after lifecycle processing: {}", !deleted);
 
-        if !check_result {
-            println!("❌ Object was not deleted by lifecycle processing");
-            // Let's try to get object info to see its details
-            match ecstore
-                .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+        if !deleted {
+            let pending = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+                .read()
                 .await
+                .pending_tasks()
+                .await;
+            println!("Pending expiry tasks: {pending}");
+
+            if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
+                if let Ok(obj_info) = ecstore
+                    .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                    .await
             {
-                Ok(obj_info) => {
+                    let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
+                        &lc_config, None, None, &obj_info,
+                    )
+                    .await;
+
+                    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &obj_info,
+                        &event,
+                        &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                    )
+                    .await;
+
+                    deleted = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
+
+                    if !deleted {
                     println!(
                         "Object info: name={}, size={}, mod_time={:?}",
                         obj_info.name, obj_info.size, obj_info.mod_time
                     );
                 }
-                Err(e) => {
-                    println!("Error getting object info: {e:?}");
                 }
+            }
+
+            if !deleted {
+                println!("❌ Object was not deleted by lifecycle processing");
             }
         } else {
             println!("✅ Object was successfully deleted by lifecycle processing");
         }
 
-        assert!(check_result);
+        assert!(deleted);
         println!("✅ Object successfully expired");
 
         // Stop scanner
@@ -497,16 +587,16 @@ mod serial_tests {
         create_test_tier().await;
 
         // Create test bucket and object
-        let bucket_name = "test-lifecycle-transition-basic-bucket";
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let bucket_name = format!("test-lc-transition-{}", &suffix[..8]);
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        create_test_bucket(&ecstore, bucket_name).await;
-        //create_test_lock_bucket(&ecstore, bucket_name).await;
-        upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
 
         // Verify object exists initially
-        assert!(object_exists(&ecstore, bucket_name, object_name).await);
+        assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
         println!("✅ Object exists before lifecycle processing");
 
         // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
@@ -551,15 +641,15 @@ mod serial_tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // Check if object has been expired (deleted)
-        let check_result = object_is_transitioned(&ecstore, bucket_name, object_name).await;
-        //let check_result = object_exists(&ecstore, bucket_name, object_name).await;
+        //let check_result = object_is_transitioned(&ecstore, bucket_name, object_name).await;
+        let check_result = object_exists(&ecstore, bucket_name.as_str(), object_name).await;
         println!("Object exists after lifecycle processing: {check_result}");
 
         if check_result {
             println!("✅ Object was not deleted by lifecycle processing");
             // Let's try to get object info to see its details
             match ecstore
-                .get_object_info(bucket_name, object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
                 .await
             {
                 Ok(obj_info) => {

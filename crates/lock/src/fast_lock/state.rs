@@ -308,11 +308,26 @@ pub struct ObjectLockState {
 
     // Third cache line: Less frequently accessed data
     /// Current owner of exclusive lock (if any)
-    pub current_owner: parking_lot::RwLock<Option<Arc<str>>>,
+    pub current_owner: parking_lot::RwLock<Option<ExclusiveOwnerInfo>>,
     /// Shared owners - optimized for small number of readers
-    pub shared_owners: parking_lot::RwLock<smallvec::SmallVec<[Arc<str>; 4]>>,
+    pub shared_owners: parking_lot::RwLock<smallvec::SmallVec<[SharedOwnerEntry; 4]>>,
     /// Lock priority for conflict resolution
     pub priority: parking_lot::RwLock<LockPriority>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExclusiveOwnerInfo {
+    pub owner: Arc<str>,
+    pub acquired_at: SystemTime,
+    pub lock_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedOwnerEntry {
+    pub owner: Arc<str>,
+    pub count: u32,
+    pub acquired_at: SystemTime,
+    pub lock_timeout: Duration,
 }
 
 impl Default for ObjectLockState {
@@ -335,60 +350,87 @@ impl ObjectLockState {
     }
 
     /// Try fast path shared lock acquisition
-    pub fn try_acquire_shared_fast(&self, owner: &Arc<str>) -> bool {
-        if self.atomic_state.try_acquire_shared() {
-            self.atomic_state.update_access_time();
-            let mut shared = self.shared_owners.write();
-            if !shared.contains(owner) {
-                shared.push(owner.clone());
-            }
-            true
-        } else {
-            false
+    pub fn try_acquire_shared_fast(&self, owner: &Arc<str>, lock_timeout: Duration) -> bool {
+        if !self.atomic_state.try_acquire_shared() {
+            return false;
         }
+
+        self.atomic_state.update_access_time();
+        let mut shared = self.shared_owners.write();
+        if let Some(entry) = shared.iter_mut().find(|entry| entry.owner.as_ref() == owner.as_ref()) {
+            entry.count = entry.count.saturating_add(1);
+            entry.acquired_at = SystemTime::now();
+            entry.lock_timeout = lock_timeout;
+        } else {
+            shared.push(SharedOwnerEntry {
+                owner: owner.clone(),
+                count: 1,
+                acquired_at: SystemTime::now(),
+                lock_timeout,
+            });
+        }
+        true
     }
 
     /// Try fast path exclusive lock acquisition
-    pub fn try_acquire_exclusive_fast(&self, owner: &Arc<str>) -> bool {
-        if self.atomic_state.try_acquire_exclusive() {
-            self.atomic_state.update_access_time();
-            let mut current = self.current_owner.write();
-            *current = Some(owner.clone());
-            true
-        } else {
-            false
+    pub fn try_acquire_exclusive_fast(&self, owner: &Arc<str>, lock_timeout: Duration) -> bool {
+        if !self.atomic_state.try_acquire_exclusive() {
+            return false;
         }
+
+        self.atomic_state.update_access_time();
+        let mut current = self.current_owner.write();
+        *current = Some(ExclusiveOwnerInfo {
+            owner: owner.clone(),
+            acquired_at: SystemTime::now(),
+            lock_timeout,
+        });
+        true
     }
 
     /// Release shared lock
     pub fn release_shared(&self, owner: &Arc<str>) -> bool {
         let mut shared = self.shared_owners.write();
-        if let Some(pos) = shared.iter().position(|x| x.as_ref() == owner.as_ref()) {
-            shared.remove(pos);
+        if let Some(pos) = shared.iter().position(|entry| entry.owner.as_ref() == owner.as_ref()) {
+            let original_entry = shared[pos].clone();
+            let removed_entry = if shared[pos].count > 1 {
+                shared[pos].count -= 1;
+                None
+            } else {
+                Some(shared.remove(pos))
+            };
             if self.atomic_state.release_shared() {
-                // Notify waiting writers if no more readers
                 if shared.is_empty() {
                     drop(shared);
                     self.optimized_notify.notify_writer();
                 }
                 true
             } else {
-                // Inconsistency detected - atomic state shows no shared lock but owner was found
                 tracing::warn!(
-                    "Atomic state inconsistency during shared lock release: owner={}, remaining_owners={}",
+                    "Atomic state inconsistency during shared lock release: owner={}, remaining_entries={}",
                     owner,
                     shared.len()
                 );
-                // Re-add owner to maintain consistency
-                shared.push(owner.clone());
+                // Re-add owner entry to maintain consistency when release failed
+                match removed_entry {
+                    Some(entry) => {
+                        shared.push(entry);
+                    }
+                    None => {
+                        if let Some(existing) = shared.iter_mut().find(|existing| existing.owner.as_ref() == owner.as_ref()) {
+                            existing.count = existing.count.saturating_add(1);
+                        } else {
+                            shared.push(original_entry);
+                        }
+                    }
+                }
                 false
             }
         } else {
-            // Owner not found in shared owners list
             tracing::debug!(
-                "Shared lock release failed - owner not found: owner={}, current_owners={:?}",
+                "Shared lock release failed - owner not found: owner={}, current_entries={:?}",
                 owner,
-                shared.iter().map(|s| s.as_ref()).collect::<Vec<_>>()
+                shared.iter().map(|s| s.owner.as_ref()).collect::<Vec<_>>()
             );
             false
         }
@@ -397,7 +439,7 @@ impl ObjectLockState {
     /// Release exclusive lock
     pub fn release_exclusive(&self, owner: &Arc<str>) -> bool {
         let mut current = self.current_owner.write();
-        if current.as_ref() == Some(owner) {
+        if current.as_ref().is_some_and(|info| info.owner.as_ref() == owner.as_ref()) {
             if self.atomic_state.release_exclusive() {
                 *current = None;
                 drop(current);
@@ -426,7 +468,7 @@ impl ObjectLockState {
             tracing::debug!(
                 "Exclusive lock release failed - owner mismatch: expected_owner={}, actual_owner={:?}",
                 owner,
-                current.as_ref().map(|s| s.as_ref())
+                current.as_ref().map(|s| s.owner.as_ref())
             );
             false
         }
@@ -483,16 +525,18 @@ mod tests {
         let owner2 = Arc::from("owner2");
 
         // Test shared locks
-        assert!(state.try_acquire_shared_fast(&owner1));
-        assert!(state.try_acquire_shared_fast(&owner2));
-        assert!(!state.try_acquire_exclusive_fast(&owner1));
+        let timeout = Duration::from_secs(30);
+
+        assert!(state.try_acquire_shared_fast(&owner1, timeout));
+        assert!(state.try_acquire_shared_fast(&owner2, timeout));
+        assert!(!state.try_acquire_exclusive_fast(&owner1, timeout));
 
         assert!(state.release_shared(&owner1));
         assert!(state.release_shared(&owner2));
 
         // Test exclusive lock
-        assert!(state.try_acquire_exclusive_fast(&owner1));
-        assert!(!state.try_acquire_shared_fast(&owner2));
+        assert!(state.try_acquire_exclusive_fast(&owner1, timeout));
+        assert!(!state.try_acquire_shared_fast(&owner2, timeout));
         assert!(state.release_exclusive(&owner1));
     }
 }

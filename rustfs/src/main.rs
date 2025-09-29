@@ -39,21 +39,22 @@ use rustfs_ahm::{
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
-use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
+use rustfs_config::DEFAULT_UPDATE_CHECK;
+use rustfs_config::ENV_UPDATE_CHECK;
+use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
+use rustfs_ecstore::config as ecconfig;
+use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
+use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
-    bucket::metadata_sys,
-    bucket::metadata_sys::init_bucket_metadata_sys,
-    cmd::bucket_replication::init_bucket_replication_pool,
-    config as ecconfig,
-    config::GLOBAL_CONFIG_SYS,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
-    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -65,6 +66,7 @@ use s3s::s3_error;
 use std::io::{Error, Result};
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -276,15 +278,21 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
+    let ctx = CancellationToken::new();
+
     // init store
-    let store = ECStore::new(server_addr, endpoint_pools.clone()).await.inspect_err(|err| {
-        error!("ECStore::new {:?}", err);
-    })?;
+    let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
+        .await
+        .inspect_err(|err| {
+            error!("ECStore::new {:?}", err);
+        })?;
 
     ecconfig::init();
     // config system configuration
     GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
+    // init  replication_pool
+    init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
 
@@ -306,6 +314,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
+
+    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        pool.clone().init_resync(ctx.clone(), buckets.clone()).await?;
+    }
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
@@ -358,8 +370,6 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // print server info
     print_server_info();
-    // initialize bucket replication pool
-    init_bucket_replication_pool().await;
 
     init_update_check();
 
@@ -369,11 +379,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -393,7 +403,13 @@ fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
 }
 
 /// Handles the shutdown process of the server
-async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
+async fn handle_shutdown(
+    state_manager: &ServiceStateManager,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    ctx: CancellationToken,
+) {
+    ctx.cancel();
+
     info!(
         target: "rustfs::main::handle_shutdown",
         "Shutdown signal received in main thread"
@@ -630,13 +646,13 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
         service_manager
             .configure(kms_config)
             .await
-            .map_err(|e| Error::other(format!("Failed to configure KMS: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
 
         // Start the KMS service
         service_manager
             .start()
             .await
-            .map_err(|e| Error::other(format!("Failed to start KMS: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
 
         info!("KMS service configured and started successfully");
     } else {

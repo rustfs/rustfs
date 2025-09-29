@@ -19,7 +19,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
-use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::{
@@ -232,8 +232,7 @@ impl Operation for StartDecommission {
         let pools: Vec<&str> = query.pool.split(",").collect();
         let mut pools_indices = Vec::with_capacity(pools.len());
 
-        // TODO: ctx
-        let (_ctx_tx, ctx_rx) = broadcast::channel::<bool>(1);
+        let ctx = CancellationToken::new();
 
         for pool in pools.iter() {
             let idx = {
@@ -264,7 +263,7 @@ impl Operation for StartDecommission {
         }
 
         if !pools_indices.is_empty() {
-            store.decommission(ctx_rx, pools_indices).await.map_err(ApiError::from)?;
+            store.decommission(ctx.clone(), pools_indices).await.map_err(ApiError::from)?;
         }
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))

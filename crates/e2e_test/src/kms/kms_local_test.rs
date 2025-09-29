@@ -740,7 +740,7 @@ async fn test_large_multipart_upload(
     // Verify data integrity
     for (i, (&actual, &expected)) in downloaded_data.iter().zip(test_data.iter()).enumerate() {
         if actual != expected {
-            panic!("Data mismatch at byte {}: got {}, expected {}", i, actual, expected);
+            panic!("Data mismatch at byte {i}: got {actual}, expected {expected}");
         }
     }
 

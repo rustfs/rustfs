@@ -16,6 +16,10 @@ use super::{quota::BucketQuota, target::BucketTargets};
 
 use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
+use crate::bucket::utils::deserialize;
+use crate::config::com::{read_config, save_config};
+use crate::error::{Error, Result};
+use crate::new_object_layer_fn;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use rustfs_policy::policy::BucketPolicy;
@@ -29,12 +33,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::error;
-
-use crate::bucket::target::BucketTarget;
-use crate::bucket::utils::deserialize;
-use crate::config::com::{read_config, save_config};
-use crate::error::{Error, Result};
-use crate::new_object_layer_fn;
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;
@@ -322,7 +320,9 @@ impl BucketMetadata {
 
         LittleEndian::write_u16(&mut buf[2..4], BUCKET_METADATA_VERSION);
 
-        let data = self.marshal_msg()?;
+        let data = self
+            .marshal_msg()
+            .map_err(|e| Error::other(format!("save bucket metadata failed: {e}")))?;
 
         buf.extend_from_slice(&data);
 
@@ -362,8 +362,8 @@ impl BucketMetadata {
         }
         //let temp = self.bucket_targets_config_json.clone();
         if !self.bucket_targets_config_json.is_empty() {
-            let arr: Vec<BucketTarget> = serde_json::from_slice(&self.bucket_targets_config_json)?;
-            self.bucket_target_config = Some(BucketTargets { targets: arr });
+            let bucket_targets: BucketTargets = serde_json::from_slice(&self.bucket_targets_config_json)?;
+            self.bucket_target_config = Some(bucket_targets);
         } else {
             self.bucket_target_config = Some(BucketTargets::default())
         }
@@ -450,5 +450,155 @@ mod test {
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+    }
+
+    #[tokio::test]
+    async fn marshal_msg_complete_example() {
+        // Create a complete BucketMetadata with various configurations
+        let mut bm = BucketMetadata::new("test-bucket");
+
+        // Set creation time to current time
+        bm.created = OffsetDateTime::now_utc();
+        bm.lock_enabled = true;
+
+        // Add policy configuration
+        let policy_json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::test-bucket/*"}]}"#;
+        bm.policy_config_json = policy_json.as_bytes().to_vec();
+        bm.policy_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add lifecycle configuration
+        let lifecycle_xml = r#"<LifecycleConfiguration><Rule><ID>rule1</ID><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#;
+        bm.lifecycle_config_xml = lifecycle_xml.as_bytes().to_vec();
+        bm.lifecycle_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add versioning configuration
+        let versioning_xml = r#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+        bm.versioning_config_xml = versioning_xml.as_bytes().to_vec();
+        bm.versioning_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add encryption configuration
+        let encryption_xml = r#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#;
+        bm.encryption_config_xml = encryption_xml.as_bytes().to_vec();
+        bm.encryption_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add tagging configuration
+        let tagging_xml = r#"<Tagging><TagSet><Tag><Key>Environment</Key><Value>Test</Value></Tag><Tag><Key>Owner</Key><Value>RustFS</Value></Tag></TagSet></Tagging>"#;
+        bm.tagging_config_xml = tagging_xml.as_bytes().to_vec();
+        bm.tagging_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add quota configuration
+        let quota_json = r#"{"quota":1073741824,"quotaType":"hard"}"#; // 1GB quota
+        bm.quota_config_json = quota_json.as_bytes().to_vec();
+        bm.quota_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add object lock configuration
+        let object_lock_xml = r#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#;
+        bm.object_lock_config_xml = object_lock_xml.as_bytes().to_vec();
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add notification configuration
+        let notification_xml = r#"<NotificationConfiguration><CloudWatchConfiguration><Id>notification1</Id><Event>s3:ObjectCreated:*</Event><CloudWatchConfiguration><LogGroupName>test-log-group</LogGroupName></CloudWatchConfiguration></CloudWatchConfiguration></NotificationConfiguration>"#;
+        bm.notification_config_xml = notification_xml.as_bytes().to_vec();
+        bm.notification_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add replication configuration
+        let replication_xml = r#"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication-role</Role><Rule><ID>rule1</ID><Status>Enabled</Status><Prefix>documents/</Prefix><Destination><Bucket>arn:aws:s3:::destination-bucket</Bucket></Destination></Rule></ReplicationConfiguration>"#;
+        bm.replication_config_xml = replication_xml.as_bytes().to_vec();
+        bm.replication_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add bucket targets configuration
+        let bucket_targets_json = r#"[{"endpoint":"http://target1.example.com","credentials":{"accessKey":"key1","secretKey":"secret1"},"targetBucket":"target-bucket-1","region":"us-east-1"},{"endpoint":"http://target2.example.com","credentials":{"accessKey":"key2","secretKey":"secret2"},"targetBucket":"target-bucket-2","region":"us-west-2"}]"#;
+        bm.bucket_targets_config_json = bucket_targets_json.as_bytes().to_vec();
+        bm.bucket_targets_config_updated_at = OffsetDateTime::now_utc();
+
+        // Add bucket targets meta configuration
+        let bucket_targets_meta_json = r#"{"replicationId":"repl-123","syncMode":"async","bandwidth":"100MB"}"#;
+        bm.bucket_targets_config_meta_json = bucket_targets_meta_json.as_bytes().to_vec();
+        bm.bucket_targets_config_meta_updated_at = OffsetDateTime::now_utc();
+
+        // Test serialization
+        let buf = bm.marshal_msg().unwrap();
+        assert!(!buf.is_empty(), "Serialized buffer should not be empty");
+
+        // Test deserialization
+        let deserialized_bm = BucketMetadata::unmarshal(&buf).unwrap();
+
+        // Verify all fields are correctly serialized and deserialized
+        assert_eq!(bm.name, deserialized_bm.name);
+        assert_eq!(bm.created.unix_timestamp(), deserialized_bm.created.unix_timestamp());
+        assert_eq!(bm.lock_enabled, deserialized_bm.lock_enabled);
+
+        // Verify configuration data
+        assert_eq!(bm.policy_config_json, deserialized_bm.policy_config_json);
+        assert_eq!(bm.lifecycle_config_xml, deserialized_bm.lifecycle_config_xml);
+        assert_eq!(bm.versioning_config_xml, deserialized_bm.versioning_config_xml);
+        assert_eq!(bm.encryption_config_xml, deserialized_bm.encryption_config_xml);
+        assert_eq!(bm.tagging_config_xml, deserialized_bm.tagging_config_xml);
+        assert_eq!(bm.quota_config_json, deserialized_bm.quota_config_json);
+        assert_eq!(bm.object_lock_config_xml, deserialized_bm.object_lock_config_xml);
+        assert_eq!(bm.notification_config_xml, deserialized_bm.notification_config_xml);
+        assert_eq!(bm.replication_config_xml, deserialized_bm.replication_config_xml);
+        assert_eq!(bm.bucket_targets_config_json, deserialized_bm.bucket_targets_config_json);
+        assert_eq!(bm.bucket_targets_config_meta_json, deserialized_bm.bucket_targets_config_meta_json);
+
+        // Verify timestamps (comparing unix timestamps to avoid precision issues)
+        assert_eq!(
+            bm.policy_config_updated_at.unix_timestamp(),
+            deserialized_bm.policy_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.lifecycle_config_updated_at.unix_timestamp(),
+            deserialized_bm.lifecycle_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.versioning_config_updated_at.unix_timestamp(),
+            deserialized_bm.versioning_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.encryption_config_updated_at.unix_timestamp(),
+            deserialized_bm.encryption_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.tagging_config_updated_at.unix_timestamp(),
+            deserialized_bm.tagging_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.quota_config_updated_at.unix_timestamp(),
+            deserialized_bm.quota_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.object_lock_config_updated_at.unix_timestamp(),
+            deserialized_bm.object_lock_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.notification_config_updated_at.unix_timestamp(),
+            deserialized_bm.notification_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.replication_config_updated_at.unix_timestamp(),
+            deserialized_bm.replication_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.bucket_targets_config_updated_at.unix_timestamp(),
+            deserialized_bm.bucket_targets_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(
+            bm.bucket_targets_config_meta_updated_at.unix_timestamp(),
+            deserialized_bm.bucket_targets_config_meta_updated_at.unix_timestamp()
+        );
+
+        // Test that the serialized data contains expected content
+        let buf_str = String::from_utf8_lossy(&buf);
+        assert!(buf_str.contains("test-bucket"), "Serialized data should contain bucket name");
+
+        // Verify the buffer size is reasonable (should be larger due to all the config data)
+        assert!(buf.len() > 1000, "Buffer should be substantial in size due to all configurations");
+
+        println!("✅ Complete BucketMetadata serialization test passed");
+        println!("   - Bucket name: {}", deserialized_bm.name);
+        println!("   - Lock enabled: {}", deserialized_bm.lock_enabled);
+        println!("   - Policy config size: {} bytes", deserialized_bm.policy_config_json.len());
+        println!("   - Lifecycle config size: {} bytes", deserialized_bm.lifecycle_config_xml.len());
+        println!("   - Serialized buffer size: {} bytes", buf.len());
     }
 }

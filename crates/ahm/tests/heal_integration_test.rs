@@ -29,6 +29,7 @@ use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
 
@@ -98,7 +99,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9001 if free
     let port = 9001; // for simplicity
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        .await
+        .unwrap();
 
     // init bucket metadata system
     let buckets_list = ecstore

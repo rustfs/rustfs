@@ -88,8 +88,8 @@ impl LockShard {
 
                 // Try atomic acquisition
                 let success = match request.mode {
-                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner),
-                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner),
+                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
+                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
                 };
 
                 if success {
@@ -108,14 +108,14 @@ impl LockShard {
                 let state = state.clone();
                 drop(objects);
 
-                if state.try_acquire_exclusive_fast(&request.owner) {
+                if state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout) {
                     return Some(state);
                 }
             } else {
                 // Create new state from pool and acquire immediately
                 let state_box = self.object_pool.acquire();
                 let state = Arc::new(*state_box);
-                if state.try_acquire_exclusive_fast(&request.owner) {
+                if state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout) {
                     objects.insert(request.key.clone(), state.clone());
                     return Some(state);
                 }
@@ -151,8 +151,8 @@ impl LockShard {
 
             // Try acquisition again
             let success = match request.mode {
-                LockMode::Shared => state.try_acquire_shared_fast(&request.owner),
-                LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner),
+                LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
+                LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
             };
 
             if success {
@@ -443,22 +443,24 @@ impl LockShard {
         let objects = self.objects.read();
         if let Some(state) = objects.get(key) {
             if let Some(mode) = state.current_mode() {
-                let owner = match mode {
+                let (owner, acquired_at, lock_timeout) = match mode {
                     LockMode::Exclusive => {
                         let current_owner = state.current_owner.read();
-                        current_owner.clone()?
+                        let info = current_owner.clone()?;
+                        (info.owner, info.acquired_at, info.lock_timeout)
                     }
                     LockMode::Shared => {
                         let shared_owners = state.shared_owners.read();
-                        shared_owners.first()?.clone()
+                        let entry = shared_owners.first()?.clone();
+                        (entry.owner, entry.acquired_at, entry.lock_timeout)
                     }
                 };
 
                 let priority = *state.priority.read();
 
-                // Estimate acquisition time (approximate)
-                let acquired_at = SystemTime::now() - Duration::from_secs(60);
-                let expires_at = acquired_at + Duration::from_secs(300);
+                let expires_at = acquired_at
+                    .checked_add(lock_timeout)
+                    .unwrap_or_else(|| acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
 
                 return Some(crate::fast_lock::types::ObjectLockInfo {
                     key: key.clone(),

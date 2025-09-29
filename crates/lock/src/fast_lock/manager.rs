@@ -106,6 +106,10 @@ impl FastObjectLockManager {
         object: impl Into<Arc<str>>,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
+        // let bucket = bucket.into();
+        // let object = object.into();
+        // let owner = owner.into();
+        // error!("acquire_write_lock: bucket={:?}, object={:?}, owner={:?}", bucket, object, owner);
         let request = ObjectLockRequest::new_write(bucket, object, owner);
         self.acquire_lock(request).await
     }
@@ -213,20 +217,33 @@ impl FastObjectLockManager {
     ) -> BatchLockResult {
         let mut all_successful = Vec::new();
         let mut all_failed = Vec::new();
+        let mut guards = Vec::new();
 
         for (&shard_id, requests) in shard_groups {
-            let shard = &self.shards[shard_id];
+            let shard = self.shards[shard_id].clone();
 
-            // Try fast path first for each request
             for request in requests {
-                if shard.try_fast_path_only(request) {
-                    all_successful.push(request.key.clone());
+                let key = request.key.clone();
+                let owner = request.owner.clone();
+                let mode = request.mode;
+
+                let acquired = if shard.try_fast_path_only(request) {
+                    true
                 } else {
-                    // Fallback to slow path
                     match shard.acquire_lock(request).await {
-                        Ok(()) => all_successful.push(request.key.clone()),
-                        Err(err) => all_failed.push((request.key.clone(), err)),
+                        Ok(()) => true,
+                        Err(err) => {
+                            all_failed.push((key.clone(), err));
+                            false
+                        }
                     }
+                };
+
+                if acquired {
+                    let guard = FastLockGuard::new(key.clone(), mode, owner.clone(), shard.clone());
+                    shard.register_guard(guard.guard_id());
+                    all_successful.push(key);
+                    guards.push(guard);
                 }
             }
         }
@@ -236,6 +253,7 @@ impl FastObjectLockManager {
             successful_locks: all_successful,
             failed_locks: all_failed,
             all_acquired,
+            guards,
         }
     }
 
@@ -245,16 +263,18 @@ impl FastObjectLockManager {
         shard_groups: &std::collections::HashMap<usize, Vec<ObjectLockRequest>>,
     ) -> BatchLockResult {
         // Phase 1: Try to acquire all locks
-        let mut acquired_locks = Vec::new();
+        let mut acquired_guards = Vec::new();
         let mut failed_locks = Vec::new();
 
         'outer: for (&shard_id, requests) in shard_groups {
-            let shard = &self.shards[shard_id];
+            let shard = self.shards[shard_id].clone();
 
             for request in requests {
                 match shard.acquire_lock(request).await {
                     Ok(()) => {
-                        acquired_locks.push((request.key.clone(), request.mode, request.owner.clone()));
+                        let guard = FastLockGuard::new(request.key.clone(), request.mode, request.owner.clone(), shard.clone());
+                        shard.register_guard(guard.guard_id());
+                        acquired_guards.push(guard);
                     }
                     Err(err) => {
                         failed_locks.push((request.key.clone(), err));
@@ -266,35 +286,22 @@ impl FastObjectLockManager {
 
         // Phase 2: If any failed, release all acquired locks with error tracking
         if !failed_locks.is_empty() {
-            let mut cleanup_failures = 0;
-            for (key, mode, owner) in acquired_locks {
-                let shard = self.get_shard(&key);
-                if !shard.release_lock(&key, &owner, mode) {
-                    cleanup_failures += 1;
-                    tracing::warn!(
-                        "Failed to release lock during batch cleanup: bucket={}, object={}",
-                        key.bucket,
-                        key.object
-                    );
-                }
-            }
-
-            if cleanup_failures > 0 {
-                tracing::error!("Batch lock cleanup had {} failures", cleanup_failures);
-            }
-
+            // Drop guards to release any acquired locks.
+            drop(acquired_guards);
             return BatchLockResult {
                 successful_locks: Vec::new(),
                 failed_locks,
                 all_acquired: false,
+                guards: Vec::new(),
             };
         }
 
-        // All successful
+        let successful_locks = acquired_guards.iter().map(|guard| guard.key().clone()).collect();
         BatchLockResult {
-            successful_locks: acquired_locks.into_iter().map(|(key, _, _)| key).collect(),
+            successful_locks,
             failed_locks: Vec::new(),
             all_acquired: true,
+            guards: acquired_guards,
         }
     }
 

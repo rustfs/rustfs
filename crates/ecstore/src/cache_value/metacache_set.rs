@@ -17,7 +17,8 @@ use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use futures::future::join_all;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{future::Future, pin::Pin, sync::Arc};
-use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
+use tokio::spawn;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -63,7 +64,7 @@ impl Clone for ListPathRawOptions {
     }
 }
 
-pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> disk::error::Result<()> {
+pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
         return Err(DiskError::other("list_path_raw: 0 drives provided"));
     }
@@ -72,13 +73,13 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(opts.fallback_disks.clone());
 
-    let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel::<bool>(1);
+    let cancel_rx = CancellationToken::new();
 
     for disk in opts.disks.iter() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
         let fds_clone = fds.clone();
-        let mut cancel_rx_clone = cancel_rx.resubscribe();
+        let cancel_rx_clone = cancel_rx.clone();
         let (rd, mut wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
@@ -106,7 +107,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 need_fallback = true;
             }
 
-            if cancel_rx_clone.try_recv().is_ok() {
+            if cancel_rx_clone.is_cancelled() {
                 // warn!("list_path_raw: cancel_rx_clone.try_recv().await.is_ok()");
                 return Ok(());
             }
@@ -173,7 +174,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             //     opts.bucket, opts.path, &current.name
             // );
 
-            if rx.try_recv().is_ok() {
+            if rx.is_cancelled() {
                 return Err(DiskError::other("canceled"));
             }
 
@@ -351,7 +352,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
     if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
         error!("list_path_raw: revjob err {:?}", err);
-        let _ = cancel_tx.send(true);
+        cancel_rx.cancel();
 
         return Err(err);
     }

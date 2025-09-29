@@ -23,18 +23,19 @@ use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
 use matchit::Params;
-use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_ecstore::admin_server_info::get_server_info;
-use rustfs_ecstore::bucket::metadata_sys::{self, get_replication_config};
+use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
+use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
 use rustfs_ecstore::data_usage::{
     aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
 };
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
@@ -57,7 +58,6 @@ use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
-// use serde_json::to_vec;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -70,6 +70,7 @@ use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 use tracing::{error, info, warn};
+use url::Host;
 // use url::UrlQuery;
 
 pub mod bucket_meta;
@@ -88,7 +89,6 @@ pub mod trace;
 pub mod user;
 #[cfg(not(target_os = "windows"))]
 use pprof::protos::Message;
-use urlencoding::decode;
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
@@ -971,128 +971,135 @@ impl Operation for GetReplicationMetricsHandler {
 pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
-    async fn call(&self, mut _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        //return Ok(S3Response::new((StatusCode::OK, Body::from("OK".to_string()))));
-        debug!("Processing SetRemoteTargetHandler request");
-        info!("SetRemoteTargetHandler credentials: {:?}", _req.credentials);
-        let queries = extract_query_params(&_req.uri);
-        let Some(_cred) = _req.credentials else {
-            error!("credentials null");
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let queries = extract_query_params(&req.uri);
+
+        let Some(bucket) = queries.get("bucket") else {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
-        let _is_owner = true; // Treat as true for now, decide based on request later
-        let body = _req.input.store_all_unlimited().await.unwrap();
-        debug!("Request body received, size: {} bytes", body.len());
 
-        if let Some(bucket) = queries.get("bucket") {
-            if bucket.is_empty() {
-                info!("have bucket: {}", bucket);
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "No buckets found".to_string()));
+        let update = queries.get("update").is_some_and(|v| v == "true");
+
+        warn!("set remote target, bucket: {}, update: {}", bucket, update);
+
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        }
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
             }
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-            };
+        };
 
-            // let binfo:BucketInfo = store
-            // .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default()).await;
-            match store
-                .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
-                .await
-            {
-                Ok(info) => {
-                    info!("Bucket Info: {:?}", info);
-                    if !info.versioning {
-                        return Ok(S3Response::new((StatusCode::FORBIDDEN, Body::from("bucket need versioned".to_string()))));
-                    }
-                }
-                Err(err) => {
-                    error!("Error: {:?}", err);
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("empty bucket".to_string()))));
-                }
-            }
+        let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
+            tracing::error!("Failed to parse BucketTarget from body: {}", e);
+            ApiError::other(e)
+        })?;
 
-            tracing::debug!("body is: {}", std::str::from_utf8(&body).unwrap_or("Invalid UTF-8"));
+        let Ok(target_url) = remote_target.url() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Invalid target url".to_string()));
+        };
 
-            let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
-                tracing::error!("Failed to parse BucketTarget from body: {}", e);
-                ApiError::other(e)
-            })?;
-            remote_target.source_bucket = bucket.clone();
+        let same_target = rustfs_utils::net::is_local_host(
+            target_url.host().unwrap_or(Host::Domain("localhost")),
+            target_url.port().unwrap_or(80),
+            global_rustfs_port(),
+        )
+        .unwrap_or_default();
 
-            info!("remote target {} And arn is:", remote_target.source_bucket.clone());
+        if same_target && bucket == &remote_target.target_bucket {
+            return Err(S3Error::with_message(S3ErrorCode::IncorrectEndpoint, "Same target".to_string()));
+        }
 
-            if let Some(val) = remote_target.arn.clone() {
-                info!("arn is {}", val);
-            }
+        remote_target.source_bucket = bucket.clone();
 
-            if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-                let (arn, exist) = sys.get_remote_arn(bucket, Some(&remote_target), "").await;
-                info!("exist: {} {}", exist, arn.clone().unwrap_or_default());
-                if exist && arn.is_some() {
-                    let jsonarn = serde_json::to_string(&arn).expect("failed to serialize");
-                    //Ok(S3Response::new)
-                    return Ok(S3Response::new((StatusCode::OK, Body::from(jsonarn))));
-                } else {
-                    remote_target.arn = arn;
-                    match sys.set_target(bucket, &remote_target, false, false).await {
-                        Ok(_) => {
-                            {
-                                //todo various persistence work
-                                let targets = sys.list_targets(Some(bucket), None).await;
-                                info!("targets is {}", targets.len());
-                                match serde_json::to_vec(&targets) {
-                                    Ok(json) => {
-                                        debug!("Serialized targets configuration, size: {} bytes", json.len());
-                                        //metadata_sys::GLOBAL_BucketMetadataSys::
-                                        //BUCKET_TARGETS_FILE: &str = "bucket-targets.json"
-                                        let _ = metadata_sys::update(bucket, "bucket-targets.json", json).await;
-                                        // if let Err(err) = metadata_sys::GLOBAL_BucketMetadataSys.get().
-                                        //     .update(ctx, bucket, "bucketTargetsFile", tgt_bytes)
-                                        //     .await
-                                        // {
-                                        //     write_error_response(ctx, &err)?;
-                                        //     return Err(err);
-                                        // }
-                                    }
-                                    Err(e) => {
-                                        error!("Serialization failed: {}", e);
-                                    }
-                                }
-                            }
+        let bucket_target_sys = BucketTargetSys::get();
 
-                            let jsonarn = serde_json::to_string(&remote_target.arn.clone()).expect("failed to serialize");
-                            return Ok(S3Response::new((StatusCode::OK, Body::from(jsonarn))));
-                        }
-                        Err(e) => {
-                            error!("set target error {}", e);
-                            return Ok(S3Response::new((
-                                StatusCode::BAD_REQUEST,
-                                Body::from("remote target not ready".to_string()),
-                            )));
-                        }
-                    }
-                }
-            } else {
-                error!("GLOBAL_BUCKET _TARGET_SYS is not initialized");
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "GLOBAL_BUCKET_TARGET_SYS is not initialized".to_string(),
-                ));
+        if !update {
+            let (arn, exist) = bucket_target_sys.get_remote_arn(bucket, Some(&remote_target), "").await;
+            remote_target.arn = arn.clone();
+            if exist && !arn.is_empty() {
+                let arn_str = serde_json::to_string(&arn).unwrap_or_default();
+
+                warn!("return exists, arn: {}", arn_str);
+                return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
             }
         }
-        // return Err(s3_error!(InvalidArgument));
-        return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
+
+        if remote_target.arn.is_empty() {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "ARN is empty".to_string()));
+        }
+
+        if update {
+            let Some(mut target) = bucket_target_sys
+                .get_remote_bucket_target_by_arn(bucket, &remote_target.arn)
+                .await
+            else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Target not found".to_string()));
+            };
+
+            target.credentials = remote_target.credentials;
+            target.endpoint = remote_target.endpoint;
+            target.secure = remote_target.secure;
+            target.target_bucket = remote_target.target_bucket;
+
+            target.path = remote_target.path;
+            target.replication_sync = remote_target.replication_sync;
+            target.bandwidth_limit = remote_target.bandwidth_limit;
+            target.health_check_duration = remote_target.health_check_duration;
+
+            warn!("update target, target: {:?}", target);
+            remote_target = target;
+        }
+
+        let arn = remote_target.arn.clone();
+
+        bucket_target_sys
+            .set_target(bucket, &remote_target, update)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+
+        let targets = bucket_target_sys.list_bucket_targets(bucket).await.map_err(|e| {
+            error!("Failed to list bucket targets: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
+        })?;
+        let json_targets = serde_json::to_vec(&targets).map_err(|e| {
+            error!("Serialization error: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+        })?;
+
+        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+            .await
+            .map_err(|e| {
+                error!("Failed to update bucket targets: {}", e);
+                S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
+            })?;
+
+        let arn_str = serde_json::to_string(&arn).unwrap_or_default();
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))))
     }
 }
 
 pub struct ListRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("list GetRemoteTargetHandler, params: {:?}", _req.credentials);
-
-        let queries = extract_query_params(&_req.uri);
-        let Some(_cred) = _req.credentials else {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let queries = extract_query_params(&req.uri);
+        let Some(_cred) = req.credentials else {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -1110,65 +1117,48 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
-            match store
+            if let Err(err) = store
                 .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
                 .await
             {
-                Ok(info) => {
-                    info!("Bucket Info: {:?}", info);
-                    if !info.versioning {
-                        return Ok(S3Response::new((
-                            StatusCode::FORBIDDEN,
-                            Body::from("Bucket needs versioning".to_string()),
-                        )));
-                    }
-                }
-                Err(err) => {
-                    error!("Error fetching bucket info: {:?}", err);
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
-                }
+                error!("Error fetching bucket info: {:?}", err);
+                return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
             }
 
-            if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-                let targets = sys.list_targets(Some(bucket), None).await;
-                info!("target sys len {}", targets.len());
-                if targets.is_empty() {
-                    return Ok(S3Response::new((
-                        StatusCode::NOT_FOUND,
-                        Body::from("No remote targets found".to_string()),
-                    )));
-                }
+            let sys = BucketTargetSys::get();
+            let targets = sys.list_targets(bucket, "").await;
 
-                let json_targets = serde_json::to_string(&targets).map_err(|e| {
-                    error!("Serialization error: {}", e);
-                    S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
-                })?;
+            let json_targets = serde_json::to_vec(&targets).map_err(|e| {
+                error!("Serialization error: {}", e);
+                S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+            })?;
 
-                return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
-            } else {
-                error!("GLOBAL_BUCKET_TARGET_SYS is not initialized");
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "GLOBAL_BUCKET_TARGET_SYS is not initialized".to_string(),
-                ));
-            }
+            let mut header = HeaderMap::new();
+            header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+            return Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
         }
 
-        warn!("Bucket parameter is missing in request");
-        Ok(S3Response::new((
-            StatusCode::BAD_REQUEST,
-            Body::from("Bucket parameter is required".to_string()),
-        )))
-        //return Err(s3_error!(NotImplemented));
+        let targets: Vec<BucketTarget> = Vec::new();
+
+        let json_targets = serde_json::to_vec(&targets).map_err(|e| {
+            error!("Serialization error: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+        })?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        return Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
     }
 }
-const COLON: AsciiSet = CONTROLS.add(b':');
+
 pub struct RemoveRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         debug!("remove remote target called");
-        let queries = extract_query_params(&_req.uri);
+        let queries = extract_query_params(&req.uri);
         let Some(bucket) = queries.get("bucket") else {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
@@ -1176,54 +1166,45 @@ impl Operation for RemoveRemoteTargetHandler {
             )));
         };
 
-        let mut need_delete = true;
+        let Some(arn_str) = queries.get("arn") else {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("ARN is required".to_string()))));
+        };
 
-        if let Some(arnstr) = queries.get("arn") {
-            let _arn = bucket_targets::ARN::parse(arnstr);
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
+        };
 
-            match get_replication_config(bucket).await {
-                Ok((conf, _ts)) => {
-                    for ru in conf.rules {
-                        let encoded = percent_encode(ru.destination.bucket.as_bytes(), &COLON);
-                        let encoded_str = encoded.to_string();
-                        if *arnstr == encoded_str {
-                            //error!("target in use");
-                            //return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
-                            need_delete = false;
-                            break;
-                        }
-                        //info!("bucket: {} and arn str is {} ", encoded_str, arnstr);
-                    }
-                }
-                Err(err) => {
-                    error!("get replication config err: {}", err);
-                    return Ok(S3Response::new((StatusCode::NOT_FOUND, Body::from(err.to_string()))));
-                }
-            }
-            if need_delete {
-                info!("arn {} is in use, cannot delete", arnstr);
-                let decoded_str = decode(arnstr).unwrap();
-                error!("need delete target is {}", decoded_str);
-                bucket_targets::remove_bucket_target(bucket, arnstr).await;
-            }
+        if let Err(err) = store
+            .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
+            .await
+        {
+            error!("Error fetching bucket info: {:?}", err);
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
         }
-        // List bucket targets and return as JSON to client
-        // match bucket_targets::list_bucket_targets(bucket).await {
-        //     Ok(targets) => {
-        //         let json_targets = serde_json::to_string(&targets).map_err(|e| {
-        //             error!("Serialization error: {}", e);
-        //             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
-        //         })?;
-        //         return Ok(S3Response::new((StatusCode::OK, Body::from(json_targets))));
-        //     }
-        //     Err(e) => {
-        //         error!("list bucket targets failed: {:?}", e);
-        //         return Err(S3Error::with_message(
-        //             S3ErrorCode::InternalError,
-        //             "list bucket targets failed".to_string(),
-        //         ));
-        //     }
-        // }
+
+        let sys = BucketTargetSys::get();
+
+        sys.remove_target(bucket, arn_str).await.map_err(|e| {
+            error!("Failed to remove target: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "Failed to remove target".to_string())
+        })?;
+
+        let targets = sys.list_bucket_targets(bucket).await.map_err(|e| {
+            error!("Failed to list bucket targets: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
+        })?;
+
+        let json_targets = serde_json::to_vec(&targets).map_err(|e| {
+            error!("Serialization error: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+        })?;
+
+        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+            .await
+            .map_err(|e| {
+                error!("Failed to update bucket targets: {}", e);
+                S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
+            })?;
 
         return Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))));
     }

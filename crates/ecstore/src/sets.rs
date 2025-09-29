@@ -17,7 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::store_api::ListPartsInfo;
+use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -48,14 +48,13 @@ use rustfs_filemeta::FileInfo;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
 use tracing::warn;
 use tracing::{error, info};
-
-use crate::lock_utils::create_unique_clients;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -162,8 +161,6 @@ impl Sets {
                     set_drive.push(None);
                 }
             }
-
-            let _lock_clients = create_unique_clients(&set_endpoints).await?;
 
             // Note: write_quorum was used for the old lock system, no longer needed with FastLock
             let _write_quorum = set_drive_count - parity_count;
@@ -459,6 +456,17 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
@@ -543,7 +551,7 @@ impl StorageAPI for Sets {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
@@ -576,38 +584,11 @@ impl StorageAPI for Sets {
             }
         }
 
-        // let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
-        // let mut jhs = Vec::with_capacity(semaphore.available_permits());
-
-        // for (k, v) in set_obj_map {
-        //     let disks = self.get_disks(k);
-        //     let semaphore = semaphore.clone();
-        //     let opts = opts.clone();
-        //     let bucket = bucket.to_string();
-
-        //     let jh = tokio::spawn(async move {
-        //         let _permit = semaphore.acquire().await.unwrap();
-        //         let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-        //         disks.delete_objects(&bucket, objs, opts).await
-        //     });
-        //     jhs.push(jh);
-        // }
-
-        // let mut results = Vec::with_capacity(jhs.len());
-        // for jh in jhs {
-        //     results.push(jh.await?.unwrap());
-        // }
-
-        // for (dobjects, errs) in results {
-        //     del_objects.extend(dobjects);
-        //     del_errs.extend(errs);
-        // }
-
-        // TODO: Implement concurrency
+        // TODO: concurrency
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await?;
+            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await;
 
             for (i, err) in errs.into_iter().enumerate() {
                 let obj = v.get(i).unwrap();
@@ -618,7 +599,15 @@ impl StorageAPI for Sets {
             }
         }
 
-        Ok((del_objects, del_errs))
+        (del_objects, del_errs)
+    }
+
+    async fn complete_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).complete_append(bucket, object, opts).await
+    }
+
+    async fn abort_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).abort_append(bucket, object, opts).await
     }
 
     async fn list_object_parts(
