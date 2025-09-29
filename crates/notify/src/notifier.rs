@@ -26,7 +26,7 @@ use tracing::{debug, error, info, instrument, warn};
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     target_list: Arc<RwLock<TargetList>>,
-    bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, fxhash::FxBuildHasher>>,
+    bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
 }
 
 impl Default for EventNotifier {

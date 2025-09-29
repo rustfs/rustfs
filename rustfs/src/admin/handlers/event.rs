@@ -20,12 +20,9 @@ use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::{ENABLE_KEY, EnableState};
-use rustfs_notify::rules::{BucketNotificationConfig, PatternRules};
-use rustfs_targets::EventName;
 use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
-use serde_urlencoded::from_bytes;
 use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
@@ -189,6 +186,11 @@ impl Operation for NotificationTarget {
             if kv.key == "endpoint" {
                 endpoint_val = Some(kv.value.clone());
             }
+
+            if target_type == NOTIFY_MQTT_SUB_SYS && kv.key == rustfs_config::MQTT_BROKER {
+                endpoint_val = Some(kv.value.clone());
+            }
+
             if kv.key == "queue_dir" {
                 queue_dir_val = Some(kv.value.clone());
             }
@@ -235,8 +237,8 @@ impl Operation for NotificationTarget {
         }
 
         if target_type == NOTIFY_MQTT_SUB_SYS {
-            let endpoint = endpoint_val.ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-            let url = Url::parse(&endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+            let endpoint = endpoint_val.ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
+            let url = Url::parse(&endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid broker endpoint url: {}", e))?;
             match url.scheme() {
                 "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" => {}
                 _ => return Err(s3_error!(InvalidArgument, "unsupported broker url scheme")),
@@ -420,112 +422,112 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
     Ok((target_type, target_name))
 }
 
-/// Set notification rules for buckets
-pub struct SetBucketNotification {}
-#[async_trait::async_trait]
-impl Operation for SetBucketNotification {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        // 1. Analyze query parameters
-        let query: BucketQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
-            .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
-
-        // 2. Permission verification
-        let Some(input_cred) = &req.credentials else {
-            return Err(s3_error!(InvalidRequest, "credentials not found"));
-        };
-        let (_cred, _owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        // 3. Get notification system instance
-        let Some(ns) = rustfs_notify::global::notification_system() else {
-            return Err(s3_error!(InternalError, "notification system not initialized"));
-        };
-
-        // 4. The parsing request body is BucketNotificationConfig
-        let mut input = req.input;
-        let body = input.store_all_unlimited().await.map_err(|e| {
-            warn!("failed to read request body: {:?}", e);
-            s3_error!(InvalidRequest, "failed to read request body")
-        })?;
-        let config: BucketNotificationConfig = serde_json::from_slice(&body)
-            .map_err(|e| s3_error!(InvalidArgument, "invalid json body for bucket notification config: {}", e))?;
-
-        // 5. Load bucket notification configuration
-        info!("Loading notification config for bucket '{}'", &query.bucket_name);
-        ns.load_bucket_notification_config(&query.bucket_name, &config)
-            .await
-            .map_err(|e| {
-                error!("failed to load bucket notification config: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load bucket notification config: {e}"))
-            })?;
-
-        let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
-    }
-}
-
-/// Get notification rules for buckets
-#[derive(Serialize)]
-struct BucketRulesResponse {
-    rules: hashbrown::HashMap<EventName, PatternRules>,
-}
-pub struct GetBucketNotification {}
-#[async_trait::async_trait]
-impl Operation for GetBucketNotification {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query: BucketQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
-            .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
-
-        let Some(input_cred) = &req.credentials else {
-            return Err(s3_error!(InvalidRequest, "credentials not found"));
-        };
-        let (_cred, _owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let Some(ns) = rustfs_notify::global::notification_system() else {
-            return Err(s3_error!(InternalError, "notification system not initialized"));
-        };
-
-        let rules_map = ns.notifier.get_rules_map(&query.bucket_name);
-        let response = BucketRulesResponse {
-            rules: rules_map.await.unwrap_or_default().inner().clone(),
-        };
-
-        let data = serde_json::to_vec(&response)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize rules: {e}")))?;
-
-        let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
-    }
-}
-
-/// Remove all notification rules for a bucket
-pub struct RemoveBucketNotification {}
-#[async_trait::async_trait]
-impl Operation for RemoveBucketNotification {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query: BucketQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
-            .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
-
-        let Some(input_cred) = &req.credentials else {
-            return Err(s3_error!(InvalidRequest, "credentials not found"));
-        };
-        let (_cred, _owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let Some(ns) = rustfs_notify::global::notification_system() else {
-            return Err(s3_error!(InternalError, "notification system not initialized"));
-        };
-
-        info!("Removing notification config for bucket '{}'", &query.bucket_name);
-        ns.remove_bucket_notification_config(&query.bucket_name).await;
-
-        let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
-    }
-}
+// /// Set notification rules for buckets
+// pub struct SetBucketNotification {}
+// #[async_trait::async_trait]
+// impl Operation for SetBucketNotification {
+//     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+//         // 1. Analyze query parameters
+//         let query: BucketQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
+//             .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
+//
+//         // 2. Permission verification
+//         let Some(input_cred) = &req.credentials else {
+//             return Err(s3_error!(InvalidRequest, "credentials not found"));
+//         };
+//         let (_cred, _owner) =
+//             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+//
+//         // 3. Get notification system instance
+//         let Some(ns) = rustfs_notify::global::notification_system() else {
+//             return Err(s3_error!(InternalError, "notification system not initialized"));
+//         };
+//
+//         // 4. The parsing request body is BucketNotificationConfig
+//         let mut input = req.input;
+//         let body = input.store_all_unlimited().await.map_err(|e| {
+//             warn!("failed to read request body: {:?}", e);
+//             s3_error!(InvalidRequest, "failed to read request body")
+//         })?;
+//         let config: BucketNotificationConfig = serde_json::from_slice(&body)
+//             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for bucket notification config: {}", e))?;
+//
+//         // 5. Load bucket notification configuration
+//         info!("Loading notification config for bucket '{}'", &query.bucket_name);
+//         ns.load_bucket_notification_config(&query.bucket_name, &config)
+//             .await
+//             .map_err(|e| {
+//                 error!("failed to load bucket notification config: {}", e);
+//                 S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load bucket notification config: {e}"))
+//             })?;
+//
+//         let mut header = HeaderMap::new();
+//         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+//         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+//         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+//     }
+// }
+//
+// /// Get notification rules for buckets
+// #[derive(Serialize)]
+// struct BucketRulesResponse {
+//     rules: hashbrown::HashMap<EventName, PatternRules>,
+// }
+// pub struct GetBucketNotification {}
+// #[async_trait::async_trait]
+// impl Operation for GetBucketNotification {
+//     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+//         let query: BucketQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
+//             .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
+//
+//         let Some(input_cred) = &req.credentials else {
+//             return Err(s3_error!(InvalidRequest, "credentials not found"));
+//         };
+//         let (_cred, _owner) =
+//             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+//
+//         let Some(ns) = rustfs_notify::global::notification_system() else {
+//             return Err(s3_error!(InternalError, "notification system not initialized"));
+//         };
+//
+//         let rules_map = ns.notifier.get_rules_map(&query.bucket_name);
+//         let response = BucketRulesResponse {
+//             rules: rules_map.await.unwrap_or_default().inner().clone(),
+//         };
+//
+//         let data = serde_json::to_vec(&response)
+//             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize rules: {e}")))?;
+//
+//         let mut header = HeaderMap::new();
+//         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+//         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+//     }
+// }
+//
+// /// Remove all notification rules for a bucket
+// pub struct RemoveBucketNotification {}
+// #[async_trait::async_trait]
+// impl Operation for RemoveBucketNotification {
+//     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+//         let query: BucketQuery = from_bytes(req.uri.query().unwrap_or("").as_bytes())
+//             .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
+//
+//         let Some(input_cred) = &req.credentials else {
+//             return Err(s3_error!(InvalidRequest, "credentials not found"));
+//         };
+//         let (_cred, _owner) =
+//             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+//
+//         let Some(ns) = rustfs_notify::global::notification_system() else {
+//             return Err(s3_error!(InternalError, "notification system not initialized"));
+//         };
+//
+//         info!("Removing notification config for bucket '{}'", &query.bucket_name);
+//         ns.remove_bucket_notification_config(&query.bucket_name).await;
+//
+//         let mut header = HeaderMap::new();
+//         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+//         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+//         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+//     }
+// }
