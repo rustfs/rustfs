@@ -25,6 +25,7 @@ use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::extract_claims;
 use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
@@ -41,6 +42,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tracing::warn;
 
 pub const MAX_SVCSESSION_POLICY_SIZE: usize = 4096;
 
@@ -62,6 +64,9 @@ impl<T: Store> IamSys<T> {
             store,
             roles_map: HashMap::new(),
         }
+    }
+    pub fn has_watcher(&self) -> bool {
+        self.store.api.has_watcher()
     }
 
     pub async fn load_group(&self, name: &str) -> Result<()> {
@@ -104,8 +109,17 @@ impl<T: Store> IamSys<T> {
 
         self.store.delete_policy(name, notify).await?;
 
-        if notify {
-            // TODO: implement notification
+        if !notify || self.has_watcher() {
+            return Ok(());
+        }
+
+        if let Some(notification_sys) = get_global_notification_sys() {
+            let resp = notification_sys.delete_policy(name).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify delete_policy failed: {}", err);
+                }
+            }
         }
 
         Ok(())
@@ -142,9 +156,20 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
-        self.store.set_policy(name, policy).await
+        let updated_at = self.store.set_policy(name, policy).await?;
 
-        // TODO: notification
+        if !self.has_watcher() {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_policy(name).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_policy failed: {}", err);
+                    }
+                }
+            }
+        }
+
+        Ok(updated_at)
     }
 
     pub async fn get_role_policy(&self, arn_str: &str) -> Result<(ARN, String)> {
@@ -159,9 +184,51 @@ impl<T: Store> IamSys<T> {
         Ok((arn, policy.clone()))
     }
 
-    pub async fn delete_user(&self, name: &str, _notify: bool) -> Result<()> {
-        self.store.delete_user(name, UserType::Reg).await
-        // TODO: notification
+    pub async fn delete_user(&self, name: &str, notify: bool) -> Result<()> {
+        self.store.delete_user(name, UserType::Reg).await?;
+
+        if notify && !self.has_watcher() {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.delete_user(name).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify delete_user failed: {}", err);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn notify_for_user(&self, name: &str, is_temp: bool) {
+        if self.has_watcher() {
+            return;
+        }
+
+        if let Some(notification_sys) = get_global_notification_sys() {
+            let resp = notification_sys.load_user(name, is_temp).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_user failed: {}", err);
+                }
+            }
+        }
+    }
+
+    async fn notify_for_service_account(&self, name: &str) {
+        if self.has_watcher() {
+            return;
+        }
+
+        if let Some(notification_sys) = get_global_notification_sys() {
+            let resp = notification_sys.load_service_account(name).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_service_account failed: {}", err);
+                }
+            }
+        }
     }
 
     pub async fn current_policies(&self, name: &str) -> String {
@@ -177,8 +244,11 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_temp_user(&self, name: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
-        self.store.set_temp_user(name, cred, policy_name).await
-        // TODO: notification
+        let updated_at = self.store.set_temp_user(name, cred, policy_name).await?;
+
+        self.notify_for_user(&cred.access_key, true).await;
+
+        Ok(updated_at)
     }
 
     pub async fn is_temp_user(&self, name: &str) -> Result<(bool, String)> {
@@ -208,8 +278,11 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_user_status(&self, name: &str, status: rustfs_madmin::AccountStatus) -> Result<OffsetDateTime> {
-        self.store.set_user_status(name, status).await
-        // TODO: notification
+        let updated_at = self.store.set_user_status(name, status).await?;
+
+        self.notify_for_user(name, false).await;
+
+        Ok(updated_at)
     }
 
     pub async fn new_service_account(
@@ -294,14 +367,17 @@ impl<T: Store> IamSys<T> {
 
         let create_at = self.store.add_service_account(cred.clone()).await?;
 
+        self.notify_for_service_account(&cred.access_key).await;
+
         Ok((cred, create_at))
-        // TODO: notification
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
-        self.store.update_service_account(name, opts).await
+        let updated_at = self.store.update_service_account(name, opts).await?;
 
-        // TODO: notification
+        self.notify_for_service_account(name).await;
+
+        Ok(updated_at)
     }
 
     pub async fn list_service_accounts(&self, access_key: &str) -> Result<Vec<Credentials>> {
@@ -424,7 +500,7 @@ impl<T: Store> IamSys<T> {
         extract_jwt_claims(&u)
     }
 
-    pub async fn delete_service_account(&self, access_key: &str, _notify: bool) -> Result<()> {
+    pub async fn delete_service_account(&self, access_key: &str, notify: bool) -> Result<()> {
         let Some(u) = self.store.get_user(access_key).await else {
             return Ok(());
         };
@@ -433,9 +509,35 @@ impl<T: Store> IamSys<T> {
             return Ok(());
         }
 
-        self.store.delete_user(access_key, UserType::Svc).await
+        self.store.delete_user(access_key, UserType::Svc).await?;
 
-        // TODO: notification
+        if notify && !self.has_watcher() {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.delete_service_account(access_key).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify delete_service_account failed: {}", err);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn notify_for_group(&self, group: &str) {
+        if self.has_watcher() {
+            return;
+        }
+
+        if let Some(notification_sys) = get_global_notification_sys() {
+            let resp = notification_sys.load_group(group).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_group failed: {}", err);
+                }
+            }
+        }
     }
 
     pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
@@ -451,8 +553,11 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
-        self.store.add_user(access_key, args).await
-        // TODO: notification
+        let updated_at = self.store.add_user(access_key, args).await?;
+
+        self.notify_for_user(access_key, false).await;
+
+        Ok(updated_at)
     }
 
     pub async fn set_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
@@ -495,18 +600,27 @@ impl<T: Store> IamSys<T> {
         if contains_reserved_chars(group) {
             return Err(IamError::GroupNameContainsReservedChars);
         }
-        self.store.add_users_to_group(group, users).await
-        // TODO: notification
+        let updated_at = self.store.add_users_to_group(group, users).await?;
+
+        self.notify_for_group(group).await;
+
+        Ok(updated_at)
     }
 
     pub async fn remove_users_from_group(&self, group: &str, users: Vec<String>) -> Result<OffsetDateTime> {
-        self.store.remove_users_from_group(group, users).await
-        // TODO: notification
+        let updated_at = self.store.remove_users_from_group(group, users).await?;
+
+        self.notify_for_group(group).await;
+
+        Ok(updated_at)
     }
 
     pub async fn set_group_status(&self, group: &str, enable: bool) -> Result<OffsetDateTime> {
-        self.store.set_group_status(group, enable).await
-        // TODO: notification
+        let updated_at = self.store.set_group_status(group, enable).await?;
+
+        self.notify_for_group(group).await;
+
+        Ok(updated_at)
     }
     pub async fn get_group_description(&self, group: &str) -> Result<GroupDesc> {
         self.store.get_group_description(group).await
@@ -517,8 +631,20 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
-        self.store.policy_db_set(name, user_type, is_group, policy).await
-        // TODO: notification
+        let updated_at = self.store.policy_db_set(name, user_type, is_group, policy).await?;
+
+        if !self.has_watcher() {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_policy failed: {}", err);
+                    }
+                }
+            }
+        }
+
+        Ok(updated_at)
     }
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
