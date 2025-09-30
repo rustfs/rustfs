@@ -18,6 +18,7 @@ use crate::auth::IAMAuth;
 use crate::config;
 use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
+use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::{
@@ -27,7 +28,6 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_ecstore::rpc::make_server;
 use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
