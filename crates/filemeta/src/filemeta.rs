@@ -689,11 +689,6 @@ impl FileMeta {
             }
         }
 
-        // ???
-        if fi.transition_status == TRANSITION_COMPLETE {
-            update_version = false;
-        }
-
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != fi.version_id {
                 continue;
@@ -864,9 +859,9 @@ impl FileMeta {
             err = self.add_version_filemata(ventry).err();
         }
 
-        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
+        //if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
             return Ok(None);
-        }
+        //}
 
         if let Some(e) = err {
             return Err(e);
@@ -1754,7 +1749,7 @@ impl MetaObject {
             ..Default::default()
         };
 
-        FileInfo {
+        let mut fi = FileInfo {
             version_id,
             erasure,
             data_dir: self.data_dir,
@@ -1765,7 +1760,22 @@ impl MetaObject {
             parts,
             metadata,
             ..Default::default()
-        }
+        };
+
+        fi.transition_tier = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}")) {
+            String::from_utf8(elm.clone()).unwrap()
+        } else { "".to_string() };
+        fi.transitioned_objname = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}")) {
+            String::from_utf8(elm.clone()).unwrap()
+        } else { "".to_string() };
+        fi.transition_version_id = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}")) {
+            Some(Uuid::from_slice(elm).unwrap())
+        } else { None };
+        fi.transition_status = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}")) {
+            String::from_utf8(elm.clone()).unwrap()
+        } else { "".to_string() };
+
+        fi
     }
 
     pub fn set_transition(&mut self, fi: &FileInfo) {
@@ -1945,7 +1955,7 @@ impl MetaDeleteMarker {
     pub fn into_fileinfo(&self, volume: &str, path: &str, _all_parts: bool) -> FileInfo {
         let metadata = self.meta_sys.clone();
 
-        FileInfo {
+        let mut fi = FileInfo {
             version_id: self.version_id.filter(|&vid| !vid.is_nil()),
             name: path.to_string(),
             volume: volume.to_string(),
@@ -1956,7 +1966,25 @@ impl MetaDeleteMarker {
                 .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
                 .collect(),
             ..Default::default()
+        };
+
+        if self.free_version() {
+            fi.set_tier_free_version();
+            fi.transition_tier = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}")) {
+                String::from_utf8(elm.clone()).unwrap()
+            } else { "".to_string() };
+            fi.transitioned_objname = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}")) {
+                String::from_utf8(elm.clone()).unwrap()
+            } else { "".to_string() };
+            fi.transition_version_id = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}")) {
+                Some(Uuid::from_slice(elm).unwrap())
+            } else { None };
+            fi.transition_status = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}")) {
+                String::from_utf8(elm.clone()).unwrap()
+            } else { "".to_string() }; //???
         }
+
+        fi
     }
 
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {

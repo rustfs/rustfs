@@ -2263,12 +2263,12 @@ impl SetDisks {
                 return Err(Error::other("inline payload shorter than expected"));
             }
 
-        if length > 0 {
+            if length > 0 {
                 writer
                     .write_all(&plain[offset..end])
                     .await
                     .map_err(|e| Error::other(format!("failed to stream inline payload: {e}")))?;
-        }
+            }
 
             return Ok(());
         }
@@ -2279,11 +2279,11 @@ impl SetDisks {
 
         if base_read_length == 0 {
             // Reading entirely from pending segments
-        tracing::debug!(
-            bucket,
-            object,
-            offset,
-            length,
+            tracing::debug!(
+                bucket,
+                object,
+                offset,
+                length,
                 base_size,
                 "Read entirely from pending segments, skipping regular parts"
             );
@@ -2325,52 +2325,52 @@ impl SetDisks {
 
         // Only read from regular parts if there's base data to read
         if base_read_length > 0 {
-        for current_part in part_indices {
+            for current_part in part_indices {
                 if total_read == base_read_length {
-                tracing::debug!(
-                    bucket,
-                    object,
-                    total_read,
+                    tracing::debug!(
+                        bucket,
+                        object,
+                        total_read,
                         base_read_length,
-                    part_index = current_part,
+                        part_index = current_part,
                         "Stopping multipart stream - reached base data limit"
-                );
-                break;
-            }
+                    );
+                    break;
+                }
 
                 if total_read >= base_read_length {
                     break;
                 }
 
-            let part_number = fi.parts[current_part].number;
-            let part_size = fi.parts[current_part].size;
-            let mut part_length = part_size - part_offset;
+                let part_number = fi.parts[current_part].number;
+                let part_size = fi.parts[current_part].size;
+                let mut part_length = part_size - part_offset;
                 if part_length > (base_read_length - total_read) {
                     part_length = base_read_length - total_read
-            }
+                }
 
-            let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
+                let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
 
-            let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
+                let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
 
-            tracing::debug!(
-                bucket,
-                object,
-                part_index = current_part,
-                part_number,
-                part_offset,
-                part_size,
-                part_length,
-                read_offset,
-                till_offset,
-                total_read_before = total_read,
-                requested_length = length,
-                "Streaming multipart part"
-            );
+                tracing::debug!(
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    part_offset,
+                    part_size,
+                    part_length,
+                    read_offset,
+                    till_offset,
+                    total_read_before = total_read,
+                    requested_length = length,
+                    "Streaming multipart part"
+                );
 
-            let mut readers = Vec::with_capacity(disks.len());
-            let mut errors = Vec::with_capacity(disks.len());
-            for (idx, disk_op) in disks.iter().enumerate() {
+                let mut readers = Vec::with_capacity(disks.len());
+                let mut errors = Vec::with_capacity(disks.len());
+                for (idx, disk_op) in disks.iter().enumerate() {
                     let checksum_algo = if fi.erasure.checksums.is_empty() {
                         HashAlgorithm::HighwayHash256
                     } else {
@@ -2384,92 +2384,92 @@ impl SetDisks {
                         info!(bucket, object, part_number, inline_len = inline.len(), "using inline data for shard read");
                     }
 
-                match create_bitrot_reader(
+                    match create_bitrot_reader(
                         inline_source,
-                    disk_op.as_ref(),
-                    bucket,
-                    &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
-                    read_offset,
-                    till_offset,
-                    erasure.shard_size(),
+                        disk_op.as_ref(),
+                        bucket,
+                        &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                        read_offset,
+                        till_offset,
+                        erasure.shard_size(),
                         checksum_algo,
-                )
-                .await
-                {
-                    Ok(Some(reader)) => {
-                        readers.push(Some(reader));
-                        errors.push(None);
-                    }
-                    Ok(None) => {
-                        readers.push(None);
-                        errors.push(Some(DiskError::DiskNotFound));
-                    }
-                    Err(e) => {
-                        readers.push(None);
-                        errors.push(Some(e));
-                    }
-                }
-            }
-
-            let nil_count = errors.iter().filter(|&e| e.is_none()).count();
-            if nil_count < erasure.data_shards {
-                if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
-                    error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
-                    return Err(to_object_err(read_err.into(), vec![bucket, object]));
-                }
-                error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
-                return Err(Error::other(format!("not enough disks to read: {errors:?}")));
-            }
-
-            // debug!(
-            //     "read part {} part_offset {},part_length {},part_size {}  ",
-            //     part_number, part_offset, part_length, part_size
-            // );
-            let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
-            tracing::debug!(
-                bucket,
-                object,
-                part_index = current_part,
-                part_number,
-                part_length,
-                bytes_written = written,
-                "Finished decoding multipart part"
-            );
-            if let Some(e) = err {
-                let de_err: DiskError = e.into();
-                let mut has_err = true;
-                if written == part_length {
-                    match de_err {
-                        DiskError::FileNotFound | DiskError::FileCorrupt => {
-                            error!("erasure.decode err 111 {:?}", &de_err);
-                            let _ = rustfs_common::heal_channel::send_heal_request(
-                                rustfs_common::heal_channel::create_heal_request_with_options(
-                                    bucket.to_string(),
-                                    Some(object.to_string()),
-                                    false,
-                                    Some(HealChannelPriority::Normal),
-                                    Some(pool_index),
-                                    Some(set_index),
-                                ),
-                            )
-                            .await;
-                            has_err = false;
+                    )
+                    .await
+                    {
+                        Ok(Some(reader)) => {
+                            readers.push(Some(reader));
+                            errors.push(None);
                         }
-                        _ => {}
+                        Ok(None) => {
+                            readers.push(None);
+                            errors.push(Some(DiskError::DiskNotFound));
+                        }
+                        Err(e) => {
+                            readers.push(None);
+                            errors.push(Some(e));
+                        }
                     }
                 }
 
-                if has_err {
-                    error!("erasure.decode err {} {:?}", written, &de_err);
-                    return Err(de_err.into());
+                let nil_count = errors.iter().filter(|&e| e.is_none()).count();
+                if nil_count < erasure.data_shards {
+                    if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+                        error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
+                        return Err(to_object_err(read_err.into(), vec![bucket, object]));
+                    }
+                    error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
+                    return Err(Error::other(format!("not enough disks to read: {errors:?}")));
                 }
+
+                // debug!(
+                //     "read part {} part_offset {},part_length {},part_size {}  ",
+                //     part_number, part_offset, part_length, part_size
+                // );
+                let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+                tracing::debug!(
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    part_length,
+                    bytes_written = written,
+                    "Finished decoding multipart part"
+                );
+                if let Some(e) = err {
+                    let de_err: DiskError = e.into();
+                    let mut has_err = true;
+                    if written == part_length {
+                        match de_err {
+                            DiskError::FileNotFound | DiskError::FileCorrupt => {
+                                error!("erasure.decode err 111 {:?}", &de_err);
+                                let _ = rustfs_common::heal_channel::send_heal_request(
+                                    rustfs_common::heal_channel::create_heal_request_with_options(
+                                        bucket.to_string(),
+                                        Some(object.to_string()),
+                                        false,
+                                        Some(HealChannelPriority::Normal),
+                                        Some(pool_index),
+                                        Some(set_index),
+                                    ),
+                                )
+                                .await;
+                                has_err = false;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if has_err {
+                        error!("erasure.decode err {} {:?}", written, &de_err);
+                        return Err(de_err.into());
+                    }
+                }
+
+                // debug!("ec decode {} written size {}", part_number, n);
+
+                total_read += part_length;
+                part_offset = 0;
             }
-
-            // debug!("ec decode {} written size {}", part_number, n);
-
-            total_read += part_length;
-            part_offset = 0;
-        }
         }
 
         // debug!("read end");
@@ -2692,7 +2692,7 @@ impl SetDisks {
                     reuse_existing_lock = true;
                     debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
                 } else {
-                warn!("Lock already exists for object {}: {:?}", object, lock_info);
+                    warn!("Lock already exists for object {}: {:?}", object, lock_info);
                 }
             } else {
                 info!("No existing lock found for object {}", object);
@@ -2701,20 +2701,20 @@ impl SetDisks {
             if reuse_existing_lock {
                 None
             } else {
-            let start_time = std::time::Instant::now();
-            let lock_result = self
-                .fast_lock_manager
-                .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                .await
-                .map_err(|e| {
-                    let elapsed = start_time.elapsed();
+                let start_time = std::time::Instant::now();
+                let lock_result = self
+                    .fast_lock_manager
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| {
+                        let elapsed = start_time.elapsed();
                         let message = self.format_lock_error(bucket, object, "write", &e);
                         error!("Failed to acquire write lock for heal operation after {:?}: {}", elapsed, message);
                         DiskError::other(message)
-                })?;
-            let elapsed = start_time.elapsed();
-            info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
-            Some(lock_result)
+                    })?;
+                let elapsed = start_time.elapsed();
+                info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
+                Some(lock_result)
             }
         } else {
             info!("Skipping lock acquisition (no_lock=true)");
@@ -5100,7 +5100,7 @@ impl StorageAPI for SetDisks {
         for dobj in &objects {
             if unique_objects.insert(dobj.object_name.clone()) {
                 batch = batch.add_write_lock(bucket, dobj.object_name.clone());
-        }
+            }
         }
 
         let batch_result = self.fast_lock_manager.acquire_locks_batch(batch).await;
@@ -5118,12 +5118,12 @@ impl StorageAPI for SetDisks {
             .collect();
 
         // Mark failures for objects that could not be locked
-                    for (i, dobj) in objects.iter().enumerate() {
+        for (i, dobj) in objects.iter().enumerate() {
             if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
                 let message = self.format_lock_error(bucket, dobj.object_name.as_str(), "write", err);
                 del_errs[i] = Some(Error::other(message));
-                        }
-                    }
+            }
+        }
 
         // let mut del_fvers = Vec::with_capacity(objects.len());
 
@@ -5225,7 +5225,7 @@ impl StorageAPI for SetDisks {
                     let mut errs = Vec::with_capacity(vers.len());
                     for _ in 0..vers.len() {
                         errs.push(Some(DiskError::DiskNotFound));
-                }
+                    }
                     errs
                 }
             });
@@ -5242,8 +5242,8 @@ impl StorageAPI for SetDisks {
                 if errors[idx].is_some() {
                     for fi in vers[idx].versions.iter() {
                         del_obj_errs[disk_idx][fi.idx] = errors[idx].clone();
-            }
-        }
+                    }
+                }
             }
         }
 
@@ -5253,7 +5253,7 @@ impl StorageAPI for SetDisks {
             for disk_idx in 0..disks.len() {
                 if del_obj_errs[disk_idx][obj_idx].is_some() {
                     disk_err[disk_idx] = del_obj_errs[disk_idx][obj_idx].clone();
-    }
+                }
             }
 
             let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, disks.len() / 2 + 1);
@@ -5453,14 +5453,14 @@ impl StorageAPI for SetDisks {
 
         if opts.skip_free_version {
             dfi.set_skip_tier_free_version();
-                }
+        }
 
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended))
-                    }
+    }
 
     #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
@@ -6830,12 +6830,12 @@ impl StorageAPI for SetDisks {
             if skip_lock {
                 None
             } else {
-            Some(
-                self.fast_lock_manager
+                Some(
+                    self.fast_lock_manager
                         .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                    .await
+                        .await
                         .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
-            )
+                )
             }
         } else {
             None
