@@ -247,7 +247,7 @@ async fn create_test_tier(server: u32) {
         name: "COLDTIER44".to_string(),
         s3: None,
         rustfs: None,
-        minio: if server==1 {
+        minio: if server == 1 {
             Some(TierMinIO {
                 access_key: "minioadmin".to_string(),
                 secret_key: "minioadmin".to_string(),
@@ -256,7 +256,7 @@ async fn create_test_tier(server: u32) {
                 prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
                 region: "".to_string(),
                 ..Default::default()
-            }) 
+            })
         } else {
             Some(TierMinIO {
                 access_key: "minioadmin".to_string(),

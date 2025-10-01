@@ -859,9 +859,9 @@ impl FileMeta {
             err = self.add_version_filemata(ventry).err();
         }
 
-        //if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
+        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
             return Ok(None);
-        //}
+        }
 
         if let Some(e) = err {
             return Err(e);
@@ -1762,18 +1762,38 @@ impl MetaObject {
             ..Default::default()
         };
 
-        fi.transition_tier = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}")) {
+        fi.transition_tier = if let Some(elm) = self
+            .meta_sys
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"))
+        {
             String::from_utf8(elm.clone()).unwrap()
-        } else { "".to_string() };
-        fi.transitioned_objname = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}")) {
+        } else {
+            "".to_string()
+        };
+        fi.transitioned_objname = if let Some(elm) = self
+            .meta_sys
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"))
+        {
             String::from_utf8(elm.clone()).unwrap()
-        } else { "".to_string() };
-        fi.transition_version_id = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}")) {
+        } else {
+            "".to_string()
+        };
+        fi.transition_version_id = if let Some(elm) = self
+            .meta_sys
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"))
+        {
             Some(Uuid::from_slice(elm).unwrap())
-        } else { None };
-        fi.transition_status = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}")) {
+        } else {
+            None
+        };
+        fi.transition_status = if let Some(elm) = self
+            .meta_sys
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
+        {
             String::from_utf8(elm.clone()).unwrap()
-        } else { "".to_string() };
+        } else {
+            "".to_string()
+        };
 
         fi
     }
@@ -1970,18 +1990,38 @@ impl MetaDeleteMarker {
 
         if self.free_version() {
             fi.set_tier_free_version();
-            fi.transition_tier = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}")) {
+            fi.transition_tier = if let Some(elm) = self
+                .meta_sys
+                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"))
+            {
                 String::from_utf8(elm.clone()).unwrap()
-            } else { "".to_string() };
-            fi.transitioned_objname = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}")) {
+            } else {
+                "".to_string()
+            };
+            fi.transitioned_objname = if let Some(elm) = self
+                .meta_sys
+                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"))
+            {
                 String::from_utf8(elm.clone()).unwrap()
-            } else { "".to_string() };
-            fi.transition_version_id = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}")) {
+            } else {
+                "".to_string()
+            };
+            fi.transition_version_id = if let Some(elm) = self
+                .meta_sys
+                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"))
+            {
                 Some(Uuid::from_slice(elm).unwrap())
-            } else { None };
-            fi.transition_status = if let Some(elm) = self.meta_sys.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}")) {
+            } else {
+                None
+            };
+            fi.transition_status = if let Some(elm) = self
+                .meta_sys
+                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
+            {
                 String::from_utf8(elm.clone()).unwrap()
-            } else { "".to_string() }; //???
+            } else {
+                "".to_string()
+            }; //???
         }
 
         fi

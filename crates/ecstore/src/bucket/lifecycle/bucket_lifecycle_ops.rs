@@ -523,13 +523,6 @@ impl TransitionState {
                                     task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(), err.to_string());
                             }
                         } else {
-                            //debug
-                            if let Ok(oi) = api.get_object_info(&task.obj_info.bucket, &task.obj_info.name, &ObjectOptions::default()).await {
-                                debug!("check oi: {:?}", oi);
-                            } else {
-                                debug!("check object_is_transitioned is error");
-                            }
-
                             let mut ts = TierStats {
                                 total_size: task.obj_info.size as u64,
                                 num_versions: 1,
