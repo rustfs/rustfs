@@ -20,7 +20,6 @@ use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     StoreError, Target, TargetError,
     store::{Key, Store},
-    target,
     target::EntityTarget,
 };
 use std::sync::Arc;
