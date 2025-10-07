@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(error.to_string(), "secret key length is too short");
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
     struct Claims {
         sub: String,
         company: String,
