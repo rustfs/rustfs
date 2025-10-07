@@ -17,9 +17,11 @@ use crate::AuditRegistry;
 use crate::observability;
 use crate::{AuditError, AuditResult};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::store::{Key, Store};
-use rustfs_targets::target::EntityTarget;
-use rustfs_targets::{StoreError, Target, TargetError};
+use rustfs_targets::{
+    StoreError, Target, TargetError,
+    store::{Key, Store},
+    target::EntityTarget,
+};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -257,7 +259,7 @@ impl AuditSystem {
                 let target_id_clone = target_id.clone();
 
                 // Create EntityTarget for the audit log entry
-                let entity_target = rustfs_targets::target::EntityTarget {
+                let entity_target = EntityTarget {
                     object_name: entry.api.name.clone().unwrap_or_default(),
                     bucket_name: entry.api.bucket.clone().unwrap_or_default(),
                     event_name: rustfs_targets::EventName::ObjectCreatedPut, // Default, should be derived from entry
@@ -337,7 +339,7 @@ impl AuditSystem {
                     let mut success_count = 0;
                     let mut errors = Vec::new();
                     for entry in entries_clone {
-                        let entity_target = rustfs_targets::target::EntityTarget {
+                        let entity_target = EntityTarget {
                             object_name: entry.api.name.clone().unwrap_or_default(),
                             bucket_name: entry.api.bucket.clone().unwrap_or_default(),
                             event_name: rustfs_targets::EventName::ObjectCreatedPut,

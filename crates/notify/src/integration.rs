@@ -15,13 +15,13 @@
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
+use hashbrown::HashMap;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
 use rustfs_targets::target::EntityTarget;
 use rustfs_targets::{StoreError, Target};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
