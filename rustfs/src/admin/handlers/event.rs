@@ -190,6 +190,11 @@ impl Operation for NotificationTarget {
             if kv.key == "endpoint" {
                 endpoint_val = Some(kv.value.clone());
             }
+
+            if target_type == NOTIFY_MQTT_SUB_SYS && kv.key == rustfs_config::MQTT_BROKER {
+                endpoint_val = Some(kv.value.clone());
+            }
+
             if kv.key == "queue_dir" {
                 queue_dir_val = Some(kv.value.clone());
             }
