@@ -4422,9 +4422,9 @@ checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
 
 [[package]]
 name = "memchr"
-version = "2.7.5"
+version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
+checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "memmap2"
@@ -4665,15 +4665,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4a28e057d01f97e61255210fcff094d74ed0466038633e95017f5beb68e4399"
 dependencies = [
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "nugine-rust-utils"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04dcd9cfa92246a9c7ca0671e00733c4e9d77ee1fa0ae08c9a181b7c8802aea2"
-dependencies = [
- "simdutf8",
 ]
 
 [[package]]
@@ -7056,9 +7047,9 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3s"
-version = "0.12.0-rc.1"
+version = "0.12.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c7ae94d88d3d0d4ab0cb3f8e106199832b2943609680b5d75b0d7f686f6be3"
+checksum = "6fbf35b8b229398629d8df8a0cb908a70a24da69f65911fe0461fba3f4e9dda5"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -7066,6 +7057,7 @@ dependencies = [
  "base64-simd",
  "bytes",
  "bytestring",
+ "cfg-if",
  "chrono",
  "const-str",
  "crc32c",
@@ -7084,7 +7076,6 @@ dependencies = [
  "memchr",
  "mime",
  "nom 7.1.3",
- "nugine-rust-utils",
  "numeric_cast",
  "pin-project-lite",
  "quick-xml 0.37.5",
