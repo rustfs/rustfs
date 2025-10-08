@@ -210,7 +210,7 @@ rustfs-rsc = "2025.506.1"
 rustls = { version = "0.23.32", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
-s3s = { version = "0.12.0-rc.1", features = ["minio"] }
+s3s = { version = "0.12.0-rc.2", features = ["minio"] }
 schemars = "1.0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
