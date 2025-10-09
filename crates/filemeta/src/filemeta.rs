@@ -19,8 +19,9 @@ use crate::{ReplicationStatusType, VersionPurgeStatusType};
 use byteorder::ByteOrder;
 use bytes::Bytes;
 use rustfs_utils::http::headers::{
-    self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX,
-    RESERVED_METADATA_PREFIX_LOWER, VERSION_PURGE_STATUS_KEY,
+    self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS,
+    AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+    VERSION_PURGE_STATUS_KEY,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -63,9 +64,6 @@ pub const TRANSITION_STATUS: &str = "transition-status";
 pub const TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const TRANSITION_TIER: &str = "transition-tier";
-
-const X_AMZ_RESTORE_EXPIRY_DAYS: &str = "X-Amz-Restore-Expiry-Days";
-const X_AMZ_RESTORE_REQUEST_DATE: &str = "X-Amz-Restore-Request-Date";
 
 // type ScanHeaderVersionFn = Box<dyn Fn(usize, &[u8], &[u8]) -> Result<()>>;
 
@@ -859,9 +857,9 @@ impl FileMeta {
             err = self.add_version_filemata(ventry).err();
         }
 
-        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
-            return Ok(None);
-        }
+        //if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
+        return Ok(None);
+        //}
 
         if let Some(e) = err {
             return Err(e);
@@ -1819,8 +1817,8 @@ impl MetaObject {
 
     pub fn remove_restore_hdrs(&mut self) {
         self.meta_user.remove(X_AMZ_RESTORE.as_str());
-        self.meta_user.remove(X_AMZ_RESTORE_EXPIRY_DAYS);
-        self.meta_user.remove(X_AMZ_RESTORE_REQUEST_DATE);
+        self.meta_user.remove(AMZ_RESTORE_EXPIRY_DAYS);
+        self.meta_user.remove(AMZ_RESTORE_REQUEST_DATE);
     }
 
     pub fn uses_data_dir(&self) -> bool {
