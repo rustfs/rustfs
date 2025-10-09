@@ -2312,7 +2312,11 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 
     let size = oi1.get_actual_size().unwrap_or_default();
 
-    if oi1.etag != oi2.e_tag
+    // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
+    let oi1_etag = oi1.etag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
+    let oi2_etag = oi2.e_tag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
+
+    if oi1_etag != oi2_etag
         || oi1.version_id.map(|v| v.to_string()) != oi2.version_id
         || size != oi2.content_length.unwrap_or_default()
         || oi1.delete_marker != oi2.delete_marker.unwrap_or_default()
