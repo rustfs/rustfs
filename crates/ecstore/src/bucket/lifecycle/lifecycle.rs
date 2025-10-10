@@ -20,7 +20,7 @@
 
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
-    ObjectLockConfiguration, ObjectLockEnabled, Transition,
+    ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
 };
 use std::cmp::Ordering;
 use std::env;
@@ -31,8 +31,6 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::info;
 
 use crate::bucket::lifecycle::rule::TransitionOps;
-
-use super::bucket_lifecycle_ops::RestoreObjectRequest;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
@@ -702,7 +700,7 @@ pub struct TransitionOptions {
     pub status: String,
     pub tier: String,
     pub etag: String,
-    pub restore_request: RestoreObjectRequest,
+    pub restore_request: RestoreRequest,
     pub restore_expiry: OffsetDateTime,
     pub expire_restored: bool,
 }

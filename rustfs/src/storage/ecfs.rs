@@ -60,8 +60,8 @@ use rustfs_s3select_query::get_global_db;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::StreamExt;
 use http::HeaderMap;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{RestoreRequestOps, validate_transition_tier, post_restore_opts};
+use rustfs_ecstore::bucket::lifecycle::lifecycle::{self, Lifecycle, TransitionOptions};
 use rustfs_ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use rustfs_ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
 use rustfs_ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
@@ -93,7 +93,7 @@ use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_ecstore::store_api::ObjectToDelete;
 use rustfs_ecstore::store_api::PutObjReader;
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_filemeta::fileinfo::ObjectPartInfo;
+use rustfs_filemeta::fileinfo::{ObjectPartInfo, RestoreStatusOps};
 use rustfs_kms::DataKey;
 use rustfs_kms::service_manager::get_global_encryption_service;
 use rustfs_kms::types::{EncryptionMetadata, ObjectEncryptionContext};
@@ -112,8 +112,8 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
-use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::is_dir_object;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
@@ -122,8 +122,10 @@ use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::dto::*;
+use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::s3_error;
 use s3s::{S3Request, S3Response};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::Path;
@@ -785,118 +787,179 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    async fn restore_object(&self, _req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
-        Err(s3_error!(NotImplemented, "RestoreObject is not implemented yet"))
-        /*
-        let bucket = params.bucket;
-        if let Err(e) = un_escape_path(params.object) {
+    async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        let RestoreObjectInput {
+            bucket,
+            key: object,
+            restore_request: rreq,
+            version_id,
+            ..
+        } = req.input.clone();
+        let rreq = rreq.unwrap();
+
+        /*if let Err(e) = un_escape_path(object) {
             warn!("post restore object failed, e: {:?}", e);
             return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
-        }
+        }*/
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if Err(err) = check_request_auth_type(req, policy::RestoreObjectAction, bucket, object) {
+        /*if Err(err) = check_request_auth_type(req, policy::RestoreObjectAction, bucket, object) {
             return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
-        }
+        }*/
 
-        if req.content_length <= 0 {
+        /*if req.content_length <= 0 {
             return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
-        }
-        let Some(opts) = post_restore_opts(req, bucket, object) else {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        }*/
+        let Ok(opts) = post_restore_opts(&version_id.unwrap(), &bucket, &object).await else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         };
 
-        let Some(obj_info) = store.get_object_info(bucket, object, opts) else {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        let Ok(mut obj_info) = store.get_object_info(&bucket, &object, &opts).await else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         };
 
         if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         }
 
-        let mut api_err;
-        let Some(rreq) = parse_restore_request(req.body(), req.content_length) else {
-            let api_err = errorCodes.ToAPIErr(ErrMalformedXML);
-            api_err.description = err.Error()
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
-        };
+        //let mut api_err;
         let mut status_code = http::StatusCode::OK;
         let mut already_restored = false;
-        if Err(err) = rreq.validate(store) {
-            api_err = errorCodes.ToAPIErr(ErrMalformedXML)
-            api_err.description = err.Error()
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        if let Err(err) = rreq.validate(store.clone()) {
+            //api_err = to_api_err(ErrMalformedXML);
+            //api_err.description = err.to_string();
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         } else {
-            if obj_info.restore_ongoing && rreq.Type != "SELECT" {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()), "post restore object failed"));
+            if obj_info.restore_ongoing && (rreq.type_.is_none() || rreq.type_.as_ref().unwrap().as_str() != "SELECT") {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()),
+                    "post restore object failed",
+                ));
             }
-            if !obj_info.restore_ongoing && !obj_info.restore_expires.unix_timestamp() == 0 {
-                status_code = http::StatusCode::Accepted;
+            if !obj_info.restore_ongoing && obj_info.restore_expires.unwrap().unix_timestamp() != 0 {
+                status_code = http::StatusCode::ACCEPTED;
                 already_restored = true;
             }
         }
-        let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days);
-        let mut metadata = clone_mss(obj_info.user_defined);
+        let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap());
+        let mut metadata = obj_info.user_defined.clone();
 
-        if rreq.type != "SELECT" {
-            obj_info.metadataOnly = true;
-            metadata[xhttp.AmzRestoreExpiryDays] = rreq.days;
-            metadata[xhttp.AmzRestoreRequestDate] = OffsetDateTime::now_utc().format(http::TimeFormat);
+        let mut header = HeaderMap::new();
+
+        let obj_info_ = obj_info.clone();
+        if rreq.type_.is_none() || rreq.type_.as_ref().unwrap().as_str() != "SELECT" {
+            obj_info.metadata_only = true;
+            metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap().to_string());
+            metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), OffsetDateTime::now_utc().format(&Rfc3339).unwrap());
             if already_restored {
-                metadata[AmzRestore] = completed_restore_obj(restore_expiry).String()
+                metadata.insert(
+                    X_AMZ_RESTORE.as_str().to_string(),
+                    RestoreStatus {
+                        is_restore_in_progress: Some(false),
+                        restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+                    }
+                    .to_string(),
+                );
             } else {
-                metadata[AmzRestore] = ongoing_restore_obj().to_string()
+                metadata.insert(
+                    X_AMZ_RESTORE.as_str().to_string(),
+                    RestoreStatus {
+                        is_restore_in_progress: Some(true),
+                        restore_expiry_date: Some(Timestamp::from(OffsetDateTime::now_utc())),
+                    }
+                    .to_string(),
+                );
             }
             obj_info.user_defined = metadata;
-            if let Err(err) = store.copy_object(bucket, object, bucket, object, obj_info, ObjectOptions {
-                version_id: obj_info.version_id,
-            }, ObjectOptions {
-                version_id: obj_info.version_id,
-                m_time:     obj_info.mod_time,
-            }) {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
+            if let Err(err) = store.clone()
+                .copy_object(
+                    &bucket,
+                    &object,
+                    &bucket,
+                    &object,
+                    &mut obj_info,
+                    &ObjectOptions {
+                        version_id: obj_info_.version_id.clone().map(|e| e.to_string()),
+                        ..Default::default()
+                    },
+                    &ObjectOptions {
+                        version_id: obj_info_.version_id.clone().map(|e| e.to_string()),
+                        mod_time: obj_info_.mod_time.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrInvalidObjectState".into()),
+                    "post restore object failed",
+                ));
             }
             if already_restored {
-                return Ok(());
+                let output = RestoreObjectOutput {
+                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+                    restore_output_path: None,
+                };
+                return Ok(S3Response::new(output));
             }
         }
 
-        let restore_object = must_get_uuid();
-        if rreq.output_location.s3.bucket_name != "" {
-            w.Header()[AmzRestoreOutputPath] = []string{pathJoin(rreq.OutputLocation.S3.BucketName, rreq.OutputLocation.S3.Prefix, restore_object)}
+        let restore_object = Uuid::new_v4().to_string();
+        //if let Some(rreq) = rreq {
+        if let Some(output_location) = &rreq.output_location {
+            if let Some(s3) = &output_location.s3 {
+                if s3.bucket_name != "" {
+                    header.insert(
+                        X_AMZ_RESTORE_OUTPUT_PATH,
+                        format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse().unwrap(),
+                    );
+                }
+            }
         }
-        w.WriteHeader(status_code)
-        send_event(EventArgs {
+        //}
+        /*send_event(EventArgs {
             event_name:  event::ObjectRestorePost,
             bucket_name: bucket,
             object:      obj_info,
             req_params:  extract_req_params(r),
             user_agent:  req.user_agent(),
             host:        handlers::get_source_ip(r),
-        });
+        });*/
         tokio::spawn(async move {
-            if !rreq.SelectParameters.IsEmpty() {
-                let actual_size = obj_info.get_actual_size();
+            /*if rreq.select_parameters.is_some() {
+                let actual_size = obj_info_.get_actual_size();
                 if actual_size.is_err() {
                     return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
                 }
 
-                let object_rsc = s3select.NewObjectReadSeekCloser(
-                    |offset int64| -> (io.ReadCloser, error) {
+                let object_rsc = s3select.new_object_read_seek_closer(
+                    |offset: i64| -> (ReadCloser, error) {
                         rs := &HTTPRangeSpec{
                           IsSuffixLength: false,
                           Start:          offset,
                           End:            -1,
                         }
-                        return getTransitionedObjectReader(bucket, object, rs, r.Header,
-                          obj_info, ObjectOptions {version_id: obj_info.version_id});
+                        return get_transitioned_object_reader(bucket, object, rs, r.Header,
+                            obj_info, ObjectOptions {version_id: obj_info_.version_id});
                     },
                     actual_size.unwrap(),
                 );
-                if err = rreq.SelectParameters.Open(objectRSC); err != nil {
+                if err = rreq.select_parameters.open(object_rsc); err != nil {
                     if serr, ok := err.(s3select.SelectError); ok {
                         let encoded_error_response = encodeResponse(APIErrorResponse {
                             code:       serr.ErrorCode(),
@@ -921,29 +984,45 @@ impl S3 for FS {
                 rreq.select_parameters.evaluate(rw);
                 rreq.select_parameters.Close();
                 return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
-            }
+            }*/
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq,
-                    restore_expiry:  restore_expiry,
+                    restore_expiry: restore_expiry,
+                    ..Default::default()
                 },
-                version_id: objInfo.version_id,
-            }
-            if Err(err) = store.restore_transitioned_object(bucket, object, opts) {
-                format!(format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string()));
-                return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
+                version_id: obj_info_.version_id.map(|e| e.to_string()),
+                ..Default::default()
+            };
+            if let Err(err) = store.clone().restore_transitioned_object(&bucket, &object, &opts).await {
+                warn!("unable to restore transitioned bucket/object {}/{}: {}",
+                    bucket,
+                    object,
+                    err.to_string()
+                );
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
+                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string()),
+                ));
             }
 
-            send_event(EventArgs {
+            /*send_event(EventArgs {
                 EventName:  event.ObjectRestoreCompleted,
                 BucketName: bucket,
                 Object:     objInfo,
                 ReqParams:  extractReqParams(r),
                 UserAgent:  r.UserAgent(),
                 Host:       handlers.GetSourceIP(r),
-            });
+            });*/
+            Ok(())
         });
-        */
+
+        let output = RestoreObjectOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+            restore_output_path: None,
+        };
+
+        return Ok(S3Response::with_headers(output, header));
     }
 
     /// Delete a bucket

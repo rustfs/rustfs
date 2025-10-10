@@ -20,6 +20,7 @@ use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
 use s3s::header::X_AMZ_RESTORE;
+use s3s::dto::{RestoreStatus, Timestamp};
 use serde::Deserialize;
 use serde::Serialize;
 use std::{collections::HashMap, fmt::Display};
@@ -631,42 +632,26 @@ pub struct FilesInfo {
     pub is_truncated: bool,
 }
 
-pub struct RestoreObjStatus {
-    pub on_going: bool,
-    pub expiry: OffsetDateTime,
+pub trait RestoreStatusOps {
+    fn expiry(&self) -> Option<OffsetDateTime>;
+    fn on_going(&self) -> bool;
+    fn on_disk(&self) -> bool;
+    fn to_string(&self) -> String;
 }
 
-impl Default for RestoreObjStatus {
-    fn default() -> Self {
-        Self {
-            on_going: false,
-            expiry: OffsetDateTime::now_utc(),
-        }
-    }
-}
-
-impl Display for RestoreObjStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.on_going() {
-            return f.write_str("ongoing-request=\"true\"");
-        }
-        f.write_fmt(format_args!(
-            "ongoing-request=\"false\", expiry-date=\"{}\"",
-            self.expiry.format(&Rfc3339).unwrap()
-        ))
-    }
-}
-
-impl RestoreObjStatus {
+impl RestoreStatusOps for RestoreStatus {
     fn expiry(&self) -> Option<OffsetDateTime> {
         if self.on_going() {
             return None;
         }
-        Some(self.expiry)
+        self.restore_expiry_date.clone().map(|e| OffsetDateTime::from(e))
     }
 
     fn on_going(&self) -> bool {
-        self.on_going
+        if let Some(on_going) = self.is_restore_in_progress {
+            return on_going;
+        }
+        false
     }
 
     fn on_disk(&self) -> bool {
@@ -678,9 +663,16 @@ impl RestoreObjStatus {
         }
         false
     }
+
+    fn to_string(&self) -> String {
+        if self.on_going() {
+            return "ongoing-request=\"true\"".to_string();
+        }
+        format!("ongoing-request=\"false\", expiry-date=\"{}\"", OffsetDateTime::from(self.restore_expiry_date.clone().unwrap()).format(&Rfc3339).unwrap())
+    }
 }
 
-fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreObjStatus> {
+fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
     if progress_tokens.len() != 2 {
@@ -693,8 +685,8 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreObjStatus> {
     match progress_tokens[1] {
         "true" | "\"true\"" => {
             if tokens.len() == 1 {
-                return Ok(RestoreObjStatus {
-                    on_going: true,
+                return Ok(RestoreStatus {
+                    is_restore_in_progress: Some(true),
                     ..Default::default()
                 });
             }
@@ -714,9 +706,9 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreObjStatus> {
             /*if err != nil {
                 return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
             }*/
-            return Ok(RestoreObjStatus {
-                on_going: false,
-                expiry: expiry,
+            return Ok(RestoreStatus {
+                is_restore_in_progress: Some(false),
+                restore_expiry_date: Some(Timestamp::from(expiry)),
             });
         }
         _ => (),
