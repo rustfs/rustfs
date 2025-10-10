@@ -44,13 +44,6 @@ impl PatternRules {
 
     /// Returns all TargetIDs that match the object name.
     pub fn match_targets(&self, object_name: &str) -> TargetIdSet {
-        // let mut matched_targets = TargetIdSet::new();
-        // for (pattern_str, target_set) in &self.rules {
-        //     if pattern::match_simple(pattern_str, object_name) {
-        //         matched_targets.extend(target_set.iter().cloned());
-        //     }
-        // }
-        // matched_targets
         self.rules
             .par_iter()
             .filter_map(|(pattern_str, target_set)| {
