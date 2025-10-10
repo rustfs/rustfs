@@ -44,6 +44,20 @@ impl InlineData {
         if self.0.is_empty() { &self.0 } else { &self.0[1..] }
     }
 
+    pub fn entries(&self) -> Result<usize> {
+        if self.0.is_empty() || !self.version_ok() {
+            return Ok(0);
+        }
+
+        let buf = self.after_version();
+
+        let mut cur = Cursor::new(buf);
+
+        let fields_len = rmp::decode::read_map_len(&mut cur)?;
+
+        Ok(fields_len as usize)
+    }
+
     pub fn find(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if self.0.is_empty() || !self.version_ok() {
             return Ok(None);
