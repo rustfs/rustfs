@@ -502,12 +502,15 @@ impl SetDisks {
             let disk = disk.clone();
             tokio::spawn(async move {
                 if let Some(disk) = disk {
+                    // Use DeleteOptions with immediate=true to avoid parent directory cleanup
+                    // This ensures xl.meta and parent directories are not touched
                     (disk
                         .delete(
                             &bucket,
                             &file_path,
                             DeleteOptions {
                                 recursive: true,
+                                immediate: true,  // Skip parent directory cleanup
                                 ..Default::default()
                             },
                         )
@@ -6511,6 +6514,20 @@ impl StorageAPI for SetDisks {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        // Acquire exclusive write lock to prevent concurrent GetObject operations
+        // This ensures that no readers can access the object while we are completing
+        // the multipart upload, updating xl.meta, and cleaning up old data_dir
+        let _write_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+            )
+        } else {
+            None
+        };
+
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
@@ -6521,20 +6538,8 @@ impl StorageAPI for SetDisks {
         let disks = disks.clone();
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
-        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
+        // Check preconditions if present
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            // if !opts.no_lock {
-            //     let guard_opt = self
-            //         .namespace_lock
-            //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-            //         .await?;
-
-            //     if guard_opt.is_none() {
-            //         return Err(Error::other("can not get lock. please retry".to_string()));
-            //     }
-            //     _object_lock_guard = guard_opt;
-            // }
-
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
             }
@@ -6747,22 +6752,42 @@ impl StorageAPI for SetDisks {
 
         // debug!("complete fileinfo {:?}", &fi);
 
-        // TODO: reduce_common_data_dir
+        // Clean up old data_dir directly on all disks
+        // After rename_data succeeds, we need to remove the old data_dir physical directories
+        // This must be done synchronously to prevent orphaned directories appearing as objects
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
-                .await?;
-        }
-        if let Some(versions) = versions {
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    bucket.to_string(),
-                    Some(object.to_string()),
-                    false,
-                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
-                    Some(self.pool_index),
-                    Some(self.set_index),
-                ))
-                .await;
+            let current_data_dir = fi.data_dir.map(|d| d.to_string()).unwrap_or_default();
+            if old_dir.to_string() != current_data_dir {
+                info!(
+                    "Cleaning up old data_dir {} for {}/{}",
+                    old_dir, bucket, object
+                );
+
+                // Construct path to old data_dir: object/old_uuid/
+                let old_data_path = format!("{}/{}", object, old_dir);
+
+                // Delete old data_dir on all disks
+                for op_disk in online_disks.iter() {
+                    if let Some(disk) = op_disk {
+                        if disk.is_online().await {
+                            // Delete the old data_dir directory recursively
+                            // Ignore errors as some disks may not have the old data_dir
+                            let delete_opts = DeleteOptions {
+                                recursive: true,
+                                immediate: false,
+                                undo_write: false,
+                                old_data_dir: None,
+                            };
+                            let _ = disk.delete(bucket, &old_data_path, delete_opts).await;
+                        }
+                    }
+                }
+            } else {
+                warn!(
+                    "Skipping cleanup: old_data_dir ({}) equals current data_dir ({})",
+                    old_dir, current_data_dir
+                );
+            }
         }
 
         let upload_id_path = upload_id_path.clone();

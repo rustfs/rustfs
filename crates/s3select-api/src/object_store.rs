@@ -248,17 +248,88 @@ where
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
         pin_mut!(stream);
         let mut remaining: usize = content_length;
-        while let Some(result) = stream.next().await {
-            let mut bytes = result.map_err(|e| o_Error::Generic {
-                store: "",
-                source: Box::new(e),
-            })?;
-            if bytes.len() > remaining {
-                bytes.truncate(remaining);
+        let mut total_read: usize = 0;
+        
+        tracing::debug!(
+            content_length,
+            "bytes_stream: starting to read from upstream"
+        );
+        
+        while remaining > 0 {
+            match stream.next().await {
+                Some(Ok(mut bytes)) => {
+                    // Truncate if we received more than needed
+                    if bytes.len() > remaining {
+                        tracing::warn!(
+                            received = bytes.len(),
+                            remaining,
+                            "bytes_stream: received more data than expected, truncating"
+                        );
+                        bytes.truncate(remaining);
+                    }
+                    
+                    let bytes_len = bytes.len();
+                    remaining -= bytes_len;
+                    total_read += bytes_len;
+                    
+                    tracing::trace!(
+                        chunk_size = bytes_len,
+                        total_read,
+                        remaining,
+                        "bytes_stream: yielding chunk"
+                    );
+                    
+                    y.yield_ok(bytes).await;
+                    
+                    // If we've read exactly what we need, break immediately
+                    if remaining == 0 {
+                        tracing::debug!(
+                            total_read,
+                            content_length,
+                            "bytes_stream: completed reading exact content_length"
+                        );
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::error!(
+                        error = ?e,
+                        total_read,
+                        remaining,
+                        content_length,
+                        "bytes_stream: upstream read error"
+                    );
+                    return Err(o_Error::Generic {
+                        store: "",
+                        source: Box::new(e),
+                    });
+                }
+                None => {
+                    // Stream ended prematurely
+                    tracing::error!(
+                        total_read,
+                        remaining,
+                        content_length,
+                        "bytes_stream: upstream stream ended prematurely (EOF before content_length satisfied)"
+                    );
+                    return Err(o_Error::Generic {
+                        store: "bytes_stream",
+                        source: format!(
+                            "Stream ended prematurely: read {} bytes, expected {} bytes, {} bytes short",
+                            total_read,
+                            content_length,
+                            remaining
+                        ).into(),
+                    });
+                }
             }
-            remaining -= bytes.len();
-            y.yield_ok(bytes).await;
         }
+        
+        tracing::debug!(
+            total_read,
+            content_length,
+            "bytes_stream: successfully completed"
+        );
         Ok(())
     })
 }

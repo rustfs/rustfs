@@ -20,7 +20,9 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=info"
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=info",
+                "RUSTFS_OBS_USE_STDOUT": "true",
+                "environment": "test"
             },
             "args": [
                 "--access-key",
