@@ -388,23 +388,11 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         complete_multipart_response.ssekms_key_id()
     );
 
-    // Verify: complete_multipart_upload response should contain encryption information
-    // KNOWN BUG: s3s library bug where CompleteMultipartUploadOutput encryption fields serialize as None
-    // even when properly set. Our server implementation is correct (see server logs above).
-    // TODO: Remove this workaround when s3s library is fixed
-    warn!("KNOWN BUG: s3s library - complete_multipart_upload response encryption fields return None even when set");
-
-    if complete_multipart_response.server_side_encryption().is_some() {
-        // If s3s library is fixed, verify the encryption info
-        assert_eq!(
-            complete_multipart_response.server_side_encryption(),
-            Some(&ServerSideEncryption::AwsKms),
-            "complete_multipart_upload response should contain SSE-KMS encryption information"
-        );
-    } else {
-        // Expected behavior due to s3s library bug - log and continue
-        warn!("Skipping assertion due to known s3s library bug - server logs confirm correct encryption handling");
-    }
+    assert_eq!(
+        complete_multipart_response.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms),
+        "complete_multipart_upload response should contain SSE-KMS encryption information"
+    );
 
     // Step 4: Download file and verify encryption status
     info!("Downloading file and verifying encryption status");

@@ -76,6 +76,7 @@ use rustfs_ecstore::bucket::tagging::decode_tags;
 use rustfs_ecstore::bucket::tagging::encode_tags;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::client::object_api_utils::format_etag;
 use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::StorageError;
@@ -460,7 +461,7 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
-                let e_tag = _obj_info.clone().etag;
+                let e_tag = _obj_info.etag.clone().map(|etag| format_etag(&etag));
 
                 // // store.put_object(bucket, object, data, opts);
 
@@ -748,7 +749,7 @@ impl S3 for FS {
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag,
+            e_tag: oi.etag.map(|etag| format_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             ..Default::default()
         };
@@ -1693,7 +1694,7 @@ impl S3 for FS {
             content_type,
             accept_ranges: Some("bytes".to_string()),
             content_range,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             metadata: Some(info.user_defined),
             server_side_encryption,
             sse_customer_algorithm,
@@ -1827,7 +1828,7 @@ impl S3 for FS {
             content_length: Some(content_length),
             content_type,
             last_modified,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             metadata: Some(metadata),
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
@@ -1978,7 +1979,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| format_etag(&etag)),
                     ..Default::default()
                 };
 
@@ -2057,7 +2058,7 @@ impl S3 for FS {
                     size: Some(v.size),
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| format_etag(&etag)),
                     ..Default::default() // TODO: another fields
                 }
             })
@@ -2311,9 +2312,91 @@ impl S3 for FS {
         let mt = metadata.clone();
         let mt2 = metadata.clone();
 
+        let append_flag = req.headers.get("x-amz-object-append");
+        let append_action_header = req.headers.get("x-amz-append-action");
+        let mut append_requested = false;
+        let mut append_position: Option<i64> = None;
+        if let Some(flag_value) = append_flag {
+            let flag_str = flag_value.to_str().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-object-append header".to_string())
+            })?;
+            if flag_str.eq_ignore_ascii_case("true") {
+                append_requested = true;
+                let position_value = req.headers.get("x-amz-append-position").ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-position header required when x-amz-object-append is true".to_string(),
+                    )
+                })?;
+                let position_str = position_value.to_str().map_err(|_| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-append-position header".to_string())
+                })?;
+                let position = position_str.parse::<i64>().map_err(|_| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-position must be a non-negative integer".to_string(),
+                    )
+                })?;
+                if position < 0 {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-position must be a non-negative integer".to_string(),
+                    ));
+                }
+                append_position = Some(position);
+            } else if !flag_str.eq_ignore_ascii_case("false") {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "x-amz-object-append must be 'true' or 'false'".to_string(),
+                ));
+            }
+        }
+
+        let mut append_action: Option<String> = None;
+        if let Some(action_value) = append_action_header {
+            let action_str = action_value.to_str().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-append-action header".to_string())
+            })?;
+            append_action = Some(action_str.to_ascii_lowercase());
+        }
+
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, mt)
             .await
             .map_err(ApiError::from)?;
+
+        if append_requested {
+            opts.append_object = true;
+            opts.append_position = append_position;
+        }
+
+        if let Some(action) = append_action {
+            if append_requested {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "x-amz-object-append cannot be combined with x-amz-append-action".to_string(),
+                ));
+            }
+
+            let obj_info = match action.as_str() {
+                "complete" => store.complete_append(&bucket, &key, &opts).await,
+                "abort" => store.abort_append(&bucket, &key, &opts).await,
+                _ => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "x-amz-append-action must be 'complete' or 'abort'".to_string(),
+                    ));
+                }
+            }
+            .map_err(ApiError::from)?;
+
+            let output = PutObjectOutput {
+                e_tag: obj_info.etag.clone(),
+                version_id: obj_info.version_id.map(|v| v.to_string()),
+                ..Default::default()
+            };
+
+            return Ok(S3Response::new(output));
+        }
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -2334,7 +2417,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
         let event_info = obj_info.clone();
-        let e_tag = obj_info.etag.clone();
+        let e_tag = obj_info.etag.clone().map(|etag| format_etag(&etag));
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
@@ -2697,7 +2780,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let output = UploadPartOutput {
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| format_etag(&etag)),
             ..Default::default()
         };
 
@@ -2883,7 +2966,7 @@ impl S3 for FS {
 
         // Create response
         let copy_part_result = CopyPartResult {
-            e_tag: part_info.etag,
+            e_tag: part_info.etag.map(|etag| format_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
             ..Default::default()
         };
@@ -2936,7 +3019,7 @@ impl S3 for FS {
                 res.parts
                     .into_iter()
                     .map(|p| Part {
-                        e_tag: p.etag,
+                        e_tag: p.etag.map(|etag| format_etag(&etag)),
                         last_modified: p.last_mod.map(Timestamp::from),
                         part_number: Some(p.part_num as i32),
                         size: Some(p.size as i64),
@@ -3111,7 +3194,7 @@ impl S3 for FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
-            e_tag: obj_info.etag.clone(),
+            e_tag: obj_info.etag.clone().map(|etag| format_etag(&etag)),
             location: Some("us-east-1".to_string()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present

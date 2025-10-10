@@ -380,6 +380,9 @@ impl ObjectStore {
 
 #[async_trait::async_trait]
 impl Store for ObjectStore {
+    fn has_watcher(&self) -> bool {
+        false
+    }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         let mut data = read_config(self.object_api.clone(), path.as_ref()).await?;
 

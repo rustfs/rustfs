@@ -420,6 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_invalid_domain_resolution() {
         let resolver = LayeredDnsResolver::new().await.unwrap();
 

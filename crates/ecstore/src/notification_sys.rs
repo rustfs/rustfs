@@ -16,11 +16,17 @@ use crate::StorageAPI;
 use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
+use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rpc::PeerRestClient;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
 use lazy_static::lazy_static;
+use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService};
+use rustfs_madmin::metrics::RealtimeMetrics;
+use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 use tracing::{error, warn};
@@ -62,21 +68,122 @@ pub struct NotificationPeerErr {
 }
 
 impl NotificationSys {
-    pub fn rest_client_from_hash(&self, _s: &str) -> Option<PeerRestClient> {
-        None
-    }
-    pub async fn delete_policy(&self) -> Vec<NotificationPeerErr> {
-        unimplemented!()
-    }
-    pub async fn load_policy(&self) -> Vec<NotificationPeerErr> {
-        unimplemented!()
+    pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
+        if self.all_peer_clients.is_empty() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.all_peer_clients.len();
+        self.all_peer_clients[idx].clone()
     }
 
-    pub async fn load_policy_mapping(&self) -> Vec<NotificationPeerErr> {
-        unimplemented!()
+    pub async fn delete_policy(&self, policy_name: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let policy = policy_name.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.delete_policy(&policy).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
     }
-    pub async fn delete_user(&self) -> Vec<NotificationPeerErr> {
-        unimplemented!()
+
+    pub async fn load_policy(&self, policy_name: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let policy = policy_name.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_policy(&policy).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn load_policy_mapping(&self, user_or_group: &str, user_type: u64, is_group: bool) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let uog = user_or_group.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_policy_mapping(&uog, user_type, is_group).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn delete_user(&self, access_key: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let ak = access_key.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.delete_user(&ak).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
     }
 
     pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
@@ -137,6 +244,114 @@ impl NotificationSys {
             });
         }
 
+        join_all(futures).await
+    }
+
+    pub async fn load_user(&self, access_key: &str, temp: bool) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let ak = access_key.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_user(&ak, temp).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn load_group(&self, group: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let gname = group.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_group(&gname).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn delete_service_account(&self, access_key: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let ak = access_key.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.delete_service_account(&ak).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn load_service_account(&self, access_key: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let ak = access_key.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_service_account(&ak).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
         join_all(futures).await
     }
 
@@ -201,6 +416,281 @@ impl NotificationSys {
         warn!("notification stop_rebalance stop_rebalance start");
         let _ = store.stop_rebalance().await;
         warn!("notification stop_rebalance stop_rebalance done");
+    }
+
+    pub async fn load_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let b = bucket.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_bucket_metadata(&b).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn delete_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let b = bucket.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.delete_bucket_metadata(&b).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn start_profiling(&self, profiler: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let pf = profiler.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.start_profiling(&pf).await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_cpus(&self) -> Vec<Cpus> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_cpus().await.unwrap_or_default()
+                } else {
+                    Cpus::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_net_info(&self) -> Vec<NetInfo> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_net_info().await.unwrap_or_default()
+                } else {
+                    NetInfo::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_partitions(&self) -> Vec<Partitions> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_partitions().await.unwrap_or_default()
+                } else {
+                    Partitions::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_os_info(&self) -> Vec<OsInfo> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_os_info().await.unwrap_or_default()
+                } else {
+                    OsInfo::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_sys_services(&self) -> Vec<SysService> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_se_linux_info().await.unwrap_or_default()
+                } else {
+                    SysService::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_sys_config(&self) -> Vec<SysConfig> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_sys_config().await.unwrap_or_default()
+                } else {
+                    SysConfig::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_sys_errors(&self) -> Vec<SysErrors> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_sys_errors().await.unwrap_or_default()
+                } else {
+                    SysErrors::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_mem_info(&self) -> Vec<MemInfo> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_mem_info().await.unwrap_or_default()
+                } else {
+                    MemInfo::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_proc_info(&self) -> Vec<ProcInfo> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_proc_info().await.unwrap_or_default()
+                } else {
+                    ProcInfo::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn get_metrics(&self, t: MetricType, opts: &CollectMetricsOpts) -> Vec<RealtimeMetrics> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            let t_clone = t;
+            let opts_clone = opts;
+            futures.push(async move {
+                if let Some(client) = client {
+                    client.get_metrics(t_clone, opts_clone).await.unwrap_or_default()
+                } else {
+                    RealtimeMetrics::default()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.reload_site_replication_config().await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn load_transition_tier_config(&self) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.load_transition_tier_config().await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
     }
 }
 

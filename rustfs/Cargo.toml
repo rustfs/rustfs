@@ -117,6 +117,10 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
+futures-util.workspace = true
+rmp-serde.workspace = true
+flatbuffers.workspace = true
+rustfs-lock.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
