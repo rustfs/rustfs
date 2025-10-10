@@ -14,7 +14,7 @@
 
 /// Check if MQTT Broker is available
 /// # Arguments
-/// * `broker_url` -URL of MQTT Broker, for example `mqtt://localhost:1883
+/// * `broker_url` - URL of MQTT Broker, for example `mqtt://localhost:1883
 /// * `topic` - Topic for testing connections
 /// # Returns
 /// * `Ok(())` - If the connection is successful
@@ -22,7 +22,7 @@
 ///
 /// # Example
 /// ```rust,no_run
-///  tokio::main
+///  #[tokio::main]
 ///  async fn main() {
 ///     let result = check_mqtt_broker_available("mqtt://localhost:1883", "test/topic").await;
 ///     if result.is_ok() {
