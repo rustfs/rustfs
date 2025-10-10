@@ -249,12 +249,9 @@ where
         pin_mut!(stream);
         let mut remaining: usize = content_length;
         let mut total_read: usize = 0;
-        
-        tracing::debug!(
-            content_length,
-            "bytes_stream: starting to read from upstream"
-        );
-        
+
+        tracing::debug!(content_length, "bytes_stream: starting to read from upstream");
+
         while remaining > 0 {
             match stream.next().await {
                 Some(Ok(mut bytes)) => {
@@ -271,21 +268,12 @@ where
                     remaining -= bytes_len;
                     total_read += bytes_len;
 
-                    tracing::trace!(
-                        chunk_size = bytes_len,
-                        total_read,
-                        remaining,
-                        "bytes_stream: yielding chunk"
-                    );
+                    tracing::trace!(chunk_size = bytes_len, total_read, remaining, "bytes_stream: yielding chunk");
 
                     y.yield_ok(bytes).await;
 
                     if remaining == 0 {
-                        tracing::debug!(
-                            total_read,
-                            content_length,
-                            "bytes_stream: completed reading exact content_length"
-                        );
+                        tracing::debug!(total_read, content_length, "bytes_stream: completed reading exact content_length");
                         break;
                     }
                 }
@@ -313,20 +301,15 @@ where
                         store: "bytes_stream",
                         source: format!(
                             "Stream ended prematurely: read {} bytes, expected {} bytes, {} bytes short",
-                            total_read,
-                            content_length,
-                            remaining
-                        ).into(),
+                            total_read, content_length, remaining
+                        )
+                        .into(),
                     });
                 }
             }
         }
-        
-        tracing::debug!(
-            total_read,
-            content_length,
-            "bytes_stream: successfully completed"
-        );
+
+        tracing::debug!(total_read, content_length, "bytes_stream: successfully completed");
         Ok(())
     })
 }

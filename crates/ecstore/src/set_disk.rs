@@ -6746,24 +6746,19 @@ impl StorageAPI for SetDisks {
         if let Some(old_dir) = op_old_dir {
             let current_data_dir = fi.data_dir.map(|d| d.to_string()).unwrap_or_default();
             if old_dir.to_string() != current_data_dir {
-                info!(
-                    "Cleaning up old data_dir {} for {}/{}",
-                    old_dir, bucket, object
-                );
+                info!("Cleaning up old data_dir {} for {}/{}", old_dir, bucket, object);
 
                 let old_data_path = format!("{}/{}", object, old_dir);
 
-                for op_disk in online_disks.iter() {
-                    if let Some(disk) = op_disk {
-                        if disk.is_online().await {
-                            let delete_opts = DeleteOptions {
-                                recursive: true,
-                                immediate: false,
-                                undo_write: false,
-                                old_data_dir: None,
-                            };
-                            let _ = disk.delete(bucket, &old_data_path, delete_opts).await;
-                        }
+                for disk in online_disks.iter().flatten() {
+                    if disk.is_online().await {
+                        let delete_opts = DeleteOptions {
+                            recursive: true,
+                            immediate: false,
+                            undo_write: false,
+                            old_data_dir: None,
+                        };
+                        let _ = disk.delete(bucket, &old_data_path, delete_opts).await;
                     }
                 }
             } else {
