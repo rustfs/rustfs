@@ -153,9 +153,6 @@ where
         }
 
         let uri = format!("{}|{}", &req.method, req.uri.path());
-
-        tracing::warn!("get uri {}", &uri);
-
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
             let mut resp = op.call(req, mat.params).await?;

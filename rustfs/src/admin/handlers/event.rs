@@ -242,7 +242,7 @@ impl Operation for NotificationTarget {
             }
             // Check MQTT Broker availability
             if let Err(e) = check_mqtt_broker_available(&endpoint, &topic_val).await {
-                return Err(s3_error!(InvalidArgument, "MQTT Broker 不可用：{}", e));
+                return Err(s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e));
             }
 
             if let Some(queue_dir) = queue_dir_val {
