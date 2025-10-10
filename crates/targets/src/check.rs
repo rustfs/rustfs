@@ -24,7 +24,7 @@
 /// ```rust,no_run
 ///  #[tokio::main]
 ///  async fn main() {
-///     let result = check_mqtt_broker_available("mqtt://localhost:1883", "test/topic").await;
+///     let result = rustfs_targets::check_mqtt_broker_available("mqtt://localhost:1883", "test/topic").await;
 ///     if result.is_ok() {
 ///         println!("MQTT Broker is available");
 ///     } else {
