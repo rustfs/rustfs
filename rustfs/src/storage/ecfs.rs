@@ -60,7 +60,7 @@ use rustfs_s3select_query::get_global_db;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::StreamExt;
 use http::HeaderMap;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{RestoreRequestOps, validate_transition_tier, post_restore_opts};
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts, validate_transition_tier};
 use rustfs_ecstore::bucket::lifecycle::lifecycle::{self, Lifecycle, TransitionOptions};
 use rustfs_ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use rustfs_ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
@@ -886,7 +886,8 @@ impl S3 for FS {
                 );
             }
             obj_info.user_defined = metadata;
-            if let Err(err) = store.clone()
+            if let Err(err) = store
+                .clone()
                 .copy_object(
                     &bucket,
                     &object,
@@ -995,11 +996,7 @@ impl S3 for FS {
                 ..Default::default()
             };
             if let Err(err) = store.clone().restore_transitioned_object(&bucket, &object, &opts).await {
-                warn!("unable to restore transitioned bucket/object {}/{}: {}",
-                    bucket,
-                    object,
-                    err.to_string()
-                );
+                warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string());
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
                     format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string()),

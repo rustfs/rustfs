@@ -67,8 +67,8 @@ use crate::store_api::StorageAPI;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use s3s::dto::{
-    BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType,
-    ServerSideEncryption, RestoreStatus, Timestamp,
+    BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
+    ServerSideEncryption, Timestamp,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_STORAGE_CLASS};
 

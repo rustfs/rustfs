@@ -19,8 +19,8 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
-use s3s::header::X_AMZ_RESTORE;
 use s3s::dto::{RestoreStatus, Timestamp};
+use s3s::header::X_AMZ_RESTORE;
 use serde::Deserialize;
 use serde::Serialize;
 use std::{collections::HashMap, fmt::Display};
@@ -668,7 +668,12 @@ impl RestoreStatusOps for RestoreStatus {
         if self.on_going() {
             return "ongoing-request=\"true\"".to_string();
         }
-        format!("ongoing-request=\"false\", expiry-date=\"{}\"", OffsetDateTime::from(self.restore_expiry_date.clone().unwrap()).format(&Rfc3339).unwrap())
+        format!(
+            "ongoing-request=\"false\", expiry-date=\"{}\"",
+            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
+                .format(&Rfc3339)
+                .unwrap()
+        )
     }
 }
 
