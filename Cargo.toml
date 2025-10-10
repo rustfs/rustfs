@@ -152,6 +152,7 @@ humantime = "2.3.0"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 jsonwebtoken = { version = "10.0.0", features = ["rust_crypto"] }
 lazy_static = "1.5.0"
+libc = "0.2.177"
 libsystemd = { version = "0.7.2" }
 local-ip-address = "0.6.5"
 lz4 = "1.28.1"

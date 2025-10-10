@@ -20,6 +20,7 @@ use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::{ENABLE_KEY, EnableState};
+use rustfs_targets::check_mqtt_broker_available;
 use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
@@ -173,6 +174,7 @@ impl Operation for NotificationTarget {
         let mut client_cert_val = None;
         let mut client_key_val = None;
         let mut qos_val = None;
+        let mut topic_val = String::new();
 
         for kv in notification_body.key_values.iter() {
             if !allowed_keys.contains(kv.key.as_str()) {
@@ -187,8 +189,13 @@ impl Operation for NotificationTarget {
                 endpoint_val = Some(kv.value.clone());
             }
 
-            if target_type == NOTIFY_MQTT_SUB_SYS && kv.key == rustfs_config::MQTT_BROKER {
-                endpoint_val = Some(kv.value.clone());
+            if target_type == NOTIFY_MQTT_SUB_SYS {
+                if kv.key == rustfs_config::MQTT_BROKER {
+                    endpoint_val = Some(kv.value.clone());
+                }
+                if kv.key == rustfs_config::MQTT_TOPIC {
+                    topic_val = kv.value.clone();
+                }
             }
 
             if kv.key == "queue_dir" {
@@ -238,11 +245,14 @@ impl Operation for NotificationTarget {
 
         if target_type == NOTIFY_MQTT_SUB_SYS {
             let endpoint = endpoint_val.ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
-            let url = Url::parse(&endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid broker endpoint url: {}", e))?;
-            match url.scheme() {
-                "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" => {}
-                _ => return Err(s3_error!(InvalidArgument, "unsupported broker url scheme")),
+            if topic_val.is_empty() {
+                return Err(s3_error!(InvalidArgument, "topic is required"));
             }
+            // Check MQTT Broker availability
+            if let Err(e) = check_mqtt_broker_available(&endpoint, &topic_val).await {
+                return Err(s3_error!(InvalidArgument, "MQTT Broker 不可用：{}", e));
+            }
+
             if let Some(queue_dir) = queue_dir_val {
                 validate_queue_dir(&queue_dir).await?;
                 if let Some(qos) = qos_val {

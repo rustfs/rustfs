@@ -212,11 +212,6 @@ impl NotificationSystem {
             return Ok(());
         }
 
-        // if let Err(e) = rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
-        //     error!("Failed to save config: {}", e);
-        //     return Err(NotificationError::SaveConfig(e.to_string()));
-        // }
-
         info!("Configuration updated. Reloading system...");
         self.reload_config(new_config).await
     }

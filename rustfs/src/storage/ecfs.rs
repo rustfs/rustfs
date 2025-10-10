@@ -15,17 +15,17 @@
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::storage::{
-    access::{authorize_request, ReqInfo},
+    access::{ReqInfo, authorize_request},
     options::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion::arrow::{
-    csv::WriterBuilder as CsvWriterBuilder, json::writer::JsonArray, json::WriterBuilder as JsonWriterBuilder,
+    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
@@ -41,8 +41,8 @@ use rustfs_ecstore::{
         object_lock::objectlock_sys::BucketObjectLockSys,
         policy_sys::PolicySys,
         replication::{
-            check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
-            schedule_replication_delete, DeletedObjectReplicationInfo, ReplicationConfigurationExt, REPLICATE_INCOMING_DELETE,
+            DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationConfigurationExt, check_replicate_delete,
+            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -50,11 +50,11 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     client::object_api_utils::format_etag,
-    compress::{is_compressible, MIN_COMPRESSIBLE_SIZE},
+    compress::{MIN_COMPRESSIBLE_SIZE, is_compressible},
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
-    error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, StorageError},
+    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::{is_valid_storage_class, DEFAULT_READ_BUFFER_SIZE, MAX_PARTS_COUNT},
+    set_disk::{DEFAULT_READ_BUFFER_SIZE, MAX_PARTS_COUNT, is_valid_storage_class},
     store_api::{
         BucketOptions,
         CompletePart,
@@ -71,11 +71,11 @@ use rustfs_ecstore::{
         // RESERVED_METADATA_PREFIX,
     },
 };
-use rustfs_filemeta::{fileinfo::ObjectPartInfo, ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, fileinfo::ObjectPartInfo};
 use rustfs_kms::{
+    DataKey,
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
-    DataKey,
 };
 use rustfs_notify::global::notifier_instance;
 use rustfs_policy::{
@@ -92,19 +92,19 @@ use rustfs_s3select_api::{
 };
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
-    arn::{TargetID, TargetIDError},
     EventName,
+    arn::{TargetID, TargetIDError},
 };
 use rustfs_utils::{
+    CompressionAlgorithm,
     http::{
-        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
         AMZ_BUCKET_REPLICATION_STATUS,
+        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
     },
     path::{is_dir_object, path_join_buf},
-    CompressionAlgorithm,
 };
 use rustfs_zip::CompressionFormat;
-use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, S3};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -112,7 +112,7 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{io::AsyncRead, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
