@@ -258,7 +258,6 @@ where
         while remaining > 0 {
             match stream.next().await {
                 Some(Ok(mut bytes)) => {
-                    // Truncate if we received more than needed
                     if bytes.len() > remaining {
                         tracing::warn!(
                             received = bytes.len(),
@@ -267,21 +266,20 @@ where
                         );
                         bytes.truncate(remaining);
                     }
-                    
+
                     let bytes_len = bytes.len();
                     remaining -= bytes_len;
                     total_read += bytes_len;
-                    
+
                     tracing::trace!(
                         chunk_size = bytes_len,
                         total_read,
                         remaining,
                         "bytes_stream: yielding chunk"
                     );
-                    
+
                     y.yield_ok(bytes).await;
-                    
-                    // If we've read exactly what we need, break immediately
+
                     if remaining == 0 {
                         tracing::debug!(
                             total_read,
@@ -305,7 +303,6 @@ where
                     });
                 }
                 None => {
-                    // Stream ended prematurely
                     tracing::error!(
                         total_read,
                         remaining,

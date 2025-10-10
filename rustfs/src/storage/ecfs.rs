@@ -1660,14 +1660,6 @@ impl S3 for FS {
             final_stream = Box::new(limit_reader);
         }
 
-        // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
-        // because DecryptReader needs to read all encrypted data to produce decrypted output
-        // 
-        // IMPORTANT: We use unlimited stream for all cases to avoid issues with bytes_stream
-        // not properly propagating EOF signals through the tokio duplex pipe. The duplex write
-        // end will automatically close when get_object_with_fileinfo completes, which will
-        // cause the read end to reach EOF naturally. Content-Length header ensures HTTP clients
-        // know the expected response size.
         let body = if stored_sse_algorithm.is_some() || managed_encryption_applied {
             tracing::info!("Managed SSE: Using unlimited stream for decryption");
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, DEFAULT_READ_BUFFER_SIZE)))

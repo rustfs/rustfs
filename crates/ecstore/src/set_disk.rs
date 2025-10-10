@@ -502,15 +502,13 @@ impl SetDisks {
             let disk = disk.clone();
             tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    // Use DeleteOptions with immediate=true to avoid parent directory cleanup
-                    // This ensures xl.meta and parent directories are not touched
                     (disk
                         .delete(
                             &bucket,
                             &file_path,
                             DeleteOptions {
                                 recursive: true,
-                                immediate: true,  // Skip parent directory cleanup
+                                immediate: true,
                                 ..Default::default()
                             },
                         )
@@ -6514,9 +6512,6 @@ impl StorageAPI for SetDisks {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        // Acquire exclusive write lock to prevent concurrent GetObject operations
-        // This ensures that no readers can access the object while we are completing
-        // the multipart upload, updating xl.meta, and cleaning up old data_dir
         let _write_lock_guard = if !opts.no_lock {
             Some(
                 self.fast_lock_manager
@@ -6536,9 +6531,7 @@ impl StorageAPI for SetDisks {
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
-        // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
-        // Check preconditions if present
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
@@ -6750,11 +6743,6 @@ impl StorageAPI for SetDisks {
         )
         .await?;
 
-        // debug!("complete fileinfo {:?}", &fi);
-
-        // Clean up old data_dir directly on all disks
-        // After rename_data succeeds, we need to remove the old data_dir physical directories
-        // This must be done synchronously to prevent orphaned directories appearing as objects
         if let Some(old_dir) = op_old_dir {
             let current_data_dir = fi.data_dir.map(|d| d.to_string()).unwrap_or_default();
             if old_dir.to_string() != current_data_dir {
@@ -6763,15 +6751,11 @@ impl StorageAPI for SetDisks {
                     old_dir, bucket, object
                 );
 
-                // Construct path to old data_dir: object/old_uuid/
                 let old_data_path = format!("{}/{}", object, old_dir);
 
-                // Delete old data_dir on all disks
                 for op_disk in online_disks.iter() {
                     if let Some(disk) = op_disk {
                         if disk.is_online().await {
-                            // Delete the old data_dir directory recursively
-                            // Ignore errors as some disks may not have the old data_dir
                             let delete_opts = DeleteOptions {
                                 recursive: true,
                                 immediate: false,

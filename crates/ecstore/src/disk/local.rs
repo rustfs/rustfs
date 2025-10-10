@@ -662,8 +662,6 @@ impl LocalDisk {
             }
         }
 
-        // Skip parent directory cleanup when immediate_purge is true or recursive is true
-        // This prevents accidental deletion of xl.meta and other critical files
         if !immediate_purge && !recursive {
             if let Some(dir_path) = delete_path.parent() {
                 Box::pin(self.delete_file(base_path, &PathBuf::from(dir_path), false, false)).await?;
@@ -2316,14 +2314,9 @@ impl DiskAPI for LocalDisk {
             }
         };
 
-        // Try to load xl.meta, but handle concurrent modification gracefully
-        // During CompleteMultipartUpload, xl.meta might be in flux on some disks
-        // In such cases, treat it as FileNotFound to allow quorum-based recovery
         let mut meta = match FileMeta::load(&buf) {
             Ok(m) => m,
             Err(e) => {
-                // Check if this is a decode/IO error (common during concurrent operations)
-                // This includes MessagePack decode errors, IO errors, etc.
                 let err_str = format!("{:?}", e);
                 warn!(
                     "Failed to decode xl.meta for {}/{}, treating as FileNotFound for quorum tolerance. Error: {}",
@@ -2345,8 +2338,6 @@ impl DiskAPI for LocalDisk {
 
         if let Some(uuid) = old_dir {
             let vid = fi.version_id.unwrap_or_default();
-            // Try to remove data dir reference from xl.meta
-            // If this fails, we still continue to clean up the data dir physically
             if let Err(e) = meta.data.remove(vec![vid, uuid]) {
                 warn!(
                     "Failed to remove data dir {} from xl.meta for {}/{}, continuing with physical cleanup. Error: {:?}",
@@ -2354,7 +2345,6 @@ impl DiskAPI for LocalDisk {
                 );
             }
 
-            // Physically delete the old data_dir
             let old_path = file_path.join(Path::new(uuid.to_string().as_str()));
             check_path_length(old_path.to_string_lossy().as_ref())?;
 
