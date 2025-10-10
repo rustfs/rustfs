@@ -5672,11 +5672,14 @@ impl StorageAPI for SetDisks {
             }
             return Err(to_object_err(ERR_METHOD_NOT_ALLOWED, vec![bucket, object]));
         }*/
-        /*if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
-            || opts.transition.etag != extract_etag(&fi.metadata)
+        // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
+        let transition_etag = rustfs_utils::path::trim_etag(&opts.transition.etag);
+        let stored_etag = rustfs_utils::path::trim_etag(&extract_etag(&fi.metadata));
+        if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
+            || transition_etag != stored_etag
         {
             return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
-        }*/
+        }
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
         }
@@ -6631,10 +6634,13 @@ impl StorageAPI for SetDisks {
             let ext_part = &curr_fi.parts[i];
             tracing::info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
 
-            if p.etag != Some(ext_part.etag.clone()) {
+            // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
+            let client_etag = p.etag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
+            let stored_etag = Some(rustfs_utils::path::trim_etag(&ext_part.etag));
+            if client_etag != stored_etag {
                 error!(
-                    "complete_multipart_upload etag err {:?}, part_id={}, bucket={}, object={}",
-                    p.etag, p.part_num, bucket, object
+                    "complete_multipart_upload etag err client={:?}, stored={:?}, part_id={}, bucket={}, object={}",
+                    p.etag, ext_part.etag, p.part_num, bucket, object
                 );
                 return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
             }
