@@ -169,6 +169,9 @@ impl InlineData {
     }
     pub fn remove(&mut self, remove_keys: Vec<Uuid>) -> Result<bool> {
         let buf = self.after_version();
+        if buf.is_empty() {
+            return Ok(false);
+        }
         let mut cur = Cursor::new(buf);
 
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
