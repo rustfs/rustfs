@@ -12,19 +12,6 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-// net.rs
-
-// This module provides network-related utilities, including URL parsing and Host handling,
-// inspired by the Go code. It implements parsing of URLs and hosts with validation,
-// similar to the original Go implementation.
-
-// Dependencies:
-// - url: For URL parsing and manipulation.
-// - serde: For JSON serialization and deserialization.
-// - serde_json: For JSON operations.
-// - regex: For regular expression matching in host validation.
-// - std::sync::LazyLock: For lazy initialization of static variables.
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -36,6 +23,7 @@ use url::Url;
 // Lazy static for the host label regex.
 static HOST_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").unwrap());
 
+/// NetError represents errors that can occur in network operations.
 #[derive(Error, Debug)]
 pub enum NetError {
     #[error("invalid argument")]
@@ -147,22 +135,34 @@ fn trim_ipv6(host: &str) -> Result<String, NetError> {
 pub struct ParsedURL(pub Url);
 
 impl ParsedURL {
+    /// is_empty returns true if the URL is empty or "about:blank".
     pub fn is_empty(&self) -> bool {
-        self.0.as_str() == ""
+        self.0.as_str() == "" || (self.0.scheme() == "about" && self.0.path() == "blank")
     }
 
+    /// hostname returns the hostname of the URL.
     pub fn hostname(&self) -> String {
         self.0.host_str().unwrap_or("").to_string()
     }
 
+    /// port returns the port of the URL as a string, defaulting to "80" for http and "443" for https if not set.
     pub fn port(&self) -> String {
-        self.0.port().map(|p| p.to_string()).unwrap_or_default()
+        match self.0.port() {
+            Some(p) => p.to_string(),
+            None => match self.0.scheme() {
+                "http" => "80".to_string(),
+                "https" => "443".to_string(),
+                _ => "".to_string(),
+            },
+        }
     }
 
+    /// scheme returns the scheme of the URL.
     pub fn scheme(&self) -> &str {
         self.0.scheme()
     }
 
+    /// url returns a reference to the underlying Url.
     pub fn url(&self) -> &Url {
         &self.0
     }
@@ -175,10 +175,18 @@ impl std::fmt::Display for ParsedURL {
             if let Some(port) = url.port() {
                 if (url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443) {
                     url.set_host(Some(&host)).unwrap();
+                    url.set_port(None).unwrap();
                 }
             }
         }
-        write!(f, "{}", url)
+        let mut s = url.to_string();
+
+        // If the URL ends with a slash and the path is just "/", remove the trailing slash.
+        if s.ends_with('/') && url.path() == "/" {
+            s.pop();
+        }
+
+        write!(f, "{}", s)
     }
 }
 
@@ -207,9 +215,17 @@ impl<'de> serde::Deserialize<'de> for ParsedURL {
 
 // parse_url parses a string into a ParsedURL, with host validation and path cleaning.
 pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
-    let mut uu = Url::parse(s).map_err(|e| NetError::ParseError(e.to_string()))?;
+    if let Some(scheme_end) = s.find("://") {
+        if s[scheme_end + 3..].starts_with('/') {
+            let scheme = &s[..scheme_end];
+            if !scheme.is_empty() {
+                return Err(NetError::SchemeWithEmptyHost);
+            }
+        }
+    }
 
-    if uu.host_str().is_none() {
+    let mut uu = Url::parse(s).map_err(|e| NetError::ParseError(e.to_string()))?;
+    if uu.host_str().is_none_or(|h| h.is_empty()) {
         if uu.scheme() != "" {
             return Err(NetError::SchemeWithEmptyHost);
         }
@@ -229,17 +245,34 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
     // Clean path: Use Url's path_segments to normalize.
     if !uu.path().is_empty() {
         // Url automatically cleans paths, but we ensure trailing slash if original had it.
-        let cleaned_path = Path::new(uu.path()).to_string_lossy().to_string();
-        uu.set_path(&cleaned_path);
-        if s.ends_with('/') && !uu.path().ends_with('/') {
-            uu.set_path(&(uu.path().to_string() + "/"));
+        let mut cleaned_path = String::new();
+        for comp in Path::new(uu.path()).components() {
+            use std::path::Component;
+            match comp {
+                Component::RootDir => cleaned_path.push('/'),
+                Component::Normal(s) => {
+                    if !cleaned_path.ends_with('/') {
+                        cleaned_path.push('/');
+                    }
+                    cleaned_path.push_str(&s.to_string_lossy());
+                }
+                _ => {}
+            }
         }
+        if s.ends_with('/') && !cleaned_path.ends_with('/') {
+            cleaned_path.push('/');
+        }
+        if cleaned_path.is_empty() {
+            cleaned_path.push('/');
+        }
+        uu.set_path(&cleaned_path);
     }
 
     Ok(ParsedURL(uu))
 }
 
 #[allow(dead_code)]
+/// parse_http_url parses a string into a ParsedURL, ensuring the scheme is http or https.
 pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     let u = parse_url(s)?;
     match u.0.scheme() {
@@ -249,6 +282,7 @@ pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
 }
 
 #[allow(dead_code)]
+/// is_network_or_host_down checks if an error indicates network or host down, considering timeouts.
 pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return !expect_timeouts;
@@ -262,11 +296,13 @@ pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> b
 }
 
 #[allow(dead_code)]
+/// is_conn_reset_err checks if an error indicates a connection reset by peer.
 pub fn is_conn_reset_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection reset by peer") || matches!(err.raw_os_error(), Some(libc::ECONNRESET))
 }
 
 #[allow(dead_code)]
+/// is_conn_refused_err checks if an error indicates a connection refused.
 pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection refused") || matches!(err.raw_os_error(), Some(libc::ECONNREFUSED))
 }
