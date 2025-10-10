@@ -66,17 +66,18 @@ impl Host {
         self.name.is_empty()
     }
 
-    // to_string returns the string representation of the host.
-    pub fn to_string(&self) -> String {
-        match self.port {
-            Some(p) => format!("{}:{}", self.name, p),
-            None => self.name.clone(),
-        }
-    }
-
     // equal checks if two hosts are equal by comparing their string representations.
     pub fn equal(&self, other: &Host) -> bool {
         self.to_string() == other.to_string()
+    }
+}
+
+impl std::fmt::Display for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.port {
+            Some(p) => write!(f, "{}:{}", self.name, p),
+            None => write!(f, "{}", self.name),
+        }
     }
 }
 
@@ -165,9 +166,10 @@ impl ParsedURL {
     pub fn url(&self) -> &Url {
         &self.0
     }
+}
 
-    // to_string returns the URL string, omitting default ports for http and https.
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for ParsedURL {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut url = self.0.clone();
         if let Some(host) = url.host_str().map(|h| h.to_string()) {
             if let Some(port) = url.port() {
@@ -176,7 +178,7 @@ impl ParsedURL {
                 }
             }
         }
-        url.to_string()
+        write!(f, "{}", url)
     }
 }
 
@@ -483,13 +485,13 @@ mod tests {
 
     #[test]
     fn is_conn_reset_err_with_reset_message() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "connection reset by peer");
+        let err = std::io::Error::other("connection reset by peer");
         assert!(is_conn_reset_err(&err));
     }
 
     #[test]
     fn is_conn_refused_err_with_refused_message() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "connection refused");
+        let err = std::io::Error::other("connection refused");
         assert!(is_conn_refused_err(&err));
     }
 }
