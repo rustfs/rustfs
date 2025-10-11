@@ -101,11 +101,11 @@ rustfs-signer.workspace = true
 rustfs-checksums.workspace = true
 futures-util.workspace = true
 async-recursion.workspace = true
-aws-credential-types = "1.2.6"
-aws-smithy-types = "1.3.2"
-parking_lot = "0.12"
-moka = { version = "0.12", features = ["future"] }
-aws-smithy-runtime-api = "1.9.0"
+aws-credential-types = { workspace = true }
+aws-smithy-types = { workspace = true }
+parking_lot = { workspace = true }
+moka = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

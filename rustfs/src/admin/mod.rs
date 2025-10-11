@@ -23,10 +23,7 @@ pub mod utils;
 use handlers::{
     GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
     bucket_meta,
-    event::{
-        GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
-        SetBucketNotification,
-    },
+    event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
     group, kms, kms_dynamic, kms_keys, policies, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
@@ -519,25 +516,7 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
-        AdminOperation(&ListNotificationTargets {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-set-bucket").as_str(),
-        AdminOperation(&SetBucketNotification {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-get-bucket").as_str(),
-        AdminOperation(&GetBucketNotification {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove-bucket").as_str(),
-        AdminOperation(&RemoveBucketNotification {}),
+        AdminOperation(&ListTargetsArns {}),
     )?;
 
     Ok(())

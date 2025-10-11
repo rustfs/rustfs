@@ -12,136 +12,112 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::access::authorize_request;
-use super::options::del_opts;
-use super::options::extract_metadata;
-use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
-use crate::storage::access::ReqInfo;
-use crate::storage::options::copy_dst_opts;
-use crate::storage::options::copy_src_opts;
-use crate::storage::options::get_complete_multipart_upload_opts;
-use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_opts, parse_copy_source_range};
-use bytes::Bytes;
-use chrono::DateTime;
-use chrono::Utc;
-use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
-use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
-use datafusion::arrow::json::writer::JsonArray;
-use http::StatusCode;
-use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
-use rustfs_ecstore::bucket::object_lock::objectlock_sys::BucketObjectLockSys;
-use rustfs_ecstore::bucket::replication::DeletedObjectReplicationInfo;
-use rustfs_ecstore::bucket::replication::REPLICATE_INCOMING_DELETE;
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
-use rustfs_ecstore::bucket::replication::check_replicate_delete;
-use rustfs_ecstore::bucket::replication::get_must_replicate_options;
-use rustfs_ecstore::bucket::replication::must_replicate;
-use rustfs_ecstore::bucket::replication::schedule_replication;
-use rustfs_ecstore::bucket::replication::schedule_replication_delete;
-use rustfs_ecstore::bucket::versioning::VersioningApi;
-use rustfs_ecstore::disk::error::DiskError;
-use rustfs_ecstore::disk::error_reduce::is_all_buckets_not_found;
-use rustfs_ecstore::error::is_err_bucket_not_found;
-use rustfs_ecstore::error::is_err_object_not_found;
-use rustfs_ecstore::error::is_err_version_not_found;
-use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
-use rustfs_ecstore::store_api::ObjectInfo;
-use rustfs_filemeta::ReplicationStatusType;
-use rustfs_filemeta::ReplicationType;
-use rustfs_filemeta::VersionPurgeStatusType;
-use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_s3select_api::query::Context;
-use rustfs_s3select_api::query::Query;
-use rustfs_s3select_query::get_global_db;
-
-// use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
+use crate::storage::{
+    access::{ReqInfo, authorize_request},
+    options::{
+        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
+        get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
+    },
+};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use datafusion::arrow::{
+    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
+};
 use futures::StreamExt;
-use http::HeaderMap;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
-use rustfs_ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_REPLICATION_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_SSECONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
-use rustfs_ecstore::bucket::metadata::OBJECT_LOCK_CONFIG;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::policy_sys::PolicySys;
-use rustfs_ecstore::bucket::tagging::decode_tags;
-use rustfs_ecstore::bucket::tagging::encode_tags;
-use rustfs_ecstore::bucket::utils::serialize;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::client::object_api_utils::format_etag;
-use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
-use rustfs_ecstore::compress::is_compressible;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::{DEFAULT_READ_BUFFER_SIZE, is_valid_storage_class};
-use rustfs_ecstore::store_api::BucketOptions;
-use rustfs_ecstore::store_api::CompletePart;
-use rustfs_ecstore::store_api::DeleteBucketOptions;
-use rustfs_ecstore::store_api::HTTPRangeSpec;
-use rustfs_ecstore::store_api::MakeBucketOptions;
-use rustfs_ecstore::store_api::MultipartUploadResult;
-use rustfs_ecstore::store_api::ObjectIO;
-use rustfs_ecstore::store_api::ObjectOptions;
-use rustfs_ecstore::store_api::ObjectToDelete;
-use rustfs_ecstore::store_api::PutObjReader;
-use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_filemeta::fileinfo::ObjectPartInfo;
-use rustfs_kms::DataKey;
-use rustfs_kms::service_manager::get_global_encryption_service;
-use rustfs_kms::types::{EncryptionMetadata, ObjectEncryptionContext};
+use http::{HeaderMap, StatusCode};
+use rustfs_ecstore::{
+    bucket::{
+        lifecycle::{bucket_lifecycle_ops::validate_transition_tier, lifecycle::Lifecycle},
+        metadata::{
+            BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_REPLICATION_CONFIG,
+            BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+        },
+        metadata_sys,
+        metadata_sys::get_replication_config,
+        object_lock::objectlock_sys::BucketObjectLockSys,
+        policy_sys::PolicySys,
+        replication::{
+            DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationConfigurationExt, check_replicate_delete,
+            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
+        },
+        tagging::{decode_tags, encode_tags},
+        utils::serialize,
+        versioning::VersioningApi,
+        versioning_sys::BucketVersioningSys,
+    },
+    client::object_api_utils::format_etag,
+    compress::{MIN_COMPRESSIBLE_SIZE, is_compressible},
+    disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
+    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    new_object_layer_fn,
+    set_disk::{DEFAULT_READ_BUFFER_SIZE, MAX_PARTS_COUNT, is_valid_storage_class},
+    store_api::{
+        BucketOptions,
+        CompletePart,
+        DeleteBucketOptions,
+        HTTPRangeSpec,
+        MakeBucketOptions,
+        MultipartUploadResult,
+        ObjectIO,
+        ObjectInfo,
+        ObjectOptions,
+        ObjectToDelete,
+        PutObjReader,
+        StorageAPI,
+        // RESERVED_METADATA_PREFIX,
+    },
+};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, fileinfo::ObjectPartInfo};
+use rustfs_kms::{
+    DataKey,
+    service_manager::get_global_encryption_service,
+    types::{EncryptionMetadata, ObjectEncryptionContext},
+};
 use rustfs_notify::global::notifier_instance;
-use rustfs_policy::auth;
-use rustfs_policy::policy::action::Action;
-use rustfs_policy::policy::action::S3Action;
-use rustfs_policy::policy::{BucketPolicy, BucketPolicyArgs, Validator};
-use rustfs_rio::CompressReader;
-use rustfs_rio::EtagReader;
-use rustfs_rio::HashReader;
-use rustfs_rio::Reader;
-use rustfs_rio::WarpReader;
-use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader};
-use rustfs_targets::EventName;
-use rustfs_targets::arn::{TargetID, TargetIDError};
-use rustfs_utils::CompressionAlgorithm;
-use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
-use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_utils::http::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
-use rustfs_utils::path::is_dir_object;
-use rustfs_utils::path::path_join_buf;
+use rustfs_policy::{
+    auth,
+    policy::{
+        action::{Action, S3Action},
+        {BucketPolicy, BucketPolicyArgs, Validator},
+    },
+};
+use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
+use rustfs_s3select_api::{
+    object_store::bytes_stream,
+    query::{Context, Query},
+};
+use rustfs_s3select_query::get_global_db;
+use rustfs_targets::{
+    EventName,
+    arn::{TargetID, TargetIDError},
+};
+use rustfs_utils::{
+    CompressionAlgorithm,
+    http::{
+        AMZ_BUCKET_REPLICATION_STATUS,
+        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+    },
+    path::{is_dir_object, path_join_buf},
+};
 use rustfs_zip::CompressionFormat;
-use s3s::S3;
-use s3s::S3Error;
-use s3s::S3ErrorCode;
-use s3s::S3Result;
-use s3s::dto::*;
-use s3s::s3_error;
-use s3s::{S3Request, S3Response};
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::path::Path;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-use tokio::io::AsyncRead;
-use tokio::sync::mpsc;
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{io::AsyncRead, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
-use tokio_util::io::ReaderStream;
-use tokio_util::io::StreamReader;
-use tracing::debug;
-use tracing::error;
-use tracing::info;
-use tracing::warn;
+use tokio_util::io::{ReaderStream, StreamReader};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 macro_rules! try_ {

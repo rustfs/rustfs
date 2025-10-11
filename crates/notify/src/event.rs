@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use chrono::{DateTime, Utc};
+use hashbrown::HashMap;
 use rustfs_targets::EventName;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use url::form_urlencoded;
 
 /// Represents the identity of the user who triggered the event

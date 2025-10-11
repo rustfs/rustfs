@@ -15,13 +15,13 @@
 use crate::Event;
 use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
 use futures::stream::{FuturesUnordered, StreamExt};
+use hashbrown::{HashMap, HashSet};
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::Target;
 use rustfs_targets::TargetError;
 use rustfs_targets::target::ChannelTargetType;
-use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
 /// Registry for managing target factories

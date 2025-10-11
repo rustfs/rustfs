@@ -92,6 +92,10 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
+        if method == Method::GET && uri.path() == "/health" {
+            return true;
+        }
+
         // AssumeRole
         if method == Method::POST && uri.path() == "/" {
             if let Some(val) = headers.get(header::CONTENT_TYPE) {
@@ -104,36 +108,13 @@ where
         uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(CONSOLE_PREFIX)
     }
 
-    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
-            if let Some(console_router) = &self.console_router {
-                let mut console_router = console_router.clone();
-                let req = convert_request(req);
-                let result = console_router.call(req).await;
-                return match result {
-                    Ok(resp) => Ok(convert_response(resp)),
-                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
-                };
-            }
-            return Err(s3_error!(InternalError, "console is not enabled"));
-        }
-
-        let uri = format!("{}|{}", &req.method, req.uri.path());
-
-        // warn!("get uri {}", &uri);
-
-        if let Ok(mat) = self.router.at(&uri) {
-            let op: &T = mat.value;
-            let mut resp = op.call(req, mat.params).await?;
-            resp.status = Some(resp.output.0);
-            return Ok(resp.map_output(|x| x.1));
-        }
-
-        return Err(s3_error!(NotImplemented));
-    }
-
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        // Allow unauthenticated access to health check
+        if req.method == Method::GET && req.uri.path() == "/health" {
+            return Ok(());
+        }
+        // Allow unauthenticated access to console static files if console is enabled
         if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
             return Ok(());
         }
@@ -155,6 +136,31 @@ where
             Some(_) => Ok(()),
             None => Err(s3_error!(AccessDenied, "Signature is required")),
         }
+    }
+
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+            if let Some(console_router) = &self.console_router {
+                let mut console_router = console_router.clone();
+                let req = convert_request(req);
+                let result = console_router.call(req).await;
+                return match result {
+                    Ok(resp) => Ok(convert_response(resp)),
+                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
+                };
+            }
+            return Err(s3_error!(InternalError, "console is not enabled"));
+        }
+
+        let uri = format!("{}|{}", &req.method, req.uri.path());
+        if let Ok(mat) = self.router.at(&uri) {
+            let op: &T = mat.value;
+            let mut resp = op.call(req, mat.params).await?;
+            resp.status = Some(resp.output.0);
+            return Ok(resp.map_output(|x| x.1));
+        }
+
+        Err(s3_error!(NotImplemented))
     }
 }
 

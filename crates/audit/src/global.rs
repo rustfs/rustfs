@@ -12,9 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::AuditEntry;
-use crate::AuditResult;
-use crate::AuditSystem;
+use crate::{AuditEntry, AuditResult, AuditSystem};
 use once_cell::sync::OnceCell;
 use rustfs_ecstore::config::Config;
 use std::sync::Arc;

@@ -32,11 +32,13 @@ bytes = { workspace = true, optional = true }
 crc32fast = { workspace = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+hashbrown = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
@@ -53,7 +55,7 @@ s3s = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-convert_case = "0.8.0"
+convert_case = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 sysinfo = { workspace = true, optional = true }
@@ -83,7 +85,7 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls charac
 net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hickory-resolver", "dep:moka", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
 io = ["dep:tokio"]
 path = []
-notify = ["dep:hyper", "dep:s3s"]  # file system notification features
+notify = ["dep:hyper", "dep:s3s", "dep:hashbrown", "dep:thiserror", "dep:serde", "dep:libc"]  # file system notification features
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex", "dep:rand"]
 crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
@@ -91,5 +93,5 @@ hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:s
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features
-http = []
-full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify","http"]  # all features
+http = ["dep:convert_case"]
+full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify", "http"]  # all features

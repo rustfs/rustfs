@@ -30,7 +30,7 @@ services:
       - "9000:9000" # S3 API port
       - "9001:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3
+      - RUSTFS_VOLUMES=/data/rustfs{0..3}  # Define 4 storage volumes
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -43,12 +43,9 @@ services:
       - RUSTFS_TLS_PATH=/opt/tls
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
     volumes:
-      - rustfs_data_0:/data/rustfs0
-      - rustfs_data_1:/data/rustfs1
-      - rustfs_data_2:/data/rustfs2
-      - rustfs_data_3:/data/rustfs3
-      - logs_data:/app/logs
-      - .docker/tls/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
+      - deploy/data/pro:/data
+      - deploy/logs:/app/logs
+      - deploy/data/certs/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
     networks:
       - rustfs-network
     restart: unless-stopped
@@ -78,7 +75,7 @@ services:
       - "9010:9000" # S3 API port  
       - "9011:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1
+      - RUSTFS_VOLUMES=/data/rustfs{1..4}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -90,7 +87,7 @@ services:
       - RUSTFS_LOG_LEVEL=debug
     volumes:
       - .:/app # Mount source code to /app for development
-      - rustfs_dev_data:/data
+      - deploy/data/dev:/data
     networks:
       - rustfs-network
     restart: unless-stopped
@@ -98,7 +95,7 @@ services:
       test:
         [
           "CMD",
-          "sh", "-c", 
+          "sh", "-c",
           "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
         ]
       interval: 30s
@@ -239,5 +236,5 @@ volumes:
     driver: local
   redis_data:
     driver: local
-  logs_data:
+  logs:
     driver: local

@@ -13,11 +13,13 @@
 // limitations under the License.
 
 pub mod arn;
+mod check;
 pub mod error;
 mod event_name;
 pub mod store;
 pub mod target;
 
+pub use check::check_mqtt_broker_available;
 pub use error::{StoreError, TargetError};
 pub use event_name::EventName;
 use serde::{Deserialize, Serialize};
