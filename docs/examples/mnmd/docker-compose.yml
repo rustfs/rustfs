@@ -1,0 +1,133 @@
+version: "3.8"
+
+services:
+  rustfs-node1:
+    image: rustfs/rustfs:1.0.0-alpha.59
+    container_name: rustfs-node1
+    hostname: rustfs-node1
+    ports:
+      - "9000:9000"   # 对外入口，仅需一个节点暴露
+    volumes:
+      - /mnt/rustfs1_data1:/data/rustfs1
+      - /mnt/rustfs1_data2:/data/rustfs2
+      - /mnt/rustfs1_data3:/data/rustfs3
+      - /mnt/rustfs1_data4:/data/rustfs4
+      - rustfs_logs1:/logs
+    environment:
+      - RUSTFS_ACCESS_KEY=rustadmin
+      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      # 关键修复：{1...4} 与 /data/rustfs1..4 一致；使用服务名而不是固定IP
+      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
+      - RUST_LOG=error
+    networks:
+      - rustfsnet
+    restart: unless-stopped
+    healthcheck:
+      # 若镜像无 nc，可改用 curl/wget，见 README 与 CHECKLIST
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  rustfs-node2:
+    image: rustfs/rustfs:1.0.0-alpha.59
+    container_name: rustfs-node2
+    hostname: rustfs-node2
+    volumes:
+      - /mnt/rustfs2_data1:/data/rustfs1
+      - /mnt/rustfs2_data2:/data/rustfs2
+      - /mnt/rustfs2_data3:/data/rustfs3
+      - /mnt/rustfs2_data4:/data/rustfs4
+      - rustfs_logs2:/logs
+    environment:
+      - RUSTFS_ACCESS_KEY=rustadmin
+      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
+      - RUST_LOG=error
+    networks:
+      - rustfsnet
+    restart: unless-stopped
+    depends_on:
+      rustfs-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  rustfs-node3:
+    image: rustfs/rustfs:1.0.0-alpha.59
+    container_name: rustfs-node3
+    hostname: rustfs-node3
+    volumes:
+      - /mnt/rustfs3_data1:/data/rustfs1
+      - /mnt/rustfs3_data2:/data/rustfs2
+      - /mnt/rustfs3_data3:/data/rustfs3
+      - /mnt/rustfs3_data4:/data/rustfs4
+      - rustfs_logs3:/logs
+    environment:
+      - RUSTFS_ACCESS_KEY=rustadmin
+      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
+      - RUST_LOG=error
+    networks:
+      - rustfsnet
+    restart: unless-stopped
+    depends_on:
+      rustfs-node2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  rustfs-node4:
+    image: rustfs/rustfs:1.0.0-alpha.59
+    container_name: rustfs-node4
+    hostname: rustfs-node4
+    volumes:
+      - /mnt/rustfs4_data1:/data/rustfs1
+      - /mnt/rustfs4_data2:/data/rustfs2
+      - /mnt/rustfs4_data3:/data/rustfs3
+      - /mnt/rustfs4_data4:/data/rustfs4
+      - rustfs_logs4:/logs
+    environment:
+      - RUSTFS_ACCESS_KEY=rustadmin
+      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
+      - RUST_LOG=error
+    networks:
+      - rustfsnet
+    restart: unless-stopped
+    depends_on:
+      rustfs-node3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+volumes:
+  rustfs_logs1:
+  rustfs_logs2:
+  rustfs_logs3:
+  rustfs_logs4:
+
+networks:
+  rustfsnet:
+    driver: bridge
