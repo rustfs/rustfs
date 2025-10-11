@@ -1,4 +1,16 @@
-version: "3.8"
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 services:
   rustfs-node1:
@@ -6,27 +18,32 @@ services:
     container_name: rustfs-node1
     hostname: rustfs-node1
     ports:
-      - "9000:9000"   # 对外入口，仅需一个节点暴露
+      - "9000:9000"   # For external entrance, only one node is exposed
     volumes:
       - /mnt/rustfs1_data1:/data/rustfs1
       - /mnt/rustfs1_data2:/data/rustfs2
       - /mnt/rustfs1_data3:/data/rustfs3
       - /mnt/rustfs1_data4:/data/rustfs4
       - rustfs_logs1:/logs
+      - ./wait-and-start.sh:/usr/local/bin/wait-and-start.sh:ro
     environment:
-      - RUSTFS_ACCESS_KEY=rustadmin
-      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      # 关键修复：{1...4} 与 /data/rustfs1..4 一致；使用服务名而不是固定IP
+      # Key fix: {1...4} consistent with /data/rustfs1..4; use service name instead of fixed IP
       - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
       - RUST_LOG=error
+      # If the image does not have a default CMD or the original ENTRYPOINT is overwritten, the script will fall back and execute this command.
+      - RUSTFS_CMD=rustfs
     networks:
-      - rustfsnet
+      - rustfs-net
     restart: unless-stopped
+    # Use /bin/sh to call the script to avoid relying on the host file execution bit
+    entrypoint: [ "/bin/sh", "/usr/local/bin/wait-and-start.sh" ]
     healthcheck:
-      # 若镜像无 nc，可改用 curl/wget，见 README 与 CHECKLIST
-      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      # If the image does not have nc, you can use curl/wget instead, see README and CHECKLIST
+      test: [ "CMD-SHELL", "nc -z localhost 9000 || exit 1" ]
       interval: 10s
       timeout: 3s
       retries: 15
@@ -42,21 +59,24 @@ services:
       - /mnt/rustfs2_data3:/data/rustfs3
       - /mnt/rustfs2_data4:/data/rustfs4
       - rustfs_logs2:/logs
+      - ./wait-and-start.sh:/usr/local/bin/wait-and-start.sh:ro
     environment:
-      - RUSTFS_ACCESS_KEY=rustadmin
-      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
       - RUST_LOG=error
+      - RUSTFS_CMD=rustfs
     networks:
-      - rustfsnet
+      - rustfs-net
     restart: unless-stopped
     depends_on:
       rustfs-node1:
         condition: service_healthy
+    entrypoint: [ "/bin/sh", "/usr/local/bin/wait-and-start.sh" ]
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      test: [ "CMD-SHELL", "nc -z localhost 9000 || exit 1" ]
       interval: 10s
       timeout: 3s
       retries: 15
@@ -72,21 +92,24 @@ services:
       - /mnt/rustfs3_data3:/data/rustfs3
       - /mnt/rustfs3_data4:/data/rustfs4
       - rustfs_logs3:/logs
+      - ./wait-and-start.sh:/usr/local/bin/wait-and-start.sh:ro
     environment:
-      - RUSTFS_ACCESS_KEY=rustadmin
-      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
       - RUST_LOG=error
+      - RUSTFS_CMD=rustfs
     networks:
-      - rustfsnet
+      - rustfs-net
     restart: unless-stopped
     depends_on:
       rustfs-node2:
         condition: service_healthy
+    entrypoint: [ "/bin/sh", "/usr/local/bin/wait-and-start.sh" ]
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      test: [ "CMD-SHELL", "nc -z localhost 9000 || exit 1" ]
       interval: 10s
       timeout: 3s
       retries: 15
@@ -102,21 +125,24 @@ services:
       - /mnt/rustfs4_data3:/data/rustfs3
       - /mnt/rustfs4_data4:/data/rustfs4
       - rustfs_logs4:/logs
+      - ./wait-and-start.sh:/usr/local/bin/wait-and-start.sh:ro
     environment:
-      - RUSTFS_ACCESS_KEY=rustadmin
-      - RUSTFS_SECRET_KEY=rustadmin
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
       - RUST_LOG=error
+      - RUSTFS_CMD=rustfs
     networks:
-      - rustfsnet
+      - rustfs-net
     restart: unless-stopped
     depends_on:
       rustfs-node3:
         condition: service_healthy
+    entrypoint: [ "/bin/sh", "/usr/local/bin/wait-and-start.sh" ]
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      test: [ "CMD-SHELL", "nc -z localhost 9000 || exit 1" ]
       interval: 10s
       timeout: 3s
       retries: 15
@@ -129,5 +155,5 @@ volumes:
   rustfs_logs4:
 
 networks:
-  rustfsnet:
+  rustfs-net:
     driver: bridge
