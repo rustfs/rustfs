@@ -28,6 +28,9 @@ docker-compose logs -f
 curl http://localhost:9000/health
 curl http://localhost:9001/health
 
+# Run comprehensive tests
+./test-deployment.sh
+
 # Stop the cluster
 docker-compose down
 
@@ -130,6 +133,26 @@ This allows the entrypoint to execute the correct command when Docker doesn't pr
 ## Testing the Deployment
 
 After starting the cluster, verify it's working:
+
+### Automated Testing
+
+Use the provided test script for comprehensive validation:
+
+```bash
+./test-deployment.sh
+```
+
+This script tests:
+- Container status (4/4 running)
+- Health checks (4/4 healthy)
+- API endpoints (4 ports)
+- Console endpoints (4 ports)
+- Inter-node connectivity
+- Data directory existence
+
+### Manual Testing
+
+For manual verification:
 
 ```bash
 # 1. Check all containers are healthy
