@@ -32,3 +32,5 @@ pub mod audit;
 pub mod notify;
 #[cfg(feature = "observability")]
 pub mod observability;
+#[cfg(feature = "opa")]
+pub mod opa;

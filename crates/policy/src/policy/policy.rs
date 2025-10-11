@@ -17,7 +17,6 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-
 /// DEFAULT_VERSION is the default version.
 /// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html
 pub const DEFAULT_VERSION: &str = "2012-10-17";
