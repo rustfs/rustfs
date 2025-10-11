@@ -225,7 +225,7 @@ async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dy
     </Rule>
     <Rule>
         <ID>test-rule2</ID>
-        <Status>Desabled</Status>
+        <Status>Disabled</Status>
         <Filter>
             <Prefix>test/</Prefix>
         </Filter>

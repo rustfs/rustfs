@@ -15,7 +15,9 @@
 use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 
 // use common::error::Error as EcsError;
-use crate::{
+use futures::Stream;
+use futures_util::future::join_all;
+use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
@@ -28,14 +30,13 @@ use crate::{
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
-use futures::Stream;
-use futures_util::future::join_all;
 
 use rustfs_common::{globals::GLOBAL_Local_Node_Name, heal_channel::HealOpts};
 
 use bytes::Bytes;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{FileInfo, MetacacheReader};
+use rustfs_iam::{get_global_iam_sys, store::UserType};
 use rustfs_lock::{LockClient, LockRequest};
 use rustfs_madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
@@ -1917,14 +1918,24 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        todo!()
+        let resp = iam_sys.delete_policy(&policy, false).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(DeletePolicyResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(DeletePolicyResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_policy(&self, request: Request<LoadPolicyRequest>) -> Result<Response<LoadPolicyResponse>, Status> {
@@ -1936,13 +1947,24 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+
+        let resp = iam_sys.load_policy(&policy).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(LoadPolicyResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(LoadPolicyResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_policy_mapping(
@@ -1957,15 +1979,30 @@ impl Node for NodeService {
                 error_info: Some("user_or_group name is missing".to_string()),
             }));
         }
-        let _user_type = request.user_type;
-        let _is_group = request.is_group;
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(user_type) = UserType::from_u64(request.user_type) else {
+            return Ok(tonic::Response::new(LoadPolicyMappingResponse {
+                success: false,
+                error_info: Some("invalid user type".to_string()),
+            }));
+        };
+        let is_group = request.is_group;
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+        let resp = iam_sys.load_policy_mapping(&user_or_group, user_type, is_group).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(LoadPolicyMappingResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(LoadPolicyMappingResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn delete_user(&self, request: Request<DeleteUserRequest>) -> Result<Response<DeleteUserResponse>, Status> {
@@ -1977,14 +2014,24 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        todo!()
+        let resp = iam_sys.delete_user(&access_key, false).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(DeleteUserResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(DeleteUserResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn delete_service_account(
@@ -1999,19 +2046,29 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+        let resp = iam_sys.delete_service_account(&access_key, false).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(DeleteServiceAccountResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(DeleteServiceAccountResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_user(&self, request: Request<LoadUserRequest>) -> Result<Response<LoadUserResponse>, Status> {
         let request = request.into_inner();
         let access_key = request.access_key;
-        let _temp = request.temp;
+        let temp = request.temp;
         if access_key.is_empty() {
             return Ok(tonic::Response::new(LoadUserResponse {
                 success: false,
@@ -2019,14 +2076,27 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        todo!()
+        let user_type = if temp { UserType::Sts } else { UserType::Reg };
+
+        let resp = iam_sys.load_user(&access_key, user_type).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(LoadUserResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        Ok(tonic::Response::new(LoadUserResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_service_account(
@@ -2042,13 +2112,25 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+
+        let resp = iam_sys.load_service_account(&access_key).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(LoadServiceAccountResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        Ok(tonic::Response::new(LoadServiceAccountResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_group(&self, request: Request<LoadGroupRequest>) -> Result<Response<LoadGroupResponse>, Status> {
@@ -2061,13 +2143,24 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(iam_sys) = get_global_iam_sys() else {
             return Ok(tonic::Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+
+        let resp = iam_sys.load_group(&group).await;
+        if let Err(err) = resp {
+            return Ok(tonic::Response::new(LoadGroupResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(LoadGroupResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn reload_site_replication_config(
