@@ -416,3 +416,94 @@ async fn delete_all_versions_in_versioned_bucket_then_reupload() -> Result<(), B
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial]
+async fn delete_all_versions_should_cleanup_object_directory() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(Vec::new()).await?;
+    sleep(Duration::from_secs(1)).await;
+    let client = env.create_s3_client();
+
+    let bucket = format!("cleanup-dir-{}", Uuid::new_v4().simple());
+    client.create_bucket().bucket(&bucket).send().await?;
+
+    // 启用版本控制
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let key = "test-cleanup.bin";
+
+    // 上传文件
+    let data: Vec<u8> = vec![0u8; 1024];
+    let put1 = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data.clone()))
+        .send()
+        .await?;
+
+    let version1 = put1.version_id().map(|v| v.to_string());
+    if version1.is_none() {
+        client.delete_bucket().bucket(&bucket).send().await?;
+        return Ok(());
+    }
+    let version1 = version1.unwrap();
+
+    sleep(Duration::from_millis(200)).await;
+
+    // 删除文件（不指定版本，创建 delete marker）
+    let delete_resp = client.delete_object().bucket(&bucket).key(key).send().await?;
+    let delete_marker_version = delete_resp.version_id().map(|v| v.to_string()).expect("delete marker version");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // 验证有2个版本（1个对象版本 + 1个 delete marker）
+    let versions = client.list_object_versions().bucket(&bucket).send().await?;
+    let total_versions = versions.versions().len() + versions.delete_markers().len();
+    assert_eq!(total_versions, 2, "Should have 2 versions (1 object + 1 delete marker)");
+
+    // 获取数据目录
+    let data_dirs = env.get_data_directories()?;
+
+    // 验证对象目录存在
+    let object_dir_exists_before = data_dirs.iter().any(|data_dir| {
+        let object_path = data_dir.join(&bucket).join(key);
+        object_path.exists()
+    });
+    assert!(object_dir_exists_before, "Object directory should exist before deleting all versions");
+
+    // 删除所有版本
+    client.delete_object().bucket(&bucket).key(key).version_id(&version1).send().await?;
+
+    client.delete_object().bucket(&bucket).key(key).version_id(&delete_marker_version).send().await?;
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 关键验证：对象目录应该被完全清理
+    let object_dir_exists_after = data_dirs.iter().any(|data_dir| {
+        let object_path = data_dir.join(&bucket).join(key);
+        object_path.exists()
+    });
+
+    assert!(
+        !object_dir_exists_after,
+        "Object directory should be cleaned up after deleting all versions. \
+         Bug: empty object directory with only xl.meta remains."
+    );
+
+    client.delete_bucket().bucket(&bucket).send().await?;
+
+    Ok(())
+}
