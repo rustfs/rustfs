@@ -30,7 +30,6 @@ crc32fast = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 time.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }

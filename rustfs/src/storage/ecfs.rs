@@ -2288,91 +2288,9 @@ impl S3 for FS {
         let mt = metadata.clone();
         let mt2 = metadata.clone();
 
-        let append_flag = req.headers.get("x-amz-object-append");
-        let append_action_header = req.headers.get("x-amz-append-action");
-        let mut append_requested = false;
-        let mut append_position: Option<i64> = None;
-        if let Some(flag_value) = append_flag {
-            let flag_str = flag_value.to_str().map_err(|_| {
-                S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-object-append header".to_string())
-            })?;
-            if flag_str.eq_ignore_ascii_case("true") {
-                append_requested = true;
-                let position_value = req.headers.get("x-amz-append-position").ok_or_else(|| {
-                    S3Error::with_message(
-                        S3ErrorCode::InvalidArgument,
-                        "x-amz-append-position header required when x-amz-object-append is true".to_string(),
-                    )
-                })?;
-                let position_str = position_value.to_str().map_err(|_| {
-                    S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-append-position header".to_string())
-                })?;
-                let position = position_str.parse::<i64>().map_err(|_| {
-                    S3Error::with_message(
-                        S3ErrorCode::InvalidArgument,
-                        "x-amz-append-position must be a non-negative integer".to_string(),
-                    )
-                })?;
-                if position < 0 {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidArgument,
-                        "x-amz-append-position must be a non-negative integer".to_string(),
-                    ));
-                }
-                append_position = Some(position);
-            } else if !flag_str.eq_ignore_ascii_case("false") {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidArgument,
-                    "x-amz-object-append must be 'true' or 'false'".to_string(),
-                ));
-            }
-        }
-
-        let mut append_action: Option<String> = None;
-        if let Some(action_value) = append_action_header {
-            let action_str = action_value.to_str().map_err(|_| {
-                S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid x-amz-append-action header".to_string())
-            })?;
-            append_action = Some(action_str.to_ascii_lowercase());
-        }
-
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, mt)
             .await
             .map_err(ApiError::from)?;
-
-        if append_requested {
-            opts.append_object = true;
-            opts.append_position = append_position;
-        }
-
-        if let Some(action) = append_action {
-            if append_requested {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidArgument,
-                    "x-amz-object-append cannot be combined with x-amz-append-action".to_string(),
-                ));
-            }
-
-            let obj_info = match action.as_str() {
-                "complete" => store.complete_append(&bucket, &key, &opts).await,
-                "abort" => store.abort_append(&bucket, &key, &opts).await,
-                _ => {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidArgument,
-                        "x-amz-append-action must be 'complete' or 'abort'".to_string(),
-                    ));
-                }
-            }
-            .map_err(ApiError::from)?;
-
-            let output = PutObjectOutput {
-                e_tag: obj_info.etag.clone(),
-                version_id: obj_info.version_id.map(|v| v.to_string()),
-                ..Default::default()
-            };
-
-            return Ok(S3Response::new(output));
-        }
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());

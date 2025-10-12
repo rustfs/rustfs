@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod append;
 mod error;
 pub mod fileinfo;
 mod filemeta;
@@ -23,7 +22,6 @@ mod replication;
 
 pub mod test_data;
 
-pub use append::*;
 pub use error::*;
 pub use fileinfo::*;
 pub use filemeta::*;

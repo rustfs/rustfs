@@ -49,9 +49,6 @@ use crate::{
     event::name::EventName,
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
-    object_append::{
-        InlineAppendContext, append_inline_data, decode_inline_payload, validate_append_position, validate_append_preconditions,
-    },
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
@@ -70,14 +67,15 @@ use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_filemeta::{
-    AppendSegment, AppendState, AppendStateKind, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry,
-    MetadataResolutionParams, ObjectPartInfo, RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, clear_append_state,
-    file_info_from_raw, get_append_state, merge_file_meta_versions, set_append_state, validate_new_segment,
+    FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
+    RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
-use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
+use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::{
     HashAlgorithm,
     crypto::{base64_decode, base64_encode, hex},
@@ -93,14 +91,12 @@ use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
     path::Path,
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
     time::Duration,
 };
 use time::OffsetDateTime;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::AsyncWrite,
     sync::{RwLock, broadcast},
 };
 use tokio::{
@@ -813,52 +809,6 @@ impl SetDisks {
 
         let disks = Self::eval_disks(disks, &errs);
         Ok(disks)
-    }
-
-    async fn rename_part_data(
-        disks: &[Option<DiskStore>],
-        src_bucket: &str,
-        src_object: &str,
-        dst_bucket: &str,
-        dst_object: &str,
-        write_quorum: usize,
-    ) -> disk::error::Result<Vec<Option<DiskStore>>> {
-        let src_bucket = Arc::new(src_bucket.to_string());
-        let src_object = Arc::new(src_object.to_string());
-        let dst_bucket = Arc::new(dst_bucket.to_string());
-        let dst_object = Arc::new(dst_object.to_string());
-
-        let mut errs = Vec::with_capacity(disks.len());
-
-        let futures = disks.iter().map(|disk| {
-            let disk = disk.clone();
-            let src_bucket = src_bucket.clone();
-            let src_object = src_object.clone();
-            let dst_bucket = dst_bucket.clone();
-            let dst_object = dst_object.clone();
-            tokio::spawn(async move {
-                if let Some(disk) = disk {
-                    disk.rename_file(&src_bucket, &src_object, &dst_bucket, &dst_object).await
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
-            })
-        });
-
-        let results = join_all(futures).await;
-        for result in results {
-            match result? {
-                Ok(_) => errs.push(None),
-                Err(err) => errs.push(Some(err)),
-            }
-        }
-
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            warn!("rename_part_data errs {:?}", &errs);
-            return Err(err);
-        }
-
-        Ok(Self::eval_disks(disks, &errs))
     }
 
     fn eval_disks(disks: &[Option<DiskStore>], errs: &[Option<DiskError>]) -> Vec<Option<DiskStore>> {
@@ -2214,97 +2164,27 @@ impl SetDisks {
         tracing::debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
-        // Check for pending segments in append state
-        let append_state = fi.get_append_state();
-        let has_pending_segments = !append_state.pending_segments.is_empty();
+        let total_size = fi.size as usize;
 
-        // Calculate total size including pending segments
-        let base_size = append_state.committed_length;
-        let pending_size: i64 = append_state.pending_segments.iter().map(|seg| seg.length).sum();
-        let total_logical_size = base_size + pending_size;
-
-        tracing::debug!(
-            bucket,
-            object,
-            base_size,
-            pending_size,
-            total_logical_size,
-            has_pending_segments,
-            pending_segments_count = append_state.pending_segments.len(),
-            "Append-aware object read"
-        );
-
-        let total_size = total_logical_size as usize;
-
-        let length = if length < 0 { total_size - offset } else { length as usize };
+        let length = if length < 0 {
+            fi.size as usize - offset
+        } else {
+            length as usize
+        };
 
         if offset > total_size || offset + length > total_size {
             error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }
 
-        let erasure = Arc::new(erasure_coding::Erasure::new(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-        ));
-
-        if fi.inline_data() {
-            let inline = fi
-                .data
-                .as_ref()
-                .ok_or_else(|| Error::other("inline payload missing for read"))?;
-            let (plain, _) = decode_inline_payload(inline, fi.size as usize, &erasure, HashAlgorithm::HighwayHash256)
-                .await
-                .map_err(|err| Error::other(format!("failed to decode inline data: {err}")))?;
-
-            let end = offset + length;
-            if end > plain.len() {
-                return Err(Error::other("inline payload shorter than expected"));
-            }
-
-            if length > 0 {
-                writer
-                    .write_all(&plain[offset..end])
-                    .await
-                    .map_err(|e| Error::other(format!("failed to stream inline payload: {e}")))?;
-            }
-
-            return Ok(());
-        }
-
-        // For regular parts reading, limit to base size (committed data)
-        let effective_read_end = (offset + length).min(base_size as usize);
-        let base_read_length = effective_read_end.saturating_sub(offset);
-
-        if base_read_length == 0 {
-            // Reading entirely from pending segments
-            tracing::debug!(
-                bucket,
-                object,
-                offset,
-                length,
-                base_size,
-                "Read entirely from pending segments, skipping regular parts"
-            );
-        }
-
-        let (part_index, mut part_offset) = if base_read_length > 0 {
-            fi.to_part_offset(offset)?
-        } else {
-            (0, 0) // Placeholder, won't be used
-        };
+        let (part_index, mut part_offset) = fi.to_part_offset(offset)?;
 
         let mut end_offset = offset;
-        if base_read_length > 0 {
-            end_offset += base_read_length - 1
+        if length > 0 {
+            end_offset += length - 1
         }
 
-        let (last_part_index, last_part_relative_offset) = if base_read_length > 0 {
-            fi.to_part_offset(end_offset)?
-        } else {
-            (0, 0) // Placeholder, won't be used
-        };
+        let (last_part_index, last_part_relative_offset) = fi.to_part_offset(end_offset)?;
 
         tracing::debug!(
             bucket,
@@ -2318,229 +2198,144 @@ impl SetDisks {
             "Multipart read bounds"
         );
 
+        let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         tracing::debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
 
         let mut total_read = 0;
-
-        // Only read from regular parts if there's base data to read
-        if base_read_length > 0 {
-            for current_part in part_indices {
-                if total_read == base_read_length {
-                    tracing::debug!(
-                        bucket,
-                        object,
-                        total_read,
-                        base_read_length,
-                        part_index = current_part,
-                        "Stopping multipart stream - reached base data limit"
-                    );
-                    break;
-                }
-
-                if total_read >= base_read_length {
-                    break;
-                }
-
-                let part_number = fi.parts[current_part].number;
-                let part_size = fi.parts[current_part].size;
-                let mut part_length = part_size - part_offset;
-                if part_length > (base_read_length - total_read) {
-                    part_length = base_read_length - total_read
-                }
-
-                let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
-
-                let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
-
+        for current_part in part_indices {
+            if total_read == length {
                 tracing::debug!(
                     bucket,
                     object,
+                    total_read,
+                    requested_length = length,
                     part_index = current_part,
-                    part_number,
-                    part_offset,
-                    part_size,
-                    part_length,
+                    "Stopping multipart stream early because accumulated bytes match request"
+                );
+                break;
+            }
+
+            let part_number = fi.parts[current_part].number;
+            let part_size = fi.parts[current_part].size;
+            let mut part_length = part_size - part_offset;
+            if part_length > (length - total_read) {
+                part_length = length - total_read
+            }
+
+            let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
+
+            let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
+
+            tracing::debug!(
+                bucket,
+                object,
+                part_index = current_part,
+                part_number,
+                part_offset,
+                part_size,
+                part_length,
+                read_offset,
+                till_offset,
+                total_read_before = total_read,
+                requested_length = length,
+                "Streaming multipart part"
+            );
+
+            let mut readers = Vec::with_capacity(disks.len());
+            let mut errors = Vec::with_capacity(disks.len());
+            for (idx, disk_op) in disks.iter().enumerate() {
+                match create_bitrot_reader(
+                    files[idx].data.as_deref(),
+                    disk_op.as_ref(),
+                    bucket,
+                    &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
                     read_offset,
                     till_offset,
-                    total_read_before = total_read,
-                    requested_length = length,
-                    "Streaming multipart part"
-                );
-
-                let mut readers = Vec::with_capacity(disks.len());
-                let mut errors = Vec::with_capacity(disks.len());
-                for (idx, disk_op) in disks.iter().enumerate() {
-                    let checksum_algo = if fi.erasure.checksums.is_empty() {
-                        HashAlgorithm::HighwayHash256
-                    } else {
-                        fi.erasure.get_checksum_info(part_number).algorithm
-                    };
-
-                    let use_inline = matches!(append_state.state, AppendStateKind::Inline | AppendStateKind::InlinePendingSpill);
-                    let inline_source = if use_inline { files[idx].data.as_deref() } else { None };
-
-                    if let Some(inline) = inline_source {
-                        info!(bucket, object, part_number, inline_len = inline.len(), "using inline data for shard read");
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256,
+                )
+                .await
+                {
+                    Ok(Some(reader)) => {
+                        readers.push(Some(reader));
+                        errors.push(None);
                     }
-
-                    match create_bitrot_reader(
-                        inline_source,
-                        disk_op.as_ref(),
-                        bucket,
-                        &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
-                        read_offset,
-                        till_offset,
-                        erasure.shard_size(),
-                        checksum_algo,
-                    )
-                    .await
-                    {
-                        Ok(Some(reader)) => {
-                            readers.push(Some(reader));
-                            errors.push(None);
-                        }
-                        Ok(None) => {
-                            readers.push(None);
-                            errors.push(Some(DiskError::DiskNotFound));
-                        }
-                        Err(e) => {
-                            readers.push(None);
-                            errors.push(Some(e));
-                        }
+                    Ok(None) => {
+                        readers.push(None);
+                        errors.push(Some(DiskError::DiskNotFound));
+                    }
+                    Err(e) => {
+                        readers.push(None);
+                        errors.push(Some(e));
                     }
                 }
-
-                let nil_count = errors.iter().filter(|&e| e.is_none()).count();
-                if nil_count < erasure.data_shards {
-                    if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
-                        error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
-                        return Err(to_object_err(read_err.into(), vec![bucket, object]));
-                    }
-                    error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
-                    return Err(Error::other(format!("not enough disks to read: {errors:?}")));
-                }
-
-                // debug!(
-                //     "read part {} part_offset {},part_length {},part_size {}  ",
-                //     part_number, part_offset, part_length, part_size
-                // );
-                let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
-                tracing::debug!(
-                    bucket,
-                    object,
-                    part_index = current_part,
-                    part_number,
-                    part_length,
-                    bytes_written = written,
-                    "Finished decoding multipart part"
-                );
-                if let Some(e) = err {
-                    let de_err: DiskError = e.into();
-                    let mut has_err = true;
-                    if written == part_length {
-                        match de_err {
-                            DiskError::FileNotFound | DiskError::FileCorrupt => {
-                                error!("erasure.decode err 111 {:?}", &de_err);
-                                let _ = rustfs_common::heal_channel::send_heal_request(
-                                    rustfs_common::heal_channel::create_heal_request_with_options(
-                                        bucket.to_string(),
-                                        Some(object.to_string()),
-                                        false,
-                                        Some(HealChannelPriority::Normal),
-                                        Some(pool_index),
-                                        Some(set_index),
-                                    ),
-                                )
-                                .await;
-                                has_err = false;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if has_err {
-                        error!("erasure.decode err {} {:?}", written, &de_err);
-                        return Err(de_err.into());
-                    }
-                }
-
-                // debug!("ec decode {} written size {}", part_number, n);
-
-                total_read += part_length;
-                part_offset = 0;
             }
+
+            let nil_count = errors.iter().filter(|&e| e.is_none()).count();
+            if nil_count < erasure.data_shards {
+                if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+                    error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
+                    return Err(to_object_err(read_err.into(), vec![bucket, object]));
+                }
+                error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
+                return Err(Error::other(format!("not enough disks to read: {errors:?}")));
+            }
+
+            // debug!(
+            //     "read part {} part_offset {},part_length {},part_size {}  ",
+            //     part_number, part_offset, part_length, part_size
+            // );
+            let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            tracing::debug!(
+                bucket,
+                object,
+                part_index = current_part,
+                part_number,
+                part_length,
+                bytes_written = written,
+                "Finished decoding multipart part"
+            );
+            if let Some(e) = err {
+                let de_err: DiskError = e.into();
+                let mut has_err = true;
+                if written == part_length {
+                    match de_err {
+                        DiskError::FileNotFound | DiskError::FileCorrupt => {
+                            error!("erasure.decode err 111 {:?}", &de_err);
+                            let _ = rustfs_common::heal_channel::send_heal_request(
+                                rustfs_common::heal_channel::create_heal_request_with_options(
+                                    bucket.to_string(),
+                                    Some(object.to_string()),
+                                    false,
+                                    Some(HealChannelPriority::Normal),
+                                    Some(pool_index),
+                                    Some(set_index),
+                                ),
+                            )
+                            .await;
+                            has_err = false;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if has_err {
+                    error!("erasure.decode err {} {:?}", written, &de_err);
+                    return Err(de_err.into());
+                }
+            }
+
+            // debug!("ec decode {} written size {}", part_number, n);
+
+            total_read += part_length;
+            part_offset = 0;
         }
 
         // debug!("read end");
 
-        // Handle pending segments if we haven't read enough data and there are pending segments
-        if has_pending_segments && offset + length > append_state.committed_length as usize {
-            tracing::debug!(
-                bucket,
-                object,
-                offset,
-                length,
-                base_size,
-                total_read,
-                pending_segments_count = append_state.pending_segments.len(),
-                "Reading from pending segments"
-            );
-
-            let read_start = offset;
-            let read_end = offset + length;
-
-            for (seg_index, segment) in append_state.pending_segments.iter().enumerate() {
-                if total_read >= length {
-                    break;
-                }
-
-                let seg_start = segment.offset as usize;
-                let seg_end = (segment.offset + segment.length) as usize;
-
-                if seg_end <= read_start {
-                    continue;
-                }
-                if seg_start >= read_end {
-                    break;
-                }
-
-                tracing::debug!(
-                    bucket,
-                    object,
-                    seg_index,
-                    seg_start,
-                    seg_end,
-                    read_start,
-                    read_end,
-                    "Loading pending segment data"
-                );
-
-                let segment_data =
-                    Self::load_pending_segment(bucket, object, erasure.clone(), &disks, segment, fi.erasure.data_blocks).await?;
-
-                let slice_start = read_start.max(seg_start) - seg_start;
-                let slice_end = read_end.min(seg_end) - seg_start;
-
-                if slice_end > slice_start {
-                    writer
-                        .write_all(&segment_data[slice_start..slice_end])
-                        .await
-                        .map_err(|e| Error::other(format!("failed to stream pending segment: {e}")))?;
-                    total_read += slice_end - slice_start;
-                }
-            }
-        }
-
-        tracing::debug!(
-            bucket,
-            object,
-            total_read,
-            expected_length = length,
-            has_pending_segments,
-            final_total_read = total_read,
-            "Append-aware multipart read finished"
-        );
+        tracing::debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
 
         Ok(())
     }
@@ -3648,813 +3443,6 @@ impl SetDisks {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, data, opts), fields(bucket, object))]
-    async fn append_inline_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &mut PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
-        let info_opts = ObjectOptions {
-            version_id: opts.version_id.clone(),
-            versioned: opts.versioned,
-            version_suspended: opts.version_suspended,
-            no_lock: true,
-            ..Default::default()
-        };
-
-        let (mut fi, mut parts_metadata, online_disks) = self.get_object_fileinfo(bucket, object, &info_opts, true).await?;
-
-        if fi.deleted {
-            return Err(StorageError::InvalidArgument(
-                bucket.to_string(),
-                object.to_string(),
-                "cannot append to deleted object".to_string(),
-            ));
-        }
-
-        let append_state_snapshot = fi.get_append_state();
-        let mut object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-
-        validate_append_preconditions(bucket, object, &object_info)?;
-
-        let position = opts.append_position.ok_or_else(|| {
-            StorageError::InvalidArgument(
-                bucket.to_string(),
-                object.to_string(),
-                "x-amz-append-position header required".to_string(),
-            )
-        })?;
-
-        let base_size_snapshot: i64 = append_state_snapshot.committed_length;
-        let pending_length_snapshot: i64 = append_state_snapshot.pending_segments.iter().map(|seg| seg.length).sum();
-        let expected_position_snapshot = base_size_snapshot.saturating_add(pending_length_snapshot);
-        if position != expected_position_snapshot {
-            return Err(StorageError::InvalidArgument(
-                bucket.to_string(),
-                object.to_string(),
-                format!("append position mismatch: provided {}, expected {}", position, expected_position_snapshot),
-            ));
-        }
-
-        let mut append_payload = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut data.stream, &mut append_payload)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to read append payload: {e}")))?;
-
-        data.stream = HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)
-            .map_err(StorageError::other)?;
-
-        if !fi.inline_data() {
-            return self
-                .append_segmented_object(fi, parts_metadata, bucket, object, append_payload, opts, position)
-                .await;
-        }
-
-        let existing_inline = fi.data.as_ref().map(|b| b.as_ref());
-        let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
-        let mut hash_algorithm = fi
-            .parts
-            .first()
-            .map(|part| fi.erasure.get_checksum_info(part.number).algorithm)
-            .unwrap_or(HashAlgorithm::HighwayHash256);
-        let mut existing_plain_override: Option<Vec<u8>> = None;
-        if fi.erasure.checksums.is_empty() {
-            hash_algorithm = HashAlgorithm::HighwayHash256;
-        }
-
-        if let Some(inline) = existing_inline {
-            debug!(
-                existing_size = fi.size,
-                inline_len = inline.len(),
-                ?hash_algorithm,
-                erasure_checksums = ?fi.erasure.checksums,
-                inline_has_checksums = !fi.erasure.checksums.is_empty(),
-                "append inline metadata"
-            );
-
-            match decode_inline_payload(inline, fi.size as usize, &erasure, hash_algorithm.clone()).await {
-                Ok((plain, detected_algo)) => {
-                    hash_algorithm = detected_algo;
-                    existing_plain_override = Some(plain);
-                }
-                Err(err) => {
-                    return Err(StorageError::other(format!("failed to decode inline data: {err}")));
-                }
-            }
-        }
-
-        let has_checksums = !fi.erasure.checksums.is_empty();
-
-        let append_ctx = InlineAppendContext {
-            existing_inline,
-            existing_plain: existing_plain_override.as_deref(),
-            existing_size: fi.size,
-            append_payload: &append_payload,
-            erasure: &erasure,
-            hash_algorithm: hash_algorithm.clone(),
-            has_checksums,
-        };
-
-        let append_result = append_inline_data(append_ctx).await?;
-
-        // Check if we need to spill to segmented mode after append
-        let total_shard_size = erasure.shard_file_size(append_result.total_size);
-        let should_remain_inline = if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
-            sc.should_inline(total_shard_size, opts.versioned)
-        } else {
-            true // fallback to inline if no storage class config
-        };
-
-        if !should_remain_inline {
-            let mut plain_total = if let Some(existing_plain) = existing_plain_override.clone() {
-                existing_plain
-            } else if let Some(inline) = existing_inline {
-                let (plain, _) = decode_inline_payload(inline, fi.size as usize, &erasure, hash_algorithm.clone())
-                    .await
-                    .map_err(|err| StorageError::other(format!("failed to decode inline data: {err}")))?;
-                plain
-            } else {
-                Vec::new()
-            };
-            plain_total.extend_from_slice(&append_payload);
-            info!(
-                bucket,
-                object,
-                total_size = append_result.total_size,
-                existing_inline_len = fi.size,
-                plain_total_len = plain_total.len(),
-                append_payload_len = append_payload.len(),
-                shard_size = total_shard_size,
-                "Inline object exceeds threshold, spilling to segmented storage"
-            );
-
-            return self
-                .spill_inline_into_segmented(
-                    fi,
-                    parts_metadata,
-                    bucket,
-                    object,
-                    plain_total,
-                    append_result.etag.clone(),
-                    opts,
-                    AppendStateKind::SegmentedActive,
-                )
-                .await;
-        }
-
-        let inline_bytes = Bytes::from(append_result.inline_data.clone());
-        let now = OffsetDateTime::now_utc();
-
-        fi.mod_time = Some(now);
-        fi.size = append_result.total_size;
-        fi.data = Some(inline_bytes.clone());
-        fi.metadata.insert("etag".to_owned(), append_result.etag.clone());
-        fi.set_inline_data();
-        fi.metadata.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"),
-            append_result.total_size.to_string(),
-        );
-        fi.metadata
-            .insert("x-rustfs-encryption-original-size".to_string(), append_result.total_size.to_string());
-        if !has_checksums {
-            fi.erasure.checksums.clear();
-        }
-
-        let mut append_state = match get_append_state(&fi.metadata) {
-            Ok(Some(state)) => state,
-            Ok(None) => AppendState::default(),
-            Err(err) => {
-                return Err(StorageError::other(format!("failed to decode append state: {err}")));
-            }
-        };
-        append_state.state = AppendStateKind::Inline;
-        append_state.committed_length = append_result.total_size;
-        append_state.pending_segments.clear();
-        append_state.epoch = append_state.epoch.saturating_add(1);
-
-        set_append_state(&mut fi.metadata, &append_state)
-            .map_err(|err| StorageError::other(format!("failed to persist append state: {err}")))?;
-        fi.parts.clear();
-        fi.add_object_part(
-            1,
-            append_result.etag.clone(),
-            append_result.total_size as usize,
-            Some(now),
-            append_result.total_size,
-            None,
-        );
-
-        for meta in parts_metadata.iter_mut() {
-            if !meta.is_valid() {
-                continue;
-            }
-            meta.mod_time = fi.mod_time;
-            meta.size = fi.size;
-            meta.metadata = fi.metadata.clone();
-            meta.parts = fi.parts.clone();
-            meta.data = Some(inline_bytes.clone());
-            meta.set_inline_data();
-            if !has_checksums {
-                meta.erasure.checksums.clear();
-            }
-        }
-
-        let write_quorum = fi.write_quorum(self.default_write_quorum());
-
-        Self::write_unique_file_info(&online_disks, "", bucket, object, &parts_metadata, write_quorum).await?;
-
-        object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        object_info.etag = Some(append_result.etag.clone());
-
-        Ok(object_info)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn spill_inline_into_segmented(
-        &self,
-        mut fi: FileInfo,
-        mut parts_metadata: Vec<FileInfo>,
-        bucket: &str,
-        object: &str,
-        plain_data: Vec<u8>,
-        etag: String,
-        opts: &ObjectOptions,
-        target_state: AppendStateKind,
-    ) -> Result<ObjectInfo> {
-        let write_quorum = fi.write_quorum(self.default_write_quorum());
-        let disks_guard = self.disks.read().await;
-        let shuffle_disks = Self::shuffle_disks(&disks_guard, &fi.erasure.distribution);
-
-        let mut data_reader = PutObjReader::from_vec(plain_data.clone());
-        let erasure = Arc::new(erasure_coding::Erasure::new(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-        ));
-
-        let mut append_state = match get_append_state(&fi.metadata) {
-            Ok(Some(state)) => state,
-            Ok(None) => fi.get_append_state(),
-            Err(err) => {
-                warn!(
-                    ?err,
-                    bucket, object, "failed to decode append state from metadata, falling back to inferred state"
-                );
-                fi.get_append_state()
-            }
-        };
-
-        let tmp_root = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
-        let data_dir = Uuid::new_v4();
-        let tmp_part_path = format!("{tmp_root}/{data_dir}/part.1");
-        let final_part_path = format!("{}/{}/part.1", object, data_dir);
-
-        let mut writers = Vec::with_capacity(shuffle_disks.len());
-        let mut errors = Vec::with_capacity(shuffle_disks.len());
-        for disk in shuffle_disks.iter() {
-            if let Some(disk) = disk {
-                let writer = create_bitrot_writer(
-                    false,
-                    Some(disk),
-                    RUSTFS_META_TMP_BUCKET,
-                    &tmp_part_path,
-                    erasure.shard_file_size(data_reader.size()),
-                    erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
-                )
-                .await?;
-                writers.push(Some(writer));
-                errors.push(None);
-            } else {
-                writers.push(None);
-                errors.push(Some(DiskError::DiskNotFound));
-            }
-        }
-
-        let healthy_writers = errors.iter().filter(|err| err.is_none()).count();
-        if healthy_writers < write_quorum {
-            if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-                return Err(write_err.into());
-            }
-            return Err(StorageError::other("not enough disks for spill"));
-        }
-
-        let stream = mem::replace(
-            &mut data_reader.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)
-                .map_err(StorageError::other)?,
-        );
-
-        let (reader, written_size) = erasure
-            .clone()
-            .encode(stream, &mut writers, write_quorum)
-            .await
-            .map_err(StorageError::other)?;
-
-        let _ = mem::replace(&mut data_reader.stream, reader);
-
-        if (written_size as i64) < data_reader.size() {
-            return Err(StorageError::other("spill write truncated payload"));
-        }
-
-        drop(writers);
-
-        let rename_result = Self::rename_part_data(
-            &shuffle_disks,
-            RUSTFS_META_TMP_BUCKET,
-            &tmp_part_path,
-            bucket,
-            &final_part_path,
-            write_quorum,
-        )
-        .await;
-
-        let cleanup_result = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_root).await;
-
-        let online_disks = match rename_result {
-            Ok(disks) => {
-                cleanup_result?;
-                disks
-            }
-            Err(err) => {
-                if let Err(clean_err) = cleanup_result {
-                    warn!("spill cleanup failed after rename error: {clean_err:?}");
-                }
-                return Err(err.into());
-            }
-        };
-
-        let now = OffsetDateTime::now_utc();
-        fi.mod_time = Some(now);
-        fi.size = plain_data.len() as i64;
-        fi.data = None;
-        fi.data_dir = Some(data_dir);
-        fi.metadata.remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data"));
-        fi.metadata.insert("etag".to_owned(), etag.clone());
-        fi.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), fi.size.to_string());
-        fi.metadata
-            .insert("x-rustfs-encryption-original-size".to_string(), fi.size.to_string());
-
-        fi.parts.clear();
-        fi.add_object_part(1, etag.clone(), plain_data.len(), Some(now), fi.size, None);
-
-        append_state.state = target_state;
-        append_state.committed_length = fi.size;
-        append_state.pending_segments.clear();
-        append_state.epoch = append_state.epoch.saturating_add(1);
-        set_append_state(&mut fi.metadata, &append_state)
-            .map_err(|err| StorageError::other(format!("failed to persist append state: {err}")))?;
-
-        for meta in parts_metadata.iter_mut() {
-            if !meta.is_valid() {
-                continue;
-            }
-            meta.mod_time = fi.mod_time;
-            meta.size = fi.size;
-            meta.data = None;
-            meta.data_dir = Some(data_dir);
-            meta.metadata = fi.metadata.clone();
-            meta.parts = fi.parts.clone();
-            meta.metadata.remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data"));
-        }
-
-        Self::write_unique_file_info(&online_disks, "", bucket, object, &parts_metadata, write_quorum).await?;
-
-        let mut object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        object_info.etag = Some(etag);
-
-        Ok(object_info)
-    }
-
-    async fn load_pending_segment(
-        bucket: &str,
-        object: &str,
-        erasure: Arc<erasure_coding::Erasure>,
-        disks: &[Option<DiskStore>],
-        segment: &AppendSegment,
-        read_quorum: usize,
-    ) -> Result<Vec<u8>> {
-        let segment_dir = segment
-            .data_dir
-            .ok_or_else(|| StorageError::other("append segment missing data directory"))?;
-        let segment_path = format!("{}/append/{}/{segment_dir}/part.1", object, segment.epoch);
-
-        let mut readers = Vec::with_capacity(disks.len());
-        let mut errors = Vec::with_capacity(disks.len());
-        for disk in disks.iter() {
-            if let Some(disk) = disk {
-                match create_bitrot_reader(
-                    None,
-                    Some(disk),
-                    bucket,
-                    &segment_path,
-                    0,
-                    segment.length as usize,
-                    erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
-                )
-                .await
-                {
-                    Ok(Some(reader)) => {
-                        readers.push(Some(reader));
-                        errors.push(None);
-                    }
-                    Ok(None) => {
-                        readers.push(None);
-                        errors.push(Some(DiskError::DiskNotFound));
-                    }
-                    Err(err) => {
-                        readers.push(None);
-                        errors.push(Some(err));
-                    }
-                }
-            } else {
-                readers.push(None);
-                errors.push(Some(DiskError::DiskNotFound));
-            }
-        }
-
-        if let Some(err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, read_quorum) {
-            return Err(err.into());
-        }
-
-        let mut writer = VecAsyncWriter::with_capacity(segment.length as usize);
-        let (written, err) = erasure
-            .decode(&mut writer, readers, 0, segment.length as usize, segment.length as usize)
-            .await;
-        if let Some(e) = err {
-            let de: DiskError = e.into();
-            return Err(de.into());
-        }
-
-        if written < segment.length as usize {
-            return Err(StorageError::other("pending segment read truncated"));
-        }
-
-        Ok(writer.into_inner())
-    }
-
-    async fn remove_pending_segments_data(&self, bucket: &str, object: &str, segments: &[AppendSegment]) -> Result<()> {
-        for segment in segments {
-            if let Some(dir) = segment.data_dir {
-                let prefix = format!("{}/append/{}/{}", object, segment.epoch, dir);
-                self.delete_all(bucket, &prefix).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn complete_append_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let mut info_opts = opts.clone();
-        info_opts.no_lock = true;
-
-        let (fi, parts_metadata, online_disks) = self.get_object_fileinfo(bucket, object, &info_opts, true).await?;
-
-        let append_state = fi.get_append_state();
-        if append_state.pending_segments.is_empty() {
-            return Err(StorageError::other("no pending segments to complete"));
-        }
-
-        let pending_size: i64 = append_state.pending_segments.iter().map(|seg| seg.length).sum();
-        let total_logical = append_state.committed_length.saturating_add(pending_size);
-
-        let mut writer = VecAsyncWriter::with_capacity(total_logical as usize);
-        Self::get_object_with_fileinfo(
-            bucket,
-            object,
-            0,
-            total_logical,
-            &mut writer,
-            fi.clone(),
-            parts_metadata.clone(),
-            &online_disks,
-            self.set_index,
-            self.pool_index,
-        )
-        .await?;
-
-        let plain_data = writer.into_inner();
-        let final_etag = format!("{:x}", Md5::digest(&plain_data));
-
-        let result_info = self
-            .spill_inline_into_segmented(
-                fi,
-                parts_metadata,
-                bucket,
-                object,
-                plain_data,
-                final_etag,
-                opts,
-                AppendStateKind::SegmentedSealed,
-            )
-            .await?;
-
-        self.remove_pending_segments_data(bucket, object, &append_state.pending_segments)
-            .await?;
-
-        Ok(result_info)
-    }
-
-    async fn abort_append_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let mut info_opts = opts.clone();
-        info_opts.no_lock = true;
-
-        let (mut fi, mut parts_metadata, online_disks) = self.get_object_fileinfo(bucket, object, &info_opts, true).await?;
-
-        let mut append_state = fi.get_append_state();
-        if append_state.pending_segments.is_empty() {
-            return Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
-        }
-
-        self.remove_pending_segments_data(bucket, object, &append_state.pending_segments)
-            .await?;
-
-        append_state.pending_segments.clear();
-        append_state.state = AppendStateKind::SegmentedSealed;
-        append_state.epoch = append_state.epoch.saturating_add(1);
-
-        let mut committed_length = append_state.committed_length;
-        let actual_committed = if fi.inline_data() {
-            fi.data.as_ref().map(|buf| buf.len() as i64).unwrap_or(committed_length)
-        } else if fi.parts.is_empty() {
-            fi.size
-        } else {
-            fi.parts.iter().map(|part| part.size as i64).sum()
-        };
-
-        if actual_committed != committed_length {
-            warn!(
-                bucket,
-                object,
-                recorded_length = committed_length,
-                actual_length = actual_committed,
-                "abort append detected committed length mismatch, correcting"
-            );
-            committed_length = actual_committed;
-            append_state.committed_length = actual_committed;
-        }
-
-        fi.mod_time = Some(OffsetDateTime::now_utc());
-        fi.size = committed_length;
-        fi.data = None;
-        fi.metadata.remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data"));
-
-        set_append_state(&mut fi.metadata, &append_state)
-            .map_err(|err| StorageError::other(format!("failed to persist append state: {err}")))?;
-
-        let complete_parts: Vec<CompletePart> = fi
-            .parts
-            .iter()
-            .map(|part| CompletePart {
-                part_num: part.number,
-                etag: Some(part.etag.clone()),
-            })
-            .collect();
-        let base_etag = if complete_parts.is_empty() {
-            fi.metadata.get("etag").cloned().unwrap_or_default()
-        } else {
-            get_complete_multipart_md5(&complete_parts)
-        };
-
-        fi.metadata.insert("etag".to_owned(), base_etag.clone());
-        fi.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), committed_length.to_string());
-        fi.metadata
-            .insert("x-rustfs-encryption-original-size".to_string(), committed_length.to_string());
-
-        for meta in parts_metadata.iter_mut() {
-            if !meta.is_valid() {
-                continue;
-            }
-            meta.mod_time = fi.mod_time;
-            meta.size = fi.size;
-            meta.metadata = fi.metadata.clone();
-            meta.parts = fi.parts.clone();
-            meta.data = None;
-            meta.data_dir = fi.data_dir;
-        }
-
-        let write_quorum = fi.write_quorum(self.default_write_quorum());
-        Self::write_unique_file_info(&online_disks, "", bucket, object, &parts_metadata, write_quorum).await?;
-
-        let mut object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        object_info.etag = Some(base_etag);
-
-        Ok(object_info)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn append_segmented_object(
-        &self,
-        mut fi: FileInfo,
-        mut parts_metadata: Vec<FileInfo>,
-        bucket: &str,
-        object: &str,
-        append_payload: Vec<u8>,
-        opts: &ObjectOptions,
-        position: i64,
-    ) -> Result<ObjectInfo> {
-        let data_dir = fi
-            .data_dir
-            .ok_or_else(|| StorageError::other(format!("append requires existing data directory for {bucket}/{object}")))?;
-
-        let mut append_state = match get_append_state(&fi.metadata) {
-            Ok(Some(state)) => state,
-            Ok(None) => fi.get_append_state(),
-            Err(err) => {
-                warn!(?err, bucket, object, "failed to decode append state from metadata, using inferred state");
-                fi.get_append_state()
-            }
-        };
-
-        if matches!(append_state.state, AppendStateKind::Inline | AppendStateKind::InlinePendingSpill) {
-            return Err(StorageError::other("segmented append invoked while object still inline"));
-        }
-
-        if append_state.state == AppendStateKind::SegmentedSealed {
-            append_state.state = AppendStateKind::SegmentedActive;
-        }
-
-        let pending_length: i64 = append_state.pending_segments.iter().map(|seg| seg.length).sum();
-        let expected_offset = append_state.committed_length.saturating_add(pending_length);
-        if position != expected_offset {
-            return Err(StorageError::InvalidArgument(
-                bucket.to_string(),
-                object.to_string(),
-                format!("append position mismatch: provided {position}, expected {expected_offset}"),
-            ));
-        }
-
-        let new_length = append_payload.len() as i64;
-        validate_new_segment(&append_state, position, new_length)
-            .map_err(|err| StorageError::other(format!("invalid append segment: {err}")))?;
-
-        let write_quorum = fi.write_quorum(self.default_write_quorum());
-        let disks_guard = self.disks.read().await;
-        let shuffle_disks = Self::shuffle_disks(&disks_guard, &fi.erasure.distribution);
-
-        let mut append_reader = PutObjReader::from_vec(append_payload);
-        let erasure = Arc::new(erasure_coding::Erasure::new(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-        ));
-
-        let tmp_root = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
-        let segment_id = Uuid::new_v4();
-        let new_epoch = append_state.epoch.saturating_add(1);
-        let tmp_part_path = format!("{tmp_root}/append/{new_epoch}/{segment_id}/part.1");
-        let final_part_path = format!("{}/append/{new_epoch}/{segment_id}/part.1", object);
-
-        let mut writers = Vec::with_capacity(shuffle_disks.len());
-        let mut errors = Vec::with_capacity(shuffle_disks.len());
-        for disk in shuffle_disks.iter() {
-            if let Some(disk) = disk {
-                let writer = create_bitrot_writer(
-                    false,
-                    Some(disk),
-                    RUSTFS_META_TMP_BUCKET,
-                    &tmp_part_path,
-                    erasure.shard_file_size(append_reader.size()),
-                    erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
-                )
-                .await?;
-                writers.push(Some(writer));
-                errors.push(None);
-            } else {
-                writers.push(None);
-                errors.push(Some(DiskError::DiskNotFound));
-            }
-        }
-
-        let healthy_writers = errors.iter().filter(|err| err.is_none()).count();
-        if healthy_writers < write_quorum {
-            if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-                return Err(write_err.into());
-            }
-            return Err(StorageError::other("not enough disks for append"));
-        }
-
-        let stream = mem::replace(
-            &mut append_reader.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)
-                .map_err(StorageError::other)?,
-        );
-
-        let (reader, written_size) = erasure
-            .clone()
-            .encode(stream, &mut writers, write_quorum)
-            .await
-            .map_err(StorageError::other)?;
-
-        let _ = mem::replace(&mut append_reader.stream, reader);
-
-        if (written_size as i64) < append_reader.size() {
-            return Err(StorageError::other("append write truncated payload"));
-        }
-
-        let mut part_etag = append_reader.stream.try_resolve_etag().unwrap_or_default();
-        if let Some(ref tag) = opts.preserve_etag {
-            part_etag = tag.clone();
-        }
-
-        drop(writers);
-
-        let rename_result = Self::rename_part_data(
-            &shuffle_disks,
-            RUSTFS_META_TMP_BUCKET,
-            &tmp_part_path,
-            bucket,
-            &final_part_path,
-            write_quorum,
-        )
-        .await;
-
-        let cleanup_result = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_root).await;
-
-        let online_disks = match rename_result {
-            Ok(disks) => {
-                cleanup_result?;
-                disks
-            }
-            Err(err) => {
-                if let Err(clean_err) = cleanup_result {
-                    warn!("append cleanup failed after rename error: {clean_err:?}");
-                }
-                return Err(err.into());
-            }
-        };
-
-        let segment = AppendSegment {
-            offset: position,
-            length: new_length,
-            data_dir: Some(segment_id),
-            etag: Some(part_etag.clone()),
-            epoch: new_epoch,
-        };
-
-        append_state.pending_segments.push(segment);
-        append_state.epoch = new_epoch;
-        append_state.state = AppendStateKind::SegmentedActive;
-
-        let logical_size = append_state
-            .committed_length
-            .saturating_add(append_state.pending_segments.iter().map(|seg| seg.length).sum());
-        fi.size = logical_size;
-        fi.mod_time = Some(OffsetDateTime::now_utc());
-
-        // Update etag to include pending segments
-        let mut aggregate_parts: Vec<CompletePart> = fi
-            .parts
-            .iter()
-            .map(|part| CompletePart {
-                part_num: part.number,
-                etag: Some(part.etag.clone()),
-            })
-            .collect();
-        let mut next_part_number = aggregate_parts.last().map(|p| p.part_num).unwrap_or(0);
-        for pending in append_state.pending_segments.iter() {
-            next_part_number += 1;
-            aggregate_parts.push(CompletePart {
-                part_num: next_part_number,
-                etag: pending.etag.clone(),
-            });
-        }
-        let aggregate_etag = get_complete_multipart_md5(&aggregate_parts);
-
-        fi.metadata.insert("etag".to_owned(), aggregate_etag.clone());
-        fi.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), logical_size.to_string());
-        fi.metadata
-            .insert("x-rustfs-encryption-original-size".to_string(), logical_size.to_string());
-
-        set_append_state(&mut fi.metadata, &append_state)
-            .map_err(|err| StorageError::other(format!("failed to persist append state: {err}")))?;
-
-        for meta in parts_metadata.iter_mut() {
-            if !meta.is_valid() {
-                continue;
-            }
-            meta.mod_time = fi.mod_time;
-            meta.size = fi.size;
-            meta.metadata = fi.metadata.clone();
-            meta.parts = fi.parts.clone();
-            meta.data = None;
-            meta.versioned = opts.versioned || opts.version_suspended;
-        }
-
-        Self::write_unique_file_info(&online_disks, "", bucket, object, &parts_metadata, write_quorum).await?;
-
-        let mut object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        object_info.etag = Some(aggregate_etag);
-
-        Ok(object_info)
-    }
-
     async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
         let mut opts = opts.clone();
 
@@ -4605,16 +3593,6 @@ impl ObjectIO for SetDisks {
         } else {
             None
         };
-
-        if opts.append_object {
-            if opts.http_preconditions.clone().is_some() {
-                if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
-                    return Err(err);
-                }
-            }
-
-            return self.append_inline_object(bucket, object, data, opts).await;
-        }
 
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -4839,37 +3817,6 @@ impl ObjectIO for SetDisks {
 
         // TODO: version support
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
-    }
-}
-
-struct VecAsyncWriter {
-    buffer: Vec<u8>,
-}
-
-impl VecAsyncWriter {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            buffer: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.buffer
-    }
-}
-
-impl AsyncWrite for VecAsyncWriter {
-    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        self.buffer.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -5285,42 +4232,6 @@ impl StorageAPI for SetDisks {
         // TODO: add_partial
 
         (del_objects, del_errs)
-    }
-
-    async fn complete_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let mut info_opts = opts.clone();
-        info_opts.no_lock = true;
-
-        let _object_lock_guard = if !opts.no_lock {
-            Some(
-                self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
-            )
-        } else {
-            None
-        };
-
-        self.complete_append_object(bucket, object, &info_opts).await
-    }
-
-    async fn abort_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let mut info_opts = opts.clone();
-        info_opts.no_lock = true;
-
-        let _object_lock_guard = if !opts.no_lock {
-            Some(
-                self.fast_lock_manager
-                    .acquire_write_lock("", object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|_| Error::other("can not get lock. please retry".to_string()))?,
-            )
-        } else {
-            None
-        };
-
-        self.abort_append_object(bucket, object, &info_opts).await
     }
 
     #[tracing::instrument(skip(self))]

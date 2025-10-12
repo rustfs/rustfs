@@ -33,7 +33,6 @@ pub mod file_cache;
 pub mod global;
 pub mod metrics_realtime;
 pub mod notification_sys;
-pub mod object_append;
 pub mod pools;
 pub mod rebalance;
 pub mod rpc;
