@@ -2422,9 +2422,16 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        // No more versions, delete the entire object directory
-        // This ensures empty object directories are cleaned up
-        self.delete_file(&volume_dir, &file_path, true, false).await
+        // No more versions, delete the entire object directory immediately
+        // Use direct removal instead of move_to_trash to ensure cleanup
+        // move_to_trash can fail silently leaving directories behind
+        if let Err(err) = tokio::fs::remove_dir_all(&file_path).await {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+
+        Ok(())
     }
     #[tracing::instrument(level = "debug", skip(self))]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, _opts: DeleteOptions) -> Vec<Option<Error>> {
