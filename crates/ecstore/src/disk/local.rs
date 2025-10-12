@@ -846,6 +846,7 @@ impl LocalDisk {
             }
 
             // Clean up append segments if present (get from stored FileInfo metadata)
+            // Note: append segments are temporary data and should be deleted immediately
             let stored_append_state = if let Ok((_, stored_fi)) = fm.find_version(fi.version_id) {
                 let fileinfo = stored_fi.into_fileinfo(volume, path, false);
                 rustfs_filemeta::get_append_state(&fileinfo.metadata).ok().flatten()
@@ -862,8 +863,9 @@ impl LocalDisk {
                                 &format!("{}/append/{}/{}", path, segment.epoch, segment_dir),
                             )?;
 
-                            if let Err(err) = self.move_to_trash(&append_segment_path, true, false).await {
-                                if !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound) {
+                            // Use direct removal instead of move_to_trash for immediate cleanup
+                            if let Err(err) = tokio::fs::remove_dir_all(&append_segment_path).await {
+                                if err.kind() != ErrorKind::NotFound {
                                     warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
                                 }
                             }
@@ -2368,9 +2370,11 @@ impl DiskAPI for LocalDisk {
 
         // Clean up append segments if present
         // Append segments are stored in {object}/append/{epoch}/{uuid} directories
+        // Note: append segments are temporary data and should be deleted immediately
+        // without going through the trash system to avoid delays
         if let Some(append_state) = stored_append_state {
             if !append_state.pending_segments.is_empty() {
-                // Clean up each pending segment
+                // Clean up each pending segment immediately
                 for segment in &append_state.pending_segments {
                     if let Some(segment_dir) = segment.data_dir {
                         let append_segment_path = file_path
@@ -2378,8 +2382,9 @@ impl DiskAPI for LocalDisk {
                             .join(segment.epoch.to_string())
                             .join(segment_dir.to_string());
 
-                        if let Err(err) = self.move_to_trash(&append_segment_path, true, false).await {
-                            if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                        // Use direct removal instead of move_to_trash for immediate cleanup
+                        if let Err(err) = tokio::fs::remove_dir_all(&append_segment_path).await {
+                            if err.kind() != ErrorKind::NotFound {
                                 warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
                             }
                         }
