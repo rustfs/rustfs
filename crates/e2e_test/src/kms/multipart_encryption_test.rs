@@ -163,7 +163,7 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
     // step4: verify multipart upload completed successfully
     assert_eq!(
         complete_output.e_tag().unwrap().to_string(),
-        format!("\"{}-{}-{}\"", object_key, upload_id, total_parts)
+        format!("\"{object_key}-{upload_id}-{total_parts}\"")
     );
 
     // verify data integrity
@@ -427,8 +427,7 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
     for (i, (&actual, &expected)) in downloaded_data.iter().zip(test_data.iter()).enumerate() {
         if actual != expected {
             panic!(
-                "step4: large multipart upload with encryption (SSE-S3) data mismatch at byte {}: actual={}, expected={}",
-                i, actual, expected
+                "step4: large multipart upload with encryption (SSE-S3) data mismatch at byte {i}: actual={actual}, expected={expected}"
             );
         }
     }

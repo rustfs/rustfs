@@ -200,7 +200,7 @@ fn hex_from_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;
-        write!(&mut out, "{:02x}", byte).expect("write hex");
+        write!(&mut out, "{byte:02x}").expect("write hex");
     }
     out
 }
@@ -349,13 +349,13 @@ impl InlineSpillProcessor {
 
         // Create temporary directory for the spill operation
         let tmp_root = format!("{}x{}", uuid::Uuid::new_v4(), time::OffsetDateTime::now_utc().unix_timestamp());
-        let tmp_path = format!("{tmp_root}/{}/part.1", data_dir);
+        let tmp_path = format!("{tmp_root}/{data_dir}/part.1");
 
         // Encode and write the data to all disks
         match self.write_segmented_data(&plain_data, &tmp_path, &erasure).await {
             Ok(_) => {
                 // Move from temp to permanent location
-                let final_path = format!("{}/part.1", data_dir);
+                let final_path = format!("{data_dir}/part.1");
                 if let Err(err) = self.move_temp_to_final(&tmp_path, &final_path).await {
                     error!(
                         bucket = bucket,
@@ -371,7 +371,7 @@ impl InlineSpillProcessor {
                 // Update file metadata
                 fi.data_dir = Some(data_dir);
                 fi.data = None; // Remove inline data
-                fi.metadata.remove(&format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER));
+                fi.metadata.remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data"));
 
                 // Update append state to SegmentedActive
                 let mut new_state = current_state;
@@ -391,7 +391,7 @@ impl InlineSpillProcessor {
                     meta.data = None;
                     meta.metadata = fi.metadata.clone();
                     meta.metadata
-                        .remove(&format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER));
+                        .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data"));
                 }
 
                 // Write updated metadata back to disks

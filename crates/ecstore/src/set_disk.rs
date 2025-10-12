@@ -163,8 +163,7 @@ impl SetDisks {
                 current_owner,
                 current_mode,
             } => format!(
-                "{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {:?}",
-                current_mode
+                "{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {current_mode:?}"
             ),
             LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
         }
@@ -3694,7 +3693,7 @@ impl SetDisks {
             return Err(StorageError::InvalidArgument(
                 bucket.to_string(),
                 object.to_string(),
-                format!("append position mismatch: provided {}, expected {}", position, expected_position_snapshot),
+                format!("append position mismatch: provided {position}, expected {expected_position_snapshot}"),
             ));
         }
 
@@ -3909,7 +3908,7 @@ impl SetDisks {
         let tmp_root = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let data_dir = Uuid::new_v4();
         let tmp_part_path = format!("{tmp_root}/{data_dir}/part.1");
-        let final_part_path = format!("{}/{}/part.1", object, data_dir);
+        let final_part_path = format!("{object}/{data_dir}/part.1");
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
@@ -4307,7 +4306,7 @@ impl SetDisks {
         let segment_id = Uuid::new_v4();
         let new_epoch = append_state.epoch.saturating_add(1);
         let tmp_part_path = format!("{tmp_root}/append/{new_epoch}/{segment_id}/part.1");
-        let final_part_path = format!("{}/append/{new_epoch}/{segment_id}/part.1", object);
+        let final_part_path = format!("{object}/append/{new_epoch}/{segment_id}/part.1");
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());

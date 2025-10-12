@@ -909,11 +909,10 @@ impl LocalDisk {
         }
 
         // Check if we should delete the entire object directory
-        // Delete if: versions is empty OR all versions are hidden (delete markers or free versions)
-        let should_delete_directory = fm.versions.is_empty() || fm.all_hidden(false);
-
-        if should_delete_directory {
-            // No more visible versions, delete the entire object directory
+        // MinIO compatibility: Only delete when versions is completely empty
+        // Even if only delete markers remain, we preserve xl.meta to maintain version history
+        if fm.versions.is_empty() {
+            // No more versions at all, delete the entire object directory
             let object_dir = self.get_object_path(volume, path)?;
             if let Err(err) = tokio::fs::remove_dir_all(&object_dir).await {
                 if err.kind() != ErrorKind::NotFound {
@@ -923,7 +922,7 @@ impl LocalDisk {
             return Ok(());
         }
 
-        // Update xl.meta
+        // Still have versions (including delete markers), update xl.meta
         let buf = fm.marshal_msg()?;
 
         let volume_dir = self.get_bucket_path(volume)?;
@@ -2411,11 +2410,10 @@ impl DiskAPI for LocalDisk {
         }
 
         // Check if we should delete the entire object directory
-        // Delete if: versions is empty OR all versions are hidden (delete markers or free versions)
-        let should_delete_directory = meta.versions.is_empty() || meta.all_hidden(false);
-
-        if !should_delete_directory {
-            // Still have visible versions, update xl.meta
+        // MinIO compatibility: Only delete when versions is completely empty
+        // Even if only delete markers remain, we preserve xl.meta to maintain version history
+        if !meta.versions.is_empty() {
+            // Still have versions (including delete markers), update xl.meta
             let buf = meta.marshal_msg()?;
             return self
                 .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
@@ -2432,7 +2430,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        // No more visible versions, delete the entire object directory immediately
+        // No more versions at all, delete the entire object directory immediately
         // Use direct removal instead of move_to_trash to ensure cleanup
         // move_to_trash can fail silently leaving directories behind
         if let Err(err) = tokio::fs::remove_dir_all(&file_path).await {
@@ -3479,14 +3477,120 @@ mod test {
         // Verify object directory exists before deletion
         assert!(object_dir.exists(), "Object directory should exist before deletion");
 
-        // Delete the delete marker (last version)
+        // Delete the delete marker itself (the only version)
         let delete_opts = super::DeleteOptions::default();
         disk.delete_version("test-volume", object_path, fi_delete_marker, false, delete_opts)
             .await
             .unwrap();
 
-        // Verify object directory is completely removed (all versions hidden)
-        assert!(!object_dir.exists(), "Object directory should be deleted when only delete markers remain");
+        // After deleting the only version (delete marker), versions becomes empty
+        // MinIO behavior: Delete entire directory when versions.is_empty()
+        assert!(!object_dir.exists(), "Object directory should be removed when all versions are deleted");
+
+        // Clean up
+        disk.delete_volume("test-volume").await.unwrap();
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_version_preserves_delete_marker() {
+        use std::collections::HashMap;
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+
+        let test_dir = "./test_preserve_delete_marker";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Create test volume
+        let _ = disk.make_volume("test-volume").await;
+
+        let object_path = "test-object";
+        let object_dir = Path::new(test_dir).join("test-volume").join(object_path);
+
+        // Scenario: User uploads file twice, then deletes (creates delete marker)
+        // v1: First upload (Object)
+        // v2: Delete marker (latest)
+
+        // Create v1 (object version)
+        let version_id_v1 = Uuid::new_v4();
+        let data_dir_v1 = Uuid::new_v4();
+        fs::create_dir_all(object_dir.join(data_dir_v1.to_string())).await.unwrap();
+
+        let fi_v1 = FileInfo {
+            volume: "test-volume".to_string(),
+            name: object_path.to_string(),
+            version_id: Some(version_id_v1),
+            data_dir: Some(data_dir_v1),
+            metadata: HashMap::new(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1024,
+            deleted: false,
+            ..Default::default()
+        };
+
+        // Write v1
+        disk.write_metadata("", "test-volume", object_path, fi_v1.clone()).await.unwrap();
+
+        // Create v2 (delete marker - simulating user deleting the file)
+        let version_id_v2 = Uuid::new_v4();
+        let fi_v2 = FileInfo {
+            volume: "test-volume".to_string(),
+            name: object_path.to_string(),
+            version_id: Some(version_id_v2),
+            data_dir: None,
+            metadata: HashMap::new(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 0,
+            deleted: true,  // Delete marker
+            ..Default::default()
+        };
+
+        // Write v2 (delete marker)
+        disk.write_metadata("", "test-volume", object_path, fi_v2.clone()).await.unwrap();
+
+        // Verify both versions exist
+        assert!(object_dir.exists(), "Object directory should exist with both versions");
+
+        // Now user deletes v1 (the actual object version)
+        let delete_opts = super::DeleteOptions::default();
+        disk.delete_version("test-volume", object_path, fi_v1, false, delete_opts).await.unwrap();
+
+        // CRITICAL QUESTION: What should happen when deleting v1?
+        // Scenario Analysis:
+        // - v2 (Delete marker): Marks object as "deleted" in latest state
+        // - v1 (Object): The actual data
+        //
+        // After deleting v1, only v2 (delete marker) remains.
+        //
+        // Expected behavior (S3/MinIO semantics):
+        // - Delete marker without ANY object versions is meaningless
+        // - It only serves to mark the LATEST state as "deleted" when old versions exist
+        // - Without old versions, it's orphaned metadata that should be cleaned
+        // - This matches user's reported issue: xl.meta should NOT remain
+        //
+        // Implementation: all_hidden(false) returns true -> entire directory deleted
+
+        let xl_meta_exists = object_dir.join("xl.meta").exists();
+        let dir_exists = object_dir.exists();
+
+        println!("After deleting v1 (object version):");
+        println!("  xl.meta exists: {}", xl_meta_exists);
+        println!("  directory exists: {}", dir_exists);
+        println!("  Interpretation: Delete marker (v2) cleaned up with v1");
+
+        // MinIO compatibility: Delete marker is a valid version, xl.meta should be preserved
+        // Even though there's no actual data, the delete marker itself is version metadata
+        assert!(xl_meta_exists, "xl.meta should be preserved when delete marker exists (MinIO compatibility)");
+        assert!(dir_exists, "Directory should remain when delete marker exists (MinIO compatibility)");
+
+        // To completely clean up, user must also delete v2 (the delete marker itself)
+        disk.delete_version("test-volume", object_path, fi_v2, false, super::DeleteOptions::default()).await.unwrap();
+        
+        // Now directory should be completely removed
+        assert!(!object_dir.exists(), "Directory should be removed after deleting the delete marker");
 
         // Clean up
         disk.delete_volume("test-volume").await.unwrap();

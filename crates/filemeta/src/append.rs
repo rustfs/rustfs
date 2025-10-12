@@ -187,8 +187,7 @@ pub fn validate_new_segment(state: &AppendState, new_offset: i64, new_length: i6
         // Check for any overlap
         if new_offset < existing_end && new_end > existing_start {
             return Err(Error::other(format!(
-                "New segment [{}, {}) overlaps with existing segment [{}, {})",
-                new_offset, new_end, existing_start, existing_end
+                "New segment [{new_offset}, {new_end}) overlaps with existing segment [{existing_start}, {existing_end})"
             )));
         }
     }

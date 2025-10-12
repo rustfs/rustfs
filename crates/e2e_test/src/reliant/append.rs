@@ -159,7 +159,7 @@ async fn append_inline_object_updates_content_and_etag() -> Result<(), Box<dyn E
 
     let initial_fetch = client.get_object().bucket(&bucket).key(key).send().await?;
     let initial_body = initial_fetch.body.collect().await?.into_bytes();
-    println!("initial body = {:?}", initial_body);
+    println!("initial body = {initial_body:?}");
 
     let append_payload = b" world";
     append_object(&client, &bucket, key, initial.len() as i64, append_payload)
@@ -1152,7 +1152,7 @@ async fn append_range_requests_across_segments() -> Result<(), Box<dyn Error + S
     ];
 
     for (start, end) in test_ranges {
-        let range_header = format!("bytes={}-{}", start, end);
+        let range_header = format!("bytes={start}-{end}");
         let range_resp = client
             .get_object()
             .bucket(&bucket)
