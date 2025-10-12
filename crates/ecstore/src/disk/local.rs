@@ -2393,19 +2393,17 @@ impl DiskAPI for LocalDisk {
 
                 // Try to clean up the append directory structure if it's empty
                 let append_base_path = file_path.join("append");
-                if append_base_path.exists() {
-                    // Try to remove empty epoch directories
-                    if let Ok(mut entries) = tokio::fs::read_dir(&append_base_path).await {
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
-                                // Try to remove the epoch directory, ignore errors if not empty
-                                let _ = tokio::fs::remove_dir(entry.path()).await;
-                            }
+                // Try to remove empty epoch directories
+                if let Ok(mut entries) = tokio::fs::read_dir(&append_base_path).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+                            // Try to remove the epoch directory, ignore errors if not empty
+                            let _ = tokio::fs::remove_dir(entry.path()).await;
                         }
                     }
-                    // Try to remove the append base directory itself
-                    let _ = tokio::fs::remove_dir(&append_base_path).await;
                 }
+                // Try to remove the append base directory itself
+                let _ = tokio::fs::remove_dir(&append_base_path).await;
             }
         }
 

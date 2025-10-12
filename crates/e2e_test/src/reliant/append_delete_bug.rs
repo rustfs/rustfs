@@ -231,3 +231,211 @@ async fn delete_object_after_abort_should_not_leave_segments() -> Result<(), Box
     Ok(())
 }
 
+#[tokio::test]
+#[serial]
+async fn delete_all_versions_then_reupload_should_be_immediately_visible() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(Vec::new()).await?;
+    sleep(Duration::from_secs(1)).await;
+    let client = env.create_s3_client();
+
+    let bucket = format!("delete-reupload-{}", Uuid::new_v4().simple());
+    client.create_bucket().bucket(&bucket).send().await?;
+
+    let key = "test-file.bin";
+
+    // 1. 上传一个文件
+    let file_size = 1024 * 1024; // 1MB for faster test
+    let initial_data: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(initial_data.clone()))
+        .send()
+        .await?;
+
+    // Verify file exists
+    let list1 = client.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(list1.contents().len(), 1);
+    assert_eq!(list1.contents()[0].key().unwrap(), key);
+
+    // 2. 删除文件（在 non-versioned bucket 中，这会物理删除）
+    client.delete_object().bucket(&bucket).key(key).send().await?;
+
+    // Give it a moment to propagate
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. 验证文件被删除
+    let list2 = client.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(list2.contents().len(), 0, "File should be deleted");
+
+    // 4. 再次上传同一个文件
+    let new_data: Vec<u8> = (0..file_size).map(|i| ((i + 100) % 256) as u8).collect();
+    let put_resp = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(new_data.clone()))
+        .send()
+        .await?;
+
+    assert!(put_resp.e_tag().is_some(), "Upload should succeed and return ETag");
+
+    // Give it a moment to propagate
+    sleep(Duration::from_millis(500)).await;
+
+    // 5. 立即列出文件，应该能看到新上传的文件
+    let list3 = client.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(
+        list3.contents().len(),
+        1,
+        "Newly uploaded file should be immediately visible after upload. \
+         If this fails, it suggests metadata inconsistency across disks."
+    );
+
+    if !list3.contents().is_empty() {
+        assert_eq!(list3.contents()[0].key().unwrap(), key);
+
+        // 6. 验证文件内容正确
+        let get_resp = client.get_object().bucket(&bucket).key(key).send().await?;
+        let body = get_resp.body.collect().await?.into_bytes();
+        assert_eq!(body.len(), new_data.len());
+        assert_eq!(body.as_ref(), new_data.as_slice());
+    }
+
+    client.delete_object().bucket(&bucket).key(key).send().await?;
+    client.delete_bucket().bucket(&bucket).send().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_all_versions_in_versioned_bucket_then_reupload() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(Vec::new()).await?;
+    sleep(Duration::from_secs(1)).await;
+    let client = env.create_s3_client();
+
+    let bucket = format!("versioned-delete-reupload-{}", Uuid::new_v4().simple());
+    client.create_bucket().bucket(&bucket).send().await?;
+
+    // 启用版本控制
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let key = "test-file.bin";
+
+    // 1. 上传文件（创建版本1）
+    let file_size = 1024 * 1024;
+    let data1: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
+    let put1 = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data1.clone()))
+        .send()
+        .await?;
+    let version1 = put1.version_id().map(|v| v.to_string());
+
+    if version1.is_none() {
+        // Versioning might not be immediately effective, skip this test
+        client.delete_bucket().bucket(&bucket).send().await?;
+        return Ok(());
+    }
+    let version1 = version1.unwrap();
+
+    // 2. 再上传一次（创建版本2）
+    let data2: Vec<u8> = (0..file_size).map(|i| ((i + 50) % 256) as u8).collect();
+    let put2 = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data2.clone()))
+        .send()
+        .await?;
+    let version2 = put2.version_id().expect("Version 2 should have version_id").to_string();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. 验证有2个版本
+    let versions = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .send()
+        .await?;
+    assert_eq!(versions.versions().len(), 2, "Should have 2 versions");
+
+    // 4. 删除所有版本
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&version1)
+        .send()
+        .await?;
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&version2)
+        .send()
+        .await?;
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 5. 验证所有版本都被删除（列表为空或只有delete markers）
+    let list_after_delete = client.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(list_after_delete.contents().len(), 0, "All versions should be deleted");
+
+    // 6. 重新上传同名文件
+    let data3: Vec<u8> = (0..file_size).map(|i| ((i + 100) % 256) as u8).collect();
+    let put3 = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data3.clone()))
+        .send()
+        .await?;
+    let version3 = put3.version_id().unwrap().to_string();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 7. 立即列出，应该能看到新上传的文件
+    let list_after_reupload = client.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(
+        list_after_reupload.contents().len(),
+        1,
+        "Newly uploaded file should be immediately visible in versioned bucket. \
+         This is the bug: file not visible immediately after re-upload."
+    );
+
+    if !list_after_reupload.contents().is_empty() {
+        assert_eq!(list_after_reupload.contents()[0].key().unwrap(), key);
+
+        // 验证内容
+        let get_resp = client.get_object().bucket(&bucket).key(key).send().await?;
+        let body = get_resp.body.collect().await?.into_bytes();
+        assert_eq!(body.as_ref(), data3.as_slice());
+    }
+
+    // 清理
+    client.delete_object().bucket(&bucket).key(key).version_id(&version3).send().await?;
+    client.delete_bucket().bucket(&bucket).send().await?;
+
+    Ok(())
+}
