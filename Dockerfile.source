@@ -8,22 +8,12 @@
 #   docker build -f Dockerfile.source -t rustfs:dev-local .
 #   docker run --rm -p 9000:9000 rustfs:dev-local
 #
-# Supports cross-compilation for amd64 and arm64 via TARGETPLATFORM.
-
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
+# Note: Builds for native architecture only (simplified for local dev).
 
 # -----------------------------
 # Build stage
 # -----------------------------
-FROM rust:1.88-bookworm AS builder
-
-# Re-declare args after FROM
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-
-# Debug: print platforms
-RUN echo "Build info -> BUILDPLATFORM=${BUILDPLATFORM}, TARGETPLATFORM=${TARGETPLATFORM}"
+FROM rust:1.83-bookworm AS builder
 
 # Install build toolchain and headers
 # Use distro packages for protoc/flatc to avoid host-arch mismatch
@@ -42,44 +32,14 @@ RUN set -eux; \
     flatbuffers-compiler; \
     rm -rf /var/lib/apt/lists/*
 
-# Optional: cross toolchain for aarch64 (only when targeting linux/arm64)
-RUN set -eux; \
-    if [ "${TARGETPLATFORM:-linux/amd64}" = "linux/arm64" ]; then \
-    export DEBIAN_FRONTEND=noninteractive; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu; \
-    rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# Add Rust targets based on TARGETPLATFORM
-RUN set -eux; \
-    case "${TARGETPLATFORM:-linux/amd64}" in \
-    linux/amd64) rustup target add x86_64-unknown-linux-gnu ;; \
-    linux/arm64) rustup target add aarch64-unknown-linux-gnu ;; \
-    *) echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 ;; \
-    esac
-
-# Cross-compilation environment (used only when targeting aarch64)
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+# Note: rust:bookworm image already includes the native x86_64 target.
+# Cross-compilation support removed for simplicity in local dev builds.
 
 WORKDIR /usr/src/rustfs
 
-# Layered copy to maximize caching:
-# 1) top-level manifests
-COPY Cargo.toml Cargo.lock ./
-# 2) workspace member manifests (adjust if workspace layout changes)
-COPY rustfs/Cargo.toml rustfs/Cargo.toml
-COPY crates/*/Cargo.toml crates/
-COPY cli/rustfs-gui/Cargo.toml cli/rustfs-gui/Cargo.toml
-
-# Pre-fetch dependencies for better caching
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo fetch --locked || true
-
-# 3) copy full sources (this is the main cache invalidation point)
+# Copy all sources
+# Note: Simplified approach - full copy for reliability
+# Fine-grained dependency caching removed due to workspace complexity
 COPY . .
 
 # Cargo build configuration for lean release artifacts
@@ -93,29 +53,16 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
 # Generate protobuf/flatbuffers code (uses protoc/flatc from distro)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/rustfs/target \
     cargo run --bin gproto
 
-# Build RustFS (target depends on TARGETPLATFORM)
+# Build RustFS (simplified: native build only for local dev)
+# Note: Cross-compilation removed to avoid target mismatch issues
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/rustfs/target \
     set -eux; \
-    case "${TARGETPLATFORM:-linux/amd64}" in \
-    linux/amd64) \
-    echo "Building for x86_64-unknown-linux-gnu"; \
-    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
-    install -m 0755 target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
-    ;; \
-    linux/arm64) \
-    echo "Building for aarch64-unknown-linux-gnu"; \
-    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
-    install -m 0755 target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
-    ;; \
-    *) \
-    echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 \
-    ;; \
-    esac
+    echo "Building rustfs for native architecture"; \
+    cargo build --release --locked --bin rustfs -j "$(nproc)"; \
+    install -m 0755 target/release/rustfs /usr/local/bin/rustfs
 
 # -----------------------------
 # Runtime stage (Ubuntu minimal)
