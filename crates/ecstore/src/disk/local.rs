@@ -46,8 +46,8 @@ use bytes::Bytes;
 use crate::file_cache::{get_global_file_cache, prefetch_metadata_patterns, read_metadata_cached};
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
-    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
-    get_file_info, read_xl_meta_no_data,
+    AppendState, Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo,
+    UpdateFn, get_file_info, read_xl_meta_no_data,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -806,6 +806,58 @@ impl LocalDisk {
         Ok((bytes, modtime))
     }
 
+    /// Extract append state from stored FileMeta version
+    /// Must be called BEFORE deleting the version, as find_version will fail after deletion
+    fn extract_append_state(&self, fm: &FileMeta, volume: &str, path: &str, version_id: Option<Uuid>) -> Option<AppendState> {
+        if let Ok((_, stored_fi)) = fm.find_version(version_id) {
+            let fileinfo = stored_fi.into_fileinfo(volume, path, false);
+            rustfs_filemeta::get_append_state(&fileinfo.metadata).ok().flatten()
+        } else {
+            None
+        }
+    }
+
+    /// Clean up append segments and empty directory structure
+    /// Append segments are temporary data and should be deleted immediately
+    async fn cleanup_append_segments(&self, append_state: &AppendState, object_dir: &Path) -> Result<()> {
+        if append_state.pending_segments.is_empty() {
+            return Ok(());
+        }
+
+        // Clean up each pending segment immediately
+        for segment in &append_state.pending_segments {
+            if let Some(segment_dir) = segment.data_dir {
+                let append_segment_path = object_dir
+                    .join("append")
+                    .join(segment.epoch.to_string())
+                    .join(segment_dir.to_string());
+
+                // Use direct removal instead of move_to_trash for immediate cleanup
+                if let Err(err) = tokio::fs::remove_dir_all(&append_segment_path).await {
+                    if err.kind() != ErrorKind::NotFound {
+                        warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
+                    }
+                }
+            }
+        }
+
+        // Try to clean up the append directory structure if it's empty
+        let append_base_path = object_dir.join("append");
+        // Try to remove empty epoch directories
+        if let Ok(mut entries) = tokio::fs::read_dir(&append_base_path).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+                    // Try to remove epoch directory, will fail if not empty (ignore errors)
+                    let _ = tokio::fs::remove_dir(entry.path()).await;
+                }
+            }
+        }
+        // Try to remove the append base directory itself
+        let _ = tokio::fs::remove_dir(&append_base_path).await;
+
+        Ok(())
+    }
+
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &Vec<FileInfo>) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         let xlpath = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
@@ -821,6 +873,10 @@ impl LocalDisk {
         fm.unmarshal_msg(&data)?;
 
         for fi in fis {
+            // IMPORTANT: Extract append state BEFORE deleting the version
+            // Once delete_version is called, find_version will fail since the version is gone
+            let stored_append_state = self.extract_append_state(&fm, volume, path, fi.version_id);
+
             let data_dir = match fm.delete_version(fi) {
                 Ok(res) => res,
                 Err(err) => {
@@ -845,41 +901,29 @@ impl LocalDisk {
                 };
             }
 
-            // Clean up append segments if present (get from stored FileInfo metadata)
-            // Note: append segments are temporary data and should be deleted immediately
-            let stored_append_state = if let Ok((_, stored_fi)) = fm.find_version(fi.version_id) {
-                let fileinfo = stored_fi.into_fileinfo(volume, path, false);
-                rustfs_filemeta::get_append_state(&fileinfo.metadata).ok().flatten()
-            } else {
-                None
-            };
-
+            // Clean up append segments if present
             if let Some(append_state) = stored_append_state {
-                if !append_state.pending_segments.is_empty() {
-                    for segment in &append_state.pending_segments {
-                        if let Some(segment_dir) = segment.data_dir {
-                            let append_segment_path =
-                                self.get_object_path(volume, &format!("{}/append/{}/{}", path, segment.epoch, segment_dir))?;
-
-                            // Use direct removal instead of move_to_trash for immediate cleanup
-                            if let Err(err) = tokio::fs::remove_dir_all(&append_segment_path).await {
-                                if err.kind() != ErrorKind::NotFound {
-                                    warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
-                                }
-                            }
-                        }
-                    }
-                }
+                let object_dir = self.get_object_path(volume, path)?;
+                self.cleanup_append_segments(&append_state, &object_dir).await?;
             }
         }
 
-        // 没有版本了，删除 xl.meta
-        if fm.versions.is_empty() {
-            self.delete_file(&volume_dir, &xlpath, true, false).await?;
+        // Check if we should delete the entire object directory
+        // Delete if: versions is empty OR all versions are hidden (delete markers or free versions)
+        let should_delete_directory = fm.versions.is_empty() || fm.all_hidden(false);
+
+        if should_delete_directory {
+            // No more visible versions, delete the entire object directory
+            let object_dir = self.get_object_path(volume, path)?;
+            if let Err(err) = tokio::fs::remove_dir_all(&object_dir).await {
+                if err.kind() != ErrorKind::NotFound {
+                    return Err(err.into());
+                }
+            }
             return Ok(());
         }
 
-        // 更新 xl.meta
+        // Update xl.meta
         let buf = fm.marshal_msg()?;
 
         let volume_dir = self.get_bucket_path(volume)?;
@@ -2343,12 +2387,7 @@ impl DiskAPI for LocalDisk {
 
         // Before deleting the version, extract append state from the actual stored FileInfo
         // The fi parameter passed in may not have complete metadata
-        let stored_append_state = if let Ok((_, stored_fi)) = meta.find_version(fi.version_id) {
-            let fileinfo = stored_fi.into_fileinfo(volume, path, false);
-            rustfs_filemeta::get_append_state(&fileinfo.metadata).ok().flatten()
-        } else {
-            None
-        };
+        let stored_append_state = self.extract_append_state(&meta, volume, path, fi.version_id);
 
         let old_dir = meta.delete_version(&fi)?;
 
@@ -2367,45 +2406,16 @@ impl DiskAPI for LocalDisk {
         }
 
         // Clean up append segments if present
-        // Append segments are stored in {object}/append/{epoch}/{uuid} directories
-        // Note: append segments are temporary data and should be deleted immediately
-        // without going through the trash system to avoid delays
         if let Some(append_state) = stored_append_state {
-            if !append_state.pending_segments.is_empty() {
-                // Clean up each pending segment immediately
-                for segment in &append_state.pending_segments {
-                    if let Some(segment_dir) = segment.data_dir {
-                        let append_segment_path = file_path
-                            .join("append")
-                            .join(segment.epoch.to_string())
-                            .join(segment_dir.to_string());
-
-                        // Use direct removal instead of move_to_trash for immediate cleanup
-                        if let Err(err) = tokio::fs::remove_dir_all(&append_segment_path).await {
-                            if err.kind() != ErrorKind::NotFound {
-                                warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
-                            }
-                        }
-                    }
-                }
-
-                // Try to clean up the append directory structure if it's empty
-                let append_base_path = file_path.join("append");
-                // Try to remove empty epoch directories
-                if let Ok(mut entries) = tokio::fs::read_dir(&append_base_path).await {
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
-                            // Try to remove the epoch directory, ignore errors if not empty
-                            let _ = tokio::fs::remove_dir(entry.path()).await;
-                        }
-                    }
-                }
-                // Try to remove the append base directory itself
-                let _ = tokio::fs::remove_dir(&append_base_path).await;
-            }
+            self.cleanup_append_segments(&append_state, &file_path).await?;
         }
 
-        if !meta.versions.is_empty() {
+        // Check if we should delete the entire object directory
+        // Delete if: versions is empty OR all versions are hidden (delete markers or free versions)
+        let should_delete_directory = meta.versions.is_empty() || meta.all_hidden(false);
+
+        if !should_delete_directory {
+            // Still have visible versions, update xl.meta
             let buf = meta.marshal_msg()?;
             return self
                 .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
@@ -2422,7 +2432,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        // No more versions, delete the entire object directory immediately
+        // No more visible versions, delete the entire object directory immediately
         // Use direct removal instead of move_to_trash to ensure cleanup
         // move_to_trash can fail silently leaving directories behind
         if let Err(err) = tokio::fs::remove_dir_all(&file_path).await {
@@ -2909,5 +2919,577 @@ mod test {
         // On non-Windows systems, backslash is not a root path
         #[cfg(not(windows))]
         assert!(!is_root_path("\\"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_append_state() {
+        use rustfs_filemeta::{AppendSegment, AppendStateKind};
+        use std::collections::HashMap;
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+
+        let test_dir = "./test_extract_append_state";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Create test volume (ignore error if already exists from previous test run)
+        let _ = disk.make_volume("test-volume").await;
+
+        // Create a FileMeta with append state
+        let mut fm = FileMeta::default();
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+
+        let mut metadata = HashMap::new();
+        let append_state = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 1024,
+            epoch: 1,
+            pending_segments: vec![AppendSegment {
+                epoch: 1,
+                offset: 0,
+                data_dir: Some(Uuid::new_v4()),
+                length: 512,
+                etag: Some("test-etag".to_string()),
+            }],
+        };
+
+        // Serialize append state to metadata
+        rustfs_filemeta::set_append_state(&mut metadata, &append_state).unwrap();
+
+        let fi = FileInfo {
+            volume: "test-volume".to_string(),
+            name: "test-object".to_string(),
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            metadata: metadata.clone(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1024,
+            ..Default::default()
+        };
+
+        // Add version to FileMeta
+        fm.add_version(fi.clone()).unwrap();
+
+        // Test 1: Extract existing append state
+        let extracted = disk.extract_append_state(&fm, "test-volume", "test-object", Some(version_id));
+        assert!(extracted.is_some(), "Should extract append state for existing version");
+        let extracted_state = extracted.unwrap();
+        assert_eq!(extracted_state.epoch, 1);
+        assert_eq!(extracted_state.committed_length, 1024);
+        assert_eq!(extracted_state.pending_segments.len(), 1);
+        assert_eq!(extracted_state.pending_segments[0].length, 512);
+
+        // Test 2: Extract with non-existent version_id
+        let non_existent_id = Uuid::new_v4();
+        let result = disk.extract_append_state(&fm, "test-volume", "test-object", Some(non_existent_id));
+        assert!(result.is_none(), "Should return None for non-existent version");
+
+        // Test 3: Extract with None version_id
+        let result = disk.extract_append_state(&fm, "test-volume", "test-object", None);
+        assert!(result.is_none(), "Should return None for None version_id");
+
+        // Test 4: Extract from version without append state
+        let version_id_no_append = Uuid::new_v4();
+        let fi_no_append = FileInfo {
+            volume: "test-volume".to_string(),
+            name: "test-object".to_string(),
+            version_id: Some(version_id_no_append),
+            data_dir: Some(Uuid::new_v4()),
+            metadata: HashMap::new(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 512,
+            ..Default::default()
+        };
+        fm.add_version(fi_no_append).unwrap();
+
+        let result = disk.extract_append_state(&fm, "test-volume", "test-object", Some(version_id_no_append));
+        assert!(result.is_none(), "Should return None for version without append state");
+
+        // Clean up
+        disk.delete_volume("test-volume").await.unwrap();
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_append_segments() {
+        use rustfs_filemeta::{AppendSegment, AppendStateKind};
+        use uuid::Uuid;
+
+        let test_dir = "./test_cleanup_append_segments";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Create object directory structure
+        let object_dir = Path::new(test_dir).join("test-object");
+        fs::create_dir_all(&object_dir).await.unwrap();
+
+        // Test 1: Cleanup with empty pending_segments (should do nothing)
+        let empty_state = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 0,
+            epoch: 1,
+            pending_segments: vec![],
+        };
+        let result = disk.cleanup_append_segments(&empty_state, &object_dir).await;
+        assert!(result.is_ok());
+
+        // Test 2: Cleanup with actual append segments
+        let segment_dir_1 = Uuid::new_v4();
+        let segment_dir_2 = Uuid::new_v4();
+        let epoch = 1;
+
+        // Create append segment directories
+        let segment_path_1 = object_dir
+            .join("append")
+            .join(epoch.to_string())
+            .join(segment_dir_1.to_string());
+        let segment_path_2 = object_dir
+            .join("append")
+            .join(epoch.to_string())
+            .join(segment_dir_2.to_string());
+        fs::create_dir_all(&segment_path_1).await.unwrap();
+        fs::create_dir_all(&segment_path_2).await.unwrap();
+
+        // Create dummy files in segments
+        fs::write(segment_path_1.join("part.1"), b"test data 1").await.unwrap();
+        fs::write(segment_path_2.join("part.1"), b"test data 2").await.unwrap();
+
+        // Verify segments exist
+        assert!(segment_path_1.exists());
+        assert!(segment_path_2.exists());
+
+        // Create append state with these segments
+        let append_state = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 1024,
+            epoch,
+            pending_segments: vec![
+                AppendSegment {
+                    epoch,
+                    offset: 0,
+                    data_dir: Some(segment_dir_1),
+                    length: 512,
+                    etag: Some("etag1".to_string()),
+                },
+                AppendSegment {
+                    epoch,
+                    offset: 512,
+                    data_dir: Some(segment_dir_2),
+                    length: 512,
+                    etag: Some("etag2".to_string()),
+                },
+            ],
+        };
+
+        // Cleanup segments
+        let result = disk.cleanup_append_segments(&append_state, &object_dir).await;
+        assert!(result.is_ok());
+
+        // Verify segments are removed
+        assert!(!segment_path_1.exists());
+        assert!(!segment_path_2.exists());
+
+        // Verify empty epoch directory is removed
+        let epoch_dir = object_dir.join("append").join(epoch.to_string());
+        assert!(!epoch_dir.exists());
+
+        // Verify append base directory is removed
+        let append_base = object_dir.join("append");
+        assert!(!append_base.exists());
+
+        // Test 3: Cleanup when directories don't exist (should not error)
+        let non_existent_segment = AppendSegment {
+            epoch: 999,
+            offset: 0,
+            data_dir: Some(Uuid::new_v4()),
+            length: 100,
+            etag: Some("test".to_string()),
+        };
+        let state_with_non_existent = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 0,
+            epoch: 999,
+            pending_segments: vec![non_existent_segment],
+        };
+        let result = disk.cleanup_append_segments(&state_with_non_existent, &object_dir).await;
+        assert!(result.is_ok());
+
+        // Test 4: Cleanup with segment without data_dir (should skip)
+        let segment_without_dir = AppendSegment {
+            epoch: 2,
+            offset: 0,
+            data_dir: None,
+            length: 100,
+            etag: Some("test".to_string()),
+        };
+        let state_without_dir = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 0,
+            epoch: 2,
+            pending_segments: vec![segment_without_dir],
+        };
+        let result = disk.cleanup_append_segments(&state_without_dir, &object_dir).await;
+        assert!(result.is_ok());
+
+        // Test 5: Cleanup with mixed empty and non-empty epoch directories
+        let epoch_3 = 3;
+        let epoch_4 = 4;
+        let segment_3 = Uuid::new_v4();
+
+        // Create epoch 3 with a segment (will be cleaned)
+        let segment_path_3 = object_dir
+            .join("append")
+            .join(epoch_3.to_string())
+            .join(segment_3.to_string());
+        fs::create_dir_all(&segment_path_3).await.unwrap();
+        fs::write(segment_path_3.join("part.1"), b"data").await.unwrap();
+
+        // Create epoch 4 with a file (should remain)
+        let epoch_4_dir = object_dir.join("append").join(epoch_4.to_string());
+        fs::create_dir_all(&epoch_4_dir).await.unwrap();
+        fs::write(epoch_4_dir.join("other-file.txt"), b"keep me").await.unwrap();
+
+        let state_mixed = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 0,
+            epoch: epoch_3,
+            pending_segments: vec![AppendSegment {
+                epoch: epoch_3,
+                offset: 0,
+                data_dir: Some(segment_3),
+                length: 100,
+                etag: Some("test".to_string()),
+            }],
+        };
+
+        let result = disk.cleanup_append_segments(&state_mixed, &object_dir).await;
+        assert!(result.is_ok());
+
+        // Verify epoch 3 directory is removed (was empty after cleanup)
+        assert!(!object_dir.join("append").join(epoch_3.to_string()).exists());
+
+        // Verify epoch 4 directory remains (has other files)
+        assert!(epoch_4_dir.exists());
+        assert!(epoch_4_dir.join("other-file.txt").exists());
+
+        // Verify append base directory remains (epoch 4 is not empty)
+        assert!(object_dir.join("append").exists());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[test]
+    fn test_check_path_length() {
+        use super::os::check_path_length;
+
+        // Test 1: Normal path length (should pass)
+        let normal_path = "/Users/test/documents/file.txt";
+        assert!(check_path_length(normal_path).is_ok());
+
+        // Test 2: Empty path (should pass)
+        assert!(check_path_length("").is_ok());
+
+        // Test 3: Special invalid paths (Unix)
+        assert!(check_path_length(".").is_err(), "Single dot should be rejected");
+        assert!(check_path_length("..").is_err(), "Double dot should be rejected");
+        assert!(check_path_length("/").is_err(), "Root path should be rejected");
+
+        // Test 4: Path segment length limit (NAME_MAX = 255 on Unix)
+        let long_segment = "a".repeat(255);
+        let path_with_long_segment = format!("/dir/{long_segment}");
+        assert!(check_path_length(&path_with_long_segment).is_ok(), "Segment of 255 chars should pass");
+
+        let too_long_segment = "a".repeat(256);
+        let path_with_too_long_segment = format!("/dir/{too_long_segment}");
+        assert!(
+            check_path_length(&path_with_too_long_segment).is_err(),
+            "Segment longer than 255 chars should fail"
+        );
+
+        // Test 5: Multiple segments within limits
+        let valid_multi_segment = format!("/{}/{}/{}", "a".repeat(200), "b".repeat(200), "c".repeat(200));
+        assert!(
+            check_path_length(&valid_multi_segment).is_ok(),
+            "Multiple segments each <= 255 should pass"
+        );
+
+        // Test 6: Total path length limit on macOS
+        #[cfg(target_os = "macos")]
+        {
+            // macOS total path length limit is > 1016 (exclusive)
+            // Create a path with many short segments that exceed 1016 total
+            let segments: Vec<String> = (0..100).map(|i| format!("seg{i:03}")).collect();
+            let joined = segments.join("/");
+            let long_path = format!("/{joined}");
+            if long_path.len() > 1016 {
+                assert!(check_path_length(&long_path).is_err(), "Total path > 1016 should fail on macOS");
+            }
+
+            // Create a path close to but under the limit
+            let segments: Vec<String> = (0..80).map(|i| format!("s{i:02}")).collect();
+            let joined = segments.join("/");
+            let acceptable_path = format!("/{joined}");
+            if acceptable_path.len() <= 1016 {
+                assert!(check_path_length(&acceptable_path).is_ok(), "Total path <= 1016 should pass on macOS");
+            }
+        }
+
+        // Test 7: Total path length limit on Windows
+        #[cfg(target_os = "windows")]
+        {
+            // Windows limit is > 1024
+            let segments: Vec<String> = (0..100).map(|i| format!("seg{:03}", i)).collect();
+            let joined = segments.join("\\");
+            let long_path = format!("C:\\{}", joined);
+            if long_path.len() > 1024 {
+                assert!(check_path_length(&long_path).is_err(), "Total path > 1024 should fail on Windows");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_object_path_edge_cases() {
+        let test_dir = "./test_get_object_path";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Test 1: Normal bucket and key
+        let path = disk.get_object_path("test-bucket", "test-object");
+        assert!(path.is_ok());
+        let path = path.unwrap();
+        assert!(path.to_string_lossy().contains("test-bucket"));
+        assert!(path.to_string_lossy().contains("test-object"));
+
+        // Test 2: Empty key (should work)
+        let path = disk.get_object_path("test-bucket", "");
+        assert!(path.is_ok());
+
+        // Test 3: Key with slashes (directory-like)
+        let path = disk.get_object_path("test-bucket", "folder/subfolder/file.txt");
+        assert!(path.is_ok());
+        let path = path.unwrap();
+        assert!(path.to_string_lossy().contains("folder"));
+        assert!(path.to_string_lossy().contains("subfolder"));
+
+        // Test 4: Key with special characters
+        let path = disk.get_object_path("test-bucket", "file with spaces.txt");
+        assert!(path.is_ok());
+
+        // Test 5: Unicode characters in key
+        let path = disk.get_object_path("test-bucket", "文件名.txt");
+        assert!(path.is_ok());
+
+        // Test 6: Very long but valid key
+        let long_key = "a".repeat(200);
+        let path = disk.get_object_path("test-bucket", &long_key);
+        assert!(path.is_ok());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_bucket_path_validation() {
+        let test_dir = "./test_get_bucket_path";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Test 1: Normal bucket name
+        let path = disk.get_bucket_path("test-bucket");
+        assert!(path.is_ok());
+
+        // Test 2: System bucket names (should work)
+        let path = disk.get_bucket_path(RUSTFS_META_BUCKET);
+        assert!(path.is_ok());
+
+        // Test 3: Empty bucket name (get_bucket_path doesn't validate, only joins path)
+        let path = disk.get_bucket_path("");
+        assert!(path.is_ok(), "get_bucket_path doesn't validate bucket names, just constructs paths");
+
+        // Test 4: Very short bucket name (get_bucket_path doesn't validate length)
+        let path = disk.get_bucket_path("ab");
+        assert!(path.is_ok(), "get_bucket_path doesn't validate bucket name length");
+
+        // Test 5: Bucket name with special characters
+        let path = disk.get_bucket_path("test-bucket-123");
+        assert!(path.is_ok());
+
+        // Note: Bucket name validation happens at a higher layer (make_volume uses is_valid_volname)
+        // get_bucket_path is just a path construction utility
+
+        // Clean up
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_with_append_segments_integration() {
+        use rustfs_filemeta::{AppendSegment, AppendStateKind};
+        use std::collections::HashMap;
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+
+        let test_dir = "./test_delete_version_integration";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Create test volume
+        let _ = disk.make_volume("test-volume").await;
+
+        // Create object directory with append segments
+        let object_path = "test-object";
+        let object_dir = Path::new(test_dir).join("test-volume").join(object_path);
+        let data_dir = Uuid::new_v4();
+        fs::create_dir_all(object_dir.join(data_dir.to_string())).await.unwrap();
+
+        // Create append segments
+        let epoch = 1u64;
+        let segment_uuid1 = Uuid::new_v4();
+        let segment_uuid2 = Uuid::new_v4();
+        let segment_path1 = object_dir
+            .join("append")
+            .join(epoch.to_string())
+            .join(segment_uuid1.to_string());
+        let segment_path2 = object_dir
+            .join("append")
+            .join(epoch.to_string())
+            .join(segment_uuid2.to_string());
+
+        fs::create_dir_all(&segment_path1).await.unwrap();
+        fs::create_dir_all(&segment_path2).await.unwrap();
+        fs::write(segment_path1.join("part.1"), b"segment data 1").await.unwrap();
+        fs::write(segment_path2.join("part.1"), b"segment data 2").await.unwrap();
+
+        // Create FileMeta with append state
+        let version_id = Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        let append_state = AppendState {
+            state: AppendStateKind::SegmentedActive,
+            committed_length: 1024,
+            epoch,
+            pending_segments: vec![
+                AppendSegment {
+                    epoch,
+                    offset: 0,
+                    data_dir: Some(segment_uuid1),
+                    length: 512,
+                    etag: Some("etag1".to_string()),
+                },
+                AppendSegment {
+                    epoch,
+                    offset: 512,
+                    data_dir: Some(segment_uuid2),
+                    length: 512,
+                    etag: Some("etag2".to_string()),
+                },
+            ],
+        };
+        rustfs_filemeta::set_append_state(&mut metadata, &append_state).unwrap();
+
+        let fi = FileInfo {
+            volume: "test-volume".to_string(),
+            name: object_path.to_string(),
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            metadata,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1024,
+            ..Default::default()
+        };
+
+        // Write FileMeta to disk
+        disk.write_metadata("", "test-volume", object_path, fi.clone()).await.unwrap();
+
+        // Verify append segments exist before deletion
+        assert!(segment_path1.exists(), "Segment 1 should exist before deletion");
+        assert!(segment_path2.exists(), "Segment 2 should exist before deletion");
+
+        // Delete the version (this should trigger cleanup_append_segments)
+        let delete_opts = super::DeleteOptions::default();
+        disk.delete_version("test-volume", object_path, fi, false, delete_opts)
+            .await
+            .unwrap();
+
+        // Verify append segments are cleaned up
+        assert!(!segment_path1.exists(), "Segment 1 should be deleted");
+        assert!(!segment_path2.exists(), "Segment 2 should be deleted");
+
+        // Verify append directory is cleaned up
+        let append_base = object_dir.join("append");
+        assert!(!append_base.exists(), "Append base directory should be deleted");
+
+        // Verify object directory is deleted (no more versions)
+        assert!(!object_dir.exists(), "Object directory should be deleted when no versions remain");
+
+        // Clean up
+        disk.delete_volume("test-volume").await.unwrap();
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_versions_with_all_hidden() {
+        use std::collections::HashMap;
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+
+        let test_dir = "./test_delete_all_hidden";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Create test volume
+        let _ = disk.make_volume("test-volume").await;
+
+        let object_path = "test-object-hidden";
+        let object_dir = Path::new(test_dir).join("test-volume").join(object_path);
+        let data_dir = Uuid::new_v4();
+        fs::create_dir_all(object_dir.join(data_dir.to_string())).await.unwrap();
+
+        // Create a delete marker (deleted=true)
+        let version_id = Uuid::new_v4();
+        let fi_delete_marker = FileInfo {
+            volume: "test-volume".to_string(),
+            name: object_path.to_string(),
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            metadata: HashMap::new(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 0,
+            deleted: true, // This is a delete marker
+            ..Default::default()
+        };
+
+        // Write the delete marker
+        disk.write_metadata("", "test-volume", object_path, fi_delete_marker.clone())
+            .await
+            .unwrap();
+
+        // Verify object directory exists before deletion
+        assert!(object_dir.exists(), "Object directory should exist before deletion");
+
+        // Delete the delete marker (last version)
+        let delete_opts = super::DeleteOptions::default();
+        disk.delete_version("test-volume", object_path, fi_delete_marker, false, delete_opts)
+            .await
+            .unwrap();
+
+        // Verify object directory is completely removed (all versions hidden)
+        assert!(!object_dir.exists(), "Object directory should be deleted when only delete markers remain");
+
+        // Clean up
+        disk.delete_volume("test-volume").await.unwrap();
+        let _ = fs::remove_dir_all(&test_dir).await;
     }
 }
