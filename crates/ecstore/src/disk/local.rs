@@ -858,10 +858,8 @@ impl LocalDisk {
                 if !append_state.pending_segments.is_empty() {
                     for segment in &append_state.pending_segments {
                         if let Some(segment_dir) = segment.data_dir {
-                            let append_segment_path = self.get_object_path(
-                                volume,
-                                &format!("{}/append/{}/{}", path, segment.epoch, segment_dir),
-                            )?;
+                            let append_segment_path =
+                                self.get_object_path(volume, &format!("{}/append/{}/{}", path, segment.epoch, segment_dir))?;
 
                             // Use direct removal instead of move_to_trash for immediate cleanup
                             if let Err(err) = tokio::fs::remove_dir_all(&append_segment_path).await {

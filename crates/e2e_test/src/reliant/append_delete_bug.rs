@@ -92,15 +92,9 @@ async fn delete_object_with_pending_append_segments_should_cleanup() -> Result<(
         .expect("first append should succeed");
 
     let append2: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 173) as u8).collect();
-    append_object(
-        &client,
-        &bucket,
-        key,
-        (initial_data.len() + append1.len()) as i64,
-        &append2,
-    )
-    .await
-    .expect("second append should succeed");
+    append_object(&client, &bucket, key, (initial_data.len() + append1.len()) as i64, &append2)
+        .await
+        .expect("second append should succeed");
 
     // 等待一下确保 append 操作完成
     sleep(Duration::from_millis(500)).await;
@@ -118,18 +112,10 @@ async fn delete_object_with_pending_append_segments_should_cleanup() -> Result<(
 
     // 验证 append segments 目录存在（证明确实创建了 pending segments）
     let segments_exist_before = check_append_segments_exist(&bucket, key, &data_dirs).await;
-    assert!(
-        segments_exist_before,
-        "Append segments directory should exist before deletion"
-    );
+    assert!(segments_exist_before, "Append segments directory should exist before deletion");
 
     // 直接删除对象（不执行 complete 或 abort）
-    client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
-        .send()
-        .await?;
+    client.delete_object().bucket(&bucket).key(key).send().await?;
 
     // 等待一下确保删除操作完成
     sleep(Duration::from_millis(500)).await;
@@ -204,27 +190,16 @@ async fn delete_object_after_abort_should_not_leave_segments() -> Result<(), Box
 
     // abort 之后 segments 应该已经被清理
     let segments_after_abort = check_append_segments_exist(&bucket, key, &data_dirs).await;
-    assert!(
-        !segments_after_abort,
-        "Append segments should be cleaned up after abort"
-    );
+    assert!(!segments_after_abort, "Append segments should be cleaned up after abort");
 
     // 删除对象
-    client
-        .delete_object()
-        .bucket(&bucket)
-        .key(key)
-        .send()
-        .await?;
+    client.delete_object().bucket(&bucket).key(key).send().await?;
 
     sleep(Duration::from_millis(500)).await;
 
     // 验证没有残留的 append 目录
     let segments_after_delete = check_append_segments_exist(&bucket, key, &data_dirs).await;
-    assert!(
-        !segments_after_delete,
-        "No append segments should remain after deletion"
-    );
+    assert!(!segments_after_delete, "No append segments should remain after deletion");
 
     client.delete_bucket().bucket(&bucket).send().await?;
 
@@ -372,11 +347,7 @@ async fn delete_all_versions_in_versioned_bucket_then_reupload() -> Result<(), B
     sleep(Duration::from_millis(500)).await;
 
     // 3. 验证有2个版本
-    let versions = client
-        .list_object_versions()
-        .bucket(&bucket)
-        .send()
-        .await?;
+    let versions = client.list_object_versions().bucket(&bucket).send().await?;
     assert_eq!(versions.versions().len(), 2, "Should have 2 versions");
 
     // 4. 删除所有版本
@@ -434,7 +405,13 @@ async fn delete_all_versions_in_versioned_bucket_then_reupload() -> Result<(), B
     }
 
     // 清理
-    client.delete_object().bucket(&bucket).key(key).version_id(&version3).send().await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&version3)
+        .send()
+        .await?;
     client.delete_bucket().bucket(&bucket).send().await?;
 
     Ok(())
