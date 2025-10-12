@@ -75,7 +75,6 @@ hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
-tokio-stream = { workspace = true }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true
@@ -89,8 +88,6 @@ rustfs-madmin.workspace = true
 rustfs-workers.workspace = true
 reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true }
-once_cell = { workspace = true }
-rustfs-rsc = { workspace = true }
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
@@ -99,13 +96,11 @@ rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-signer.workspace = true
 rustfs-checksums.workspace = true
-futures-util.workspace = true
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 parking_lot = { workspace = true }
 moka = { workspace = true }
-aws-smithy-runtime-api = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }
