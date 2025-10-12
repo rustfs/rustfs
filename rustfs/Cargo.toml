@@ -70,7 +70,6 @@ clap = { workspace = true }
 datafusion = { workspace = true }
 const-str = { workspace = true }
 futures.workspace = true
-hashbrown = { workspace = true }
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -79,7 +78,6 @@ matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
-percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 reqwest = { workspace = true }
 rustls = { workspace = true }
