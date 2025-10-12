@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod append;
+mod append_delete_bug;
 mod conditional_writes;
 mod lifecycle;
 mod lock;

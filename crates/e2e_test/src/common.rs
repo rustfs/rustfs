@@ -269,6 +269,16 @@ impl RustFSTestEnvironment {
         Ok(())
     }
 
+    /// Get data directories used by this test environment
+    pub fn get_data_directories(&self) -> Result<Vec<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+        // RustFS uses the temp_dir as the base directory
+        // Data is stored in subdirectories under the base directory
+        let mut data_dirs = Vec::new();
+        let base_path = PathBuf::from(&self.temp_dir);
+        data_dirs.push(base_path);
+        Ok(data_dirs)
+    }
+
     /// Stop the RustFS server
     pub fn stop_server(&mut self) {
         if let Some(mut process) = self.process.take() {

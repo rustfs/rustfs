@@ -844,6 +844,33 @@ impl LocalDisk {
                     }
                 };
             }
+
+            // Clean up append segments if present (get from stored FileInfo metadata)
+            let stored_append_state = if let Ok((_, stored_fi)) = fm.find_version(fi.version_id) {
+                let fileinfo = stored_fi.into_fileinfo(volume, path, false);
+                rustfs_filemeta::get_append_state(&fileinfo.metadata).ok().flatten()
+            } else {
+                None
+            };
+
+            if let Some(append_state) = stored_append_state {
+                if !append_state.pending_segments.is_empty() {
+                    for segment in &append_state.pending_segments {
+                        if let Some(segment_dir) = segment.data_dir {
+                            let append_segment_path = self.get_object_path(
+                                volume,
+                                &format!("{}/append/{}/{}", path, segment.epoch, segment_dir),
+                            )?;
+
+                            if let Err(err) = self.move_to_trash(&append_segment_path, true, false).await {
+                                if !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound) {
+                                    warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 没有版本了，删除 xl.meta
@@ -2313,6 +2340,16 @@ impl DiskAPI for LocalDisk {
         };
 
         let mut meta = FileMeta::load(&buf)?;
+
+        // Before deleting the version, extract append state from the actual stored FileInfo
+        // The fi parameter passed in may not have complete metadata
+        let stored_append_state = if let Ok((_, stored_fi)) = meta.find_version(fi.version_id) {
+            let fileinfo = stored_fi.into_fileinfo(volume, path, false);
+            rustfs_filemeta::get_append_state(&fileinfo.metadata).ok().flatten()
+        } else {
+            None
+        };
+
         let old_dir = meta.delete_version(&fi)?;
 
         if let Some(uuid) = old_dir {
@@ -2325,6 +2362,44 @@ impl DiskAPI for LocalDisk {
             if let Err(err) = self.move_to_trash(&old_path, true, false).await {
                 if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
                     return Err(err);
+                }
+            }
+        }
+
+        // Clean up append segments if present
+        // Append segments are stored in {object}/append/{epoch}/{uuid} directories
+        if let Some(append_state) = stored_append_state {
+            if !append_state.pending_segments.is_empty() {
+                // Clean up each pending segment
+                for segment in &append_state.pending_segments {
+                    if let Some(segment_dir) = segment.data_dir {
+                        let append_segment_path = file_path
+                            .join("append")
+                            .join(segment.epoch.to_string())
+                            .join(segment_dir.to_string());
+
+                        if let Err(err) = self.move_to_trash(&append_segment_path, true, false).await {
+                            if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                                warn!("Failed to clean up append segment at {:?}: {:?}", append_segment_path, err);
+                            }
+                        }
+                    }
+                }
+
+                // Try to clean up the append directory structure if it's empty
+                let append_base_path = file_path.join("append");
+                if append_base_path.exists() {
+                    // Try to remove empty epoch directories
+                    if let Ok(mut entries) = tokio::fs::read_dir(&append_base_path).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+                                // Try to remove the epoch directory, ignore errors if not empty
+                                let _ = tokio::fs::remove_dir(entry.path()).await;
+                            }
+                        }
+                    }
+                    // Try to remove the append base directory itself
+                    let _ = tokio::fs::remove_dir(&append_base_path).await;
                 }
             }
         }
