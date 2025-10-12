@@ -5439,9 +5439,10 @@ impl StorageAPI for SetDisks {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
 
         // Create a single object deletion request
+        // Use goi.version_id to ensure we can find and cleanup append segments
         let mut dfi = FileInfo {
             name: object.to_string(),
-            version_id: opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+            version_id: version_id.or(goi.version_id),
             mark_deleted: mark_delete,
             deleted: delete_marker,
             mod_time: Some(mod_time),
