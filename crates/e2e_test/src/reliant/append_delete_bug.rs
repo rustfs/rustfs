@@ -465,7 +465,10 @@ async fn delete_all_versions_should_cleanup_object_directory() -> Result<(), Box
 
     // 删除文件（不指定版本，创建 delete marker）
     let delete_resp = client.delete_object().bucket(&bucket).key(key).send().await?;
-    let delete_marker_version = delete_resp.version_id().map(|v| v.to_string()).expect("delete marker version");
+    let delete_marker_version = delete_resp
+        .version_id()
+        .map(|v| v.to_string())
+        .expect("delete marker version");
 
     sleep(Duration::from_millis(200)).await;
 
@@ -485,9 +488,21 @@ async fn delete_all_versions_should_cleanup_object_directory() -> Result<(), Box
     assert!(object_dir_exists_before, "Object directory should exist before deleting all versions");
 
     // 删除所有版本
-    client.delete_object().bucket(&bucket).key(key).version_id(&version1).send().await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&version1)
+        .send()
+        .await?;
 
-    client.delete_object().bucket(&bucket).key(key).version_id(&delete_marker_version).send().await?;
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .version_id(&delete_marker_version)
+        .send()
+        .await?;
 
     sleep(Duration::from_millis(500)).await;
 
