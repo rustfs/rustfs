@@ -1,6 +1,7 @@
 # MNMD Deployment Checklist
 
-This checklist provides step-by-step verification for deploying RustFS in MNMD (Multi-Node Multi-Drive) mode using Docker.
+This checklist provides step-by-step verification for deploying RustFS in MNMD (Multi-Node Multi-Drive) mode using
+Docker.
 
 ## Pre-Deployment Checks
 
@@ -12,6 +13,7 @@ This checklist provides step-by-step verification for deploying RustFS in MNMD (
 - [ ] At least 40GB disk space available (for 4 nodes × 4 volumes)
 
 Verify with:
+
 ```bash
 docker --version
 docker-compose --version
@@ -25,6 +27,7 @@ df -h
 - [ ] File system supports extended attributes
 
 Verify with:
+
 ```bash
 df -T | grep -E '(xfs|ext4)'
 ```
@@ -35,6 +38,7 @@ df -T | grep -E '(xfs|ext4)'
 - [ ] SELinux is properly configured (if enabled)
 
 Verify with:
+
 ```bash
 groups | grep docker
 getenforce  # If enabled, should show "Permissive" or "Enforcing" with proper policies
@@ -46,6 +50,7 @@ getenforce  # If enabled, should show "Permissive" or "Enforcing" with proper po
 - [ ] No firewall blocking Docker bridge network
 
 Verify with:
+
 ```bash
 # Check if ports are free
 netstat -tuln | grep -E ':(9000|9001|9010|9011|9020|9021|9030|9031)'
@@ -55,10 +60,9 @@ netstat -tuln | grep -E ':(9000|9001|9010|9011|9020|9021|9030|9031)'
 ### 5. Files Present
 
 - [ ] `docker-compose.yml` exists in current directory
-- [ ] `wait-and-start.sh` exists in current directory
-- [ ] `wait-and-start.sh` has execute permissions
 
 Verify with:
+
 ```bash
 cd docs/examples/mnmd
 ls -la
@@ -314,6 +318,7 @@ Before deploying to production:
 ## Summary
 
 This checklist ensures:
+
 - ✓ Correct disk indexing (1..4 instead of 0..3)
 - ✓ Proper startup coordination via wait-and-start.sh
 - ✓ Service discovery via Docker service names

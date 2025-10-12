@@ -1,12 +1,15 @@
 # RustFS MNMD (Multi-Node Multi-Drive) Docker Example
 
-This directory contains a complete, ready-to-use MNMD deployment example for RustFS with 4 nodes and 4 drives per node (4x4 configuration).
+This directory contains a complete, ready-to-use MNMD deployment example for RustFS with 4 nodes and 4 drives per node (
+4x4 configuration).
 
 ## Overview
 
 This example addresses common deployment issues including:
-- **VolumeNotFound errors** - Fixed by using correct disk indexing (`/data/rustfs{1...4}` instead of `/data/rustfs{0...3}`)
-- **Startup race conditions** - Solved with startup coordination via `wait-and-start.sh`
+
+- **VolumeNotFound errors** - Fixed by using correct disk indexing (`/data/rustfs{1...4}` instead of
+  `/data/rustfs{0...3}`)
+- **Startup race conditions** - Solved with a simple `sleep` command in each service.
 - **Service discovery** - Uses Docker service names (`rustfs-node{1..4}`) instead of hard-coded IPs
 - **Health checks** - Implements proper health monitoring with `nc` (with alternatives documented)
 
@@ -49,6 +52,7 @@ RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
 ```
 
 This expands to 16 endpoints (4 nodes × 4 drives):
+
 - Node 1: `/data/rustfs1`, `/data/rustfs2`, `/data/rustfs3`, `/data/rustfs4`
 - Node 2: `/data/rustfs1`, `/data/rustfs2`, `/data/rustfs3`, `/data/rustfs4`
 - Node 3: `/data/rustfs1`, `/data/rustfs2`, `/data/rustfs3`, `/data/rustfs4`
@@ -58,20 +62,19 @@ This expands to 16 endpoints (4 nodes × 4 drives):
 
 ### Port Mappings
 
-| Node | API Port | Console Port |
-|------|----------|--------------|
-| node1 | 9000 | 9001 |
-| node2 | 9010 | 9011 |
-| node3 | 9020 | 9021 |
-| node4 | 9030 | 9031 |
+| Node  | API Port | Console Port |
+|-------|----------|--------------|
+| node1 | 9000     | 9001         |
+| node2 | 9010     | 9011         |
+| node3 | 9020     | 9021         |
+| node4 | 9030     | 9031         |
 
 ### Startup Coordination
 
-The `wait-and-start.sh` script ensures:
-1. All required data directories (`/data/rustfs1..4`) are created
-2. Peer nodes are reachable before starting (best-effort, with 120s timeout)
-3. No circular deadlocks (continues after timeout)
-4. Proper command execution via `CMD` or `RUSTFS_CMD` fallback
+To prevent race conditions during startup where nodes might not find each other, a simple `sleep 3` command is added to
+each service's command. This provides a brief delay, allowing the network and other services to initialize before RustFS
+starts. For more complex scenarios, a more robust health-check dependency or an external entrypoint script might be
+required.
 
 ### Health Checks
 
@@ -79,7 +82,7 @@ Default health check using `nc` (netcat):
 
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+  test: [ "CMD-SHELL", "nc -z localhost 9000 || exit 1" ]
   interval: 10s
   timeout: 5s
   retries: 3
@@ -91,9 +94,10 @@ healthcheck:
 If your base image lacks `nc`, use one of these alternatives:
 
 **Using curl:**
+
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "curl -f http://localhost:9000/health || exit 1"]
+  test: [ "CMD-SHELL", "curl -f http://localhost:9000/health || exit 1" ]
   interval: 10s
   timeout: 5s
   retries: 3
@@ -101,9 +105,10 @@ healthcheck:
 ```
 
 **Using wget:**
+
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1"]
+  test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1" ]
   interval: 10s
   timeout: 5s
   retries: 3
@@ -143,6 +148,7 @@ Use the provided test script for comprehensive validation:
 ```
 
 This script tests:
+
 - Container status (4/4 running)
 - Health checks (4/4 healthy)
 - API endpoints (4 ports)
@@ -182,13 +188,15 @@ docker exec rustfs-node1 nc -zv rustfs-node4 9000
 
 **Symptom:** Error message about `/data/rustfs0` not found.
 
-**Solution:** This example uses `/data/rustfs{1...4}` indexing to match the mounted Docker volumes. Ensure your `RUSTFS_VOLUMES` configuration starts at index 1, not 0.
+**Solution:** This example uses `/data/rustfs{1...4}` indexing to match the mounted Docker volumes. Ensure your
+`RUSTFS_VOLUMES` configuration starts at index 1, not 0.
 
 ### Health Check Failures
 
 **Symptom:** Containers show as unhealthy.
 
 **Solutions:**
+
 1. Check if `nc` is available: `docker exec rustfs-node1 which nc`
 2. Use alternative health checks (curl/wget) as documented above
 3. Increase `start_period` if nodes need more time to initialize
@@ -198,9 +206,10 @@ docker exec rustfs-node1 nc -zv rustfs-node4 9000
 **Symptom:** Services timeout waiting for peers.
 
 **Solutions:**
+
 1. Check logs: `docker-compose logs rustfs-node1`
-2. Increase timeout in `wait-and-start.sh` (default: 120s)
-3. Verify network connectivity: `docker-compose exec rustfs-node1 ping rustfs-node2`
+2. Verify network connectivity: `docker-compose exec rustfs-node1 ping rustfs-node2`
+3. Consider increasing the `sleep` duration in the `docker-compose.yml` `command` directive if a longer delay is needed.
 
 ### Permission Issues
 
@@ -257,4 +266,3 @@ deploy:
 
 - RustFS Documentation: https://rustfs.io
 - Docker Compose Documentation: https://docs.docker.com/compose/
-- MinIO Distributed Setup (similar architecture): https://min.io/docs/minio/linux/operations/install-deploy-manage/deploy-minio-multi-node-multi-drive.html
