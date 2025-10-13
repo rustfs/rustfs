@@ -367,6 +367,7 @@ impl AsyncRead for HashReader {
                 }
 
                 if filled == 0 {
+                    // TODO: check once only
                     // check SHA256
                     if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
                         let sha256 = hasher.finalize();
