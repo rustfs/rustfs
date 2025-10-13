@@ -122,6 +122,14 @@ RustFS 是一个社区驱动的项目，我们感谢所有的贡献。查看[贡
   <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" />
 </a >
 
+
+## Github 全球推荐榜
+
+🚀 RustFS 受到了全世界开源爱好者和企业用户的喜欢，多次登顶Github Trending全球榜。
+
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
+
+
 ## 许可证
 
 [Apache 2.0](https://opensource.org/licenses/Apache-2.0)
