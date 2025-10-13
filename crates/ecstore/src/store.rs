@@ -1709,17 +1709,6 @@ impl StorageAPI for ECStore {
         // Ok((del_objects, del_errs))
     }
 
-    async fn complete_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let object = encode_dir_object(object);
-        let (pinfo, _) = self.internal_get_pool_info_existing_with_opts(bucket, &object, opts).await?;
-        self.pools[pinfo.index].complete_append(bucket, &object, opts).await
-    }
-
-    async fn abort_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let object = encode_dir_object(object);
-        let (pinfo, _) = self.internal_get_pool_info_existing_with_opts(bucket, &object, opts).await?;
-        self.pools[pinfo.index].abort_append(bucket, &object, opts).await
-    }
     #[tracing::instrument(skip(self))]
     async fn list_object_parts(
         &self,

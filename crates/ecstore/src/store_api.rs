@@ -328,8 +328,6 @@ pub struct ObjectOptions {
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: Option<usize>,
-    pub append_object: bool,
-    pub append_position: Option<i64>,
 
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
@@ -658,15 +656,6 @@ impl ObjectInfo {
             })
             .collect();
 
-        let append_state = fi.get_append_state();
-        let pending_length: i64 = append_state.pending_segments.iter().map(|seg| seg.length).sum();
-        let logical_size = append_state.committed_length.saturating_add(pending_length);
-        let actual_size_meta = fi
-            .metadata
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"))
-            .and_then(|o| o.parse::<i64>().ok())
-            .unwrap_or(logical_size);
-
         ObjectInfo {
             bucket: bucket.to_string(),
             name,
@@ -676,7 +665,7 @@ impl ObjectInfo {
             version_id,
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
-            size: logical_size,
+            size: fi.size,
             parts,
             is_latest: fi.is_latest,
             user_tags,
@@ -688,7 +677,6 @@ impl ObjectInfo {
             inlined,
             user_defined: metadata,
             transitioned_object,
-            actual_size: actual_size_meta,
             ..Default::default()
         }
     }
@@ -1199,10 +1187,6 @@ pub trait StorageAPI: ObjectIO + Debug {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>);
-
-    async fn complete_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-
-    async fn abort_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 
     // TransitionObject TODO:
     // RestoreTransitionedObject TODO:
