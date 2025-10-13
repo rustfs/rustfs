@@ -3729,7 +3729,12 @@ impl ObjectIO for SetDisks {
         // }
 
         if (w_size as i64) < data.size() {
-            return Err(Error::other("put_object write size < data.size()"));
+            warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            return Err(Error::other(format!(
+                "put_object write size < data.size(), w_size={}, data.size={}",
+                w_size,
+                data.size()
+            )));
         }
 
         if user_defined.contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression")) {
@@ -4952,7 +4957,12 @@ impl StorageAPI for SetDisks {
         let _ = mem::replace(&mut data.stream, reader);
 
         if (w_size as i64) < data.size() {
-            return Err(Error::other("put_object_part write size < data.size()"));
+            warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            return Err(Error::other(format!(
+                "put_object_part write size < data.size(), w_size={}, data.size={}",
+                w_size,
+                data.size()
+            )));
         }
 
         let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
