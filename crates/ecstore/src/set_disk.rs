@@ -3712,7 +3712,7 @@ impl ObjectIO for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
@@ -4944,7 +4944,7 @@ impl StorageAPI for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录

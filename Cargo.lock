@@ -1753,6 +1753,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc64"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2707e3afba5e19b75d582d88bc79237418f2a2a2d673d01cf9b03633b46e98f3"
+
+[[package]]
 name = "crc64fast-nvme"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6854,8 +6860,10 @@ name = "rustfs-rio"
 version = "0.0.5"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "bytes",
  "crc32fast",
+ "crc64",
  "futures",
  "http 1.3.1",
  "md-5",
@@ -6865,6 +6873,9 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-test",
  "tokio-util",

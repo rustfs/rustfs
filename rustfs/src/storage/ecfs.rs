@@ -423,13 +423,13 @@ impl FS {
                     );
                     metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-                    let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+                    let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
                     reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
                     size = -1;
                 }
 
-                let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+                let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
                 let mut reader = PutObjReader::new(hrd);
 
                 let _obj_info = store
@@ -682,7 +682,7 @@ impl S3 for FS {
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
         }
 
-        let mut reader = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, length, actual_size, None, None, false).map_err(ApiError::from)?;
 
         if let Some(ref sse_alg) = effective_sse {
             if is_managed_sse(sse_alg) {
@@ -702,7 +702,7 @@ impl S3 for FS {
                 effective_kms_key_id = Some(kms_key_used.clone());
 
                 let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
             }
         }
 
@@ -2206,14 +2206,14 @@ impl S3 for FS {
             );
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-            let hrd = HashReader::new(reader, size as i64, size as i64, None, false).map_err(ApiError::from)?;
+            let hrd = HashReader::new(reader, size as i64, size as i64, None, None, false).map_err(ApiError::from)?;
 
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
         }
 
         // TODO: md5 check
-        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
         // Apply SSE-C encryption if customer provided key
         if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
@@ -2254,7 +2254,7 @@ impl S3 for FS {
 
             // Apply encryption
             let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
@@ -2278,7 +2278,8 @@ impl S3 for FS {
                     effective_kms_key_id = Some(kms_key_used.clone());
 
                     let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-                    reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+                    reader =
+                        HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
                 }
             }
         }
@@ -2652,18 +2653,18 @@ impl S3 for FS {
         */
 
         if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
             reader = Box::new(compress_reader);
             size = -1;
         }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
         if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined).await? {
             let part_nonce = derive_part_nonce(base_nonce, part_id);
             let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -2831,17 +2832,17 @@ impl S3 for FS {
         let mut size = length;
 
         if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
         }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
         if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &mp_info.user_defined).await? {
             let part_nonce = derive_part_nonce(base_nonce, part_id);
             let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         let mut reader = PutObjReader::new(reader);

@@ -72,7 +72,7 @@ mod tests {
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
         let mut hash_reader =
-            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("hash_etag".to_string()), false).unwrap();
+            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("hash_etag".to_string()), None, false).unwrap();
 
         // Test HashReader ETag resolution
         assert_eq!(resolve_etag_generic(&mut hash_reader), Some("hash_etag".to_string()));
@@ -127,8 +127,15 @@ mod tests {
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
         // Create nested structure: CompressReader<HashReader<BufReader<Cursor>>>
-        let hash_reader =
-            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("hash_nested_etag".to_string()), false).unwrap();
+        let hash_reader = HashReader::new(
+            reader,
+            data.len() as i64,
+            data.len() as i64,
+            Some("hash_nested_etag".to_string()),
+            None,
+            false,
+        )
+        .unwrap();
         let mut compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Deflate);
 
         // Test that nested HashReader can be resolved
@@ -150,8 +157,15 @@ mod tests {
         let data2 = b"hash test";
         let reader2 = BufReader::new(Cursor::new(&data2[..]));
         let reader2 = Box::new(WarpReader::new(reader2));
-        let mut hash_reader =
-            HashReader::new(reader2, data2.len() as i64, data2.len() as i64, Some("hash_etag".to_string()), false).unwrap();
+        let mut hash_reader = HashReader::new(
+            reader2,
+            data2.len() as i64,
+            data2.len() as i64,
+            Some("hash_etag".to_string()),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(resolve_etag_generic(&mut hash_reader), Some("hash_etag".to_string()));
 
         // Test 3: Single wrapper - CompressReader<EtagReader>
@@ -195,6 +209,7 @@ mod tests {
             data.len() as i64,
             data.len() as i64,
             Some("real_world_etag".to_string()),
+            None,
             false,
         )
         .unwrap();
@@ -239,7 +254,7 @@ mod tests {
         let data = b"no etag test";
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
-        let mut hash_reader_no_etag = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
+        let mut hash_reader_no_etag = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
         assert_eq!(resolve_etag_generic(&mut hash_reader_no_etag), None);
 
         // Test with EtagReader that has None etag

@@ -95,8 +95,15 @@ impl PutObjReader {
     pub fn from_vec(data: Vec<u8>) -> Self {
         let content_length = data.len() as i64;
         PutObjReader {
-            stream: HashReader::new(Box::new(WarpReader::new(Cursor::new(data))), content_length, content_length, None, false)
-                .unwrap(),
+            stream: HashReader::new(
+                Box::new(WarpReader::new(Cursor::new(data))),
+                content_length,
+                content_length,
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
         }
     }
 

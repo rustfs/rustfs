@@ -100,13 +100,16 @@
 //! # });
 //! ```
 
+use crate::Checksum;
+use crate::ChecksumHasher;
+use crate::Sha256Hasher;
+use crate::compress_index::{Index, TryGetIndex};
+use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader};
 use pin_project_lite::pin_project;
+use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-
-use crate::compress_index::{Index, TryGetIndex};
-use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader};
 
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
@@ -117,6 +120,8 @@ pub trait HashReaderMut {
     fn set_size(&mut self, size: i64);
     fn actual_size(&self) -> i64;
     fn set_actual_size(&mut self, actual_size: i64);
+    fn content_hash(&self) -> &Option<Checksum>;
+    fn content_sha256(&self) -> &Option<Vec<u8>>;
 }
 
 pin_project! {
@@ -129,7 +134,11 @@ pin_project! {
         pub actual_size: i64,
         pub diskable_md5: bool,
         bytes_read: u64,
-        // TODO: content_hash
+        content_hash: Option<Checksum>,
+        content_hasher: Option<Box<dyn ChecksumHasher>>,
+        content_sha256: Option<Vec<u8>>,
+        content_sha256_hasher: Option<Sha256Hasher>,
+
     }
 
 }
@@ -139,7 +148,8 @@ impl HashReader {
         mut inner: Box<dyn Reader>,
         size: i64,
         actual_size: i64,
-        md5: Option<String>,
+        md5hex: Option<String>,
+        sha256hex: Option<String>,
         diskable_md5: bool,
     ) -> std::io::Result<Self> {
         // Check if it's already a HashReader and update its parameters
@@ -152,7 +162,7 @@ impl HashReader {
             }
 
             if let Some(checksum) = existing_hash_reader.checksum() {
-                if let Some(ref md5) = md5 {
+                if let Some(ref md5) = md5hex {
                     if checksum != md5 {
                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "HashReader checksum mismatch"));
                     }
@@ -166,7 +176,7 @@ impl HashReader {
                 ));
             }
 
-            existing_hash_reader.set_checksum(md5.clone());
+            existing_hash_reader.set_checksum(md5hex.clone());
 
             if existing_hash_reader.size() < 0 && size >= 0 {
                 existing_hash_reader.set_size(size);
@@ -176,13 +186,27 @@ impl HashReader {
                 existing_hash_reader.set_actual_size(actual_size);
             }
 
+            let size = existing_hash_reader.size();
+            let actual_size = existing_hash_reader.actual_size();
+            let content_hash = existing_hash_reader.content_hash().clone();
+            let content_hasher = existing_hash_reader
+                .content_hash()
+                .clone()
+                .map(|hash| hash.checksum_type.hasher().unwrap());
+            let content_sha256 = existing_hash_reader.content_sha256().clone();
+            let content_sha256_hasher = existing_hash_reader.content_sha256().clone().map(|_| Sha256Hasher::new());
+
             return Ok(Self {
                 inner,
                 size,
-                checksum: md5,
+                checksum: md5hex.clone(),
                 actual_size,
                 diskable_md5,
                 bytes_read: 0,
+                content_sha256,
+                content_sha256_hasher,
+                content_hash,
+                content_hasher,
             });
         }
 
@@ -190,20 +214,24 @@ impl HashReader {
             let hr = HardLimitReader::new(inner, size);
             inner = Box::new(hr);
             if !diskable_md5 && !inner.is_hash_reader() {
-                let er = EtagReader::new(inner, md5.clone());
+                let er = EtagReader::new(inner, md5hex.clone());
                 inner = Box::new(er);
             }
         } else if !diskable_md5 {
-            let er = EtagReader::new(inner, md5.clone());
+            let er = EtagReader::new(inner, md5hex.clone());
             inner = Box::new(er);
         }
         Ok(Self {
             inner,
             size,
-            checksum: md5,
+            checksum: md5hex,
             actual_size,
             diskable_md5,
             bytes_read: 0,
+            content_hash: None,
+            content_hasher: None,
+            content_sha256: sha256hex.clone().map(|hash| hash.into_bytes()),
+            content_sha256_hasher: sha256hex.clone().map(|_| Sha256Hasher::new()),
         })
     }
 
@@ -227,6 +255,23 @@ impl HashReader {
     }
     pub fn actual_size(&self) -> i64 {
         self.actual_size
+    }
+
+    pub fn add_checksum(&mut self, cs: Option<Checksum>, ignore_value: bool) -> Result<(), std::io::Error> {
+        if ignore_value {
+            return Ok(());
+        }
+
+        if let Some(checksum) = cs {
+            let Some(hasher) = checksum.checksum_type.hasher() else {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
+            };
+
+            self.content_hash = Some(checksum);
+            self.content_hasher = Some(hasher);
+        }
+
+        Ok(())
     }
 }
 
@@ -258,19 +303,59 @@ impl HashReaderMut for HashReader {
     fn set_actual_size(&mut self, actual_size: i64) {
         self.actual_size = actual_size;
     }
+
+    fn content_hash(&self) -> &Option<Checksum> {
+        &self.content_hash
+    }
+
+    fn content_sha256(&self) -> &Option<Vec<u8>> {
+        &self.content_sha256
+    }
 }
 
 impl AsyncRead for HashReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
+        let before = buf.filled().len();
         let poll = this.inner.poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &poll {
             let filled = buf.filled().len();
             *this.bytes_read += filled as u64;
 
+            if filled > 0 {
+                let data = &buf.filled()[before..];
+
+                // Update SHA256 hasher
+                if let Some(hasher) = this.content_sha256_hasher {
+                    if let Err(e) = hasher.write_all(data) {
+                        return Poll::Ready(Err(std::io::Error::other(e)));
+                    }
+                }
+
+                // Update content hasher
+                if let Some(hasher) = this.content_hasher {
+                    if let Err(e) = hasher.write_all(data) {
+                        return Poll::Ready(Err(std::io::Error::other(e)));
+                    }
+                }
+            }
+
             if filled == 0 {
-                // EOF
-                // TODO: check content_hash
+                // check SHA256
+                if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
+                    let sha256 = hasher.finalize_reset();
+                    if sha256 != *expected_sha256 {
+                        return Poll::Ready(Err(std::io::Error::other("SHA256 mismatch")));
+                    }
+                }
+
+                // check content hasher
+                if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
+                    let content_hash = hasher.finalize_reset();
+                    if content_hash != expected_content_hash.raw {
+                        return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                    }
+                }
             }
         }
         poll
@@ -323,7 +408,7 @@ mod tests {
         // Test 1: Simple creation
         let reader1 = BufReader::new(Cursor::new(&data[..]));
         let reader1 = Box::new(WarpReader::new(reader1));
-        let hash_reader1 = HashReader::new(reader1, size, actual_size, etag.clone(), false).unwrap();
+        let hash_reader1 = HashReader::new(reader1, size, actual_size, etag.clone(), None, false).unwrap();
         assert_eq!(hash_reader1.size(), size);
         assert_eq!(hash_reader1.actual_size(), actual_size);
 
@@ -332,7 +417,7 @@ mod tests {
         let reader2 = Box::new(WarpReader::new(reader2));
         let hard_limit = HardLimitReader::new(reader2, size);
         let hard_limit = Box::new(hard_limit);
-        let hash_reader2 = HashReader::new(hard_limit, size, actual_size, etag.clone(), false).unwrap();
+        let hash_reader2 = HashReader::new(hard_limit, size, actual_size, etag.clone(), None, false).unwrap();
         assert_eq!(hash_reader2.size(), size);
         assert_eq!(hash_reader2.actual_size(), actual_size);
 
@@ -341,7 +426,7 @@ mod tests {
         let reader3 = Box::new(WarpReader::new(reader3));
         let etag_reader = EtagReader::new(reader3, etag.clone());
         let etag_reader = Box::new(etag_reader);
-        let hash_reader3 = HashReader::new(etag_reader, size, actual_size, etag.clone(), false).unwrap();
+        let hash_reader3 = HashReader::new(etag_reader, size, actual_size, etag.clone(), None, false).unwrap();
         assert_eq!(hash_reader3.size(), size);
         assert_eq!(hash_reader3.actual_size(), actual_size);
     }
@@ -351,7 +436,7 @@ mod tests {
         let data = b"hello hashreader";
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
-        let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
+        let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
         let mut buf = Vec::new();
         let _ = hash_reader.read_to_end(&mut buf).await.unwrap();
         // Since we removed EtagReader integration, etag might be None
@@ -365,7 +450,7 @@ mod tests {
         let data = b"no etag";
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
-        let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, true).unwrap();
+        let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, true).unwrap();
         let mut buf = Vec::new();
         let _ = hash_reader.read_to_end(&mut buf).await.unwrap();
         // Etag should be None when diskable_md5 is true
@@ -381,10 +466,17 @@ mod tests {
         let reader = Box::new(WarpReader::new(reader));
         // Create a HashReader first
         let hash_reader =
-            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("test_etag".to_string()), false).unwrap();
+            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("test_etag".to_string()), None, false).unwrap();
         let hash_reader = Box::new(WarpReader::new(hash_reader));
         // Now try to create another HashReader from the existing one using new
-        let result = HashReader::new(hash_reader, data.len() as i64, data.len() as i64, Some("test_etag".to_string()), false);
+        let result = HashReader::new(
+            hash_reader,
+            data.len() as i64,
+            data.len() as i64,
+            Some("test_etag".to_string()),
+            None,
+            false,
+        );
 
         assert!(result.is_ok());
         let final_reader = result.unwrap();
@@ -422,7 +514,7 @@ mod tests {
 
         let reader = Box::new(WarpReader::new(reader));
         // Create HashReader
-        let mut hr = HashReader::new(reader, size, actual_size, Some(expected.clone()), false).unwrap();
+        let mut hr = HashReader::new(reader, size, actual_size, Some(expected.clone()), None, false).unwrap();
 
         // If compression is enabled, compress data first
         let compressed_data = if is_compress {
@@ -518,7 +610,7 @@ mod tests {
 
         let reader = BufReader::new(Cursor::new(data.clone()));
         let reader = Box::new(WarpReader::new(reader));
-        let hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
+        let hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
 
         // Test compression
         let compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Gzip);
@@ -564,7 +656,7 @@ mod tests {
 
             let reader = BufReader::new(Cursor::new(data.clone()));
             let reader = Box::new(WarpReader::new(reader));
-            let hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
+            let hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
 
             // Compress
             let compress_reader = CompressReader::new(hash_reader, algorithm);
