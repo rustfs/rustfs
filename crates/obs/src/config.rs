@@ -139,11 +139,9 @@ impl Default for OtelConfig {
 }
 
 /// Overall application configuration
-/// Add observability, sinks, and logger configuration
+/// Add observability configuration
 ///
 /// Observability: OpenTelemetry configuration
-/// Sinks: Kafka, Webhook, File sink configuration
-/// Logger: Logger configuration
 ///
 /// # Example
 /// ```

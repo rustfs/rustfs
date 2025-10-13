@@ -18,10 +18,7 @@
 //!
 //! ## feature mark
 //!
-//! - `file`: enable file logging enabled by default
 //! - `gpu`: gpu monitoring function
-//! - `kafka`: enable kafka metric output
-//! - `webhook`: enable webhook notifications
 //! - `full`: includes all functions
 //!
 //! to enable gpu monitoring add in cargo toml

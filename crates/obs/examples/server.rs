@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use opentelemetry::global;
-use rustfs_obs::{init_obs, SystemObserver};
+use rustfs_obs::{SystemObserver, init_obs};
 use std::time::{Duration, SystemTime};
 use tracing::{error, info, instrument};
 use tracing_core::Level;
