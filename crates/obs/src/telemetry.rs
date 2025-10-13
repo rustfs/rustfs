@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::OtelConfig;
+use crate::config::OtelConfig;
 use flexi_logger::{
     Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
     WriteMode::{AsyncWith, BufferAndFlush},

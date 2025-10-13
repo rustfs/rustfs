@@ -21,8 +21,8 @@ use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm, Key,
-    Nonce,
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -127,7 +127,7 @@ async fn async_main() -> Result<()> {
     init_license(opt.license.clone());
 
     // Initialize Observability
-    let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
+    let guard = init_obs(Some(opt.clone().obs_endpoint)).await;
 
     // print startup logo
     info!("{}", LOGO);
