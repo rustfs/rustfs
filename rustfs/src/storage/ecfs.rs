@@ -2088,6 +2088,40 @@ impl S3 for FS {
 
         let input = req.input;
 
+        let mut checksum: s3s::checksum::ChecksumHasher = Default::default();
+        if input.checksum_crc32.is_some() {
+            checksum.crc32 = Some(Default::default());
+        }
+        if input.checksum_crc32c.is_some() {
+            checksum.crc32c = Some(Default::default());
+        }
+        if input.checksum_sha1.is_some() {
+            checksum.sha1 = Some(Default::default());
+        }
+        if input.checksum_sha256.is_some() {
+            checksum.sha256 = Some(Default::default());
+        }
+        if input.checksum_crc64nvme.is_some() {
+            checksum.crc64nvme = Some(Default::default());
+        }
+        if let Some(alg) = &input.checksum_algorithm {
+            match alg.as_str() {
+                ChecksumAlgorithm::CRC32 => checksum.crc32 = Some(Default::default()),
+                ChecksumAlgorithm::CRC32C => checksum.crc32c = Some(Default::default()),
+                ChecksumAlgorithm::SHA1 => checksum.sha1 = Some(Default::default()),
+                ChecksumAlgorithm::SHA256 => checksum.sha256 = Some(Default::default()),
+                ChecksumAlgorithm::CRC64NVME => checksum.crc64nvme = Some(Default::default()),
+                _ => return Err(s3_error!(NotImplemented, "Unsupported checksum algorithm")),
+            }
+        }
+
+        warn!("checksum algorithm={:?}", &input.checksum_algorithm);
+        warn!("checksum crc32={:?}", &input.checksum_crc32);
+        warn!("checksum crc32c={:?}", &input.checksum_crc32c);
+        warn!("checksum sha1={:?}", &input.checksum_sha1);
+        warn!("checksum sha256={:?}", &input.checksum_sha256);
+        warn!("checksum crc64nvme={:?}", input.checksum_crc64nvme);
+
         // Save SSE-C parameters before moving input
         if let Some(ref storage_class) = input.storage_class {
             if !is_valid_storage_class(storage_class.as_str()) {
@@ -2206,8 +2240,15 @@ impl S3 for FS {
             );
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-            let hrd = HashReader::new(reader, size as i64, size as i64, None, None, false).map_err(ApiError::from)?;
+            let mut hrd = HashReader::new(reader, size as i64, size as i64, None, None, false).map_err(ApiError::from)?;
 
+            let cs = rustfs_rio::Checksum::new_from_header(&req.headers).map_err(ApiError::from)?;
+
+            warn!("cs={:?}", cs);
+
+            if let Err(err) = hrd.add_checksum(cs, false) {
+                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            }
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
         }

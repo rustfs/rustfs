@@ -15,12 +15,12 @@
 use crate::errors::ChecksumMismatch;
 use base64::{Engine as _, engine::general_purpose};
 use crc32fast::Hasher as Crc32Hasher;
-use crc64::crc64;
 use http::HeaderMap;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
+use tracing::warn;
 
 pub const SHA256_SIZE: usize = 32;
 
@@ -234,8 +234,13 @@ impl Checksum {
         } else {
             value_string = value.to_string();
         }
-
+        warn!("value_string={value_string}");
+        // let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(&value_string).ok()?;
         let raw = general_purpose::STANDARD.decode(&value_string).ok()?;
+
+        warn!("raw={:?}", raw);
+
+        warn!("trailing={}", checksum_type.trailing());
 
         let checksum = Checksum {
             checksum_type,
@@ -592,8 +597,8 @@ impl ChecksumType {
 
 /// Trait for checksum hashers
 pub trait ChecksumHasher: Write + Send + Sync {
-    fn finalize(self: Box<Self>) -> Vec<u8>;
-    fn finalize_reset(&mut self) -> Vec<u8>;
+    fn finalize(&mut self) -> Vec<u8>;
+    fn reset(&mut self);
 }
 
 /// CRC32 IEEE hasher
@@ -627,14 +632,12 @@ impl Write for Crc32IeeeHasher {
 }
 
 impl ChecksumHasher for Crc32IeeeHasher {
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        self.hasher.finalize().to_be_bytes().to_vec()
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.clone().finalize().to_be_bytes().to_vec()
     }
 
-    fn finalize_reset(&mut self) -> Vec<u8> {
-        let result = self.hasher.clone().finalize().to_be_bytes().to_vec();
+    fn reset(&mut self) {
         self.hasher = Crc32Hasher::new();
-        result
     }
 }
 
@@ -669,14 +672,12 @@ impl Write for Crc32CastagnoliHasher {
 }
 
 impl ChecksumHasher for Crc32CastagnoliHasher {
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        self.hasher.finalize().to_be_bytes().to_vec()
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.clone().finalize().to_be_bytes().to_vec()
     }
 
-    fn finalize_reset(&mut self) -> Vec<u8> {
-        let result = self.hasher.clone().finalize().to_be_bytes().to_vec();
+    fn reset(&mut self) {
         self.hasher = crc32fast::Hasher::new_with_initial(0);
-        result
     }
 }
 
@@ -709,14 +710,12 @@ impl Write for Sha1Hasher {
 }
 
 impl ChecksumHasher for Sha1Hasher {
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        self.hasher.finalize().to_vec()
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.clone().finalize().to_vec()
     }
 
-    fn finalize_reset(&mut self) -> Vec<u8> {
-        let result = self.hasher.clone().finalize().to_vec();
+    fn reset(&mut self) {
         self.hasher = Sha1::new();
-        result
     }
 }
 
@@ -749,39 +748,32 @@ impl Write for Sha256Hasher {
 }
 
 impl ChecksumHasher for Sha256Hasher {
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        self.hasher.finalize().to_vec()
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.clone().finalize().to_vec()
     }
 
-    fn finalize_reset(&mut self) -> Vec<u8> {
-        let result = self.hasher.clone().finalize().to_vec();
+    fn reset(&mut self) {
         self.hasher = Sha256::new();
-        result
     }
 }
 
 /// CRC64 NVME hasher
+#[derive(Default)]
 pub struct Crc64NvmeHasher {
-    state: u64,
-}
-
-const _CRC64_NVME_POLYNOMIAL: u64 = 0xad93d23594c93659;
-
-impl Default for Crc64NvmeHasher {
-    fn default() -> Self {
-        Self::new()
-    }
+    hasher: crc64fast_nvme::Digest,
 }
 
 impl Crc64NvmeHasher {
     pub fn new() -> Self {
-        Self { state: 0 }
+        Self {
+            hasher: Default::default(),
+        }
     }
 }
 
 impl Write for Crc64NvmeHasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.state = crc64(self.state, buf);
+        self.hasher.write(buf);
         Ok(buf.len())
     }
 
@@ -791,14 +783,12 @@ impl Write for Crc64NvmeHasher {
 }
 
 impl ChecksumHasher for Crc64NvmeHasher {
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        self.state.to_be_bytes().to_vec()
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.sum64().to_be_bytes().to_vec()
     }
 
-    fn finalize_reset(&mut self) -> Vec<u8> {
-        let result = self.state.to_be_bytes().to_vec();
-        self.state = 0;
-        result
+    fn reset(&mut self) {
+        self.hasher = Default::default();
     }
 }
 
@@ -866,7 +856,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (Option<HashMap<String, Stri
             buf = &buf[n..];
 
             if !checksum_type.full_object_requested() {
-                checksum_str = format!("{}-{}", checksum_str, parts_count);
+                checksum_str = format!("{checksum_str}-{parts_count}");
             } else if part <= 0 {
                 result.insert("x-amz-checksum-type".to_string(), "FULL_OBJECT".to_string());
             }

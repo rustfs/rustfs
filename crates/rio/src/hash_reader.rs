@@ -369,7 +369,7 @@ impl AsyncRead for HashReader {
                 if filled == 0 {
                     // check SHA256
                     if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
-                        let sha256 = hasher.finalize_reset();
+                        let sha256 = hasher.finalize();
                         if sha256 != *expected_sha256 {
                             warn!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
                             return Poll::Ready(Err(std::io::Error::other("SHA256 mismatch")));
@@ -378,7 +378,7 @@ impl AsyncRead for HashReader {
 
                     // check content hasher
                     if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
-                        let content_hash = hasher.finalize_reset();
+                        let content_hash = hasher.finalize();
                         if content_hash != expected_content_hash.raw {
                             warn!("Content hash mismatch, expected={:?}, actual={:?}", expected_content_hash, content_hash);
                             return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
