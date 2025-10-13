@@ -104,15 +104,20 @@ use crate::Checksum;
 use crate::ChecksumHasher;
 use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader};
+use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader, WarpReader};
 use pin_project_lite::pin_project;
+use std::io::Cursor;
 use std::io::Write;
+use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+use tracing::warn;
 
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
+    fn into_inner(self) -> Box<dyn Reader>;
+    fn take_inner(&mut self) -> Box<dyn Reader>;
     fn bytes_read(&self) -> u64;
     fn checksum(&self) -> &Option<String>;
     fn set_checksum(&mut self, checksum: Option<String>);
@@ -195,7 +200,7 @@ impl HashReader {
                 .map(|hash| hash.checksum_type.hasher().unwrap());
             let content_sha256 = existing_hash_reader.content_sha256().clone();
             let content_sha256_hasher = existing_hash_reader.content_sha256().clone().map(|_| Sha256Hasher::new());
-
+            let inner = existing_hash_reader.take_inner();
             return Ok(Self {
                 inner,
                 size,
@@ -233,6 +238,10 @@ impl HashReader {
             content_sha256: sha256hex.clone().map(|hash| hash.into_bytes()),
             content_sha256_hasher: sha256hex.clone().map(|_| Sha256Hasher::new()),
         })
+    }
+
+    pub fn into_inner(self) -> Box<dyn Reader> {
+        self.inner
     }
 
     /// Update HashReader parameters
@@ -276,6 +285,15 @@ impl HashReader {
 }
 
 impl HashReaderMut for HashReader {
+    fn into_inner(self) -> Box<dyn Reader> {
+        self.inner
+    }
+
+    fn take_inner(&mut self) -> Box<dyn Reader> {
+        // Replace inner with an empty reader to move it out safely while keeping self valid
+        mem::replace(&mut self.inner, Box::new(WarpReader::new(Cursor::new(Vec::new()))))
+    }
+
     fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
@@ -316,49 +334,64 @@ impl HashReaderMut for HashReader {
 impl AsyncRead for HashReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
+
+        warn!(
+            "hashreader poll_read actual_size={}, size={}, bytes_read={}",
+            this.actual_size, this.size, this.bytes_read
+        );
         let before = buf.filled().len();
-        let poll = this.inner.poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let filled = buf.filled().len();
-            *this.bytes_read += filled as u64;
-
-            if filled > 0 {
+        match this.inner.poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
                 let data = &buf.filled()[before..];
+                let filled = data.len();
+                warn!("hashreader poll_read filled={}", filled);
+                *this.bytes_read += filled as u64;
 
-                // Update SHA256 hasher
-                if let Some(hasher) = this.content_sha256_hasher {
-                    if let Err(e) = hasher.write_all(data) {
-                        return Poll::Ready(Err(std::io::Error::other(e)));
+                if filled > 0 {
+                    // Update SHA256 hasher
+                    if let Some(hasher) = this.content_sha256_hasher {
+                        if let Err(e) = hasher.write_all(data) {
+                            warn!("SHA256 hasher write error, error={:?}", e);
+                            return Poll::Ready(Err(std::io::Error::other(e)));
+                        }
+                    }
+
+                    // Update content hasher
+                    if let Some(hasher) = this.content_hasher {
+                        if let Err(e) = hasher.write_all(data) {
+                            warn!("Content hasher write error, error={:?}", e);
+                            return Poll::Ready(Err(std::io::Error::other(e)));
+                        }
                     }
                 }
 
-                // Update content hasher
-                if let Some(hasher) = this.content_hasher {
-                    if let Err(e) = hasher.write_all(data) {
-                        return Poll::Ready(Err(std::io::Error::other(e)));
+                if filled == 0 {
+                    // check SHA256
+                    if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
+                        let sha256 = hasher.finalize_reset();
+                        if sha256 != *expected_sha256 {
+                            warn!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
+                            return Poll::Ready(Err(std::io::Error::other("SHA256 mismatch")));
+                        }
+                    }
+
+                    // check content hasher
+                    if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
+                        let content_hash = hasher.finalize_reset();
+                        if content_hash != expected_content_hash.raw {
+                            warn!("Content hash mismatch, expected={:?}, actual={:?}", expected_content_hash, content_hash);
+                            return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                        }
                     }
                 }
+                Poll::Ready(Ok(()))
             }
-
-            if filled == 0 {
-                // check SHA256
-                if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
-                    let sha256 = hasher.finalize_reset();
-                    if sha256 != *expected_sha256 {
-                        return Poll::Ready(Err(std::io::Error::other("SHA256 mismatch")));
-                    }
-                }
-
-                // check content hasher
-                if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
-                    let content_hash = hasher.finalize_reset();
-                    if content_hash != expected_content_hash.raw {
-                        return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
-                    }
-                }
+            Poll::Ready(Err(e)) => {
+                warn!("hashreader poll_read error={:?}", e);
+                Poll::Ready(Err(e))
             }
         }
-        poll
     }
 }
 
