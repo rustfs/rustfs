@@ -184,7 +184,31 @@ pub struct Checksum {
 
 impl Checksum {
     pub fn new_from_header(headers: &HeaderMap) -> Result<Option<Self>, std::io::Error> {
-        get_content_checksum(headers)
+        if let Ok(Some(mut checksum)) = get_content_checksum(headers) {
+            if checksum.checksum_type.trailing() {
+                let trailer_encoded = checksum
+                    .checksum_type
+                    .key()
+                    .and_then(|key| headers.get(key).map(|v| v.to_str().unwrap_or("").to_string()));
+
+                if let Some(trailer_encoded) = trailer_encoded {
+                    checksum.encoded = trailer_encoded.clone();
+                    checksum.raw = general_purpose::STANDARD
+                        .decode(&trailer_encoded)
+                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid trailer_encoded value"))?;
+                    if checksum.raw.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid trailer_encoded value: empty",
+                        ));
+                    }
+                }
+            }
+
+            return Ok(Some(checksum));
+        }
+
+        Ok(None)
     }
 
     /// Create a new checksum from data
