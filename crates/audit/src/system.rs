@@ -12,10 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::AuditEntry;
-use crate::AuditRegistry;
-use crate::observability;
-use crate::{AuditError, AuditResult};
+use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability};
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     StoreError, Target, TargetError,

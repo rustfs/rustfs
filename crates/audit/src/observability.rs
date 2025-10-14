@@ -21,8 +21,8 @@
 //! - Error rate monitoring
 //! - Queue depth monitoring
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -312,7 +312,7 @@ impl PerformanceValidation {
 }
 
 /// Global metrics instance
-static GLOBAL_METRICS: once_cell::sync::OnceCell<Arc<AuditMetrics>> = once_cell::sync::OnceCell::new();
+static GLOBAL_METRICS: OnceLock<Arc<AuditMetrics>> = OnceLock::new();
 
 /// Get or initialize the global metrics instance
 pub fn global_metrics() -> Arc<AuditMetrics> {

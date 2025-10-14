@@ -12,20 +12,19 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::AuditEntry;
-use crate::{AuditError, AuditResult};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
-use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
+use crate::{AuditEntry, AuditError, AuditResult};
+use futures::{StreamExt, stream::FuturesUnordered};
 use rustfs_config::{
     DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
     MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
     WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
-    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL, audit::AUDIT_ROUTE_PREFIX,
 };
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs};
-use rustfs_targets::{Target, TargetError};
+use rustfs_targets::{
+    Target, TargetError,
+    target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs},
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
