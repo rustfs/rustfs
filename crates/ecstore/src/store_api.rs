@@ -25,12 +25,14 @@ use crate::{
     bucket::lifecycle::lifecycle::ExpirationOptions,
     bucket::lifecycle::{bucket_lifecycle_ops::TransitionedObject, lifecycle::TransitionOptions},
 };
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
     FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
@@ -90,6 +92,10 @@ impl Debug for PutObjReader {
 impl PutObjReader {
     pub fn new(stream: HashReader) -> Self {
         PutObjReader { stream }
+    }
+
+    pub fn as_hash_reader(&self) -> &HashReader {
+        &self.stream
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
@@ -364,6 +370,8 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+
+    pub want_checksum: Option<Checksum>,
 }
 
 impl ObjectOptions {
@@ -446,6 +454,8 @@ pub struct BucketInfo {
 #[derive(Debug, Default, Clone)]
 pub struct MultipartUploadResult {
     pub upload_id: String,
+    pub checksum_algo: Option<String>,
+    pub checksum_type: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -507,7 +517,7 @@ pub struct ObjectInfo {
     pub version_purge_status_internal: Option<String>,
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
-    pub checksum: Vec<u8>,
+    pub checksum: Option<Bytes>,
 }
 
 impl Clone for ObjectInfo {
@@ -544,7 +554,7 @@ impl Clone for ObjectInfo {
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
-            checksum: Default::default(),
+            checksum: self.checksum.clone(),
             expires: self.expires,
         }
     }
@@ -684,6 +694,7 @@ impl ObjectInfo {
             inlined,
             user_defined: metadata,
             transitioned_object,
+            checksum: fi.checksum.clone(),
             ..Default::default()
         }
     }

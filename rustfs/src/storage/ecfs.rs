@@ -2229,6 +2229,10 @@ impl S3 for FS {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
+        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata.clone())
+            .await
+            .map_err(ApiError::from)?;
+
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
         let actual_size = size;
@@ -2242,19 +2246,26 @@ impl S3 for FS {
 
             let mut hrd = HashReader::new(reader, size as i64, size as i64, None, None, false).map_err(ApiError::from)?;
 
-            let cs = rustfs_rio::Checksum::new_from_header(&req.headers).map_err(ApiError::from)?;
-
-            warn!("cs={:?}", cs);
-
-            if let Err(err) = hrd.add_checksum(cs, false) {
+            if let Err(err) = hrd.add_checksum_from_s3s(&req, false) {
                 return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
             }
+
+            opts.want_checksum = hrd.checksum();
+
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
         }
 
         // TODO: md5 check
         let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+
+        if size >= 0 {
+            if let Err(err) = reader.add_checksum_from_s3s(&req, false) {
+                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            }
+
+            opts.want_checksum = reader.checksum();
+        }
 
         // Apply SSE-C encryption if customer provided key
         if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
@@ -2327,12 +2338,7 @@ impl S3 for FS {
 
         let mut reader = PutObjReader::new(reader);
 
-        let mt = metadata.clone();
         let mt2 = metadata.clone();
-
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, mt)
-            .await
-            .map_err(ApiError::from)?;
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -2505,14 +2511,31 @@ impl S3 for FS {
             );
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
+        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
-        let MultipartUploadResult { upload_id, .. } = store
+        let checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
+        if checksum_type.is(rustfs_rio::ChecksumType::INVALID) {
+            return Err(s3_error!(InvalidArgument, "Invalid checksum type"));
+        } else if checksum_type.is_set() && !checksum_type.is(rustfs_rio::ChecksumType::TRAILING) {
+            opts.want_checksum = Some(rustfs_rio::Checksum {
+                checksum_type,
+                ..Default::default()
+            });
+        }
+
+        let MultipartUploadResult {
+            upload_id,
+            checksum_algo,
+            checksum_type,
+        } = store
             .new_multipart_upload(&bucket, &key, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        warn!("MultipartUploadResult, upload_id={upload_id:?}, checksum_algo={checksum_algo:?}, checksum_type={checksum_type:?}",);
+
         let object_name = key.clone();
         let bucket_name = bucket.clone();
         let output = CreateMultipartUploadOutput {
@@ -2522,6 +2545,8 @@ impl S3 for FS {
             server_side_encryption: effective_sse, // TDD: Return effective encryption config
             sse_customer_algorithm,
             ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
+            checksum_algorithm: checksum_algo.map(|s| ChecksumAlgorithm::from(s)),
+            checksum_type: checksum_type.map(|s| ChecksumType::from(s)),
             ..Default::default()
         };
 

@@ -14,6 +14,7 @@
 
 use crate::errors::ChecksumMismatch;
 use base64::{Engine as _, engine::general_purpose};
+use bytes::Bytes;
 use crc32fast::Hasher as Crc32Hasher;
 use http::HeaderMap;
 use sha1::Sha1;
@@ -31,7 +32,7 @@ pub const RUSTFS_MULTIPART_CHECKSUM: &str = "x-rustfs-multipart-checksum";
 pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-type";
 
 /// Checksum type enumeration with flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 
 impl ChecksumType {
@@ -148,6 +149,58 @@ impl ChecksumType {
             ""
         }
     }
+
+    pub fn from_header(headers: &HeaderMap) -> Self {
+        Self::from_string_with_obj_type(
+            headers
+                .get("x-amz-checksum-algorithm")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()).unwrap_or(""),
+        )
+    }
+
+    /// Create checksum type from string algorithm
+    pub fn from_string(alg: &str) -> Self {
+        Self::from_string_with_obj_type(alg, "")
+    }
+
+    /// Create checksum type from algorithm and object type
+    pub fn from_string_with_obj_type(alg: &str, obj_type: &str) -> Self {
+        let full = match obj_type {
+            "FULL_OBJECT" => Self::FULL_OBJECT,
+            "COMPOSITE" | "" => Self::NONE,
+            _ => return Self::INVALID,
+        };
+
+        match alg.to_uppercase().as_str() {
+            "CRC32" => ChecksumType(Self::CRC32.0 | full.0),
+            "CRC32C" => ChecksumType(Self::CRC32C.0 | full.0),
+            "SHA1" => {
+                if full != Self::NONE {
+                    return Self::INVALID;
+                }
+                Self::SHA1
+            }
+            "SHA256" => {
+                if full != Self::NONE {
+                    return Self::INVALID;
+                }
+                Self::SHA256
+            }
+            "CRC64NVME" => {
+                // AWS seems to ignore full value and just assume it
+                Self::CRC64_NVME
+            }
+            "" => {
+                if full != Self::NONE {
+                    return Self::INVALID;
+                }
+                Self::NONE
+            }
+            _ => Self::INVALID,
+        }
+    }
 }
 
 impl std::fmt::Display for ChecksumType {
@@ -174,7 +227,7 @@ pub const BASE_CHECKSUM_TYPES: &[ChecksumType] = &[
 ];
 
 /// Checksum structure containing type and encoded value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Checksum {
     pub checksum_type: ChecksumType,
     pub encoded: String,
@@ -183,34 +236,6 @@ pub struct Checksum {
 }
 
 impl Checksum {
-    pub fn new_from_header(headers: &HeaderMap) -> Result<Option<Self>, std::io::Error> {
-        if let Ok(Some(mut checksum)) = get_content_checksum(headers) {
-            if checksum.checksum_type.trailing() {
-                let trailer_encoded = checksum
-                    .checksum_type
-                    .key()
-                    .and_then(|key| headers.get(key).map(|v| v.to_str().unwrap_or("").to_string()));
-
-                if let Some(trailer_encoded) = trailer_encoded {
-                    checksum.encoded = trailer_encoded.clone();
-                    checksum.raw = general_purpose::STANDARD
-                        .decode(&trailer_encoded)
-                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid trailer_encoded value"))?;
-                    if checksum.raw.is_empty() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Invalid trailer_encoded value: empty",
-                        ));
-                    }
-                }
-            }
-
-            return Ok(Some(checksum));
-        }
-
-        Ok(None)
-    }
-
     /// Create a new checksum from data
     pub fn new_from_data(checksum_type: ChecksumType, data: &[u8]) -> Option<Self> {
         if !checksum_type.is_set() {
@@ -330,6 +355,10 @@ impl Checksum {
         let mut map = HashMap::new();
         map.insert(self.checksum_type.to_string(), self.encoded.clone());
         Some(map)
+    }
+
+    pub fn to_bytes(&self, parts: &[u8]) -> Bytes {
+        self.append_to(Vec::new(), parts).into()
     }
 
     /// Append checksum to byte buffer
@@ -466,7 +495,7 @@ impl Checksum {
 }
 
 /// Get content checksum from headers
-fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std::io::Error> {
+pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std::io::Error> {
     // Check for trailing checksums
     if let Some(trailer_header) = headers.get("x-amz-trailer") {
         let mut result = None;
@@ -573,50 +602,6 @@ fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
     }
 
     (checksum_type, String::new())
-}
-
-impl ChecksumType {
-    /// Create checksum type from string algorithm
-    pub fn from_string(alg: &str) -> Self {
-        Self::from_string_with_obj_type(alg, "")
-    }
-
-    /// Create checksum type from algorithm and object type
-    pub fn from_string_with_obj_type(alg: &str, obj_type: &str) -> Self {
-        let full = match obj_type {
-            "FULL_OBJECT" => Self::FULL_OBJECT,
-            "COMPOSITE" | "" => Self::NONE,
-            _ => return Self::INVALID,
-        };
-
-        match alg.to_uppercase().as_str() {
-            "CRC32" => ChecksumType(Self::CRC32.0 | full.0),
-            "CRC32C" => ChecksumType(Self::CRC32C.0 | full.0),
-            "SHA1" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA1
-            }
-            "SHA256" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA256
-            }
-            "CRC64NVME" => {
-                // AWS seems to ignore full value and just assume it
-                Self::CRC64_NVME
-            }
-            "" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::NONE
-            }
-            _ => Self::INVALID,
-        }
-    }
 }
 
 /// Trait for checksum hashers

@@ -15,6 +15,7 @@
 use crate::error::{Error, Result};
 use crate::store_api::ObjectInfo;
 
+use bytes::Bytes;
 use regex::Regex;
 
 use rustfs_filemeta::VersionPurgeStatusType;
@@ -341,7 +342,7 @@ pub struct ReplicateObjectInfo {
     pub replication_timestamp: Option<OffsetDateTime>,
     pub ssec: bool,
     pub user_tags: String,
-    pub checksum: Vec<u8>,
+    pub checksum: Option<Bytes>,
     pub retry_count: u32,
 }
 

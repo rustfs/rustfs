@@ -3761,31 +3761,40 @@ impl ObjectIO for SetDisks {
             }
         }
 
+        if fi.checksum.is_none() {
+            fi.checksum = opts.want_checksum.as_ref().map(|checksum| checksum.to_bytes(&[]));
+        }
+
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
             if sc == storageclass::STANDARD {
                 let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
         }
 
-        let now = OffsetDateTime::now_utc();
+        let mod_time = if let Some(mod_time) = opts.mod_time {
+            Some(mod_time)
+        } else {
+            Some(OffsetDateTime::now_utc())
+        };
 
-        for (i, fi) in parts_metadatas.iter_mut().enumerate() {
-            fi.metadata = user_defined.clone();
+        for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
+            pfi.metadata = user_defined.clone();
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
+                    pfi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                 }
 
-                fi.set_inline_data();
+                pfi.set_inline_data();
             }
 
-            fi.mod_time = Some(now);
-            fi.size = w_size as i64;
-            fi.versioned = opts.versioned || opts.version_suspended;
-            fi.add_object_part(1, etag.clone(), w_size, fi.mod_time, actual_size, index_op.clone());
+            pfi.mod_time = mod_time;
+            pfi.size = w_size as i64;
+            pfi.versioned = opts.versioned || opts.version_suspended;
+            pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone());
+            pfi.checksum = fi.checksum.clone();
 
             if opts.data_movement {
-                fi.set_data_moved();
+                pfi.set_data_moved();
             }
         }
 
@@ -3820,7 +3829,8 @@ impl ObjectIO for SetDisks {
 
         fi.replication_state_internal = Some(opts.put_replication_state());
 
-        // TODO: version support
+        fi.is_latest = true;
+
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
 }
@@ -4839,63 +4849,30 @@ impl StorageAPI for SetDisks {
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let disks = self.disks.read().await;
+        if let Some(checksum) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            && !checksum.is_empty()
+        {
+            warn!(
+                "checksum mismatch expected: {}, actual: {}",
+                checksum,
+                data.as_hash_reader().content_crc_type().unwrap_or_default().to_string()
+            );
+            if data
+                .as_hash_reader()
+                .content_crc_type()
+                .is_none_or(|v| v.to_string() != checksum)
+            {
+                return Err(Error::other(format!("checksum mismatch: {}", checksum)));
+            }
+        }
 
-        let disks = disks.clone();
+        let disks = self.disks.read().await.clone();
+
         let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
         let part_suffix = format!("part.{part_id}");
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
-
-        // let mut writers = Vec::with_capacity(disks.len());
-        // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
-        // let shared_size = erasure.shard_size(erasure.block_size);
-
-        // let futures = disks.iter().map(|disk| {
-        //     let disk = disk.clone();
-        //     let tmp_part_path = tmp_part_path.clone();
-        //     tokio::spawn(async move {
-        //         if let Some(disk) = disk {
-        //             // let writer = disk.append_file(RUSTFS_META_TMP_BUCKET, &tmp_part_path).await?;
-        //             // let filewriter = disk
-        //             //     .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
-        //             //     .await?;
-        //             match new_bitrot_filewriter(
-        //                 disk.clone(),
-        //                 RUSTFS_META_TMP_BUCKET,
-        //                 &tmp_part_path,
-        //                 false,
-        //                 DEFAULT_BITROT_ALGO,
-        //                 shared_size,
-        //             )
-        //             .await
-        //             {
-        //                 Ok(writer) => Ok(Some(writer)),
-        //                 Err(e) => Err(e),
-        //             }
-        //         } else {
-        //             Ok(None)
-        //         }
-        //     })
-        // });
-        // for x in join_all(futures).await {
-        //     let x = x??;
-        //     writers.push(x);
-        // }
-
-        // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
-
-        // let stream = replace(&mut data.stream, Box::new(empty()));
-        // let etag_stream = EtagReader::new(stream);
-
-        // let (w_size, mut etag) = Arc::new(erasure)
-        //     .encode(etag_stream, &mut writers, data.content_length, write_quorum)
-        //     .await?;
-
-        // if let Err(err) = close_bitrot_writers(&mut writers).await {
-        //     error!("close_bitrot_writers err {:?}", err);
-        // }
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
@@ -5358,6 +5335,11 @@ impl StorageAPI for SetDisks {
             }
         }
 
+        if let Some(checksum) = opts.want_checksum {
+            user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM, checksum.checksum_type.to_string());
+            user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE, checksum.checksum_type.obj_type());
+        }
+
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mod_time = opts.mod_time.unwrap_or(OffsetDateTime::now_utc());
@@ -5389,7 +5371,11 @@ impl StorageAPI for SetDisks {
 
         // evalDisks
 
-        Ok(MultipartUploadResult { upload_id })
+        Ok(MultipartUploadResult {
+            upload_id,
+            checksum_algo: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM).cloned(),
+            checksum_type: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE).cloned(),
+        })
     }
 
     #[tracing::instrument(skip(self))]

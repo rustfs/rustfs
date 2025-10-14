@@ -6866,6 +6866,7 @@ dependencies = [
  "rand 0.9.2",
  "reqwest",
  "rustfs-utils",
+ "s3s",
  "serde",
  "serde_json",
  "sha1 0.10.6",

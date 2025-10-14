@@ -50,6 +50,7 @@ sha1.workspace = true
 sha2.workspace = true
 base64-simd.workspace = true
 crc64fast-nvme.workspace = true
+s3s.workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }

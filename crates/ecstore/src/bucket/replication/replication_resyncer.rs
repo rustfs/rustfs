@@ -663,7 +663,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         replication_timestamp: None,
         ssec: false, // TODO: add ssec support
         user_tags: oi.user_tags.clone(),
-        checksum: Vec::new(),
+        checksum: oi.checksum.clone(),
         retry_count: 0,
     }
 }

@@ -102,10 +102,15 @@
 
 use crate::Checksum;
 use crate::ChecksumHasher;
+use crate::ChecksumType;
 use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
+use crate::get_content_checksum;
 use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader, WarpReader};
+use http::HeaderMap;
 use pin_project_lite::pin_project;
+use s3s::{S3Request, TrailingHeaders};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Write;
 use std::mem;
@@ -127,6 +132,8 @@ pub trait HashReaderMut {
     fn set_actual_size(&mut self, actual_size: i64);
     fn content_hash(&self) -> &Option<Checksum>;
     fn content_sha256(&self) -> &Option<Vec<u8>>;
+    fn get_trailer(&self) -> Option<&TrailingHeaders>;
+    fn set_trailer(&mut self, trailer: Option<TrailingHeaders>);
 }
 
 pin_project! {
@@ -143,6 +150,9 @@ pin_project! {
         content_hasher: Option<Box<dyn ChecksumHasher>>,
         content_sha256: Option<Vec<u8>>,
         content_sha256_hasher: Option<Sha256Hasher>,
+        checksum_on_finish: bool,
+
+        trailer_s3s: Option<TrailingHeaders>,
 
     }
 
@@ -212,6 +222,8 @@ impl HashReader {
                 content_sha256_hasher,
                 content_hash,
                 content_hasher,
+                checksum_on_finish: false,
+                trailer_s3s: existing_hash_reader.get_trailer().cloned(),
             });
         }
 
@@ -237,6 +249,8 @@ impl HashReader {
             content_hasher: None,
             content_sha256: sha256hex.clone().map(|hash| hash.into_bytes()),
             content_sha256_hasher: sha256hex.clone().map(|_| Sha256Hasher::new()),
+            checksum_on_finish: false,
+            trailer_s3s: None,
         })
     }
 
@@ -266,21 +280,89 @@ impl HashReader {
         self.actual_size
     }
 
-    pub fn add_checksum(&mut self, cs: Option<Checksum>, ignore_value: bool) -> Result<(), std::io::Error> {
+    pub fn add_checksum_from_s3s<T>(&mut self, req: &S3Request<T>, ignore_value: bool) -> Result<(), std::io::Error> {
+        let cs = get_content_checksum(&req.headers)?;
+
         if ignore_value {
             return Ok(());
         }
 
         if let Some(checksum) = cs {
-            let Some(hasher) = checksum.checksum_type.hasher() else {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
-            };
+            if checksum.checksum_type.trailing() {
+                self.trailer_s3s = req.trailing_headers.clone();
+            }
 
-            self.content_hash = Some(checksum);
-            self.content_hasher = Some(hasher);
+            self.content_hash = Some(checksum.clone());
+
+            return self.add_non_trailing_checksum(Some(checksum), ignore_value);
         }
 
         Ok(())
+    }
+
+    pub fn add_checksum_no_trailer(&mut self, header: &HeaderMap, ignore_value: bool) -> Result<(), std::io::Error> {
+        let cs = get_content_checksum(header)?;
+
+        if let Some(checksum) = cs {
+            self.content_hash = Some(checksum.clone());
+
+            return self.add_non_trailing_checksum(Some(checksum), ignore_value);
+        }
+        Ok(())
+    }
+
+    pub fn add_non_trailing_checksum(&mut self, checksum: Option<Checksum>, ignore_value: bool) -> Result<(), std::io::Error> {
+        if let Some(checksum) = checksum {
+            self.content_hash = Some(checksum.clone());
+
+            if ignore_value {
+                return Ok(());
+            }
+
+            if let Some(hasher) = checksum.checksum_type.hasher() {
+                self.content_hasher = Some(hasher);
+            } else {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn checksum(&self) -> Option<Checksum> {
+        if self
+            .content_hash
+            .as_ref()
+            .is_none_or(|v| !v.checksum_type.is_set() || !v.valid())
+        {
+            return None;
+        }
+        self.content_hash.clone()
+    }
+    pub fn content_crc_type(&self) -> Option<ChecksumType> {
+        self.content_hash.as_ref().map(|v| v.checksum_type)
+    }
+
+    pub fn content_crc(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        if let Some(checksum) = self.content_hash.as_ref() {
+            if !checksum.valid() || checksum.checksum_type.is(ChecksumType::NONE) {
+                return map;
+            }
+
+            if checksum.checksum_type.trailing() {
+                // TODO: get from trailer_s3s
+                // map.insert(
+                //     checksum.checksum_type.to_string(),
+                //     self.trailer_s3s.as_ref().map(|v|)
+                // );
+                return map;
+            }
+
+            map.insert(checksum.checksum_type.to_string(), checksum.encoded.clone());
+
+            return map;
+        }
+        map
     }
 }
 
@@ -329,6 +411,14 @@ impl HashReaderMut for HashReader {
     fn content_sha256(&self) -> &Option<Vec<u8>> {
         &self.content_sha256
     }
+
+    fn get_trailer(&self) -> Option<&TrailingHeaders> {
+        self.trailer_s3s.as_ref()
+    }
+
+    fn set_trailer(&mut self, trailer: Option<TrailingHeaders>) {
+        self.trailer_s3s = trailer;
+    }
 }
 
 impl AsyncRead for HashReader {
@@ -354,6 +444,8 @@ impl AsyncRead for HashReader {
                         if let Err(e) = hasher.write_all(data) {
                             warn!("SHA256 hasher write error, error={:?}", e);
                             return Poll::Ready(Err(std::io::Error::other(e)));
+                        } else {
+                            warn!("SHA256 hasher write success");
                         }
                     }
 
@@ -362,12 +454,21 @@ impl AsyncRead for HashReader {
                         if let Err(e) = hasher.write_all(data) {
                             warn!("Content hasher write error, error={:?}", e);
                             return Poll::Ready(Err(std::io::Error::other(e)));
+                        } else {
+                            warn!("Content hasher write success");
                         }
                     }
                 }
 
-                if filled == 0 {
+                if filled == 0 && !*this.checksum_on_finish {
                     // TODO: check once only
+                    warn!(
+                        "hashreader poll_read check sha256 and content hasher, sha256_hasher={:?}, sha256={:?}, content_hasher={:?}, content_hash={:?}",
+                        this.content_sha256_hasher.is_some(),
+                        this.content_sha256,
+                        this.content_hasher.is_some(),
+                        this.content_hash
+                    );
                     // check SHA256
                     if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
                         let sha256 = hasher.finalize();
@@ -375,6 +476,7 @@ impl AsyncRead for HashReader {
                             warn!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
                             return Poll::Ready(Err(std::io::Error::other("SHA256 mismatch")));
                         }
+                        warn!("SHA256 hasher final success");
                     }
 
                     // check content hasher
@@ -384,7 +486,10 @@ impl AsyncRead for HashReader {
                             warn!("Content hash mismatch, expected={:?}, actual={:?}", expected_content_hash, content_hash);
                             return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
                         }
+                        warn!("Content hasher final success");
                     }
+
+                    *this.checksum_on_finish = true;
                 }
                 Poll::Ready(Ok(()))
             }
