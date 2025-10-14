@@ -17,20 +17,39 @@
 # This example demonstrates a complete, ready-to-use MNMD deployment
 # addressing startup coordination and VolumeNotFound issues.
 
+x-node-template: &node-template
+  image: rustfs/rustfs:latest
+  environment:
+    # Use service names and correct disk indexing (1..4 to match mounted paths)
+    - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
+    - RUSTFS_ADDRESS=0.0.0.0:9000
+    - RUSTFS_CONSOLE_ENABLE=true
+    - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+    - RUSTFS_EXTERNAL_ADDRESS=0.0.0.0:9000  # Same as internal since no port mapping
+    - RUSTFS_ACCESS_KEY=rustfsadmin
+    - RUSTFS_SECRET_KEY=rustfsadmin
+    - RUSTFS_CMD=rustfs
+  command: ["sh", "-c", "sleep 3 && rustfs"]
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "sh", "-c",
+        "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
+      ]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+  networks:
+    - rustfs-mnmd
+
+
 services:
   rustfs-node1:
-    image: rustfs/rustfs:latest
+    <<: *node-template
     container_name: rustfs-node1
     hostname: rustfs-node1
-    environment:
-      # Use service names and correct disk indexing (1..4 to match mounted paths)
-      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
-      - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
-      - RUSTFS_CMD=rustfs
     ports:
       - "9000:9000"  # API endpoint
       - "9001:9001"  # Console
@@ -39,33 +58,11 @@ services:
       - node1-data2:/data/rustfs2
       - node1-data3:/data/rustfs3
       - node1-data4:/data/rustfs4
-    command: [ "sh", "-c", "sleep 3 && rustfs" ]
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    networks:
-      - rustfs-mnmd
 
   rustfs-node2:
-    image: rustfs/rustfs:latest
+    <<: *node-template
     container_name: rustfs-node2
     hostname: rustfs-node2
-    environment:
-      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
-      - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
-      - RUSTFS_CMD=rustfs
     ports:
       - "9010:9000"  # API endpoint
       - "9011:9001"  # Console
@@ -74,33 +71,11 @@ services:
       - node2-data2:/data/rustfs2
       - node2-data3:/data/rustfs3
       - node2-data4:/data/rustfs4
-    command: [ "sh", "-c", "sleep 3 && rustfs" ]
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    networks:
-      - rustfs-mnmd
 
   rustfs-node3:
-    image: rustfs/rustfs:latest
+    <<: *node-template
     container_name: rustfs-node3
     hostname: rustfs-node3
-    environment:
-      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
-      - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
-      - RUSTFS_CMD=rustfs
     ports:
       - "9020:9000"  # API endpoint
       - "9021:9001"  # Console
@@ -109,33 +84,11 @@ services:
       - node3-data2:/data/rustfs2
       - node3-data3:/data/rustfs3
       - node3-data4:/data/rustfs4
-    command: [ "sh", "-c", "sleep 3 && rustfs" ]
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    networks:
-      - rustfs-mnmd
 
   rustfs-node4:
-    image: rustfs/rustfs:latest
+    <<: *node-template
     container_name: rustfs-node4
     hostname: rustfs-node4
-    environment:
-      - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
-      - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
-      - RUSTFS_CMD=rustfs
     ports:
       - "9030:9000"  # API endpoint
       - "9031:9001"  # Console
@@ -144,20 +97,6 @@ services:
       - node4-data2:/data/rustfs2
       - node4-data3:/data/rustfs3
       - node4-data4:/data/rustfs4
-    command: [ "sh", "-c", "sleep 3 && rustfs" ]
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    networks:
-      - rustfs-mnmd
 
 networks:
   rustfs-mnmd:
