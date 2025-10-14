@@ -172,8 +172,18 @@ RustFS is a community-driven project, and we appreciate all contributions. Check
   <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" />
 </a>
 
+
+## Github Trending Top
+
+🚀 RustFS is beloved by open-source enthusiasts and enterprise users worldwide, often appearing on the GitHub Trending top charts.
+
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
+
+
+
 ## License
 
 [Apache 2.0](https://opensource.org/licenses/Apache-2.0)
 
 **RustFS** is a trademark of RustFS, Inc. All other trademarks are the property of their respective owners.
+
