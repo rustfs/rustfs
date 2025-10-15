@@ -7207,8 +7207,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "s3s"
 version = "0.12.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fbf35b8b229398629d8df8a0cb908a70a24da69f65911fe0461fba3f4e9dda5"
+source = "git+https://github.com/s3s-project/s3s.git?rev=6b861cb316b272cb49a76c2292a27e71d52f64cb#6b861cb316b272cb49a76c2292a27e71d52f64cb"
 dependencies = [
  "arrayvec",
  "async-trait",
