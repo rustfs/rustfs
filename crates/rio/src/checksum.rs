@@ -289,7 +289,7 @@ impl Checksum {
 
         warn!("raw={:?}", raw);
 
-        warn!("trailing={}", checksum_type.trailing());
+        warn!("checksum_type={},trailing={}", checksum_type, checksum_type.trailing());
 
         let checksum = Checksum {
             checksum_type,

@@ -107,9 +107,11 @@ use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
 use crate::get_content_checksum;
 use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader, WarpReader};
+use base64::Engine;
+use base64::engine::general_purpose;
 use http::HeaderMap;
 use pin_project_lite::pin_project;
-use s3s::{S3Request, TrailingHeaders};
+use s3s::TrailingHeaders;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Write;
@@ -280,8 +282,13 @@ impl HashReader {
         self.actual_size
     }
 
-    pub fn add_checksum_from_s3s<T>(&mut self, req: &S3Request<T>, ignore_value: bool) -> Result<(), std::io::Error> {
-        let cs = get_content_checksum(&req.headers)?;
+    pub fn add_checksum_from_s3s(
+        &mut self,
+        headers: &HeaderMap,
+        trailing_headers: Option<TrailingHeaders>,
+        ignore_value: bool,
+    ) -> Result<(), std::io::Error> {
+        let cs = get_content_checksum(headers)?;
 
         if ignore_value {
             return Ok(());
@@ -289,7 +296,7 @@ impl HashReader {
 
         if let Some(checksum) = cs {
             if checksum.checksum_type.trailing() {
-                self.trailer_s3s = req.trailing_headers.clone();
+                self.trailer_s3s = trailing_headers.clone();
             }
 
             self.content_hash = Some(checksum.clone());
@@ -350,11 +357,15 @@ impl HashReader {
             }
 
             if checksum.checksum_type.trailing() {
-                // TODO: get from trailer_s3s
-                // map.insert(
-                //     checksum.checksum_type.to_string(),
-                //     self.trailer_s3s.as_ref().map(|v|)
-                // );
+                if let Some(trailer) = self.trailer_s3s.as_ref() {
+                    if let Some(Some(checksum_str)) = trailer.read(|headers| {
+                        headers
+                            .get(checksum.checksum_type.to_string())
+                            .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                    }) {
+                        map.insert(checksum.checksum_type.to_string(), checksum_str);
+                    }
+                }
                 return map;
             }
 
@@ -425,17 +436,13 @@ impl AsyncRead for HashReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
 
-        warn!(
-            "hashreader poll_read actual_size={}, size={}, bytes_read={}",
-            this.actual_size, this.size, this.bytes_read
-        );
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
                 let data = &buf.filled()[before..];
                 let filled = data.len();
-                warn!("hashreader poll_read filled={}", filled);
+
                 *this.bytes_read += filled as u64;
 
                 if filled > 0 {
@@ -461,7 +468,6 @@ impl AsyncRead for HashReader {
                 }
 
                 if filled == 0 && !*this.checksum_on_finish {
-                    // TODO: check once only
                     warn!(
                         "hashreader poll_read check sha256 and content hasher, sha256_hasher={:?}, sha256={:?}, content_hasher={:?}, content_hash={:?}",
                         this.content_sha256_hasher.is_some(),
@@ -481,12 +487,34 @@ impl AsyncRead for HashReader {
 
                     // check content hasher
                     if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
-                        let content_hash = hasher.finalize();
-                        if content_hash != expected_content_hash.raw {
-                            warn!("Content hash mismatch, expected={:?}, actual={:?}", expected_content_hash, content_hash);
-                            return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                        if expected_content_hash.checksum_type.trailing() {
+                            if let Some(trailer) = this.trailer_s3s.as_ref() {
+                                if let Some(Some(checksum_str)) = trailer.read(|headers| {
+                                    expected_content_hash.checksum_type.key().and_then(|key| {
+                                        headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                                    })
+                                }) {
+                                    warn!("Content hasher trailing checksum_str={checksum_str}");
+                                    expected_content_hash.encoded = checksum_str;
+                                    expected_content_hash.raw = general_purpose::STANDARD
+                                        .decode(&expected_content_hash.encoded)
+                                        .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
+
+                                    if expected_content_hash.raw.is_empty() {
+                                        return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                                    }
+
+                                    warn!("Content hasher trailing final success");
+                                }
+                            }
+                        } else {
+                            let content_hash = hasher.finalize();
+                            if content_hash != expected_content_hash.raw {
+                                warn!("Content hash mismatch, expected={:?}, actual={:?}", expected_content_hash, content_hash);
+                                return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                            }
+                            warn!("Content hasher final success");
                         }
-                        warn!("Content hasher final success");
                     }
 
                     *this.checksum_on_finish = true;

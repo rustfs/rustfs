@@ -25,7 +25,6 @@ use std::vec;
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tracing::error;
-use tracing::warn;
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
@@ -140,7 +139,6 @@ impl Erasure {
             loop {
                 match rustfs_utils::read_full(&mut reader, &mut buf).await {
                     Ok(n) if n > 0 => {
-                        warn!("encode read n={}", n);
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
                         if let Err(err) = tx.send(res).await {
@@ -148,15 +146,12 @@ impl Erasure {
                         }
                     }
                     Ok(_) => {
-                        warn!("encode read unexpected ok");
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        warn!("encode read unexpected eof");
                         break;
                     }
                     Err(e) => {
-                        warn!("encode read error={:?}", e);
                         return Err(e);
                     }
                 }

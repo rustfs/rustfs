@@ -7207,7 +7207,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "s3s"
 version = "0.12.0-rc.2"
-source = "git+https://github.com/s3s-project/s3s.git?rev=6b861cb316b272cb49a76c2292a27e71d52f64cb#6b861cb316b272cb49a76c2292a27e71d52f64cb"
+source = "git+https://github.com/s3s-project/s3s.git?branch=main#6b861cb316b272cb49a76c2292a27e71d52f64cb"
 dependencies = [
  "arrayvec",
  "async-trait",

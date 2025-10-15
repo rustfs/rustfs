@@ -4860,7 +4860,7 @@ impl StorageAPI for SetDisks {
             if data
                 .as_hash_reader()
                 .content_crc_type()
-                .is_none_or(|v| v.to_string() != checksum)
+                .is_none_or(|v| v.to_string() != *checksum)
             {
                 return Err(Error::other(format!("checksum mismatch: {}", checksum)));
             }
@@ -5335,9 +5335,12 @@ impl StorageAPI for SetDisks {
             }
         }
 
-        if let Some(checksum) = opts.want_checksum {
-            user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM, checksum.checksum_type.to_string());
-            user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE, checksum.checksum_type.obj_type());
+        if let Some(checksum) = &opts.want_checksum {
+            user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM.to_string(), checksum.checksum_type.to_string());
+            user_defined.insert(
+                rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(),
+                checksum.checksum_type.obj_type().to_string(),
+            );
         }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
