@@ -79,7 +79,7 @@ pub async fn lookup_config() -> Result<Args, String> {
     check()?;
     let args = Args {
         url: url.ok().unwrap(),
-        auth_token: get_cfg(ENV_POLICY_PLUGIN_AUTH_TOKEN)?,
+        auth_token: get_cfg(ENV_POLICY_PLUGIN_AUTH_TOKEN).unwrap_or_default(),
     };
     validate(&args).await?;
     Ok(args)
