@@ -243,7 +243,7 @@ time = { version = "0.3.44", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.47.1", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
