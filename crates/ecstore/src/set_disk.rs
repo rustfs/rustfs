@@ -21,7 +21,7 @@ use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::{object_api_utils::extract_etag, transition_api::ReaderImpl};
+use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::disk::STORAGE_FORMAT_FILE;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
@@ -4581,7 +4581,7 @@ impl StorageAPI for SetDisks {
         }*/
         // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
         let transition_etag = rustfs_utils::path::trim_etag(&opts.transition.etag);
-        let stored_etag = rustfs_utils::path::trim_etag(&extract_etag(&fi.metadata));
+        let stored_etag = rustfs_utils::path::trim_etag(&get_raw_etag(&fi.metadata));
         if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp()
             || transition_etag != stored_etag
         {
