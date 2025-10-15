@@ -148,11 +148,10 @@ pub fn new_getobjectreader(
     Ok((get_fn, off as i64, length as i64))
 }
 
-/// Convert a stored ETag representation into the strongly-typed `s3s::dto::ETag`.
+/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
 ///
-/// The function accepts values that may already be quoted (`"abc"` or `W/"abc"`) or raw hashes
-/// (`abc`) and normalises them for the S3 response layer.
-pub fn format_etag(etag: &str) -> ETag {
+/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
+pub fn to_s3s_etag(etag: &str) -> ETag {
     if let Some(rest) = etag.strip_prefix("W/\"") {
         if let Some(body) = rest.strip_suffix('"') {
             return ETag::Weak(body.to_string());
@@ -167,7 +166,7 @@ pub fn format_etag(etag: &str) -> ETag {
     ETag::Strong(etag.to_string())
 }
 
-pub fn extract_etag(metadata: &HashMap<String, String>) -> String {
+pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
     metadata
         .get("etag")
         .cloned()
@@ -180,28 +179,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_etag() {
+    fn test_to_s3s_etag() {
         // Test unquoted ETag - should become strong etag
         assert_eq!(
-            format_etag("6af8d12c0c74b78094884349f3c8a079"),
+            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
             ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
         );
 
         assert_eq!(
-            format_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
+            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
             ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
         );
 
         assert_eq!(
-            format_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
+            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
             ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
         );
 
-        assert_eq!(format_etag(""), ETag::Strong(String::new()));
+        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
 
-        assert_eq!(format_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
+        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
 
-        assert_eq!(format_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
+        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
     }
 
     #[test]
@@ -210,17 +209,17 @@ mod tests {
 
         // Test with etag field
         metadata.insert("etag".to_string(), "abc123".to_string());
-        assert_eq!(extract_etag(&metadata), "abc123");
+        assert_eq!(get_raw_etag(&metadata), "abc123");
 
         metadata.insert("etag".to_string(), "\"def456\"".to_string());
-        assert_eq!(extract_etag(&metadata), "\"def456\"");
+        assert_eq!(get_raw_etag(&metadata), "\"def456\"");
 
         // Test fallback to md5Sum
         metadata.remove("etag");
         metadata.insert("md5Sum".to_string(), "xyz789".to_string());
-        assert_eq!(extract_etag(&metadata), "xyz789");
+        assert_eq!(get_raw_etag(&metadata), "xyz789");
 
         metadata.clear();
-        assert_eq!(extract_etag(&metadata), "");
+        assert_eq!(get_raw_etag(&metadata), "");
     }
 }
