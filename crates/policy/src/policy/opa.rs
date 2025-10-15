@@ -243,13 +243,11 @@ mod tests {
 
     #[test]
     fn test_lookup_config_not_enabled() {
-        // 确保OPA URL环境变量未设置
         temp_env::with_var_unset("RUSTFS_POLICY_PLUGIN_URL", || {
-            // 异步运行时中测试lookup_config
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async { lookup_config().await });
 
-            // 应该返回默认的空Args
+            // Should return the default empty Args
             assert!(result.is_ok());
             let args = result.unwrap();
             assert!(!args.enable());
