@@ -35,6 +35,7 @@ use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
+use s3s::dto::ETag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -458,9 +459,13 @@ pub struct CompletePart {
 
 impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
+        let etag = value.e_tag.map(|etag| match etag {
+            ETag::Strong(v) => format!("\"{v}\""),
+            ETag::Weak(v) => format!("W/\"{v}\""),
+        });
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
-            etag: value.e_tag,
+            etag,
         }
     }
 }
