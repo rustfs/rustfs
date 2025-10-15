@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_args_enable() {
-        // 测试Args的enable方法
+        // Test Args enable method
         let args_enabled = Args {
             url: "http://localhost:8181".to_string(),
             auth_token: "token".to_string(),
