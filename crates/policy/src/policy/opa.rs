@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_check_valid_config() {
-        // 使用 temp_env 临时设置环境变量
+        // Use temp_env to temporarily set environment variables
         temp_env::with_vars(
             [
                 ("RUSTFS_POLICY_PLUGIN_URL", Some("http://localhost:8181/v1/data/rustfs/authz/allow")),
