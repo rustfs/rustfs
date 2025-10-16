@@ -160,7 +160,7 @@ pub async fn start_http_server(
     let api_endpoints = format!("http://{local_ip}:{server_port}");
     let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
     info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-    println!("   API: {}  {}", api_endpoints, localhost_endpoint);
+    println!("   API: {api_endpoints}  {localhost_endpoint}");
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
@@ -675,9 +675,8 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
     builder.thread_name(thread_name.clone());
     println!(
         "Starting Tokio runtime with configured parameters:\n\
-    worker_threads: {}, max_blocking_threads: {}, thread_stack_size: {}, thread_keep_alive: {}, \
-    global_queue_interval: {}, thread_name: {}",
-        worker_threads, max_blocking_threads, thread_stack_size, thread_keep_alive, global_queue_interval, thread_name
+    worker_threads: {worker_threads}, max_blocking_threads: {max_blocking_threads}, thread_stack_size: {thread_stack_size}, thread_keep_alive: {thread_keep_alive}, \
+    global_queue_interval: {global_queue_interval}, thread_name: {thread_name}"
     );
     builder
 }

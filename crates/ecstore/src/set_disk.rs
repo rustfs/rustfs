@@ -3528,9 +3528,9 @@ impl ObjectIO for SetDisks {
         // }
 
         if object_info.size == 0 {
-            if let Some(rs) = range {
-                let _ = rs.get_offset_length(object_info.size)?;
-            }
+            // if let Some(rs) = range {
+            //     let _ = rs.get_offset_length(object_info.size)?;
+            // }
 
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(Vec::new())),
@@ -4450,8 +4450,6 @@ impl StorageAPI for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        // warn!("get object_info fi {:?}", &fi);
-
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
@@ -4867,7 +4865,7 @@ impl StorageAPI for SetDisks {
                 .content_crc_type()
                 .is_none_or(|v| v.to_string() != *checksum)
             {
-                return Err(Error::other(format!("checksum mismatch: {}", checksum)));
+                return Err(Error::other(format!("checksum mismatch: {checksum}")));
             }
         }
 

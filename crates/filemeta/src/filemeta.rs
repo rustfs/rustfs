@@ -1763,7 +1763,7 @@ impl MetaObject {
 
         let checksum = self
             .meta_sys
-            .get(format!("{}crc", RESERVED_METADATA_PREFIX_LOWER).as_str())
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}crc").as_str())
             .map(|v| Bytes::from(v.clone()));
 
         let erasure = ErasureInfo {
@@ -1982,7 +1982,7 @@ impl From<FileInfo> for MetaObject {
         }
 
         if let Some(content_hash) = value.checksum {
-            meta_sys.insert(format!("{}crc", RESERVED_METADATA_PREFIX_LOWER), content_hash.to_vec());
+            meta_sys.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}crc"), content_hash.to_vec());
         }
 
         Self {

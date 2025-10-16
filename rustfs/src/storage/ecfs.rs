@@ -96,7 +96,9 @@ use rustfs_targets::{
     EventName,
     arn::{TargetID, TargetIDError},
 };
-use rustfs_utils::http::{AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE};
+use rustfs_utils::http::{
+    AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5,
+};
 use rustfs_utils::{
     CompressionAlgorithm,
     http::{
@@ -106,6 +108,7 @@ use rustfs_utils::{
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
+use s3s::header::{X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::{
     collections::HashMap,
@@ -1677,9 +1680,12 @@ impl S3 for FS {
             && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
             && rs.is_none()
         {
-            let (checksums, _is_multipart) = info
-                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
-                .map_err(ApiError::from)?;
+            let (checksums, _is_multipart) =
+                info.decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                    .map_err(|e| {
+                        error!("decrypt_checksums error: {}", e);
+                        ApiError::from(e)
+                    })?;
 
             warn!("get object metadata checksums: {:?}", checksums);
             for (key, checksum) in checksums {
@@ -1707,7 +1713,7 @@ impl S3 for FS {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| format_etag(&etag)),
-            metadata: Some(info.user_defined),
+            metadata: filter_object_metadata(&info.user_defined),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -1808,7 +1814,7 @@ impl S3 for FS {
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        // warn!("head_object info {:?}", &info);
+        warn!("head_object info {:?}", &info);
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -1828,7 +1834,10 @@ impl S3 for FS {
 
         // TODO: range download
 
-        let content_length = info.get_actual_size().map_err(ApiError::from)?;
+        let content_length = info.get_actual_size().map_err(|e| {
+            error!("get_actual_size error: {}", e);
+            ApiError::from(e)
+        })?;
 
         let metadata_map = info.user_defined.clone();
         let server_side_encryption = metadata_map
@@ -1840,19 +1849,57 @@ impl S3 for FS {
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
-        let metadata = metadata_map;
+        let mut checksum_crc32 = None;
+        let mut checksum_crc32c = None;
+        let mut checksum_sha1 = None;
+        let mut checksum_sha256 = None;
+        let mut checksum_crc64nvme = None;
+        let mut checksum_type = None;
+
+        // checksum
+        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
+            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
+            && rs.is_none()
+        {
+            let (checksums, _is_multipart) = info
+                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                .map_err(ApiError::from)?;
+
+            warn!("get object metadata checksums: {:?}", checksums);
+            for (key, checksum) in checksums {
+                if key == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(checksum));
+                    continue;
+                }
+
+                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
+                    _ => (),
+                }
+            }
+        }
 
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
             last_modified,
             e_tag: info.etag.map(|etag| format_etag(&etag)),
-            metadata: Some(metadata),
+            metadata: filter_object_metadata(&metadata_map),
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -1876,7 +1923,7 @@ impl S3 for FS {
         tokio::spawn(async move {
             notifier_instance().notify(event_args).await;
         });
-
+        warn!("head_object output {:?}", &output);
         Ok(S3Response::new(output))
     }
 
@@ -2436,7 +2483,7 @@ impl S3 for FS {
         }
 
         warn!(
-            "checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+            "put object checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
         );
 
         let output = PutObjectOutput {
@@ -2653,6 +2700,7 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        let input = req.input;
         let UploadPartInput {
             body,
             bucket,
@@ -2665,7 +2713,7 @@ impl S3 for FS {
             sse_customer_key_md5: _sse_customer_key_md5,
             // content_md5,
             ..
-        } = req.input;
+        } = input;
 
         let part_id = part_number as usize;
 
@@ -2823,8 +2871,50 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+
+        if let Some(alg) = &input.checksum_algorithm {
+            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
+            }) {
+                match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                    _ => (),
+                }
+            }
+        }
+
+        warn!(
+            "upload_part checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+        );
+
         let output = UploadPartOutput {
             e_tag: info.etag.map(|etag| format_etag(&etag)),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
             ..Default::default()
         };
 
@@ -3194,6 +3284,7 @@ impl S3 for FS {
             key,
             upload_id
         );
+
         let multipart_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
@@ -4757,6 +4848,34 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
         }
     }
     false
+}
+
+fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    let mut filtered_metadata = HashMap::new();
+    for (k, v) in metadata {
+        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+            continue;
+        }
+        if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
+            continue;
+        }
+
+        if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
+            continue;
+        }
+
+        // let lower_key = k.to_ascii_lowercase();
+        // if lower_key.starts_with("x-amz-meta-") || lower_key.starts_with("x-rustfs-meta-") {
+        //     filtered_metadata.insert(lower_key, v.to_string());
+        // }
+
+        filtered_metadata.insert(k.clone(), v.clone());
+    }
+    if filtered_metadata.is_empty() {
+        None
+    } else {
+        Some(filtered_metadata)
+    }
 }
 
 #[cfg(test)]
