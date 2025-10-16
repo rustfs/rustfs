@@ -28,6 +28,7 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::sleep;
 use tracing::info;
 
 #[tokio::main]
@@ -68,7 +69,7 @@ async fn main() -> Result<(), NotificationError> {
             key: WEBHOOK_QUEUE_DIR.to_string(),
             value: current_root
                 .clone()
-                .join("../../deploy/logs/notify/webhook")
+                .join("../../deploy/logs/notify")
                 .to_str()
                 .unwrap()
                 .to_string(),
@@ -91,7 +92,7 @@ async fn main() -> Result<(), NotificationError> {
     system.init().await?;
     info!("✅ System initialized with Webhook target.");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
 
     // --- Dynamically update system configuration: Add an MQTT Target ---
     info!("\n---> Dynamically adding MQTT target...");
@@ -129,11 +130,7 @@ async fn main() -> Result<(), NotificationError> {
         },
         KV {
             key: MQTT_QUEUE_DIR.to_string(),
-            value: current_root
-                .join("../../deploy/logs/notify/mqtt")
-                .to_str()
-                .unwrap()
-                .to_string(),
+            value: current_root.join("../../deploy/logs/notify").to_str().unwrap().to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -152,7 +149,7 @@ async fn main() -> Result<(), NotificationError> {
         .await?;
     info!("✅ MQTT target added and system reloaded.");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
 
     // --- Loading and managing Bucket configurations ---
     info!("\n---> Loading bucket notification config...");
@@ -176,7 +173,7 @@ async fn main() -> Result<(), NotificationError> {
     system.send_event(event).await;
     info!("✅ Event sent. Both Webhook and MQTT targets should receive it.");
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
 
     // --- Dynamically remove configuration ---
     info!("\n---> Dynamically removing Webhook target...");
@@ -188,5 +185,6 @@ async fn main() -> Result<(), NotificationError> {
     info!("✅ Bucket 'my-bucket' config removed.");
 
     info!("\nDemo completed successfully");
+    sleep(Duration::from_secs(1)).await;
     Ok(())
 }
