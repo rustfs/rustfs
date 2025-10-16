@@ -834,7 +834,7 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 }
 
 /// Read checksums from byte buffer
-pub fn read_checksums(mut buf: &[u8], part: i32) -> (Option<HashMap<String, String>>, bool) {
+pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bool) {
     let mut result = HashMap::new();
     let mut is_multipart = false;
 
@@ -898,7 +898,6 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (Option<HashMap<String, Stri
         }
     }
 
-    let result = if result.is_empty() { None } else { Some(result) };
     (result, is_multipart)
 }
 

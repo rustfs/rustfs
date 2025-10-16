@@ -13,9 +13,6 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
-use crate::bucket::replication::REPLICATION_RESET;
-use crate::bucket::replication::REPLICATION_STATUS;
-use crate::bucket::replication::{ReplicateDecision, replication_statuses_map, version_purge_statuses_map};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
@@ -29,7 +26,8 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
-    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
+    ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
@@ -889,6 +887,24 @@ impl ObjectInfo {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
+        if part > 0 {
+            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).map(|p| p.checksums.clone()) {
+                return Ok((checksums, true));
+            }
+        }
+
+        // TODO: decrypt checksums
+
+        warn!("get object body metadata checksum: {:?}", self.checksum);
+        if let Some(data) = &self.checksum {
+            let (checksums, is_multipart) = rustfs_rio::read_checksums(data.as_ref(), 0);
+            return Ok((checksums, is_multipart));
+        }
+
+        Ok((HashMap::new(), false))
     }
 }
 

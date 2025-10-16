@@ -45,7 +45,7 @@ pub struct ObjectPartInfo {
     // Index holds the index of the part in the erasure coding
     pub index: Option<Bytes>,
     // Checksums holds checksums of the part
-    pub checksums: Option<HashMap<String, String>>,
+    pub checksums: HashMap<String, String>,
     pub error: Option<String>,
 }
 
@@ -300,7 +300,7 @@ impl FileInfo {
             mod_time,
             actual_size,
             index,
-            checksums: None,
+            checksums: HashMap::new(),
             error: None,
         };
 

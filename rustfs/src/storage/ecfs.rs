@@ -41,8 +41,8 @@ use rustfs_ecstore::{
         object_lock::objectlock_sys::BucketObjectLockSys,
         policy_sys::PolicySys,
         replication::{
-            DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationConfigurationExt, check_replicate_delete,
-            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
+            DeletedObjectReplicationInfo, ReplicationConfigurationExt, check_replicate_delete, get_must_replicate_options,
+            must_replicate, schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -71,6 +71,7 @@ use rustfs_ecstore::{
         // RESERVED_METADATA_PREFIX,
     },
 };
+use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, fileinfo::ObjectPartInfo};
 use rustfs_kms::{
     DataKey,
@@ -95,6 +96,7 @@ use rustfs_targets::{
     EventName,
     arn::{TargetID, TargetIDError},
 };
+use rustfs_utils::http::{AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE};
 use rustfs_utils::{
     CompressionAlgorithm,
     http::{
@@ -1471,7 +1473,7 @@ impl S3 for FS {
 
         let mut content_length = info.size;
 
-        let content_range = if let Some(rs) = rs {
+        let content_range = if let Some(rs) = &rs {
             let total_size = info.get_actual_size().map_err(ApiError::from)?;
             let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
             content_length = length;
@@ -1663,6 +1665,40 @@ impl S3 for FS {
             .cloned();
         let ssekms_key_id = info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
+        let mut checksum_crc32 = None;
+        let mut checksum_crc32c = None;
+        let mut checksum_sha1 = None;
+        let mut checksum_sha256 = None;
+        let mut checksum_crc64nvme = None;
+        let mut checksum_type = None;
+
+        // checksum
+        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
+            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
+            && rs.is_none()
+        {
+            let (checksums, _is_multipart) = info
+                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                .map_err(ApiError::from)?;
+
+            warn!("get object metadata checksums: {:?}", checksums);
+            for (key, checksum) in checksums {
+                if key == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(checksum));
+                    continue;
+                }
+
+                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
+                    _ => (),
+                }
+            }
+        }
+
         let output = GetObjectOutput {
             body,
             content_length: Some(response_content_length),
@@ -1676,6 +1712,12 @@ impl S3 for FS {
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             ..Default::default()
         };
 

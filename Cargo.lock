@@ -6639,6 +6639,8 @@ dependencies = [
  "bytes",
  "crc32fast",
  "criterion",
+ "lazy_static",
+ "regex",
  "rmp",
  "rmp-serde",
  "rustfs-utils",

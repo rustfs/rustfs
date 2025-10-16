@@ -72,7 +72,7 @@ use rustfs_filemeta::{
 };
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
@@ -3761,8 +3761,13 @@ impl ObjectIO for SetDisks {
             }
         }
 
+        error!("put_object fileinfo checksum: {:?}", fi.checksum);
+        error!("put_object opts want_checksum: {:?}", opts.want_checksum);
+
         if fi.checksum.is_none() {
-            fi.checksum = opts.want_checksum.as_ref().map(|checksum| checksum.to_bytes(&[]));
+            if let Some(content_hash) = data.as_hash_reader().content_hash() {
+                fi.checksum = Some(content_hash.to_bytes(&[]));
+            }
         }
 
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
