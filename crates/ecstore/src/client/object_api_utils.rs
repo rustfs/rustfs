@@ -20,8 +20,8 @@
 #![allow(clippy::all)]
 
 use http::HeaderMap;
-use std::io::Cursor;
-use std::{collections::HashMap, sync::Arc};
+use s3s::dto::ETag;
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
@@ -148,27 +148,30 @@ pub fn new_getobjectreader(
     Ok((get_fn, off as i64, length as i64))
 }
 
-/// Format an ETag value according to HTTP standards (wrap with quotes if not already wrapped)
-pub fn format_etag(etag: &str) -> String {
-    if etag.starts_with('"') && etag.ends_with('"') {
-        // Already properly formatted
-        etag.to_string()
-    } else if etag.starts_with("W/\"") && etag.ends_with('"') {
-        // Already a weak ETag, properly formatted
-        etag.to_string()
-    } else {
-        // Need to wrap with quotes
-        format!("\"{}\"", etag)
+/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
+///
+/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
+pub fn to_s3s_etag(etag: &str) -> ETag {
+    if let Some(rest) = etag.strip_prefix("W/\"") {
+        if let Some(body) = rest.strip_suffix('"') {
+            return ETag::Weak(body.to_string());
+        }
+        return ETag::Weak(rest.to_string());
     }
+
+    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        return ETag::Strong(body.to_string());
+    }
+
+    ETag::Strong(etag.to_string())
 }
 
-pub fn extract_etag(metadata: &HashMap<String, String>) -> String {
-    let etag = if let Some(etag) = metadata.get("etag") {
-        etag.clone()
-    } else {
-        metadata["md5Sum"].clone()
-    };
-    format_etag(&etag)
+pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
+    metadata
+        .get("etag")
+        .cloned()
+        .or_else(|| metadata.get("md5Sum").cloned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -176,30 +179,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_etag() {
-        // Test unquoted ETag - should add quotes
-        assert_eq!(format_etag("6af8d12c0c74b78094884349f3c8a079"), "\"6af8d12c0c74b78094884349f3c8a079\"");
-
-        // Test already quoted ETag - should not double quote
+    fn test_to_s3s_etag() {
+        // Test unquoted ETag - should become strong etag
         assert_eq!(
-            format_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
-            "\"6af8d12c0c74b78094884349f3c8a079\""
+            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
+            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
         );
 
-        // Test weak ETag - should keep as is
         assert_eq!(
-            format_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
-            "W/\"6af8d12c0c74b78094884349f3c8a079\""
+            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
+            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
         );
 
-        // Test empty ETag - should add quotes
-        assert_eq!(format_etag(""), "\"\"");
+        assert_eq!(
+            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
+            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
 
-        // Test malformed quote (only starting quote) - should wrap properly
-        assert_eq!(format_etag("\"incomplete"), "\"\"incomplete\"");
+        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
 
-        // Test malformed quote (only ending quote) - should wrap properly
-        assert_eq!(format_etag("incomplete\""), "\"incomplete\"\"");
+        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
+
+        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
     }
 
     #[test]
@@ -208,15 +209,17 @@ mod tests {
 
         // Test with etag field
         metadata.insert("etag".to_string(), "abc123".to_string());
-        assert_eq!(extract_etag(&metadata), "\"abc123\"");
+        assert_eq!(get_raw_etag(&metadata), "abc123");
 
-        // Test with already quoted etag field
         metadata.insert("etag".to_string(), "\"def456\"".to_string());
-        assert_eq!(extract_etag(&metadata), "\"def456\"");
+        assert_eq!(get_raw_etag(&metadata), "\"def456\"");
 
         // Test fallback to md5Sum
         metadata.remove("etag");
         metadata.insert("md5Sum".to_string(), "xyz789".to_string());
-        assert_eq!(extract_etag(&metadata), "\"xyz789\"");
+        assert_eq!(get_raw_etag(&metadata), "xyz789");
+
+        metadata.clear();
+        assert_eq!(get_raw_etag(&metadata), "");
     }
 }
