@@ -13,18 +13,14 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use futures::pin_mut;
-use futures::{Stream, StreamExt};
-use std::io::Error;
+use futures::{Stream, StreamExt, pin_mut};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
-    time::{Duration, Instant},
-};
-use std::{
-    net::Ipv6Addr,
+    io::Error,
+    net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
     sync::{Arc, LazyLock, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 use tracing::{error, info};
 use transform_stream::AsyncTryStream;
