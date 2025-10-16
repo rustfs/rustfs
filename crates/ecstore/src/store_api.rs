@@ -1619,31 +1619,33 @@ mod tests {
 
     #[test]
     fn test_http_range_spec_from_object_info_valid_and_invalid_parts() {
-        let mut object_info = ObjectInfo::default();
-        object_info.size = 300;
-        object_info.parts = vec![
-            ObjectPartInfo {
-                etag: String::new(),
-                number: 1,
-                size: 100,
-                actual_size: 100,
-                ..Default::default()
-            },
-            ObjectPartInfo {
-                etag: String::new(),
-                number: 2,
-                size: 100,
-                actual_size: 100,
-                ..Default::default()
-            },
-            ObjectPartInfo {
-                etag: String::new(),
-                number: 3,
-                size: 100,
-                actual_size: 100,
-                ..Default::default()
-            },
-        ];
+        let object_info = ObjectInfo {
+            size: 300,
+            parts: vec![
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 1,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 2,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 3,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
 
         let spec = HTTPRangeSpec::from_object_info(&object_info, 2).unwrap();
         assert_eq!(spec.start, 100);
