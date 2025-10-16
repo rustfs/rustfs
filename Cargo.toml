@@ -28,6 +28,7 @@ members = [
     "crates/madmin", # Management dashboard and admin API interface
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
+    "crates/policy",# Policy management
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
     "crates/targets", # Target-specific configurations and utilities

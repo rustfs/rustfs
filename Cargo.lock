@@ -6662,6 +6662,7 @@ dependencies = [
  "futures",
  "jsonwebtoken",
  "rand 0.9.2",
+ "rustfs-config",
  "rustfs-crypto",
  "rustfs-ecstore",
  "rustfs-madmin",
@@ -6823,18 +6824,23 @@ name = "rustfs-policy"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
+ "chrono",
  "ipnetwork",
  "jsonwebtoken",
  "rand 0.9.2",
  "regex",
+ "reqwest",
+ "rustfs-config",
  "rustfs-crypto",
  "serde",
  "serde_json",
  "strum 0.27.2",
+ "temp-env",
  "test-case",
  "thiserror 2.0.17",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

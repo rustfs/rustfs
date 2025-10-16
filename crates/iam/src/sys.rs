@@ -35,14 +35,17 @@ use rustfs_policy::auth::{
     is_access_key_valid, is_secret_key_valid,
 };
 use rustfs_policy::policy::Args;
+use rustfs_policy::policy::opa;
 use rustfs_policy::policy::{EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, iam_policy_claim_name_sa};
 use rustfs_utils::crypto::{base64_decode, base64_encode};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use time::OffsetDateTime;
-use tracing::warn;
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 pub const MAX_SVCSESSION_POLICY_SIZE: usize = 4096;
 
@@ -53,6 +56,12 @@ pub const POLICYNAME: &str = "policy";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
 
+static POLICY_PLUGIN_CLIENT: OnceLock<Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>>> = OnceLock::new();
+
+fn get_policy_plugin_client() -> Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>> {
+    POLICY_PLUGIN_CLIENT.get_or_init(|| Arc::new(RwLock::new(None))).clone()
+}
+
 pub struct IamSys<T> {
     store: Arc<IamCache<T>>,
     roles_map: HashMap<ARN, String>,
@@ -60,6 +69,20 @@ pub struct IamSys<T> {
 
 impl<T: Store> IamSys<T> {
     pub fn new(store: Arc<IamCache<T>>) -> Self {
+        tokio::spawn(async move {
+            match opa::lookup_config().await {
+                Ok(conf) => {
+                    if conf.enable() {
+                        Self::set_policy_plugin_client(opa::AuthZPlugin::new(conf)).await;
+                        info!("OPA plugin enabled");
+                    }
+                }
+                Err(e) => {
+                    error!("Error loading OPA configuration err:{}", e);
+                }
+            };
+        });
+
         Self {
             store,
             roles_map: HashMap::new(),
@@ -67,6 +90,18 @@ impl<T: Store> IamSys<T> {
     }
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
+    }
+
+    pub async fn set_policy_plugin_client(client: rustfs_policy::policy::opa::AuthZPlugin) {
+        let policy_plugin_client = get_policy_plugin_client();
+        let mut guard = policy_plugin_client.write().await;
+        *guard = Some(client);
+    }
+
+    pub async fn get_policy_plugin_client() -> Option<rustfs_policy::policy::opa::AuthZPlugin> {
+        let policy_plugin_client = get_policy_plugin_client();
+        let guard = policy_plugin_client.read().await;
+        guard.clone()
     }
 
     pub async fn load_group(&self, name: &str) -> Result<()> {
@@ -764,6 +799,11 @@ impl<T: Store> IamSys<T> {
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
         if args.is_owner {
             return true;
+        }
+
+        let opa_enable = Self::get_policy_plugin_client().await;
+        if let Some(opa_enable) = opa_enable {
+            return opa_enable.is_allowed(args).await;
         }
 
         let Ok((is_temp, parent_user)) = self.is_temp_user(args.account).await else { return false };

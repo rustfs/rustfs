@@ -20,7 +20,10 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=info"
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=debug",
+                "RUSTFS_SKIP_BACKGROUND_TASK": "on",
+                // "RUSTFS_POLICY_PLUGIN_URL":"http://localhost:8181/v1/data/rustfs/authz/allow",
+                // "RUSTFS_POLICY_PLUGIN_AUTH_TOKEN":"your-opa-token" 
             },
             "args": [
                 "--access-key",
@@ -29,6 +32,8 @@
                 "rustfsadmin",
                 "--address",
                 "0.0.0.0:9010",
+                "--server-domains",
+                "127.0.0.1:9010",
                 "./target/volume/test{1...4}"
             ],
             "cwd": "${workspaceFolder}"
