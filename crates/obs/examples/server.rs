@@ -15,12 +15,11 @@
 use opentelemetry::global;
 use rustfs_obs::{SystemObserver, init_obs};
 use std::time::{Duration, SystemTime};
-use tracing::{error, info, instrument};
-use tracing_core::Level;
+use tracing::{Level, error, info, instrument};
 
 #[tokio::main]
 async fn main() {
-    let obs_conf = Some("crates/obs/examples/config.toml".to_string());
+    let obs_conf = Some("http://localhost:4317".to_string());
     let _guard = init_obs(obs_conf).await;
     let span = tracing::span!(Level::INFO, "main");
     let _enter = span.enter();
