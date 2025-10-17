@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::logger::InitLogStatus;
+use crate::AppConfig;
 use crate::telemetry::{OtelGuard, init_telemetry};
-use crate::{AppConfig, Logger, get_global_logger, init_global_logger};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
@@ -61,46 +60,14 @@ pub enum GlobalError {
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// let (logger, guard) = init_obs(None).await;
+/// let guard = init_obs(None).await;
 /// # }
 /// ```
-pub async fn init_obs(endpoint: Option<String>) -> (Arc<tokio::sync::Mutex<Logger>>, OtelGuard) {
+pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
     // Load the configuration file
     let config = AppConfig::new_with_endpoint(endpoint);
 
-    let guard = init_telemetry(&config.observability);
-
-    let logger = init_global_logger(&config).await;
-    let obs_config = config.observability.clone();
-    tokio::spawn(async move {
-        let result = InitLogStatus::init_start_log(&obs_config).await;
-        match result {
-            Ok(_) => {
-                info!("Logger initialized successfully");
-            }
-            Err(e) => {
-                error!("Failed to initialize logger: {}", e);
-            }
-        }
-    });
-
-    (logger, guard)
-}
-
-/// Get the global logger instance
-/// This function returns a reference to the global logger instance.
-///
-/// # Returns
-/// A reference to the global logger instance
-///
-/// # Example
-/// ```no_run
-/// use rustfs_obs::get_logger;
-///
-/// let logger = get_logger();
-/// ```
-pub fn get_logger() -> &'static Arc<tokio::sync::Mutex<Logger>> {
-    get_global_logger()
+    init_telemetry(&config.observability)
 }
 
 /// Set the global guard for OpenTelemetry
@@ -117,7 +84,7 @@ pub fn get_logger() -> &'static Arc<tokio::sync::Mutex<Logger>> {
 /// use rustfs_obs::{ init_obs, set_global_guard};
 ///
 /// async fn init() -> Result<(), Box<dyn std::error::Error>> {
-///     let (_, guard) = init_obs(None).await;
+///     let guard = init_obs(None).await;
 ///     set_global_guard(guard)?;
 ///     Ok(())
 /// }

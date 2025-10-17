@@ -65,7 +65,7 @@ impl OptimizedFileCache {
         // Cache miss, read file
         let data = tokio::fs::read(&path)
             .await
-            .map_err(|e| Error::other(format!("Read metadata failed: {}", e)))?;
+            .map_err(|e| Error::other(format!("Read metadata failed: {e}")))?;
 
         let mut meta = FileMeta::default();
         meta.unmarshal_msg(&data)?;
@@ -86,7 +86,7 @@ impl OptimizedFileCache {
 
         let data = tokio::fs::read(&path)
             .await
-            .map_err(|e| Error::other(format!("Read file failed: {}", e)))?;
+            .map_err(|e| Error::other(format!("Read file failed: {e}")))?;
 
         let bytes = Bytes::from(data);
         self.file_content_cache.insert(path, bytes.clone()).await;
@@ -295,9 +295,9 @@ mod tests {
         let mut paths = Vec::new();
 
         for i in 0..5 {
-            let file_path = dir.path().join(format!("test_{}.txt", i));
+            let file_path = dir.path().join(format!("test_{i}.txt"));
             let mut file = std::fs::File::create(&file_path).unwrap();
-            writeln!(file, "content {}", i).unwrap();
+            writeln!(file, "content {i}").unwrap();
             paths.push(file_path);
         }
 

@@ -43,3 +43,7 @@ pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
 pub fn get() -> Result<Arc<IamSys<ObjectStore>>> {
     IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)
 }
+
+pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {
+    IAM_SYS.get().cloned()
+}

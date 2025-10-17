@@ -30,6 +30,9 @@ documentation = "https://docs.rustfs.com/"
 name = "rustfs"
 path = "src/main.rs"
 
+[features]
+default = []
+
 [lints]
 workspace = true
 
@@ -39,6 +42,7 @@ rustfs-zip = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-appauth = { workspace = true }
+rustfs-audit = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-common = { workspace = true }
@@ -51,29 +55,36 @@ rustfs-obs = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-protos = { workspace = true }
 rustfs-s3select-query = { workspace = true }
-rustfs-audit-logger = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-kms = { workspace = true }
+rustfs-lock.workspace = true
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
+axum-extra = { workspace = true }
+axum-server = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }
 const-str = { workspace = true }
+flatbuffers.workspace = true
 futures.workspace = true
+futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
 matchit = { workspace = true }
+md5.workspace = true
 mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
-percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 reqwest = { workspace = true }
-rustls.workspace = true
+rmp-serde.workspace = true
+rustls = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 serde.workspace = true
@@ -92,7 +103,7 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tokio-stream.workspace = true
-tokio-rustls = { workspace = true, features = ["default"] }
+tokio-rustls = { workspace = true }
 tokio-tar = { workspace = true }
 tonic = { workspace = true }
 tower.workspace = true
@@ -102,16 +113,16 @@ tower-http = { workspace = true, features = [
     "compression-gzip",
     "cors",
     "catch-panic",
+    "timeout",
+    "limit",
 ] }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
-pprof.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
-
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
@@ -123,6 +134,11 @@ tikv-jemalloc-sys = { workspace = true }
 jemalloc_pprof = { workspace = true }
 pprof = { workspace = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+mimalloc = "0.1"
+
+[dev-dependencies]
+uuid = { workspace = true, features = ["v4"] }
 
 [build-dependencies]
 http.workspace = true

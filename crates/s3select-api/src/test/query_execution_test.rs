@@ -63,7 +63,7 @@ mod tests {
     fn test_running_state_as_ref() {
         assert_eq!(RUNNING::DISPATCHING.as_ref(), "DISPATCHING");
         assert_eq!(RUNNING::ANALYZING.as_ref(), "ANALYZING");
-        assert_eq!(RUNNING::OPTMIZING.as_ref(), "OPTMIZING");
+        assert_eq!(RUNNING::OPTIMIZING.as_ref(), "OPTIMIZING");
         assert_eq!(RUNNING::SCHEDULING.as_ref(), "SCHEDULING");
     }
 

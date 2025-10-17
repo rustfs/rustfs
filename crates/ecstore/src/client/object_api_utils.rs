@@ -20,8 +20,8 @@
 #![allow(clippy::all)]
 
 use http::HeaderMap;
-use std::io::Cursor;
-use std::{collections::HashMap, sync::Arc};
+use s3s::dto::ETag;
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
@@ -148,10 +148,78 @@ pub fn new_getobjectreader(
     Ok((get_fn, off as i64, length as i64))
 }
 
-pub fn extract_etag(metadata: &HashMap<String, String>) -> String {
-    if let Some(etag) = metadata.get("etag") {
-        etag.clone()
-    } else {
-        metadata["md5Sum"].clone()
+/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
+///
+/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
+pub fn to_s3s_etag(etag: &str) -> ETag {
+    if let Some(rest) = etag.strip_prefix("W/\"") {
+        if let Some(body) = rest.strip_suffix('"') {
+            return ETag::Weak(body.to_string());
+        }
+        return ETag::Weak(rest.to_string());
+    }
+
+    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        return ETag::Strong(body.to_string());
+    }
+
+    ETag::Strong(etag.to_string())
+}
+
+pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
+    metadata
+        .get("etag")
+        .cloned()
+        .or_else(|| metadata.get("md5Sum").cloned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_s3s_etag() {
+        // Test unquoted ETag - should become strong etag
+        assert_eq!(
+            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
+            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
+
+        assert_eq!(
+            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
+            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
+
+        assert_eq!(
+            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
+            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
+
+        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
+
+        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
+
+        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
+    }
+
+    #[test]
+    fn test_extract_etag() {
+        let mut metadata = HashMap::new();
+
+        // Test with etag field
+        metadata.insert("etag".to_string(), "abc123".to_string());
+        assert_eq!(get_raw_etag(&metadata), "abc123");
+
+        metadata.insert("etag".to_string(), "\"def456\"".to_string());
+        assert_eq!(get_raw_etag(&metadata), "\"def456\"");
+
+        // Test fallback to md5Sum
+        metadata.remove("etag");
+        metadata.insert("md5Sum".to_string(), "xyz789".to_string());
+        assert_eq!(get_raw_etag(&metadata), "xyz789");
+
+        metadata.clear();
+        assert_eq!(get_raw_etag(&metadata), "");
     }
 }

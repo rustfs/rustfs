@@ -21,27 +21,27 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, bucket_meta,
-    event::{
-        GetBucketNotification, ListNotificationTargets, NotificationTarget, RemoveBucketNotification, RemoveNotificationTarget,
-        SetBucketNotification,
-    },
-    group, policies, pools,
-    profile::{TriggerProfileCPU, TriggerProfileMemory},
-    rebalance,
-    service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
-    sts, tier, user,
+    bucket_meta, event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget}, group, kms, kms_dynamic,
+    kms_keys,
+    policies,
+    pools, rebalance, service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount}, sts, tier, user, GetReplicationMetricsHandler,
+    HealthCheckHandler,
+    ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
 };
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
 use s3s::route::S3Route;
+use crate::admin::handlers::profile::{TriggerProfileCPU, TriggerProfileMemory};
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 // const ADMIN_PREFIX: &str = "/minio/admin";
 
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
+
+    // Health check endpoint for monitoring and orchestration
+    r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
@@ -216,16 +216,124 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
+    // Performance profiling endpoints (available on all platforms, with platform-specific responses)
+    #[cfg(not(target_os = "windows"))]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
         AdminOperation(&handlers::ProfileHandler {}),
     )?;
 
+    #[cfg(not(target_os = "windows"))]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
         AdminOperation(&handlers::ProfileStatusHandler {}),
+    )?;
+
+    // KMS management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/create-key").as_str(),
+        AdminOperation(&kms::CreateKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/describe-key").as_str(),
+        AdminOperation(&kms::DescribeKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/list-keys").as_str(),
+        AdminOperation(&kms::ListKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/generate-data-key").as_str(),
+        AdminOperation(&kms::GenerateDataKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
+        AdminOperation(&kms::KmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/config").as_str(),
+        AdminOperation(&kms::KmsConfigHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/clear-cache").as_str(),
+        AdminOperation(&kms::KmsClearCacheHandler {}),
+    )?;
+
+    // KMS Dynamic Configuration APIs
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
+        AdminOperation(&kms_dynamic::ConfigureKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/start").as_str(),
+        AdminOperation(&kms_dynamic::StartKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/stop").as_str(),
+        AdminOperation(&kms_dynamic::StopKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/service-status").as_str(),
+        AdminOperation(&kms_dynamic::GetKmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/reconfigure").as_str(),
+        AdminOperation(&kms_dynamic::ReconfigureKmsHandler {}),
+    )?;
+
+    // KMS key management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::CreateKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
+        AdminOperation(&kms_keys::DeleteKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
+        AdminOperation(&kms_keys::CancelKmsKeyDeletionHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::ListKmsKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
+        AdminOperation(&kms_keys::DescribeKmsKeyHandler {}),
     )?;
 
     Ok(r)
@@ -409,25 +517,7 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
-        AdminOperation(&ListNotificationTargets {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-set-bucket").as_str(),
-        AdminOperation(&SetBucketNotification {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-get-bucket").as_str(),
-        AdminOperation(&GetBucketNotification {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove-bucket").as_str(),
-        AdminOperation(&RemoveBucketNotification {}),
+        AdminOperation(&ListTargetsArns {}),
     )?;
 
     r.insert(

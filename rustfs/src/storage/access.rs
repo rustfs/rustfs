@@ -50,9 +50,9 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
         let conditions = get_condition_values(&req.headers, cred);
 
-        if action != Action::S3Action(S3Action::DeleteObjectAction)
+        if action == Action::S3Action(S3Action::DeleteObjectAction)
             && req_info.version_id.is_some()
-            && iam_store
+            && !iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
@@ -66,7 +66,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 })
                 .await
         {
-            return Ok(());
+            return Err(s3_error!(AccessDenied, "Access Denied"));
         }
 
         if iam_store

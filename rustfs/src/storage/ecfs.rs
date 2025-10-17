@@ -12,109 +12,112 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::access::authorize_request;
-use super::options::del_opts;
-use super::options::extract_metadata;
-use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
-use crate::storage::access::ReqInfo;
-use crate::storage::options::copy_dst_opts;
-use crate::storage::options::copy_src_opts;
-use crate::storage::options::get_complete_multipart_upload_opts;
-use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_opts, parse_copy_source_range};
+use crate::storage::{
+    access::{ReqInfo, authorize_request},
+    options::{
+        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
+        get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
+    },
+};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
-use chrono::DateTime;
-use chrono::Utc;
-use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
-use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
-use datafusion::arrow::json::writer::JsonArray;
-// use rustfs_ecstore::store_api::RESERVED_METADATA_PREFIX;
+use chrono::{DateTime, Utc};
+use datafusion::arrow::{
+    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
+};
 use futures::StreamExt;
-use http::HeaderMap;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
-use rustfs_ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_REPLICATION_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_SSECONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
-use rustfs_ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
-use rustfs_ecstore::bucket::metadata::OBJECT_LOCK_CONFIG;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::policy_sys::PolicySys;
-use rustfs_ecstore::bucket::tagging::decode_tags;
-use rustfs_ecstore::bucket::tagging::encode_tags;
-use rustfs_ecstore::bucket::utils::serialize;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationStatusType;
-use rustfs_ecstore::cmd::bucket_replication::ReplicationType;
-use rustfs_ecstore::cmd::bucket_replication::get_must_replicate_options;
-use rustfs_ecstore::cmd::bucket_replication::must_replicate;
-use rustfs_ecstore::cmd::bucket_replication::schedule_replication;
-use rustfs_ecstore::compress::MIN_COMPRESSIBLE_SIZE;
-use rustfs_ecstore::compress::is_compressible;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
-use rustfs_ecstore::set_disk::{DEFAULT_READ_BUFFER_SIZE, is_valid_storage_class};
-use rustfs_ecstore::store_api::BucketOptions;
-use rustfs_ecstore::store_api::CompletePart;
-use rustfs_ecstore::store_api::DeleteBucketOptions;
-use rustfs_ecstore::store_api::HTTPRangeSpec;
-use rustfs_ecstore::store_api::MakeBucketOptions;
-use rustfs_ecstore::store_api::MultipartUploadResult;
-use rustfs_ecstore::store_api::ObjectIO;
-use rustfs_ecstore::store_api::ObjectOptions;
-use rustfs_ecstore::store_api::ObjectToDelete;
-use rustfs_ecstore::store_api::PutObjReader;
-use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use http::{HeaderMap, StatusCode};
+use rustfs_ecstore::{
+    bucket::{
+        lifecycle::{bucket_lifecycle_ops::validate_transition_tier, lifecycle::Lifecycle},
+        metadata::{
+            BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_REPLICATION_CONFIG,
+            BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+        },
+        metadata_sys,
+        metadata_sys::get_replication_config,
+        object_lock::objectlock_sys::BucketObjectLockSys,
+        policy_sys::PolicySys,
+        replication::{
+            DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationConfigurationExt, check_replicate_delete,
+            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
+        },
+        tagging::{decode_tags, encode_tags},
+        utils::serialize,
+        versioning::VersioningApi,
+        versioning_sys::BucketVersioningSys,
+    },
+    client::object_api_utils::to_s3s_etag,
+    compress::{MIN_COMPRESSIBLE_SIZE, is_compressible},
+    disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
+    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    new_object_layer_fn,
+    set_disk::{DEFAULT_READ_BUFFER_SIZE, MAX_PARTS_COUNT, is_valid_storage_class},
+    store_api::{
+        BucketOptions,
+        CompletePart,
+        DeleteBucketOptions,
+        HTTPRangeSpec,
+        MakeBucketOptions,
+        MultipartUploadResult,
+        ObjectIO,
+        ObjectInfo,
+        ObjectOptions,
+        ObjectToDelete,
+        PutObjReader,
+        StorageAPI,
+        // RESERVED_METADATA_PREFIX,
+    },
+};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, fileinfo::ObjectPartInfo};
+use rustfs_kms::{
+    DataKey,
+    service_manager::get_global_encryption_service,
+    types::{EncryptionMetadata, ObjectEncryptionContext},
+};
 use rustfs_notify::global::notifier_instance;
-use rustfs_policy::auth;
-use rustfs_policy::policy::action::Action;
-use rustfs_policy::policy::action::S3Action;
-use rustfs_policy::policy::{BucketPolicy, BucketPolicyArgs, Validator};
-use rustfs_rio::CompressReader;
-use rustfs_rio::EtagReader;
-use rustfs_rio::HashReader;
-use rustfs_rio::Reader;
-use rustfs_rio::WarpReader;
-use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_s3select_api::query::Context;
-use rustfs_s3select_api::query::Query;
+use rustfs_policy::{
+    auth,
+    policy::{
+        action::{Action, S3Action},
+        {BucketPolicy, BucketPolicyArgs, Validator},
+    },
+};
+use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
+use rustfs_s3select_api::{
+    object_store::bytes_stream,
+    query::{Context, Query},
+};
 use rustfs_s3select_query::get_global_db;
-use rustfs_targets::EventName;
-use rustfs_targets::arn::{TargetID, TargetIDError};
-use rustfs_utils::CompressionAlgorithm;
-use rustfs_utils::path::path_join_buf;
+use rustfs_targets::{
+    EventName,
+    arn::{TargetID, TargetIDError},
+};
+use rustfs_utils::{
+    CompressionAlgorithm,
+    http::{
+        AMZ_BUCKET_REPLICATION_STATUS,
+        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+    },
+    path::{is_dir_object, path_join_buf},
+};
 use rustfs_zip::CompressionFormat;
-use s3s::S3;
-use s3s::S3Error;
-use s3s::S3ErrorCode;
-use s3s::S3Result;
-use s3s::dto::*;
-use s3s::s3_error;
-use s3s::{S3Request, S3Response};
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::path::Path;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-use tokio::sync::mpsc;
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{io::AsyncRead, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
-use tokio_util::io::ReaderStream;
-use tokio_util::io::StreamReader;
-use tracing::debug;
-use tracing::error;
-use tracing::info;
-use tracing::warn;
+use tokio_util::io::{ReaderStream, StreamReader};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -136,6 +139,199 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 #[derive(Debug, Clone)]
 pub struct FS {
     // pub store: ECStore,
+}
+
+struct ManagedEncryptionMaterial {
+    data_key: DataKey,
+    headers: HashMap<String, String>,
+    kms_key_id: String,
+}
+
+async fn create_managed_encryption_material(
+    bucket: &str,
+    key: &str,
+    algorithm: &ServerSideEncryption,
+    kms_key_id: Option<String>,
+    original_size: i64,
+) -> Result<ManagedEncryptionMaterial, ApiError> {
+    let Some(service) = get_global_encryption_service().await else {
+        return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
+    };
+
+    if !is_managed_sse(algorithm) {
+        return Err(ApiError::from(StorageError::other(format!(
+            "Unsupported server-side encryption algorithm: {}",
+            algorithm.as_str()
+        ))));
+    }
+
+    let algorithm_str = algorithm.as_str();
+
+    let mut context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+    if original_size >= 0 {
+        context = context.with_size(original_size as u64);
+    }
+
+    let mut kms_key_candidate = kms_key_id;
+    if kms_key_candidate.is_none() {
+        kms_key_candidate = service.get_default_key_id().cloned();
+    }
+
+    let kms_key_to_use = kms_key_candidate
+        .clone()
+        .ok_or_else(|| ApiError::from(StorageError::other("No KMS key available for managed server-side encryption")))?;
+
+    let (data_key, encrypted_data_key) = service
+        .create_data_key(&kms_key_candidate, &context)
+        .await
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
+
+    let metadata = EncryptionMetadata {
+        algorithm: algorithm_str.to_string(),
+        key_id: kms_key_to_use.clone(),
+        key_version: 1,
+        iv: data_key.nonce.to_vec(),
+        tag: None,
+        encryption_context: context.encryption_context.clone(),
+        encrypted_at: Utc::now(),
+        original_size: if original_size >= 0 { original_size as u64 } else { 0 },
+        encrypted_data_key,
+    };
+
+    let mut headers = service.metadata_to_headers(&metadata);
+    headers.insert("x-rustfs-encryption-original-size".to_string(), metadata.original_size.to_string());
+
+    Ok(ManagedEncryptionMaterial {
+        data_key,
+        headers,
+        kms_key_id: kms_key_to_use,
+    })
+}
+
+async fn decrypt_managed_encryption_key(
+    bucket: &str,
+    key: &str,
+    metadata: &HashMap<String, String>,
+) -> Result<Option<([u8; 32], [u8; 12], Option<i64>)>, ApiError> {
+    if !metadata.contains_key("x-rustfs-encryption-key") {
+        return Ok(None);
+    }
+
+    let Some(service) = get_global_encryption_service().await else {
+        return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
+    };
+
+    let parsed = service
+        .headers_to_metadata(metadata)
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {e}"))))?;
+
+    if parsed.iv.len() != 12 {
+        return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
+    }
+
+    let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+    let data_key = service
+        .decrypt_data_key(&parsed.encrypted_data_key, &context)
+        .await
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
+
+    let key_bytes = data_key.plaintext_key;
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&parsed.iv[..12]);
+
+    let original_size = metadata
+        .get("x-rustfs-encryption-original-size")
+        .and_then(|s| s.parse::<i64>().ok());
+
+    Ok(Some((key_bytes, nonce, original_size)))
+}
+
+fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
+    let mut nonce = base;
+    let current = u32::from_be_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]);
+    let incremented = current.wrapping_add(part_number as u32);
+    nonce[8..12].copy_from_slice(&incremented.to_be_bytes());
+    nonce
+}
+
+struct InMemoryAsyncReader {
+    cursor: std::io::Cursor<Vec<u8>>,
+}
+
+impl InMemoryAsyncReader {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            cursor: std::io::Cursor::new(data),
+        }
+    }
+}
+
+impl AsyncRead for InMemoryAsyncReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let unfilled = buf.initialize_unfilled();
+        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
+        buf.advance(bytes_read);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+async fn decrypt_multipart_managed_stream(
+    mut encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    parts: &[ObjectPartInfo],
+    key_bytes: [u8; 32],
+    base_nonce: [u8; 12],
+) -> Result<(Box<dyn Reader>, i64), StorageError> {
+    let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
+
+    let mut plaintext = Vec::with_capacity(total_plain_capacity);
+
+    for part in parts {
+        if part.size == 0 {
+            continue;
+        }
+
+        let mut encrypted_part = vec![0u8; part.size];
+        tokio::io::AsyncReadExt::read_exact(&mut encrypted_stream, &mut encrypted_part)
+            .await
+            .map_err(|e| StorageError::other(format!("failed to read encrypted multipart segment {}: {}", part.number, e)))?;
+
+        let part_nonce = derive_part_nonce(base_nonce, part.number);
+        let cursor = std::io::Cursor::new(encrypted_part);
+        let mut decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
+
+        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext)
+            .await
+            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, e)))?;
+    }
+
+    let total_plain_size = plaintext.len() as i64;
+    let reader = Box::new(WarpReader::new(InMemoryAsyncReader::new(plaintext))) as Box<dyn Reader>;
+
+    Ok((reader, total_plain_size))
+}
+
+fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>) {
+    const KEYS: [&str; 7] = [
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-rustfs-encryption-iv",
+        "x-rustfs-encryption-tag",
+        "x-rustfs-encryption-key",
+        "x-rustfs-encryption-context",
+        "x-rustfs-encryption-original-size",
+    ];
+
+    for key in KEYS.iter() {
+        metadata.remove(*key);
+    }
+}
+
+fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
+    matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }
 
 impl FS {
@@ -241,7 +437,7 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
-                let e_tag = _obj_info.clone().etag;
+                let e_tag = _obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
                 // // store.put_object(bucket, object, data, opts);
 
@@ -309,7 +505,7 @@ async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store
 
 #[async_trait::async_trait]
 impl S3 for FS {
-    #[tracing::instrument(
+    #[instrument(
         level = "debug",
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
@@ -342,7 +538,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::BucketCreated,
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo { ..Default::default() },
+            object: ObjectInfo { ..Default::default() },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
             version_id: String::new(),
@@ -359,12 +555,14 @@ impl S3 for FS {
     }
 
     /// Copy an object from one location to another
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let CopyObjectInput {
             copy_source,
             bucket,
             key,
+            server_side_encryption: requested_sse,
+            ssekms_key_id: requested_kms_key_id,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -403,6 +601,30 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        let effective_sse = requested_sse.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| match sse.sse_algorithm.as_str() {
+                            "AES256" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                            "aws:kms" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+                            _ => None,
+                        })
+                })
+            })
+        });
+        let mut effective_kms_key_id = requested_kms_key_id.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| sse.kms_master_key_id.clone())
+                })
+            })
+        });
+
         let h = HeaderMap::new();
 
         let gr = store
@@ -417,6 +639,17 @@ impl S3 for FS {
         }
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(gr.stream));
+
+        if let Some((key_bytes, nonce, original_size_opt)) =
+            decrypt_managed_encryption_key(&src_bucket, &src_key, &src_info.user_defined).await?
+        {
+            reader = Box::new(DecryptReader::new(reader, key_bytes, nonce));
+            if let Some(original) = original_size_opt {
+                src_info.actual_size = original;
+            }
+        }
+
+        strip_managed_encryption_metadata(&mut src_info.user_defined);
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
@@ -449,12 +682,34 @@ impl S3 for FS {
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
         }
 
-        let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
 
-        src_info.put_object_reader = Some(PutObjReader::new(hrd));
+        if let Some(ref sse_alg) = effective_sse {
+            if is_managed_sse(sse_alg) {
+                let material =
+                    create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
+
+                let ManagedEncryptionMaterial {
+                    data_key,
+                    headers,
+                    kms_key_id: kms_key_used,
+                } = material;
+
+                let key_bytes = data_key.plaintext_key;
+                let nonce = data_key.nonce;
+
+                src_info.user_defined.extend(headers.into_iter());
+                effective_kms_key_id = Some(kms_key_used.clone());
+
+                let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
+                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            }
+        }
+
+        src_info.put_object_reader = Some(PutObjReader::new(reader));
 
         // check quota
-        // TODO: src metadada
+        // TODO: src metadata
 
         for (k, v) in compress_metadata {
             src_info.user_defined.insert(k, v);
@@ -470,13 +725,15 @@ impl S3 for FS {
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag,
+            e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             ..Default::default()
         };
 
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
+            server_side_encryption: effective_sse,
+            ssekms_key_id: effective_kms_key_id,
             ..Default::default()
         };
 
@@ -666,7 +923,7 @@ impl S3 for FS {
     }
 
     /// Delete a bucket
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
         // TODO: DeleteBucketInput doesn't have force parameter?
@@ -688,7 +945,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::BucketRemoved,
             bucket_name: input.bucket,
-            object: rustfs_ecstore::store_api::ObjectInfo { ..Default::default() },
+            object: ObjectInfo { ..Default::default() },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
             version_id: String::new(),
@@ -705,68 +962,121 @@ impl S3 for FS {
     }
 
     /// Delete an object
-    #[tracing::instrument(level = "debug", skip(self, req))]
-    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+    #[instrument(level = "debug", skip(self, req))]
+    async fn delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        let replica = req
+            .headers
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .map(|v| v.to_str().unwrap_or_default() == ReplicationStatusType::Replica.as_str())
+            .unwrap_or_default();
+
+        if replica {
+            authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
+        }
+
         let metadata = extract_metadata(&req.headers);
 
-        let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
+        let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
-        let dobj = ObjectToDelete {
-            object_name: key.clone(),
-            version_id,
-        };
+        // TODO: check object lock
 
-        let objects: Vec<ObjectToDelete> = vec![dobj];
+        let lock_cfg = BucketObjectLockSys::get(&bucket).await;
+        if lock_cfg.is_some() && opts.delete_prefix {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("force-delete is forbidden on Object Locking enabled buckets".into()),
+                "force-delete is forbidden on Object Locking enabled buckets",
+            ));
+        }
+
+        // let mut vid = opts.version_id.clone();
+
+        if replica {
+            opts.set_replica_status(ReplicationStatusType::Replica);
+
+            // if opts.version_purge_status().is_empty() {
+            //     vid = None;
+            // }
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
 
-        // TODO: let errors;
+        let obj_info = {
+            match store.delete_object(&bucket, &key, opts).await {
+                Ok(obj) => obj,
+                Err(err) => {
+                    if is_err_bucket_not_found(&err) {
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+                    }
 
-        let (delete_marker, version_id) = {
-            if let Some((a, b)) = dobjs
-                .iter()
-                .map(|v| {
-                    let delete_marker = { if v.delete_marker { Some(true) } else { None } };
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        // TODO: send event
 
-                    let version_id = v.version_id.clone();
+                        return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+                    }
 
-                    (delete_marker, version_id)
-                })
-                .next()
-            {
-                (a, b)
-            } else {
-                (None, None)
+                    return Err(ApiError::from(err).into());
+                }
             }
         };
-        let del_version_id = version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+
+        if obj_info.name.is_empty() {
+            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+        }
+
+        if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.version_purge_status == VersionPurgeStatusType::Pending
+        {
+            schedule_replication_delete(DeletedObjectReplicationInfo {
+                delete_object: rustfs_ecstore::store_api::DeletedObject {
+                    delete_marker: obj_info.delete_marker,
+                    delete_marker_version_id: if obj_info.delete_marker { obj_info.version_id } else { None },
+                    object_name: key.clone(),
+                    version_id: if obj_info.delete_marker { None } else { obj_info.version_id },
+                    delete_marker_mtime: obj_info.mod_time,
+                    replication_state: Some(obj_info.replication_state()),
+                    ..Default::default()
+                },
+                bucket: bucket.clone(),
+                event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                ..Default::default()
+            })
+            .await;
+        }
+
+        let delete_marker = obj_info.delete_marker;
+        let version_id = obj_info.version_id;
+
         let output = DeleteObjectOutput {
-            delete_marker,
-            version_id,
+            delete_marker: Some(delete_marker),
+            version_id: version_id.map(|v| v.to_string()),
             ..Default::default()
         };
 
+        let event_name = if delete_marker {
+            EventName::ObjectRemovedDeleteMarkerCreated
+        } else {
+            EventName::ObjectRemovedDelete
+        };
+
         let event_args = rustfs_notify::event::EventArgs {
-            event_name: EventName::ObjectRemovedDelete,
+            event_name,
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo {
-                name: key,
-                bucket,
+            object: ObjectInfo {
+                name: key.clone(),
+                bucket: bucket.clone(),
                 ..Default::default()
             },
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: del_version_id,
+            version_id: version_id.map(|v| v.to_string()).unwrap_or_default(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
         };
@@ -780,56 +1090,230 @@ impl S3 for FS {
     }
 
     /// Delete multiple objects
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        // info!("delete_objects args {:?}", req.input);
-
         let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
-        let objects: Vec<ObjectToDelete> = delete
-            .objects
-            .iter()
-            .map(|v| {
-                let version_id = v.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
-                ObjectToDelete {
+        if delete.objects.is_empty() || delete.objects.len() > 1000 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "No objects to delete or too many objects to delete".to_string(),
+            ));
+        }
+
+        let replicate_deletes = has_replication_rules(
+            &bucket,
+            &delete
+                .objects
+                .iter()
+                .map(|v| ObjectToDelete {
                     object_name: v.key.clone(),
-                    version_id,
-                }
-            })
-            .collect();
+                    ..Default::default()
+                })
+                .collect::<Vec<ObjectToDelete>>(),
+        )
+        .await;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let metadata = extract_metadata(&req.headers);
+        let has_lock_enable = BucketObjectLockSys::get(&bucket).await.is_some();
 
-        let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
+        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
 
-        let (dobjs, errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
+        #[derive(Default, Clone)]
+        struct DeleteResult {
+            delete_object: Option<rustfs_ecstore::store_api::DeletedObject>,
+            error: Option<Error>,
+        }
 
-        let deleted = dobjs
+        let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
+
+        let mut object_to_delete = Vec::new();
+        let mut object_to_delete_index = HashMap::new();
+
+        for (idx, object) in delete.objects.iter().enumerate() {
+            // TODO: check auth
+            if let Some(version_id) = object.version_id.clone() {
+                let _vid = match Uuid::parse_str(&version_id) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        delete_results[idx].error = Some(Error {
+                            code: Some("NoSuchVersion".to_string()),
+                            key: Some(object.key.clone()),
+                            message: Some(err.to_string()),
+                            version_id: Some(version_id),
+                        });
+
+                        continue;
+                    }
+                };
+            };
+
+            let mut object = ObjectToDelete {
+                object_name: object.key.clone(),
+                version_id: object.version_id.clone().map(|v| Uuid::parse_str(&v).unwrap()),
+                ..Default::default()
+            };
+
+            let opts = ObjectOptions {
+                version_id: object.version_id.map(|v| v.to_string()),
+                versioned: version_cfg.prefix_enabled(&object.object_name),
+                version_suspended: version_cfg.suspended(),
+                ..Default::default()
+            };
+
+            let mut goi = ObjectInfo::default();
+            let mut gerr = None;
+
+            if replicate_deletes || object.version_id.is_some() && has_lock_enable {
+                (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                    Ok(res) => (res, None),
+                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+                };
+            }
+
+            if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                object.version_id = Some(Uuid::nil());
+            }
+
+            if replicate_deletes {
+                let dsc = check_replicate_delete(
+                    &bucket,
+                    &ObjectToDelete {
+                        object_name: object.object_name.clone(),
+                        version_id: object.version_id,
+                        ..Default::default()
+                    },
+                    &goi,
+                    &opts,
+                    gerr.clone(),
+                )
+                .await;
+                if dsc.replicate_any() {
+                    if object.version_id.is_some() {
+                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+                        object.version_purge_statuses = dsc.pending_status();
+                    } else {
+                        object.delete_marker_replication_status = dsc.pending_status();
+                    }
+                    object.replicate_decision_str = Some(dsc.to_string());
+                }
+            }
+
+            // TODO: Retention
+            object_to_delete_index.insert(object.object_name.clone(), idx);
+            object_to_delete.push(object);
+        }
+
+        let (mut dobjs, errs) = {
+            store
+                .delete_objects(
+                    &bucket,
+                    object_to_delete.clone(),
+                    ObjectOptions {
+                        version_suspended: version_cfg.suspended(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        };
+
+        if is_all_buckets_not_found(
+            &errs
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.clone().into()))
+                .collect::<Vec<Option<DiskError>>>() as &[Option<DiskError>],
+        ) {
+            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+        }
+
+        for (i, err) in errs.into_iter().enumerate() {
+            let obj = dobjs[i].clone();
+
+            // let replication_state = obj.replication_state.clone().unwrap_or_default();
+
+            // let obj_to_del = ObjectToDelete {
+            //     object_name: decode_dir_object(dobjs[i].object_name.as_str()),
+            //     version_id: obj.version_id,
+            //     delete_marker_replication_status: replication_state.replication_status_internal.clone(),
+            //     version_purge_status: Some(obj.version_purge_status()),
+            //     version_purge_statuses: replication_state.version_purge_status_internal.clone(),
+            //     replicate_decision_str: Some(replication_state.replicate_decision_str.clone()),
+            // };
+
+            let Some(didx) = object_to_delete_index.get(&obj.object_name) else {
+                continue;
+            };
+
+            if err.is_none()
+                || err
+                    .clone()
+                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
+            {
+                if replicate_deletes {
+                    dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
+                }
+                delete_results[*didx].delete_object = Some(dobjs[i].clone());
+                continue;
+            }
+
+            if let Some(err) = err {
+                delete_results[*didx].error = Some(Error {
+                    code: Some(err.to_string()),
+                    key: Some(object_to_delete[i].object_name.clone()),
+                    message: Some(err.to_string()),
+                    version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
+                });
+            }
+        }
+
+        let deleted = delete_results
             .iter()
+            .filter_map(|v| v.delete_object.clone())
             .map(|v| DeletedObject {
                 delete_marker: { if v.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: v.delete_marker_version_id.clone(),
+                delete_marker_version_id: v.delete_marker_version_id.map(|v| v.to_string()),
                 key: Some(v.object_name.clone()),
-                version_id: v.version_id.clone(),
+                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
+                    None
+                } else {
+                    v.version_id.map(|v| v.to_string())
+                },
             })
             .collect();
 
-        // TODO: let errors;
-        for err in errs.iter().flatten() {
-            warn!("delete_objects err  {:?}", err);
-        }
+        let errors = delete_results.iter().filter_map(|v| v.error.clone()).collect::<Vec<Error>>();
 
         let output = DeleteObjectsOutput {
             deleted: Some(deleted),
-            // errors,
+            errors: Some(errors),
             ..Default::default()
         };
+
+        for dobjs in delete_results.iter() {
+            if let Some(dobj) = &dobjs.delete_object {
+                if replicate_deletes
+                    && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
+                        || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+                {
+                    let mut dobj = dobj.clone();
+                    if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
+                        dobj.version_id = Some(Uuid::nil());
+                    }
+
+                    let deleted_object = DeletedObjectReplicationInfo {
+                        delete_object: dobj,
+                        bucket: bucket.clone(),
+                        event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                        ..Default::default()
+                    };
+                    schedule_replication_delete(deleted_object).await;
+                }
+            }
+        }
+
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
             for dobj in dobjs {
@@ -845,7 +1329,7 @@ impl S3 for FS {
                 let event_args = rustfs_notify::event::EventArgs {
                     event_name,
                     bucket_name: bucket.clone(),
-                    object: rustfs_ecstore::store_api::ObjectInfo {
+                    object: ObjectInfo {
                         name: dobj.object_name,
                         bucket: bucket.clone(),
                         ..Default::default()
@@ -866,7 +1350,7 @@ impl S3 for FS {
     }
 
     /// Get bucket location
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         // mc get  1
         let input = req.input;
@@ -891,7 +1375,7 @@ impl S3 for FS {
     }
 
     /// Get bucket notification
-    #[tracing::instrument(
+    #[instrument(
         level = "debug",
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
@@ -951,6 +1435,15 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+        debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
+        for part in &info.parts {
+            debug!(
+                part_number = part.number,
+                part_size = part.size,
+                part_actual_size = part.actual_size,
+                "GET object part details"
+            );
+        }
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -987,20 +1480,193 @@ impl S3 for FS {
             None
         };
 
-        let body = Some(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
-            content_length as usize,
-        )));
+        // Apply SSE-C decryption if customer provided key and object was encrypted with SSE-C
+        let mut final_stream = reader.stream;
+        let stored_sse_algorithm = info.user_defined.get("x-amz-server-side-encryption-customer-algorithm");
+        let stored_sse_key_md5 = info.user_defined.get("x-amz-server-side-encryption-customer-key-md5");
+        let mut managed_encryption_applied = false;
+        let mut managed_original_size: Option<i64> = None;
+
+        debug!(
+            "GET object metadata check: stored_sse_algorithm={:?}, stored_sse_key_md5={:?}, provided_sse_key={:?}",
+            stored_sse_algorithm,
+            stored_sse_key_md5,
+            req.input.sse_customer_key.is_some()
+        );
+
+        if stored_sse_algorithm.is_some() {
+            // Object was encrypted with SSE-C, so customer must provide matching key
+            if let (Some(sse_key), Some(sse_key_md5_provided)) = (&req.input.sse_customer_key, &req.input.sse_customer_key_md5) {
+                // For true multipart objects (more than 1 part), SSE-C decryption is currently not fully implemented
+                // Each part needs to be decrypted individually, which requires storage layer changes
+                // Note: Single part objects also have info.parts.len() == 1, but they are not true multipart uploads
+                if info.parts.len() > 1 {
+                    warn!(
+                        "SSE-C multipart object detected with {} parts. Currently, multipart SSE-C upload parts are not encrypted during upload_part, so no decryption is needed during GET.",
+                        info.parts.len()
+                    );
+
+                    // Verify that the provided key MD5 matches the stored MD5 for security
+                    if let Some(stored_md5) = stored_sse_key_md5 {
+                        debug!("SSE-C MD5 comparison: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
+                        if sse_key_md5_provided != stored_md5 {
+                            error!("SSE-C key MD5 mismatch: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
+                            return Err(
+                                ApiError::from(StorageError::other("SSE-C key does not match object encryption key")).into()
+                            );
+                        }
+                    } else {
+                        return Err(ApiError::from(StorageError::other(
+                            "Object encrypted with SSE-C but stored key MD5 not found",
+                        ))
+                        .into());
+                    }
+
+                    // Since upload_part currently doesn't encrypt the data (SSE-C code is commented out),
+                    // we don't need to decrypt it either. Just return the data as-is.
+                    // TODO: Implement proper multipart SSE-C encryption/decryption
+                } else {
+                    // Verify that the provided key MD5 matches the stored MD5
+                    if let Some(stored_md5) = stored_sse_key_md5 {
+                        debug!("SSE-C MD5 comparison: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
+                        if sse_key_md5_provided != stored_md5 {
+                            error!("SSE-C key MD5 mismatch: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
+                            return Err(
+                                ApiError::from(StorageError::other("SSE-C key does not match object encryption key")).into()
+                            );
+                        }
+                    } else {
+                        return Err(ApiError::from(StorageError::other(
+                            "Object encrypted with SSE-C but stored key MD5 not found",
+                        ))
+                        .into());
+                    }
+
+                    // Decode the base64 key
+                    let key_bytes = BASE64_STANDARD
+                        .decode(sse_key)
+                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
+
+                    // Verify key length (should be 32 bytes for AES-256)
+                    if key_bytes.len() != 32 {
+                        return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+                    }
+
+                    // Convert Vec<u8> to [u8; 32]
+                    let mut key_array = [0u8; 32];
+                    key_array.copy_from_slice(&key_bytes[..32]);
+
+                    // Verify MD5 hash of the key matches what we expect
+                    let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+                    if computed_md5 != *sse_key_md5_provided {
+                        return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                    }
+
+                    // Generate the same deterministic nonce from object key
+                    let mut nonce = [0u8; 12];
+                    let nonce_source = format!("{bucket}-{key}");
+                    let nonce_hash = md5::compute(nonce_source.as_bytes());
+                    nonce.copy_from_slice(&nonce_hash.0[..12]);
+
+                    // Apply decryption
+                    // We need to wrap the stream in a Reader first since DecryptReader expects a Reader
+                    let warp_reader = WarpReader::new(final_stream);
+                    let decrypt_reader = DecryptReader::new(warp_reader, key_array, nonce);
+                    final_stream = Box::new(decrypt_reader);
+                }
+            } else {
+                return Err(
+                    ApiError::from(StorageError::other("Object encrypted with SSE-C but no customer key provided")).into(),
+                );
+            }
+        }
+
+        if stored_sse_algorithm.is_none() {
+            if let Some((key_bytes, nonce, original_size)) =
+                decrypt_managed_encryption_key(&bucket, &key, &info.user_defined).await?
+            {
+                if info.parts.len() > 1 {
+                    let (reader, plain_size) = decrypt_multipart_managed_stream(final_stream, &info.parts, key_bytes, nonce)
+                        .await
+                        .map_err(ApiError::from)?;
+                    final_stream = reader;
+                    managed_original_size = Some(plain_size);
+                } else {
+                    let warp_reader = WarpReader::new(final_stream);
+                    let decrypt_reader = DecryptReader::new(warp_reader, key_bytes, nonce);
+                    final_stream = Box::new(decrypt_reader);
+                    managed_original_size = original_size;
+                }
+                managed_encryption_applied = true;
+            }
+        }
+
+        // For SSE-C encrypted objects, use the original size instead of encrypted size
+        let response_content_length = if stored_sse_algorithm.is_some() {
+            if let Some(original_size_str) = info.user_defined.get("x-amz-server-side-encryption-customer-original-size") {
+                let original_size = original_size_str.parse::<i64>().unwrap_or(content_length);
+                info!(
+                    "SSE-C decryption: using original size {} instead of encrypted size {}",
+                    original_size, content_length
+                );
+                original_size
+            } else {
+                debug!("SSE-C decryption: no original size found, using content_length {}", content_length);
+                content_length
+            }
+        } else if managed_encryption_applied {
+            managed_original_size.unwrap_or(content_length)
+        } else {
+            content_length
+        };
+
+        info!("Final response_content_length: {}", response_content_length);
+
+        if stored_sse_algorithm.is_some() || managed_encryption_applied {
+            let limit_reader = HardLimitReader::new(Box::new(WarpReader::new(final_stream)), response_content_length);
+            final_stream = Box::new(limit_reader);
+        }
+
+        // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
+        // because DecryptReader needs to read all encrypted data to produce decrypted output
+        let body = if stored_sse_algorithm.is_some() || managed_encryption_applied {
+            info!("Managed SSE: Using unlimited stream for decryption");
+            Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, DEFAULT_READ_BUFFER_SIZE)))
+        } else {
+            Some(StreamingBlob::wrap(bytes_stream(
+                ReaderStream::with_capacity(final_stream, DEFAULT_READ_BUFFER_SIZE),
+                response_content_length as usize,
+            )))
+        };
+
+        // Extract SSE information from metadata for response
+        let server_side_encryption = info
+            .user_defined
+            .get("x-amz-server-side-encryption")
+            .map(|v| ServerSideEncryption::from(v.clone()));
+        let sse_customer_algorithm = info
+            .user_defined
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .map(|v| SSECustomerAlgorithm::from(v.clone()));
+        let sse_customer_key_md5 = info
+            .user_defined
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .cloned();
+        let ssekms_key_id = info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
         let output = GetObjectOutput {
             body,
-            content_length: Some(content_length),
+            content_length: Some(response_content_length),
             last_modified,
             content_type,
             accept_ranges: Some("bytes".to_string()),
             content_range,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: Some(info.user_defined),
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
             ..Default::default()
         };
 
@@ -1027,7 +1693,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
 
@@ -1044,7 +1710,7 @@ impl S3 for FS {
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         // mc get 2
         let HeadObjectInput {
@@ -1113,15 +1779,29 @@ impl S3 for FS {
 
         let content_length = info.get_actual_size().map_err(ApiError::from)?;
 
-        let metadata = info.user_defined;
+        let metadata_map = info.user_defined.clone();
+        let server_side_encryption = metadata_map
+            .get("x-amz-server-side-encryption")
+            .map(|v| ServerSideEncryption::from(v.clone()));
+        let sse_customer_algorithm = metadata_map
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .map(|v| SSECustomerAlgorithm::from(v.clone()));
+        let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
+        let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+
+        let metadata = metadata_map;
 
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
             last_modified,
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: Some(metadata),
             version_id: info.version_id.map(|v| v.to_string()),
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -1149,7 +1829,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         // mc ls
 
@@ -1165,20 +1845,26 @@ impl S3 for FS {
             .await
             .is_err()
         {
-            bucket_infos.retain(|info| {
-                let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+            bucket_infos = futures::stream::iter(bucket_infos)
+                .filter_map(|info| async {
+                    let mut req_clone = req.clone();
+                    let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                    req_info.bucket = Some(info.name.clone());
 
-                req_info.bucket = Some(info.name.clone());
-
-                futures::executor::block_on(async {
-                    authorize_request(&mut req, Action::S3Action(S3Action::ListBucketAction))
+                    if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
                         .await
                         .is_ok()
-                        || authorize_request(&mut req, Action::S3Action(S3Action::GetBucketLocationAction))
+                        || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
                             .await
                             .is_ok()
+                    {
+                        Some(info)
+                    } else {
+                        None
+                    }
                 })
-            });
+                .collect()
+                .await;
         }
 
         let buckets: Vec<Bucket> = bucket_infos
@@ -1198,7 +1884,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
@@ -1209,11 +1895,12 @@ impl S3 for FS {
             name: v2.name,
             prefix: v2.prefix,
             max_keys: v2.max_keys,
+            common_prefixes: v2.common_prefixes,
             ..Default::default()
         }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
@@ -1230,6 +1917,7 @@ impl S3 for FS {
         let prefix = prefix.unwrap_or_default();
         let max_keys = match max_keys {
             Some(v) if v > 0 && v <= 1000 => v,
+            Some(v) if v > 1000 => 1000,
             None => 1000,
             _ => return Err(s3_error!(InvalidArgument, "max-keys must be between 1 and 1000")),
         };
@@ -1264,7 +1952,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
                     ..Default::default()
                 };
 
@@ -1343,7 +2031,7 @@ impl S3 for FS {
                     size: Some(v.size),
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
-                    e_tag: v.etag.clone(),
+                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
                     ..Default::default() // TODO: another fields
                 }
             })
@@ -1385,7 +2073,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    // #[tracing::instrument(level = "debug", skip(self, req))]
+    // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         if req
             .headers
@@ -1397,6 +2085,7 @@ impl S3 for FS {
 
         let input = req.input;
 
+        // Save SSE-C parameters before moving input
         if let Some(ref storage_class) = input.storage_class {
             if !is_valid_storage_class(storage_class.as_str()) {
                 return Err(s3_error!(InvalidStorageClass));
@@ -1411,6 +2100,11 @@ impl S3 for FS {
             tagging,
             metadata,
             version_id,
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            ssekms_key_id,
             ..
         } = input;
 
@@ -1438,12 +2132,64 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
+        // TDD: Get bucket default encryption configuration
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        debug!("TDD: bucket_sse_config={:?}", bucket_sse_config);
+
+        // TDD: Determine effective encryption configuration (request overrides bucket default)
+        let original_sse = server_side_encryption.clone();
+        let effective_sse = server_side_encryption.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                debug!("TDD: Processing bucket SSE config: {:?}", config);
+                config.rules.first().and_then(|rule| {
+                    debug!("TDD: Processing SSE rule: {:?}", rule);
+                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                        debug!("TDD: Found SSE default: {:?}", sse);
+                        match sse.sse_algorithm.as_str() {
+                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
+                        }
+                    })
+                })
+            })
+        });
+        debug!("TDD: effective_sse={:?} (original={:?})", effective_sse, original_sse);
+
+        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| sse.kms_master_key_id.clone())
+                })
+            })
+        });
+
         let mut metadata = metadata.unwrap_or_default();
 
         extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, Some(&key));
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
+        }
+
+        // TDD: Store effective SSE information in metadata for GET responses
+        if let Some(sse_alg) = &sse_customer_algorithm {
+            metadata.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                sse_alg.as_str().to_string(),
+            );
+        }
+        if let Some(sse_md5) = &sse_customer_key_md5 {
+            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
+        }
+        if let Some(sse) = &effective_sse {
+            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
+        }
+
+        if let Some(kms_key_id) = &effective_kms_key_id {
+            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
@@ -1464,7 +2210,75 @@ impl S3 for FS {
         }
 
         // TODO: md5 check
-        let reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+        // Apply SSE-C encryption if customer provided key
+        if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
+            (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
+        {
+            // Decode the base64 key
+            let key_bytes = BASE64_STANDARD
+                .decode(sse_key)
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
+
+            // Verify key length (should be 32 bytes for AES-256)
+            if key_bytes.len() != 32 {
+                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+            }
+
+            // Convert Vec<u8> to [u8; 32]
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&key_bytes[..32]);
+
+            // Verify MD5 hash of the key
+            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            if computed_md5 != *sse_key_md5_provided {
+                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+            }
+
+            // Store original size for later retrieval during decryption
+            let original_size = if size >= 0 { size } else { actual_size };
+            metadata.insert(
+                "x-amz-server-side-encryption-customer-original-size".to_string(),
+                original_size.to_string(),
+            );
+
+            // Generate a deterministic nonce from object key for consistency
+            let mut nonce = [0u8; 12];
+            let nonce_source = format!("{bucket}-{key}");
+            let nonce_hash = md5::compute(nonce_source.as_bytes());
+            nonce.copy_from_slice(&nonce_hash.0[..12]);
+
+            // Apply encryption
+            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+        }
+
+        // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
+        if sse_customer_algorithm.is_none() {
+            if let Some(sse_alg) = &effective_sse {
+                if is_managed_sse(sse_alg) {
+                    let material =
+                        create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size)
+                            .await?;
+
+                    let ManagedEncryptionMaterial {
+                        data_key,
+                        headers,
+                        kms_key_id: kms_key_used,
+                    } = material;
+
+                    let key_bytes = data_key.plaintext_key;
+                    let nonce = data_key.nonce;
+
+                    metadata.extend(headers);
+                    effective_kms_key_id = Some(kms_key_used.clone());
+
+                    let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
+                    reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+                }
+            }
+        }
 
         let mut reader = PutObjReader::new(reader);
 
@@ -1476,17 +2290,17 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
-        // warn!("dsc {}", &dsc.replicate_any().clone());
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
+
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
             let now: DateTime<Utc> = Utc::now();
             let formatted_time = now.to_rfc3339();
             opts.user_defined.insert(k, formatted_time);
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            opts.user_defined.insert(k, dsc.pending_status());
+            opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
 
         let obj_info = store
@@ -1494,20 +2308,23 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
         let event_info = obj_info.clone();
-        let e_tag = obj_info.etag.clone();
+        let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
-            let objectlayer = new_object_layer_fn();
-            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
 
         let output = PutObjectOutput {
             e_tag,
+            server_side_encryption: effective_sse, // TDD: Return effective encryption config
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
             ..Default::default()
         };
 
@@ -1530,7 +2347,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -1541,6 +2358,10 @@ impl S3 for FS {
             tagging,
             version_id,
             storage_class,
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
             ..
         } = req.input.clone();
 
@@ -1565,6 +2386,73 @@ impl S3 for FS {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
+        // TDD: Get bucket SSE configuration for multipart upload
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        debug!("TDD: Got bucket SSE config for multipart: {:?}", bucket_sse_config);
+
+        // TDD: Determine effective encryption (request parameters override bucket defaults)
+        let original_sse = server_side_encryption.clone();
+        let effective_sse = server_side_encryption.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                debug!("TDD: Processing bucket SSE config for multipart: {:?}", config);
+                config.rules.first().and_then(|rule| {
+                    debug!("TDD: Processing SSE rule for multipart: {:?}", rule);
+                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                        debug!("TDD: Found SSE default for multipart: {:?}", sse);
+                        match sse.sse_algorithm.as_str() {
+                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
+                        }
+                    })
+                })
+            })
+        });
+        debug!("TDD: effective_sse for multipart={:?} (original={:?})", effective_sse, original_sse);
+
+        let _original_kms_key_id = ssekms_key_id.clone();
+        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| sse.kms_master_key_id.clone())
+                })
+            })
+        });
+
+        // Store effective SSE information in metadata for multipart upload
+        if let Some(sse_alg) = &sse_customer_algorithm {
+            metadata.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                sse_alg.as_str().to_string(),
+            );
+        }
+        if let Some(sse_md5) = &sse_customer_key_md5 {
+            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
+        }
+
+        if let Some(sse) = &effective_sse {
+            if is_managed_sse(sse) {
+                let material = create_managed_encryption_material(&bucket, &key, sse, effective_kms_key_id.clone(), 0).await?;
+
+                let ManagedEncryptionMaterial {
+                    data_key: _,
+                    headers,
+                    kms_key_id: kms_key_used,
+                } = material;
+
+                metadata.extend(headers.into_iter());
+                effective_kms_key_id = Some(kms_key_used.clone());
+            } else {
+                metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
+            }
+        }
+
+        if let Some(kms_key_id) = &effective_kms_key_id {
+            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
+        }
+
         if is_compressible(&req.headers, &key) {
             metadata.insert(
                 format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
@@ -1586,6 +2474,9 @@ impl S3 for FS {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id),
+            server_side_encryption: effective_sse, // TDD: Return effective encryption config
+            sse_customer_algorithm,
+            ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
             ..Default::default()
         };
 
@@ -1596,7 +2487,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedCompleteMultipartUpload,
             bucket_name: bucket_name.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo {
+            object: ObjectInfo {
                 name: object_name,
                 bucket: bucket_name,
                 ..Default::default()
@@ -1616,7 +2507,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let UploadPartInput {
             body,
@@ -1625,6 +2516,9 @@ impl S3 for FS {
             upload_id,
             part_number,
             content_length,
+            sse_customer_algorithm: _sse_customer_algorithm,
+            sse_customer_key: _sse_customer_key,
+            sse_customer_key_md5: _sse_customer_key_md5,
             // content_md5,
             ..
         } = req.input;
@@ -1633,35 +2527,78 @@ impl S3 for FS {
 
         // let upload_id =
 
-        let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
-        let mut size = match content_length {
-            Some(c) => c,
-            None => {
-                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
-                    match atoi::atoi::<i64>(val.as_bytes()) {
-                        Some(x) => x,
-                        None => return Err(s3_error!(UnexpectedContent)),
-                    }
-                } else {
-                    return Err(s3_error!(UnexpectedContent));
+        let mut size = content_length;
+        let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
+
+        if size.is_none() {
+            if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
+                if let Some(x) = atoi::atoi::<i64>(val.as_bytes()) {
+                    size = Some(x);
                 }
             }
-        };
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+            if size.is_none() {
+                let mut total = 0i64;
+                let mut buffer = bytes::BytesMut::new();
+                while let Some(chunk) = body_stream.next().await {
+                    let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
+                    total += chunk.len() as i64;
+                    buffer.extend_from_slice(&chunk);
+                }
 
-        // mc cp step 4
+                if total <= 0 {
+                    return Err(s3_error!(UnexpectedContent));
+                }
 
-        let opts = ObjectOptions::default();
+                size = Some(total);
+                let combined = buffer.freeze();
+                let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
+                body_stream = StreamingBlob::wrap(stream);
+            }
+        }
 
+        // Get multipart info early to check if managed encryption will be applied
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        let opts = ObjectOptions::default();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Check if managed encryption will be applied
+        let will_apply_managed_encryption = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined)
+            .await?
+            .is_some();
+
+        // If managed encryption will be applied, and we have Content-Length, buffer the entire body
+        // This is necessary because encryption changes the data size, which causes Content-Length mismatches
+        if will_apply_managed_encryption && size.is_some() {
+            let mut total = 0i64;
+            let mut buffer = bytes::BytesMut::new();
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
+                total += chunk.len() as i64;
+                buffer.extend_from_slice(&chunk);
+            }
+
+            if total <= 0 {
+                return Err(s3_error!(UnexpectedContent));
+            }
+
+            size = Some(total);
+            let combined = buffer.freeze();
+            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
+            body_stream = StreamingBlob::wrap(stream);
+        }
+
+        let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
+
+        let body = StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+
+        // mc cp step 4
 
         let is_compressible = fi
             .user_defined
@@ -1671,15 +2608,60 @@ impl S3 for FS {
 
         let actual_size = size;
 
+        // TODO: Apply SSE-C encryption for upload_part if needed
+        // Temporarily commented out to debug multipart issues
+        /*
+        // Apply SSE-C encryption if customer provided key before any other processing
+        if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
+            (&_sse_customer_algorithm, &_sse_customer_key, &_sse_customer_key_md5) {
+
+            // Decode the base64 key
+            let key_bytes = BASE64_STANDARD.decode(sse_key)
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
+
+            // Verify key length (should be 32 bytes for AES-256)
+            if key_bytes.len() != 32 {
+                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+            }
+
+            // Convert Vec<u8> to [u8; 32]
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&key_bytes[..32]);
+
+            // Verify MD5 hash of the key
+            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            if computed_md5 != *sse_key_md5_provided {
+                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+            }
+
+            // Generate a deterministic nonce from object key for consistency
+            let mut nonce = [0u8; 12];
+            let nonce_source = format!("{}-{}", bucket, key);
+            let nonce_hash = md5::compute(nonce_source.as_bytes());
+            nonce.copy_from_slice(&nonce_hash.0[..12]);
+
+            // Apply encryption - this will change the size so we need to handle it
+            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
+            reader = Box::new(encrypt_reader);
+            // When encrypting, size becomes unknown since encryption adds authentication tags
+            size = -1;
+        }
+        */
+
         if is_compressible {
             let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
-
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+            let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
+            reader = Box::new(compress_reader);
             size = -1;
         }
 
-        // TODO: md5 check
-        let reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+        if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined).await? {
+            let part_nonce = derive_part_nonce(base_nonce, part_id);
+            let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+        }
 
         let mut reader = PutObjReader::new(reader);
 
@@ -1689,14 +2671,14 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let output = UploadPartOutput {
-            e_tag: info.etag,
+            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             ..Default::default()
         };
 
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let UploadPartCopyInput {
             bucket,
@@ -1759,7 +2741,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let src_info = src_reader.object_info;
+        let mut src_info = src_reader.object_info;
 
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
@@ -1833,6 +2815,15 @@ impl S3 for FS {
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
 
+        if let Some((key_bytes, nonce, original_size_opt)) =
+            decrypt_managed_encryption_key(&src_bucket, &src_key, &src_info.user_defined).await?
+        {
+            reader = Box::new(DecryptReader::new(reader, key_bytes, nonce));
+            if let Some(original) = original_size_opt {
+                src_info.actual_size = original;
+            }
+        }
+
         let actual_size = length;
         let mut size = length;
 
@@ -1842,8 +2833,14 @@ impl S3 for FS {
             size = -1;
         }
 
-        // TODO: md5 check
-        let reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+        if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &mp_info.user_defined).await? {
+            let part_nonce = derive_part_nonce(base_nonce, part_id);
+            let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+        }
+
         let mut reader = PutObjReader::new(reader);
 
         // Set up destination options (inherit from multipart upload)
@@ -1860,7 +2857,7 @@ impl S3 for FS {
 
         // Create response
         let copy_part_result = CopyPartResult {
-            e_tag: part_info.etag,
+            e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
             ..Default::default()
         };
@@ -1874,7 +2871,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let ListPartsInput {
             bucket,
@@ -1913,7 +2910,7 @@ impl S3 for FS {
                 res.parts
                     .into_iter()
                     .map(|p| Part {
-                        e_tag: p.etag,
+                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
                         last_modified: p.last_mod.map(Timestamp::from),
                         part_number: Some(p.part_num as i32),
                         size: Some(p.size as i64),
@@ -2007,7 +3004,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -2037,34 +3034,82 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // TDD: Get multipart info to extract encryption configuration before completing
+        info!(
+            "TDD: Attempting to get multipart info for bucket={}, key={}, upload_id={}",
+            bucket, key, upload_id
+        );
+        let multipart_info = store
+            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        info!("TDD: Got multipart info successfully");
+        info!("TDD: Multipart info metadata: {:?}", multipart_info.user_defined);
+
+        // TDD: Extract encryption information from multipart upload metadata
+        let server_side_encryption = multipart_info
+            .user_defined
+            .get("x-amz-server-side-encryption")
+            .map(|s| ServerSideEncryption::from(s.clone()));
+        info!(
+            "TDD: Raw encryption from metadata: {:?} -> parsed: {:?}",
+            multipart_info.user_defined.get("x-amz-server-side-encryption"),
+            server_side_encryption
+        );
+
+        let ssekms_key_id = multipart_info
+            .user_defined
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .cloned();
+
+        info!(
+            "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
+            server_side_encryption, ssekms_key_id
+        );
+
         let obj_info = store
+            .clone()
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(ApiError::from)?;
 
+        info!(
+            "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
+            server_side_encryption, ssekms_key_id
+        );
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
-            e_tag: obj_info.etag.clone(),
+            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
             location: Some("us-east-1".to_string()),
+            server_side_encryption, // TDD: Return encryption info
+            ssekms_key_id,          // TDD: Return KMS key ID if present
             ..Default::default()
         };
+        info!(
+            "TDD: Created output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption, output.ssekms_key_id
+        );
 
         let mt2 = HashMap::new();
         let repoptions =
-            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, opts);
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            let objectlayer = new_object_layer_fn();
-            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
+        info!(
+            "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption, output.ssekms_key_id
+        );
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<AbortMultipartUploadInput>,
@@ -2086,7 +3131,7 @@ impl S3 for FS {
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         let bucket = req.input.bucket.clone();
         // check bucket exists.
@@ -2109,7 +3154,7 @@ impl S3 for FS {
         Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
@@ -2131,7 +3176,7 @@ impl S3 for FS {
         Ok(S3Response::new(Default::default()))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn delete_bucket_tagging(
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
@@ -2145,7 +3190,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let PutObjectTaggingInput {
             bucket,
@@ -2210,7 +3255,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedPutTagging,
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo {
+            object: ObjectInfo {
                 name: object.clone(),
                 bucket,
                 ..Default::default()
@@ -2230,7 +3275,7 @@ impl S3 for FS {
         Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
 
@@ -2252,7 +3297,7 @@ impl S3 for FS {
         }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn delete_object_tagging(
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
@@ -2277,7 +3322,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedDeleteTagging,
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo {
+            object: ObjectInfo {
                 name: object.clone(),
                 bucket,
                 ..Default::default()
@@ -2297,7 +3342,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
@@ -2320,7 +3365,7 @@ impl S3 for FS {
         }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -2477,7 +3522,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
@@ -2510,7 +3555,7 @@ impl S3 for FS {
         }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
@@ -2544,7 +3589,7 @@ impl S3 for FS {
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn delete_bucket_lifecycle(
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
@@ -2649,7 +3694,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn get_object_lock_configuration(
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
@@ -2671,7 +3716,7 @@ impl S3 for FS {
         }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self))]
     async fn put_object_lock_configuration(
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
@@ -2717,7 +3762,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let rcfg = match metadata_sys::get_replication_config(&bucket).await {
+        let rcfg = match get_replication_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
                 error!("get_replication_config err {:?}", err);
@@ -3047,7 +4092,7 @@ impl S3 for FS {
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectAccessedAttributes,
             bucket_name: bucket.clone(),
-            object: rustfs_ecstore::store_api::ObjectInfo {
+            object: ObjectInfo {
                 name: key.clone(),
                 bucket,
                 ..Default::default()
@@ -3537,6 +4582,22 @@ pub(crate) fn process_lambda_configurations<F>(
             event_rules.push((events, prefix, suffix, target_ids));
         }
     }
+}
+
+pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
+    let (cfg, _created) = match get_replication_config(bucket).await {
+        Ok(replication_config) => replication_config,
+        Err(_err) => {
+            return false;
+        }
+    };
+
+    for object in objects {
+        if cfg.has_active_rules(&object.object_name, true) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

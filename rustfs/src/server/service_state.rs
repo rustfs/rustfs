@@ -73,15 +73,15 @@ pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl-C signal");
+            info!("RustFS Received Ctrl-C signal");
             ShutdownSignal::CtrlC
         }
         _ = sigint.recv() => {
-            info!("Received SIGINT signal");
+            info!("RustFS Received SIGINT signal");
             ShutdownSignal::Sigint
         }
         _ = sigterm.recv() => {
-            info!("Received SIGTERM signal");
+            info!("RustFS Received SIGTERM signal");
             ShutdownSignal::Sigterm
         }
     }
@@ -121,7 +121,7 @@ impl ServiceStateManager {
     fn notify_systemd(&self, state: &ServiceState) {
         match state {
             ServiceState::Starting => {
-                info!("Service is starting...");
+                info!("RustFS Service is starting...");
                 #[cfg(target_os = "linux")]
                 if let Err(e) =
                     libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...".to_string())])
@@ -130,15 +130,15 @@ impl ServiceStateManager {
                 }
             }
             ServiceState::Ready => {
-                info!("Service is ready");
+                info!("RustFS Service is ready");
                 notify_systemd("ready");
             }
             ServiceState::Stopping => {
-                info!("Service is stopping...");
+                info!("RustFS Service is stopping...");
                 notify_systemd("stopping");
             }
             ServiceState::Stopped => {
-                info!("Service has stopped");
+                info!("RustFS Service has stopped");
                 #[cfg(target_os = "linux")]
                 if let Err(e) =
                     libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped".to_string())])

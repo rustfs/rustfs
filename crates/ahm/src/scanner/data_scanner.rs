@@ -17,13 +17,19 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+use time::OffsetDateTime;
 
 use ecstore::{
     disk::{Disk, DiskAPI, DiskStore, WalkDirOptions},
     set_disk::SetDisks,
 };
-use rustfs_ecstore::{self as ecstore, StorageAPI, data_usage::store_data_usage_in_backend};
+use rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_ecstore::{
+    self as ecstore, StorageAPI,
+    data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
+};
 use rustfs_filemeta::{MetacacheReader, VersionType};
+use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -34,17 +40,17 @@ use super::stats_aggregator::{DecentralizedStatsAggregator, DecentralizedStatsAg
 // IO throttling component is integrated into NodeScanner
 use crate::heal::HealManager;
 use crate::scanner::lifecycle::ScannerItem;
+use crate::scanner::local_scan::{self, LocalObjectRecord, LocalScanOutcome};
 use crate::{
     HealRequest,
     error::{Error, Result},
     get_ahm_services_cancel_token,
 };
 
-use rustfs_common::data_usage::{BucketUsageInfo, DataUsageInfo, SizeSummary};
+use rustfs_common::data_usage::{DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use uuid;
 
@@ -261,6 +267,15 @@ impl Scanner {
             let enable_healing = config.enable_healing;
             drop(config);
 
+            let scan_outcome = match local_scan::scan_and_persist_local_usage(ecstore.clone()).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    warn!("Local usage scan failed: {}", err);
+                    LocalScanOutcome::default()
+                }
+            };
+            let bucket_objects_map = &scan_outcome.bucket_objects;
+
             // List all buckets
             debug!("Listing buckets");
             match ecstore
@@ -285,14 +300,29 @@ impl Scanner {
                             .map(|(c, _)| Arc::new(c));
 
                         // Get bucket versioning configuration
-                        let versioning_config = Arc::new(VersioningConfig {
-                            enabled: bucket_info.versioning,
+                        let versioning_config = Arc::new(VersioningConfiguration {
+                            status: if bucket_info.versioning {
+                                Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
+                            } else {
+                                None
+                            },
+                            ..Default::default()
                         });
 
-                        // Count objects in this bucket
-                        let actual_objects = self.count_objects_in_bucket(&ecstore, bucket_name).await;
-                        total_objects_scanned += actual_objects;
-                        debug!("Counted {} objects in bucket {} (actual count)", actual_objects, bucket_name);
+                        let records = match bucket_objects_map.get(bucket_name) {
+                            Some(records) => records,
+                            None => {
+                                debug!(
+                                    "No local snapshot entries found for bucket {}; skipping lifecycle/integrity",
+                                    bucket_name
+                                );
+                                continue;
+                            }
+                        };
+
+                        let live_objects = records.iter().filter(|record| record.usage.has_live_object).count() as u64;
+                        total_objects_scanned = total_objects_scanned.saturating_add(live_objects);
+                        debug!("Counted {} objects in bucket {} using local snapshots", live_objects, bucket_name);
 
                         // Process objects for lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
@@ -303,9 +333,8 @@ impl Scanner {
                                 Some(versioning_config.clone()),
                             );
 
-                            // List objects in bucket and apply lifecycle actions
                             match self
-                                .process_bucket_objects_for_lifecycle(&ecstore, bucket_name, &mut scanner_item)
+                                .process_bucket_objects_for_lifecycle(bucket_name, &mut scanner_item, records)
                                 .await
                             {
                                 Ok(processed_count) => {
@@ -320,11 +349,16 @@ impl Scanner {
                         // If deep scan is enabled, verify each object's integrity
                         if enable_deep_scan && enable_healing {
                             debug!("Deep scan enabled, verifying object integrity in bucket {}", bucket_name);
-                            if let Err(e) = self.deep_scan_bucket_objects(&ecstore, bucket_name).await {
+                            if let Err(e) = self
+                                .deep_scan_bucket_objects_with_records(&ecstore, bucket_name, records)
+                                .await
+                            {
                                 warn!("Deep scan failed for bucket {}: {}", bucket_name, e);
                             }
                         }
                     }
+
+                    self.update_data_usage_statistics(&scan_outcome, &ecstore).await;
                 }
                 Err(e) => {
                     error!("Failed to list buckets: {}", e);
@@ -336,9 +370,6 @@ impl Scanner {
                 // Update metrics directly
                 self.metrics.increment_objects_scanned(total_objects_scanned);
                 debug!("Updated metrics with {} objects", total_objects_scanned);
-
-                // Also update data usage statistics
-                self.update_data_usage_statistics(total_objects_scanned, &ecstore).await;
             } else {
                 warn!("No objects found during basic test scan");
             }
@@ -350,91 +381,138 @@ impl Scanner {
     }
 
     /// Update data usage statistics based on scan results
-    async fn update_data_usage_statistics(&self, total_objects: u64, ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>) {
-        debug!("Updating data usage statistics with {} objects", total_objects);
+    async fn update_data_usage_statistics(
+        &self,
+        outcome: &LocalScanOutcome,
+        ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>,
+    ) {
+        let enabled = {
+            let cfg = self.config.read().await;
+            cfg.enable_data_usage_stats
+        };
 
-        // Get buckets list to update data usage
-        match ecstore
-            .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
-            .await
-        {
-            Ok(buckets) => {
-                let buckets_len = buckets.len(); // Store length before moving
-                let mut data_usage_guard = self.data_usage_stats.lock().await;
+        if !enabled {
+            debug!("Data usage statistics disabled; skipping refresh");
+            return;
+        }
 
-                for bucket_info in buckets {
-                    let bucket_name = &bucket_info.name;
+        if outcome.snapshots.is_empty() {
+            warn!("No local usage snapshots available; skipping data usage aggregation");
+            return;
+        }
 
-                    // Skip system buckets
-                    if bucket_name.starts_with('.') {
-                        continue;
-                    }
+        let mut aggregated = DataUsageInfo::default();
+        let mut latest_update: Option<SystemTime> = None;
 
-                    // Get object count for this bucket
-                    let bucket_objects = self.count_objects_in_bucket(ecstore, bucket_name).await;
-
-                    // Create or update bucket data usage info
-                    let bucket_data = data_usage_guard.entry(bucket_name.clone()).or_insert_with(|| {
-                        let mut info = DataUsageInfo::new();
-                        info.objects_total_count = bucket_objects;
-                        info.buckets_count = 1;
-
-                        // Add bucket to buckets_usage
-                        let bucket_usage = BucketUsageInfo {
-                            size: bucket_objects * 1024, // Estimate 1KB per object
-                            objects_count: bucket_objects,
-                            object_size_histogram: HashMap::new(),
-                            ..Default::default()
-                        };
-                        info.buckets_usage.insert(bucket_name.clone(), bucket_usage);
-                        info
-                    });
-
-                    // Update existing bucket data
-                    bucket_data.objects_total_count = bucket_objects;
-                    if let Some(bucket_usage) = bucket_data.buckets_usage.get_mut(bucket_name) {
-                        bucket_usage.objects_count = bucket_objects;
-                        bucket_usage.size = bucket_objects * 1024; // Estimate 1KB per object
-                    }
-
-                    debug!("Updated data usage for bucket {}: {} objects", bucket_name, bucket_objects);
-                }
-
-                debug!("Data usage statistics updated for {} buckets", buckets_len);
-                debug!("Current data_usage_guard size after update: {}", data_usage_guard.len());
-
-                // Also persist consolidated data to backend
-                drop(data_usage_guard); // Release the lock
-                debug!("About to get consolidated data usage info for persistence");
-                if let Ok(consolidated_info) = self.get_consolidated_data_usage_info().await {
-                    debug!("Got consolidated info with {} objects total", consolidated_info.objects_total_count);
-                    let config = self.config.read().await;
-                    if config.enable_data_usage_stats {
-                        debug!("Data usage stats enabled, proceeding to store to backend");
-                        if let Some(store) = rustfs_ecstore::new_object_layer_fn() {
-                            debug!("ECStore available, spawning background storage task");
-                            let data_clone = consolidated_info.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = store_data_usage_in_backend(data_clone, store).await {
-                                    error!("Failed to store consolidated data usage to backend: {}", e);
-                                } else {
-                                    debug!("Successfully stored consolidated data usage to backend");
-                                }
-                            });
-                        } else {
-                            warn!("ECStore not available");
-                        }
-                    } else {
-                        warn!("Data usage stats not enabled");
-                    }
-                } else {
-                    error!("Failed to get consolidated data usage info");
+        for snapshot in &outcome.snapshots {
+            if let Some(update) = snapshot.last_update {
+                if latest_update.is_none_or(|current| update > current) {
+                    latest_update = Some(update);
                 }
             }
-            Err(e) => {
-                error!("Failed to update data usage statistics: {}", e);
+
+            aggregated.objects_total_count = aggregated.objects_total_count.saturating_add(snapshot.objects_total_count);
+            aggregated.versions_total_count = aggregated.versions_total_count.saturating_add(snapshot.versions_total_count);
+            aggregated.delete_markers_total_count = aggregated
+                .delete_markers_total_count
+                .saturating_add(snapshot.delete_markers_total_count);
+            aggregated.objects_total_size = aggregated.objects_total_size.saturating_add(snapshot.objects_total_size);
+
+            for (bucket, usage) in &snapshot.buckets_usage {
+                let size = usage.size;
+                match aggregated.buckets_usage.entry(bucket.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().merge(usage),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(usage.clone());
+                    }
+                }
+
+                aggregated
+                    .bucket_sizes
+                    .entry(bucket.clone())
+                    .and_modify(|existing| *existing = existing.saturating_add(size))
+                    .or_insert(size);
             }
         }
+
+        aggregated.buckets_count = aggregated.buckets_usage.len() as u64;
+        aggregated.last_update = latest_update;
+
+        self.node_scanner.update_data_usage(aggregated.clone()).await;
+        let local_stats = self.node_scanner.get_stats_summary().await;
+        self.stats_aggregator.set_local_stats(local_stats).await;
+
+        let mut guard = self.data_usage_stats.lock().await;
+        guard.clear();
+        for (bucket, usage) in &aggregated.buckets_usage {
+            let mut bucket_data = DataUsageInfo::new();
+            bucket_data.last_update = aggregated.last_update;
+            bucket_data.buckets_count = 1;
+            bucket_data.objects_total_count = usage.objects_count;
+            bucket_data.versions_total_count = usage.versions_count;
+            bucket_data.delete_markers_total_count = usage.delete_markers_count;
+            bucket_data.objects_total_size = usage.size;
+            bucket_data.bucket_sizes.insert(bucket.clone(), usage.size);
+            bucket_data.buckets_usage.insert(bucket.clone(), usage.clone());
+            guard.insert(bucket.clone(), bucket_data);
+        }
+        drop(guard);
+
+        let info_clone = aggregated.clone();
+        let store_clone = ecstore.clone();
+        tokio::spawn(async move {
+            if let Err(err) = store_data_usage_in_backend(info_clone, store_clone).await {
+                warn!("Failed to persist aggregated usage: {}", err);
+            }
+        });
+    }
+
+    fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
+        if let Some(info) = &record.object_info {
+            return info.clone();
+        }
+
+        let usage = &record.usage;
+
+        ObjectInfo {
+            bucket: usage.bucket.clone(),
+            name: usage.object.clone(),
+            size: usage.total_size as i64,
+            delete_marker: !usage.has_live_object && usage.delete_markers_count > 0,
+            mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
+            ..Default::default()
+        }
+    }
+
+    fn ns_to_offset_datetime(ns: i128) -> Option<OffsetDateTime> {
+        OffsetDateTime::from_unix_timestamp_nanos(ns).ok()
+    }
+
+    async fn deep_scan_bucket_objects_with_records(
+        &self,
+        ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>,
+        bucket_name: &str,
+        records: &[LocalObjectRecord],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return self.deep_scan_bucket_objects(ecstore, bucket_name).await;
+        }
+
+        for record in records {
+            if !record.usage.has_live_object {
+                continue;
+            }
+
+            let object_name = &record.usage.object;
+            if let Err(err) = self.verify_object_integrity(bucket_name, object_name).await {
+                warn!(
+                    "Object integrity verification failed for {}/{} during deep scan: {}",
+                    bucket_name, object_name, err
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Deep scan objects in a bucket for integrity verification
@@ -484,130 +562,29 @@ impl Scanner {
 
         Ok(())
     }
-    async fn count_objects_in_bucket(&self, ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>, bucket_name: &str) -> u64 {
-        // Use filesystem scanning approach
-
-        // Get first disk path for scanning
-        let mut total_objects = 0u64;
-
-        for pool in &ecstore.pools {
-            for set_disks in &pool.disk_set {
-                let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
-                if let Some(disk) = disks.first() {
-                    let bucket_path = disk.path().join(bucket_name);
-                    if bucket_path.exists() {
-                        if let Ok(entries) = std::fs::read_dir(&bucket_path) {
-                            let object_count = entries
-                                .filter_map(|entry| entry.ok())
-                                .filter(|entry| {
-                                    if let Ok(file_type) = entry.file_type() {
-                                        file_type.is_dir()
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .filter(|entry| {
-                                    // Skip hidden/system directories
-                                    if let Some(name) = entry.file_name().to_str() {
-                                        !name.starts_with('.')
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .count() as u64;
-
-                            debug!(
-                                "Filesystem scan found {} objects in bucket {} on disk {:?}",
-                                object_count,
-                                bucket_name,
-                                disk.path()
-                            );
-                            total_objects = object_count; // Use count from first disk
-                            break;
-                        }
-                    }
-                }
-            }
-            if total_objects > 0 {
-                break;
-            }
-        }
-
-        if total_objects == 0 {
-            // Fallback: assume 1 object if bucket exists
-            debug!("Using fallback count of 1 for bucket {}", bucket_name);
-            1
-        } else {
-            total_objects
-        }
-    }
 
     /// Process bucket objects for lifecycle actions
     async fn process_bucket_objects_for_lifecycle(
         &self,
-        ecstore: &std::sync::Arc<rustfs_ecstore::store::ECStore>,
         bucket_name: &str,
         scanner_item: &mut ScannerItem,
+        records: &[LocalObjectRecord],
     ) -> Result<u64> {
         info!("Processing objects for lifecycle in bucket: {}", bucket_name);
         let mut processed_count = 0u64;
 
-        // Instead of filesystem scanning, use ECStore's list_objects_v2 method to get correct object names
-        let mut continuation_token = None;
-        loop {
-            let list_result = match ecstore
-                .clone()
-                .list_objects_v2(
-                    bucket_name,
-                    "", // prefix
-                    continuation_token.clone(),
-                    None,  // delimiter
-                    1000,  // max_keys
-                    false, // fetch_owner
-                    None,  // start_after
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!("Failed to list objects in bucket {}: {}", bucket_name, e);
-                    break;
-                }
-            };
-
-            info!("Found {} objects in bucket {}", list_result.objects.len(), bucket_name);
-
-            for obj in list_result.objects {
-                info!("Processing lifecycle for object: {}/{}", bucket_name, obj.name);
-
-                // Create ObjectInfo for lifecycle processing
-                let object_info = rustfs_ecstore::store_api::ObjectInfo {
-                    bucket: bucket_name.to_string(),
-                    name: obj.name.clone(),
-                    version_id: None,
-                    mod_time: obj.mod_time,
-                    size: obj.size,
-                    user_defined: std::collections::HashMap::new(),
-                    ..Default::default()
-                };
-
-                // Create SizeSummary for tracking
-                let mut size_summary = SizeSummary::default();
-
-                // Apply lifecycle actions
-                let (deleted, _size) = scanner_item.apply_actions(&object_info, &mut size_summary).await;
-                if deleted {
-                    info!("Object {}/{} was deleted by lifecycle action", bucket_name, obj.name);
-                }
-                processed_count += 1;
+        for record in records {
+            if !record.usage.has_live_object {
+                continue;
             }
 
-            // Check if there are more objects to list
-            if list_result.is_truncated {
-                continuation_token = list_result.next_continuation_token.clone();
-            } else {
-                break;
+            let object_info = Self::convert_record_to_object_info(record);
+            let mut size_summary = SizeSummary::default();
+            let (deleted, _size) = scanner_item.apply_actions(&object_info, &mut size_summary).await;
+            if deleted {
+                info!("Object {}/{} was deleted by lifecycle action", bucket_name, object_info.name);
             }
+            processed_count = processed_count.saturating_add(1);
         }
 
         info!("Processed {} objects for lifecycle in bucket {}", processed_count, bucket_name);
@@ -641,6 +618,21 @@ impl Scanner {
         tokio::spawn(async move {
             if let Err(e) = scanner.legacy_scan_loop().await {
                 error!("Legacy scanner loop failed: {}", e);
+            }
+        });
+
+        // Trigger an immediate data usage collection so that admin APIs have fresh data after startup.
+        let scanner = self.clone_for_background();
+        tokio::spawn(async move {
+            let enable_stats = {
+                let cfg = scanner.config.read().await;
+                cfg.enable_data_usage_stats
+            };
+
+            if enable_stats {
+                if let Err(e) = scanner.collect_and_persist_data_usage().await {
+                    warn!("Initial data usage collection failed: {}", e);
+                }
             }
         });
 
@@ -705,23 +697,6 @@ impl Scanner {
                     "get_data_usage_info: After merging bucket {}: integrated_info.objects_total_count={}",
                     bucket_name, integrated_info.objects_total_count
                 );
-            }
-        }
-
-        self.update_capacity_info(&mut integrated_info).await;
-        Ok(integrated_info)
-    }
-
-    /// Get consolidated data usage info without debug output (for internal use)
-    async fn get_consolidated_data_usage_info(&self) -> Result<DataUsageInfo> {
-        let mut integrated_info = DataUsageInfo::new();
-
-        // Collect data from all buckets
-        {
-            let data_usage_guard = self.data_usage_stats.lock().await;
-            for (bucket_name, bucket_data) in data_usage_guard.iter() {
-                let _bucket_name = bucket_name;
-                integrated_info.merge(bucket_data);
             }
         }
 
@@ -865,17 +840,13 @@ impl Scanner {
                 // Update legacy metrics with aggregated data
                 self.update_legacy_metrics_from_aggregated(&aggregated_stats).await;
 
-                // If aggregated stats show no objects scanned, also try basic test scan
-                if aggregated_stats.total_objects_scanned == 0 {
-                    debug!("Aggregated stats show 0 objects, falling back to direct ECStore scan for testing");
-                    info!("Calling perform_basic_test_scan due to 0 aggregated objects");
-                    if let Err(scan_error) = self.perform_basic_test_scan().await {
-                        warn!("Basic test scan failed: {}", scan_error);
-                    } else {
-                        debug!("Basic test scan completed successfully after aggregated stats");
-                    }
+                // Always perform basic test scan to ensure lifecycle processing in test environments
+                debug!("Performing basic test scan to ensure lifecycle processing");
+                info!("Calling perform_basic_test_scan to ensure lifecycle processing");
+                if let Err(scan_error) = self.perform_basic_test_scan().await {
+                    warn!("Basic test scan failed: {}", scan_error);
                 } else {
-                    info!("Not calling perform_basic_test_scan because aggregated_stats.total_objects_scanned > 0");
+                    debug!("Basic test scan completed successfully");
                 }
 
                 info!(
@@ -891,17 +862,13 @@ impl Scanner {
                 info!("Local stats: total_objects_scanned={}", local_stats.total_objects_scanned);
                 self.update_legacy_metrics_from_local(&local_stats).await;
 
-                // In test environments, if no real scanning happened, perform basic scan
-                if local_stats.total_objects_scanned == 0 {
-                    debug!("No objects scanned by NodeScanner, falling back to direct ECStore scan for testing");
-                    info!("Calling perform_basic_test_scan due to 0 local objects");
-                    if let Err(scan_error) = self.perform_basic_test_scan().await {
-                        warn!("Basic test scan failed: {}", scan_error);
-                    } else {
-                        debug!("Basic test scan completed successfully");
-                    }
+                // Always perform basic test scan to ensure lifecycle processing in test environments
+                debug!("Performing basic test scan to ensure lifecycle processing");
+                info!("Calling perform_basic_test_scan to ensure lifecycle processing");
+                if let Err(scan_error) = self.perform_basic_test_scan().await {
+                    warn!("Basic test scan failed: {}", scan_error);
                 } else {
-                    info!("Not calling perform_basic_test_scan because local_stats.total_objects_scanned > 0");
+                    debug!("Basic test scan completed successfully");
                 }
             }
         }
@@ -940,16 +907,47 @@ impl Scanner {
             return Ok(());
         };
 
-        // Collect data usage from NodeScanner stats
-        let _local_stats = self.node_scanner.get_stats_summary().await;
+        // Run local usage scan and aggregate snapshots; fall back to on-demand build when necessary.
+        let mut data_usage = match local_scan::scan_and_persist_local_usage(ecstore.clone()).await {
+            Ok(outcome) => {
+                info!(
+                    "Local usage scan completed: {} disks with {} snapshot entries",
+                    outcome.disk_status.len(),
+                    outcome.snapshots.len()
+                );
 
-        // Build data usage from ECStore directly for now
-        let data_usage = self.build_data_usage_from_ecstore(&ecstore).await?;
+                match aggregate_local_snapshots(ecstore.clone()).await {
+                    Ok((_, mut aggregated)) => {
+                        if aggregated.last_update.is_none() {
+                            aggregated.last_update = Some(SystemTime::now());
+                        }
+                        aggregated
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to aggregate local data usage snapshots, falling back to realtime collection: {}",
+                            e
+                        );
+                        self.build_data_usage_from_ecstore(&ecstore).await?
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Local usage scan failed (using realtime collection instead): {}", e);
+                self.build_data_usage_from_ecstore(&ecstore).await?
+            }
+        };
 
-        // Update NodeScanner with collected data
+        // Make sure bucket counters reflect aggregated content
+        data_usage.buckets_count = data_usage.buckets_usage.len() as u64;
+        if data_usage.last_update.is_none() {
+            data_usage.last_update = Some(SystemTime::now());
+        }
+
+        // Publish to node stats manager
         self.node_scanner.update_data_usage(data_usage.clone()).await;
 
-        // Store to local cache
+        // Store to local cache for quick API responses
         {
             let mut data_usage_guard = self.data_usage_stats.lock().await;
             data_usage_guard.insert("consolidated".to_string(), data_usage.clone());
@@ -973,8 +971,10 @@ impl Scanner {
         });
 
         info!(
-            "Data usage collection completed: {} buckets, {} objects",
-            data_usage.buckets_count, data_usage.objects_total_count
+            "Data usage collection completed: {} buckets, {} objects ({} disks reporting)",
+            data_usage.buckets_count,
+            data_usage.objects_total_count,
+            data_usage.disk_usage_status.len()
         );
 
         Ok(())
@@ -1830,7 +1830,16 @@ impl Scanner {
             }
         };
         let bucket_info = ecstore.get_bucket_info(bucket, &Default::default()).await.ok();
-        let versioning_config = bucket_info.map(|bi| Arc::new(VersioningConfig { enabled: bi.versioning }));
+        let versioning_config = bucket_info.map(|bi| {
+            Arc::new(VersioningConfiguration {
+                status: if bi.versioning {
+                    Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
+                } else {
+                    None
+                },
+                ..Default::default()
+            })
+        });
         let lifecycle_config = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket)
             .await
             .ok()
@@ -2472,17 +2481,41 @@ impl Scanner {
     async fn legacy_scan_loop(&self) -> Result<()> {
         info!("Starting legacy scan loop for backward compatibility");
 
-        while !get_ahm_services_cancel_token().is_none_or(|t| t.is_cancelled()) {
-            // Update local stats in aggregator
+        loop {
+            if let Some(token) = get_ahm_services_cancel_token() {
+                if token.is_cancelled() {
+                    info!("Cancellation requested, exiting legacy scan loop");
+                    break;
+                }
+            }
+
+            let (enable_data_usage_stats, scan_interval) = {
+                let config = self.config.read().await;
+                (config.enable_data_usage_stats, config.scan_interval)
+            };
+
+            if enable_data_usage_stats {
+                if let Err(e) = self.collect_and_persist_data_usage().await {
+                    warn!("Background data usage collection failed: {}", e);
+                }
+            }
+
+            // Update local stats in aggregator after latest scan
             let local_stats = self.node_scanner.get_stats_summary().await;
             self.stats_aggregator.set_local_stats(local_stats).await;
 
-            // Sleep for scan interval
-            let config = self.config.read().await;
-            let scan_interval = config.scan_interval;
-            drop(config);
-
-            tokio::time::sleep(scan_interval).await;
+            match get_ahm_services_cancel_token() {
+                Some(token) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(scan_interval) => {}
+                        _ = token.cancelled() => {
+                            info!("Cancellation requested, exiting legacy scan loop");
+                            break;
+                        }
+                    }
+                }
+                None => tokio::time::sleep(scan_interval).await,
+            }
         }
 
         Ok(())
@@ -2632,7 +2665,7 @@ mod tests {
         // create ECStore with dynamic port
         let port = port.unwrap_or(9000);
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("Invalid server address format");
-        let ecstore = ECStore::new(server_addr, endpoint_pools)
+        let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
             .await
             .expect("Failed to create ECStore");
 

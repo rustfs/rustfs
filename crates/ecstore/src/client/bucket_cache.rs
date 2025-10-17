@@ -36,6 +36,7 @@ use s3s::S3ErrorCode;
 use super::constants::UNSIGNED_PAYLOAD;
 use super::credentials::SignatureType;
 
+#[derive(Debug, Clone)]
 pub struct BucketLocationCache {
     items: HashMap<String, String>,
 }

@@ -29,7 +29,7 @@ impl std::error::Error for ParseEventNameError {}
 
 /// Represents the type of event that occurs on the object.
 /// Based on AWS S3 event type and includes RustFS extension.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum EventName {
     // Single event type (values are 1-32 for compatible mask logic)
     ObjectAccessedGet = 1,
@@ -73,7 +73,8 @@ pub enum EventName {
     ObjectRestoreAll,
     ObjectTransitionAll,
     ObjectScannerAll, // New, from Go
-    Everything,       // New, from Go
+    #[default]
+    Everything, // New, from Go
 }
 
 // Single event type sequential array for Everything.expand()

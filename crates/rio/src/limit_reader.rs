@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
+use crate::{EtagResolvable, HashReaderDetector, HashReaderMut, TryGetIndex};
 
 pin_project! {
     #[derive(Debug)]
@@ -117,6 +117,8 @@ where
         self.inner.as_hash_reader_mut()
     }
 }
+
+impl<R> TryGetIndex for LimitReader<R> where R: AsyncRead + Unpin + Send + Sync {}
 
 #[cfg(test)]
 mod tests {

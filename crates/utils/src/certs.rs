@@ -102,7 +102,7 @@ pub fn load_all_certs_from_directory(
         let path = entry.path();
 
         if path.is_dir() {
-            let domain_name = path
+            let domain_name: &str = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| certs_error(format!("invalid domain name directory:{path:?}")))?;
@@ -173,7 +173,7 @@ pub fn create_multi_cert_resolver(
 
     for (domain, (certs, key)) in cert_key_pairs {
         // create a signature
-        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|e| certs_error(format!("unsupported private key types:{domain}, err:{e:?}")))?;
 
         // create a CertifiedKey

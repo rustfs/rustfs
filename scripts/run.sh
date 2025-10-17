@@ -45,7 +45,8 @@ export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
-
+export RUSTFS_CONSOLE_ADDRESS=":9001"
+export RUSTFS_EXTERNAL_ADDRESS=":9000"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
@@ -63,25 +64,18 @@ export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # Whether to enable local logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
+export RUSTFS_OBS_LOG_POOL_CAPA=10240
+export RUSTFS_OBS_LOG_MESSAGE_CAPA=32768
+export RUSTFS_OBS_LOG_FLUSH_MS=300
 
-export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs"
-export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
-export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
-export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
-#
-# Kafka sink 配置
-#export RUSTFS_SINKS_KAFKA_BROKERS=localhost:9092
-#export RUSTFS_SINKS_KAFKA_TOPIC=logs
-#export RUSTFS_SINKS_KAFKA_BATCH_SIZE=100
-#export RUSTFS_SINKS_KAFKA_BATCH_TIMEOUT_MS=1000
-#
-# Webhook sink 配置
-#export RUSTFS_SINKS_WEBHOOK_ENDPOINT=http://localhost:8080/webhook
-#export RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN=you-auth-token
-#export RUSTFS_SINKS_WEBHOOK_BATCH_SIZE=100
-#export RUSTFS_SINKS_WEBHOOK_BATCH_TIMEOUT_MS=1000
-#
-#export RUSTFS_LOGGER_QUEUE_CAPACITY=10
+#tokio runtime
+export RUSTFS_RUNTIME_WORKER_THREADS=16
+export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
+export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=true
+# shellcheck disable=SC2125
+export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
+export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
+export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
@@ -101,6 +95,9 @@ export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook noti
 export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook notification address
 export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
 
+# export RUSTFS_POLICY_PLUGIN_URL="http://localhost:8181/v1/data/rustfs/authz/allow"  # The URL of the OPA system
+# export RUSTFS_POLICY_PLUGIN_AUTH_TOKEN="your-opa-token"  # The authentication token for the OPA system is optional
+
 
 export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
@@ -108,6 +105,10 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
 
 #export RUSTFS_REGION="us-east-1"
+
+export RUSTFS_ENABLE_SCANNER=false
+
+export RUSTFS_ENABLE_HEAL=false
 
 # Event message configuration
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"

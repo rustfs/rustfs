@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
+
 //! Layered DNS resolution utility for Kubernetes environments
 //!
 //! This module provides robust DNS resolution with multiple fallback layers:
@@ -127,6 +129,7 @@ impl LayeredDnsResolver {
     /// Validate domain format according to RFC standards
     #[instrument(skip_all, fields(domain = %domain))]
     fn validate_domain_format(domain: &str) -> Result<(), DnsError> {
+        info!("Validating domain format start");
         // Check FQDN length
         if domain.len() > MAX_FQDN_LENGTH {
             return Err(DnsError::InvalidFormat {
@@ -157,7 +160,7 @@ impl LayeredDnsResolver {
                 });
             }
         }
-
+        info!("DNS resolver validated successfully");
         Ok(())
     }
 
@@ -209,7 +212,6 @@ impl LayeredDnsResolver {
                 let ips: Vec<IpAddr> = lookup.iter().collect();
                 if !ips.is_empty() {
                     info!("System DNS resolution successful for domain: {} -> {} IPs", domain, ips.len());
-                    debug!("System DNS resolved IPs: {:?}", ips);
                     Ok(ips)
                 } else {
                     warn!("System DNS returned empty result for domain: {}", domain);
@@ -242,7 +244,6 @@ impl LayeredDnsResolver {
                 let ips: Vec<IpAddr> = lookup.iter().collect();
                 if !ips.is_empty() {
                     info!("Public DNS resolution successful for domain: {} -> {} IPs", domain, ips.len());
-                    debug!("Public DNS resolved IPs: {:?}", ips);
                     Ok(ips)
                 } else {
                     warn!("Public DNS returned empty result for domain: {}", domain);
@@ -270,6 +271,7 @@ impl LayeredDnsResolver {
     /// 3. Public DNS (hickory-resolver with TLS-enabled Cloudflare DNS fallback)
     #[instrument(skip_all, fields(domain = %domain))]
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>, DnsError> {
+        info!("Starting DNS resolution process for domain: {} start", domain);
         // Validate domain format first
         Self::validate_domain_format(domain)?;
 
@@ -305,7 +307,7 @@ impl LayeredDnsResolver {
             }
             Err(public_err) => {
                 error!(
-                    "All DNS resolution attempts failed for domain: {}. System DNS: failed, Public DNS: {}",
+                    "All DNS resolution attempts failed for domain:` {}`. System DNS: failed, Public DNS: {}",
                     domain, public_err
                 );
                 Err(DnsError::AllAttemptsFailed {
@@ -345,6 +347,7 @@ pub fn get_global_dns_resolver() -> Option<&'static LayeredDnsResolver> {
 /// Resolve domain using the global DNS resolver with comprehensive tracing
 #[instrument(skip_all, fields(domain = %domain))]
 pub async fn resolve_domain(domain: &str) -> Result<Vec<IpAddr>, DnsError> {
+    info!("resolving domain for: {}", domain);
     match get_global_dns_resolver() {
         Some(resolver) => resolver.resolve(domain).await,
         None => Err(DnsError::InitializationFailed {
@@ -395,7 +398,7 @@ mod tests {
         // Test cache stats (note: moka cache might not immediately reflect changes)
         let (total, _weighted_size) = resolver.cache_stats().await;
         // Cache should have at least the entry we just added (might be 0 due to async nature)
-        assert!(total <= 1, "Cache should have at most 1 entry, got {}", total);
+        assert!(total <= 1, "Cache should have at most 1 entry, got {total}");
     }
 
     #[tokio::test]
@@ -406,12 +409,12 @@ mod tests {
         match resolver.resolve("localhost").await {
             Ok(ips) => {
                 assert!(!ips.is_empty());
-                println!("Resolved localhost to: {:?}", ips);
+                println!("Resolved localhost to: {ips:?}");
             }
             Err(e) => {
                 // In some test environments, even localhost might fail
                 // This is acceptable as long as our error handling works
-                println!("DNS resolution failed (might be expected in test environments): {}", e);
+                println!("DNS resolution failed (might be expected in test environments): {e}");
             }
         }
     }
@@ -427,7 +430,7 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(e) = result {
-            println!("Expected error for invalid domain: {}", e);
+            println!("Expected error for invalid domain: {e}");
             // Should be AllAttemptsFailed since both system and public DNS should fail
             assert!(matches!(e, DnsError::AllAttemptsFailed { .. }));
         }
@@ -463,10 +466,10 @@ mod tests {
         match resolve_domain("localhost").await {
             Ok(ips) => {
                 assert!(!ips.is_empty());
-                println!("Global resolver resolved localhost to: {:?}", ips);
+                println!("Global resolver resolved localhost to: {ips:?}");
             }
             Err(e) => {
-                println!("Global resolver DNS resolution failed (might be expected in test environments): {}", e);
+                println!("Global resolver DNS resolution failed (might be expected in test environments): {e}");
             }
         }
     }

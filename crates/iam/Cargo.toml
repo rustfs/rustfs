@@ -34,6 +34,7 @@ time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 rustfs-ecstore = { workspace = true }
 rustfs-policy.workspace = true
+rustfs-config.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
@@ -46,5 +47,6 @@ jsonwebtoken = { workspace = true }
 tracing.workspace = true
 rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
+tokio-util.workspace = true
 
 [dev-dependencies]

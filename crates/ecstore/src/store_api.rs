@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::replication::REPLICATION_RESET;
+use crate::bucket::replication::REPLICATION_STATUS;
+use crate::bucket::replication::{ReplicateDecision, replication_statuses_map, version_purge_statuses_map};
 use crate::bucket::versioning::VersioningApi as _;
-use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
 use crate::store_utils::clean_metadata;
@@ -25,20 +27,25 @@ use crate::{
 };
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
+use rustfs_filemeta::{
+    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use time::OffsetDateTime;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -221,6 +228,12 @@ impl GetObjectReader {
     }
 }
 
+impl AsyncRead for GetObjectReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HTTPRangeSpec {
     pub is_suffix_length: bool,
@@ -234,11 +247,16 @@ impl HTTPRangeSpec {
             return None;
         }
 
-        let mut start = 0i64;
-        let mut end = -1i64;
-        for i in 0..oi.parts.len().min(part_number) {
+        if part_number == 0 || part_number > oi.parts.len() {
+            return None;
+        }
+
+        let mut start = 0_i64;
+        let mut end = -1_i64;
+        for i in 0..part_number {
+            let part = &oi.parts[i];
             start = end + 1;
-            end = start + (oi.parts[i].size as i64) - 1
+            end = start + (part.size as i64) - 1;
         }
 
         Some(HTTPRangeSpec {
@@ -253,8 +271,14 @@ impl HTTPRangeSpec {
 
         let mut start = self.start;
         if self.is_suffix_length {
-            start = res_size + self.start;
-
+            let suffix_len = if self.start < 0 {
+                self.start
+                    .checked_neg()
+                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+            } else {
+                self.start
+            };
+            start = res_size - suffix_len;
             if start < 0 {
                 start = 0;
             }
@@ -267,7 +291,13 @@ impl HTTPRangeSpec {
         }
 
         if self.is_suffix_length {
-            let specified_len = self.start; // 假设 h.start 是一个 i64 类型
+            let specified_len = if self.start < 0 {
+                self.start
+                    .checked_neg()
+                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+            } else {
+                self.start
+            };
             let mut range_length = specified_len;
 
             if specified_len > res_size {
@@ -326,6 +356,7 @@ pub struct ObjectOptions {
 
     pub skip_decommissioned: bool,
     pub skip_rebalancing: bool,
+    pub skip_free_version: bool,
 
     pub data_movement: bool,
     pub src_pool_idx: usize,
@@ -334,10 +365,9 @@ pub struct ObjectOptions {
     pub metadata_chg: bool,
     pub http_preconditions: Option<HTTPPreconditions>,
 
+    pub delete_replication: Option<ReplicationState>,
     pub replication_request: bool,
     pub delete_marker: bool,
-
-    pub skip_free_version: bool,
 
     pub transition: TransitionOptions,
     pub expiration: ExpirationOptions,
@@ -346,15 +376,66 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 }
 
-// impl Default for ObjectOptions {
-//     fn default() -> Self {
-//         Self {
-//             max_parity: Default::default(),
-//             mod_time: OffsetDateTime::UNIX_EPOCH,
-//             part_number: Default::default(),
-//         }
-//     }
-// }
+impl ObjectOptions {
+    pub fn set_delete_replication_state(&mut self, dsc: ReplicateDecision) {
+        let mut rs = ReplicationState {
+            replicate_decision_str: dsc.to_string(),
+            ..Default::default()
+        };
+        if self.version_id.is_none() {
+            rs.replication_status_internal = dsc.pending_status();
+            rs.targets = replication_statuses_map(rs.replication_status_internal.as_deref().unwrap_or_default());
+        } else {
+            rs.version_purge_status_internal = dsc.pending_status();
+            rs.purge_targets = version_purge_statuses_map(rs.version_purge_status_internal.as_deref().unwrap_or_default());
+        }
+
+        self.delete_replication = Some(rs)
+    }
+
+    pub fn set_replica_status(&mut self, status: ReplicationStatusType) {
+        if let Some(rs) = self.delete_replication.as_mut() {
+            rs.replica_status = status;
+            rs.replica_timestamp = Some(OffsetDateTime::now_utc());
+        } else {
+            self.delete_replication = Some(ReplicationState {
+                replica_status: status,
+                replica_timestamp: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+        }
+    }
+
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.delete_replication
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        self.delete_replication
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
+
+    pub fn put_replication_state(&self) -> ReplicationState {
+        let rs = match self
+            .user_defined
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_STATUS}").as_str())
+        {
+            Some(v) => v.to_string(),
+            None => return ReplicationState::default(),
+        };
+
+        ReplicationState {
+            replication_status_internal: Some(rs.to_string()),
+            targets: replication_statuses_map(rs.as_str()),
+            ..Default::default()
+        }
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketOptions {
@@ -396,7 +477,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
-            etag: value.e_tag,
+            etag: value.e_tag.map(|e| e.value().to_owned()),
         }
     }
 }
@@ -423,6 +504,7 @@ pub struct ObjectInfo {
     pub is_latest: bool,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
+    pub expires: Option<OffsetDateTime>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
     pub put_object_reader: Option<PutObjReader>,
@@ -430,10 +512,11 @@ pub struct ObjectInfo {
     pub inlined: bool,
     pub metadata_only: bool,
     pub version_only: bool,
-    pub replication_status_internal: String,
+    pub replication_status_internal: Option<String>,
     pub replication_status: ReplicationStatusType,
-    pub version_purge_status_internal: String,
+    pub version_purge_status_internal: Option<String>,
     pub version_purge_status: VersionPurgeStatusType,
+    pub replication_decision: String,
     pub checksum: Vec<u8>,
 }
 
@@ -470,7 +553,9 @@ impl Clone for ObjectInfo {
             replication_status: self.replication_status.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
+            replication_decision: self.replication_decision.clone(),
             checksum: Default::default(),
+            expires: self.expires,
         }
     }
 }
@@ -665,7 +750,10 @@ impl ObjectInfo {
                 };
 
                 for fi in versions.iter() {
-                    // TODO:VersionPurgeStatus
+                    if !fi.version_purge_status().is_empty() {
+                        continue;
+                    }
+
                     let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                     objects.push(ObjectInfo::from_file_info(fi, bucket, &entry.name, versioned));
                 }
@@ -769,6 +857,32 @@ impl ObjectInfo {
         }
 
         objects
+    }
+
+    pub fn replication_state(&self) -> ReplicationState {
+        ReplicationState {
+            replication_status_internal: self.replication_status_internal.clone(),
+            version_purge_status_internal: self.version_purge_status_internal.clone(),
+            replicate_decision_str: self.replication_decision.clone(),
+            targets: replication_statuses_map(self.replication_status_internal.clone().unwrap_or_default().as_str()),
+            purge_targets: version_purge_statuses_map(self.version_purge_status_internal.clone().unwrap_or_default().as_str()),
+            reset_statuses_map: self
+                .user_defined
+                .iter()
+                .filter_map(|(k, v)| {
+                    if k.starts_with(&format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}")) {
+                        Some((
+                            k.trim_start_matches(&format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}-"))
+                                .to_string(),
+                            v.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 }
 
@@ -927,17 +1041,52 @@ pub struct ListPartsInfo {
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,
+    pub delete_marker_replication_status: Option<String>,
+    pub version_purge_status: Option<VersionPurgeStatusType>,
+    pub version_purge_statuses: Option<String>,
+    pub replicate_decision_str: Option<String>,
 }
+
+impl ObjectToDelete {
+    pub fn replication_state(&self) -> ReplicationState {
+        ReplicationState {
+            replication_status_internal: self.delete_marker_replication_status.clone(),
+            version_purge_status_internal: self.version_purge_statuses.clone(),
+            replicate_decision_str: self.replicate_decision_str.clone().unwrap_or_default(),
+            targets: replication_statuses_map(self.delete_marker_replication_status.as_deref().unwrap_or_default()),
+            purge_targets: version_purge_statuses_map(self.version_purge_statuses.as_deref().unwrap_or_default()),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,
-    pub delete_marker_version_id: Option<String>,
+    pub delete_marker_version_id: Option<Uuid>,
     pub object_name: String,
-    pub version_id: Option<String>,
+    pub version_id: Option<Uuid>,
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication
-    // pub replication_state: ReplicationState,
+    pub replication_state: Option<ReplicationState>,
+    pub found: bool,
+}
+
+impl DeletedObject {
+    pub fn version_purge_status(&self) -> VersionPurgeStatusType {
+        self.replication_state
+            .as_ref()
+            .map(|v| v.composite_version_purge_status())
+            .unwrap_or(VersionPurgeStatusType::Empty)
+    }
+
+    pub fn delete_marker_replication_status(&self) -> ReplicationStatusType {
+        self.replication_state
+            .as_ref()
+            .map(|v| v.composite_replication_status())
+            .unwrap_or(ReplicationStatusType::Empty)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -949,8 +1098,33 @@ pub struct ListObjectVersionsInfo {
     pub prefixes: Vec<String>,
 }
 
+type WalkFilter = fn(&FileInfo) -> bool;
+
+#[derive(Clone, Default)]
+pub struct WalkOptions {
+    pub filter: Option<WalkFilter>,           // return WalkFilter returns 'true/false'
+    pub marker: Option<String>,               // set to skip until this object
+    pub latest_only: bool,                    // returns only latest versions for all matching objects
+    pub ask_disks: String,                    // dictates how many disks are being listed
+    pub versions_sort: WalkVersionsSortOrder, // sort order for versions of the same object; default: Ascending order in ModTime
+    pub limit: usize,                         // maximum number of items, 0 means no limit
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum WalkVersionsSortOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug)]
+pub struct ObjectInfoOrErr {
+    pub item: Option<ObjectInfo>,
+    pub err: Option<Error>,
+}
+
 #[async_trait::async_trait]
-pub trait ObjectIO: Send + Sync + 'static {
+pub trait ObjectIO: Send + Sync + Debug + 'static {
     // GetObjectNInfo FIXME:
     async fn get_object_reader(
         &self,
@@ -966,7 +1140,7 @@ pub trait ObjectIO: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
-pub trait StorageAPI: ObjectIO {
+pub trait StorageAPI: ObjectIO + Debug {
     // NewNSLock TODO:
     // Shutdown TODO:
     // NSScanner TODO:
@@ -1000,7 +1174,15 @@ pub trait StorageAPI: ObjectIO {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo>;
-    // Walk TODO:
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()>;
 
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
@@ -1021,7 +1203,7 @@ pub trait StorageAPI: ObjectIO {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>);
 
     // TransitionObject TODO:
     // RestoreTransitionedObject TODO:
@@ -1394,6 +1576,83 @@ mod tests {
 
         assert_eq!(offset, 5);
         assert_eq!(length, 10); // end - start + 1 = 14 - 5 + 1 = 10
+    }
+
+    #[test]
+    fn test_http_range_spec_suffix_positive_start() {
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 5,
+            end: -1,
+        };
+
+        let (offset, length) = range_spec.get_offset_length(20).unwrap();
+        assert_eq!(offset, 15);
+        assert_eq!(length, 5);
+    }
+
+    #[test]
+    fn test_http_range_spec_suffix_negative_start() {
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: -5,
+            end: -1,
+        };
+
+        let (offset, length) = range_spec.get_offset_length(20).unwrap();
+        assert_eq!(offset, 15);
+        assert_eq!(length, 5);
+    }
+
+    #[test]
+    fn test_http_range_spec_suffix_exceeds_object() {
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 50,
+            end: -1,
+        };
+
+        let (offset, length) = range_spec.get_offset_length(20).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(length, 20);
+    }
+
+    #[test]
+    fn test_http_range_spec_from_object_info_valid_and_invalid_parts() {
+        let object_info = ObjectInfo {
+            size: 300,
+            parts: vec![
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 1,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 2,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 3,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let spec = HTTPRangeSpec::from_object_info(&object_info, 2).unwrap();
+        assert_eq!(spec.start, 100);
+        assert_eq!(spec.end, 199);
+
+        assert!(HTTPRangeSpec::from_object_info(&object_info, 0).is_none());
+        assert!(HTTPRangeSpec::from_object_info(&object_info, 4).is_none());
     }
 
     #[tokio::test]

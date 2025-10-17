@@ -44,6 +44,8 @@ pub struct GetObjectOptions {
     pub internal: AdvancedGetOptions,
 }
 
+pub type StatObjectOptions = GetObjectOptions;
+
 impl Default for GetObjectOptions {
     fn default() -> Self {
         Self {

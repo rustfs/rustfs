@@ -28,10 +28,9 @@ use rustfs_ecstore::bucket::metadata_sys::get_object_lock_config;
 use rustfs_ecstore::bucket::object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cmd::bucket_targets::VersioningConfig;
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_filemeta::FileInfo;
-use s3s::dto::BucketLifecycleConfiguration as LifecycleConfig;
+use s3s::dto::{BucketLifecycleConfiguration as LifecycleConfig, VersioningConfiguration};
 use time::OffsetDateTime;
 use tracing::info;
 
@@ -43,11 +42,15 @@ pub struct ScannerItem {
     pub bucket: String,
     pub object_name: String,
     pub lifecycle: Option<Arc<LifecycleConfig>>,
-    pub versioning: Option<Arc<VersioningConfig>>,
+    pub versioning: Option<Arc<VersioningConfiguration>>,
 }
 
 impl ScannerItem {
-    pub fn new(bucket: String, lifecycle: Option<Arc<LifecycleConfig>>, versioning: Option<Arc<VersioningConfig>>) -> Self {
+    pub fn new(
+        bucket: String,
+        lifecycle: Option<Arc<LifecycleConfig>>,
+        versioning: Option<Arc<VersioningConfiguration>>,
+    ) -> Self {
         Self {
             bucket,
             object_name: "".to_string(),
@@ -145,6 +148,7 @@ impl ScannerItem {
             to_del.push(ObjectToDelete {
                 object_name: obj.name,
                 version_id: obj.version_id,
+                ..Default::default()
             });
         }
 
@@ -233,7 +237,7 @@ impl ScannerItem {
             IlmAction::DeleteAction => {
                 info!("apply_lifecycle: Object {} marked for deletion", oi.name);
                 if let Some(vcfg) = &self.versioning {
-                    if !vcfg.is_enabled() {
+                    if !vcfg.enabled() {
                         info!("apply_lifecycle: Versioning disabled, setting new_size=0");
                         new_size = 0;
                     }

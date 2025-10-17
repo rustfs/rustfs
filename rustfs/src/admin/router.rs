@@ -13,27 +13,27 @@
 // limitations under the License.
 
 use axum::routing::get;
+use hyper::http::Extensions;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
 use hyper::Uri;
-use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
 use rustfs_ecstore::rpc::verify_rpc_signature;
+use s3s::header;
+use s3s::route::S3Route;
+use s3s::s3_error;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
-use s3s::header;
-use s3s::route::S3Route;
-use s3s::s3_error;
 use tower::Service;
 use tracing::error;
 
-use crate::admin::ADMIN_PREFIX;
 use crate::admin::console;
 use crate::admin::rpc::RPC_PREFIX;
+use crate::admin::ADMIN_PREFIX;
 
 const CONSOLE_PREFIX: &str = "/rustfs/console";
 
@@ -92,6 +92,10 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
+        if method == Method::GET && uri.path() == "/health" {
+            return true;
+        }
+
         // AssumeRole
         if method == Method::POST && uri.path() == "/" {
             if let Some(val) = headers.get(header::CONTENT_TYPE) {
@@ -104,36 +108,13 @@ where
         uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(CONSOLE_PREFIX)
     }
 
-    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
-            if let Some(console_router) = &self.console_router {
-                let mut console_router = console_router.clone();
-                let req = convert_request(req);
-                let result = console_router.call(req).await;
-                return match result {
-                    Ok(resp) => Ok(convert_response(resp)),
-                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
-                };
-            }
-            return Err(s3_error!(InternalError, "console is not enabled"));
-        }
-
-        let uri = format!("{}|{}", &req.method, req.uri.path());
-
-        // warn!("get uri {}", &uri);
-
-        if let Ok(mat) = self.router.at(&uri) {
-            let op: &T = mat.value;
-            let mut resp = op.call(req, mat.params).await?;
-            resp.status = Some(resp.output.0);
-            return Ok(resp.map_output(|x| x.1));
-        }
-
-        Err(s3_error!(NotImplemented))
-    }
-
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        // Allow unauthenticated access to health check
+        if req.method == Method::GET && req.uri.path() == "/health" {
+            return Ok(());
+        }
+        // Allow unauthenticated access to console static files if console is enabled
         if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
             return Ok(());
         }
@@ -155,6 +136,31 @@ where
             Some(_) => Ok(()),
             None => Err(s3_error!(AccessDenied, "Signature is required")),
         }
+    }
+
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+            if let Some(console_router) = &self.console_router {
+                let mut console_router = console_router.clone();
+                let req = convert_request(req);
+                let result = console_router.call(req).await;
+                return match result {
+                    Ok(resp) => Ok(convert_response(resp)),
+                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
+                };
+            }
+            return Err(s3_error!(InternalError, "console is not enabled"));
+        }
+
+        let uri = format!("{}|{}", &req.method, req.uri.path());
+        if let Ok(mat) = self.router.at(&uri) {
+            let op: &T = mat.value;
+            let mut resp = op.call(req, mat.params).await?;
+            resp.status = Some(resp.output.0);
+            return Ok(resp.map_output(|x| x.1));
+        }
+
+        Err(s3_error!(NotImplemented))
     }
 }
 

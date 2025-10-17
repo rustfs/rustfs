@@ -14,6 +14,7 @@
 
 use std::{fs, net::SocketAddr, sync::Arc, sync::OnceLock, time::Duration};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 use serial_test::serial;
 
@@ -89,7 +90,9 @@ async fn prepare_test_env(test_dir: Option<&str>, port: Option<u16>) -> (Vec<std
     // create ECStore with dynamic port
     let port = port.unwrap_or(9000);
     let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools).await.unwrap();
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        .await
+        .unwrap();
 
     // init bucket metadata system
     let buckets_list = ecstore

@@ -13,19 +13,20 @@
 // limitations under the License.
 
 use crate::{error::NotificationError, event::Event, rules::RulesMap};
-use dashmap::DashMap;
+use hashbrown::HashMap;
 use rustfs_targets::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
-use std::{collections::HashMap, sync::Arc};
+use starshard::AsyncShardedHashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     target_list: Arc<RwLock<TargetList>>,
-    bucket_rules_map: Arc<DashMap<String, RulesMap>>,
+    bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
 }
 
 impl Default for EventNotifier {
@@ -39,7 +40,7 @@ impl EventNotifier {
     pub fn new() -> Self {
         EventNotifier {
             target_list: Arc::new(RwLock::new(TargetList::new())),
-            bucket_rules_map: Arc::new(DashMap::new()),
+            bucket_rules_map: Arc::new(AsyncShardedHashMap::new(0)),
         }
     }
 
@@ -58,7 +59,7 @@ impl EventNotifier {
     /// This method removes all rules associated with the specified bucket name.
     /// It will log a message indicating the removal of rules.
     pub async fn remove_rules_map(&self, bucket_name: &str) {
-        if self.bucket_rules_map.remove(bucket_name).is_some() {
+        if self.bucket_rules_map.remove(&bucket_name.to_string()).await.is_some() {
             info!("Removed all notification rules for bucket: {}", bucket_name);
         }
     }
@@ -76,21 +77,21 @@ impl EventNotifier {
     /// Adds a rules map for a bucket
     pub async fn add_rules_map(&self, bucket_name: &str, rules_map: RulesMap) {
         if rules_map.is_empty() {
-            self.bucket_rules_map.remove(bucket_name);
+            self.bucket_rules_map.remove(&bucket_name.to_string()).await;
         } else {
-            self.bucket_rules_map.insert(bucket_name.to_string(), rules_map);
+            self.bucket_rules_map.insert(bucket_name.to_string(), rules_map).await;
         }
         info!("Added rules for bucket: {}", bucket_name);
     }
 
     /// Gets the rules map for a specific bucket.
-    pub fn get_rules_map(&self, bucket_name: &str) -> Option<RulesMap> {
-        self.bucket_rules_map.get(bucket_name).map(|r| r.clone())
+    pub async fn get_rules_map(&self, bucket_name: &str) -> Option<RulesMap> {
+        self.bucket_rules_map.get(&bucket_name.to_string()).await
     }
 
     /// Removes notification rules for a bucket
     pub async fn remove_notification(&self, bucket_name: &str) {
-        self.bucket_rules_map.remove(bucket_name);
+        self.bucket_rules_map.remove(&bucket_name.to_string()).await;
         info!("Removed notification rules for bucket: {}", bucket_name);
     }
 
@@ -113,7 +114,7 @@ impl EventNotifier {
     /// Return `true` if at least one matching notification rule exists.
     pub async fn has_subscriber(&self, bucket_name: &str, event_name: &EventName) -> bool {
         // Rules to check if the bucket exists
-        if let Some(rules_map) = self.bucket_rules_map.get(bucket_name) {
+        if let Some(rules_map) = self.bucket_rules_map.get(&bucket_name.to_string()).await {
             // A composite event (such as ObjectCreatedAll) is expanded to multiple single events.
             // We need to check whether any of these single events have the rules configured.
             rules_map.has_subscriber(event_name)
@@ -129,7 +130,7 @@ impl EventNotifier {
         let bucket_name = &event.s3.bucket.name;
         let object_key = &event.s3.object.key;
         let event_name = event.event_name;
-        if let Some(rules) = self.bucket_rules_map.get(bucket_name) {
+        if let Some(rules) = self.bucket_rules_map.get(bucket_name).await {
             let target_ids = rules.match_rules(event_name, object_key);
             if target_ids.is_empty() {
                 debug!("No matching targets for event in bucket: {}", bucket_name);

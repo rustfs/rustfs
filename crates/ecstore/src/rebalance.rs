@@ -34,8 +34,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -151,7 +151,7 @@ pub struct DiskStat {
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct RebalanceMeta {
     #[serde(skip)]
-    pub cancel: Option<broadcast::Sender<bool>>, // To be invoked on rebalance-stop
+    pub cancel: Option<CancellationToken>, // To be invoked on rebalance-stop
     #[serde(skip)]
     pub last_refreshed_at: Option<OffsetDateTime>,
     #[serde(rename = "stopTs")]
@@ -493,8 +493,8 @@ impl ECStore {
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(meta) = rebalance_meta.as_ref() {
-            if let Some(tx) = meta.cancel.as_ref() {
-                let _ = tx.send(true);
+            if let Some(cancel_tx) = meta.cancel.as_ref() {
+                cancel_tx.cancel();
             }
         }
 
@@ -506,13 +506,14 @@ impl ECStore {
         info!("start_rebalance: start rebalance");
         // let rebalance_meta = self.rebalance_meta.read().await;
 
-        let (tx, rx) = broadcast::channel::<bool>(1);
+        let cancel_tx = CancellationToken::new();
+        let rx = cancel_tx.clone();
 
         {
             let mut rebalance_meta = self.rebalance_meta.write().await;
 
             if let Some(meta) = rebalance_meta.as_mut() {
-                meta.cancel = Some(tx)
+                meta.cancel = Some(cancel_tx)
             } else {
                 info!("start_rebalance: rebalance_meta is None exit");
                 return;
@@ -565,9 +566,9 @@ impl ECStore {
 
             let pool_idx = idx;
             let store = self.clone();
-            let rx = rx.resubscribe();
+            let rx_clone = rx.clone();
             tokio::spawn(async move {
-                if let Err(err) = store.rebalance_buckets(rx, pool_idx).await {
+                if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx).await {
                     error!("Rebalance failed for pool {}: {}", pool_idx, err);
                 } else {
                     info!("Rebalance completed for pool {}", pool_idx);
@@ -579,7 +580,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    async fn rebalance_buckets(self: &Arc<Self>, mut rx: B_Receiver<bool>, pool_index: usize) -> Result<()> {
+    async fn rebalance_buckets(self: &Arc<Self>, rx: CancellationToken, pool_index: usize) -> Result<()> {
         let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<Result<()>>(1);
 
         // Save rebalance metadata periodically
@@ -651,7 +652,7 @@ impl ECStore {
         info!("Pool {} rebalancing is started", pool_index);
 
         loop {
-            if let Ok(true) = rx.try_recv() {
+            if rx.is_cancelled() {
                 info!("Pool {} rebalancing is stopped", pool_index);
                 done_tx.send(Err(Error::other("rebalance stopped canceled"))).await.ok();
                 break;
@@ -660,7 +661,7 @@ impl ECStore {
             if let Some(bucket) = self.next_rebal_bucket(pool_index).await? {
                 info!("Rebalancing bucket: start {}", bucket);
 
-                if let Err(err) = self.rebalance_bucket(rx.resubscribe(), bucket.clone(), pool_index).await {
+                if let Err(err) = self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await {
                     if err.to_string().contains("not initialized") {
                         info!("rebalance_bucket: rebalance not initialized, continue");
                         continue;
@@ -1033,7 +1034,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    async fn rebalance_bucket(self: &Arc<Self>, rx: B_Receiver<bool>, bucket: String, pool_index: usize) -> Result<()> {
+    async fn rebalance_bucket(self: &Arc<Self>, rx: CancellationToken, bucket: String, pool_index: usize) -> Result<()> {
         // Placeholder for actual bucket rebalance logic
         info!("Rebalancing bucket {} in pool {}", bucket, pool_index);
 
@@ -1072,7 +1073,7 @@ impl ECStore {
             });
 
             let set = set.clone();
-            let rx = rx.resubscribe();
+            let rx = rx.clone();
             let bucket = bucket.clone();
             // let wk = wk.clone();
 
@@ -1144,7 +1145,7 @@ impl SetDisks {
     #[tracing::instrument(skip(self, rx, cb))]
     pub async fn list_objects_to_rebalance(
         self: &Arc<Self>,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         bucket: String,
         cb: ListCallback,
     ) -> Result<()> {
