@@ -160,6 +160,7 @@ lz4 = "1.28.1"
 matchit = "0.8.4"
 md-5 = "0.10.6"
 md5 = "0.8.0"
+mimalloc = "0.1"
 mime_guess = "2.0.5"
 moka = { version = "0.12.11", features = ["future"] }
 netif = "0.1.6"

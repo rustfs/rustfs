@@ -135,7 +135,7 @@ jemalloc_pprof = { workspace = true }
 pprof = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
-mimalloc = "0.1"
+mimalloc = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
