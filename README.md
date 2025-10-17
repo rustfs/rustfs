@@ -29,7 +29,11 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简�
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
-RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
+RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages
+worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature,
+support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in
+comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation,
+RustFS provides faster speed and safer distributed features for high-performance object storage.
 
 > ⚠️ **RustFS is under rapid development. Do NOT use in production environments!**
 
@@ -46,27 +50,27 @@ RustFS is a high-performance distributed object storage software built using Rus
 
 Stress test server parameters
 
-|  Type  |  parameter   | Remark |
-| - | - | - |
-|CPU | 2 Core | Intel Xeon(Sapphire Rapids) Platinum 8475B , 2.7/3.2 GHz|   |
-|Memory| 4GB |     |
-|Network | 15Gbp |      |
-|Driver  | 40GB x 4 |   IOPS 3800 / Driver |
+| Type    | parameter | Remark                                                   |
+|---------|-----------|----------------------------------------------------------|
+| CPU     | 2 Core    | Intel Xeon(Sapphire Rapids) Platinum 8475B , 2.7/3.2 GHz |   |
+| Memory  | 4GB       |                                                          |
+| Network | 15Gbp     |                                                          |
+| Driver  | 40GB x 4  | IOPS 3800 / Driver                                       |
 
 <https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a>
 
 ### RustFS vs Other object storage
 
-| RustFS | Other object storage|
-| - | - |
-| Powerful Console | Simple and useless Console |
-| Developed based on Rust language, memory is safer | Developed in Go or C, with potential issues like memory GC/leaks |
-| Does not report logs to third-party countries  | Reporting logs to other third countries may violate national security laws |
-| Licensed under Apache, more business-friendly  | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
-| Comprehensive S3 support, works with domestic and international cloud providers  | Full support for S3, but no local cloud vendor support |
-| Rust-based development, strong support for secure and innovative devices  | Poor support for edge gateways and secure innovative devices|
-| Stable commercial prices, free community support | High pricing, with costs up to $250,000 for 1PiB |
-| No risk | Intellectual property risks and risks of prohibited uses |
+| RustFS                                                                          | Other object storage                                                                                                    |
+|---------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| Powerful Console                                                                | Simple and useless Console                                                                                              |
+| Developed based on Rust language, memory is safer                               | Developed in Go or C, with potential issues like memory GC/leaks                                                        |
+| Does not report logs to third-party countries                                   | Reporting logs to other third countries may violate national security laws                                              |
+| Licensed under Apache, more business-friendly                                   | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
+| Comprehensive S3 support, works with domestic and international cloud providers | Full support for S3, but no local cloud vendor support                                                                  |
+| Rust-based development, strong support for secure and innovative devices        | Poor support for edge gateways and secure innovative devices                                                            |
+| Stable commercial prices, free community support                                | High pricing, with costs up to $250,000 for 1PiB                                                                        |
+| No risk                                                                         | Intellectual property risks and risks of prohibited uses                                                                |
 
 ## Quickstart
 
@@ -91,13 +95,16 @@ To get started with RustFS, follow these steps:
    docker run -d -p 9000:9000 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.45
    ```
 
-  For docker installation, you can also run the container with docker compose. With the `docker-compose.yml` file under root directory, running the command:
+For docker installation, you can also run the container with docker compose. With the `docker-compose.yml` file under
+root directory, running the command:
 
   ```
   docker compose --profile observability up -d
   ```
-  
-  **NOTE**: You should be better to have a look for `docker-compose.yaml` file. Because, several services contains in the file. Grafan,prometheus,jaeger containers will be launched using docker compose file, which is helpful for rustfs observability. If you want to start redis as well as nginx container, you can specify the corresponding profiles.
+
+**NOTE**: You should be better to have a look for `docker-compose.yaml` file. Because, several services contains in the
+file. Grafan,prometheus,jaeger containers will be launched using docker compose file, which is helpful for rustfs
+observability. If you want to start redis as well as nginx container, you can specify the corresponding profiles.
 
 3. **Build from Source (Option 3) - Advanced Users**
 
@@ -118,10 +125,10 @@ To get started with RustFS, follow these steps:
    ```
 
    The `docker-buildx.sh` script supports:
-   - **Multi-architecture builds**: `linux/amd64`, `linux/arm64`
-   - **Automatic version detection**: Uses git tags or commit hashes
-   - **Registry flexibility**: Supports Docker Hub, GitHub Container Registry, etc.
-   - **Build optimization**: Includes caching and parallel builds
+    - **Multi-architecture builds**: `linux/amd64`, `linux/arm64`
+    - **Automatic version detection**: Uses git tags or commit hashes
+    - **Registry flexibility**: Supports Docker Hub, GitHub Container Registry, etc.
+    - **Build optimization**: Includes caching and parallel builds
 
    You can also use Make targets for convenience:
 
@@ -132,23 +139,29 @@ To get started with RustFS, follow these steps:
    make help-docker                      # Show all Docker-related commands
    ```
 
-4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console, default username and password is `rustfsadmin` .
+4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console,
+   default username and password is `rustfsadmin` .
 5. **Create a Bucket**: Use the console to create a new bucket for your objects.
-6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
+6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your
+   RustFS instance.
 
-**NOTE**: If you want to access RustFS instance with `https`, you can refer to [TLS configuration docs](https://docs.rustfs.com/integration/tls-configured.html).
+**NOTE**: If you want to access RustFS instance with `https`, you can refer
+to [TLS configuration docs](https://docs.rustfs.com/integration/tls-configured.html).
 
 ## Documentation
 
-For detailed documentation, including configuration options, API references, and advanced usage, please visit our [Documentation](https://docs.rustfs.com).
+For detailed documentation, including configuration options, API references, and advanced usage, please visit
+our [Documentation](https://docs.rustfs.com).
 
 ## Getting Help
 
 If you have any questions or need assistance, you can:
 
 - Check the [FAQ](https://github.com/rustfs/rustfs/discussions/categories/q-a) for common issues and solutions.
-- Join our [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) to ask questions and share your experiences.
-- Open an issue on our [GitHub Issues](https://github.com/rustfs/rustfs/issues) page for bug reports or feature requests.
+- Join our [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) to ask questions and share your
+  experiences.
+- Open an issue on our [GitHub Issues](https://github.com/rustfs/rustfs/issues) page for bug reports or feature
+  requests.
 
 ## Links
 
@@ -166,20 +179,20 @@ If you have any questions or need assistance, you can:
 
 ## Contributors
 
-RustFS is a community-driven project, and we appreciate all contributions. Check out the [Contributors](https://github.com/rustfs/rustfs/graphs/contributors) page to see the amazing people who have helped make RustFS better.
+RustFS is a community-driven project, and we appreciate all contributions. Check out
+the [Contributors](https://github.com/rustfs/rustfs/graphs/contributors) page to see the amazing people who have helped
+make RustFS better.
 
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
-  <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" />
+  <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors"/>
 </a>
-
 
 ## Github Trending Top
 
-🚀 RustFS is beloved by open-source enthusiasts and enterprise users worldwide, often appearing on the GitHub Trending top charts.
+🚀 RustFS is beloved by open-source enthusiasts and enterprise users worldwide, often appearing on the GitHub Trending
+top charts.
 
 <a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
-
-
 
 ## License
 
