@@ -21,7 +21,6 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
-use tracing::warn;
 
 pub const SHA256_SIZE: usize = 32;
 
@@ -283,13 +282,8 @@ impl Checksum {
         } else {
             value_string = value.to_string();
         }
-        warn!("value_string={value_string}");
         // let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(&value_string).ok()?;
         let raw = general_purpose::STANDARD.decode(&value_string).ok()?;
-
-        warn!("raw={:?}", raw);
-
-        warn!("checksum_type={},trailing={}", checksum_type, checksum_type.trailing());
 
         let checksum = Checksum {
             checksum_type,

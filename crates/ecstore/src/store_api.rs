@@ -35,7 +35,6 @@ use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
-use s3s::dto::ETag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -470,17 +469,24 @@ pub struct PartInfo {
 pub struct CompletePart {
     pub part_num: usize,
     pub etag: Option<String>,
+    // pub size: Option<usize>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
 }
 
 impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
-        let etag = value.e_tag.map(|etag| match etag {
-            ETag::Strong(v) => format!("\"{v}\""),
-            ETag::Weak(v) => format!("W/\"{v}\""),
-        });
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
-            etag,
+            etag: value.e_tag.map(|v| v.value().to_string()),
+            checksum_crc32: value.checksum_crc32,
+            checksum_crc32c: value.checksum_crc32c,
+            checksum_sha1: value.checksum_sha1,
+            checksum_sha256: value.checksum_sha256,
+            checksum_crc64nvme: value.checksum_crc64nvme,
         }
     }
 }
@@ -891,7 +897,7 @@ impl ObjectInfo {
 
     pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
         if part > 0 {
-            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).map(|p| p.checksums.clone()) {
+            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone()) {
                 return Ok((checksums, true));
             }
         }

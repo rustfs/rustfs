@@ -1262,6 +1262,8 @@ impl ECStore {
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
                     etag: pi.etag,
+
+                    ..Default::default()
                 };
             }
 

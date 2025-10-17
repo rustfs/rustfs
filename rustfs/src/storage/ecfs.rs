@@ -2534,6 +2534,8 @@ impl S3 for FS {
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            checksum_algorithm,
+            checksum_type,
             ..
         } = req.input.clone();
 
@@ -2654,8 +2656,6 @@ impl S3 for FS {
             .new_multipart_upload(&bucket, &key, &opts)
             .await
             .map_err(ApiError::from)?;
-
-        warn!("MultipartUploadResult, upload_id={upload_id:?}, checksum_algo={checksum_algo:?}, checksum_type={checksum_type:?}",);
 
         let object_name = key.clone();
         let bucket_name = bucket.clone();
@@ -3270,8 +3270,20 @@ impl S3 for FS {
         let mut uploaded_parts = Vec::new();
 
         for part in multipart_upload.parts.into_iter().flatten() {
+            warn!("TDD: Part checksum_crc32: {:?}", part.checksum_crc32);
+            warn!("TDD: Part checksum_crc32c: {:?}", part.checksum_crc32c);
+            warn!("TDD: Part checksum_sha1: {:?}", part.checksum_sha1);
+            warn!("TDD: Part checksum_sha256: {:?}", part.checksum_sha256);
+            warn!("TDD: Part checksum_crc64nvme: {:?}", part.checksum_crc64nvme);
             uploaded_parts.push(CompletePart::from(part));
         }
+
+        // is part number sorted?
+        if !uploaded_parts.is_sorted_by_key(|p| p.part_num) {
+            return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
+        }
+
+        // TODO: check object lock
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -3326,6 +3338,41 @@ impl S3 for FS {
             server_side_encryption,
             ssekms_key_id
         );
+
+        let mut checksum_crc32 = None;
+        let mut checksum_crc32c = None;
+        let mut checksum_sha1 = None;
+        let mut checksum_sha256 = None;
+        let mut checksum_crc64nvme = None;
+        let mut checksum_type = None;
+
+        // checksum
+        let (checksums, _is_multipart) = obj_info
+            .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+            .map_err(ApiError::from)?;
+
+        warn!("complete multipart upload metadata checksums: {:?}", checksums);
+        for (key, checksum) in checksums {
+            if key == AMZ_CHECKSUM_TYPE {
+                checksum_type = Some(ChecksumType::from(checksum));
+                continue;
+            }
+
+            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
+                rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
+                rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
+                rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
+                rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
+                _ => (),
+            }
+        }
+
+        warn!(
+            "complete multipart upload metadata checksums: crc32={:?}, crc32c={:?}, sha1={:?}, sha256={:?}, crc64nvme={:?}, type={:?}",
+            checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256, checksum_crc64nvme, checksum_type
+        );
+
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
@@ -3333,6 +3380,12 @@ impl S3 for FS {
             location: Some("us-east-1".to_string()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             ..Default::default()
         };
         tracing::info!(

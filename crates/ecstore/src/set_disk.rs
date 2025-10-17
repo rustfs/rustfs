@@ -2950,6 +2950,7 @@ impl SetDisks {
                                         part.mod_time,
                                         part.actual_size,
                                         part.index.clone(),
+                                        part.checksums.clone(),
                                     );
                                     if is_inline_buffer {
                                         if let Some(writer) = writers[index].take() {
@@ -3761,9 +3762,6 @@ impl ObjectIO for SetDisks {
             }
         }
 
-        error!("put_object fileinfo checksum: {:?}", fi.checksum);
-        error!("put_object opts want_checksum: {:?}", opts.want_checksum);
-
         if fi.checksum.is_none() {
             if let Some(content_hash) = data.as_hash_reader().content_hash() {
                 fi.checksum = Some(content_hash.to_bytes(&[]));
@@ -3795,7 +3793,7 @@ impl ObjectIO for SetDisks {
             pfi.mod_time = mod_time;
             pfi.size = w_size as i64;
             pfi.versioned = opts.versioned || opts.version_suspended;
-            pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone());
+            pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone(), None);
             pfi.checksum = fi.checksum.clone();
 
             if opts.data_movement {
@@ -4777,6 +4775,11 @@ impl StorageAPI for SetDisks {
             uploaded_parts.push(CompletePart {
                 part_num: p_info.part_num,
                 etag: p_info.etag,
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
             });
         }
         if let Err(err) = self.complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &ObjectOptions {
@@ -5339,6 +5342,7 @@ impl StorageAPI for SetDisks {
         }
 
         if let Some(checksum) = &opts.want_checksum {
+            warn!("new_multipart_upload want_checksum: {:?}", checksum);
             user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM.to_string(), checksum.checksum_type.to_string());
             user_defined.insert(
                 rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(),
@@ -5469,6 +5473,28 @@ impl StorageAPI for SetDisks {
             return Err(Error::other("part result number err"));
         }
 
+        warn!("fi metadata: {:?}", fi.metadata);
+
+        if let Some(cs) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM) {
+            warn!("complete_multipart_upload metadata checksums: {:?}", cs);
+            let Some(checksum_type) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE) else {
+                return Err(Error::other("checksum type not found"));
+            };
+
+            if opts.want_checksum.is_some()
+                && !opts.want_checksum.as_ref().is_some_and(|v| {
+                    v.checksum_type
+                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, checksum_type))
+                })
+            {
+                return Err(Error::other(format!(
+                    "checksum type mismatch, got {:?}, want {:?}",
+                    opts.want_checksum.as_ref().unwrap(),
+                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, checksum_type)
+                )));
+            }
+        }
+
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 error!("complete_multipart_upload part error: {:?}", &err);
@@ -5489,6 +5515,7 @@ impl StorageAPI for SetDisks {
                 part.mod_time,
                 part.actual_size,
                 part.index.clone(),
+                part.checksums.clone(),
             );
         }
 
@@ -6424,10 +6451,20 @@ mod tests {
             CompletePart {
                 part_num: 1,
                 etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
             },
             CompletePart {
                 part_num: 2,
                 etag: Some("098f6bcd4621d373cade4e832627b4f6".to_string()),
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
             },
         ];
 
@@ -6444,6 +6481,11 @@ mod tests {
         let single_part = vec![CompletePart {
             part_num: 1,
             etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_crc64nvme: None,
         }];
         let single_result = get_complete_multipart_md5(&single_part);
         assert!(single_result.ends_with("-1"));

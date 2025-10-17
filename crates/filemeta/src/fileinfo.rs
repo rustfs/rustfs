@@ -45,7 +45,7 @@ pub struct ObjectPartInfo {
     // Index holds the index of the part in the erasure coding
     pub index: Option<Bytes>,
     // Checksums holds checksums of the part
-    pub checksums: HashMap<String, String>,
+    pub checksums: Option<HashMap<String, String>>,
     pub error: Option<String>,
 }
 
@@ -284,6 +284,7 @@ impl FileInfo {
         Ok(t)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_object_part(
         &mut self,
         num: usize,
@@ -292,6 +293,7 @@ impl FileInfo {
         mod_time: Option<OffsetDateTime>,
         actual_size: i64,
         index: Option<Bytes>,
+        checksums: Option<HashMap<String, String>>,
     ) {
         let part = ObjectPartInfo {
             etag,
@@ -300,7 +302,7 @@ impl FileInfo {
             mod_time,
             actual_size,
             index,
-            checksums: HashMap::new(),
+            checksums,
             error: None,
         };
 

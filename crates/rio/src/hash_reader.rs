@@ -459,10 +459,7 @@ impl AsyncRead for HashReader {
                     // Update content hasher
                     if let Some(hasher) = this.content_hasher {
                         if let Err(e) = hasher.write_all(data) {
-                            warn!("Content hasher write error, error={:?}", e);
                             return Poll::Ready(Err(std::io::Error::other(e)));
-                        } else {
-                            warn!("Content hasher write success");
                         }
                     }
                 }
