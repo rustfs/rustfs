@@ -35,7 +35,6 @@ use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
-use s3s::dto::ETag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -248,11 +247,16 @@ impl HTTPRangeSpec {
             return None;
         }
 
-        let mut start = 0i64;
-        let mut end = -1i64;
-        for i in 0..oi.parts.len().min(part_number) {
+        if part_number == 0 || part_number > oi.parts.len() {
+            return None;
+        }
+
+        let mut start = 0_i64;
+        let mut end = -1_i64;
+        for i in 0..part_number {
+            let part = &oi.parts[i];
             start = end + 1;
-            end = start + (oi.parts[i].size as i64) - 1
+            end = start + (part.size as i64) - 1;
         }
 
         Some(HTTPRangeSpec {
@@ -267,8 +271,14 @@ impl HTTPRangeSpec {
 
         let mut start = self.start;
         if self.is_suffix_length {
-            start = res_size + self.start;
-
+            let suffix_len = if self.start < 0 {
+                self.start
+                    .checked_neg()
+                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+            } else {
+                self.start
+            };
+            start = res_size - suffix_len;
             if start < 0 {
                 start = 0;
             }
@@ -281,7 +291,13 @@ impl HTTPRangeSpec {
         }
 
         if self.is_suffix_length {
-            let specified_len = self.start; // 假设 h.start 是一个 i64 类型
+            let specified_len = if self.start < 0 {
+                self.start
+                    .checked_neg()
+                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+            } else {
+                self.start
+            };
             let mut range_length = specified_len;
 
             if specified_len > res_size {
@@ -459,13 +475,9 @@ pub struct CompletePart {
 
 impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
-        let etag = value.e_tag.map(|etag| match etag {
-            ETag::Strong(v) => format!("\"{v}\""),
-            ETag::Weak(v) => format!("W/\"{v}\""),
-        });
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
-            etag,
+            etag: value.e_tag.map(|e| e.value().to_owned()),
         }
     }
 }
@@ -1564,6 +1576,83 @@ mod tests {
 
         assert_eq!(offset, 5);
         assert_eq!(length, 10); // end - start + 1 = 14 - 5 + 1 = 10
+    }
+
+    #[test]
+    fn test_http_range_spec_suffix_positive_start() {
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 5,
+            end: -1,
+        };
+
+        let (offset, length) = range_spec.get_offset_length(20).unwrap();
+        assert_eq!(offset, 15);
+        assert_eq!(length, 5);
+    }
+
+    #[test]
+    fn test_http_range_spec_suffix_negative_start() {
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: -5,
+            end: -1,
+        };
+
+        let (offset, length) = range_spec.get_offset_length(20).unwrap();
+        assert_eq!(offset, 15);
+        assert_eq!(length, 5);
+    }
+
+    #[test]
+    fn test_http_range_spec_suffix_exceeds_object() {
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 50,
+            end: -1,
+        };
+
+        let (offset, length) = range_spec.get_offset_length(20).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(length, 20);
+    }
+
+    #[test]
+    fn test_http_range_spec_from_object_info_valid_and_invalid_parts() {
+        let object_info = ObjectInfo {
+            size: 300,
+            parts: vec![
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 1,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 2,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 3,
+                    size: 100,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let spec = HTTPRangeSpec::from_object_info(&object_info, 2).unwrap();
+        assert_eq!(spec.start, 100);
+        assert_eq!(spec.end, 199);
+
+        assert!(HTTPRangeSpec::from_object_info(&object_info, 0).is_none());
+        assert!(HTTPRangeSpec::from_object_info(&object_info, 4).is_none());
     }
 
     #[tokio::test]
