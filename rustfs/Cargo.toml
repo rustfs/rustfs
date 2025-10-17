@@ -130,7 +130,7 @@ sysctl = { workspace = true }
 libsystemd.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.6.1"
 
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
 mimalloc = "0.1"
