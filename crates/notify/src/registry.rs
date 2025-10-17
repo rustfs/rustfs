@@ -263,7 +263,7 @@ impl TargetRegistry {
                 successes_by_section
                     .entry(section_name)
                     .or_default()
-                    .insert(id, (*kvs).clone());
+                    .insert(id.to_lowercase(), (*kvs).clone());
             }
 
             let mut new_config = config.clone();

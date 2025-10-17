@@ -84,7 +84,7 @@ pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
 /// use rustfs_obs::{ init_obs, set_global_guard};
 ///
 /// async fn init() -> Result<(), Box<dyn std::error::Error>> {
-///     let (_, guard) = init_obs(None).await;
+///     let guard = init_obs(None).await;
 ///     set_global_guard(guard)?;
 ///     Ok(())
 /// }
