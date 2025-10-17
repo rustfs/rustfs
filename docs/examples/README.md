@@ -35,12 +35,13 @@ docker-compose up -d
 For additional deployment examples, see:
 
 - [`docker/`](./docker/) - Root-level examples directory with:
-    - `docker-quickstart.sh` - Quick start script for basic deployments,Quickstart script (basic
+    - `docker-quickstart.sh` - Quick start script for basic deployments, Quickstart script (basic
       /dev/prod/status/test/cleanup)
-    - `enhanced-docker-deployment.sh` - Advanced deployment scenarios,Advanced deployment script with multiple scenarios
-      and detailed logs (basic /dev/prod/all/status/test/logs/cleanup)
-    - `enhanced-security-deployment.sh` Production-ready scripts with TLS, throttling, and secure credential generation
-    - `docker-comprehensive.yml` - Docker Compose with multiple profiles, docker Compose files containing multiple
+    - `enhanced-docker-deployment.sh` - Advanced deployment scenarios, Advanced deployment script with multiple
+      scenarios and detailed logs (basic /dev/prod/all/status/test/logs/cleanup)
+    - `enhanced-security-deployment.sh` - Production-ready scripts with TLS, throttling, and secure credential
+      generation
+    - `docker-comprehensive.yml` - Docker Compose with multiple profiles, Docker Compose files containing multiple
       profiles (basic / dev / production / enterprise / api-only / nginx, etc.)
     - Usage example:
         ```bash
@@ -54,8 +55,7 @@ For additional deployment examples, see:
         ./docs/examples/docker/enhanced-security-deployment.sh
         ```
         - Note: If the original CI or other documents refer to the old path `examples/`, please update it to
-          `docs/examples/docker/`. Relative links within the document are already in this README
-          The middle finger moves to its new position.
+          `docs/examples/docker/`. Relative links within the document are already in this README.
 
 - [`.docker/compose/`](/.docker/compose/) - Docker Compose configurations:
     - `docker-compose.cluster.yaml` - Basic cluster setup
