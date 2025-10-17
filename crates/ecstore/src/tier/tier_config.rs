@@ -26,14 +26,22 @@ pub enum TierType {
     Unsupported,
     #[serde(rename = "s3")]
     S3,
-    #[serde(rename = "azure")]
-    Azure,
-    #[serde(rename = "gcs")]
-    GCS,
     #[serde(rename = "rustfs")]
     RustFS,
     #[serde(rename = "minio")]
     MinIO,
+    #[serde(rename = "aliyun")]
+    Aliyun,
+    #[serde(rename = "tencent")]
+    Tencent,
+    #[serde(rename = "huaweicloud")]
+    Huaweicloud,
+    #[serde(rename = "azure")]
+    Azure,
+    #[serde(rename = "gcs")]
+    GCS,
+    #[serde(rename = "r2")]
+    R2,
 }
 
 impl Display for TierType {
@@ -48,6 +56,24 @@ impl Display for TierType {
             TierType::MinIO => {
                 write!(f, "MinIO")
             }
+            TierType::MinIO => {
+                write!(f, "Aliyun")
+            }
+            TierType::MinIO => {
+                write!(f, "Tencent")
+            }
+            TierType::MinIO => {
+                write!(f, "Huaweicloud")
+            }
+            TierType::MinIO => {
+                write!(f, "Azure")
+            }
+            TierType::MinIO => {
+                write!(f, "GCS")
+            }
+            TierType::MinIO => {
+                write!(f, "R2")
+            }
             _ => {
                 write!(f, "Unsupported")
             }
@@ -61,6 +87,12 @@ impl TierType {
             "S3" => TierType::S3,
             "RustFS" => TierType::RustFS,
             "MinIO" => TierType::MinIO,
+            "Aliyun" => TierType::Aliyun,
+            "Tencent" => TierType::Tencent,
+            "Huaweicloud" => TierType::Huaweicloud,
+            "Azure" => TierType::Azure,
+            "GCS" => TierType::GCS,
+            "R2" => TierType::R2,
             _ => TierType::Unsupported,
         }
     }
@@ -70,6 +102,12 @@ impl TierType {
             TierType::S3 => "s3".to_string(),
             TierType::RustFS => "rustfs".to_string(),
             TierType::MinIO => "minio".to_string(),
+            TierType::Aliyun => "aliyun".to_string(),
+            TierType::Tencent => "tencent".to_string(),
+            TierType::Huaweicloud => "huaweicloud".to_string(),
+            TierType::Azure => "azure".to_string(),
+            TierType::GCS => "gcs".to_string(),
+            TierType::R2 => "r2".to_string(),            
             _ => "unsupported".to_string(),
         }
     }
@@ -86,8 +124,18 @@ pub struct TierConfig {
     pub name: String,
     #[serde(rename = "s3", skip_serializing_if = "Option::is_none")]
     pub s3: Option<TierS3>,
-    //TODO: azure: Option<TierAzure>,
-    //TODO: gcs: Option<TierGCS>,
+    #[serde(rename = "aliyun", skip_serializing_if = "Option::is_none")]
+    pub aliyun: Option<TierAliyun>,
+    #[serde(rename = "tencent", skip_serializing_if = "Option::is_none")]
+    pub tencent: Option<TierTencent>,
+    #[serde(rename = "huaweicloud", skip_serializing_if = "Option::is_none")]
+    pub huaweicloud: Option<TierHuaweicloud>,
+    #[serde(rename = "azure", skip_serializing_if = "Option::is_none")]
+    pub azure: Option<TierAzure>,
+    #[serde(rename = "gcs", skip_serializing_if = "Option::is_none")]
+    pub gcs: Option<TierGCS>,
+    #[serde(rename = "r2", skip_serializing_if = "Option::is_none")]
+    pub r2: Option<TierR2>,
     #[serde(rename = "rustfs", skip_serializing_if = "Option::is_none")]
     pub rustfs: Option<TierRustFS>,
     #[serde(rename = "minio", skip_serializing_if = "Option::is_none")]
@@ -97,10 +145,14 @@ pub struct TierConfig {
 impl Clone for TierConfig {
     fn clone(&self) -> TierConfig {
         let mut s3 = None;
-        //az  TierAzure
-        //gcs TierGCS
         let mut r = None;
         let mut m = None;
+        let mut aliyun = None;
+        let mut tencent = None;
+        let mut huaweicloud = None;
+        let mut azure = None;
+        let mut gcs = None;
+        let mut r2 = None;
         match self.tier_type {
             TierType::S3 => {
                 let mut s3_ = self.s3.as_ref().expect("err").clone();
@@ -116,6 +168,36 @@ impl Clone for TierConfig {
                 let mut m_ = self.minio.as_ref().expect("err").clone();
                 m_.secret_key = "REDACTED".to_string();
                 m = Some(m_);
+            }
+            TierType::Aliyun => {
+                let mut aliyun_ = self.aliyun.as_ref().expect("err").clone();
+                aliyun_.secret_key = "REDACTED".to_string();
+                aliyun = Some(aliyun_);
+            }
+            TierType::Tencent => {
+                let mut tencent_ = self.tencent.as_ref().expect("err").clone();
+                tencent_.secret_key = "REDACTED".to_string();
+                tencent = Some(tencent_);
+            }
+            TierType::Huaweicloud => {
+                let mut huaweicloud_ = self.huaweicloud.as_ref().expect("err").clone();
+                huaweicloud_.secret_key = "REDACTED".to_string();
+                huaweicloud = Some(huaweicloud_);
+            }
+            TierType::Azure => {
+                let mut azure_ = self.azure.as_ref().expect("err").clone();
+                azure_.secret_key = "REDACTED".to_string();
+                azure = Some(azure_);
+            }
+            TierType::GCS => {
+                let mut gcs_ = self.gcs.as_ref().expect("err").clone();
+                gcs_.secret_key = "REDACTED".to_string();
+                gcs = Some(gcs_);
+            }
+            TierType::R2 => {
+                let mut r2_ = self.r2.as_ref().expect("err").clone();
+                r2_.secret_key = "REDACTED".to_string();
+                r2 = Some(r2_);
             }
             _ => (),
         }
@@ -137,6 +219,12 @@ impl TierConfig {
             TierType::S3 => self.s3.as_ref().expect("err").endpoint.clone(),
             TierType::RustFS => self.rustfs.as_ref().expect("err").endpoint.clone(),
             TierType::MinIO => self.minio.as_ref().expect("err").endpoint.clone(),
+            TierType::Aliyun => self.aliyun.as_ref().expect("err").endpoint.clone(),
+            TierType::Tencent => self.tencent.as_ref().expect("err").endpoint.clone(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").endpoint.clone(),
+            TierType::Azure => self.azure.as_ref().expect("err").endpoint.clone(),
+            TierType::GCS => self.gcs.as_ref().expect("err").endpoint.clone(),
+            TierType::R2 => self.r2.as_ref().expect("err").endpoint.clone(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -149,6 +237,12 @@ impl TierConfig {
             TierType::S3 => self.s3.as_ref().expect("err").bucket.clone(),
             TierType::RustFS => self.rustfs.as_ref().expect("err").bucket.clone(),
             TierType::MinIO => self.minio.as_ref().expect("err").bucket.clone(),
+            TierType::Aliyun => self.aliyun.as_ref().expect("err").bucket.clone(),
+            TierType::Tencent => self.tencent.as_ref().expect("err").bucket.clone(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").bucket.clone(),
+            TierType::Azure => self.azure.as_ref().expect("err").bucket.clone(),
+            TierType::GCS => self.gcs.as_ref().expect("err").bucket.clone(),
+            TierType::R2 => self.r2.as_ref().expect("err").bucket.clone(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -161,6 +255,12 @@ impl TierConfig {
             TierType::S3 => self.s3.as_ref().expect("err").prefix.clone(),
             TierType::RustFS => self.rustfs.as_ref().expect("err").prefix.clone(),
             TierType::MinIO => self.minio.as_ref().expect("err").prefix.clone(),
+            TierType::Aliyun => self.aliyun.as_ref().expect("err").prefix.clone(),
+            TierType::Tencent => self.tencent.as_ref().expect("err").prefix.clone(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").prefix.clone(),
+            TierType::Azure => self.azure.as_ref().expect("err").prefix.clone(),
+            TierType::GCS => self.gcs.as_ref().expect("err").prefix.clone(),
+            TierType::R2 => self.r2.as_ref().expect("err").prefix.clone(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -173,6 +273,12 @@ impl TierConfig {
             TierType::S3 => self.s3.as_ref().expect("err").region.clone(),
             TierType::RustFS => self.rustfs.as_ref().expect("err").region.clone(),
             TierType::MinIO => self.minio.as_ref().expect("err").region.clone(),
+            TierType::Aliyun => self.aliyun.as_ref().expect("err").region.clone(),
+            TierType::Tencent => self.tencent.as_ref().expect("err").region.clone(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").region.clone(),
+            TierType::Azure => self.azure.as_ref().expect("err").region.clone(),
+            TierType::GCS => self.gcs.as_ref().expect("err").region.clone(),
+            TierType::R2 => self.r2.as_ref().expect("err").region.clone(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -318,4 +424,88 @@ impl TierMinIO {
             ..Default::default()
         })
     }
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct TierAliyun {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct TierTencent {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct TierHuaweicloud {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct TierAzure {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct TierGCS {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct TierR2 {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
 }
