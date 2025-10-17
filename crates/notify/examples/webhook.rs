@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::routing::get;
 use axum::{
     Router,
     extract::Json,
+    extract::Query,
     http::{HeaderMap, Response, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
+use rustfs_utils::parse_and_resolve_address;
+use serde::Deserialize;
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use axum::extract::Query;
-use serde::Deserialize;
+use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
 struct ResetParams {
@@ -32,9 +33,6 @@ struct ResetParams {
 }
 
 // Define a global variable and count the number of data received
-use rustfs_utils::parse_and_resolve_address;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::net::TcpListener;
 
 static WEBHOOK_COUNT: AtomicU64 = AtomicU64::new(0);
 

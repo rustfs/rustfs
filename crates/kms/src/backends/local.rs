@@ -635,7 +635,7 @@ impl KmsBackend for LocalKmsBackend {
     }
 
     async fn encrypt(&self, request: EncryptRequest) -> Result<EncryptResponse> {
-        let encrypt_request = crate::types::EncryptRequest {
+        let encrypt_request = EncryptRequest {
             key_id: request.key_id.clone(),
             plaintext: request.plaintext,
             encryption_context: request.encryption_context,
@@ -719,14 +719,14 @@ impl KmsBackend for LocalKmsBackend {
             .client
             .load_master_key(key_id)
             .await
-            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {key_id} not found")))?;
+            .map_err(|_| KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
             // For immediate deletion, actually delete the key from filesystem
             let key_path = self.client.master_key_path(key_id);
             tokio::fs::remove_file(&key_path)
                 .await
-                .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
+                .map_err(|e| KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
 
             // Remove from cache
             let mut cache = self.client.key_cache.write().await;
@@ -756,9 +756,7 @@ impl KmsBackend for LocalKmsBackend {
             // Schedule for deletion (default 30 days)
             let days = request.pending_window_in_days.unwrap_or(30);
             if !(7..=30).contains(&days) {
-                return Err(crate::error::KmsError::invalid_parameter(
-                    "pending_window_in_days must be between 7 and 30".to_string(),
-                ));
+                return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
             }
 
             let deletion_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
@@ -772,16 +770,16 @@ impl KmsBackend for LocalKmsBackend {
         let key_path = self.client.master_key_path(key_id);
         let content = tokio::fs::read(&key_path)
             .await
-            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to read key file: {e}")))?;
-        let stored_key: crate::backends::local::StoredMasterKey = serde_json::from_slice(&content)
-            .map_err(|e| crate::error::KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
+            .map_err(|e| KmsError::internal_error(format!("Failed to read key file: {e}")))?;
+        let stored_key: StoredMasterKey =
+            serde_json::from_slice(&content).map_err(|e| KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
 
         // Decrypt the existing key material to preserve it
         let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
-            let nonce = aes_gcm::Nonce::from_slice(&stored_key.nonce);
+            let nonce = Nonce::from_slice(&stored_key.nonce);
             cipher
                 .decrypt(nonce, stored_key.encrypted_key_material.as_ref())
-                .map_err(|e| crate::error::KmsError::cryptographic_error("decrypt", e.to_string()))?
+                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
         } else {
             stored_key.encrypted_key_material
         };
@@ -820,10 +818,10 @@ impl KmsBackend for LocalKmsBackend {
             .client
             .load_master_key(key_id)
             .await
-            .map_err(|_| crate::error::KmsError::key_not_found(format!("Key {key_id} not found")))?;
+            .map_err(|_| KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         if master_key.status != KeyStatus::PendingDeletion {
-            return Err(crate::error::KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
+            return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
         }
 
         // Cancel the deletion by resetting the state

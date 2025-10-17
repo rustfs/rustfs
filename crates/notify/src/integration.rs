@@ -296,8 +296,8 @@ impl NotificationSystem {
         info!("Removing config for target {} of type {}", target_name, target_type);
         self.update_config_and_reload(|config| {
             let mut changed = false;
-            if let Some(targets) = config.0.get_mut(target_type) {
-                if targets.remove(target_name).is_some() {
+            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
+                if targets.remove(&target_name.to_lowercase()).is_some() {
                     changed = true;
                 }
                 if targets.is_empty() {
@@ -307,6 +307,7 @@ impl NotificationSystem {
             if !changed {
                 info!("Target {} of type {} not found, no changes made.", target_name, target_type);
             }
+            debug!("Config after remove: {:?}", config);
             changed
         })
         .await

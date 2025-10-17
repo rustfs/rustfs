@@ -57,6 +57,7 @@ rustfs-protos = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-kms = { workspace = true }
+rustfs-lock.workspace = true
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
@@ -69,7 +70,9 @@ chrono = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }
 const-str = { workspace = true }
+flatbuffers.workspace = true
 futures.workspace = true
+futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -80,6 +83,7 @@ mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
 pin-project-lite.workspace = true
 reqwest = { workspace = true }
+rmp-serde.workspace = true
 rustls = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
@@ -116,10 +120,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
-futures-util.workspace = true
-rmp-serde.workspace = true
-flatbuffers.workspace = true
-rustfs-lock.workspace = true
+
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
@@ -129,7 +130,7 @@ sysctl = { workspace = true }
 libsystemd.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.6.1"
 
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
 mimalloc = "0.1"
