@@ -38,7 +38,7 @@
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// let (logger, guard) = init_obs(None).await;
+/// #   let guard = init_obs(None).await;
 /// # }
 /// ```
 mod config;
