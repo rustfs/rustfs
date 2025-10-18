@@ -675,7 +675,7 @@ impl Operation for ImportIam {
                 let policies: HashMap<String, rustfs_policy::policy::Policy> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (name, policy) in policies {
-                    if policy.id.is_empty() {
+                    if policy.is_empty() {
                         let res = iam_store.delete_policy(&name, true).await;
                         removed.policies.push(name.clone());
                         if let Err(e) = res {
