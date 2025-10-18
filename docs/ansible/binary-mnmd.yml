@@ -137,7 +137,7 @@
   hosts: rustfs
   become: yes
   vars:
-    install_script_tmp: /home/xiaomage/rustfs/install_rustfs.sh
+    install_script_tmp: /opt/rustfs/install_rustfs.sh
     ansible_python_interpreter: /usr/bin/python3
   tags: rustfs_uninstall
 
