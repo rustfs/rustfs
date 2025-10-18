@@ -528,7 +528,7 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         };
 
-        if u.credentials.is_service_account() {
+        if !u.credentials.is_service_account() {
             return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         }
 

@@ -991,11 +991,7 @@ impl Operation for ImportIam {
             }
         }
 
-        let ret = ImportIAMResult {
-            skipped,
-            added,
-            failed,
-        };
+        let ret = ImportIAMResult { skipped, added, failed };
 
         let body = serde_json::to_vec(&ret).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
