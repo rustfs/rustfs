@@ -653,7 +653,6 @@ impl Operation for ImportIam {
         };
 
         let skipped = IAMEntities::default();
-        let mut removed = IAMEntities::default();
         let mut added = IAMEntities::default();
         let mut failed = IAMErrEntities::default();
 
@@ -675,19 +674,12 @@ impl Operation for ImportIam {
                 let policies: HashMap<String, rustfs_policy::policy::Policy> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (name, policy) in policies {
-                    if policy.id.is_empty() {
-                        let res = iam_store.delete_policy(&name, true).await;
-                        removed.policies.push(name.clone());
-                        if let Err(e) = res {
-                            return Err(s3_error!(InternalError, "delete policy failed, name: {name}, err: {e}"));
-                        }
-                        continue;
-                    }
-
-                    let res = iam_store.set_policy(&name, policy).await;
-                    added.policies.push(name.clone());
-                    if let Err(e) = res {
-                        return Err(s3_error!(InternalError, "set policy failed, name: {name}, err: {e}"));
+                    match iam_store.set_policy(&name, policy).await {
+                        Ok(_) => added.policies.push(name.clone()),
+                        Err(e) => failed.policies.push(IAMErrEntity {
+                            name: name.clone(),
+                            error: e.to_string(),
+                        }),
                     }
                 }
             }
@@ -1001,7 +993,6 @@ impl Operation for ImportIam {
 
         let ret = ImportIAMResult {
             skipped,
-            removed,
             added,
             failed,
         };
