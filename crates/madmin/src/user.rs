@@ -377,11 +377,7 @@ pub struct ImportIAMResult {
     /// imported entries. We dont fail hard in this case and
     pub skipped: IAMEntities,
 
-    /// Removed entries - this mostly happens for policies
-    /// where empty might be getting imported and that's invalid
-    pub removed: IAMEntities,
-
-    /// Newly added entries
+    /// Newly added or updated entries
     pub added: IAMEntities,
 
     /// Failed entries while import. This would have details of
