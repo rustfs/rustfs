@@ -2,11 +2,11 @@
 
 This chapter show how to install rustfs with mnmd(multiple nodes multiple disks) using ansible playbook.Two installation method are available, namely binary and docker compose.
 
-## Requirments
+## Requirements
 
 - Multiple nodes(At least 4 nodes,each has private IP and public IP)
 - Multiple disks(At least 1 disk per nodes, 4 disks is a better choice)
-- Ansible should be avialable
+- Ansible should be available
 - Docker should be available(only for docker compose installation)
 
 ## Binary installation and uninstallation
