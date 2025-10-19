@@ -21,6 +21,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use azure_core::http::ClientOptions;
+use azure_identity::DeveloperToolsCredential;
+use azure_storage_blob::{BlobClient, BlobClientOptions};
+use azure_security_keyvault_secrets::{SecretClient, SecretClientOptions};
+
 use crate::client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
@@ -28,7 +33,7 @@ use crate::client::{
     transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 use crate::tier::{
-    tier_config::TierMinIO,
+    tier_config::TierAzure,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
     warm_backend_s3::WarmBackendS3,
 };
@@ -39,10 +44,15 @@ const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
-pub struct WarmBackendMinIO(WarmBackendS3);
+pub struct WarmBackendAzure {
+    pub client: Arc<SecretClient>,
+    pub bucket: String,
+    pub prefix: String,
+    pub storage_class: String,
+};
 
-impl WarmBackendMinIO {
-    pub async fn new(conf: &TierMinIO, tier: &str) -> Result<Self, std::io::Error> {
+impl WarmBackendAzure {
+    pub async fn new(conf: &TierAzure, tier: &str) -> Result<Self, std::io::Error> {
         if conf.access_key == "" || conf.secret_key == "" {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
@@ -51,46 +61,48 @@ impl WarmBackendMinIO {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        let u = match url::Url::parse(&conf.endpoint) {
-            Ok(u) => u,
-            Err(e) => {
-                return Err(std::io::Error::other(e.to_string()));
-            }
-        };
-
-        let creds = Credentials::new(Static(Value {
+        let creds = DeveloperToolsCredential::new(Some(Value {
             access_key_id: conf.access_key.clone(),
             secret_access_key: conf.secret_key.clone(),
-            session_token: "".to_string(),
-            signer_type: SignatureType::SignatureV4,
-            ..Default::default()
         }));
-        let opts = Options {
-            creds,
-            secure: u.scheme() == "https",
-            //transport: GLOBAL_RemoteTargetTransport,
-            trailing_headers: true,
+        let opts = SecretClientOptions {
+            api_vertion: "7.5".to_string(),
             ..Default::default()
         };
-        let scheme = u.scheme();
-        let default_port = if scheme == "https" { 443 } else { 80 };
         let client =
-            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts).await?;
-
+            SecretClient::new(conf.endpoint, creds.clone(), Some(opts))?;
         let client = Arc::new(client);
-        let core = TransitionCore(Arc::clone(&client));
-        Ok(Self(WarmBackendS3 {
+        Ok(Self {
             client,
-            core,
             bucket: conf.bucket.clone(),
             prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
             storage_class: "".to_string(),
-        }))
+        })
+    }
+
+    pub fn tier(&self) -> *blob.AccessTier {
+        if az.StorageClass == "" {
+          return nil
+        }
+        for _, t := range blob.PossibleAccessTierValues() {
+          if strings.EqualFold(az.StorageClass, string(t)) {
+            return &t
+          }
+        }
+        nil
+    }
+
+    pub fn get_dest(&self, object: &str) -> String {
+        let mut dest_obj = object.to_string();
+        if self.prefix != "" {
+            dest_obj = format!("{}/{}", &self.prefix, object);
+        }
+        return dest_obj;
     }
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for WarmBackendMinIO {
+impl WarmBackend for WarmBackendAzure {
     async fn put_with_meta(
         &self,
         object: &str,
@@ -132,27 +144,75 @@ impl WarmBackend for WarmBackendMinIO {
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
-        self.0.in_use().await
+        /*let result = self.client
+            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
+            .await?;
+
+        Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)*/
+        Ok(false)
     }
 }
 
-fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
-    let mut object_size = object_size;
-    if object_size == -1 {
-        object_size = MAX_MULTIPART_PUT_OBJECT_SIZE;
+fn azure_to_object_error(err: Error, params: Vec<String>) -> Option<error> {
+    if err == nil {
+      return nil
     }
 
-    if object_size > MAX_MULTIPART_PUT_OBJECT_SIZE {
-        return Err(std::io::Error::other("entity too large"));
+    bucket := ""
+    object := ""
+    if len(params) >= 1 {
+      bucket = params[0]
+    }
+    if len(params) == 2 {
+      object = params[1]
     }
 
-    let configured_part_size = MIN_PART_SIZE;
-    let mut part_size_flt = object_size as f64 / MAX_PARTS_COUNT as f64;
-    part_size_flt = (part_size_flt as f64 / configured_part_size as f64).ceil() * configured_part_size as f64;
-
-    let part_size = part_size_flt as i64;
-    if part_size == 0 {
-        return Ok(MIN_PART_SIZE);
+    azureErr, ok := err.(*azcore.ResponseError)
+    if !ok {
+      // We don't interpret non Azure errors. As azure errors will
+      // have StatusCode to help to convert to object errors.
+      return err
     }
-    Ok(part_size)
+
+    serviceCode := azureErr.ErrorCode
+    statusCode := azureErr.StatusCode
+
+    azureCodesToObjectError(err, serviceCode, statusCode, bucket, object)
+}
+
+fn azure_codes_to_object_error(err: Error, service_code: String, status_code: i32, bucket: String, object: String) -> Option<Error> {
+  switch serviceCode {
+  case "ContainerNotFound", "ContainerBeingDeleted":
+    err = BucketNotFound{Bucket: bucket}
+  case "ContainerAlreadyExists":
+    err = BucketExists{Bucket: bucket}
+  case "InvalidResourceName":
+    err = BucketNameInvalid{Bucket: bucket}
+  case "RequestBodyTooLarge":
+    err = PartTooBig{}
+  case "InvalidMetadata":
+    err = UnsupportedMetadata{}
+  case "BlobAccessTierNotSupportedForAccountType":
+    err = NotImplemented{}
+  case "OutOfRangeInput":
+    err = ObjectNameInvalid{
+      Bucket: bucket,
+      Object: object,
+    }
+  default:
+    switch statusCode {
+    case http.StatusNotFound:
+      if object != "" {
+        err = ObjectNotFound{
+          Bucket: bucket,
+          Object: object,
+        }
+      } else {
+        err = BucketNotFound{Bucket: bucket}
+      }
+    case http.StatusBadRequest:
+      err = BucketNameInvalid{Bucket: bucket}
+    }
+  }
+  return err
 }

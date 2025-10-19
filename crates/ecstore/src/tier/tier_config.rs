@@ -107,7 +107,7 @@ impl TierType {
             TierType::Huaweicloud => "huaweicloud".to_string(),
             TierType::Azure => "azure".to_string(),
             TierType::GCS => "gcs".to_string(),
-            TierType::R2 => "r2".to_string(),            
+            TierType::R2 => "r2".to_string(),
             _ => "unsupported".to_string(),
         }
     }
@@ -470,30 +470,95 @@ pub struct TierHuaweicloud {
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
+pub struct ServicePrincipalAuth {
+  pub tenant_id:     String,
+  pub client_id:     String,
+  pub client_secret: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
 pub struct TierAzure {
     pub name: String,
     pub endpoint: String,
-    #[serde(rename = "accessKey")]
-    pub access_key: String,
-    #[serde(rename = "secretKey")]
-    pub secret_key: String,
+    #[serde(rename = "accountName")]
+    pub account_name: String,
+    #[serde(rename = "accountKey")]
+    pub account_key: String,
     pub bucket: String,
     pub prefix: String,
     pub region: String,
+    #[serde(rename = "storageClass")]
+    pub storage_class: String,
+    #[serde(rename = "spAuth")]
+    pub sp_auth: ServicePrincipalAuth,
 }
+
+impl TierAzure {
+    pub fn is_sp_enabled(&self) -> bool {
+        self.sp_auth.tenant_id != "" && self.sp_auth.client_id != "" && self.sp_auth.client_secret != ""
+    }
+}
+
+/*
+fn AzureServicePrincipal(tenantID, clientID, clientSecret string) func(az *TierAzure) error {
+  return func(az *TierAzure) error {
+    if tenantID == "" {
+      return errors.New("empty tenant ID unsupported")
+    }
+    if clientID == "" {
+      return errors.New("empty client ID unsupported")
+    }
+    if clientSecret == "" {
+      return errors.New("empty client secret unsupported")
+    }
+    az.SPAuth.TenantID = tenantID
+    az.SPAuth.ClientID = clientID
+    az.SPAuth.ClientSecret = clientSecret
+    return nil
+  }
+}
+
+fn AzurePrefix(prefix string) func(az *TierAzure) error {
+  return func(az *TierAzure) error {
+    az.Prefix = prefix
+    return nil
+  }
+}
+
+fn AzureEndpoint(endpoint string) func(az *TierAzure) error {
+  return func(az *TierAzure) error {
+    az.Endpoint = endpoint
+    return nil
+  }
+}
+
+fn AzureRegion(region string) func(az *TierAzure) error {
+  return func(az *TierAzure) error {
+    az.Region = region
+    return nil
+  }
+}
+
+fn AzureStorageClass(sc string) func(az *TierAzure) error {
+  return func(az *TierAzure) error {
+    az.StorageClass = sc
+    return nil
+  }
+}*/
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct TierGCS {
     pub name: String,
     pub endpoint: String,
-    #[serde(rename = "accessKey")]
-    pub access_key: String,
-    #[serde(rename = "secretKey")]
-    pub secret_key: String,
+    #[serde(rename = "creds")]
+    pub creds: String,
     pub bucket: String,
     pub prefix: String,
     pub region: String,
+    #[serde(rename = "storageClass")]
+    pub storage_class: String,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]

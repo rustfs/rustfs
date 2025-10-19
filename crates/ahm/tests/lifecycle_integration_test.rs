@@ -246,6 +246,12 @@ async fn create_test_tier(server: u32) {
         tier_type: TierType::MinIO,
         name: "COLDTIER44".to_string(),
         s3: None,
+        aliyun: None,
+        tencent: None,
+        huaweicloud: None,
+        azure: None,
+        gcs: None,
+        r2: None,
         rustfs: None,
         minio: if server == 1 {
             Some(TierMinIO {

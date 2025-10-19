@@ -107,6 +107,11 @@ parking_lot = "0.12"
 moka = { version = "0.12", features = ["future"] }
 aws-smithy-runtime-api = "1.9.0"
 serde_urlencoded.workspace = true
+google-cloud-storage = "1.1.0"
+azure_core = "0.29.1"
+azure_identity = "0.29.0"
+azure_security_keyvault_secrets = "0.8.0"
+azure_storage_blob = "0.6.0"
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }
