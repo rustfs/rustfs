@@ -28,7 +28,7 @@ For binary installation([script installation](https://rustfs.com/en/download/),y
 
 Replacing the IP with your nodes' **private IP**.If you have more than 4 nodes, adding the ip in order.
 
-Runing the command to install rustfs
+Running the command to install rustfs
 
 ```
 ansible-playbook --skip-tags rustfs_uninstall binary-mnmd.yml
