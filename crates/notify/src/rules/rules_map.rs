@@ -14,10 +14,10 @@
 
 use super::pattern_rules::PatternRules;
 use super::target_id_set::TargetIdSet;
+use hashbrown::HashMap;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// RulesMap - Rule mapping organized by event name。
 /// `event.RulesMap` (map[Name]Rules) in the corresponding Go code

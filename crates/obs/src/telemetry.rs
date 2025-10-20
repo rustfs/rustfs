@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::OtelConfig;
+use crate::config::OtelConfig;
 use flexi_logger::{
     Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
     WriteMode::{AsyncWith, BufferAndFlush},
@@ -63,7 +63,8 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 /// - The tracer provider (for distributed tracing)
 /// - The meter provider (for metrics collection)
 /// - The logger provider (for structured logging)
-// Implement Debug trait correctly, rather than using derive, as some fields may not have implemented Debug
+///
+/// Implement Debug trait correctly, rather than using derive, as some fields may not have implemented Debug
 pub struct OtelGuard {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,

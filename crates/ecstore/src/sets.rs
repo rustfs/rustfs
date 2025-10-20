@@ -602,14 +602,6 @@ impl StorageAPI for Sets {
         (del_objects, del_errs)
     }
 
-    async fn complete_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).complete_append(bucket, object, opts).await
-    }
-
-    async fn abort_append(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).abort_append(bucket, object, opts).await
-    }
-
     async fn list_object_parts(
         &self,
         bucket: &str,

@@ -29,17 +29,12 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 workspace = true
 
 [features]
-default = ["file"]
-file = []
+default = []
 gpu = ["dep:nvml-wrapper"]
-webhook = ["dep:reqwest"]
-kafka = ["dep:rdkafka"]
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
-async-trait = { workspace = true }
-chrono = { workspace = true }
 flexi_logger = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
@@ -57,24 +52,9 @@ tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
-reqwest = { workspace = true, optional = true }
-serde_json = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
 
 
-# Only enable kafka features and related dependencies on Linux
-[target.'cfg(target_os = "linux")'.dependencies]
-rdkafka = { workspace = true, features = ["tokio"], optional = true }
-
-
 [dev-dependencies]
-chrono = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
-opentelemetry-stdout = { workspace = true }
-opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
-opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 tokio = { workspace = true, features = ["full"] }
-tracing = { workspace = true, features = ["std", "attributes"] }
-tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt"] }

@@ -32,14 +32,17 @@ rustfs-utils = { workspace = true, features = ["path", "sys"] }
 rustfs-targets = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-dashmap = { workspace = true }
 futures = { workspace = true }
 form_urlencoded = { workspace = true }
+hashbrown = { workspace = true }
 once_cell = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
+rayon = { workspace = true }
 rumqttc = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+starshard = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }

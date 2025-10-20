@@ -208,11 +208,12 @@ impl<'a> BytesEncode<'a> for LifecycleContentCodec {
     type EItem = LifecycleContent;
 
     /// Encodes the u32 timestamp in big endian followed by the log level with a single byte.
-    fn bytes_encode(log: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
-        let (timestamp_bytes, level_byte) = match log {
-            LifecycleContent { timestamp, level: Level::Debug } => (timestamp.to_be_bytes(), 0),
-            LifecycleContent { timestamp, level: Level::Warn } => (timestamp.to_be_bytes(), 1),
-            LifecycleContent { timestamp, level: Level::Error } => (timestamp.to_be_bytes(), 2),
+    fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
+        let (ver_id_bytes, timestamp_bytes, tier_bytes, lifecycle_type) = match lcc {
+            LifecycleContent { ver_id, mod_time, tier, LifecycleType::ExpiryCurrent } => (timestamp.to_be_bytes(), 0),
+            LifecycleContent { ver_id, mod_time, tier, LifecycleType::ExpiryNoncurrent } => (timestamp.to_be_bytes(), 1),
+            LifecycleContent { ver_id, mod_time, tier, LifecycleType::TransitionCurrent } => (timestamp.to_be_bytes(), 2),
+            LifecycleContent { ver_id, mod_time, tier, LifecycleType::TransitionNoncurrent } => (timestamp.to_be_bytes(), 3),
         };
 
         let mut output = Vec::new();
@@ -233,15 +234,16 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
             None => return Err("invalid log key: cannot extract timestamp".into()),
         };
 
-        let level = match bytes.get(size_of::<u32>()) {
-            Some(&0) => Level::Debug,
-            Some(&1) => Level::Warn,
-            Some(&2) => Level::Error,
+        let type_ = match bytes.get(size_of::<u32>()) {
+            Some(&0) => LifecycleType::ExpiryCurrent,
+            Some(&1) => LifecycleType::ExpiryNoncurrent,
+            Some(&2) => LifecycleType::TransitionCurrent,
+            Some(&3) => LifecycleType::TransitionNoncurrent,
             Some(_) => return Err("invalid log key: invalid log level".into()),
             None => return Err("invalid log key: cannot extract log level".into()),
         };
 
-        Ok(LogKey { timestamp, level })
+        Ok(LifecycleContent { ver_id, mod_time, tier, type_ })
     }
 }
 

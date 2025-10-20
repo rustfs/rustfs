@@ -87,7 +87,7 @@ pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Resu
     jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
 }
 
-pub fn extract_claims<T: DeserializeOwned>(
+pub fn extract_claims<T: DeserializeOwned + Clone>(
     token: &str,
     secret: &str,
 ) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(error.to_string(), "secret key length is too short");
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
     struct Claims {
         sub: String,
         company: String,

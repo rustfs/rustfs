@@ -12,16 +12,13 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::AuditEntry;
-use crate::AuditResult;
-use crate::AuditSystem;
-use once_cell::sync::OnceCell;
+use crate::{AuditEntry, AuditResult, AuditSystem};
 use rustfs_ecstore::config::Config;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{error, warn};
 
 /// Global audit system instance
-static AUDIT_SYSTEM: OnceCell<Arc<AuditSystem>> = OnceCell::new();
+static AUDIT_SYSTEM: OnceLock<Arc<AuditSystem>> = OnceLock::new();
 
 /// Initialize the global audit system
 pub fn init_audit_system() -> Arc<AuditSystem> {

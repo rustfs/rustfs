@@ -12,16 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{UnifiedLogEntry, sinks::Sink};
-use std::sync::Arc;
-use tokio::sync::mpsc::Receiver;
+//opa env vars
+pub const ENV_POLICY_PLUGIN_OPA_URL: &str = "RUSTFS_POLICY_PLUGIN_URL";
+pub const ENV_POLICY_PLUGIN_AUTH_TOKEN: &str = "RUSTFS_POLICY_PLUGIN_AUTH_TOKEN";
 
-/// Start the log processing worker thread
-pub(crate) async fn start_worker(receiver: Receiver<UnifiedLogEntry>, sinks: Vec<Arc<dyn Sink>>) {
-    let mut receiver = receiver;
-    while let Some(entry) = receiver.recv().await {
-        for sink in &sinks {
-            sink.write(&entry).await;
-        }
-    }
-}
+pub const ENV_POLICY_PLUGIN_KEYS: &[&str] = &[ENV_POLICY_PLUGIN_OPA_URL, ENV_POLICY_PLUGIN_AUTH_TOKEN];
+
+pub const POLICY_PLUGIN_SUB_SYS: &str = "policy_plugin";

@@ -15,13 +15,13 @@
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
+use hashbrown::HashMap;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
 use rustfs_targets::target::EntityTarget;
 use rustfs_targets::{StoreError, Target};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -212,11 +212,6 @@ impl NotificationSystem {
             return Ok(());
         }
 
-        // if let Err(e) = rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
-        //     error!("Failed to save config: {}", e);
-        //     return Err(NotificationError::SaveConfig(e.to_string()));
-        // }
-
         info!("Configuration updated. Reloading system...");
         self.reload_config(new_config).await
     }
@@ -301,8 +296,8 @@ impl NotificationSystem {
         info!("Removing config for target {} of type {}", target_name, target_type);
         self.update_config_and_reload(|config| {
             let mut changed = false;
-            if let Some(targets) = config.0.get_mut(target_type) {
-                if targets.remove(target_name).is_some() {
+            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
+                if targets.remove(&target_name.to_lowercase()).is_some() {
                     changed = true;
                 }
                 if targets.is_empty() {
@@ -312,6 +307,7 @@ impl NotificationSystem {
             if !changed {
                 info!("Target {} of type {} not found, no changes made.", target_name, target_type);
             }
+            debug!("Config after remove: {:?}", config);
             changed
         })
         .await

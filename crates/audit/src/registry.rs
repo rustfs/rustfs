@@ -12,20 +12,19 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::AuditEntry;
-use crate::{AuditError, AuditResult};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
-use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
+use crate::{AuditEntry, AuditError, AuditResult};
+use futures::{StreamExt, stream::FuturesUnordered};
 use rustfs_config::{
     DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
     MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
     WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
-    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL, audit::AUDIT_ROUTE_PREFIX,
 };
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs};
-use rustfs_targets::{Target, TargetError};
+use rustfs_targets::{
+    Target, TargetError,
+    target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs},
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +67,10 @@ impl AuditRegistry {
 
         // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
-        let mut final_config = config.clone();
+        // let final_config = config.clone();
+
+        // Record the defaults for each segment so that the segment can eventually be rebuilt
+        let mut section_defaults: HashMap<String, KVS> = HashMap::new();
 
         // Supported target types for audit
         let target_types = vec![ChannelTargetType::Webhook.as_str(), ChannelTargetType::Mqtt.as_str()];
@@ -80,10 +82,13 @@ impl AuditRegistry {
             info!(target_type = %target_type, "Starting audit target type processing");
 
             // 2. Prepare the configuration source
-            let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}");
+            let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}").to_lowercase();
             let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
             let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
             debug!(?default_cfg, "Retrieved default configuration");
+
+            // Save defaults for eventual write back
+            section_defaults.insert(section_name.clone(), default_cfg.clone());
 
             // Get valid fields for the target type
             let valid_fields = match target_type {
@@ -101,7 +106,7 @@ impl AuditRegistry {
             let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
 
             for (env_key, env_value) in &all_env {
-                let audit_prefix = format!("{ENV_PREFIX}AUDIT_{}", target_type.to_uppercase());
+                let audit_prefix = format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}").to_uppercase();
                 if !env_key.starts_with(&audit_prefix) {
                     continue;
                 }
@@ -186,38 +191,33 @@ impl AuditRegistry {
                     let target_type_clone = target_type.to_string();
                     let id_clone = id.clone();
                     let merged_config_arc = Arc::new(merged_config.clone());
-                    let final_config_arc = Arc::new(final_config.clone());
-
                     let task = tokio::spawn(async move {
                         let result = create_audit_target(&target_type_clone, &id_clone, &merged_config_arc).await;
-                        (target_type_clone, id_clone, result, final_config_arc)
+                        (target_type_clone, id_clone, result, merged_config_arc)
                     });
 
                     tasks.push(task);
 
                     // Update final config with successful instance
-                    final_config
-                        .0
-                        .entry(section_name.clone())
-                        .or_default()
-                        .insert(id, merged_config);
+                    // final_config.0.entry(section_name.clone()).or_default().insert(id, merged_config);
                 } else {
                     info!(instance_id = %id, "Skipping disabled audit target, will be removed from final configuration");
                     // Remove disabled target from final configuration
-                    final_config.0.entry(section_name.clone()).or_default().remove(&id);
+                    // final_config.0.entry(section_name.clone()).or_default().remove(&id);
                 }
             }
         }
 
         // 6. Concurrently execute all creation tasks and collect results
         let mut successful_targets = Vec::new();
-
+        let mut successful_configs = Vec::new();
         while let Some(task_result) = tasks.next().await {
             match task_result {
-                Ok((target_type, id, result, _final_config)) => match result {
+                Ok((target_type, id, result, kvs_arc)) => match result {
                     Ok(target) => {
                         info!(target_type = %target_type, instance_id = %id, "Created audit target successfully");
                         successful_targets.push(target);
+                        successful_configs.push((target_type, id, kvs_arc));
                     }
                     Err(e) => {
                         error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create audit target");
@@ -229,21 +229,67 @@ impl AuditRegistry {
             }
         }
 
-        // 7. Save the new configuration to the system
-        let Some(store) = rustfs_ecstore::new_object_layer_fn() else {
-            return Err(AuditError::ServerNotInitialized(
-                "Failed to save target configuration: server storage not initialized".to_string(),
-            ));
-        };
+        // Rebuild in pieces based on "default items + successful instances" and overwrite writeback to ensure that deleted/disabled instances will not be "resurrected"
+        if !successful_configs.is_empty() || !section_defaults.is_empty() {
+            info!("Prepare to rebuild and save target configurations to the system configuration...");
 
-        match rustfs_ecstore::config::com::save_server_config(store, &final_config).await {
-            Ok(_) => info!("New audit configuration saved to system successfully"),
-            Err(e) => {
-                error!(error = %e, "Failed to save new audit configuration");
-                return Err(AuditError::SaveConfig(e.to_string()));
+            // Aggregate successful instances into segments
+            let mut successes_by_section: HashMap<String, HashMap<String, KVS>> = HashMap::new();
+            for (target_type, id, kvs) in successful_configs {
+                let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}").to_lowercase();
+                successes_by_section
+                    .entry(section_name)
+                    .or_default()
+                    .insert(id.to_lowercase(), (*kvs).clone());
+            }
+
+            let mut new_config = config.clone();
+
+            // Collection of segments that need to be processed: Collect all segments where default items exist or where successful instances exist
+            let mut sections: HashSet<String> = HashSet::new();
+            sections.extend(section_defaults.keys().cloned());
+            sections.extend(successes_by_section.keys().cloned());
+
+            for section_name in sections {
+                let mut section_map: HashMap<String, KVS> = HashMap::new();
+
+                // The default entry (if present) is written back to `_`
+                if let Some(default_cfg) = section_defaults.get(&section_name) {
+                    if !default_cfg.is_empty() {
+                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_cfg.clone());
+                    }
+                }
+
+                // Successful instance write back
+                if let Some(instances) = successes_by_section.get(&section_name) {
+                    for (id, kvs) in instances {
+                        section_map.insert(id.clone(), kvs.clone());
+                    }
+                }
+
+                // Empty segments are removed and non-empty segments are replaced as a whole.
+                if section_map.is_empty() {
+                    new_config.0.remove(&section_name);
+                } else {
+                    new_config.0.insert(section_name, section_map);
+                }
+            }
+
+            // 7. Save the new configuration to the system
+            let Some(store) = rustfs_ecstore::new_object_layer_fn() else {
+                return Err(AuditError::ServerNotInitialized(
+                    "Failed to save target configuration: server storage not initialized".to_string(),
+                ));
+            };
+
+            match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
+                Ok(_) => info!("New audit configuration saved to system successfully"),
+                Err(e) => {
+                    error!(error = %e, "Failed to save new audit configuration");
+                    return Err(AuditError::SaveConfig(e.to_string()));
+                }
             }
         }
-
         Ok(successful_targets)
     }
 

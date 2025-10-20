@@ -324,7 +324,7 @@ async fn run_mqtt_event_loop(
                         Ok(Err(e)) => Err(e),
                         Err(_) => {
                             debug!(target_id = %target_id, "MQTT poll timed out (EVENT_LOOP_POLL_TIMEOUT) while not connected or status pending.");
-                            Err(rumqttc::ConnectionError::NetworkTimeout)
+                            Err(ConnectionError::NetworkTimeout)
                         }
                     }
                 } else {
@@ -376,7 +376,7 @@ async fn run_mqtt_event_loop(
                         connected_status.store(false, Ordering::SeqCst);
                         error!(target_id = %target_id, error = %e, "Error from MQTT event loop poll");
 
-                        if matches!(e, rumqttc::ConnectionError::NetworkTimeout) && (!initial_connection_established || !connected_status.load(Ordering::SeqCst)) {
+                        if matches!(e, ConnectionError::NetworkTimeout) && (!initial_connection_established || !connected_status.load(Ordering::SeqCst)) {
                            warn!(target_id = %target_id, "Timeout during initial poll or pending state, will retry.");
                            continue;
                         }
@@ -395,8 +395,8 @@ async fn run_mqtt_event_loop(
                             error!(target_id = %target_id, error = %e, "Fatal MQTT error, terminating event loop.");
                             break;
                         }
-                       // rumqttc's eventloop.poll() may return Err and terminate after some errors,
-                        // Or it will handle reconnection internally. The continue here will make select! wait again.
+                        // rumqttc's eventloop.poll() may return Err and terminate after some errors,
+                        // Or it will handle reconnection internally. To continue here will make select! wait again.
                         // If the error is temporary and rumqttc is handling reconnection, poll() should eventually succeed or return a different error again.
                         // Sleep briefly to avoid busy cycles in case of rapid failure.
                         tokio::time::sleep(Duration::from_secs(1)).await;

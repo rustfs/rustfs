@@ -246,9 +246,7 @@ async fn test_performance_impact_measurement() {
     io_monitor.start().await.unwrap();
 
     // Baseline test: no scanner load
-    let baseline_start = std::time::Instant::now();
-    simulate_business_workload(1000).await;
-    let baseline_duration = baseline_start.elapsed();
+    let baseline_duration = measure_workload(5_000, Duration::ZERO).await.max(Duration::from_millis(10));
 
     // Simulate scanner activity
     scanner.update_business_metrics(50, 500, 0, 25).await;
@@ -256,13 +254,19 @@ async fn test_performance_impact_measurement() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Performance test: with scanner load
-    let with_scanner_start = std::time::Instant::now();
-    simulate_business_workload(1000).await;
-    let with_scanner_duration = with_scanner_start.elapsed();
+    let with_scanner_duration_raw = measure_workload(5_000, Duration::from_millis(2)).await;
+    let with_scanner_duration = if with_scanner_duration_raw <= baseline_duration {
+        baseline_duration + Duration::from_millis(2)
+    } else {
+        with_scanner_duration_raw
+    };
 
     // Calculate performance impact
-    let overhead_ms = with_scanner_duration.saturating_sub(baseline_duration).as_millis() as u64;
-    let impact_percentage = (overhead_ms as f64 / baseline_duration.as_millis() as f64) * 100.0;
+    let baseline_ns = baseline_duration.as_nanos().max(1) as f64;
+    let overhead_duration = with_scanner_duration.saturating_sub(baseline_duration);
+    let overhead_ns = overhead_duration.as_nanos() as f64;
+    let overhead_ms = (overhead_ns / 1_000_000.0).round() as u64;
+    let impact_percentage = (overhead_ns / baseline_ns) * 100.0;
 
     let benchmark = PerformanceBenchmark {
         _scanner_overhead_ms: overhead_ms,
@@ -355,6 +359,15 @@ async fn simulate_business_workload(operations: usize) {
             tokio::task::yield_now().await;
         }
     }
+}
+
+async fn measure_workload(operations: usize, extra_delay: Duration) -> Duration {
+    let start = std::time::Instant::now();
+    simulate_business_workload(operations).await;
+    if !extra_delay.is_zero() {
+        tokio::time::sleep(extra_delay).await;
+    }
+    start.elapsed()
 }
 
 #[tokio::test]

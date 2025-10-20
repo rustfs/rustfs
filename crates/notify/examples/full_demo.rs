@@ -68,7 +68,7 @@ async fn main() -> Result<(), NotificationError> {
             key: WEBHOOK_QUEUE_DIR.to_string(),
             value: current_root
                 .clone()
-                .join("../../deploy/logs/notify/webhook")
+                .join("../../deploy/logs/notify")
                 .to_str()
                 .unwrap()
                 .to_string(),
@@ -120,11 +120,7 @@ async fn main() -> Result<(), NotificationError> {
         },
         KV {
             key: MQTT_QUEUE_DIR.to_string(),
-            value: current_root
-                .join("../../deploy/logs/notify/mqtt")
-                .to_str()
-                .unwrap()
-                .to_string(),
+            value: current_root.join("../../deploy/logs/notify").to_str().unwrap().to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -137,7 +133,7 @@ async fn main() -> Result<(), NotificationError> {
     let mqtt_kvs = KVS(mqtt_kvs_vec);
     let mut mqtt_targets = std::collections::HashMap::new();
     mqtt_targets.insert(DEFAULT_TARGET.to_string(), mqtt_kvs);
-    config.0.insert(NOTIFY_MQTT_SUB_SYS.to_string(), mqtt_targets);
+    // config.0.insert(NOTIFY_MQTT_SUB_SYS.to_string(), mqtt_targets);
 
     // Load the configuration and initialize the system
     *system.config.write().await = config;

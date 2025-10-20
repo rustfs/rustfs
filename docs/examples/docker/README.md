@@ -1,10 +1,12 @@
 # RustFS Docker Deployment Examples
 
-This directory contains various deployment scripts and configuration files for RustFS with console and endpoint service separation.
+This directory contains various deployment scripts and configuration files for RustFS with console and endpoint service
+separation.
 
 ## Quick Start Scripts
 
 ### `docker-quickstart.sh`
+
 The fastest way to get RustFS running with different configurations.
 
 ```bash
@@ -28,6 +30,7 @@ The fastest way to get RustFS running with different configurations.
 ```
 
 ### `enhanced-docker-deployment.sh`
+
 Comprehensive deployment script with multiple scenarios and detailed logging.
 
 ```bash
@@ -51,7 +54,9 @@ Comprehensive deployment script with multiple scenarios and detailed logging.
 ```
 
 ### `enhanced-security-deployment.sh`
-Production-ready deployment with enhanced security features including TLS, rate limiting, and secure credential generation.
+
+Production-ready deployment with enhanced security features including TLS, rate limiting, and secure credential
+generation.
 
 ```bash
 # Deploy with security hardening
@@ -68,6 +73,7 @@ Production-ready deployment with enhanced security features including TLS, rate 
 ## Docker Compose Examples
 
 ### `docker-comprehensive.yml`
+
 Complete Docker Compose configuration with multiple deployment profiles.
 
 ```bash
@@ -106,6 +112,7 @@ docker-compose -f docker-comprehensive.yml --profile dev up -d
 ```
 
 **Access Points:**
+
 - API: http://localhost:9010 (or 9030 for enhanced)
 - Console: http://localhost:9011/rustfs/console/ (or 9031 for enhanced)
 - Credentials: dev-admin / dev-secret
@@ -121,6 +128,7 @@ docker-compose -f docker-comprehensive.yml --profile dev up -d
 ```
 
 **Features:**
+
 - TLS encryption for console
 - Rate limiting enabled
 - Restricted CORS policies
@@ -194,13 +202,13 @@ curl http://localhost:9001/health
 
 ### Port Mappings
 
-| Deployment | API Port | Console Port | Description |
-|-----------|----------|--------------|-------------|
-| Basic | 9000 | 9001 | Simple deployment |
-| Dev | 9010 | 9011 | Development environment |
-| Prod | 9020 | 9021 | Production-like setup |
-| Enterprise | 9030 | 9443 | Enterprise with TLS |
-| API-Only | 9040 | - | API endpoint only |
+| Deployment | API Port | Console Port | Description             |
+|------------|----------|--------------|-------------------------|
+| Basic      | 9000     | 9001         | Simple deployment       |
+| Dev        | 9010     | 9011         | Development environment |
+| Prod       | 9020     | 9021         | Production-like setup   |
+| Enterprise | 9030     | 9443         | Enterprise with TLS     |
+| API-Only   | 9040     | -            | API endpoint only       |
 
 ### Network Isolation
 
@@ -213,11 +221,13 @@ Production deployments use network isolation:
 ## Security Considerations
 
 ### Development
+
 - Permissive CORS policies for easy testing
 - Debug logging enabled
 - Default credentials for simplicity
 
-### Production  
+### Production
+
 - Restrictive CORS policies
 - TLS encryption for console
 - Rate limiting enabled
@@ -226,6 +236,7 @@ Production deployments use network isolation:
 - Network isolation
 
 ### Enterprise
+
 - Complete TLS encryption
 - Advanced rate limiting
 - Authentication timeouts
@@ -260,11 +271,12 @@ docker exec rustfs-container netstat -tulpn | grep -E ':(9000|9001)'
 
 ## Migration from Previous Versions
 
-See [docs/console-separation.md](../docs/console-separation.md) for detailed migration instructions from single-port deployments to the separated architecture.
+See [docs/console-separation.md](../../console-separation.md) for detailed migration instructions from single-port
+deployments to the separated architecture.
 
 ## Additional Resources
 
-- [Console Separation Documentation](../docs/console-separation.md)
-- [Docker Compose Configuration](../docker-compose.yml)
-- [Main Dockerfile](../Dockerfile)
-- [Security Best Practices](../docs/console-separation.md#security-hardening)
+- [Console Separation Documentation](../../console-separation.md)
+- [Docker Compose Configuration](../../../docker-compose.yml)
+- [Main Dockerfile](../../../Dockerfile)
+- [Security Best Practices](../../console-separation.md#security-hardening)

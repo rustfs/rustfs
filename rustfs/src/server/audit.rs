@@ -18,6 +18,11 @@ use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use tracing::{error, info, warn};
 
+/// Start the audit system.
+/// This function checks if the audit subsystem is configured in the global server configuration.
+/// If configured, it initializes and starts the audit system.
+/// If not configured, it skips the initialization.
+/// It also handles cases where the audit system is already running or if the global configuration is not loaded.
 pub(crate) async fn start_audit_system() -> AuditResult<()> {
     info!(
         target: "rustfs::main::start_audit_system",
@@ -94,6 +99,10 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
     }
 }
 
+/// Stop the audit system.
+/// This function checks if the audit system is initialized and running.
+/// If it is running, it prepares to stop the system, stops it, and records the stop time.
+/// If the system is already stopped or not initialized, it logs a warning and returns.
 pub(crate) async fn stop_audit_system() -> AuditResult<()> {
     if let Some(system) = audit_system() {
         let state = system.get_state().await;

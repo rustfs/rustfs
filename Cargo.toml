@@ -28,6 +28,7 @@ members = [
     "crates/madmin", # Management dashboard and admin API interface
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
+    "crates/policy", # Policy management
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
     "crates/targets", # Target-specific configurations and utilities
@@ -99,8 +100,10 @@ async-recursion = "1.1.1"
 async-trait = "0.1.89"
 async-compression = { version = "0.4.19" }
 atomic_enum = "0.3.0"
-aws-config = { version = "1.8.6" }
-aws-sdk-s3 = { version = "1.106.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
+aws-config = { version = "1.8.8" }
+aws-credential-types = { version = "1.2.8" }
+aws-smithy-types = { version = "1.3.3" }
+aws-sdk-s3 = { version = "1.108.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
 axum = "0.8.6"
 axum-extra = "0.10.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"], default-features = false }
@@ -110,27 +113,28 @@ brotli = "8.0.2"
 bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.1.0"
 byteorder = "1.5.0"
-cfg-if = "1.0.3"
+cfg-if = "1.0.4"
+convert_case = "0.8.0"
 crc-fast = "1.3.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.48", features = ["derive", "env"] }
+clap = { version = "4.5.49", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
-dashmap = "6.1.0"
-datafusion = "50.0.0"
+datafusion = "50.2.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
 flatbuffers = "25.9.23"
-flate2 = "1.1.2"
-flexi_logger = { version = "0.31.4", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
+flate2 = "1.1.4"
+flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
 form_urlencoded = "1.2.2"
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 glob = "0.3.3"
+hashbrown = { version = "0.16.0", features = ["serde", "rayon"] }
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 hickory-resolver = { version = "0.25.2", features = ["tls-ring"] }
@@ -146,8 +150,9 @@ http = "1.3.1"
 http-body = "1.0.1"
 humantime = "2.3.0"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "10.0.0", features = ["rust_crypto"] }
 lazy_static = "1.5.0"
+libc = "0.2.177"
 libsystemd = { version = "0.7.2" }
 local-ip-address = "0.6.5"
 lz4 = "1.28.1"
@@ -158,40 +163,39 @@ mime_guess = "2.0.5"
 moka = { version = "0.12.11", features = ["future"] }
 netif = "0.1.6"
 nix = { version = "0.30.1", features = ["fs"] }
-nu-ansi-term = "0.50.1"
+nu-ansi-term = "0.50.3"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
 object_store = "0.12.4"
 once_cell = "1.21.3"
-opentelemetry = { version = "0.30.0" }
-opentelemetry-appender-tracing = { version = "0.30.1", features = [
+opentelemetry = { version = "0.31.0" }
+opentelemetry-appender-tracing = { version = "0.31.1", features = [
     "experimental_use_tracing_span_context",
     "experimental_metadata_attributes",
     "spec_unstable_logs_enabled"
 ] }
-opentelemetry_sdk = { version = "0.30.0" }
-opentelemetry-stdout = { version = "0.30.0" }
-opentelemetry-otlp = { version = "0.30.0", default-features = false, features = [
+opentelemetry_sdk = { version = "0.31.0" }
+opentelemetry-stdout = { version = "0.31.0" }
+opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
     "grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"
 ] }
-opentelemetry-semantic-conventions = { version = "0.30.0", features = [
+opentelemetry-semantic-conventions = { version = "0.31.0", features = [
     "semconv_experimental",
 ] }
-parking_lot = "0.12.4"
+parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
 blake3 = { version = "1.8.2" }
 pbkdf2 = "0.12.2"
-percent-encoding = "2.3.2"
 pin-project-lite = "0.2.16"
 prost = "0.14.1"
 pretty_assertions = "1.4.1"
 quick-xml = "0.38.3"
 rand = "0.9.2"
-rdkafka = { version = "0.38.0", features = ["tokio"] }
-reed-solomon-simd = { version = "3.0.1" }
-regex = { version = "1.11.3" }
-reqwest = { version = "0.12.23", default-features = false, features = [
+rayon = "1.11.0"
+reed-solomon-simd = { version = "3.1.0" }
+regex = { version = "1.12.2" }
+reqwest = { version = "0.12.24", default-features = false, features = [
     "rustls-tls-webpki-roots",
     "charset",
     "http2",
@@ -200,17 +204,17 @@ reqwest = { version = "0.12.23", default-features = false, features = [
     "json",
     "blocking",
 ] }
-rmcp = { version = "0.6.4" }
-rmp = "0.8.14"
-rmp-serde = "1.3.0"
-rsa = "0.9.8"
+rmcp = { version = "0.8.1" }
+rmp = { version = "0.8.14" }
+rmp-serde = { version = "1.3.0" }
+rsa = { version = "0.9.8" }
 rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.7.2" }
-rustfs-rsc = "2025.506.1"
+rustc-hash = { version = "2.1.1" }
 rustls = { version = "0.23.32", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
-s3s = { version = "0.12.0-rc.2", features = ["minio"] }
+s3s = { version = "0.12.0-rc.3", features = ["minio"] }
 schemars = "1.0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
@@ -224,7 +228,8 @@ smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.8.9"
 snap = "1.1.1"
-socket2 = "0.6.0"
+socket2 = "0.6.1"
+starshard = { version = "0.5.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.37.1"
 sysctl = "0.7.1"
@@ -239,7 +244,7 @@ time = { version = "0.3.44", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.47.1", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
@@ -250,10 +255,10 @@ tonic-prost = { version = "0.14.2" }
 tonic-prost-build = { version = "0.14.2" }
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
-tracing = "0.1.41"
+tracing = { version = "0.1.41" }
 tracing-core = "0.1.34"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.31.0"
+tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.7"
@@ -269,7 +274,7 @@ wildmatch = { version = "2.5.0", features = ["serde"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "5.1.1"
+zip = "6.0.0"
 zstd = "0.13.3"
 
 

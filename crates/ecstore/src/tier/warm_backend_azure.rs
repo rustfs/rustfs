@@ -121,19 +121,16 @@ impl WarmBackend for WarmBackendAzure {
         };*/
 
         let Ok(res) = blob_client
-        .put_block_blob(
-            match r {
-                ReaderImpl::Body(content_body) => {
-                    content_body.to_vec()
-                }
-                ReaderImpl::ObjectBody(mut content_body) => {
-                    content_body.read_all().await?
-                }
-            }
-        )
-        .content_type("text/plain")
-        .into_future()
-        .await else { return Err(std::io::Error::other("put_block_blob error")) };
+            .put_block_blob(match r {
+                ReaderImpl::Body(content_body) => content_body.to_vec(),
+                ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
+            })
+            .content_type("text/plain")
+            .into_future()
+            .await
+        else {
+            return Err(std::io::Error::other("put_block_blob error"));
+        };
 
         //self.ToObjectError(err, object)
         Ok(res.request_id.to_string())

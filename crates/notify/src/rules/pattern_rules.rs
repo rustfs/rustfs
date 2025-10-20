@@ -14,9 +14,10 @@
 
 use super::pattern;
 use super::target_id_set::TargetIdSet;
+use hashbrown::HashMap;
+use rayon::prelude::*;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// PatternRules - Event rule that maps object name patterns to TargetID collections.
 /// `event.Rules` (map[string]TargetIDSet) in the Go code
@@ -43,13 +44,19 @@ impl PatternRules {
 
     /// Returns all TargetIDs that match the object name.
     pub fn match_targets(&self, object_name: &str) -> TargetIdSet {
-        let mut matched_targets = TargetIdSet::new();
-        for (pattern_str, target_set) in &self.rules {
-            if pattern::match_simple(pattern_str, object_name) {
-                matched_targets.extend(target_set.iter().cloned());
-            }
-        }
-        matched_targets
+        self.rules
+            .par_iter()
+            .filter_map(|(pattern_str, target_set)| {
+                if pattern::match_simple(pattern_str, object_name) {
+                    Some(target_set.iter().cloned().collect::<TargetIdSet>())
+                } else {
+                    None
+                }
+            })
+            .reduce(TargetIdSet::new, |mut acc, set| {
+                acc.extend(set);
+                acc
+            })
     }
 
     pub fn is_empty(&self) -> bool {

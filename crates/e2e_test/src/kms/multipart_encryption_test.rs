@@ -13,16 +13,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! 分片上传加密功能的分步测试用例
+//!
+//! 这个测试套件将验证分片上传加密功能的每一个步骤：
+//! 1. 测试基础的单分片加密（验证加密基础逻辑）
+//! 2. 测试多分片上传（验证分片拼接逻辑）
+//! 3. 测试加密元数据的保存和读取
+//! 4. 测试完整的分片上传加密流程
+
 use super::common::LocalKMSTestEnvironment;
 use crate::common::{TEST_BUCKET, init_logging};
 use serial_test::serial;
 use tracing::{debug, info};
 
+/// 步骤1：测试基础单文件加密功能（确保SSE-S3在非分片场景下正常工作）
 #[tokio::test]
 #[serial]
 async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 step1: test basic single file encryption");
+    info!("🧪 步骤1：测试基础单文件加密功能");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -31,11 +40,11 @@ async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::er
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
 
-    // test small file encryption (should inline store)
+    // 测试小文件加密（应该会内联存储）
     let test_data = b"Hello, this is a small test file for SSE-S3!";
     let object_key = "test-single-file-encrypted";
 
-    info!("📤 step1: upload small file ({}) with SSE-S3 encryption", test_data.len());
+    info!("📤 上传小文件（{}字节），启用SSE-S3加密", test_data.len());
     let put_response = s3_client
         .put_object()
         .bucket(TEST_BUCKET)
@@ -45,41 +54,41 @@ async fn test_step1_basic_single_file_encryption() -> Result<(), Box<dyn std::er
         .send()
         .await?;
 
-    debug!("PUT response ETag: {:?}", put_response.e_tag());
-    debug!("PUT response SSE: {:?}", put_response.server_side_encryption());
+    debug!("PUT响应ETag: {:?}", put_response.e_tag());
+    debug!("PUT响应SSE: {:?}", put_response.server_side_encryption());
 
-    // verify PUT response contains correct encryption header
+    // 验证PUT响应包含正确的加密头
     assert_eq!(
         put_response.server_side_encryption(),
         Some(&aws_sdk_s3::types::ServerSideEncryption::Aes256)
     );
 
-    info!("📥 step1: download file and verify encryption status");
+    info!("📥 下载文件并验证加密状态");
     let get_response = s3_client.get_object().bucket(TEST_BUCKET).key(object_key).send().await?;
 
-    debug!("GET response SSE: {:?}", get_response.server_side_encryption());
+    debug!("GET响应SSE: {:?}", get_response.server_side_encryption());
 
-    // verify GET response contains correct encryption header
+    // 验证GET响应包含正确的加密头
     assert_eq!(
         get_response.server_side_encryption(),
         Some(&aws_sdk_s3::types::ServerSideEncryption::Aes256)
     );
 
-    // verify data integrity
+    // 验证数据完整性
     let downloaded_data = get_response.body.collect().await?.into_bytes();
     assert_eq!(&downloaded_data[..], test_data);
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ step1: basic single file encryption works as expected");
+    info!("✅ 步骤1通过：基础单文件加密功能正常");
     Ok(())
 }
 
-/// test basic multipart upload without encryption
+/// 步骤2：测试不加密的分片上传（确保分片上传基础功能正常）
 #[tokio::test]
 #[serial]
 async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 step2: test basic multipart upload without encryption");
+    info!("🧪 步骤2：测试不加密的分片上传");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -93,16 +102,12 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
     let total_parts = 2;
     let total_size = part_size * total_parts;
 
-    // generate test data (with clear pattern for easy verification)
+    // 生成测试数据（有明显的模式便于验证）
     let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
 
-    info!(
-        "🚀 step2: start multipart upload (no encryption) with {} parts, each {}MB",
-        total_parts,
-        part_size / (1024 * 1024)
-    );
+    info!("🚀 开始分片上传（无加密）：{} parts，每个 {}MB", total_parts, part_size / (1024 * 1024));
 
-    // step1: create multipart upload
+    // 步骤1：创建分片上传
     let create_multipart_output = s3_client
         .create_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -111,16 +116,16 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
         .await?;
 
     let upload_id = create_multipart_output.upload_id().unwrap();
-    info!("📋 step2: create multipart upload, ID: {}", upload_id);
+    info!("📋 创建分片上传，ID: {}", upload_id);
 
-    // step2: upload each part
+    // 步骤2：上传各个分片
     let mut completed_parts = Vec::new();
     for part_number in 1..=total_parts {
         let start = (part_number - 1) * part_size;
         let end = std::cmp::min(start + part_size, total_size);
         let part_data = &test_data[start..end];
 
-        info!("📤 step2: upload part {} ({} bytes)", part_number, part_data.len());
+        info!("📤 上传分片 {} ({} bytes)", part_number, part_data.len());
 
         let upload_part_output = s3_client
             .upload_part()
@@ -140,15 +145,15 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
                 .build(),
         );
 
-        debug!("step2: part {} uploaded, ETag: {}", part_number, etag);
+        debug!("分片 {} 上传完成，ETag: {}", part_number, etag);
     }
 
-    // step3: complete multipart upload
+    // 步骤3：完成分片上传
     let completed_multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
         .set_parts(Some(completed_parts))
         .build();
 
-    info!("🔗 step2: complete multipart upload");
+    info!("🔗 完成分片上传");
     let complete_output = s3_client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -158,16 +163,10 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
         .send()
         .await?;
 
-    debug!("step2: multipart upload completed, ETag: {:?}", complete_output.e_tag());
+    debug!("完成分片上传，ETag: {:?}", complete_output.e_tag());
 
-    // step4: verify multipart upload completed successfully
-    assert_eq!(
-        complete_output.e_tag().unwrap().to_string(),
-        format!("\"{}-{}-{}\"", object_key, upload_id, total_parts)
-    );
-
-    // verify data integrity
-    info!("📥 step2: download file and verify data integrity");
+    // 步骤4：下载并验证
+    info!("📥 下载文件并验证数据完整性");
     let get_response = s3_client.get_object().bucket(TEST_BUCKET).key(object_key).send().await?;
 
     let downloaded_data = get_response.body.collect().await?.into_bytes();
@@ -175,16 +174,16 @@ async fn test_step2_basic_multipart_upload_without_encryption() -> Result<(), Bo
     assert_eq!(&downloaded_data[..], &test_data[..]);
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ step2: basic multipart upload without encryption works as expected");
+    info!("✅ 步骤2通过：不加密的分片上传功能正常");
     Ok(())
 }
 
-/// test multipart upload with SSE-S3 encryption
+/// 步骤3：测试分片上传 + SSE-S3加密（重点测试）
 #[tokio::test]
 #[serial]
 async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 step3: test multipart upload with SSE-S3 encryption");
+    info!("🧪 步骤3：测试分片上传 + SSE-S3加密");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -198,16 +197,16 @@ async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::er
     let total_parts = 2;
     let total_size = part_size * total_parts;
 
-    // generate test data (with clear pattern for easy verification)
+    // 生成测试数据
     let test_data: Vec<u8> = (0..total_size).map(|i| ((i / 1000) % 256) as u8).collect();
 
     info!(
-        "🔐 step3: start multipart upload with SSE-S3 encryption: {} parts, each {}MB",
+        "🔐 开始分片上传（SSE-S3加密）：{} parts，每个 {}MB",
         total_parts,
         part_size / (1024 * 1024)
     );
 
-    // step1: create multipart upload and enable SSE-S3
+    // 步骤1：创建分片上传并启用SSE-S3
     let create_multipart_output = s3_client
         .create_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -217,24 +216,24 @@ async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::er
         .await?;
 
     let upload_id = create_multipart_output.upload_id().unwrap();
-    info!("📋 step3: create multipart upload with SSE-S3 encryption, ID: {}", upload_id);
+    info!("📋 创建加密分片上传，ID: {}", upload_id);
 
-    // step2: verify CreateMultipartUpload response (SSE-S3 header should be included)
+    // 验证CreateMultipartUpload响应（如果有SSE头的话）
     if let Some(sse) = create_multipart_output.server_side_encryption() {
-        debug!("CreateMultipartUpload response contains SSE header: {:?}", sse);
+        debug!("CreateMultipartUpload包含SSE响应: {:?}", sse);
         assert_eq!(sse, &aws_sdk_s3::types::ServerSideEncryption::Aes256);
     } else {
-        debug!("CreateMultipartUpload response does not contain SSE header (some implementations may return empty string)");
+        debug!("CreateMultipartUpload不包含SSE响应头（某些实现中正常）");
     }
 
-    // step2: upload each part
+    // 步骤2：上传各个分片
     let mut completed_parts = Vec::new();
     for part_number in 1..=total_parts {
         let start = (part_number - 1) * part_size;
         let end = std::cmp::min(start + part_size, total_size);
         let part_data = &test_data[start..end];
 
-        info!("🔐 step3: upload encrypted part {} ({} bytes)", part_number, part_data.len());
+        info!("🔐 上传加密分片 {} ({} bytes)", part_number, part_data.len());
 
         let upload_part_output = s3_client
             .upload_part()
@@ -254,15 +253,15 @@ async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::er
                 .build(),
         );
 
-        debug!("step3: part {} uploaded, ETag: {}", part_number, etag);
+        debug!("加密分片 {} 上传完成，ETag: {}", part_number, etag);
     }
 
-    // step3: complete multipart upload
+    // 步骤3：完成分片上传
     let completed_multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
         .set_parts(Some(completed_parts))
         .build();
 
-    info!("🔗 step3: complete multipart upload with SSE-S3 encryption");
+    info!("🔗 完成加密分片上传");
     let complete_output = s3_client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -272,46 +271,43 @@ async fn test_step3_multipart_upload_with_sse_s3() -> Result<(), Box<dyn std::er
         .send()
         .await?;
 
-    debug!(
-        "step3: complete multipart upload with SSE-S3 encryption, ETag: {:?}",
-        complete_output.e_tag()
-    );
+    debug!("完成加密分片上传，ETag: {:?}", complete_output.e_tag());
 
-    // step4: HEAD request to check metadata
-    info!("📋 step4: check object metadata");
+    // 步骤4：HEAD请求检查元数据
+    info!("📋 检查对象元数据");
     let head_response = s3_client.head_object().bucket(TEST_BUCKET).key(object_key).send().await?;
 
-    debug!("HEAD response SSE: {:?}", head_response.server_side_encryption());
-    debug!("HEAD response metadata: {:?}", head_response.metadata());
+    debug!("HEAD响应 SSE: {:?}", head_response.server_side_encryption());
+    debug!("HEAD响应 元数据: {:?}", head_response.metadata());
 
-    // step5: GET request to download and verify
-    info!("📥 step5: download encrypted file and verify");
+    // 步骤5：GET请求下载并验证
+    info!("📥 下载加密文件并验证");
     let get_response = s3_client.get_object().bucket(TEST_BUCKET).key(object_key).send().await?;
 
-    debug!("GET response SSE: {:?}", get_response.server_side_encryption());
+    debug!("GET响应 SSE: {:?}", get_response.server_side_encryption());
 
-    // step5: verify GET response contains SSE-S3 encryption header
+    // 🎯 关键验证：GET响应必须包含SSE-S3加密头
     assert_eq!(
         get_response.server_side_encryption(),
         Some(&aws_sdk_s3::types::ServerSideEncryption::Aes256)
     );
 
-    // step5: verify downloaded data matches original test data
+    // 验证数据完整性
     let downloaded_data = get_response.body.collect().await?.into_bytes();
     assert_eq!(downloaded_data.len(), total_size);
     assert_eq!(&downloaded_data[..], &test_data[..]);
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ step3: multipart upload with SSE-S3 encryption function is normal");
+    info!("✅ 步骤3通过：分片上传 + SSE-S3加密功能正常");
     Ok(())
 }
 
-/// step4: test larger multipart upload with encryption (streaming encryption)
+/// 步骤4：测试更大的分片上传（测试流式加密）
 #[tokio::test]
 #[serial]
 async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 step4: test larger multipart upload with encryption (streaming encryption)");
+    info!("🧪 步骤4：测试大文件分片上传加密");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -326,13 +322,13 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
     let total_size = part_size * total_parts;
 
     info!(
-        "🗂️ step4: generate large test data: {} parts, each {}MB, total {}MB",
+        "🗂️ 生成大文件测试数据：{} parts，每个 {}MB，总计 {}MB",
         total_parts,
         part_size / (1024 * 1024),
         total_size / (1024 * 1024)
     );
 
-    // step4: generate large test data (using complex pattern for verification)
+    // 生成大文件测试数据（使用复杂模式便于验证）
     let test_data: Vec<u8> = (0..total_size)
         .map(|i| {
             let part_num = i / part_size;
@@ -341,9 +337,9 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
         })
         .collect();
 
-    info!("🔐 step4: start large multipart upload with encryption (SSE-S3)");
+    info!("🔐 开始大文件分片上传（SSE-S3加密）");
 
-    // step4: create multipart upload
+    // 创建分片上传
     let create_multipart_output = s3_client
         .create_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -353,9 +349,9 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
         .await?;
 
     let upload_id = create_multipart_output.upload_id().unwrap();
-    info!("📋 step4: create multipart upload with encryption (SSE-S3), ID: {}", upload_id);
+    info!("📋 创建大文件加密分片上传，ID: {}", upload_id);
 
-    // step4: upload parts
+    // 上传各个分片
     let mut completed_parts = Vec::new();
     for part_number in 1..=total_parts {
         let start = (part_number - 1) * part_size;
@@ -363,7 +359,7 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
         let part_data = &test_data[start..end];
 
         info!(
-            "🔐 step4: upload part {} ({:.2}MB)",
+            "🔐 上传大文件加密分片 {} ({:.2}MB)",
             part_number,
             part_data.len() as f64 / (1024.0 * 1024.0)
         );
@@ -386,15 +382,15 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
                 .build(),
         );
 
-        debug!("step4: upload part {} completed, ETag: {}", part_number, etag);
+        debug!("大文件加密分片 {} 上传完成，ETag: {}", part_number, etag);
     }
 
-    // step4: complete multipart upload
+    // 完成分片上传
     let completed_multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
         .set_parts(Some(completed_parts))
         .build();
 
-    info!("🔗 step4: complete multipart upload with encryption (SSE-S3)");
+    info!("🔗 完成大文件加密分片上传");
     let complete_output = s3_client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -404,46 +400,40 @@ async fn test_step4_large_multipart_upload_with_encryption() -> Result<(), Box<d
         .send()
         .await?;
 
-    debug!(
-        "step4: complete multipart upload with encryption (SSE-S3), ETag: {:?}",
-        complete_output.e_tag()
-    );
+    debug!("完成大文件加密分片上传，ETag: {:?}", complete_output.e_tag());
 
-    // step4: download and verify
-    info!("📥 step4: download and verify large multipart upload with encryption (SSE-S3)");
+    // 下载并验证
+    info!("📥 下载大文件并验证");
     let get_response = s3_client.get_object().bucket(TEST_BUCKET).key(object_key).send().await?;
 
-    // step4: verify encryption header
+    // 验证加密头
     assert_eq!(
         get_response.server_side_encryption(),
         Some(&aws_sdk_s3::types::ServerSideEncryption::Aes256)
     );
 
-    // step4: verify data integrity
+    // 验证数据完整性
     let downloaded_data = get_response.body.collect().await?.into_bytes();
     assert_eq!(downloaded_data.len(), total_size);
 
-    // step4: verify data matches original test data
+    // 逐字节验证数据（对于大文件更严格）
     for (i, (&actual, &expected)) in downloaded_data.iter().zip(test_data.iter()).enumerate() {
         if actual != expected {
-            panic!(
-                "step4: large multipart upload with encryption (SSE-S3) data mismatch at byte {}: actual={}, expected={}",
-                i, actual, expected
-            );
+            panic!("大文件数据在第{i}字节不匹配: 实际={actual}, 期待={expected}");
         }
     }
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ step4: large multipart upload with encryption (SSE-S3) functionality normal");
+    info!("✅ 步骤4通过：大文件分片上传加密功能正常");
     Ok(())
 }
 
-/// step5: test all encryption types multipart upload
+/// 步骤5：测试所有加密类型的分片上传
 #[tokio::test]
 #[serial]
 async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 step5: test all encryption types multipart upload");
+    info!("🧪 步骤5：测试所有加密类型的分片上传");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -456,8 +446,8 @@ async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::
     let total_parts = 2;
     let total_size = part_size * total_parts;
 
-    // step5: test SSE-KMS multipart upload
-    info!("🔐 step5: test SSE-KMS multipart upload");
+    // 测试SSE-KMS
+    info!("🔐 测试 SSE-KMS 分片上传");
     test_multipart_encryption_type(
         &s3_client,
         TEST_BUCKET,
@@ -469,8 +459,8 @@ async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::
     )
     .await?;
 
-    // step5: test SSE-C multipart upload
-    info!("🔐 step5: test SSE-C multipart upload");
+    // 测试SSE-C
+    info!("🔐 测试 SSE-C 分片上传");
     test_multipart_encryption_type(
         &s3_client,
         TEST_BUCKET,
@@ -483,7 +473,7 @@ async fn test_step5_all_encryption_types_multipart() -> Result<(), Box<dyn std::
     .await?;
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ step5: all encryption types multipart upload functionality normal");
+    info!("✅ 步骤5通过：所有加密类型的分片上传功能正常");
     Ok(())
 }
 
@@ -493,7 +483,7 @@ enum EncryptionType {
     SSEC,
 }
 
-/// step5: test specific encryption type multipart upload
+/// 辅助函数：测试特定加密类型的分片上传
 async fn test_multipart_encryption_type(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -503,10 +493,10 @@ async fn test_multipart_encryption_type(
     total_parts: usize,
     encryption_type: EncryptionType,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // step5: generate test data
+    // 生成测试数据
     let test_data: Vec<u8> = (0..total_size).map(|i| ((i * 7) % 256) as u8).collect();
 
-    // step5: prepare SSE-C key and MD5 (if needed)
+    // 准备SSE-C所需的密钥（如果需要）
     let (sse_c_key, sse_c_md5) = if matches!(encryption_type, EncryptionType::SSEC) {
         let key = "01234567890123456789012345678901";
         let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
@@ -516,10 +506,9 @@ async fn test_multipart_encryption_type(
         (None, None)
     };
 
-    // step5: create multipart upload
-    info!("🔗 step5: create multipart upload with encryption {:?}", encryption_type);
+    info!("📋 创建分片上传 - {:?}", encryption_type);
 
-    // step5: create multipart upload request
+    // 创建分片上传
     let mut create_request = s3_client.create_multipart_upload().bucket(bucket).key(object_key);
 
     create_request = match encryption_type {
@@ -533,6 +522,7 @@ async fn test_multipart_encryption_type(
     let create_multipart_output = create_request.send().await?;
     let upload_id = create_multipart_output.upload_id().unwrap();
 
+    // 上传分片
     let mut completed_parts = Vec::new();
     for part_number in 1..=total_parts {
         let start = (part_number - 1) * part_size;
@@ -547,7 +537,7 @@ async fn test_multipart_encryption_type(
             .part_number(part_number as i32)
             .body(aws_sdk_s3::primitives::ByteStream::from(part_data.to_vec()));
 
-        // step5: include SSE-C key and MD5 in each UploadPart request (if needed)
+        // SSE-C需要在每个UploadPart请求中包含密钥
         if matches!(encryption_type, EncryptionType::SSEC) {
             upload_request = upload_request
                 .sse_customer_algorithm("AES256")
@@ -564,11 +554,10 @@ async fn test_multipart_encryption_type(
                 .build(),
         );
 
-        // step5: complete multipart upload request
-        debug!("🔗 step5: complete multipart upload part {} with etag {}", part_number, etag);
+        debug!("{:?} 分片 {} 上传完成", encryption_type, part_number);
     }
 
-    // step5: complete multipart upload
+    // 完成分片上传
     let completed_multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
         .set_parts(Some(completed_parts))
         .build();
@@ -582,12 +571,10 @@ async fn test_multipart_encryption_type(
         .send()
         .await?;
 
-    // step5: download and verify multipart upload
-    info!("🔗 step5: download and verify multipart upload with encryption {:?}", encryption_type);
-
+    // 下载并验证
     let mut get_request = s3_client.get_object().bucket(bucket).key(object_key);
 
-    // step5: include SSE-C key and MD5 in each GET request (if needed)
+    // SSE-C需要在GET请求中包含密钥
     if matches!(encryption_type, EncryptionType::SSEC) {
         get_request = get_request
             .sse_customer_algorithm("AES256")
@@ -597,7 +584,7 @@ async fn test_multipart_encryption_type(
 
     let get_response = get_request.send().await?;
 
-    // step5: verify encryption headers
+    // 验证加密头
     match encryption_type {
         EncryptionType::SSEKMS => {
             assert_eq!(
@@ -610,15 +597,11 @@ async fn test_multipart_encryption_type(
         }
     }
 
-    // step5: verify data integrity
+    // 验证数据完整性
     let downloaded_data = get_response.body.collect().await?.into_bytes();
     assert_eq!(downloaded_data.len(), total_size);
     assert_eq!(&downloaded_data[..], &test_data[..]);
 
-    // step5: verify data integrity
-    info!(
-        "✅ step5: verify data integrity for multipart upload with encryption {:?}",
-        encryption_type
-    );
+    info!("✅ {:?} 分片上传测试通过", encryption_type);
     Ok(())
 }

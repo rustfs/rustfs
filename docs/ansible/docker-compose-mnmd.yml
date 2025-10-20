@@ -1,0 +1,115 @@
+---
+- name: Prepare for RustFS installation
+  hosts: rustfs
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    install_script_url: "https://rustfs.com/install_rustfs.sh"
+    docker_compose: "/opt/rustfs/docker-compose"
+  remote_user: root
+
+  tasks:
+    - name: Install docker
+      tags: docker_install
+      shell: |
+            apt-get remove -y docker docker.io containerd runc || true
+            apt-get update -y
+            apt-get install -y ca-certificates curl gnupg lsb-release
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu \
+              $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update -y
+            apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+      become: yes
+      register: docker_installation_result
+      changed_when: false
+      when: ansible_facts['distribution'] == "Ubuntu"
+
+    - name: Installation check
+      debug:
+        var: docker_installation_result.stdout
+      when: ansible_facts['distribution'] == "Ubuntu"
+
+    - name: Create docker compose dir
+      file:
+        path: "{{ docker_compose }}"
+        state: directory
+        mode: '0755'
+
+    - name: Prepare docker compose file
+      copy:
+        content: |
+          services:
+            rustfs:
+              image: rustfs/rustfs:latest
+              container_name: rustfs
+              hostname: rustfs
+              network_mode: host
+              environment:
+                # Use service names and correct disk indexing (1..4 to match mounted paths)
+                - RUSTFS_VOLUMES=http://rustfs-node{1...4}:9000/data/rustfs{1...4}
+                - RUSTFS_ADDRESS=0.0.0.0:9000
+                - RUSTFS_CONSOLE_ENABLE=true
+                - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+                - RUSTFS_EXTERNAL_ADDRESS=0.0.0.0:9000  # Same as internal since no port mapping
+                - RUSTFS_ACCESS_KEY=rustfsadmin
+                - RUSTFS_SECRET_KEY=rustfsadmin
+                - RUSTFS_CMD=rustfs
+              command: ["sh", "-c", "sleep 3 && rustfs"]
+              healthcheck:
+                test:
+                  [
+                    "CMD-SHELL",
+                    "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health || exit 1"
+                  ]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+                start_period: 30s
+              ports:
+                - "9000:9000"  # API endpoint
+                - "9001:9001"  # Console
+              volumes:
+                - rustfs-data1:/data/rustfs1
+                - rustfs-data2:/data/rustfs2
+                - rustfs-data3:/data/rustfs3
+                - rustfs-data4:/data/rustfs4
+              extra_hosts:
+                - "rustfs-node1:172.20.92.202"
+                - "rustfs-node2:172.20.92.201"
+                - "rustfs-node3:172.20.92.200"
+                - "rustfs-node4:172.20.92.199"
+
+          volumes:
+            rustfs-data1:
+            rustfs-data2:
+            rustfs-data3:
+            rustfs-data4:
+
+        dest: "{{ docker_compose }}/docker-compose.yml"
+        mode: '0644'
+    
+    - name: Install rustfs using docker compose
+      tags: rustfs_install
+      command: docker compose -f "{{ docker_compose}}/docker-compose.yml" up -d
+      args:
+        chdir: "{{ docker_compose }}"
+
+    - name: Get docker compose output
+      command: docker compose ps
+      args:
+        chdir: "{{ docker_compose }}"
+      register: docker_compose_output
+
+    - name: Check the docker compose installation output
+      debug:
+        msg: "{{ docker_compose_output.stdout }}"
+
+    - name: Uninstall rustfs using docker compose
+      tags: rustfs_uninstall 
+      command: docker compose -f "{{ docker_compose}}/docker-compose.yml" down
+      args:
+        chdir: "{{ docker_compose }}"

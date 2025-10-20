@@ -17,7 +17,6 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-
 /// DEFAULT_VERSION is the default version.
 /// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html
 pub const DEFAULT_VERSION: &str = "2012-10-17";
@@ -155,8 +154,8 @@ impl Validator for Policy {
     type Error = Error;
 
     fn is_valid(&self) -> Result<()> {
-        if !self.id.is_empty() && !self.id.eq(DEFAULT_VERSION) {
-            return Err(IamError::InvalidVersion(self.id.0.clone()).into());
+        if !self.version.is_empty() && !self.version.eq(DEFAULT_VERSION) {
+            return Err(IamError::InvalidVersion(self.version.clone()).into());
         }
 
         for statement in self.statements.iter() {
@@ -214,8 +213,8 @@ impl Validator for BucketPolicy {
     type Error = Error;
 
     fn is_valid(&self) -> Result<()> {
-        if !self.id.is_empty() && !self.id.eq(DEFAULT_VERSION) {
-            return Err(IamError::InvalidVersion(self.id.0.clone()).into());
+        if !self.version.is_empty() && !self.version.eq(DEFAULT_VERSION) {
+            return Err(IamError::InvalidVersion(self.version.clone()).into());
         }
 
         for statement in self.statements.iter() {

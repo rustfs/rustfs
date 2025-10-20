@@ -21,12 +21,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use google_cloud_storage as gcs;
-use google_cloud_storage::client::Storage;
+use bytes::Bytes;
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_auth::credentials::user_account::Builder;
+use google_cloud_storage as gcs;
+use google_cloud_storage::client::Storage;
 use std::convert::TryFrom;
-use bytes::Bytes;
 
 use crate::client::{
     admin_handler_utils::AdminError,
