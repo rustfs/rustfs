@@ -78,7 +78,7 @@ use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::{
     HashAlgorithm,
-    crypto::{base64_decode, base64_encode, hex},
+    crypto::hex,
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
@@ -158,10 +158,7 @@ impl SetDisks {
             LockResult::Conflict {
                 current_owner,
                 current_mode,
-            } => format!(
-                "{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {:?}",
-                current_mode
-            ),
+            } => format!("{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {current_mode:?}"),
             LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
         }
     }
@@ -922,9 +919,8 @@ impl SetDisks {
     }
 
     fn get_upload_id_dir(bucket: &str, object: &str, upload_id: &str) -> String {
-        // warn!("get_upload_id_dir upload_id {:?}", upload_id);
-
-        let upload_uuid = base64_decode(upload_id.as_bytes())
+        let upload_uuid = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload_id.as_bytes())
             .and_then(|v| {
                 String::from_utf8(v).map_or(Ok(upload_id.to_owned()), |v| {
                     let parts: Vec<_> = v.splitn(2, '.').collect();
@@ -4857,19 +4853,12 @@ impl StorageAPI for SetDisks {
 
         if let Some(checksum) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
             && !checksum.is_empty()
-        {
-            warn!(
-                "checksum mismatch expected: {}, actual: {}",
-                checksum,
-                data.as_hash_reader().content_crc_type().unwrap_or_default().to_string()
-            );
-            if data
+            && data
                 .as_hash_reader()
                 .content_crc_type()
                 .is_none_or(|v| v.to_string() != *checksum)
-            {
-                return Err(Error::other(format!("checksum mismatch: {checksum}")));
-            }
+        {
+            return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }
 
         let disks = self.disks.read().await.clone();
@@ -5220,7 +5209,8 @@ impl StorageAPI for SetDisks {
             uploads.push(MultipartInfo {
                 bucket: bucket.to_owned(),
                 object: object.to_owned(),
-                upload_id: base64_encode(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
+                upload_id: base64_simd::URL_SAFE_NO_PAD
+                    .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
                 initiated: Some(start_time),
                 ..Default::default()
             });
@@ -5342,7 +5332,6 @@ impl StorageAPI for SetDisks {
         }
 
         if let Some(checksum) = &opts.want_checksum {
-            warn!("new_multipart_upload want_checksum: {:?}", checksum);
             user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM.to_string(), checksum.checksum_type.to_string());
             user_defined.insert(
                 rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(),
@@ -5364,7 +5353,8 @@ impl StorageAPI for SetDisks {
 
         let upload_uuid = format!("{}x{}", Uuid::new_v4(), mod_time.unix_timestamp_nanos());
 
-        let upload_id = base64_encode(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
+        let upload_id = base64_simd::URL_SAFE_NO_PAD
+            .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 
@@ -5473,10 +5463,7 @@ impl StorageAPI for SetDisks {
             return Err(Error::other("part result number err"));
         }
 
-        warn!("fi metadata: {:?}", fi.metadata);
-
         if let Some(cs) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM) {
-            warn!("complete_multipart_upload metadata checksums: {:?}", cs);
             let Some(checksum_type) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE) else {
                 return Err(Error::other("checksum type not found"));
             };

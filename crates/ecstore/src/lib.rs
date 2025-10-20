@@ -44,7 +44,7 @@ mod store_init;
 pub mod store_list_objects;
 pub mod store_utils;
 
-pub mod checksum;
+// pub mod checksum;
 pub mod client;
 pub mod event;
 pub mod event_notification;

@@ -20,7 +20,7 @@ use std::fmt::Write;
 use time::{OffsetDateTime, format_description};
 
 use super::utils::get_host_addr;
-use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
+use rustfs_utils::crypto::{hex, hmac_sha1};
 use s3s::Body;
 
 const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -111,7 +111,11 @@ pub fn sign_v2(
     }
 
     let auth_header = format!("{SIGN_V2_ALGORITHM} {access_key_id}:");
-    let auth_header = format!("{}{}", auth_header, base64_encode(&hmac_sha1(secret_access_key, string_to_sign)));
+    let auth_header = format!(
+        "{}{}",
+        auth_header,
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign))
+    );
 
     headers.insert("Authorization", auth_header.parse().unwrap());
 

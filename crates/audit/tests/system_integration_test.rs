@@ -52,7 +52,7 @@ async fn test_complete_audit_system_lifecycle() {
             assert_eq!(system.get_state().await, system::AuditSystemState::Running);
         }
         Err(e) => {
-            panic!("Unexpected error: {}", e);
+            panic!("Unexpected error: {e}");
         }
     }
 
@@ -103,7 +103,7 @@ async fn test_audit_log_dispatch_with_no_targets() {
             // Also acceptable since system not running
         }
         Err(e) => {
-            panic!("Unexpected error: {}", e);
+            panic!("Unexpected error: {e}");
         }
     }
 }
@@ -172,7 +172,7 @@ async fn test_config_parsing_with_multiple_instances() {
             // Expected - parsing worked but save failed
         }
         Err(e) => {
-            println!("Config parsing error: {}", e);
+            println!("Config parsing error: {e}");
             // Other errors might indicate parsing issues, but not necessarily failures
         }
         Ok(_) => {
@@ -261,7 +261,7 @@ async fn test_concurrent_operations() {
         let (i, state, is_running) = task.await.expect("Task should complete");
         assert_eq!(state, system::AuditSystemState::Stopped);
         assert!(!is_running);
-        println!("Task {} completed successfully", i);
+        println!("Task {i} completed successfully");
     }
 }
 
@@ -295,8 +295,8 @@ async fn test_performance_under_load() {
     }
 
     let elapsed = start.elapsed();
-    println!("100 concurrent dispatches took: {:?}", elapsed);
-    println!("Successes: {}, Errors: {}", success_count, error_count);
+    println!("100 concurrent dispatches took: {elapsed:?}");
+    println!("Successes: {success_count}, Errors: {error_count}");
 
     // Should complete reasonably quickly
     assert!(elapsed < Duration::from_secs(5), "Concurrent operations took too long");
@@ -318,14 +318,14 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
     use std::collections::HashMap;
 
     let mut req_header = HashMap::new();
-    req_header.insert("authorization".to_string(), format!("Bearer test-token-{}", id));
+    req_header.insert("authorization".to_string(), format!("Bearer test-token-{id}"));
     req_header.insert("content-type".to_string(), "application/octet-stream".to_string());
 
     let mut resp_header = HashMap::new();
     resp_header.insert("x-response".to_string(), "ok".to_string());
 
     let mut tags = HashMap::new();
-    tags.insert(format!("tag-{}", id), json!("sample"));
+    tags.insert(format!("tag-{id}"), json!("sample"));
 
     let mut req_query = HashMap::new();
     req_query.insert("id".to_string(), id.to_string());
@@ -333,7 +333,7 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
     let api_details = ApiDetails {
         name: Some("PutObject".to_string()),
         bucket: Some("test-bucket".to_string()),
-        object: Some(format!("test-object-{}", id)),
+        object: Some(format!("test-object-{id}")),
         status: Some("success".to_string()),
         status_code: Some(200),
         input_bytes: Some(1024),
@@ -348,7 +348,7 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
 
     AuditEntry {
         version: "1".to_string(),
-        deployment_id: Some(format!("test-deployment-{}", id)),
+        deployment_id: Some(format!("test-deployment-{id}")),
         site_name: Some("test-site".to_string()),
         time: Utc::now(),
         event: EventName::ObjectCreatedPut,
@@ -356,9 +356,9 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
         trigger: "api".to_string(),
         api: api_details,
         remote_host: Some("127.0.0.1".to_string()),
-        request_id: Some(format!("test-request-{}", id)),
+        request_id: Some(format!("test-request-{id}")),
         user_agent: Some("test-agent".to_string()),
-        req_path: Some(format!("/test-bucket/test-object-{}", id)),
+        req_path: Some(format!("/test-bucket/test-object-{id}")),
         req_host: Some("test-host".to_string()),
         req_node: Some("node-1".to_string()),
         req_claims: None,
@@ -366,8 +366,8 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
         req_header: Some(req_header),
         resp_header: Some(resp_header),
         tags: Some(tags),
-        access_key: Some(format!("AKIA{}", id)),
-        parent_user: Some(format!("parent-{}", id)),
+        access_key: Some(format!("AKIA{id}")),
+        parent_user: Some(format!("parent-{id}")),
         error: None,
     }
 }

@@ -119,7 +119,7 @@ use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tracing::warn;
+use tracing::error;
 
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
@@ -133,7 +133,7 @@ pub trait HashReaderMut {
     fn actual_size(&self) -> i64;
     fn set_actual_size(&mut self, actual_size: i64);
     fn content_hash(&self) -> &Option<Checksum>;
-    fn content_sha256(&self) -> &Option<Vec<u8>>;
+    fn content_sha256(&self) -> &Option<String>;
     fn get_trailer(&self) -> Option<&TrailingHeaders>;
     fn set_trailer(&mut self, trailer: Option<TrailingHeaders>);
 }
@@ -150,7 +150,7 @@ pin_project! {
         bytes_read: u64,
         content_hash: Option<Checksum>,
         content_hasher: Option<Box<dyn ChecksumHasher>>,
-        content_sha256: Option<Vec<u8>>,
+        content_sha256: Option<String>,
         content_sha256_hasher: Option<Sha256Hasher>,
         checksum_on_finish: bool,
 
@@ -249,7 +249,7 @@ impl HashReader {
             bytes_read: 0,
             content_hash: None,
             content_hasher: None,
-            content_sha256: sha256hex.clone().map(|hash| hash.into_bytes()),
+            content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.clone().map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
             trailer_s3s: None,
@@ -419,7 +419,7 @@ impl HashReaderMut for HashReader {
         &self.content_hash
     }
 
-    fn content_sha256(&self) -> &Option<Vec<u8>> {
+    fn content_sha256(&self) -> &Option<String> {
         &self.content_sha256
     }
 
@@ -449,10 +449,8 @@ impl AsyncRead for HashReader {
                     // Update SHA256 hasher
                     if let Some(hasher) = this.content_sha256_hasher {
                         if let Err(e) = hasher.write_all(data) {
-                            warn!("SHA256 hasher write error, error={:?}", e);
+                            error!("SHA256 hasher write error, error={:?}", e);
                             return Poll::Ready(Err(std::io::Error::other(e)));
-                        } else {
-                            warn!("SHA256 hasher write success");
                         }
                     }
 
@@ -465,21 +463,13 @@ impl AsyncRead for HashReader {
                 }
 
                 if filled == 0 && !*this.checksum_on_finish {
-                    warn!(
-                        "hashreader poll_read check sha256 and content hasher, sha256_hasher={:?}, sha256={:?}, content_hasher={:?}, content_hash={:?}",
-                        this.content_sha256_hasher.is_some(),
-                        this.content_sha256,
-                        this.content_hasher.is_some(),
-                        this.content_hash
-                    );
                     // check SHA256
                     if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
-                        let sha256 = hasher.finalize();
+                        let sha256 = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
                         if sha256 != *expected_sha256 {
-                            warn!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
-                            return Poll::Ready(Err(std::io::Error::other("SHA256 mismatch")));
+                            error!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
+                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SHA256 mismatch")));
                         }
-                        warn!("SHA256 hasher final success");
                     }
 
                     // check content hasher
@@ -491,7 +481,6 @@ impl AsyncRead for HashReader {
                                         headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string()))
                                     })
                                 }) {
-                                    warn!("Content hasher trailing checksum_str={checksum_str}");
                                     expected_content_hash.encoded = checksum_str;
                                     expected_content_hash.raw = general_purpose::STANDARD
                                         .decode(&expected_content_hash.encoded)
@@ -500,17 +489,21 @@ impl AsyncRead for HashReader {
                                     if expected_content_hash.raw.is_empty() {
                                         return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
                                     }
-
-                                    warn!("Content hasher trailing final success");
                                 }
                             }
                         } else {
                             let content_hash = hasher.finalize();
                             if content_hash != expected_content_hash.raw {
-                                warn!("Content hash mismatch, expected={:?}, actual={:?}", expected_content_hash, content_hash);
-                                return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                                error!(
+                                    "Content hash mismatch, expected={:?}, actual={:?}",
+                                    hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower),
+                                    hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower)
+                                );
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Content hash mismatch",
+                                )));
                             }
-                            warn!("Content hasher final success");
                         }
                     }
 
@@ -518,10 +511,7 @@ impl AsyncRead for HashReader {
                 }
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => {
-                warn!("hashreader poll_read error={:?}", e);
-                Poll::Ready(Err(e))
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
     }
 }

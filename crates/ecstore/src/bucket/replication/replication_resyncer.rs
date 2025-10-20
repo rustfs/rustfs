@@ -982,7 +982,7 @@ pub async fn check_replicate_delete(
     let rcfg = match get_replication_config(bucket).await {
         Ok(Some(config)) => config,
         Ok(None) => {
-            warn!("No replication config found for bucket: {}", bucket);
+            // warn!("No replication config found for bucket: {}", bucket);
             return ReplicateDecision::default();
         }
         Err(err) => {

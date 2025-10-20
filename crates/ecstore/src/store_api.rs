@@ -97,14 +97,20 @@ impl PutObjReader {
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
+        use sha2::{Digest, Sha256};
         let content_length = data.len() as i64;
+        let sha256hex = if content_length > 0 {
+            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
         PutObjReader {
             stream: HashReader::new(
                 Box::new(WarpReader::new(Cursor::new(data))),
                 content_length,
                 content_length,
                 None,
-                None,
+                sha256hex,
                 false,
             )
             .unwrap(),
@@ -904,7 +910,6 @@ impl ObjectInfo {
 
         // TODO: decrypt checksums
 
-        warn!("get object body metadata checksum: {:?}", self.checksum);
         if let Some(data) = &self.checksum {
             let (checksums, is_multipart) = rustfs_rio::read_checksums(data.as_ref(), 0);
             return Ok((checksums, is_multipart));

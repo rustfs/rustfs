@@ -186,7 +186,7 @@ impl std::fmt::Display for ParsedURL {
             s.pop();
         }
 
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 

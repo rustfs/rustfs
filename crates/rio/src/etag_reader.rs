@@ -19,6 +19,7 @@ use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+use tracing::error;
 
 pin_project! {
     pub struct  EtagReader {
@@ -60,8 +61,10 @@ impl AsyncRead for EtagReader {
                 // EOF
                 *this.finished = true;
                 if let Some(checksum) = this.checksum {
-                    let etag = format!("{:x}", this.md5.clone().finalize());
-                    if *checksum != etag {
+                    let etag = this.md5.clone().finalize().to_vec();
+                    let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
+                    if *checksum != etag_hex {
+                        error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag_hex);
                         return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Checksum mismatch")));
                     }
                 }
@@ -78,7 +81,7 @@ impl EtagResolvable for EtagReader {
     fn try_resolve_etag(&mut self) -> Option<String> {
         // EtagReader provides its own etag, not delegating to inner
         if let Some(checksum) = &self.checksum {
-            Some(checksum.clone())
+            Some(hex_simd::encode_to_string(checksum, hex_simd::AsciiCase::Lower))
         } else if self.finished {
             Some(self.get_etag())
         } else {
@@ -214,7 +217,7 @@ mod tests {
         let data = b"checksum test data";
         let mut hasher = Md5::new();
         hasher.update(data);
-        let expected = format!("{:x}", hasher.finalize());
+        let expected = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
         let reader = BufReader::new(&data[..]);
         let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, Some(expected.clone()));
@@ -233,7 +236,7 @@ mod tests {
         let wrong_checksum = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
         let reader = BufReader::new(&data[..]);
         let reader = Box::new(WarpReader::new(reader));
-        let mut etag_reader = EtagReader::new(reader, Some(wrong_checksum));
+        let mut etag_reader = EtagReader::new(reader, Some(wrong_checksum.clone()));
 
         let mut buf = Vec::new();
         // Verification failed, should return InvalidData error

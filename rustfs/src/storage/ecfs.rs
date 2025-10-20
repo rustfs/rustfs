@@ -97,7 +97,8 @@ use rustfs_targets::{
     arn::{TargetID, TargetIDError},
 };
 use rustfs_utils::http::{
-    AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5,
+    AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_CONTENT_SHA256, AMZ_META_UNENCRYPTED_CONTENT_LENGTH,
+    AMZ_META_UNENCRYPTED_CONTENT_MD5,
 };
 use rustfs_utils::{
     CompressionAlgorithm,
@@ -346,19 +347,36 @@ impl FS {
     }
 
     async fn put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let input = req.input;
+
         let PutObjectInput {
             body,
             bucket,
             key,
             version_id,
+            content_length,
+            content_md5,
             ..
-        } = req.input;
+        } = input;
+
         let event_version_id = version_id;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
 
-        // let etag_stream = EtagReader::new(body);
+        let size = match content_length {
+            Some(c) => c,
+            None => {
+                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
+                    match atoi::atoi::<i64>(val.as_bytes()) {
+                        Some(x) => x,
+                        None => return Err(s3_error!(UnexpectedContent)),
+                    }
+                } else {
+                    return Err(s3_error!(UnexpectedContent));
+                }
+            }
+        };
 
         let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
             return Err(s3_error!(InvalidArgument, "key extension not found"));
@@ -366,8 +384,34 @@ impl FS {
 
         let ext = ext.to_owned();
 
+        let md5hex = if let Some(base64_md5) = content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let sha256hex = req.headers.get(AMZ_CONTENT_SHA256).and_then(|v| {
+            v.to_str()
+                .ok()
+                .filter(|&v| v != "UNSIGNED-PAYLOAD" && v != "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+                .map(|v| v.to_string())
+        });
+
+        let actual_size = size;
+
+        let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
+
+        let mut hreader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+        if let Err(err) = hreader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+        }
+
         // TODO: support zip
-        let decoder = CompressionFormat::from_extension(&ext).get_decoder(body).map_err(|e| {
+        let decoder = CompressionFormat::from_extension(&ext).get_decoder(hreader).map_err(|e| {
             error!("get_decoder err {:?}", e);
             s3_error!(InvalidArgument, "get_decoder err")
         })?;
@@ -484,9 +528,51 @@ impl FS {
         //     Err(e) => error!("Decompression failed: {}", e),
         // }
 
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+
+        if let Some(alg) = &input.checksum_algorithm {
+            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
+            }) {
+                match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                    _ => (),
+                }
+            }
+        }
+
+        warn!(
+            "put object extract checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+        );
+
         // TODO: etag
         let output = PutObjectOutput {
-            // e_tag: Some(etag_stream.etag().await),
+            // e_tag: hreader.try_resolve_etag().map(|v| ETag::Strong(v)),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -1687,7 +1773,6 @@ impl S3 for FS {
                         ApiError::from(e)
                     })?;
 
-            warn!("get object metadata checksums: {:?}", checksums);
             for (key, checksum) in checksums {
                 if key == AMZ_CHECKSUM_TYPE {
                     checksum_type = Some(ChecksumType::from(checksum));
@@ -1814,7 +1899,6 @@ impl S3 for FS {
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        warn!("head_object info {:?}", &info);
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -1923,7 +2007,7 @@ impl S3 for FS {
         tokio::spawn(async move {
             notifier_instance().notify(event_args).await;
         });
-        warn!("head_object output {:?}", &output);
+
         Ok(S3Response::new(output))
     }
 
@@ -2177,30 +2261,6 @@ impl S3 for FS {
 
         let input = req.input;
 
-        let mut checksum: s3s::checksum::ChecksumHasher = Default::default();
-        if input.checksum_crc32.is_some() {
-            checksum.crc32 = Some(Default::default());
-        }
-        if input.checksum_crc32c.is_some() {
-            checksum.crc32c = Some(Default::default());
-        }
-        if input.checksum_sha1.is_some() {
-            checksum.sha1 = Some(Default::default());
-        }
-        if input.checksum_sha256.is_some() {
-            checksum.sha256 = Some(Default::default());
-        }
-        if input.checksum_crc64nvme.is_some() {
-            checksum.crc64nvme = Some(Default::default());
-        }
-
-        warn!("checksum algorithm={:?}", &input.checksum_algorithm);
-        warn!("checksum crc32={:?}", &input.checksum_crc32);
-        warn!("checksum crc32c={:?}", &input.checksum_crc32c);
-        warn!("checksum sha1={:?}", &input.checksum_sha1);
-        warn!("checksum sha256={:?}", &input.checksum_sha256);
-        warn!("checksum crc64nvme={:?}", input.checksum_crc64nvme);
-
         // Save SSE-C parameters before moving input
         if let Some(ref storage_class) = input.storage_class {
             if !is_valid_storage_class(storage_class.as_str()) {
@@ -2221,6 +2281,7 @@ impl S3 for FS {
             sse_customer_key,
             sse_customer_key_md5,
             ssekms_key_id,
+            content_md5,
             ..
         } = input;
 
@@ -2316,6 +2377,22 @@ impl S3 for FS {
 
         let actual_size = size;
 
+        let mut md5hex = if let Some(base64_md5) = content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let mut sha256hex = req.headers.get(AMZ_CONTENT_SHA256).and_then(|v| {
+            v.to_str()
+                .ok()
+                .filter(|&v| v != "UNSIGNED-PAYLOAD" && v != "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+                .map(|v| v.to_string())
+        });
+
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             metadata.insert(
                 format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
@@ -2323,7 +2400,7 @@ impl S3 for FS {
             );
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-            let mut hrd = HashReader::new(reader, size as i64, size as i64, None, None, false).map_err(ApiError::from)?;
+            let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
@@ -2333,10 +2410,11 @@ impl S3 for FS {
 
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
+            md5hex = None;
+            sha256hex = None;
         }
 
-        // TODO: md5 check
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if size >= 0 {
             if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
@@ -2481,10 +2559,6 @@ impl S3 for FS {
                 }
             }
         }
-
-        warn!(
-            "put object checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
-        );
 
         let output = PutObjectOutput {
             e_tag,
@@ -2838,8 +2912,24 @@ impl S3 for FS {
         }
         */
 
+        let mut md5hex = if let Some(base64_md5) = input.content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let mut sha256hex = req.headers.get(AMZ_CONTENT_SHA256).and_then(|v| {
+            v.to_str()
+                .ok()
+                .filter(|&v| v != "UNSIGNED-PAYLOAD" && v != "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+                .map(|v| v.to_string())
+        });
+
         if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
@@ -2848,9 +2938,11 @@ impl S3 for FS {
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
             reader = Box::new(compress_reader);
             size = -1;
+            md5hex = None;
+            sha256hex = None;
         }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
@@ -2901,10 +2993,6 @@ impl S3 for FS {
                 }
             }
         }
-
-        warn!(
-            "upload_part checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
-        );
 
         let output = UploadPartOutput {
             e_tag: info.etag.map(|etag| format_etag(&etag)),
@@ -3268,11 +3356,6 @@ impl S3 for FS {
         let mut uploaded_parts = Vec::new();
 
         for part in multipart_upload.parts.into_iter().flatten() {
-            warn!("TDD: Part checksum_crc32: {:?}", part.checksum_crc32);
-            warn!("TDD: Part checksum_crc32c: {:?}", part.checksum_crc32c);
-            warn!("TDD: Part checksum_sha1: {:?}", part.checksum_sha1);
-            warn!("TDD: Part checksum_sha256: {:?}", part.checksum_sha256);
-            warn!("TDD: Part checksum_crc64nvme: {:?}", part.checksum_crc64nvme);
             uploaded_parts.push(CompletePart::from(part));
         }
 
@@ -3349,7 +3432,6 @@ impl S3 for FS {
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
 
-        warn!("complete multipart upload metadata checksums: {:?}", checksums);
         for (key, checksum) in checksums {
             if key == AMZ_CHECKSUM_TYPE {
                 checksum_type = Some(ChecksumType::from(checksum));
@@ -3365,11 +3447,6 @@ impl S3 for FS {
                 _ => (),
             }
         }
-
-        warn!(
-            "complete multipart upload metadata checksums: crc32={:?}, crc32c={:?}, sha1={:?}, sha256={:?}, crc64nvme={:?}, type={:?}",
-            checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256, checksum_crc64nvme, checksum_type
-        );
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),

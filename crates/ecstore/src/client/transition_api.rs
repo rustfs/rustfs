@@ -61,7 +61,7 @@ use crate::client::{
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
 };
-use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
+use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use rustfs_rio::HashReader;
 use rustfs_utils::{
     net::get_endpoint_url,
