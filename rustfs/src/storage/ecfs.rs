@@ -2534,8 +2534,6 @@ impl S3 for FS {
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
-            checksum_algorithm,
-            checksum_type,
             ..
         } = req.input.clone();
 
