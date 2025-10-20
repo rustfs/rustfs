@@ -101,6 +101,7 @@ aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 parking_lot = { workspace = true }
 moka = { workspace = true }
+base64-simd.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

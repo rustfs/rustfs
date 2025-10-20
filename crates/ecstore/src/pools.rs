@@ -1262,6 +1262,8 @@ impl ECStore {
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
                     etag: pi.etag,
+
+                    ..Default::default()
                 };
             }
 
@@ -1289,7 +1291,7 @@ impl ECStore {
         }
 
         let reader = BufReader::new(rd.stream);
-        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, None, false)?;
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self

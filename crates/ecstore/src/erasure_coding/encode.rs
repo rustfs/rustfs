@@ -145,7 +145,9 @@ impl Erasure {
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
-                    Ok(_) => break,
+                    Ok(_) => {
+                        break;
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         break;
                     }

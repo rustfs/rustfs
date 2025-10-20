@@ -20,7 +20,7 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use rustfs_utils::{HashAlgorithm, crypto::base64_encode};
+use rustfs_utils::HashAlgorithm;
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
 use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
@@ -29,6 +29,7 @@ use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
+use crate::client::utils::base64_encode;
 use crate::client::{
     api_error_response::{ErrorResponse, http_resp_to_error_response, to_error_response},
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},

@@ -1,9 +1,4 @@
 use crate::StorageAPI;
-use crate::bucket::replication::MrfReplicateEntry;
-use crate::bucket::replication::ReplicateDecision;
-use crate::bucket::replication::ReplicateObjectInfo;
-use crate::bucket::replication::ReplicationWorkerOperation;
-use crate::bucket::replication::ResyncDecision;
 use crate::bucket::replication::ResyncOpts;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
@@ -18,16 +13,21 @@ use crate::bucket::replication::replication_resyncer::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationResyncer,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::bucket::replication::replication_statuses_map;
-use crate::bucket::replication::version_purge_statuses_map;
 use crate::config::com::read_config;
 use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
 
 use lazy_static::lazy_static;
+use rustfs_filemeta::MrfReplicateEntry;
+use rustfs_filemeta::ReplicateDecision;
+use rustfs_filemeta::ReplicateObjectInfo;
 use rustfs_filemeta::ReplicatedTargetInfo;
 use rustfs_filemeta::ReplicationStatusType;
 use rustfs_filemeta::ReplicationType;
+use rustfs_filemeta::ReplicationWorkerOperation;
+use rustfs_filemeta::ResyncDecision;
+use rustfs_filemeta::replication_statuses_map;
+use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -996,7 +996,7 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
         target_purge_statuses: purge_statuses,
         replication_timestamp: tm,
         user_tags: oi.user_tags,
-        checksum: vec![],
+        checksum: None,
         retry_count: 0,
         event_type: "".to_string(),
         existing_obj_resync: ResyncDecision::default(),

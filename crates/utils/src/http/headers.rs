@@ -176,6 +176,7 @@ pub const RUSTFS_BUCKET_REPLICATION_DELETE_MARKER: &str = "X-Rustfs-Source-Delet
 pub const RUSTFS_BUCKET_REPLICATION_PROXY_REQUEST: &str = "X-Rustfs-Source-Proxy-Request";
 pub const RUSTFS_BUCKET_REPLICATION_REQUEST: &str = "X-Rustfs-Source-Replication-Request";
 pub const RUSTFS_BUCKET_REPLICATION_CHECK: &str = "X-Rustfs-Source-Replication-Check";
+pub const RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM: &str = "X-Rustfs-Source-Replication-Ssec-Crc";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";

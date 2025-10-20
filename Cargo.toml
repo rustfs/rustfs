@@ -121,6 +121,7 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.49", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
 crc32fast = "1.5.0"
+crc64fast-nvme = "1.2.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "50.2.0"

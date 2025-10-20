@@ -160,7 +160,7 @@ impl Operation for CreateKmsKeyHandler {
                 error!("Failed to create KMS key: {}", e);
                 let response = CreateKmsKeyResponse {
                     success: false,
-                    message: format!("Failed to create key: {}", e),
+                    message: format!("Failed to create key: {e}"),
                     key_id: "".to_string(),
                     key_metadata: None,
                 };
@@ -310,7 +310,7 @@ impl Operation for DeleteKmsKeyHandler {
                 };
                 let response = DeleteKmsKeyResponse {
                     success: false,
-                    message: format!("Failed to delete key: {}", e),
+                    message: format!("Failed to delete key: {e}"),
                     key_id: request.key_id,
                     deletion_date: None,
                 };
@@ -442,7 +442,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 error!("Failed to cancel deletion for KMS key {}: {}", request.key_id, e);
                 let response = CancelKmsKeyDeletionResponse {
                     success: false,
-                    message: format!("Failed to cancel key deletion: {}", e),
+                    message: format!("Failed to cancel key deletion: {e}"),
                     key_id: request.key_id,
                     key_metadata: None,
                 };
@@ -554,7 +554,7 @@ impl Operation for ListKmsKeysHandler {
                 error!("Failed to list KMS keys: {}", e);
                 let response = ListKmsKeysResponse {
                     success: false,
-                    message: format!("Failed to list keys: {}", e),
+                    message: format!("Failed to list keys: {e}"),
                     keys: vec![],
                     truncated: false,
                     next_marker: None,
@@ -671,7 +671,7 @@ impl Operation for DescribeKmsKeyHandler {
 
                 let response = DescribeKmsKeyResponse {
                     success: false,
-                    message: format!("Failed to describe key: {}", e),
+                    message: format!("Failed to describe key: {e}"),
                     key_metadata: None,
                 };
 

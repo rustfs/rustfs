@@ -59,7 +59,7 @@ export RUSTFS_EXTERNAL_ADDRESS=":9000"
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
-export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_LOGGER_LEVEL=debug # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # Whether to enable local logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
@@ -102,7 +102,7 @@ export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
 export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
 
-export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
+# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
 
 #export RUSTFS_REGION="us-east-1"
 

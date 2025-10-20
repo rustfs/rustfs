@@ -18,7 +18,10 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 
 use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
+use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
+use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
+use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
@@ -125,14 +128,14 @@ pub async fn get_opts(
     Ok(opts)
 }
 
-fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> Result<()> {
+fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> std::io::Result<()> {
     if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
         let mut preconditions = HTTPPreconditions::default();
         if let Some(if_none_match) = headers.get("If-None-Match") {
             preconditions.if_none_match = Some(
                 if_none_match
                     .to_str()
-                    .map_err(|_| StorageError::other("Invalid If-None-Match header"))?
+                    .map_err(|_| std::io::Error::other("Invalid If-None-Match header"))?
                     .to_string(),
             );
         }
@@ -140,7 +143,7 @@ fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, op
             preconditions.if_match = Some(
                 if_match
                     .to_str()
-                    .map_err(|_| StorageError::other("Invalid If-Match header"))?
+                    .map_err(|_| std::io::Error::other("Invalid If-Match header"))?
                     .to_string(),
             );
         }
@@ -200,8 +203,32 @@ pub async fn put_opts(
     Ok(opts)
 }
 
-pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
-    let mut opts = ObjectOptions::default();
+pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> std::io::Result<ObjectOptions> {
+    let mut user_defined = HashMap::new();
+
+    let mut replication_request = false;
+    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) {
+        user_defined.insert(
+            format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"),
+            v.to_str().unwrap_or_default().to_owned(),
+        );
+        replication_request = true;
+    }
+
+    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
+        user_defined.insert(
+            RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM.to_string(),
+            v.to_str().unwrap_or_default().to_owned(),
+        );
+    }
+
+    let mut opts = ObjectOptions {
+        want_checksum: rustfs_rio::get_content_checksum(headers)?,
+        user_defined,
+        replication_request,
+        ..Default::default()
+    };
+
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
 }
