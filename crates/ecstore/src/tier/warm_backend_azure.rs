@@ -21,10 +21,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use azure_core::http::{ClientOptions, RequestContent, Body};
-use azure_identity::DeveloperToolsCredential;
+use azure_core::http::{Body, ClientOptions, RequestContent};
 use azure_storage::StorageCredentials;
-use azure_storage_blob::{BlobServiceClient, BlobClient, BlobClientOptions};
+use azure_storage_blobs::prelude::*;
 
 use crate::client::{
     admin_handler_utils::AdminError,
@@ -60,9 +59,9 @@ impl WarmBackendAzure {
         }
 
         let creds = StorageCredentials::access_key(conf.access_key.clone(), conf.secret_key.clone());
-        let client = ClientBuilder::new(conf.access_key, creds)
-                .endpoint(conf.endpoint)
-                .blob_service_client();
+        let client = ClientBuilder::new(conf.access_key.clone(), creds)
+            //.endpoint(conf.endpoint)
+            .blob_service_client();
         let client = Arc::new(client);
         Ok(Self {
             client,
@@ -104,43 +103,40 @@ impl WarmBackend for WarmBackendAzure {
     ) -> Result<String, std::io::Error> {
         let part_size = length;
         let client = self.client.clone();
-        let container_client = client.blob_container_client(self.bucket);
+        let container_client = client.container_client(self.bucket.clone());
         let blob_client = container_client.blob_client(self.get_dest(object));
-        let azure_core::http::Response(res) = blob_client
+        /*let res = blob_client
             .upload(
-                RequestContent::from(
-                    match r {
-                        ReaderImpl::Body(content_body) => {
-                            content_body.to_vec()
-                        }
-                        ReaderImpl::ObjectBody(mut content_body) => {
-                            content_body.read_all().await?
-                        }
-                    }
-                ),
+                RequestContent::from(match r {
+                    ReaderImpl::Body(content_body) => content_body.to_vec(),
+                    ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
+                }),
                 false,
                 length as u64,
                 None,
             )
-            .await else { return Err(std::io::Error::other("upload error")) };
+            .await
+        else {
+            return Err(std::io::Error::other("upload error"));
+        };*/
 
-        /*let Ok(res) = blob_client
-            .put_block_blob(
-                match r {
-                    ReaderImpl::Body(content_body) => {
-                        content_body.to_vec()
-                    }
-                    ReaderImpl::ObjectBody(mut content_body) => {
-                        content_body.read_all().await?
-                    }
+        let Ok(res) = blob_client
+        .put_block_blob(
+            match r {
+                ReaderImpl::Body(content_body) => {
+                    content_body.to_vec()
                 }
-            )
-            .content_type("text/plain")
-            .into_future()
-            .await else { return Err(std::io::Error::other("put_block_blob error")) };*/
+                ReaderImpl::ObjectBody(mut content_body) => {
+                    content_body.read_all().await?
+                }
+            }
+        )
+        .content_type("text/plain")
+        .into_future()
+        .await else { return Err(std::io::Error::other("put_block_blob error")) };
 
         //self.ToObjectError(err, object)
-        Ok(res.request_id())
+        Ok(res.request_id.to_string())
     }
 
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error> {
@@ -149,11 +145,17 @@ impl WarmBackend for WarmBackendAzure {
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         let client = self.client.clone();
+        let container_client = client.container_client(self.bucket.clone());
+        let blob_client = container_client.blob_client(self.get_dest(object));
+        blob_client.get();
         todo!();
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         let client = self.client.clone();
+        let container_client = client.container_client(self.bucket.clone());
+        let blob_client = container_client.blob_client(self.get_dest(object));
+        blob_client.delete();
         todo!();
     }
 

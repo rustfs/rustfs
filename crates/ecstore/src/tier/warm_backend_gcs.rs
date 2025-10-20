@@ -23,7 +23,10 @@ use std::sync::Arc;
 
 use google_cloud_storage as gcs;
 use google_cloud_storage::client::Storage;
-use google_cloud_storage::streaming_source::StreamingSource;
+use google_cloud_auth::credentials::Credentials;
+use google_cloud_auth::credentials::user_account::Builder;
+use std::convert::TryFrom;
+use bytes::Bytes;
 
 use crate::client::{
     admin_handler_utils::AdminError,
@@ -58,11 +61,21 @@ impl WarmBackendGCS {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
+        let authorized_user = serde_json::from_str(&conf.creds)?;
+        let credentials = Builder::new(authorized_user)
+            //.with_retry_policy(AlwaysRetry.with_attempt_limit(3))
+            //.with_backoff_policy(backoff)
+            .build()
+            .map_err(|e| std::io::Error::other(format!("Invalid credentials JSON: {}", e)))?;
+
         let Ok(client) = Storage::builder()
             .with_endpoint(conf.endpoint.clone())
-            //.with_credentials(conf.creds)
+            .with_credentials(credentials)
             .build()
-            .await else { return Err(std::io::Error::other("Storage::builder error")) };
+            .await
+        else {
+            return Err(std::io::Error::other("Storage::builder error"));
+        };
         let client = Arc::new(client);
         Ok(Self {
             client,
@@ -91,21 +104,17 @@ impl WarmBackend for WarmBackendGCS {
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
         let d = match r {
-            ReaderImpl::Body(content_body) => {
-                String::from_utf8(content_body.to_vec()).unwrap()
-            }
-            ReaderImpl::ObjectBody(mut content_body) => {
-                String::from_utf8(content_body.read_all().await?).unwrap()
-            }
+            ReaderImpl::Body(content_body) => content_body.to_vec(),
+            ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
         };
-        let Ok(res) = self.client
-            .write_object(
-                &self.bucket,
-                &self.get_dest(object),
-                d
-            )
+        let Ok(res) = self
+            .client
+            .write_object(&self.bucket, &self.get_dest(object), Bytes::from(d))
             .send_buffered()
-            .await else { return Err(std::io::Error::other("write_object error")) };
+            .await
+        else {
+            return Err(std::io::Error::other("write_object error"));
+        };
         //self.ToObjectError(err, object)
         Ok(res.generation.to_string())
     }
@@ -115,13 +124,9 @@ impl WarmBackend for WarmBackendGCS {
     }
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let Ok(mut reader) = self.client
-            .read_object(
-                &self.bucket,
-                &self.get_dest(object)
-            )
-            .send()
-            .await else { return Err(std::io::Error::other("read_object error")) };
+        let Ok(mut reader) = self.client.read_object(&self.bucket, &self.get_dest(object)).send().await else {
+            return Err(std::io::Error::other("read_object error"));
+        };
         let mut contents = Vec::new();
         while let Ok(Some(chunk)) = reader.next().await.transpose() {
             contents.extend_from_slice(&chunk);
@@ -131,12 +136,12 @@ impl WarmBackend for WarmBackendGCS {
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         /*self.client
-            .delete_object()
-            .set_bucket(&self.bucket)
-            .set_object(&self.get_dest(object))
-            //.set_generation(object.generation)
-            .send()
-            .await?;*/
+        .delete_object()
+        .set_bucket(&self.bucket)
+        .set_object(&self.get_dest(object))
+        //.set_generation(object.generation)
+        .send()
+        .await?;*/
         Ok(())
     }
 

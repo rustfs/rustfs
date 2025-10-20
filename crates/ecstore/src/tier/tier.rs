@@ -329,7 +329,7 @@ impl TierConfigMgr {
                 if creds.access_key == "" || creds.secret_key == "" {
                     return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
                 }
-                gcs.creds = creds.access_key;  //creds.creds_json
+                gcs.creds = creds.access_key; //creds.creds_json
             }
             TierType::R2 => {
                 let mut r2 = tier_config.r2.as_mut().expect("err");

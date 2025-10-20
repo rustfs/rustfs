@@ -1154,40 +1154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "azure_identity"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5c5b86f84a851bc9200d1a9e771dcb3a99ec4bcf09e320f8a199556a9ed3c54"
-dependencies = [
- "async-lock",
- "async-trait",
- "azure_core 0.29.1",
- "futures",
- "pin-project",
- "serde",
- "time",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "azure_security_keyvault_secrets"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0af4b3632c81be998e5151b2231842c59eeaa7e78e5ec7e2dc2c3cc8c7127a59"
-dependencies = [
- "async-trait",
- "azure_core 0.29.1",
- "futures",
- "rustc_version",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "typespec_client_core",
-]
-
-[[package]]
 name = "azure_storage"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1207,18 +1173,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "azure_storage_blob"
-version = "0.6.0"
+name = "azure_storage_blobs"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eac4439384310152491cccabdf42d3374b2efeb8c8e732e0ced93dcf9630042"
+checksum = "97e83c3636ae86d9a6a7962b2112e3b19eb3903915c50ce06ff54ff0a2e6a7e4"
 dependencies = [
- "async-trait",
- "azure_core 0.29.1",
+ "RustyXML",
+ "azure_core 0.21.0",
+ "azure_storage",
+ "azure_svc_blobstorage",
+ "bytes",
+ "futures",
  "serde",
+ "serde_derive",
  "serde_json",
- "typespec_client_core",
+ "time",
+ "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "azure_svc_blobstorage"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e6c6f20c5611b885ba94c7bae5e02849a267381aecb8aee577e8c35ff4064c6"
+dependencies = [
+ "azure_core 0.21.0",
+ "bytes",
+ "futures",
+ "log",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "time",
 ]
 
 [[package]]
@@ -7134,10 +7122,8 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "azure_core 0.29.1",
- "azure_identity",
- "azure_security_keyvault_secrets",
  "azure_storage",
- "azure_storage_blob",
+ "azure_storage_blobs",
  "base64 0.22.1",
  "byteorder",
  "bytes",
@@ -7149,6 +7135,7 @@ dependencies = [
  "futures",
  "futures-util",
  "glob",
+ "google-cloud-auth",
  "google-cloud-storage",
  "hex-simd",
  "hmac 0.12.1",
@@ -9491,7 +9478,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
- "quick-xml 0.31.0",
  "serde",
  "serde_json",
  "url",

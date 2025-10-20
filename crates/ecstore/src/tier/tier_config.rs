@@ -477,9 +477,9 @@ pub struct TierHuaweicloud {
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct ServicePrincipalAuth {
-  pub tenant_id:     String,
-  pub client_id:     String,
-  pub client_secret: String,
+    pub tenant_id: String,
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
