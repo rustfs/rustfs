@@ -56,22 +56,22 @@ impl Display for TierType {
             TierType::MinIO => {
                 write!(f, "MinIO")
             }
-            TierType::MinIO => {
+            TierType::Aliyun => {
                 write!(f, "Aliyun")
             }
-            TierType::MinIO => {
+            TierType::Tencent => {
                 write!(f, "Tencent")
             }
-            TierType::MinIO => {
+            TierType::Huaweicloud => {
                 write!(f, "Huaweicloud")
             }
-            TierType::MinIO => {
+            TierType::Azure => {
                 write!(f, "Azure")
             }
-            TierType::MinIO => {
+            TierType::GCS => {
                 write!(f, "GCS")
             }
-            TierType::MinIO => {
+            TierType::R2 => {
                 write!(f, "R2")
             }
             _ => {
@@ -191,7 +191,7 @@ impl Clone for TierConfig {
             }
             TierType::GCS => {
                 let mut gcs_ = self.gcs.as_ref().expect("err").clone();
-                gcs_.secret_key = "REDACTED".to_string();
+                gcs_.creds = "REDACTED".to_string();
                 gcs = Some(gcs_);
             }
             TierType::R2 => {
@@ -208,6 +208,12 @@ impl Clone for TierConfig {
             s3,
             rustfs: r,
             minio: m,
+            aliyun: aliyun,
+            tencent: tencent,
+            huaweicloud: huaweicloud,
+            azure: azure,
+            gcs: gcs,
+            r2: r2,
         }
     }
 }
@@ -481,10 +487,10 @@ pub struct ServicePrincipalAuth {
 pub struct TierAzure {
     pub name: String,
     pub endpoint: String,
-    #[serde(rename = "accountName")]
-    pub account_name: String,
-    #[serde(rename = "accountKey")]
-    pub account_key: String,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
     pub bucket: String,
     pub prefix: String,
     pub region: String,

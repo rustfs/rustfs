@@ -329,8 +329,7 @@ impl TierConfigMgr {
                 if creds.access_key == "" || creds.secret_key == "" {
                     return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
                 }
-                gcs.access_key = creds.access_key;
-                gcs.secret_key = creds.secret_key;
+                gcs.creds = creds.access_key;  //creds.creds_json
             }
             TierType::R2 => {
                 let mut r2 = tier_config.r2.as_mut().expect("err");
@@ -344,7 +343,7 @@ impl TierConfigMgr {
         }
 
         let d = new_warm_backend(&tier_config, true).await?;
-        self.tiers.insert(tier_name.to_string(), cfg);
+        self.tiers.insert(tier_name.to_string(), tier_config);
         self.driver_cache.insert(tier_name.to_string(), d);
         Ok(())
     }

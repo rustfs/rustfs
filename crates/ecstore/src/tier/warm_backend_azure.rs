@@ -21,21 +21,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use azure_core::http::ClientOptions;
+use azure_core::http::{ClientOptions, RequestContent, Body};
 use azure_identity::DeveloperToolsCredential;
-use azure_storage_blob::{BlobClient, BlobClientOptions};
-use azure_security_keyvault_secrets::{SecretClient, SecretClientOptions};
+use azure_storage::StorageCredentials;
+use azure_storage_blob::{BlobServiceClient, BlobClient, BlobClientOptions};
 
 use crate::client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
+    transition_api::{Options, ReadCloser, ReaderImpl},
 };
 use crate::tier::{
     tier_config::TierAzure,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
-    warm_backend_s3::WarmBackendS3,
 };
 use tracing::warn;
 
@@ -45,11 +43,11 @@ const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 pub struct WarmBackendAzure {
-    pub client: Arc<SecretClient>,
+    pub client: Arc<BlobServiceClient>,
     pub bucket: String,
     pub prefix: String,
     pub storage_class: String,
-};
+}
 
 impl WarmBackendAzure {
     pub async fn new(conf: &TierAzure, tier: &str) -> Result<Self, std::io::Error> {
@@ -61,16 +59,10 @@ impl WarmBackendAzure {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        let creds = DeveloperToolsCredential::new(Some(Value {
-            access_key_id: conf.access_key.clone(),
-            secret_access_key: conf.secret_key.clone(),
-        }));
-        let opts = SecretClientOptions {
-            api_vertion: "7.5".to_string(),
-            ..Default::default()
-        };
-        let client =
-            SecretClient::new(conf.endpoint, creds.clone(), Some(opts))?;
+        let creds = StorageCredentials::access_key(conf.access_key.clone(), conf.secret_key.clone());
+        let client = ClientBuilder::new(conf.access_key, creds)
+                .endpoint(conf.endpoint)
+                .blob_service_client();
         let client = Arc::new(client);
         Ok(Self {
             client,
@@ -80,17 +72,17 @@ impl WarmBackendAzure {
         })
     }
 
-    pub fn tier(&self) -> *blob.AccessTier {
-        if az.StorageClass == "" {
-          return nil
+    /*pub fn tier(&self) -> *blob.AccessTier {
+        if self.storage_class == "" {
+            return None;
         }
-        for _, t := range blob.PossibleAccessTierValues() {
-          if strings.EqualFold(az.StorageClass, string(t)) {
-            return &t
-          }
+        for t in blob.PossibleAccessTierValues() {
+            if strings.EqualFold(self.storage_class, t) {
+                return &t
+            }
         }
-        nil
-    }
+        None
+    }*/
 
     pub fn get_dest(&self, object: &str) -> String {
         let mut dest_obj = object.to_string();
@@ -110,25 +102,45 @@ impl WarmBackend for WarmBackendAzure {
         length: i64,
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
-        let part_size = optimal_part_size(length)?;
-        let client = self.0.client.clone();
-        let res = client
-            .put_object(
-                &self.0.bucket,
-                &self.0.get_dest(object),
-                r,
-                length,
-                &PutObjectOptions {
-                    storage_class: self.0.storage_class.clone(),
-                    part_size: part_size as u64,
-                    disable_content_sha256: true,
-                    user_metadata: meta,
-                    ..Default::default()
-                },
+        let part_size = length;
+        let client = self.client.clone();
+        let container_client = client.blob_container_client(self.bucket);
+        let blob_client = container_client.blob_client(self.get_dest(object));
+        let azure_core::http::Response(res) = blob_client
+            .upload(
+                RequestContent::from(
+                    match r {
+                        ReaderImpl::Body(content_body) => {
+                            content_body.to_vec()
+                        }
+                        ReaderImpl::ObjectBody(mut content_body) => {
+                            content_body.read_all().await?
+                        }
+                    }
+                ),
+                false,
+                length as u64,
+                None,
             )
-            .await?;
+            .await else { return Err(std::io::Error::other("upload error")) };
+
+        /*let Ok(res) = blob_client
+            .put_block_blob(
+                match r {
+                    ReaderImpl::Body(content_body) => {
+                        content_body.to_vec()
+                    }
+                    ReaderImpl::ObjectBody(mut content_body) => {
+                        content_body.read_all().await?
+                    }
+                }
+            )
+            .content_type("text/plain")
+            .into_future()
+            .await else { return Err(std::io::Error::other("put_block_blob error")) };*/
+
         //self.ToObjectError(err, object)
-        Ok(res.version_id)
+        Ok(res.request_id())
     }
 
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error> {
@@ -136,11 +148,13 @@ impl WarmBackend for WarmBackendAzure {
     }
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        self.0.get(object, rv, opts).await
+        let client = self.client.clone();
+        todo!();
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
-        self.0.remove(object, rv).await
+        let client = self.client.clone();
+        todo!();
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
@@ -153,7 +167,7 @@ impl WarmBackend for WarmBackendAzure {
     }
 }
 
-fn azure_to_object_error(err: Error, params: Vec<String>) -> Option<error> {
+/*fn azure_to_object_error(err: Error, params: Vec<String>) -> Option<error> {
     if err == nil {
       return nil
     }
@@ -178,9 +192,9 @@ fn azure_to_object_error(err: Error, params: Vec<String>) -> Option<error> {
     statusCode := azureErr.StatusCode
 
     azureCodesToObjectError(err, serviceCode, statusCode, bucket, object)
-}
+}*/
 
-fn azure_codes_to_object_error(err: Error, service_code: String, status_code: i32, bucket: String, object: String) -> Option<Error> {
+/*fn azure_codes_to_object_error(err: Error, service_code: String, status_code: i32, bucket: String, object: String) -> Option<Error> {
   switch serviceCode {
   case "ContainerNotFound", "ContainerBeingDeleted":
     err = BucketNotFound{Bucket: bucket}
@@ -215,4 +229,4 @@ fn azure_codes_to_object_error(err: Error, service_code: String, status_code: i3
     }
   }
   return err
-}
+}*/
