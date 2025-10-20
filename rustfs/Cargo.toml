@@ -115,6 +115,7 @@ tower-http = { workspace = true, features = [
     "catch-panic",
     "timeout",
     "limit",
+    "fs"
 ] }
 url = { workspace = true }
 urlencoding = { workspace = true }
@@ -140,6 +141,8 @@ pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+tracing-subscriber = { workspace = true }
+rustls = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

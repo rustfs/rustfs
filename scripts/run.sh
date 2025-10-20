@@ -44,7 +44,7 @@ fi
 export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS=":9000"
-export RUSTFS_CONSOLE_ENABLE=true
+export RUSTFS_CONSOLE_ENABLE=false
 export RUSTFS_CONSOLE_ADDRESS=":9001"
 export RUSTFS_EXTERNAL_ADDRESS=":9000"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
@@ -58,8 +58,8 @@ export RUSTFS_EXTERNAL_ADDRESS=":9000"
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
-export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
-export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_ENVIRONMENT=production # Environment name
+export RUSTFS_OBS_LOGGER_LEVEL=debug # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # Whether to enable local logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
@@ -119,5 +119,6 @@ fi
 
 # Start webhook server
 #cargo run --example webhook -p rustfs-notify &
+#cargo run --example console -p rustfs &
 # Start main service
 cargo run --bin rustfs

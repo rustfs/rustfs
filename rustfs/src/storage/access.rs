@@ -66,6 +66,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 })
                 .await
         {
+            println!("authorize_request DeleteObjectVersionAction denied");
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
 

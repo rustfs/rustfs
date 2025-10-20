@@ -24,13 +24,19 @@ pub async fn validate_admin_request(
     };
     for action in actions {
         match check_admin_request_auth(iam_store.clone(), headers, cred, is_owner, deny_only, action).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                return {
+                    println!("Successfully validated admin request");
+                    Ok(())
+                };
+            }
             Err(_) => {
+                println!("validate_admin_request action {:?} failed", action);
                 continue;
             }
         }
     }
-
+    println!("validate_admin_request All actions denied");
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
@@ -58,6 +64,7 @@ async fn check_admin_request_auth(
         })
         .await
     {
+        println!("check_admin_request_auth Access Denied: action={:?}, conditions={:?}", action, conditions);
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
