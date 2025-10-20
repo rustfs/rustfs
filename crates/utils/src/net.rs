@@ -14,7 +14,6 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-use std::io::Error;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
@@ -22,10 +21,6 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
     sync::{Arc, LazyLock, Mutex, RwLock},
     time::{Duration, Instant},
-};
-use std::{
-    net::Ipv6Addr,
-    sync::{Arc, LazyLock, Mutex, RwLock},
 };
 use tracing::{error, info};
 use transform_stream::AsyncTryStream;
