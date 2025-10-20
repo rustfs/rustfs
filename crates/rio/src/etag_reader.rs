@@ -44,7 +44,8 @@ impl EtagReader {
     /// Get the final md5 value (etag) as a hex string, only compute once.
     /// Can be called multiple times, always returns the same result after finished.
     pub fn get_etag(&mut self) -> String {
-        format!("{:x}", self.md5.clone().finalize())
+        let etag = self.md5.clone().finalize().to_vec();
+        hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower)
     }
 }
 
@@ -81,7 +82,7 @@ impl EtagResolvable for EtagReader {
     fn try_resolve_etag(&mut self) -> Option<String> {
         // EtagReader provides its own etag, not delegating to inner
         if let Some(checksum) = &self.checksum {
-            Some(hex_simd::encode_to_string(checksum, hex_simd::AsciiCase::Lower))
+            Some(checksum.clone())
         } else if self.finished {
             Some(self.get_etag())
         } else {

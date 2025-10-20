@@ -50,7 +50,7 @@
 //! let diskable_md5 = false;
 //!
 //! // Method 1: Simple creation (recommended for most cases)
-//! let hash_reader = HashReader::new(reader, size, actual_size, etag.clone(), diskable_md5).unwrap();
+//! let hash_reader = HashReader::new(reader, size, actual_size, etag.clone(), None, diskable_md5).unwrap();
 //!
 //! // Method 2: With manual wrapping to recreate original logic
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
@@ -71,7 +71,7 @@
 //!     // No wrapping needed
 //!     reader2
 //! };
-//! let hash_reader2 = HashReader::new(wrapped_reader, size, actual_size, etag, diskable_md5).unwrap();
+//! let hash_reader2 = HashReader::new(wrapped_reader, size, actual_size, etag.clone(), None, diskable_md5).unwrap();
 //! # });
 //! ```
 //!
@@ -88,14 +88,14 @@
 //! # tokio_test::block_on(async {
 //! let data = b"test";
 //! let reader = BufReader::new(Cursor::new(&data[..]));
-//! let hash_reader = HashReader::new(Box::new(WarpReader::new(reader)), 4, 4, None, false).unwrap();
+//! let hash_reader = HashReader::new(Box::new(WarpReader::new(reader)), 4, 4, None, None,false).unwrap();
 //!
 //! // Check if a type is a HashReader
 //! assert!(hash_reader.is_hash_reader());
 //!
 //! // Use new for compatibility (though it's simpler to use new() directly)
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
-//! let result = HashReader::new(Box::new(WarpReader::new(reader2)), 4, 4, None, false);
+//! let result = HashReader::new(Box::new(WarpReader::new(reader2)), 4, 4, None, None, false);
 //! assert!(result.is_ok());
 //! # });
 //! ```
