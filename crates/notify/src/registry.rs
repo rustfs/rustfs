@@ -16,12 +16,9 @@ use crate::Event;
 use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::{HashMap, HashSet};
-use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, notify::NOTIFY_ROUTE_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::Target;
-use rustfs_targets::TargetError;
-use rustfs_targets::target::ChannelTargetType;
+use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
 use tracing::{debug, error, info, warn};
 
 /// Registry for managing target factories
@@ -90,7 +87,9 @@ impl TargetRegistry {
         let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
         // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
-        let mut final_config = config.clone(); // Clone a configuration for aggregating the final result
+        // let final_config = config.clone(); // Clone a configuration for aggregating the final result
+        // Record the defaults for each segment so that the segment can eventually be rebuilt
+        let mut section_defaults: HashMap<String, KVS> = HashMap::new();
         // 1. Traverse all registered plants and process them by target type
         for (target_type, factory) in &self.factories {
             tracing::Span::current().record("target_type", target_type.as_str());
@@ -98,11 +97,14 @@ impl TargetRegistry {
 
             // 2. Prepare the configuration source
             // 2.1. Get the configuration segment in the file, e.g. 'notify_webhook'
-            let section_name = format!("{NOTIFY_ROUTE_PREFIX}{target_type}");
+            let section_name = format!("{NOTIFY_ROUTE_PREFIX}{target_type}").to_lowercase();
             let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
             // 2.2. Get the default configuration for that type
             let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
             debug!(?default_cfg, "Get the default configuration");
+
+            // Save defaults for eventual write back
+            section_defaults.insert(section_name.clone(), default_cfg.clone());
 
             // *** Optimization point 1: Get all legitimate fields of the current target type ***
             let valid_fields = factory.get_valid_fields();
@@ -111,7 +113,9 @@ impl TargetRegistry {
             // 3. Resolve instance IDs and configuration overrides from environment variables
             let mut instance_ids_from_env = HashSet::new();
             // 3.1. Instance discovery: Based on the '..._ENABLE_INSTANCEID' format
-            let enable_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}_{ENABLE_KEY}_").to_uppercase();
+            let enable_prefix =
+                format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}")
+                    .to_uppercase();
             for (key, value) in &all_env {
                 if value.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
                     || value.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
@@ -128,14 +132,14 @@ impl TargetRegistry {
 
             // 3.2. Parse all relevant environment variable configurations
             // 3.2.1. Build environment variable prefixes such as 'RUSTFS_NOTIFY_WEBHOOK_'
-            let env_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}_").to_uppercase();
+            let env_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}").to_uppercase();
             // 3.2.2. 'env_overrides' is used to store configurations parsed from environment variables in the format: {instance id -> {field -> value}}
             let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
             for (key, value) in &all_env {
                 if let Some(rest) = key.strip_prefix(&env_prefix) {
                     // Use rsplitn to split from the right side to properly extract the INSTANCE_ID at the end
                     // Format: <FIELD_NAME>_<INSTANCE_ID> or <FIELD_NAME>
-                    let mut parts = rest.rsplitn(2, '_');
+                    let mut parts = rest.rsplitn(2, DEFAULT_DELIMITER);
 
                     // The first part from the right is INSTANCE_ID
                     let instance_id_part = parts.next().unwrap_or(DEFAULT_DELIMITER);
@@ -224,7 +228,7 @@ impl TargetRegistry {
                 } else {
                     info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
                     // Remove disabled target from final configuration
-                    final_config.0.entry(section_name.clone()).or_default().remove(&id);
+                    // final_config.0.entry(section_name.clone()).or_default().remove(&id);
                 }
             }
         }
@@ -246,15 +250,50 @@ impl TargetRegistry {
         }
 
         // 7. Aggregate new configuration and write back to system configuration
-        if !successful_configs.is_empty() {
+        if !successful_configs.is_empty() || !section_defaults.is_empty() {
             info!(
                 "Prepare to update {} successfully created target configurations to the system configuration...",
                 successful_configs.len()
             );
-            let mut new_config = config.clone();
+
+            let mut successes_by_section: HashMap<String, HashMap<String, KVS>> = HashMap::new();
+
             for (target_type, id, kvs) in successful_configs {
                 let section_name = format!("{NOTIFY_ROUTE_PREFIX}{target_type}").to_lowercase();
-                new_config.0.entry(section_name).or_default().insert(id, (*kvs).clone());
+                successes_by_section
+                    .entry(section_name)
+                    .or_default()
+                    .insert(id.to_lowercase(), (*kvs).clone());
+            }
+
+            let mut new_config = config.clone();
+            // Collection of segments that need to be processed: Collect all segments where default items exist or where successful instances exist
+            let mut sections: HashSet<String> = HashSet::new();
+            sections.extend(section_defaults.keys().cloned());
+            sections.extend(successes_by_section.keys().cloned());
+
+            for section in sections {
+                let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
+                // Add default item
+                if let Some(default_kvs) = section_defaults.get(&section) {
+                    if !default_kvs.is_empty() {
+                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
+                    }
+                }
+
+                // Add successful instance item
+                if let Some(instances) = successes_by_section.get(&section) {
+                    for (id, kvs) in instances {
+                        section_map.insert(id.clone(), kvs.clone());
+                    }
+                }
+
+                // Empty breaks are removed and non-empty breaks are replaced entirely.
+                if section_map.is_empty() {
+                    new_config.0.remove(&section);
+                } else {
+                    new_config.0.insert(section, section_map);
+                }
             }
 
             let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {

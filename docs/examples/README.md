@@ -9,6 +9,7 @@ This directory contains practical deployment examples and configurations for Rus
 Complete Docker Compose example for deploying RustFS in a 4-node, 4-drive-per-node configuration.
 
 **Features:**
+
 - Proper disk indexing (1..4) to avoid VolumeNotFound errors
 - Startup coordination via `wait-and-start.sh` script
 - Service discovery using Docker service names
@@ -18,25 +19,47 @@ Complete Docker Compose example for deploying RustFS in a 4-node, 4-drive-per-no
 **Use Case:** Production-ready multi-node deployment for high availability and performance.
 
 **Quick Start:**
+
 ```bash
 cd docs/examples/mnmd
 docker-compose up -d
 ```
 
 **See also:**
+
 - [MNMD README](./mnmd/README.md) - Detailed usage guide
 - [MNMD CHECKLIST](./mnmd/CHECKLIST.md) - Step-by-step verification
 
 ## Other Deployment Examples
 
 For additional deployment examples, see:
-- [`examples/`](/examples/) - Root-level examples directory with:
-  - `docker-quickstart.sh` - Quick start script for basic deployments
-  - `enhanced-docker-deployment.sh` - Advanced deployment scenarios
-  - `docker-comprehensive.yml` - Docker Compose with multiple profiles
+
+- [`docker/`](./docker/) - Root-level examples directory with:
+    - `docker-quickstart.sh` - Quick start script for basic deployments, Quickstart script (basic
+      /dev/prod/status/test/cleanup)
+    - `enhanced-docker-deployment.sh` - Advanced deployment scenarios, Advanced deployment script with multiple
+      scenarios and detailed logs (basic /dev/prod/all/status/test/logs/cleanup)
+    - `enhanced-security-deployment.sh` - Production-ready scripts with TLS, throttling, and secure credential
+      generation
+    - `docker-comprehensive.yml` - Docker Compose with multiple profiles, Docker Compose files containing multiple
+      profiles (basic / dev / production / enterprise / api-only / nginx, etc.)
+    - Usage example:
+        ```bash
+        # Rapid development environment
+        ./docs/examples/docker/docker-quickstart.sh dev
+
+        # Start dev profile using Docker Compose
+        docker-compose -f docs/examples/docker/docker-comprehensive.yml --profile dev up -d
+
+        # Secure deployment
+        ./docs/examples/docker/enhanced-security-deployment.sh
+        ```
+        - Note: If the original CI or other documents refer to the old path `examples/`, please update it to
+          `docs/examples/docker/`. Relative links within the document are already in this README.
+
 - [`.docker/compose/`](/.docker/compose/) - Docker Compose configurations:
-  - `docker-compose.cluster.yaml` - Basic cluster setup
-  - `docker-compose.observability.yaml` - Observability stack integration
+    - `docker-compose.cluster.yaml` - Basic cluster setup
+    - `docker-compose.observability.yaml` - Observability stack integration
 
 ## Related Documentation
 
@@ -47,6 +70,7 @@ For additional deployment examples, see:
 ## Contributing
 
 When adding new examples:
+
 1. Create a dedicated subdirectory under `docs/examples/`
 2. Include a comprehensive README.md
 3. Provide working configuration files
@@ -56,5 +80,6 @@ When adding new examples:
 ## Support
 
 For issues or questions:
+
 - GitHub Issues: https://github.com/rustfs/rustfs/issues
-- Documentation: https://rustfs.io
+- Documentation: https://rustfs.com/docs

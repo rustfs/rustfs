@@ -37,7 +37,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 url = { workspace = true }
-once_cell = { workspace = true }
 rumqttc = { workspace = true }
 
 [lints]

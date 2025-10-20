@@ -1,0 +1,168 @@
+---
+- name: Prepare for RustFS installation
+  hosts: rustfs
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  remote_user: root
+
+  tasks:
+    - name: Create Workspace
+      file:
+        path: /opt/rustfs
+        state: directory
+        mode: '0755'
+      register: create_dir_result
+
+    - name: Dir Creation Result Check
+      debug:
+        msg: "RustFS dir created successfully"
+      when: create_dir_result.changed
+
+    - name: Modify Target Server's hosts file
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          127.0.0.1     localhost
+          172.20.92.199  rustfs-node1
+          172.20.92.200  rustfs-node2
+          172.20.92.201  rustfs-node3
+          172.20.92.202  rustfs-node4
+
+    - name: Create rustfs group
+      group:
+        name: rustfs
+        system: yes
+        state: present    
+
+    - name: Create rustfs user
+      user:
+        name: rustfs
+        shell: /bin/bash
+        system: yes
+        create_home: no
+        group: rustfs
+        state: present
+
+    - name: Get rustfs user id
+      command: id -u rustfs
+      register: rustfs_uid
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Check rustfs user id
+      debug:
+        msg: "rustfs uid is {{ rustfs_uid.stdout }}"
+
+    - name: Create volume dir
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: rustfs
+        group: rustfs
+        mode: '0755'
+      loop:
+        - /data/rustfs0
+        - /data/rustfs1
+        - /data/rustfs2
+        - /data/rustfs3
+        - /var/logs/rustfs
+
+- name: Install RustFS
+  hosts: rustfs
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    install_script_url: "https://rustfs.com/install_rustfs.sh"
+    install_script_tmp: "/opt/rustfs/install_rustfs.sh"
+  tags: rustfs_install
+
+  tasks:
+    - name: Prepare configuration file
+      copy:
+        dest: /etc/default/rustfs
+        content: |
+          RUSTFS_ACCESS_KEY=rustfsadmin
+          RUSTFS_SECRET_KEY=rustfsadmin
+          RUSTFS_VOLUMES="http://rustfs-node{1...4}:9000/data/rustfs{0...3}"
+          RUSTFS_ADDRESS=":9000"
+          RUSTFS_CONSOLE_ENABLE=true
+          RUST_LOG=error
+          RUSTFS_OBS_LOG_DIRECTORY="/var/logs/rustfs/"
+          RUSTFS_EXTERNAL_ADDRESS=0.0.0.0:9000
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Install unzip
+      apt:
+        name: unzip
+        state: present
+        update_cache: yes
+
+    - name: Download the rustfs install script
+      get_url:
+        url: "{{ install_script_url }}"
+        dest: "{{ install_script_tmp }}"
+        mode: '0755'
+    
+    - name: Run rustfs installation script
+      expect:
+        command: bash "{{install_script_tmp}}"
+        responses:
+          '.*Enter your choice.*': "1\n"
+          '.*Please enter RustFS service port.*': "9000\n"
+          '.*Please enter RustFS console port.*': "9001\n"
+          '.*Please enter data storage directory.*': "http://rustfs-node{1...4}:9000/data/rustfs{0...3}\n"
+        timeout: 300
+      register: rustfs_install_result
+      tags:
+        - rustfs_install
+
+    - name: Debug installation output
+      debug:
+        var: rustfs_install_result.stdout_lines
+
+    - name: Installation confirmation
+      command: rustfs --version
+      register: rustfs_version
+      changed_when: false
+      failed_when: rustfs_version.rc != 0
+
+    - name: Show rustfs version
+      debug:
+        msg: "RustFS version is {{ rustfs_version.stdout }}"
+
+- name: Uninstall RustFS
+  hosts: rustfs
+  become: yes
+  vars:
+    install_script_tmp: /opt/rustfs/install_rustfs.sh
+    ansible_python_interpreter: /usr/bin/python3
+  tags: rustfs_uninstall
+
+  tasks:
+    - name: Run rustfs uninstall script
+      expect:
+        command: bash "{{ install_script_tmp }}"
+        responses:
+          'Enter your choice.*': "2\n"
+          'Are you sure you want to uninstall RustFS.*': "y\n"
+      timeout: 300
+      register: rustfs_uninstall_result
+      tags: rustfs_uninstall
+
+    - name: Debug uninstall output
+      debug:
+        var: rustfs_uninstall_result.stdout_lines
+
+    - name: Delete data dir
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /data/rustfs0
+        - /data/rustfs1
+        - /data/rustfs2
+        - /data/rustfs3
+        - /var/logs/rustfs

@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-policy/latest/rustfs_policy/"
 workspace = true
 
 [dependencies]
+rustfs-config = { workspace = true, features = ["constants","opa"] }
 tokio.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -41,6 +42,10 @@ rand.workspace = true
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true }
 regex = { workspace = true }
+reqwest.workspace = true
+chrono.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 test-case.workspace = true
+temp-env = { workspace = true }
