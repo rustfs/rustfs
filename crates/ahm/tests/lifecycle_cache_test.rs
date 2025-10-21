@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use heed::byteorder::BigEndian;
+use heed::types::*;
+use heed::{BoxedError, BytesDecode, BytesEncode, Database, DatabaseFlags, Env, EnvOpenOptions};
 use rustfs_ahm::scanner::Scanner;
 use rustfs_ahm::scanner::local_scan::{self, LocalObjectRecord, LocalScanOutcome};
 use rustfs_ecstore::{
@@ -22,6 +25,7 @@ use rustfs_ecstore::{
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serial_test::serial;
+use std::borrow::Cow;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -30,9 +34,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{debug, info};
-use heed::{BoxedError, BytesDecode, BytesEncode, Database, EnvOpenOptions, DatabaseFlags};
-use heed::types::*;
 //use heed_traits::Comparator;
+use time::OffsetDateTime;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -41,8 +44,8 @@ static LIFECYCLE_EXPIRY_CURRENT_DAYS: i32 = 1;
 static LIFECYCLE_EXPIRY_NONCURRENT_DAYS: i32 = 1;
 static LIFECYCLE_TRANSITION_CURRENT_DAYS: i32 = 1;
 static LIFECYCLE_TRANSITION_NONCURRENT_DAYS: i32 = 1;
-static GLOBAL_LMDB_ENV: OnceLock<EnvOpenOptions> = OnceLock::new();
-static GLOBAL_LMDB_DB: OnceLock<Database<Str, LifecycleContentCodec>> = OnceLock::new();
+static GLOBAL_LMDB_ENV: OnceLock<Env> = OnceLock::new();
+static GLOBAL_LMDB_DB: OnceLock<Database<I128<BigEndian>, LifecycleContentCodec>> = OnceLock::new();
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -123,16 +126,15 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     //lmdb env
-    let lmdb_env = unsafe {
-        EnvOpenOptions::new()::open("lifecycle-db")?
-    };
-    let mut wtxn = lmdb_env.write_txn()?;
+    let lmdb_env = unsafe { EnvOpenOptions::new().open("lifecycle-db").unwrap() };
+    let mut wtxn = lmdb_env.write_txn().unwrap();
     let db = lmdb_env
         .database_options()
-        .types::<Str, LifecycleContentCodec>()
+        .types::<I128<BigEndian>, LifecycleContentCodec>()
         .flags(DatabaseFlags::DUP_SORT)
         //.dup_sort_comparator::<>()
-        .create(&mut wtxn)?;
+        .create(&mut wtxn)
+        .unwrap();
     wtxn.commit();
     let _ = GLOBAL_LMDB_ENV.set(lmdb_env);
     let _ = GLOBAL_LMDB_DB.set(db);
@@ -187,6 +189,7 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum LifecycleType {
     ExpiryCurrent,
     ExpiryNoncurrent,
@@ -197,9 +200,9 @@ enum LifecycleType {
 #[derive(Debug, PartialEq, Eq)]
 pub struct LifecycleContent {
     ver_id: String,
-    mod_time: OffsetDatetime,
-    tier: String,
+    mod_time: OffsetDateTime,
     type_: LifecycleType,
+    tier: String,
 }
 
 pub struct LifecycleContentCodec;
@@ -209,16 +212,56 @@ impl<'a> BytesEncode<'a> for LifecycleContentCodec {
 
     /// Encodes the u32 timestamp in big endian followed by the log level with a single byte.
     fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
-        let (ver_id_bytes, timestamp_bytes, tier_bytes, lifecycle_type) = match lcc {
-            LifecycleContent { ver_id, mod_time, tier, LifecycleType::ExpiryCurrent } => (timestamp.to_be_bytes(), 0),
-            LifecycleContent { ver_id, mod_time, tier, LifecycleType::ExpiryNoncurrent } => (timestamp.to_be_bytes(), 1),
-            LifecycleContent { ver_id, mod_time, tier, LifecycleType::TransitionCurrent } => (timestamp.to_be_bytes(), 2),
-            LifecycleContent { ver_id, mod_time, tier, LifecycleType::TransitionNoncurrent } => (timestamp.to_be_bytes(), 3),
+        let (ver_id_bytes, timestamp_bytes, type_, tier_bytes) = match lcc {
+            LifecycleContent {
+                ver_id,
+                mod_time,
+                type_: LifecycleType::ExpiryCurrent,
+                tier,
+            } => (
+                ver_id.clone().into_bytes(),
+                mod_time.unix_timestamp().to_be_bytes(),
+                0,
+                tier.clone().into_bytes(),
+            ),
+            LifecycleContent {
+                ver_id,
+                mod_time,
+                type_: LifecycleType::ExpiryNoncurrent,
+                tier,
+            } => (
+                ver_id.clone().into_bytes(),
+                mod_time.unix_timestamp().to_be_bytes(),
+                1,
+                tier.clone().into_bytes(),
+            ),
+            LifecycleContent {
+                ver_id,
+                mod_time,
+                type_: LifecycleType::TransitionCurrent,
+                tier,
+            } => (
+                ver_id.clone().into_bytes(),
+                mod_time.unix_timestamp().to_be_bytes(),
+                2,
+                tier.clone().into_bytes(),
+            ),
+            LifecycleContent {
+                ver_id,
+                mod_time,
+                type_: LifecycleType::TransitionNoncurrent,
+                tier,
+            } => (
+                ver_id.clone().into_bytes(),
+                mod_time.unix_timestamp().to_be_bytes(),
+                3,
+                tier.clone().into_bytes(),
+            ),
         };
 
         let mut output = Vec::new();
         output.extend_from_slice(&timestamp_bytes);
-        output.push(level_byte);
+        output.push(type_);
         Ok(Cow::Owned(output))
     }
 }
@@ -229,8 +272,8 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
     fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, BoxedError> {
         use std::mem::size_of;
 
-        let timestamp = match bytes.get(..size_of::<u32>()) {
-            Some(bytes) => bytes.try_into().map(u32::from_be_bytes).unwrap(),
+        let mod_time_timestamp = match bytes.get(..size_of::<i128>()) {
+            Some(bytes) => bytes.try_into().map(i128::from_be_bytes).unwrap(),
             None => return Err("invalid log key: cannot extract timestamp".into()),
         };
 
@@ -243,7 +286,12 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
             None => return Err("invalid log key: cannot extract log level".into()),
         };
 
-        Ok(LifecycleContent { ver_id, mod_time, tier, type_ })
+        Ok(LifecycleContent {
+            ver_id: "".to_string(),
+            mod_time: OffsetDateTime::from_unix_timestamp(mod_time_timestamp.try_into().unwrap()).unwrap(),
+            type_,
+            tier: "".to_string(),
+        })
     }
 }
 
@@ -278,19 +326,17 @@ mod serial_tests {
         };
         let bucket_objects_map = &scan_outcome.bucket_objects;
 
-        let records = match bucket_objects_map.get(bucket_name) {
+        let records = match bucket_objects_map.get(&bucket_name) {
             Some(records) => records,
             None => {
-                debug!(
-                    "No local snapshot entries found for bucket {}; skipping lifecycle/integrity",
-                    bucket_name
-                );
+                debug!("No local snapshot entries found for bucket {}; skipping lifecycle/integrity", bucket_name);
+                &vec![]
             }
         };
 
         if let Some(lmdb_env) = GLOBAL_LMDB_ENV.get() {
             if let Some(lmdb) = GLOBAL_LMDB_DB.get() {
-                let mut wtxn = lmdb_env.write_txn()?;
+                let mut wtxn = lmdb_env.write_txn().unwrap();
 
                 /*if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
                     if let Ok(object_info) = ecstore
@@ -323,33 +369,62 @@ mod serial_tests {
                     }
 
                     let object_info = Scanner::convert_record_to_object_info(record);
-                    rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(object_info.mod_time, 1);
+                    rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(object_info.mod_time.unwrap(), 1);
                 }
 
                 lmdb.put(
                     &mut wtxn,
-                    "123143242",
-                    &LifecycleContent { timestamp: 1608326232, level: Level::Debug },
-                )?;
-                wtxn.commit()?;
+                    &123143242,
+                    &LifecycleContent {
+                        ver_id: "aaa".to_string(),
+                        mod_time: OffsetDateTime::now_utc(),
+                        type_: LifecycleType::TransitionNoncurrent,
+                        tier: "".to_string(),
+                    },
+                )
+                .unwrap();
+                wtxn.commit().unwrap();
 
-                let rtxn = lmdb_env.read_txn()?;
-                let _ = lmdb.get(&rtxn, "123143242")?;
+                let rtxn = lmdb_env.read_txn().unwrap();
+                let _ = lmdb.get(&rtxn, &123143242).unwrap();
                 //rtxn.commit()?;
 
-                let mut wtxn = lmdb_env.write_txn()?;
-                let mut iter = lmdb.iter_mut(&mut wtxn)?;
-                let _ = iter.next().transpose()?;
-                let _ = unsafe { iter.del_curent()? };
-                let _ = unsafe { iter.put_curent(
-                    "123143242",
-                    &LifecycleContent { timestamp: 1608326232, level: Level::Debug },
-                )? };
-                let _ = lmdb.dalete(&mut wtxn, "123143242")?;
-                wtxn.commit()?;
+                let mut wtxn = lmdb_env.write_txn().unwrap();
+                let mut iter = lmdb.iter_mut(&mut wtxn).unwrap();
+                let _ = iter.next().transpose().unwrap();
+                let _ = unsafe { iter.del_current().unwrap() };
+                let _ = unsafe {
+                    iter.put_current(
+                        &123143242,
+                        &LifecycleContent {
+                            ver_id: "aaa".to_string(),
+                            mod_time: OffsetDateTime::now_utc(),
+                            type_: LifecycleType::TransitionNoncurrent,
+                            tier: "".to_string(),
+                        },
+                    )
+                    .unwrap()
+                };
+                let _ = wtxn.commit().unwrap();
+
+                let mut wtxn = lmdb_env.write_txn().unwrap();
+                let _ = lmdb.delete(&mut wtxn, &123143242).unwrap();
+                let _ = lmdb
+                    .delete_one_duplicate(
+                        &mut wtxn,
+                        &123143242,
+                        &LifecycleContent {
+                            ver_id: "aaa".to_string(),
+                            mod_time: OffsetDateTime::now_utc(),
+                            type_: LifecycleType::TransitionNoncurrent,
+                            tier: "".to_string(),
+                        },
+                    )
+                    .unwrap();
+                let _ = wtxn.commit().unwrap();
             }
         }
-        
+
         println!("Lifecycle expiry basic test completed");
     }
 }
