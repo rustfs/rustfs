@@ -7229,6 +7229,7 @@ dependencies = [
  "glob",
  "google-cloud-auth",
  "google-cloud-storage",
+ "heed",
  "hex-simd",
  "hmac 0.12.1",
  "http 1.3.1",

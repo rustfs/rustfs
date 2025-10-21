@@ -21,8 +21,9 @@
 
 use http::HeaderMap;
 use s3s::dto::ETag;
+use std::pin::Pin;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
-use std::pin::Pin;use tokio::io::BufReader;
+use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions};
@@ -159,13 +160,13 @@ pub fn to_s3s_etag(etag: &str) -> ETag {
     if let Some(rest) = etag.strip_prefix("W/\"") {
         if let Some(body) = rest.strip_suffix('"') {
             return ETag::Weak(body.to_string());
-    }
+        }
         return ETag::Weak(rest.to_string());
-}
+    }
 
     if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
         return ETag::Strong(body.to_string());
-}
+    }
 
     ETag::Strong(etag.to_string())
 }

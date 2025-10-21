@@ -31,7 +31,10 @@ use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use rustfs_ecstore::{
     bucket::{
-        lifecycle::{bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts, validate_transition_tier}, lifecycle::{self, Lifecycle, TransitionOptions}},
+        lifecycle::{
+            bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts, validate_transition_tier},
+            lifecycle::{self, Lifecycle, TransitionOptions},
+        },
         metadata::{
             BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_REPLICATION_CONFIG,
             BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
@@ -71,8 +74,8 @@ use rustfs_ecstore::{
         // RESERVED_METADATA_PREFIX,
     },
 };
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_filemeta::fileinfo::{ObjectPartInfo, RestoreStatusOps};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_kms::{
     DataKey,
     service_manager::get_global_encryption_service,
@@ -100,13 +103,16 @@ use rustfs_utils::{
     CompressionAlgorithm,
     http::{
         AMZ_BUCKET_REPLICATION_STATUS,
-        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE},
+        headers::{
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
+            RESERVED_METADATA_PREFIX_LOWER,
+        },
     },
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
-use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -1925,7 +1931,7 @@ impl S3 for FS {
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
                     let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
-                req_info.bucket = Some(info.name.clone());
+                    req_info.bucket = Some(info.name.clone());
 
                     if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
                         .await

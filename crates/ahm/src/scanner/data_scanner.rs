@@ -467,7 +467,7 @@ impl Scanner {
         });
     }
 
-    fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
+    pub fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
         if let Some(info) = &record.object_info {
             return info.clone();
         }
