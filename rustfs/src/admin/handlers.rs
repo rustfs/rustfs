@@ -431,7 +431,10 @@ impl Operation for DataUsageInfoHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::DataUsageInfoAdminAction)],
+            vec![
+                Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
+                Action::S3Action(S3Action::ListBucketAction),
+            ],
         )
         .await?;
 
