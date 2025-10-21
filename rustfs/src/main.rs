@@ -229,30 +229,31 @@ async fn run(opt: config::Opt) -> Result<()> {
     let console_shutdown_tx = shutdown_tx.clone();
     if opt.console_enable && !opt.console_address.is_empty() {
         // Deal with port mapping issues for virtual machines like docker
-        let (external_addr, external_port) = if !opt.external_address.is_empty() {
-            let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
-            let external_port = external_addr.port();
-            if external_port != server_port {
-                warn!(
-                    "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
-                    external_port, server_port
-                );
-            }
-            info!(
-                target: "rustfs::main::run",
-                external_address = %external_addr,
-                external_port = %external_port,
-                "Using external address {} for endpoint access", external_addr
-            );
-            rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
-            set_global_addr(&opt.external_address).await;
-            (external_addr.ip(), external_port)
-        } else {
-            (server_addr.ip(), server_port)
-        };
-        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
+        // let (external_addr, external_port) = if !opt.external_address.is_empty() {
+        //     let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
+        //     let external_port = external_addr.port();
+        //     if external_port != server_port {
+        //         warn!(
+        //             "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
+        //             external_port, server_port
+        //         );
+        //     }
+        //     info!(
+        //         target: "rustfs::main::run",
+        //         external_address = %external_addr,
+        //         external_port = %external_port,
+        //         "Using external address {} for endpoint access", external_addr
+        //     );
+        //     rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
+        //     set_global_addr(&opt.external_address).await;
+        //     (external_addr.ip(), external_port)
+        // } else {
+        //     (server_addr.ip(), server_port)
+        // };
+        // warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
+        let console_addr = parse_and_resolve_address(&opt.console_address)?;
         // init console configuration
-        init_console_cfg(external_addr, external_port);
+        init_console_cfg(console_addr.ip(), console_addr.port());
 
         let opt_clone = opt.clone();
         tokio::spawn(async move {

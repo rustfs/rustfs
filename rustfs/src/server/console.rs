@@ -12,11 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::console::static_handler;
+use crate::admin::console::{config_handler, license_handler, static_handler};
 use crate::config::Opt;
-use axum::{Router, extract::Request, middleware, response::Json, routing::get};
+use crate::server::proxy::{create_optimized_client, method_not_allowed, proxy_handler};
+use axum::{
+    Router,
+    body::Body,
+    extract::{Request, State},
+    middleware,
+    response::{IntoResponse, Json},
+    routing::{any, get, post},
+};
 use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderValue, Method};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_utils::net::parse_and_resolve_address;
 use serde_json::json;
@@ -35,7 +44,7 @@ use tracing::{debug, error, info, instrument, warn};
 const CONSOLE_PREFIX: &str = "/rustfs/console";
 
 /// Console access logging middleware
-async fn console_logging_middleware(req: Request, next: axum::middleware::Next) -> axum::response::Response {
+async fn console_logging_middleware(req: Request, next: middleware::Next) -> axum::response::Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let start = std::time::Instant::now();
@@ -157,13 +166,19 @@ fn setup_console_middleware_stack(
     rate_limit_enable: bool,
     rate_limit_rpm: u32,
     auth_timeout: u64,
+    client: Arc<Client<HttpConnector, Body>>,
 ) -> Router {
     let mut app = Router::new()
-        .route("/license", get(crate::admin::console::license_handler))
-        .route("/config.json", get(crate::admin::console::config_handler))
+        .route("/license", get(license_handler))
+        .route("/license", any(method_not_allowed))
+        .route("/config.json", get(config_handler))
+        .route("/config.json", any(method_not_allowed))
         .route("/health", get(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
-        .fallback_service(get(static_handler));
+        .route("/", get(root_dispatcher))
+        .route("/", post(proxy_handler))
+        .fallback(any(proxy_handler))
+        .with_state(client);
 
     // Add comprehensive middleware layers using tower-http features
     app = app
@@ -185,6 +200,21 @@ fn setup_console_middleware_stack(
     }
 
     app
+}
+
+// Create a root path intelligent distribution processor
+async fn root_dispatcher(State(client): State<Arc<Client<HttpConnector, Body>>>, req: Request) -> axum::response::Response {
+    // Extract the URI information before consuming the req
+    let uri = req.uri().clone();
+    let has_query = uri.query().map(|q| !q.is_empty()).unwrap_or(false);
+
+    if has_query {
+        // There are query parameters, which are forwarded to proxy_handler
+        proxy_handler(State(client), req).await
+    } else {
+        // No query parameters, return static pages
+        static_handler(uri).await.into_response()
+    }
 }
 
 /// Console health check handler with comprehensive health information
@@ -306,9 +336,9 @@ pub async fn start_console_server(opt: &Opt, shutdown_rx: tokio::sync::broadcast
 
     // Configure CORS based on settings
     let cors_layer = parse_cors_origins(cors_allowed_origins);
-
+    let client = Arc::new(create_optimized_client());
     // Build console router with enhanced middleware stack using tower-http features
-    let app = setup_console_middleware_stack(cors_layer, rate_limit_enable, rate_limit_rpm, auth_timeout);
+    let app = setup_console_middleware_stack(cors_layer, rate_limit_enable, rate_limit_rpm, auth_timeout, client);
 
     let local_ip = rustfs_utils::get_local_ip().unwrap_or_else(|| "127.0.0.1".parse().unwrap());
     let protocol = if tls_enabled { "https" } else { "http" };
@@ -374,6 +404,7 @@ async fn handle_tls_connections(
     }
 
     info!(target: "rustfs::console::shutdown", "Console TLS server stopped");
+    println!("rustfs::console::shutdown Console TLS server stopped");
     Ok(())
 }
 
@@ -406,5 +437,6 @@ async fn handle_plain_connections(
     }
 
     info!(target: "rustfs::console::shutdown", "Console server stopped");
+    println!("rustfs::console::shutdown Console server stopped");
     Ok(())
 }

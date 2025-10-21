@@ -223,8 +223,6 @@ fn _is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[allow(clippy::const_is_empty)]
-#[allow(dead_code)]
 #[instrument(fields(host))]
 pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme

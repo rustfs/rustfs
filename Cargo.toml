@@ -109,6 +109,7 @@ axum-extra = "0.10.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"], default-features = false }
 base64-simd = "0.8.0"
 base64 = "0.22.1"
+blake3 = { version = "1.8.2" }
 brotli = "8.0.2"
 bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.1.0"
@@ -118,7 +119,7 @@ convert_case = "0.8.0"
 crc-fast = "1.3.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.49", features = ["derive", "env"] }
+clap = { version = "4.5.50", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
 crc32fast = "1.5.0"
 criterion = { version = "0.7", features = ["html_reports"] }
@@ -144,6 +145,7 @@ hyper-util = { version = "0.1.17", features = [
     "tokio",
     "server-auto",
     "server-graceful",
+    "client-legacy",
 ] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
 http = "1.3.1"
@@ -185,7 +187,6 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = [
 parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
-blake3 = { version = "1.8.2" }
 pbkdf2 = "0.12.2"
 pin-project-lite = "0.2.16"
 prost = "0.14.1"

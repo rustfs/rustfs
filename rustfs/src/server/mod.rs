@@ -22,6 +22,7 @@ mod service_state;
 #[cfg(test)]
 mod console_test;
 mod event;
+mod proxy;
 
 pub(crate) use audit::{start_audit_system, stop_audit_system};
 pub(crate) use console::start_console_server;
