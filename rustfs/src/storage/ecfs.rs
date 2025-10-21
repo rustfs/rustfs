@@ -14,6 +14,7 @@
 
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
+use crate::storage::options::get_content_sha256;
 use crate::storage::{
     access::{ReqInfo, authorize_request},
     options::{
@@ -97,8 +98,7 @@ use rustfs_targets::{
     arn::{TargetID, TargetIDError},
 };
 use rustfs_utils::http::{
-    AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_CONTENT_SHA256, AMZ_META_UNENCRYPTED_CONTENT_LENGTH,
-    AMZ_META_UNENCRYPTED_CONTENT_MD5,
+    AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5,
 };
 use rustfs_utils::{
     CompressionAlgorithm,
@@ -393,13 +393,7 @@ impl FS {
             None
         };
 
-        let sha256hex = req.headers.get(AMZ_CONTENT_SHA256).and_then(|v| {
-            v.to_str()
-                .ok()
-                .filter(|&v| v != "UNSIGNED-PAYLOAD" && v != "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-                .map(|v| v.to_string())
-        });
-
+        let sha256hex = get_content_sha256(&req.headers);
         let actual_size = size;
 
         let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
@@ -2383,12 +2377,7 @@ impl S3 for FS {
             None
         };
 
-        let mut sha256hex = req.headers.get(AMZ_CONTENT_SHA256).and_then(|v| {
-            v.to_str()
-                .ok()
-                .filter(|&v| v != "UNSIGNED-PAYLOAD" && v != "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-                .map(|v| v.to_string())
-        });
+        let mut sha256hex = get_content_sha256(&req.headers);
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             metadata.insert(
@@ -2918,12 +2907,7 @@ impl S3 for FS {
             None
         };
 
-        let mut sha256hex = req.headers.get(AMZ_CONTENT_SHA256).and_then(|v| {
-            v.to_str()
-                .ok()
-                .filter(|&v| v != "UNSIGNED-PAYLOAD" && v != "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-                .map(|v| v.to_string())
-        });
+        let mut sha256hex = get_content_sha256(&req.headers);
 
         if is_compressible {
             let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
@@ -3776,7 +3760,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
+        let conditions = get_condition_values(&req.headers, &auth::Credentials::default(), None, None);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,

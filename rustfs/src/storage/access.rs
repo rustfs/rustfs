@@ -32,6 +32,7 @@ pub(crate) struct ReqInfo {
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
+    pub region: Option<String>,
 }
 
 /// Authorizes the request based on the action and credentials.
@@ -48,7 +49,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let conditions = get_condition_values(&req.headers, cred);
+        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None);
 
         if action == Action::S3Action(S3Action::DeleteObjectAction)
             && req_info.version_id.is_some()
@@ -104,7 +105,12 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             return Ok(());
         }
     } else {
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
+        let conditions = get_condition_values(
+            &req.headers,
+            &auth::Credentials::default(),
+            req_info.version_id.as_deref(),
+            req.region.as_deref(),
+        );
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
             if PolicySys::is_allowed(&BucketPolicyArgs {
@@ -181,6 +187,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
+            region: rustfs_ecstore::global::get_global_region(),
             ..Default::default()
         };
 

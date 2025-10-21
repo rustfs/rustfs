@@ -491,19 +491,22 @@ impl AsyncRead for HashReader {
                                     }
                                 }
                             }
-                        } else {
-                            let content_hash = hasher.finalize();
-                            if content_hash != expected_content_hash.raw {
-                                error!(
-                                    "Content hash mismatch, expected={:?}, actual={:?}",
-                                    hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower),
-                                    hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower)
-                                );
-                                return Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "Content hash mismatch",
-                                )));
-                            }
+                        }
+
+                        let content_hash = hasher.finalize();
+
+                        if content_hash != expected_content_hash.raw {
+                            error!(
+                                "Content hash mismatch, type={:?}, encoded={:?}, expected={:?}, actual={:?}",
+                                expected_content_hash.checksum_type,
+                                expected_content_hash.encoded,
+                                hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower),
+                                hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower)
+                            );
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Content hash mismatch",
+                            )));
                         }
                     }
 

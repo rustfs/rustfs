@@ -19,6 +19,7 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::SESSION_POLICY_NAME;
 use rustfs_iam::sys::get_claims_from_token_with_secret;
 use rustfs_policy::auth;
+use rustfs_utils::http::ip::get_source_ip_raw;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -28,6 +29,40 @@ use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
 use std::collections::HashMap;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+// Authentication type constants
+const JWT_ALGORITHM: &str = "Bearer ";
+const SIGN_V2_ALGORITHM: &str = "AWS ";
+const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const STREAMING_CONTENT_SHA256: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const STREAMING_CONTENT_SHA256_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+pub const UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+const ACTION_HEADER: &str = "Action";
+const AMZ_CREDENTIAL: &str = "X-Amz-Credential";
+const AMZ_ACCESS_KEY_ID: &str = "AWSAccessKeyId";
+pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+
+// Authentication type enum
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AuthType {
+    #[default]
+    Unknown,
+    Anonymous,
+    Presigned,
+    PresignedV2,
+    PostPolicy,
+    StreamingSigned,
+    Signed,
+    SignedV2,
+    #[allow(clippy::upper_case_acronyms)]
+    JWT,
+    #[allow(clippy::upper_case_acronyms)]
+    STS,
+    StreamingSignedTrailer,
+    StreamingUnsignedTrailer,
+}
 
 pub struct IAMAuth {
     simple_auth: SimpleAuth,
@@ -167,7 +202,12 @@ pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str
         .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"))
 }
 
-pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> HashMap<String, Vec<String>> {
+pub fn get_condition_values(
+    header: &HeaderMap,
+    cred: &auth::Credentials,
+    version_id: Option<&str>,
+    region: Option<&str>,
+) -> HashMap<String, Vec<String>> {
     let username = if cred.is_temp() || cred.is_service_account() {
         cred.parent_user.clone()
     } else {
@@ -190,31 +230,82 @@ pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> Has
         "Anonymous"
     };
 
+    // Get current time
+    let curr_time = OffsetDateTime::now_utc();
+    let epoch_time = curr_time.unix_timestamp();
+
+    // Use provided version ID or empty string
+    let vid = version_id.unwrap_or("");
+
+    // Determine auth type and signature version from headers
+    let (auth_type, signature_version) = determine_auth_type_and_version(header);
+
+    // Get TLS status from header
+    let is_tls = header
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s == "https")
+        .or_else(|| {
+            header
+                .get("x-forwarded-scheme")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "https")
+        })
+        .unwrap_or(false);
+
+    // Get remote address from header or use default
+    let remote_addr = header
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .or_else(|| header.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("127.0.0.1");
+
     let mut args = HashMap::new();
+
+    // Add basic time and security info
+    args.insert("CurrentTime".to_owned(), vec![curr_time.format(&Rfc3339).unwrap_or_default()]);
+    args.insert("EpochTime".to_owned(), vec![epoch_time.to_string()]);
+    args.insert("SecureTransport".to_owned(), vec![is_tls.to_string()]);
+    args.insert("SourceIp".to_owned(), vec![get_source_ip_raw(header, remote_addr)]);
+
+    // Add user agent and referer
+    if let Some(user_agent) = header.get("user-agent") {
+        args.insert("UserAgent".to_owned(), vec![user_agent.to_str().unwrap_or("").to_string()]);
+    }
+    if let Some(referer) = header.get("referer") {
+        args.insert("Referer".to_owned(), vec![referer.to_str().unwrap_or("").to_string()]);
+    }
+
+    // Add user and principal info
     args.insert("userid".to_owned(), vec![username.clone()]);
     args.insert("username".to_owned(), vec![username]);
     args.insert("principaltype".to_owned(), vec![principal_type.to_string()]);
+
+    // Add version ID
+    if !vid.is_empty() {
+        args.insert("versionid".to_owned(), vec![vid.to_string()]);
+    }
+
+    // Add signature version and auth type
+    if !signature_version.is_empty() {
+        args.insert("signatureversion".to_owned(), vec![signature_version]);
+    }
+    if !auth_type.is_empty() {
+        args.insert("authType".to_owned(), vec![auth_type]);
+    }
+
+    if let Some(lc) = region {
+        if !lc.is_empty() {
+            args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
+        }
+    }
 
     let mut clone_header = header.clone();
     if let Some(v) = clone_header.get("x-amz-signature-age") {
         args.insert("signatureAge".to_string(), vec![v.to_str().unwrap_or("").to_string()]);
         clone_header.remove("x-amz-signature-age");
     }
-
-    // TODO: parse_object_tags
-    // if let Some(_user_tags) = clone_header.get("x-amz-tagging") {
-    // TODO: parse_object_tags
-    // if let Ok(tag) = tags::parse_object_tags(user_tags.to_str().unwrap_or("")) {
-    //     let tag_map = tag.to_map();
-    //     let mut keys = Vec::new();
-    //     for (k, v) in tag_map {
-    //         args.insert(format!("ExistingObjectTag/{}", k), vec![v.clone()]);
-    //         args.insert(format!("RequestObjectTag/{}", k), vec![v.clone()]);
-    //         keys.push(k);
-    //     }
-    //     args.insert("RequestObjectTagKeys".to_string(), keys);
-    // }
-    // }
 
     for obj_lock in &[
         "x-amz-object-lock-mode",
@@ -250,37 +341,6 @@ pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> Has
         }
     }
 
-    // TODO: add from url query
-    // let mut clone_url_values = r
-    //     .uri()
-    //     .query()
-    //     .unwrap_or("")
-    //     .split('&')
-    //     .map(|s| {
-    //         let mut split = s.split('=');
-    //         (split.next().unwrap_or("").to_string(), split.next().unwrap_or("").to_string())
-    //     })
-    //     .collect::<HashMap<String, String>>();
-
-    // for obj_lock in &[
-    //     "x-amz-object-lock-mode",
-    //     "x-amz-object-lock-legal-hold",
-    //     "x-amz-object-lock-retain-until-date",
-    // ] {
-    //     if let Some(values) = clone_url_values.get(*obj_lock) {
-    //         args.insert(obj_lock.trim_start_matches("x-amz-").to_string(), vec![values.clone()]);
-    //     }
-    //     clone_url_values.remove(*obj_lock);
-    // }
-
-    // for (key, values) in clone_url_values.iter() {
-    //     if let Some(existing_values) = args.get_mut(key) {
-    //         existing_values.push(values.clone());
-    //     } else {
-    //         args.insert(key.clone(), vec![values.clone()]);
-    //     }
-    // }
-
     if let Some(claims) = &cred.claims {
         for (k, v) in claims {
             if let Some(v_str) = v.as_str() {
@@ -308,6 +368,152 @@ pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> Has
     }
 
     args
+}
+
+// Get request authentication type
+pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
+    if is_request_signature_v2(header) {
+        AuthType::SignedV2
+    } else if is_request_presigned_signature_v2(header) {
+        AuthType::PresignedV2
+    } else if is_request_sign_streaming_v4(header) {
+        AuthType::StreamingSigned
+    } else if is_request_sign_streaming_trailer_v4(header) {
+        AuthType::StreamingSignedTrailer
+    } else if is_request_unsigned_trailer_v4(header) {
+        AuthType::StreamingUnsignedTrailer
+    } else if is_request_signature_v4(header) {
+        AuthType::Signed
+    } else if is_request_presigned_signature_v4(header) {
+        AuthType::Presigned
+    } else if is_request_jwt(header) {
+        AuthType::JWT
+    } else if is_request_post_policy_signature_v4(header) {
+        AuthType::PostPolicy
+    } else if is_request_sts(header) {
+        AuthType::STS
+    } else if is_request_anonymous(header) {
+        AuthType::Anonymous
+    } else {
+        AuthType::Unknown
+    }
+}
+
+// Helper function to determine auth type and signature version
+fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
+    match get_request_auth_type(header) {
+        AuthType::JWT => ("JWT".to_string(), String::new()),
+        AuthType::SignedV2 => ("REST-HEADER".to_string(), "AWS2".to_string()),
+        AuthType::PresignedV2 => ("REST-QUERY-STRING".to_string(), "AWS2".to_string()),
+        AuthType::StreamingSigned | AuthType::StreamingSignedTrailer | AuthType::StreamingUnsignedTrailer => {
+            ("REST-HEADER".to_string(), "AWS4-HMAC-SHA256".to_string())
+        }
+        AuthType::Signed => ("REST-HEADER".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        AuthType::Presigned => ("REST-QUERY-STRING".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        AuthType::PostPolicy => ("POST".to_string(), String::new()),
+        AuthType::STS => ("STS".to_string(), String::new()),
+        AuthType::Anonymous => ("Anonymous".to_string(), String::new()),
+        AuthType::Unknown => (String::new(), String::new()),
+    }
+}
+
+// Verify if request has JWT
+fn is_request_jwt(header: &HeaderMap) -> bool {
+    if let Some(auth) = header.get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            return auth_str.starts_with(JWT_ALGORITHM);
+        }
+    }
+    false
+}
+
+// Verify if request has AWS Signature Version '4'
+fn is_request_signature_v4(header: &HeaderMap) -> bool {
+    if let Some(auth) = header.get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            return auth_str.starts_with(SIGN_V4_ALGORITHM);
+        }
+    }
+    false
+}
+
+// Verify if request has AWS Signature Version '2'
+fn is_request_signature_v2(header: &HeaderMap) -> bool {
+    if let Some(auth) = header.get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
+        }
+    }
+    false
+}
+
+// Verify if request has AWS PreSign Version '4'
+pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
+    if let Some(credential) = header.get(AMZ_CREDENTIAL) {
+        return !credential.to_str().unwrap_or("").is_empty();
+    }
+    false
+}
+
+// Verify request has AWS PreSign Version '2'
+fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
+    if let Some(access_key) = header.get(AMZ_ACCESS_KEY_ID) {
+        return !access_key.to_str().unwrap_or("").is_empty();
+    }
+    false
+}
+
+// Verify if request has AWS Post policy Signature Version '4'
+fn is_request_post_policy_signature_v4(header: &HeaderMap) -> bool {
+    if let Some(content_type) = header.get("content-type") {
+        if let Ok(ct) = content_type.to_str() {
+            return ct.contains("multipart/form-data");
+        }
+    }
+    false
+}
+
+// Verify if the request has AWS Streaming Signature Version '4'
+fn is_request_sign_streaming_v4(header: &HeaderMap) -> bool {
+    if let Some(content_sha256) = header.get("x-amz-content-sha256") {
+        if let Ok(sha256_str) = content_sha256.to_str() {
+            return sha256_str == STREAMING_CONTENT_SHA256;
+        }
+    }
+    false
+}
+
+// Verify if the request has AWS Streaming Signature Version '4' with trailer
+fn is_request_sign_streaming_trailer_v4(header: &HeaderMap) -> bool {
+    if let Some(content_sha256) = header.get("x-amz-content-sha256") {
+        if let Ok(sha256_str) = content_sha256.to_str() {
+            return sha256_str == STREAMING_CONTENT_SHA256_TRAILER;
+        }
+    }
+    false
+}
+
+// Verify if the request has AWS Streaming Signature Version '4' with unsigned content and trailer
+fn is_request_unsigned_trailer_v4(header: &HeaderMap) -> bool {
+    if let Some(content_sha256) = header.get("x-amz-content-sha256") {
+        if let Ok(sha256_str) = content_sha256.to_str() {
+            return sha256_str == UNSIGNED_PAYLOAD_TRAILER;
+        }
+    }
+    false
+}
+
+// Verify if request is STS (Security Token Service)
+fn is_request_sts(header: &HeaderMap) -> bool {
+    if let Some(action) = header.get(ACTION_HEADER) {
+        return !action.to_str().unwrap_or("").is_empty();
+    }
+    false
+}
+
+// Verify if request is anonymous
+fn is_request_anonymous(header: &HeaderMap) -> bool {
+    header.get("authorization").is_none()
 }
 
 pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> {
@@ -549,7 +755,7 @@ mod tests {
         let cred = create_test_credentials();
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(conditions.get("userid"), Some(&vec!["test-access-key".to_string()]));
         assert_eq!(conditions.get("username"), Some(&vec!["test-access-key".to_string()]));
@@ -561,7 +767,7 @@ mod tests {
         let cred = create_temp_credentials();
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(conditions.get("userid"), Some(&vec!["parent-user".to_string()]));
         assert_eq!(conditions.get("username"), Some(&vec!["parent-user".to_string()]));
@@ -573,7 +779,7 @@ mod tests {
         let cred = create_service_account_credentials();
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(conditions.get("userid"), Some(&vec!["service-parent".to_string()]));
         assert_eq!(conditions.get("username"), Some(&vec!["service-parent".to_string()]));
@@ -588,7 +794,7 @@ mod tests {
         headers.insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
         headers.insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2024-12-31T23:59:59Z"));
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["GOVERNANCE".to_string()]));
         assert_eq!(
@@ -603,7 +809,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-signature-age", HeaderValue::from_static("300"));
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(conditions.get("signatureAge"), Some(&vec!["300".to_string()]));
         // Verify the header is removed after processing
@@ -620,7 +826,7 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(conditions.get("username"), Some(&vec!["ldap-user".to_string()]));
         assert_eq!(conditions.get("groups"), Some(&vec!["group1".to_string(), "group2".to_string()]));
@@ -633,7 +839,7 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred);
+        let conditions = get_condition_values(&headers, &cred, None, None);
 
         assert_eq!(
             conditions.get("groups"),
@@ -757,5 +963,139 @@ mod tests {
         let cred = create_test_credentials();
 
         assert!(!cred.is_service_account());
+    }
+
+    #[test]
+    fn test_get_request_auth_type_jwt() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::JWT);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_signature_v2() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("AWS AKIAIOSFODNN7EXAMPLE:frJIUN8DYpKDtOLCwo//bqJZQ1iY="),
+        );
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::SignedV2);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_signature_v4() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"),
+        );
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::Signed);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_presigned_v2() {
+        let mut headers = HeaderMap::new();
+        headers.insert("AWSAccessKeyId", HeaderValue::from_static("AKIAIOSFODNN7EXAMPLE"));
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::PresignedV2);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_presigned_v4() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Amz-Credential",
+            HeaderValue::from_static("AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"),
+        );
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::Presigned);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_post_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"),
+        );
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::PostPolicy);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_streaming_signed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"));
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::StreamingSigned);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_streaming_signed_trailer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
+        );
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::StreamingSignedTrailer);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_streaming_unsigned_trailer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD-TRAILER"));
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::StreamingUnsignedTrailer);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_sts() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Action", HeaderValue::from_static("AssumeRole"));
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::STS);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_anonymous() {
+        let headers = HeaderMap::new();
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::Anonymous);
+    }
+
+    #[test]
+    fn test_get_request_auth_type_unknown() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("CustomAuth token123"));
+
+        let auth_type = get_request_auth_type(&headers);
+
+        assert_eq!(auth_type, AuthType::Unknown);
     }
 }

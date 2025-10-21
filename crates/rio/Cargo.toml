@@ -52,6 +52,7 @@ base64-simd.workspace = true
 crc64fast-nvme.workspace = true
 s3s.workspace = true
 hex-simd.workspace = true
+crc32c.workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }

@@ -645,27 +645,18 @@ impl ChecksumHasher for Crc32IeeeHasher {
 }
 
 /// CRC32 Castagnoli hasher
-pub struct Crc32CastagnoliHasher {
-    hasher: crc32fast::Hasher,
-}
-
-impl Default for Crc32CastagnoliHasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Default)]
+pub struct Crc32CastagnoliHasher(u32);
 
 impl Crc32CastagnoliHasher {
     pub fn new() -> Self {
-        Self {
-            hasher: crc32fast::Hasher::new_with_initial(0),
-        }
+        Self::default()
     }
 }
 
 impl Write for Crc32CastagnoliHasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
+        self.0 = crc32c::crc32c_append(self.0, buf);
         Ok(buf.len())
     }
 
@@ -676,11 +667,11 @@ impl Write for Crc32CastagnoliHasher {
 
 impl ChecksumHasher for Crc32CastagnoliHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.hasher.clone().finalize().to_be_bytes().to_vec()
+        self.0.to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.hasher = crc32fast::Hasher::new_with_initial(0);
+        self.0 = 0;
     }
 }
 
