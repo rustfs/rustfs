@@ -147,7 +147,7 @@ pub fn get_source_ip_raw(headers: &HeaderMap, remote_addr: &str) -> String {
 /// and falls back to remote_addr when necessary.
 pub fn get_source_ip(headers: &HeaderMap, remote_addr: &str) -> String {
     let addr = get_source_ip_raw(headers, remote_addr);
-    if addr.contains(':') { format!("[{}]", addr) } else { addr }
+    if addr.contains(':') { format!("[{addr}]") } else { addr }
 }
 
 #[cfg(test)]
