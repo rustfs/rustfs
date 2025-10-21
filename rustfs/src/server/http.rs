@@ -462,7 +462,13 @@ fn process_connection(
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
                                 span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
                             }
-                            debug!("Request Header: {}: {:?}", header_name, header_value);
+                            let sensitive_headers = ["set-cookie", "authorization", "cookie"];
+                            if !sensitive_headers
+                                .iter()
+                                .any(|&h| h.eq_ignore_ascii_case(header_name.as_str()))
+                            {
+                                debug!("Request Header: {}: {:?}", header_name, header_value);
+                            }
                         }
                         span
                     })
@@ -473,14 +479,24 @@ fn process_connection(
                             key_request_uri_path = %request.uri().path().to_owned(),
                             "handle request api total",
                         );
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        debug!("Request URI: {}", request.uri());
+                        debug!(
+                            "http started method: {}, Request URI: {}, url path: {}",
+                            request.method(),
+                            request.uri(),
+                            request.uri().path()
+                        );
                     })
                     .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
                         _span.record("http response status_code", tracing::field::display(response.status()));
                         debug!("http response generated in {:?}", latency);
                         for (header_name, header_value) in response.headers() {
-                            debug!("response Header: {}: {:?}", header_name, header_value);
+                            let sensitive_headers = ["set-cookie", "authorization", "cookie"];
+                            if !sensitive_headers
+                                .iter()
+                                .any(|&h| h.eq_ignore_ascii_case(header_name.as_str()))
+                            {
+                                debug!("response Header: {}: {:?}", header_name, header_value);
+                            }
                         }
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
