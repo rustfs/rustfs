@@ -202,7 +202,13 @@ fn setup_console_middleware_stack(
     app
 }
 
-// Create a root path intelligent distribution processor
+/// Root path dispatcher - intelligently routes requests based on query parameters
+/// # Arguments
+/// * `State(client)` - Shared Hyper client state
+/// * `req` - The incoming request
+/// # Returns:
+/// * `Response` - The response from static handler or proxy handler
+///
 async fn root_dispatcher(State(client): State<Arc<Client<HttpConnector, Body>>>, req: Request) -> axum::response::Response {
     // Extract the URI information before consuming the req
     let uri = req.uri().clone();
@@ -257,6 +263,13 @@ async fn health_check() -> Json<serde_json::Value> {
 }
 
 /// Parse CORS allowed origins from configuration
+///
+/// # Arguments
+/// * `origins` - Optional string of comma-separated origins or "*"
+///
+/// # Returns:
+/// * `CorsLayer` - Configured CORS layer
+///
 pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
@@ -300,6 +313,13 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
 }
 
 /// Start the standalone console server with enhanced security and monitoring
+/// # Arguments
+/// * `opt` - Configuration options
+/// * `shutdown_rx` - Shutdown signal receiver
+///
+/// # Returns:
+/// * `Result<()>` - Result indicating success or failure
+///
 #[instrument(skip(opt, shutdown_rx))]
 pub async fn start_console_server(opt: &Opt, shutdown_rx: tokio::sync::broadcast::Receiver<()>) -> Result<()> {
     if !opt.console_enable {

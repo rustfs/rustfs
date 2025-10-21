@@ -88,7 +88,7 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
 
     debug!("Forward the request to:{}", target_uri_str);
 
-    // 解析目标 URI
+    // Parse the target URI
     let target_uri: Uri = match target_uri_str.parse() {
         Ok(u) => u,
         Err(e) => {
@@ -103,7 +103,7 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
         .uri(target_uri.clone())
         .version(req.version());
 
-    // Smart Replication Headers（Filter hop-by-hop headers）
+    // Smart Replication Headers (Filter hop-by-hop headers)
     let headers_to_skip = [header::CONNECTION, header::UPGRADE, header::TRANSFER_ENCODING];
 
     // Copy headers
@@ -117,7 +117,7 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
     }
     debug!("Retweeted {} headers", header_count);
 
-    // Remove body: Use the original body directly, support streaming forwarding (efficient, no buffering)
+    // Extract body for forwarding: Use the original body directly, support streaming forwarding (efficient, no buffering)
     debug!("The request body is ready for forwarding");
     let body = req.into_body();
     // Build a Hyper request

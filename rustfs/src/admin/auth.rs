@@ -25,10 +25,8 @@ pub async fn validate_admin_request(
     for action in actions {
         match check_admin_request_auth(iam_store.clone(), headers, cred, is_owner, deny_only, action).await {
             Ok(_) => {
-                return {
-                    tracing::info!("Successfully validated admin request");
-                    Ok(())
-                };
+                tracing::info!("Successfully validated admin request");
+                return Ok(());
             }
             Err(_) => {
                 tracing::info!("validate_admin_request action {:?} failed", action);
