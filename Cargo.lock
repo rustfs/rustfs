@@ -6773,6 +6773,7 @@ dependencies = [
  "base64 0.22.1",
  "base64-simd",
  "bytes",
+ "crc32c",
  "crc32fast",
  "crc64fast-nvme",
  "futures",

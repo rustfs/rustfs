@@ -38,10 +38,11 @@ const SIGN_V2_ALGORITHM: &str = "AWS ";
 const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const STREAMING_CONTENT_SHA256: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_CONTENT_SHA256_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
-const UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+pub const UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const ACTION_HEADER: &str = "Action";
 const AMZ_CREDENTIAL: &str = "X-Amz-Credential";
 const AMZ_ACCESS_KEY_ID: &str = "AWSAccessKeyId";
+pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
 // Authentication type enum
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -447,7 +448,7 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
 }
 
 // Verify if request has AWS PreSign Version '4'
-fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
+pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
     }
