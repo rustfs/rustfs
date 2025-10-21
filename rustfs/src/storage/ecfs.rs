@@ -4983,12 +4983,17 @@ fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<
             continue;
         }
 
-        // let lower_key = k.to_ascii_lowercase();
-        // if lower_key.starts_with("x-amz-meta-") || lower_key.starts_with("x-rustfs-meta-") {
-        //     filtered_metadata.insert(lower_key, v.to_string());
-        // }
+        let lower_key = k.to_ascii_lowercase();
+        if let Some(key) = lower_key.strip_prefix("x-amz-meta-") {
+            filtered_metadata.insert(key.to_string(), v.to_string());
+            continue;
+        }
 
-        filtered_metadata.insert(k.clone(), v.clone());
+        if let Some(key) = lower_key.strip_prefix("x-rustfs-meta-") {
+            filtered_metadata.insert(key.to_string(), v.to_string());
+        }
+
+        // filtered_metadata.insert(k.clone(), v.clone());
     }
     if filtered_metadata.is_empty() {
         None

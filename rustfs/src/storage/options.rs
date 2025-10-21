@@ -285,17 +285,13 @@ pub fn extract_metadata_from_mime_with_object_name(
     object_name: Option<&str>,
 ) {
     for (k, v) in headers.iter() {
-        if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
-            if key.is_empty() {
-                continue;
-            }
-
-            metadata.insert(key.to_owned(), String::from_utf8_lossy(v.as_bytes()).to_string());
+        if k.as_str().starts_with("x-amz-meta-") {
+            metadata.insert(k.to_owned().to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
             continue;
         }
 
-        if let Some(key) = k.as_str().strip_prefix("x-rustfs-meta-") {
-            metadata.insert(key.to_owned(), String::from_utf8_lossy(v.as_bytes()).to_string());
+        if k.as_str().starts_with("x-rustfs-meta-") {
+            metadata.insert(k.to_owned().to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
             continue;
         }
 
