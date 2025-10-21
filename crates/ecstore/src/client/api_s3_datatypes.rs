@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
-use crate::checksum::ChecksumMode;
+use crate::client::checksum::ChecksumMode;
 use crate::client::transition_api::ObjectMultipartInfo;
-use rustfs_utils::crypto::base64_decode;
+use crate::client::utils::base64_decode;
 
 use super::transition_api;
 

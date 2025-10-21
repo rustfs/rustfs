@@ -144,7 +144,7 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let conditions = get_condition_values(&req.headers, &cred_clone);
+        let conditions = get_condition_values(&req.headers, &cred_clone, None, None);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -431,7 +431,10 @@ impl Operation for DataUsageInfoHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::DataUsageInfoAdminAction)],
+            vec![
+                Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
+                Action::S3Action(S3Action::ListBucketAction),
+            ],
         )
         .await?;
 

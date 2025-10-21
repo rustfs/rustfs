@@ -57,7 +57,7 @@ async fn test_config_parsing_webhook() {
         }
         Err(e) => {
             // Other errors might indicate parsing issues
-            println!("Unexpected error: {}", e);
+            println!("Unexpected error: {e}");
         }
         Ok(_) => {
             // Unexpected success in test environment without server storage
@@ -103,6 +103,6 @@ fn test_enable_value_parsing() {
 
     for (input, expected) in test_cases {
         let result = matches!(input.to_lowercase().as_str(), "1" | "on" | "true" | "yes");
-        assert_eq!(result, expected, "Failed for input: {}", input);
+        assert_eq!(result, expected, "Failed for input: {input}");
     }
 }

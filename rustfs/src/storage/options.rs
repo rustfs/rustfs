@@ -17,8 +17,16 @@ use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 
+use crate::auth::UNSIGNED_PAYLOAD;
+use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
 use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
+use rustfs_policy::service_type::ServiceType;
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use rustfs_utils::http::AMZ_CONTENT_SHA256;
+use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
+use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
+use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
@@ -26,6 +34,10 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
 use uuid::Uuid;
+
+use crate::auth::AuthType;
+use crate::auth::get_request_auth_type;
+use crate::auth::is_request_presigned_signature_v4;
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -125,14 +137,14 @@ pub async fn get_opts(
     Ok(opts)
 }
 
-fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> Result<()> {
+fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> std::io::Result<()> {
     if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
         let mut preconditions = HTTPPreconditions::default();
         if let Some(if_none_match) = headers.get("If-None-Match") {
             preconditions.if_none_match = Some(
                 if_none_match
                     .to_str()
-                    .map_err(|_| StorageError::other("Invalid If-None-Match header"))?
+                    .map_err(|_| std::io::Error::other("Invalid If-None-Match header"))?
                     .to_string(),
             );
         }
@@ -140,7 +152,7 @@ fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, op
             preconditions.if_match = Some(
                 if_match
                     .to_str()
-                    .map_err(|_| StorageError::other("Invalid If-Match header"))?
+                    .map_err(|_| std::io::Error::other("Invalid If-Match header"))?
                     .to_string(),
             );
         }
@@ -200,8 +212,32 @@ pub async fn put_opts(
     Ok(opts)
 }
 
-pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
-    let mut opts = ObjectOptions::default();
+pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> std::io::Result<ObjectOptions> {
+    let mut user_defined = HashMap::new();
+
+    let mut replication_request = false;
+    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) {
+        user_defined.insert(
+            format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"),
+            v.to_str().unwrap_or_default().to_owned(),
+        );
+        replication_request = true;
+    }
+
+    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
+        user_defined.insert(
+            RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM.to_string(),
+            v.to_str().unwrap_or_default().to_owned(),
+        );
+    }
+
+    let mut opts = ObjectOptions {
+        want_checksum: rustfs_rio::get_content_checksum(headers)?,
+        user_defined,
+        replication_request,
+        ..Default::default()
+    };
+
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
 }
@@ -385,6 +421,100 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
     } else {
         Err(s3_error!(InvalidArgument, "Invalid range format"))
     }
+}
+
+pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<String> {
+    match get_request_auth_type(headers) {
+        AuthType::Presigned | AuthType::Signed => {
+            if skip_content_sha256_cksum(headers) {
+                None
+            } else {
+                Some(get_content_sha256_cksum(headers, ServiceType::S3))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// skip_content_sha256_cksum returns true if caller needs to skip
+/// payload checksum, false if not.
+fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
+    let content_sha256 = if is_request_presigned_signature_v4(headers) {
+        // For presigned requests, check query params first, then headers
+        // Note: In a real implementation, you would need to check query parameters
+        // For now, we'll just check headers
+        headers.get(AMZ_CONTENT_SHA256)
+    } else {
+        headers.get(AMZ_CONTENT_SHA256)
+    };
+
+    // Skip if no header was set
+    let Some(header_value) = content_sha256 else {
+        return true;
+    };
+
+    let Ok(value) = header_value.to_str() else {
+        return true;
+    };
+
+    // If x-amz-content-sha256 is set and the value is not
+    // 'UNSIGNED-PAYLOAD' we should validate the content sha256.
+    match value {
+        v if v == UNSIGNED_PAYLOAD || v == UNSIGNED_PAYLOAD_TRAILER => true,
+        v if v == EMPTY_STRING_SHA256_HASH => {
+            // some broken clients set empty-sha256
+            // with > 0 content-length in the body,
+            // we should skip such clients and allow
+            // blindly such insecure clients only if
+            // S3 strict compatibility is disabled.
+
+            // We return true only in situations when
+            // deployment has asked RustFS to allow for
+            // such broken clients and content-length > 0.
+            // For now, we'll assume strict compatibility is disabled
+            // In a real implementation, you would check a global config
+            if let Some(content_length) = headers.get("content-length") {
+                if let Ok(length_str) = content_length.to_str() {
+                    if let Ok(length) = length_str.parse::<i64>() {
+                        return length > 0; // && !global_server_ctxt.strict_s3_compat
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Returns SHA256 for calculating canonical-request.
+fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
+    if service_type == ServiceType::STS {
+        // For STS requests, we would need to read the body and calculate SHA256
+        // This is a simplified implementation - in practice you'd need access to the request body
+        // For now, we'll return a placeholder
+        return "sts-body-sha256-placeholder".to_string();
+    }
+
+    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4(headers) {
+        // For a presigned request we look at the query param for sha256.
+        // X-Amz-Content-Sha256, if not set in presigned requests, checksum
+        // will default to 'UNSIGNED-PAYLOAD'.
+        (UNSIGNED_PAYLOAD.to_string(), headers.get(AMZ_CONTENT_SHA256))
+    } else {
+        // X-Amz-Content-Sha256, if not set in signed requests, checksum
+        // will default to sha256([]byte("")).
+        (EMPTY_STRING_SHA256_HASH.to_string(), headers.get(AMZ_CONTENT_SHA256))
+    };
+
+    // We found 'X-Amz-Content-Sha256' return the captured value.
+    if let Some(header_value) = content_sha256 {
+        if let Ok(value) = header_value.to_str() {
+            return value.to_string();
+        }
+    }
+
+    // We couldn't find 'X-Amz-Content-Sha256'.
+    default_sha256_cksum
 }
 
 #[cfg(test)]

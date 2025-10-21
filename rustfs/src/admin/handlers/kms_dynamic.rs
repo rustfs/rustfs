@@ -65,7 +65,7 @@ impl Operation for ConfigureKmsHandler {
                 Ok(req) => req,
                 Err(e) => {
                     error!("Invalid JSON in configure request: {}", e);
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {}", e)))));
+                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
                 }
             }
         };
@@ -92,7 +92,7 @@ impl Operation for ConfigureKmsHandler {
                 (true, "KMS configured successfully".to_string(), status)
             }
             Err(e) => {
-                let error_msg = format!("Failed to configure KMS: {}", e);
+                let error_msg = format!("Failed to configure KMS: {e}");
                 error!("{}", error_msg);
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
@@ -155,7 +155,7 @@ impl Operation for StartKmsHandler {
                 Ok(req) => req,
                 Err(e) => {
                     error!("Invalid JSON in start request: {}", e);
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {}", e)))));
+                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
                 }
             }
         };
@@ -205,14 +205,14 @@ impl Operation for StartKmsHandler {
                             (true, "KMS service restarted successfully".to_string(), status)
                         }
                         Err(e) => {
-                            let error_msg = format!("Failed to restart KMS service: {}", e);
+                            let error_msg = format!("Failed to restart KMS service: {e}");
                             error!("{}", error_msg);
                             let status = service_manager.get_status().await;
                             (false, error_msg, status)
                         }
                     },
                     Err(e) => {
-                        let error_msg = format!("Failed to stop KMS service for restart: {}", e);
+                        let error_msg = format!("Failed to stop KMS service for restart: {e}");
                         error!("{}", error_msg);
                         let status = service_manager.get_status().await;
                         (false, error_msg, status)
@@ -227,7 +227,7 @@ impl Operation for StartKmsHandler {
                         (true, "KMS service started successfully".to_string(), status)
                     }
                     Err(e) => {
-                        let error_msg = format!("Failed to start KMS service: {}", e);
+                        let error_msg = format!("Failed to start KMS service: {e}");
                         error!("{}", error_msg);
                         let status = service_manager.get_status().await;
                         (false, error_msg, status)
@@ -296,7 +296,7 @@ impl Operation for StopKmsHandler {
                 (true, "KMS service stopped successfully".to_string(), status)
             }
             Err(e) => {
-                let error_msg = format!("Failed to stop KMS service: {}", e);
+                let error_msg = format!("Failed to stop KMS service: {e}");
                 error!("{}", error_msg);
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)
@@ -436,7 +436,7 @@ impl Operation for ReconfigureKmsHandler {
                 Ok(req) => req,
                 Err(e) => {
                     error!("Invalid JSON in reconfigure request: {}", e);
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {}", e)))));
+                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
                 }
             }
         };
@@ -463,7 +463,7 @@ impl Operation for ReconfigureKmsHandler {
                 (true, "KMS reconfigured and restarted successfully".to_string(), status)
             }
             Err(e) => {
-                let error_msg = format!("Failed to reconfigure KMS: {}", e);
+                let error_msg = format!("Failed to reconfigure KMS: {e}");
                 error!("{}", error_msg);
                 let status = service_manager.get_status().await;
                 (false, error_msg, status)

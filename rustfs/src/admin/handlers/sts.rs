@@ -21,7 +21,6 @@ use matchit::Params;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
-use rustfs_utils::crypto::base64_encode;
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -175,7 +174,10 @@ pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str
             return Err(s3_error!(InvalidRequest, "policy too large"));
         }
 
-        claims.insert(SESSION_POLICY_NAME.to_string(), serde_json::Value::String(base64_encode(&policy_buf)));
+        claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            serde_json::Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+        );
     }
 
     Ok(())

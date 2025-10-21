@@ -15,9 +15,12 @@
 use crate::error::{Error, Result};
 use crate::fileinfo::{ErasureAlgo, ErasureInfo, FileInfo, FileInfoVersions, ObjectPartInfo, RawFileInfo};
 use crate::filemeta_inline::InlineData;
-use crate::{ReplicationStatusType, VersionPurgeStatusType};
+use crate::{
+    ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+};
 use byteorder::ByteOrder;
 use bytes::Bytes;
+use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use rustfs_utils::http::headers::{
     self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX,
     RESERVED_METADATA_PREFIX_LOWER, VERSION_PURGE_STATUS_KEY,
@@ -30,6 +33,7 @@ use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::{collections::HashMap, io::Cursor};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
 use tracing::error;
 use uuid::Uuid;
@@ -1742,7 +1746,25 @@ impl MetaObject {
             }
         }
 
-        // todo: ReplicationState,Delete
+        let replication_state_internal = get_internal_replication_state(&metadata);
+
+        let mut deleted = false;
+
+        if let Some(v) = replication_state_internal.as_ref() {
+            if !v.composite_version_purge_status().is_empty() {
+                deleted = true;
+            }
+
+            let st = v.composite_replication_status();
+            if !st.is_empty() {
+                metadata.insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), st.to_string());
+            }
+        }
+
+        let checksum = self
+            .meta_sys
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}crc").as_str())
+            .map(|v| Bytes::from(v.clone()));
 
         let erasure = ErasureInfo {
             algorithm: self.erasure_algorithm.to_string(),
@@ -1754,6 +1776,26 @@ impl MetaObject {
             ..Default::default()
         };
 
+        let transition_status = self
+            .meta_sys
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}").as_str())
+            .map(|v| String::from_utf8_lossy(v).to_string())
+            .unwrap_or_default();
+        let transitioned_objname = self
+            .meta_sys
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}").as_str())
+            .map(|v| String::from_utf8_lossy(v).to_string())
+            .unwrap_or_default();
+        let transition_version_id = self
+            .meta_sys
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}").as_str())
+            .map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());
+        let transition_tier = self
+            .meta_sys
+            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}").as_str())
+            .map(|v| String::from_utf8_lossy(v).to_string())
+            .unwrap_or_default();
+
         FileInfo {
             version_id,
             erasure,
@@ -1764,6 +1806,13 @@ impl MetaObject {
             volume: volume.to_string(),
             parts,
             metadata,
+            replication_state_internal,
+            deleted,
+            checksum,
+            transition_status,
+            transitioned_objname,
+            transition_version_id,
+            transition_tier,
             ..Default::default()
         }
     }
@@ -1904,6 +1953,38 @@ impl From<FileInfo> for MetaObject {
             }
         }
 
+        if !value.transition_status.is_empty() {
+            meta_sys.insert(
+                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"),
+                value.transition_status.as_bytes().to_vec(),
+            );
+        }
+
+        if !value.transitioned_objname.is_empty() {
+            meta_sys.insert(
+                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"),
+                value.transitioned_objname.as_bytes().to_vec(),
+            );
+        }
+
+        if let Some(vid) = &value.transition_version_id {
+            meta_sys.insert(
+                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"),
+                vid.as_bytes().to_vec(),
+            );
+        }
+
+        if !value.transition_tier.is_empty() {
+            meta_sys.insert(
+                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"),
+                value.transition_tier.as_bytes().to_vec(),
+            );
+        }
+
+        if let Some(content_hash) = value.checksum {
+            meta_sys.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}crc"), content_hash.to_vec());
+        }
+
         Self {
             version_id: value.version_id,
             data_dir: value.data_dir,
@@ -1927,6 +2008,50 @@ impl From<FileInfo> for MetaObject {
     }
 }
 
+fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
+    let mut rs = ReplicationState::default();
+    let mut has = false;
+
+    for (k, v) in metadata.iter() {
+        if k == VERSION_PURGE_STATUS_KEY {
+            rs.version_purge_status_internal = Some(v.clone());
+            rs.purge_targets = version_purge_statuses_map(v.as_str());
+            has = true;
+            continue;
+        }
+
+        if let Some(sub_key) = k.strip_prefix(RESERVED_METADATA_PREFIX_LOWER) {
+            match sub_key {
+                "replica-timestamp" => {
+                    has = true;
+                    rs.replica_timestamp = Some(OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
+                }
+                "replica-status" => {
+                    has = true;
+                    rs.replica_status = ReplicationStatusType::from(v.as_str());
+                }
+                "replication-timestamp" => {
+                    has = true;
+                    rs.replication_timestamp = Some(OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+                }
+                "replication-status" => {
+                    has = true;
+                    rs.replication_status_internal = Some(v.clone());
+                    rs.targets = replication_statuses_map(v.as_str());
+                }
+                _ => {
+                    if let Some(arn) = sub_key.strip_prefix("replication-reset-") {
+                        has = true;
+                        rs.reset_statuses_map.insert(arn.to_string(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if has { Some(rs) } else { None }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct MetaDeleteMarker {
     #[serde(rename = "ID")]
@@ -1939,24 +2064,51 @@ pub struct MetaDeleteMarker {
 
 impl MetaDeleteMarker {
     pub fn free_version(&self) -> bool {
-        self.meta_sys.contains_key(FREE_VERSION_META_HEADER)
+        self.meta_sys
+            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}{FREE_VERSION}").as_str())
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, _all_parts: bool) -> FileInfo {
-        let metadata = self.meta_sys.clone();
+        let metadata = self
+            .meta_sys
+            .clone()
+            .into_iter()
+            .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
+            .collect();
+        let replication_state_internal = get_internal_replication_state(&metadata);
 
-        FileInfo {
+        let mut fi = FileInfo {
             version_id: self.version_id.filter(|&vid| !vid.is_nil()),
             name: path.to_string(),
             volume: volume.to_string(),
             deleted: true,
             mod_time: self.mod_time,
-            metadata: metadata
-                .into_iter()
-                .map(|(k, v)| (k, String::from_utf8_lossy(&v).to_string()))
-                .collect(),
+            metadata,
+            replication_state_internal,
             ..Default::default()
+        };
+
+        if self.free_version() {
+            fi.set_tier_free_version();
+            fi.transition_tier = self
+                .meta_sys
+                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}").as_str())
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .unwrap_or_default();
+
+            fi.transitioned_objname = self
+                .meta_sys
+                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}").as_str())
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .unwrap_or_default();
+
+            fi.transition_version_id = self
+                .meta_sys
+                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}").as_str())
+                .map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());
         }
+
+        fi
     }
 
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
@@ -2159,8 +2311,6 @@ pub enum Flags {
     UsesDataDir = 1 << 1,
     InlineData = 1 << 2,
 }
-
-const FREE_VERSION_META_HEADER: &str = "free-version";
 
 // mergeXLV2Versions
 pub fn merge_file_meta_versions(

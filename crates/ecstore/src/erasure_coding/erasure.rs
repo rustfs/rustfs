@@ -468,15 +468,21 @@ impl Erasure {
             let mut buf = vec![0u8; block_size];
             match rustfs_utils::read_full(&mut *reader, &mut buf).await {
                 Ok(n) if n > 0 => {
+                    warn!("encode_stream_callback_async read n={}", n);
                     total += n;
                     let res = self.encode_data(&buf[..n]);
                     on_block(res).await?
                 }
-                Ok(_) => break,
+                Ok(_) => {
+                    warn!("encode_stream_callback_async read unexpected ok");
+                    break;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    warn!("encode_stream_callback_async read unexpected eof");
                     break;
                 }
                 Err(e) => {
+                    warn!("encode_stream_callback_async read error={:?}", e);
                     on_block(Err(e)).await?;
                     break;
                 }
