@@ -3776,7 +3776,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
+        let conditions = get_condition_values(&req.headers, &auth::Credentials::default(), None, None);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,

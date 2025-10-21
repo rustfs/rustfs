@@ -42,7 +42,7 @@ async fn check_admin_request_auth(
     deny_only: bool,
     action: Action,
 ) -> S3Result<()> {
-    let conditions = get_condition_values(headers, cred);
+    let conditions = get_condition_values(headers, cred, None, None);
 
     if !iam_store
         .is_allowed(&Args {
