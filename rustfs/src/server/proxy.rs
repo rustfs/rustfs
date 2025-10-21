@@ -54,10 +54,10 @@ pub(crate) fn create_optimized_client() -> Client<HttpConnector, Body> {
 ///
 #[instrument]
 pub(crate) async fn method_not_allowed(req: Request) -> Response {
-    error!("The method does not allow:{} {}", req.method(), req.uri());
+    error!("Method not allowed: {} {}", req.method(), req.uri());
     (
         StatusCode::METHOD_NOT_ALLOWED,
-        format!("The method does not allow:{} {}", req.method(), req.uri()),
+        format!("Method not allowed: {} {}", req.method(), req.uri()),
     )
         .into_response()
 }
@@ -86,14 +86,14 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
     };
     let target_uri_str = format!("{}{}", target_host, path_and_query);
 
-    debug!("Forward the request to:{}", target_uri_str);
+    debug!("Forwarding request to:{}", target_uri_str);
 
     // Parse the target URI
     let target_uri: Uri = match target_uri_str.parse() {
         Ok(u) => u,
         Err(e) => {
-            error!("Invalid request path URI: {}", e);
-            return (StatusCode::BAD_REQUEST, format!("Invalid request path URI:{}", e)).into_response();
+            error!("Failed to parse target URI: {}", e);
+            return (StatusCode::BAD_REQUEST, format!("Failed to parse target URI:{}", e)).into_response();
         }
     };
     debug!("Proxy forwarding: {} {} -> {}", method, original_uri, target_uri);
@@ -115,7 +115,7 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
             header_count += 1;
         }
     }
-    debug!("Retweeted {} headers", header_count);
+    debug!("Forwarded {} headers", header_count);
 
     // Extract body for forwarding: Use the original body directly, support streaming forwarding (efficient, no buffering)
     debug!("The request body is ready for forwarding");
@@ -124,8 +124,8 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
     let hyper_req = match builder.body(body) {
         Ok(r) => r,
         Err(e) => {
-            error!("Proxy request build fails:{}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Proxy request build fails:{}", e)).into_response();
+            error!("Failed to build proxy request:{}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build proxy request:{}", e)).into_response();
         }
     };
 
@@ -141,7 +141,7 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
 
             let mut resp = Response::builder().status(status);
 
-            // Copy the response headers (Filter hop-by-hop headers)
+            // Copy the response headers (filter hop-by-hop headers)
             for (k, v) in headers.iter() {
                 if !headers_to_skip.contains(k) {
                     resp = resp.header(k, v);
@@ -153,22 +153,22 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
             match resp.body(Body::new(body_stream)) {
                 Ok(response) => response,
                 Err(e) => {
-                    error!("Build response failed:{}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Build response failed").into_response()
+                    error!("Failed to build response:{}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response").into_response()
                 }
             }
         }
         Ok(Err(e)) => {
             if e.is_connect() {
-                error!("Unable to connect to upstream services:{}", e);
+                error!("Unable to connect to upstream service:{}", e);
                 (StatusCode::BAD_GATEWAY, "Upstream service connection failed").into_response()
             } else {
-                error!("The proxy request failed:{}", e);
+                error!("Proxy request failed:{}", e);
                 (StatusCode::BAD_GATEWAY, format!("Proxy error:{}", e)).into_response()
             }
         }
         Err(_) => {
-            error!("Agent request total timeout");
+            error!("Proxy request timed out");
             (StatusCode::GATEWAY_TIMEOUT, "Request timeout").into_response()
         }
     }

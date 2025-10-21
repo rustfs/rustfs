@@ -215,7 +215,7 @@ async fn root_dispatcher(State(client): State<Arc<Client<HttpConnector, Body>>>,
     let has_query = uri.query().map(|q| !q.is_empty()).unwrap_or(false);
 
     if has_query {
-        // There are query parameters, which are forwarded to proxy_handler
+        // Has query parameters, forward to proxy_handler
         proxy_handler(State(client), req).await
     } else {
         // No query parameters, return static pages
