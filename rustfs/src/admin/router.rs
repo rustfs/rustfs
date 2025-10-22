@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::routing::get;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -32,10 +31,9 @@ use tower::Service;
 use tracing::error;
 
 use crate::admin::ADMIN_PREFIX;
-use crate::admin::console;
+use crate::admin::console::CONSOLE_PREFIX;
+use crate::admin::console::make_console_server;
 use crate::admin::rpc::RPC_PREFIX;
-
-const CONSOLE_PREFIX: &str = "/rustfs/console";
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -48,12 +46,7 @@ impl<T: Operation> S3Router<T> {
         let router = Router::new();
 
         let console_router = if console_enabled {
-            Some(
-                axum::Router::new()
-                    .nest(CONSOLE_PREFIX, axum::Router::new().fallback_service(get(console::static_handler)))
-                    .fallback_service(get(console::static_handler))
-                    .into_service::<Body>(),
-            )
+            Some(make_console_server().into_service::<Body>())
         } else {
             None
         };
