@@ -1140,6 +1140,7 @@ impl ECStore {
                 .await
             {
                 if !is_err_bucket_exists(&err) {
+                    error!("decommission: make bucket failed: {err}");
                     return Err(err);
                 }
             }
