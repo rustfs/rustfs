@@ -390,9 +390,9 @@ fn setup_console_middleware_stack(
     auth_timeout: u64,
 ) -> Router {
     let mut app = Router::new()
-        .route("/license", get(crate::admin::console::license_handler))
-        .route("/config.json", get(crate::admin::console::config_handler))
-        .route("/health", get(health_check))
+        .route(&format!("{CONSOLE_PREFIX}/license"), get(crate::admin::console::license_handler))
+        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(crate::admin::console::config_handler))
+        .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
