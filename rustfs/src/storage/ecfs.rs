@@ -14,7 +14,7 @@
 
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
-use crate::storage::options::get_content_sha256;
+use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
     access::{ReqInfo, authorize_request},
     options::{
@@ -97,9 +97,7 @@ use rustfs_targets::{
     EventName,
     arn::{TargetID, TargetIDError},
 };
-use rustfs_utils::http::{
-    AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5,
-};
+use rustfs_utils::http::{AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE};
 use rustfs_utils::{
     CompressionAlgorithm,
     http::{
@@ -109,7 +107,6 @@ use rustfs_utils::{
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
-use s3s::header::{X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::{
     collections::HashMap,
@@ -4951,34 +4948,6 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
         }
     }
     false
-}
-
-fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
-    let mut filtered_metadata = HashMap::new();
-    for (k, v) in metadata {
-        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
-            continue;
-        }
-        if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
-            continue;
-        }
-
-        if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
-            continue;
-        }
-
-        // let lower_key = k.to_ascii_lowercase();
-        // if lower_key.starts_with("x-amz-meta-") || lower_key.starts_with("x-rustfs-meta-") {
-        //     filtered_metadata.insert(lower_key, v.to_string());
-        // }
-
-        filtered_metadata.insert(k.clone(), v.clone());
-    }
-    if filtered_metadata.is_empty() {
-        None
-    } else {
-        Some(filtered_metadata)
-    }
 }
 
 #[cfg(test)]
