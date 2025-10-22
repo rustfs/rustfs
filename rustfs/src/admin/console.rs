@@ -379,7 +379,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 }
 
 pub fn is_console_path(path: &str) -> bool {
-    path == "/health" || path == "/license" || path == "/config.json" || path.starts_with(CONSOLE_PREFIX)
+    path.starts_with(CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
