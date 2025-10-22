@@ -72,14 +72,11 @@ impl Operation for ConfigureKmsHandler {
 
         info!("Configuring KMS with request: {:?}", configure_request);
 
-        let service_manager = match get_global_kms_service_manager() {
-            Some(manager) => manager,
-            None => {
-                warn!("KMS service manager not initialized, initializing now as fallback");
-                // Initialize the service manager as a fallback
-                rustfs_kms::init_global_kms_service_manager()
-            }
-        };
+        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
+            warn!("KMS service manager not initialized, initializing now as fallback");
+            // Initialize the service manager as a fallback
+            rustfs_kms::init_global_kms_service_manager()
+        });
 
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
@@ -162,14 +159,11 @@ impl Operation for StartKmsHandler {
 
         info!("Starting KMS service with force: {:?}", start_request.force);
 
-        let service_manager = match get_global_kms_service_manager() {
-            Some(manager) => manager,
-            None => {
-                warn!("KMS service manager not initialized, initializing now as fallback");
-                // Initialize the service manager as a fallback
-                rustfs_kms::init_global_kms_service_manager()
-            }
-        };
+        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
+            warn!("KMS service manager not initialized, initializing now as fallback");
+            // Initialize the service manager as a fallback
+            rustfs_kms::init_global_kms_service_manager()
+        });
 
         // Check if already running and force flag
         let current_status = service_manager.get_status().await;
@@ -280,14 +274,11 @@ impl Operation for StopKmsHandler {
 
         info!("Stopping KMS service");
 
-        let service_manager = match get_global_kms_service_manager() {
-            Some(manager) => manager,
-            None => {
-                warn!("KMS service manager not initialized, initializing now as fallback");
-                // Initialize the service manager as a fallback
-                rustfs_kms::init_global_kms_service_manager()
-            }
-        };
+        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
+            warn!("KMS service manager not initialized, initializing now as fallback");
+            // Initialize the service manager as a fallback
+            rustfs_kms::init_global_kms_service_manager()
+        });
 
         let (success, message, status) = match service_manager.stop().await {
             Ok(()) => {
@@ -348,14 +339,11 @@ impl Operation for GetKmsStatusHandler {
 
         info!("Getting KMS service status");
 
-        let service_manager = match get_global_kms_service_manager() {
-            Some(manager) => manager,
-            None => {
-                warn!("KMS service manager not initialized, initializing now as fallback");
-                // Initialize the service manager as a fallback
-                rustfs_kms::init_global_kms_service_manager()
-            }
-        };
+        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
+            warn!("KMS service manager not initialized, initializing now as fallback");
+            // Initialize the service manager as a fallback
+            rustfs_kms::init_global_kms_service_manager()
+        });
 
         let status = service_manager.get_status().await;
         let config = service_manager.get_config().await;
@@ -443,14 +431,11 @@ impl Operation for ReconfigureKmsHandler {
 
         info!("Reconfiguring KMS with request: {:?}", configure_request);
 
-        let service_manager = match get_global_kms_service_manager() {
-            Some(manager) => manager,
-            None => {
-                warn!("KMS service manager not initialized, initializing now as fallback");
-                // Initialize the service manager as a fallback
-                rustfs_kms::init_global_kms_service_manager()
-            }
-        };
+        let service_manager = get_global_kms_service_manager().unwrap_or_else(|| {
+            warn!("KMS service manager not initialized, initializing now as fallback");
+            // Initialize the service manager as a fallback
+            rustfs_kms::init_global_kms_service_manager()
+        });
 
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();

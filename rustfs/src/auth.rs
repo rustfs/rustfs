@@ -598,7 +598,7 @@ mod tests {
         // The struct should be created successfully
         // We can't easily test internal state without exposing it,
         // but we can test it doesn't panic on creation
-        assert_eq!(std::mem::size_of_val(&iam_auth), std::mem::size_of::<IAMAuth>());
+        assert_eq!(size_of_val(&iam_auth), size_of::<IAMAuth>());
     }
 
     #[tokio::test]
