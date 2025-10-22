@@ -16,6 +16,10 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
+use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
+use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
+use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
@@ -323,6 +327,39 @@ pub fn extract_metadata_from_mime_with_object_name(
             "binary/octet-stream".to_owned()
         };
         metadata.insert("content-type".to_owned(), default_content_type);
+    }
+}
+
+pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    let mut filtered_metadata = HashMap::new();
+    for (k, v) in metadata {
+        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+            continue;
+        }
+        if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
+            continue;
+        }
+
+        if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
+            continue;
+        }
+
+        let lower_key = k.to_ascii_lowercase();
+        if let Some(key) = lower_key.strip_prefix("x-amz-meta-") {
+            filtered_metadata.insert(key.to_string(), v.to_string());
+            continue;
+        }
+        if let Some(key) = lower_key.strip_prefix("x-rustfs-meta-") {
+            filtered_metadata.insert(key.to_string(), v.to_string());
+            continue;
+        }
+
+        filtered_metadata.insert(k.clone(), v.clone());
+    }
+    if filtered_metadata.is_empty() {
+        None
+    } else {
+        Some(filtered_metadata)
     }
 }
 
