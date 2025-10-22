@@ -32,6 +32,7 @@ use tracing::error;
 
 use crate::admin::ADMIN_PREFIX;
 use crate::admin::console::CONSOLE_PREFIX;
+use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
 use crate::admin::rpc::RPC_PREFIX;
 
@@ -85,7 +86,7 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
-        if method == Method::GET && uri.path() == "/health" {
+        if method == Method::GET && is_console_path(uri.path()) {
             return true;
         }
 
@@ -104,7 +105,7 @@ where
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         // Allow unauthenticated access to health check
-        if req.method == Method::GET && req.uri.path() == "/health" {
+        if req.method == Method::GET && is_console_path(req.uri.path()) {
             return Ok(());
         }
         // Allow unauthenticated access to console static files if console is enabled
@@ -132,7 +133,7 @@ where
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+        if self.console_enabled && is_console_path(req.uri.path()) {
             if let Some(console_router) = &self.console_router {
                 let mut console_router = console_router.clone();
                 let req = convert_request(req);

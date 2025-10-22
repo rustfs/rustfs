@@ -378,6 +378,10 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
     (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins)
 }
 
+pub fn is_console_path(path: &str) -> bool {
+    path == "/health" || path == "/license" || path == "/config.json" || path.starts_with(CONSOLE_PREFIX)
+}
+
 /// Setup comprehensive middleware stack with tower-http features
 fn setup_console_middleware_stack(
     cors_layer: CorsLayer,
