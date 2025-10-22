@@ -15,42 +15,12 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use crate::server::start_console_server;
     use clap::Parser;
-    use tokio::time::{Duration, timeout};
-
-    #[tokio::test]
-    async fn test_console_server_can_start_and_stop() {
-        // Test that console server can be started and shut down gracefully
-        let args = vec!["rustfs", "/tmp/test", "--console-address", ":0"]; // Use port 0 for auto-assignment
-        let opt = Opt::parse_from(args);
-
-        let (tx, rx) = tokio::sync::broadcast::channel(1);
-
-        // Start console server in a background task
-        let handle = tokio::spawn(async move { start_console_server(&opt, rx).await });
-
-        // Give it a moment to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Send shutdown signal
-        let _ = tx.send(());
-
-        // Wait for server to shut down
-        let result = timeout(Duration::from_secs(5), handle).await;
-
-        assert!(result.is_ok(), "Console server should shutdown gracefully");
-        let server_result = result.unwrap();
-        assert!(server_result.is_ok(), "Console server should not have errors");
-        let final_result = server_result.unwrap();
-        assert!(final_result.is_ok(), "Console server should complete successfully");
-    }
 
     #[tokio::test]
     async fn test_console_cors_configuration() {
         // Test CORS configuration parsing
-        use crate::server::console::parse_cors_origins;
-
+        use crate::admin::console::parse_cors_origins;
         // Test wildcard origin
         let cors_wildcard = Some("*".to_string());
         let _layer1 = parse_cors_origins(cors_wildcard.as_ref());

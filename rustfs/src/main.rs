@@ -25,10 +25,9 @@ mod storage;
 mod update;
 mod version;
 
-use crate::admin::console::init_console_cfg;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_console_server, start_http_server, stop_audit_system, wait_for_shutdown,
+    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
@@ -224,53 +223,21 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
-    let shutdown_tx = start_http_server(&opt, state_manager.clone()).await?;
-    // Start console server if enabled
-    let console_shutdown_tx = shutdown_tx.clone();
-    if opt.console_enable && !opt.console_address.is_empty() {
-        // Deal with port mapping issues for virtual machines like docker
-        let (external_addr, external_port) = if !opt.external_address.is_empty() {
-            let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
-            let external_port = external_addr.port();
-            if external_port != server_port {
-                warn!(
-                    "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
-                    external_port, server_port
-                );
-            }
-            info!(
-                target: "rustfs::main::run",
-                external_address = %external_addr,
-                external_port = %external_port,
-                "Using external address {} for endpoint access", external_addr
-            );
-            rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
-            set_global_addr(&opt.external_address).await;
-            (external_addr.ip(), external_port)
-        } else {
-            (server_addr.ip(), server_port)
-        };
-        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
-        // init console configuration
-        init_console_cfg(external_addr, external_port);
+    let s3_shutdown_tx = {
+        let mut s3_opt = opt.clone();
+        s3_opt.console_enable = false;
+        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone()).await?;
+        Some(s3_shutdown_tx)
+    };
 
-        let opt_clone = opt.clone();
-        tokio::spawn(async move {
-            let console_shutdown_rx = console_shutdown_tx.subscribe();
-            if let Err(e) = start_console_server(&opt_clone, console_shutdown_rx).await {
-                error!("Console server failed to start: {}", e);
-            }
-        });
+    let console_shutdown_tx = if opt.console_enable && !opt.console_address.is_empty() {
+        let mut console_opt = opt.clone();
+        console_opt.address = console_opt.console_address.clone();
+        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone()).await?;
+        Some(console_shutdown_tx)
     } else {
-        info!("Console server is disabled.");
-        info!("You can access the RustFS API at {}", &opt.address);
-        info!("For more information, visit https://rustfs.com/docs/");
-        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
-        info!(
-            "Current console address is set to: '{}' ,console enable is set to: '{}'",
-            &opt.console_address, &opt.console_enable
-        );
-    }
+        None
+    };
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
@@ -379,11 +346,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -405,7 +372,8 @@ fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
-    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -462,7 +430,12 @@ async fn handle_shutdown(
         target: "rustfs::main::handle_shutdown",
         "Server is stopping..."
     );
-    let _ = shutdown_tx.send(());
+    if let Some(s3_shutdown_tx) = s3_shutdown_tx {
+        let _ = s3_shutdown_tx.send(());
+    }
+    if let Some(console_shutdown_tx) = console_shutdown_tx {
+        let _ = console_shutdown_tx.send(());
+    }
 
     // Wait for the worker thread to complete the cleaning work
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

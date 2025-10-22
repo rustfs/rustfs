@@ -19,6 +19,9 @@ pub mod router;
 mod rpc;
 pub mod utils;
 
+#[cfg(test)]
+mod console_test;
+
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
     GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,

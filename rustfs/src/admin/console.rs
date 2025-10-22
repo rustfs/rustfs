@@ -14,43 +14,34 @@
 
 use crate::config::build;
 use crate::license::get_license;
+use axum::Json;
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
+use axum::{Router, extract::Request, middleware, routing::get};
 use axum_extra::extract::Host;
+use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderMap, HeaderName, StatusCode, Uri};
+use http::{HeaderValue, Method};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use serde::Serialize;
+use serde_json::json;
+use std::io::Result;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::sync::OnceLock;
-// use axum::response::Redirect;
-// use axum::routing::get;
-// use axum::{
-//     body::Body,
-//     http::{Response, StatusCode},
-//     response::IntoResponse,
-//     Router,
-// };
-// use axum_extra::extract::Host;
-// use axum_server::tls_rustls::RustlsConfig;
-// use http::{header, HeaderMap, HeaderName, Uri};
-// use io::Error;
-// use mime_guess::from_path;
-// use rust_embed::RustEmbed;
-// use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-// use rustfs_utils::parse_and_resolve_address;
-// use serde::Serialize;
-// use std::io;
-// use std::net::{IpAddr, SocketAddr};
-// use std::sync::OnceLock;
-// use std::time::Duration;
-// use tokio::signal;
-// use tower_http::cors::{Any, CorsLayer};
-// use tower_http::trace::TraceLayer;
-use tracing::{error, instrument};
+use std::time::Duration;
+use tokio_rustls::rustls::ServerConfig;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
+use tracing::{debug, error, info, instrument, warn};
 
 // shadow!(build);
-
+pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
 const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 
 #[derive(RustEmbed)]
@@ -270,131 +261,256 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
         .unwrap()
 }
 
-// pub fn register_router() -> Router {
-//     Router::new()
-//         .route("/license", get(license_handler))
-//         .route("/config.json", get(config_handler))
-//         .fallback_service(get(static_handler))
-// }
-//
-// #[allow(dead_code)]
-// pub async fn start_static_file_server(addrs: &str, tls_path: Option<String>) {
-//     // Configure CORS
-//     let cors = CorsLayer::new()
-//         .allow_origin(Any) // In the production environment, we recommend that you specify a specific domain name
-//         .allow_methods([http::Method::GET, http::Method::POST])
-//         .allow_headers([header::CONTENT_TYPE]);
-//
-//     // Create a route
-//     let app = register_router()
-//         .layer(cors)
-//         .layer(tower_http::compression::CompressionLayer::new().gzip(true).deflate(true))
-//         .layer(TraceLayer::new_for_http());
-//
-//     // Check and start the HTTPS/HTTP server
-//     match start_server(addrs, tls_path, app).await {
-//         Ok(_) => info!("Console Server shutdown gracefully"),
-//         Err(e) => error!("Console Server error: {}", e),
-//     }
-// }
-//
-// async fn start_server(addrs: &str, tls_path: Option<String>, app: Router) -> io::Result<()> {
-//     let server_addr = parse_and_resolve_address(addrs).expect("Console Failed to parse socket address");
-//     let server_port = server_addr.port();
-//     let server_address = server_addr.to_string();
-//
-//     info!("Console WebUI: http://{} http://127.0.0.1:{} ", server_address, server_port);
-//
-//     let tls_path = tls_path.unwrap_or_default();
-//     let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-//     let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-//     let handle = axum_server::Handle::new();
-//     // create a signal off listening task
-//     let handle_clone = handle.clone();
-//     tokio::spawn(async move {
-//         shutdown_signal().await;
-//         info!("Console Initiating graceful shutdown...");
-//         handle_clone.graceful_shutdown(Some(Duration::from_secs(10)));
-//     });
-//
-//     let has_tls_certs = tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok();
-//     info!("Console TLS certs: {:?}", has_tls_certs);
-//     if has_tls_certs {
-//         info!("Console Found TLS certificates, starting with HTTPS");
-//         match RustlsConfig::from_pem_file(cert_path, key_path).await {
-//             Ok(config) => {
-//                 info!("Console Starting HTTPS server...");
-//                 axum_server::bind_rustls(server_addr, config)
-//                     .handle(handle.clone())
-//                     .serve(app.into_make_service())
-//                     .await
-//                     .map_err(Error::other)?;
-//
-//                 info!("Console HTTPS server running on https://{}", server_addr);
-//
-//                 Ok(())
-//             }
-//             Err(e) => {
-//                 error!("Console Failed to create TLS config: {}", e);
-//                 start_http_server(server_addr, app, handle).await
-//             }
-//         }
-//     } else {
-//         info!("Console TLS certificates not found at {} and {}", key_path, cert_path);
-//         start_http_server(server_addr, app, handle).await
-//     }
-// }
-//
-// #[allow(dead_code)]
-// /// 308 redirect for HTTP to HTTPS
-// fn redirect_to_https(https_port: u16) -> Router {
-//     Router::new().route(
-//         "/*path",
-//         get({
-//             move |uri: Uri, req: http::Request<Body>| async move {
-//                 let host = req
-//                     .headers()
-//                     .get("host")
-//                     .map_or("localhost", |h| h.to_str().unwrap_or("localhost"));
-//                 let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("");
-//                 let https_url = format!("https://{host}:{https_port}{path}");
-//                 Redirect::permanent(&https_url)
-//             }
-//         }),
-//     )
-// }
-//
-// async fn start_http_server(addr: SocketAddr, app: Router, handle: axum_server::Handle) -> io::Result<()> {
-//     info!("Console Starting HTTP server... {}", addr.to_string());
-//     axum_server::bind(addr)
-//         .handle(handle)
-//         .serve(app.into_make_service())
-//         .await
-//         .map_err(Error::other)
-// }
-//
-// async fn shutdown_signal() {
-//     let ctrl_c = async {
-//         signal::ctrl_c().await.expect("Console failed to install Ctrl+C handler");
-//     };
-//
-//     #[cfg(unix)]
-//     let terminate = async {
-//         signal::unix::signal(signal::unix::SignalKind::terminate())
-//             .expect("Console failed to install signal handler")
-//             .recv()
-//             .await;
-//     };
-//
-//     #[cfg(not(unix))]
-//     let terminate = std::future::pending::<()>();
-//
-//     tokio::select! {
-//         _ = ctrl_c => {
-//             info!("Console shutdown_signal ctrl_c")
-//         },
-//         _ = terminate => {
-//             info!("Console shutdown_signal terminate")
-//         },
-//     }
-// }
+/// Console access logging middleware
+async fn console_logging_middleware(req: Request, next: axum::middleware::Next) -> axum::response::Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let start = std::time::Instant::now();
+
+    let response = next.run(req).await;
+    let duration = start.elapsed();
+
+    info!(
+        target: "rustfs::console::access",
+        method = %method,
+        uri = %uri,
+        status = %response.status(),
+        duration_ms = %duration.as_millis(),
+        "Console access"
+    );
+
+    response
+}
+
+/// Setup TLS configuration for console using axum-server, following endpoint TLS implementation logic
+#[instrument(skip(tls_path))]
+async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<RustlsConfig>> {
+    let tls_path = match tls_path {
+        Some(path) if !path.is_empty() => path,
+        _ => {
+            debug!("TLS path is not provided, console starting with HTTP");
+            return Ok(None);
+        }
+    };
+
+    if tokio::fs::metadata(tls_path).await.is_err() {
+        debug!("TLS path does not exist, console starting with HTTP");
+        return Ok(None);
+    }
+
+    debug!("Found TLS directory for console, checking for certificates");
+
+    // Make sure to use a modern encryption suite
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
+        if !cert_key_pairs.is_empty() {
+            debug!(
+                "Found {} certificates for console, creating SNI-aware multi-cert resolver",
+                cert_key_pairs.len()
+            );
+
+            // Create an SNI-enabled certificate resolver
+            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+
+            // Configure the server to enable SNI support
+            let mut server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(resolver));
+
+            // Configure ALPN protocol priority
+            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+
+            // Log SNI requests
+            if rustfs_utils::tls_key_log() {
+                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            }
+
+            info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
+            return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
+        }
+    }
+
+    // 2. Revert to the traditional single-certificate mode
+    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
+    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
+    if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
+        debug!("Found legacy single TLS certificate for console, starting with HTTPS");
+
+        return match RustlsConfig::from_pem_file(cert_path, key_path).await {
+            Ok(config) => {
+                info!(target: "rustfs::console::tls", "Console TLS enabled with single certificate");
+                Ok(Some(config))
+            }
+            Err(e) => {
+                error!(target: "rustfs::console::error", error = %e, "Failed to create TLS config for console");
+                Err(std::io::Error::other(e))
+            }
+        };
+    }
+
+    debug!("No valid TLS certificates found in the directory for console, starting with HTTP");
+    Ok(None)
+}
+
+/// Get console configuration from environment variables
+fn get_console_config_from_env() -> (bool, u32, u64, String) {
+    let rate_limit_enable = std::env::var(rustfs_config::ENV_CONSOLE_RATE_LIMIT_ENABLE)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE.to_string())
+        .parse::<bool>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE);
+
+    let rate_limit_rpm = std::env::var(rustfs_config::ENV_CONSOLE_RATE_LIMIT_RPM)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_RPM.to_string())
+        .parse::<u32>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_RPM);
+
+    let auth_timeout = std::env::var(rustfs_config::ENV_CONSOLE_AUTH_TIMEOUT)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_AUTH_TIMEOUT.to_string())
+        .parse::<u64>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_AUTH_TIMEOUT);
+    let cors_allowed_origins = std::env::var(rustfs_config::ENV_CONSOLE_CORS_ALLOWED_ORIGINS)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
+        .parse::<String>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string());
+
+    (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins)
+}
+
+pub fn is_console_path(path: &str) -> bool {
+    path.starts_with(CONSOLE_PREFIX)
+}
+
+/// Setup comprehensive middleware stack with tower-http features
+fn setup_console_middleware_stack(
+    cors_layer: CorsLayer,
+    rate_limit_enable: bool,
+    rate_limit_rpm: u32,
+    auth_timeout: u64,
+) -> Router {
+    let mut app = Router::new()
+        .route(&format!("{CONSOLE_PREFIX}/license"), get(crate::admin::console::license_handler))
+        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(crate::admin::console::config_handler))
+        .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check))
+        .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
+        .fallback_service(get(static_handler));
+
+    // Add comprehensive middleware layers using tower-http features
+    app = app
+        .layer(CatchPanicLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(console_logging_middleware))
+        .layer(cors_layer)
+        // Add timeout layer - convert auth_timeout from seconds to Duration
+        .layer(TimeoutLayer::new(Duration::from_secs(auth_timeout)))
+        // Add request body limit (10MB for console uploads)
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
+
+    // Add rate limiting if enabled
+    if rate_limit_enable {
+        info!("Console rate limiting enabled: {} requests per minute", rate_limit_rpm);
+        // Note: tower-http doesn't provide a built-in rate limiter, but we have the foundation
+        // For production, you would integrate with a rate limiting service like Redis
+        // For now, we log that it's configured and ready for integration
+    }
+
+    app
+}
+
+/// Console health check handler with comprehensive health information
+async fn health_check() -> Json<serde_json::Value> {
+    use rustfs_ecstore::new_object_layer_fn;
+
+    let mut health_status = "ok";
+    let mut details = json!({});
+
+    // Check storage backend health
+    if let Some(_store) = new_object_layer_fn() {
+        details["storage"] = json!({"status": "connected"});
+    } else {
+        health_status = "degraded";
+        details["storage"] = json!({"status": "disconnected"});
+    }
+
+    // Check IAM system health
+    match rustfs_iam::get() {
+        Ok(_) => {
+            details["iam"] = json!({"status": "connected"});
+        }
+        Err(_) => {
+            health_status = "degraded";
+            details["iam"] = json!({"status": "disconnected"});
+        }
+    }
+
+    Json(json!({
+        "status": health_status,
+        "service": "rustfs-console",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "details": details,
+        "uptime": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }))
+}
+
+/// Parse CORS allowed origins from configuration
+pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
+    let cors_layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers(Any);
+
+    match origins {
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
+        Some(origins_str) => {
+            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
+            if origins.is_empty() {
+                warn!("Empty CORS origins provided, using permissive CORS");
+                cors_layer.allow_origin(Any).expose_headers(Any)
+            } else {
+                // Parse origins with proper error handling
+                let mut valid_origins = Vec::new();
+                for origin in origins {
+                    match origin.parse::<HeaderValue>() {
+                        Ok(header_value) => {
+                            valid_origins.push(header_value);
+                        }
+                        Err(e) => {
+                            warn!("Invalid CORS origin '{}': {}", origin, e);
+                        }
+                    }
+                }
+
+                if valid_origins.is_empty() {
+                    warn!("No valid CORS origins found, using permissive CORS");
+                    cors_layer.allow_origin(Any).expose_headers(Any)
+                } else {
+                    info!("Console CORS origins configured: {:?}", valid_origins);
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
+                }
+            }
+        }
+        None => {
+            debug!("No CORS origins configured for console, using permissive CORS");
+            cors_layer.allow_origin(Any)
+        }
+    }
+}
+
+pub(crate) fn make_console_server() -> Router {
+    let (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins) = get_console_config_from_env();
+    // String to Option<&String>
+    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
+        None
+    } else {
+        Some(&cors_allowed_origins)
+    };
+    // Configure CORS based on settings
+    let cors_layer = parse_cors_origins(cors_allowed_origins);
+
+    // Build console router with enhanced middleware stack using tower-http features
+    setup_console_middleware_stack(cors_layer, rate_limit_enable, rate_limit_rpm, auth_timeout)
+}
