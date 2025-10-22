@@ -86,7 +86,7 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
-        if method == Method::GET && is_console_path(uri.path()) {
+        if method == Method::GET && uri.path() == "/health" {
             return true;
         }
 
@@ -105,11 +105,11 @@ where
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         // Allow unauthenticated access to health check
-        if req.method == Method::GET && is_console_path(req.uri.path()) {
+        if req.method == Method::GET && req.uri.path() == "/health" {
             return Ok(());
         }
         // Allow unauthenticated access to console static files if console is enabled
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+        if self.console_enabled && is_console_path(req.uri.path()) {
             return Ok(());
         }
 
