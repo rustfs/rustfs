@@ -16,7 +16,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{StatusCode, Uri, header},
-    middleware::{self, Next},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use http::HeaderValue;

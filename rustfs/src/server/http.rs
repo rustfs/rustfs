@@ -19,7 +19,6 @@ use crate::config;
 use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
-use axum::middleware;
 use bytes::Bytes;
 use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::{
@@ -450,8 +449,6 @@ fn process_connection(
 
         let hybrid_service = ServiceBuilder::new()
             .layer(CatchPanicLayer::new())
-            .layer(cors_layer)
-            .layer(middleware::from_fn(crate::server::proxy::normalize_host_header))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -470,7 +467,7 @@ fn process_connection(
                                 .iter()
                                 .any(|&h| h.eq_ignore_ascii_case(header_name.as_str()))
                             {
-                                debug!("Request Header: {}: {:?}", header_name, header_value);
+                                warn!("Request Header: {}: {:?}", header_name, header_value);
                             }
                         }
                         span
@@ -482,7 +479,7 @@ fn process_connection(
                             key_request_uri_path = %request.uri().path().to_owned(),
                             "handle request api total",
                         );
-                        debug!(
+                        warn!(
                             "http started method: {}, Request URI: {}, url path: {}",
                             request.method(),
                             request.uri(),
@@ -498,7 +495,7 @@ fn process_connection(
                                 .iter()
                                 .any(|&h| h.eq_ignore_ascii_case(header_name.as_str()))
                             {
-                                debug!("response Header: {}: {:?}", header_name, header_value);
+                                warn!("response Header: {}: {:?}", header_name, header_value);
                             }
                         }
                     })
@@ -514,6 +511,7 @@ fn process_connection(
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
+            .layer(cors_layer)
             .layer(RedirectLayer)
             .service(service);
         let hybrid_service = TowerToHyperService::new(hybrid_service);

@@ -191,7 +191,7 @@ fn setup_console_middleware_stack(
         // Add timeout layer - convert auth_timeout from seconds to Duration
         .layer(TimeoutLayer::new(Duration::from_secs(auth_timeout)))
         // Add request body limit (10MB for console uploads)
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
+        .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 
     // Add rate limiting if enabled
     if rate_limit_enable {
