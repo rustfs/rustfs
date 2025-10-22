@@ -145,10 +145,7 @@ pub async fn start_http_server(
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
-        Some(ip) => {
-            debug!("Obtained local IP address: {}", ip);
-            ip
-        }
+        Some(ip) => ip,
         None => {
             warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
             local_addr.ip()
@@ -181,15 +178,14 @@ pub async fn start_http_server(
     } else {
         info!("   API: {}  {}", api_endpoints, localhost_endpoint);
         println!("   API: {api_endpoints}  {localhost_endpoint}");
-    }
-
-    info!("   RootUser: {}", opt.access_key.clone());
-    info!("   RootPass: {}", opt.secret_key.clone());
-    if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
-        warn!(
-            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-            DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
-        );
+        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+            warn!(
+                "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
+                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+            );
+        }
+        info!("For more information, visit https://rustfs.com/docs/");
+        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
     }
 
     // Setup S3 service
@@ -200,7 +196,6 @@ pub async fn start_http_server(
 
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
-        debug!("authentication is enabled {}, {}", &access_key, &secret_key);
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
