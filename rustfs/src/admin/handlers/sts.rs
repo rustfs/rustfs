@@ -103,10 +103,10 @@ impl Operation for AssumeRoleHandle {
 
         claims.insert(
             "exp".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
+            Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
         );
 
-        claims.insert("parent".to_string(), serde_json::Value::String(cred.access_key.clone()));
+        claims.insert("parent".to_string(), Value::String(cred.access_key.clone()));
 
         // warn!("AssumeRole get cred {:?}", &user);
         // warn!("AssumeRole get body {:?}", &body);
@@ -176,7 +176,7 @@ pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str
 
         claims.insert(
             SESSION_POLICY_NAME.to_string(),
-            serde_json::Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+            Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
         );
     }
 

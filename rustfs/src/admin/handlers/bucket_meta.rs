@@ -137,16 +137,15 @@ impl Operation for ExportBucketMetadata {
                 let conf_path = path_join_buf(&[bucket.name.as_str(), conf]);
                 match conf {
                     BUCKET_POLICY_CONFIG => {
-                        let config: rustfs_policy::policy::BucketPolicy =
-                            match metadata_sys::get_bucket_policy(&bucket.name).await {
-                                Ok((res, _)) => res,
-                                Err(e) => {
-                                    if e == StorageError::ConfigNotFound {
-                                        continue;
-                                    }
-                                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                        let config: BucketPolicy = match metadata_sys::get_bucket_policy(&bucket.name).await {
+                            Ok((res, _)) => res,
+                            Err(e) => {
+                                if e == StorageError::ConfigNotFound {
+                                    continue;
                                 }
-                            };
+                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                            }
+                        };
                         let config_json =
                             serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
                         zip_writer

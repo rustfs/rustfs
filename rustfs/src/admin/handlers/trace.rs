@@ -43,10 +43,10 @@ impl Operation for Trace {
         let _trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
-        let _perrs = match GLOBAL_Endpoints.get() {
+        let _peers = match GLOBAL_Endpoints.get() {
             Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
