@@ -446,7 +446,7 @@ fn process_connection(
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
-
+        let sensitive_headers = ["set-cookie", "authorization", "cookie"];
         let hybrid_service = ServiceBuilder::new()
             .layer(CatchPanicLayer::new())
             .layer(
@@ -462,7 +462,6 @@ fn process_connection(
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
                                 span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
                             }
-                            let sensitive_headers = ["set-cookie", "authorization", "cookie"];
                             if !sensitive_headers
                                 .iter()
                                 .any(|&h| h.eq_ignore_ascii_case(header_name.as_str()))
@@ -490,7 +489,6 @@ fn process_connection(
                         _span.record("http response status_code", tracing::field::display(response.status()));
                         debug!("http response generated in {:?}", latency);
                         for (header_name, header_value) in response.headers() {
-                            let sensitive_headers = ["set-cookie", "authorization", "cookie"];
                             if !sensitive_headers
                                 .iter()
                                 .any(|&h| h.eq_ignore_ascii_case(header_name.as_str()))
