@@ -16,8 +16,10 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use http::HeaderValue;
 use hyper::Request as HyperRequest;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -172,4 +174,26 @@ pub(crate) async fn proxy_handler(State(client): State<Arc<Client<HttpConnector,
             (StatusCode::GATEWAY_TIMEOUT, "Request timeout").into_response()
         }
     }
+}
+
+/// Validate and standardize the Host header
+pub(crate) async fn normalize_host_header(mut req: Request, next: Next) -> Response {
+    // 1. Get the original Host
+    let original_host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok());
+
+    // 2. Check X-Forwarded-Host (Original Domain Forwarded by Nginx)
+    if let Some(forwarded_host) = req.headers().get("x-forwarded-host").and_then(|v| v.to_str().ok()) {
+        debug!(
+            "Replacing Host: {} -> {} (from X-Forwarded-Host)",
+            original_host.unwrap_or("none"),
+            forwarded_host
+        );
+
+        // 3. Replace the intranet host with the original host
+        if let Ok(value) = HeaderValue::from_str(forwarded_host) {
+            req.headers_mut().insert(header::HOST, value);
+        }
+    }
+
+    next.run(req).await
 }

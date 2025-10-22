@@ -14,7 +14,7 @@
 
 use crate::admin::console::{config_handler, license_handler, static_handler};
 use crate::config::Opt;
-use crate::server::proxy::{create_optimized_client, method_not_allowed, proxy_handler};
+use crate::server::proxy::{create_optimized_client, method_not_allowed, normalize_host_header, proxy_handler};
 use axum::{
     Router,
     body::Body,
@@ -183,6 +183,8 @@ fn setup_console_middleware_stack(
     // Add comprehensive middleware layers using tower-http features
     app = app
         .layer(CatchPanicLayer::new())
+        // ✅ Add Host normalized middleware
+        .layer(middleware::from_fn(normalize_host_header))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)

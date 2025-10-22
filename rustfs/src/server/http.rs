@@ -19,6 +19,7 @@ use crate::config;
 use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
+use axum::middleware;
 use bytes::Bytes;
 use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::{
@@ -449,6 +450,8 @@ fn process_connection(
 
         let hybrid_service = ServiceBuilder::new()
             .layer(CatchPanicLayer::new())
+            .layer(cors_layer)
+            .layer(middleware::from_fn(crate::server::proxy::normalize_host_header))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -511,7 +514,6 @@ fn process_connection(
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
-            .layer(cors_layer)
             .layer(RedirectLayer)
             .service(service);
         let hybrid_service = TowerToHyperService::new(hybrid_service);
