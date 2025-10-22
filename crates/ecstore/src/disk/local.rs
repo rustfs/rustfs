@@ -2087,6 +2087,7 @@ impl DiskAPI for LocalDisk {
         for vol in volumes {
             if let Err(e) = self.make_volume(vol).await {
                 if e != DiskError::VolumeExists {
+                    error!("local disk make volumes failed: {e}");
                     return Err(e);
                 }
             }
@@ -2108,6 +2109,7 @@ impl DiskAPI for LocalDisk {
                 os::make_dir_all(&volume_dir, self.root.as_path()).await?;
                 return Ok(());
             }
+            error!("local disk make volume failed: {e}");
             return Err(to_volume_error(e).into());
         }
 
