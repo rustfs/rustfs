@@ -92,9 +92,10 @@ impl WarmBackendS3 {
             creds,
             secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
+            region: conf.region.clone(),
             ..Default::default()
         };
-        let client = TransitionClient::new(&u.host().expect("err").to_string(), opts).await?;
+        let client = TransitionClient::new(&u.host().expect("err").to_string(), opts, "s3").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

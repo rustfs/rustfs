@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 
 use crate::client::{
     api_error_response::{http_resp_to_error_response, to_error_response},
-    transition_api::{Document, TransitionClient},
+    transition_api::{Document, Document2, TransitionClient},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use s3s::Body;
@@ -82,7 +82,7 @@ impl TransitionClient {
         let req = self.get_bucket_location_request(bucket_name)?;
 
         let mut resp = self.doit(req).await?;
-        location = process_bucket_location_response(resp, bucket_name).await?;
+        location = process_bucket_location_response(resp, bucket_name, &self.tier_type).await?;
         {
             let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
             bucket_loc_cache.set(bucket_name, &location);
@@ -175,7 +175,7 @@ impl TransitionClient {
     }
 }
 
-async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str) -> Result<String, std::io::Error> {
+async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str, tier_type: &str) -> Result<String, std::io::Error> {
     //if resp != nil {
     if resp.status() != StatusCode::OK {
         let err_resp = http_resp_to_error_response(&resp, vec![], bucket_name, "");
@@ -209,9 +209,15 @@ async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket
     //}
 
     let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-    let Document(location_constraint) = quick_xml::de::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
+    let mut location;
+    if tier_type == "huaweicloud" {
+        let Document2(location_constraint) = quick_xml::de::from_str::<Document2>(&String::from_utf8(b).unwrap()).unwrap();
+        location = location_constraint.0;
+    } else {
+        let Document(location_constraint) = quick_xml::de::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
+        location = location_constraint;
+    }
 
-    let mut location = location_constraint;
     if location == "" {
         location = "us-east-1".to_string();
     }

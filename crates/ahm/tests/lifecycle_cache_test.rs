@@ -189,6 +189,30 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
     }
 }
 
+fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
+    let usage = &record.usage;
+
+    ObjectInfo {
+        bucket: usage.bucket.clone(),
+        name: usage.object.clone(),
+        size: usage.total_size as i64,
+        delete_marker: !usage.has_live_object && usage.delete_markers_count > 0,
+        mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
+        ..Default::default()
+    }
+}
+
+fn to_object_info(bucket: &str, name: &str, size: i64, delete_marker: bool, mod_time: OffsetDateTime) -> ObjectInfo {
+    ObjectInfo {
+        bucket: bucket.to_string(),
+        name: object.to_string(),
+        size: total_size,
+        delete_marker,
+        mod_time,
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum LifecycleType {
     ExpiryCurrent,
@@ -202,7 +226,7 @@ pub struct LifecycleContent {
     ver_id: String,
     mod_time: OffsetDateTime,
     type_: LifecycleType,
-    tier: String,
+    object_name: String,
 }
 
 pub struct LifecycleContentCodec;
@@ -212,50 +236,50 @@ impl<'a> BytesEncode<'a> for LifecycleContentCodec {
 
     /// Encodes the u32 timestamp in big endian followed by the log level with a single byte.
     fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
-        let (ver_id_bytes, timestamp_bytes, type_, tier_bytes) = match lcc {
+        let (ver_id_bytes, timestamp_bytes, type_, object_name_bytes) = match lcc {
             LifecycleContent {
                 ver_id,
                 mod_time,
                 type_: LifecycleType::ExpiryCurrent,
-                tier,
+                object_name,
             } => (
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 0,
-                tier.clone().into_bytes(),
+                object_name.clone().into_bytes(),
             ),
             LifecycleContent {
                 ver_id,
                 mod_time,
                 type_: LifecycleType::ExpiryNoncurrent,
-                tier,
+                object_name,
             } => (
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 1,
-                tier.clone().into_bytes(),
+                object_name.clone().into_bytes(),
             ),
             LifecycleContent {
                 ver_id,
                 mod_time,
                 type_: LifecycleType::TransitionCurrent,
-                tier,
+                object_name,
             } => (
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 2,
-                tier.clone().into_bytes(),
+                object_name.clone().into_bytes(),
             ),
             LifecycleContent {
                 ver_id,
                 mod_time,
                 type_: LifecycleType::TransitionNoncurrent,
-                tier,
+                object_name,
             } => (
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 3,
-                tier.clone().into_bytes(),
+                object_name.clone().into_bytes(),
             ),
         };
 
@@ -290,7 +314,7 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
             ver_id: "".to_string(),
             mod_time: OffsetDateTime::from_unix_timestamp(mod_time_timestamp.try_into().unwrap()).unwrap(),
             type_,
-            tier: "".to_string(),
+            object_name: "".to_string(),
         })
     }
 }
@@ -368,7 +392,7 @@ mod serial_tests {
                         continue;
                     }
 
-                    let object_info = Scanner::convert_record_to_object_info(record);
+                    let object_info = convert_record_to_object_info(record);
                     rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(object_info.mod_time.unwrap(), 1);
                 }
 
@@ -379,7 +403,7 @@ mod serial_tests {
                         ver_id: "aaa".to_string(),
                         mod_time: OffsetDateTime::now_utc(),
                         type_: LifecycleType::TransitionNoncurrent,
-                        tier: "".to_string(),
+                        object_name: "".to_string(),
                     },
                 )
                 .unwrap();
@@ -400,7 +424,7 @@ mod serial_tests {
                             ver_id: "aaa".to_string(),
                             mod_time: OffsetDateTime::now_utc(),
                             type_: LifecycleType::TransitionNoncurrent,
-                            tier: "".to_string(),
+                            object_name: "".to_string(),
                         },
                     )
                     .unwrap()
@@ -417,7 +441,7 @@ mod serial_tests {
                             ver_id: "aaa".to_string(),
                             mod_time: OffsetDateTime::now_utc(),
                             type_: LifecycleType::TransitionNoncurrent,
-                            tier: "".to_string(),
+                            object_name: "".to_string(),
                         },
                     )
                     .unwrap();

@@ -70,12 +70,13 @@ impl WarmBackendR2 {
             secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
+            region: conf.region.clone(),
             ..Default::default()
         };
         let scheme = u.scheme();
         let default_port = if scheme == "https" { 443 } else { 80 };
         let client =
-            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts).await?;
+            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts, "r2").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

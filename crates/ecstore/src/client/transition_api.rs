@@ -44,7 +44,7 @@ use std::{
 use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -109,6 +109,7 @@ pub struct TransitionClient {
     pub health_status: AtomicI32,
     pub trailing_header_support: bool,
     pub max_retries: i64,
+    pub tier_type: String,
 }
 
 #[derive(Debug, Default)]
@@ -132,13 +133,13 @@ pub enum BucketLookupType {
 }
 
 impl TransitionClient {
-    pub async fn new(endpoint: &str, opts: Options) -> Result<TransitionClient, std::io::Error> {
-        let clnt = Self::private_new(endpoint, opts).await?;
+    pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+        let clnt = Self::private_new(endpoint, opts, tier_type).await?;
 
         Ok(clnt)
     }
 
-    async fn private_new(endpoint: &str, opts: Options) -> Result<TransitionClient, std::io::Error> {
+    async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
         //#[cfg(feature = "ring")]
@@ -175,6 +176,7 @@ impl TransitionClient {
             health_status: AtomicI32::new(C_UNKNOWN),
             trailing_header_support: opts.trailing_headers,
             max_retries: opts.max_retries,
+            tier_type: tier_type.to_string(),
         };
 
         {
@@ -283,11 +285,14 @@ impl TransitionClient {
         let mut resp = resp.unwrap();
         debug!("http_resp: {:?}", resp);
 
+        let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
+
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
             //self.dump_http(&cloned_req, &resp)?;
             let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-            debug!("err_body: {}", String::from_utf8(b).unwrap());
+            warn!("err_body: {}", String::from_utf8(b).unwrap());
         }
 
         Ok(resp)
@@ -625,7 +630,7 @@ pub struct TransitionCore(pub Arc<TransitionClient>);
 
 impl TransitionCore {
     pub async fn new(endpoint: &str, opts: Options) -> Result<Self, std::io::Error> {
-        let client = TransitionClient::new(endpoint, opts).await?;
+        let client = TransitionClient::new(endpoint, opts, "").await?;
         Ok(Self(Arc::new(client)))
     }
 
@@ -999,3 +1004,9 @@ impl tower::Service<Request<Body>> for SendRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct Document(pub String);
+
+#[derive(Serialize, Deserialize)]
+pub struct LocationConstraint(pub String);
+
+#[derive(Serialize, Deserialize)]
+pub struct Document2(pub LocationConstraint);
