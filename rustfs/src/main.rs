@@ -139,19 +139,25 @@ async fn async_main() -> Result<()> {
     profiling::start_profiling_if_enabled();
 
     // Run parameters
-    run(opt).await
+    match run(opt).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!("Server encountered an error and is shutting down: {}", e);
+            Err(e)
+        }
+    }
 }
 
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
-    // // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
-    // let dns_init = tokio::spawn(async {
-    //     if let Err(e) = rustfs_utils::dns_resolver::init_global_dns_resolver().await {
-    //         warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
-    //     }
-    // });
+    // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
+    let dns_init = tokio::spawn(async {
+        if let Err(e) = rustfs_utils::dns_resolver::init_global_dns_resolver().await {
+            warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
+        }
+    });
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -178,8 +184,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     set_global_addr(&opt.address).await;
 
-    // // Wait for DNS initialization to complete before network-heavy operations
-    // dns_init.await.map_err(Error::other)?;
+    // Wait for DNS initialization to complete before network-heavy operations
+    dns_init.await.map_err(Error::other)?;
 
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
