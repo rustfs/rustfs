@@ -132,7 +132,13 @@ async fn async_main() -> Result<()> {
     info!("{}", LOGO);
 
     // Store in global storage
-    set_global_guard(guard).map_err(Error::other)?;
+    match set_global_guard(guard).map_err(Error::other) {
+        Ok(_) => (),
+        Err(e) => {
+            error!("Failed to set global observability guard: {}", e);
+            return Err(e);
+        }
+    }
 
     // Initialize performance profiling if enabled
     #[cfg(not(target_os = "windows"))]
