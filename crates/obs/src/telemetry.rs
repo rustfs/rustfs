@@ -21,7 +21,6 @@ use flexi_logger::{
 };
 use metrics::counter;
 use nu_ansi_term::Color;
-use opentelemetry::global::meter_provider;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;

@@ -148,17 +148,6 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
-            match crate::dns_resolver::resolve_domain(domain).await {
-                Ok(ips) => {
-                    info!("Resolved domain {domain} using custom DNS resolver: {ips:?}");
-                    return Ok(ips.into_iter().collect());
-                }
-                Err(err) => {
-                    error!(
-                        "Failed to resolve domain {domain} using custom DNS resolver, falling back to system resolver,err: {err}"
-                    );
-                }
-            }
             // Check cache first
             if CUSTOM_DNS_RESOLVER.read().unwrap().is_none() {
                 if let Ok(mut cache) = DNS_CACHE.lock() {
