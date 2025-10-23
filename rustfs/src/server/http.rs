@@ -491,8 +491,8 @@ fn process_connection(
                         );
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
                         let labels = [
-                            ("key_request_method", format!("{}", request.method())),
-                            ("key_request_uri_path", format!("{}", request.uri().path())),
+                            ("key_request_method", format!("{}", request.method().to_string())),
+                            ("key_request_uri_path", format!("{}", request.uri().path().to_owned())),
                         ];
                         counter!("rustfs_api_requests_total", &labels).increment(1);
                     })
