@@ -46,7 +46,7 @@ static LIFECYCLE_EXPIRY_NONCURRENT_DAYS: i32 = 1;
 static LIFECYCLE_TRANSITION_CURRENT_DAYS: i32 = 1;
 static LIFECYCLE_TRANSITION_NONCURRENT_DAYS: i32 = 1;
 static GLOBAL_LMDB_ENV: OnceLock<Env> = OnceLock::new();
-static GLOBAL_LMDB_DB: OnceLock<Database<I128<BigEndian>, LifecycleContentCodec>> = OnceLock::new();
+static GLOBAL_LMDB_DB: OnceLock<Database<I64<BigEndian>, LifecycleContentCodec>> = OnceLock::new();
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -127,16 +127,42 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     //lmdb env
-    let lmdb_env = unsafe { EnvOpenOptions::new().open("lifecycle-db").unwrap() };
+    // User home directory
+    /*if let Ok(home_dir) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
+        let mut path = PathBuf::from(home_dir);
+        path.push(format!(".{DEFAULT_LOG_FILENAME}"));
+        path.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&path) {
+            //return path;
+        }
+    }*/
+    let test_lmdb_lifecycle_dir = format!("/tmp/lmdb_lifecycle");
+    let temp_dir = std::path::PathBuf::from(&test_lmdb_lifecycle_dir);
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir).await.ok();
+    }
+    fs::create_dir_all(&temp_dir).await.unwrap();
+    let lmdb_env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(100)
+            .open(&test_lmdb_lifecycle_dir)
+            .unwrap()
+    };
+    let bucket_name = format!("test-lc-cache-{}", "00000");
     let mut wtxn = lmdb_env.write_txn().unwrap();
-    let db = lmdb_env
+    let db = match lmdb_env
         .database_options()
-        .types::<I128<BigEndian>, LifecycleContentCodec>()
+        .name(&format!("bucket_{}", bucket_name))
+        .types::<I64<BigEndian>, LifecycleContentCodec>()
         .flags(DatabaseFlags::DUP_SORT)
         //.dup_sort_comparator::<>()
-        .create(&mut wtxn)
-        .unwrap();
-    wtxn.commit();
+        .create(&mut wtxn) {
+            Ok(db) => db,
+            Err(err) => {
+                panic!("lmdb error: {}", err);
+            }
+        };
+    let _ = wtxn.commit();
     let _ = GLOBAL_LMDB_ENV.set(lmdb_env);
     let _ = GLOBAL_LMDB_DB.set(db);
 
@@ -179,6 +205,8 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
         .await
         .expect("Failed to upload test object");
 
+    println!("object_info1: {:?}", object_info);
+
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
@@ -190,6 +218,10 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
     }
 }
 
+fn ns_to_offset_datetime(ns: i128) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(ns).ok()
+}
+
 fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
     let usage = &record.usage;
 
@@ -198,12 +230,19 @@ fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
         name: usage.object.clone(),
         size: usage.total_size as i64,
         delete_marker: !usage.has_live_object && usage.delete_markers_count > 0,
-        //mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
+        mod_time: usage.last_modified_ns.and_then(ns_to_offset_datetime),
         ..Default::default()
     }
 }
 
-fn to_object_info(bucket: &str, object: &str, total_size: i64, delete_marker: bool, mod_time: OffsetDateTime, version_id: &str) -> ObjectInfo {
+fn to_object_info(
+    bucket: &str,
+    object: &str,
+    total_size: i64,
+    delete_marker: bool,
+    mod_time: OffsetDateTime,
+    version_id: &str,
+) -> ObjectInfo {
     ObjectInfo {
         bucket: bucket.to_string(),
         name: object.to_string(),
@@ -238,7 +277,7 @@ impl<'a> BytesEncode<'a> for LifecycleContentCodec {
     type EItem = LifecycleContent;
 
     fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
-        let (ver_no, ver_id_bytes, timestamp_bytes, type_, object_name_bytes) = match lcc {
+        let (ver_no_byte, ver_id_bytes, mod_timestamp_bytes, type_byte, object_name_bytes) = match lcc {
             LifecycleContent {
                 ver_no,
                 ver_id,
@@ -293,9 +332,12 @@ impl<'a> BytesEncode<'a> for LifecycleContentCodec {
             ),
         };
 
-        let mut output = Vec::new();
-        output.extend_from_slice(&timestamp_bytes);
-        output.push(type_);
+        let mut output = Vec::<u8>::new();
+        output.push(*ver_no_byte);
+        output.extend_from_slice(&ver_id_bytes);
+        output.extend_from_slice(&mod_timestamp_bytes);
+        output.push(type_byte);
+        output.extend_from_slice(&object_name_bytes);
         Ok(Cow::Owned(output))
     }
 }
@@ -306,28 +348,41 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
     fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, BoxedError> {
         use std::mem::size_of;
 
-        let mod_time_timestamp = match bytes.get(..size_of::<i128>()) {
-            Some(bytes) => bytes.try_into().map(i128::from_be_bytes).unwrap(),
-            None => return Err("invalid log key: cannot extract timestamp".into()),
+        let ver_no = match bytes.get(..size_of::<u8>()) {
+            Some(bytes) => bytes.try_into().map(u8::from_be_bytes).unwrap(),
+            None => return Err("invalid LifecycleContent: cannot extract ver_no".into()),
         };
 
-        let type_ = match bytes.get(size_of::<u32>()) {
+        let ver_id = match bytes.get(size_of::<u8>()..(36+1)) {
+            Some(bytes) => unsafe { std::str::from_utf8_unchecked(bytes).to_string() },
+            None => return Err("invalid LifecycleContent: cannot extract ver_id".into()),
+        };
+
+        let mod_timestamp = match bytes.get((36+1)..(size_of::<i64>()+36+1)) {
+            Some(bytes) => bytes.try_into().map(i64::from_be_bytes).unwrap(),
+            None => return Err("invalid LifecycleContent: cannot extract mod_time timestamp".into()),
+        };
+
+        let type_ = match bytes.get(size_of::<i64>()+36+1) {
             Some(&0) => LifecycleType::ExpiryCurrent,
             Some(&1) => LifecycleType::ExpiryNoncurrent,
             Some(&2) => LifecycleType::TransitionCurrent,
             Some(&3) => LifecycleType::TransitionNoncurrent,
-            Some(_) => return Err("invalid log key: invalid log level".into()),
-            None => return Err("invalid log key: cannot extract log level".into()),
+            Some(_) => return Err("invalid LifecycleContent: invalid LifecycleType".into()),
+            None => return Err("invalid LifecycleContent: cannot extract LifecycleType".into()),
         };
 
-        let ver_no = 0;
+        let object_name = match bytes.get((size_of::<i64>()+36+1+1)..) {
+            Some(bytes) => unsafe { std::str::from_utf8_unchecked(bytes).to_string() },
+            None => return Err("invalid LifecycleContent: cannot extract object_name".into()),
+        };
 
         Ok(LifecycleContent {
             ver_no,
-            ver_id: "".to_string(),
-            mod_time: OffsetDateTime::from_unix_timestamp(mod_time_timestamp.try_into().unwrap()).unwrap(),
+            ver_id,
+            mod_time: OffsetDateTime::from_unix_timestamp(mod_timestamp.try_into().unwrap()).unwrap(),
             type_,
-            object_name: "".to_string(),
+            object_name,
         })
     }
 }
@@ -406,66 +461,53 @@ mod serial_tests {
                     }
 
                     let object_info = convert_record_to_object_info(record);
-                    rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(object_info.mod_time.unwrap(), 1);
-                }
+                    println!("object_info2: {:?}", object_info);
+                    let mod_time = object_info.mod_time.unwrap_or(OffsetDateTime::now_utc());
+                    let expiry_time = rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, 1);
 
-                lmdb.put(
-                    &mut wtxn,
-                    &123143242,
-                    &LifecycleContent {
-                        ver_no: 0,
-                        ver_id: "aaa".to_string(),
-                        mod_time: OffsetDateTime::now_utc(),
-                        type_: LifecycleType::TransitionNoncurrent,
-                        object_name: "".to_string(),
-                    },
-                )
-                .unwrap();
-                wtxn.commit().unwrap();
+                    let version_id = if let Some(version_id) = object_info.version_id {
+                        version_id.to_string()
+                    } else {
+                        "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz".to_string()
+                    };
 
-                let rtxn = lmdb_env.read_txn().unwrap();
-                let _ = lmdb.get(&rtxn, &123143242).unwrap();
-                //rtxn.commit()?;
-
-                let mut wtxn = lmdb_env.write_txn().unwrap();
-                let mut iter = lmdb.iter_mut(&mut wtxn).unwrap();
-                let _ = iter.next().transpose().unwrap();
-                let _ = unsafe { iter.del_current().unwrap() };
-                let _ = unsafe {
-                    iter.put_current(
-                        &123143242,
-                        &LifecycleContent {
-                            ver_no: 0,
-                            ver_id: "aaa".to_string(),
-                            mod_time: OffsetDateTime::now_utc(),
-                            type_: LifecycleType::TransitionNoncurrent,
-                            object_name: "".to_string(),
-                        },
-                    )
-                    .unwrap()
-                };
-                drop(iter);
-                //let _ = wtxn.commit().unwrap();
-
-                //let mut wtxn = lmdb_env.write_txn().unwrap();
-                let _ = lmdb.delete(&mut wtxn, &123143242).unwrap();
-                let _ = lmdb
-                    .delete_one_duplicate(
+                    lmdb.put(
                         &mut wtxn,
-                        &123143242,
+                        &expiry_time.unix_timestamp(),
                         &LifecycleContent {
                             ver_no: 0,
-                            ver_id: "aaa".to_string(),
-                            mod_time: OffsetDateTime::now_utc(),
+                            ver_id: version_id,
+                            mod_time,
                             type_: LifecycleType::TransitionNoncurrent,
-                            object_name: "".to_string(),
+                            object_name: object_info.name,
                         },
                     )
                     .unwrap();
+                }
+
+                wtxn.commit().unwrap();
+
+                let mut wtxn = lmdb_env.write_txn().unwrap();
+                let mut iter = lmdb.iter_mut(&mut wtxn).unwrap();
+                //let _ = unsafe { iter.del_current().unwrap() };
+                for row in iter {
+                    if let Ok(ref elm) = row {
+                        let LifecycleContent {
+                            ver_no,
+                            ver_id,
+                            mod_time,
+                            type_,
+                            object_name,
+                        } = &elm.1;
+                        println!("cache row:{} {} {} {:?} {}", ver_no, ver_id, mod_time, type_, object_name);
+                    }
+                    println!("row:{:?}", row);
+                }
+                //drop(iter);
                 let _ = wtxn.commit().unwrap();
             }
         }
 
-        println!("Lifecycle expiry basic test completed");
+        println!("Lifecycle cache test completed");
     }
 }
