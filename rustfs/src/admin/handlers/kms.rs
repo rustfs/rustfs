@@ -153,7 +153,7 @@ impl Operation for CreateKeyHandler {
         let tags = request.tags.unwrap_or_default();
         let key_name = tags.get("name").cloned();
 
-        let kms_request = rustfs_kms::types::CreateKeyRequest {
+        let kms_request = CreateKeyRequest {
             key_name,
             key_usage: request.key_usage.unwrap_or(KeyUsage::EncryptDecrypt),
             description: request.description,
@@ -216,7 +216,7 @@ impl Operation for DescribeKeyHandler {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
-        let request = rustfs_kms::types::DescribeKeyRequest { key_id: key_id.clone() };
+        let request = DescribeKeyRequest { key_id: key_id.clone() };
 
         match service.describe_key(request).await {
             Ok(response) => {
@@ -270,7 +270,7 @@ impl Operation for ListKeysHandler {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
-        let request = rustfs_kms::types::ListKeysRequest {
+        let request = ListKeysRequest {
             limit: Some(limit),
             marker,
             status_filter: None,
@@ -336,7 +336,7 @@ impl Operation for GenerateDataKeyHandler {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
-        let kms_request = rustfs_kms::GenerateDataKeyRequest {
+        let kms_request = GenerateDataKeyRequest {
             key_id: request.key_id,
             key_spec: request.key_spec,
             encryption_context: request.encryption_context.unwrap_or_default(),

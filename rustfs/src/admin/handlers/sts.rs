@@ -21,7 +21,6 @@ use matchit::Params;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
-use rustfs_utils::crypto::base64_encode;
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -104,10 +103,10 @@ impl Operation for AssumeRoleHandle {
 
         claims.insert(
             "exp".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
+            Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
         );
 
-        claims.insert("parent".to_string(), serde_json::Value::String(cred.access_key.clone()));
+        claims.insert("parent".to_string(), Value::String(cred.access_key.clone()));
 
         // warn!("AssumeRole get cred {:?}", &user);
         // warn!("AssumeRole get body {:?}", &body);
@@ -175,7 +174,10 @@ pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str
             return Err(s3_error!(InvalidRequest, "policy too large"));
         }
 
-        claims.insert(SESSION_POLICY_NAME.to_string(), serde_json::Value::String(base64_encode(&policy_buf)));
+        claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+        );
     }
 
     Ok(())

@@ -98,17 +98,11 @@ async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
         }
 
         if let Err(e) = retry_metadata(queue_dir).await {
-            match e.kind() {
-                ErrorKind::NotFound => {
-                    return Err(s3_error!(InvalidArgument, "queue_dir does not exist"));
-                }
-                ErrorKind::PermissionDenied => {
-                    return Err(s3_error!(InvalidArgument, "queue_dir exists but permission denied"));
-                }
-                _ => {
-                    return Err(s3_error!(InvalidArgument, "failed to access queue_dir: {}", e));
-                }
-            }
+            return match e.kind() {
+                ErrorKind::NotFound => Err(s3_error!(InvalidArgument, "queue_dir does not exist")),
+                ErrorKind::PermissionDenied => Err(s3_error!(InvalidArgument, "queue_dir exists but permission denied")),
+                _ => Err(s3_error!(InvalidArgument, "failed to access queue_dir: {}", e)),
+            };
         }
     }
 

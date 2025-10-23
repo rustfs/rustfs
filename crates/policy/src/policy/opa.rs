@@ -39,7 +39,7 @@ pub struct AuthZPlugin {
 fn check() -> Result<(), String> {
     let env_list = env::vars();
     let mut candidate = HashMap::new();
-    let prefix = format!("{}{}", ENV_PREFIX, POLICY_PLUGIN_SUB_SYS).to_uppercase();
+    let prefix = format!("{ENV_PREFIX}{POLICY_PLUGIN_SUB_SYS}").to_uppercase();
     for (key, value) in env_list {
         if key.starts_with(&prefix) {
             candidate.insert(key.to_string(), value);
@@ -48,13 +48,13 @@ fn check() -> Result<(), String> {
 
     //check required env vars
     if candidate.remove(ENV_POLICY_PLUGIN_OPA_URL).is_none() {
-        return Err(format!("Missing required env var: {}", ENV_POLICY_PLUGIN_OPA_URL));
+        return Err(format!("Missing required env var: {ENV_POLICY_PLUGIN_OPA_URL}"));
     }
 
     // check optional env vars
     candidate.remove(ENV_POLICY_PLUGIN_AUTH_TOKEN);
     if !candidate.is_empty() {
-        return Err(format!("Invalid env vars: {:?}", candidate));
+        return Err(format!("Invalid env vars: {candidate:?}"));
     }
     Ok(())
 }
@@ -73,7 +73,7 @@ async fn validate(config: &Args) -> Result<(), String> {
             };
         }
         Err(err) => {
-            return Err(format!("Error connecting to OPA: {}", err));
+            return Err(format!("Error connecting to OPA: {err}"));
         }
     };
     Ok(())
@@ -83,7 +83,7 @@ pub async fn lookup_config() -> Result<Args, String> {
     let args = Args::default();
 
     let get_cfg =
-        |cfg: &str| -> Result<String, String> { env::var(cfg).map_err(|e| format!("Error getting env var {}: {:?}", cfg, e)) };
+        |cfg: &str| -> Result<String, String> { env::var(cfg).map_err(|e| format!("Error getting env var {cfg}: {e:?}")) };
 
     let url = get_cfg(ENV_POLICY_PLUGIN_OPA_URL);
     if url.is_err() {

@@ -301,6 +301,10 @@ impl Erasure {
             written += n;
         }
 
+        if ret_err.is_some() {
+            return (written, ret_err);
+        }
+
         if written < length {
             ret_err = Some(Error::LessData.into());
         }

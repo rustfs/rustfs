@@ -30,7 +30,7 @@ workspace = true
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants","opa"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true

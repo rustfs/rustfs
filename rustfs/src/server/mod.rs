@@ -13,18 +13,14 @@
 // limitations under the License.
 
 mod audit;
-mod console;
 mod http;
 mod hybrid;
 mod layer;
 mod service_state;
 
-#[cfg(test)]
-mod console_test;
 mod event;
 
 pub(crate) use audit::{start_audit_system, stop_audit_system};
-pub(crate) use console::start_console_server;
 pub(crate) use event::{init_event_notifier, shutdown_event_notifier};
 pub(crate) use http::{get_tokio_runtime_builder, print_tokio_thread_enable, start_http_server};
 pub(crate) use service_state::SHUTDOWN_TIMEOUT;

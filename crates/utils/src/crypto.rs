@@ -17,11 +17,11 @@ use std::mem::MaybeUninit;
 use hex_simd::{AsOut, AsciiCase};
 use hyper::body::Bytes;
 
-pub fn base64_encode(input: &[u8]) -> String {
+pub fn base64_encode_url_safe_no_pad(input: &[u8]) -> String {
     base64_simd::URL_SAFE_NO_PAD.encode_to_string(input)
 }
 
-pub fn base64_decode(input: &[u8]) -> Result<Vec<u8>, base64_simd::Error> {
+pub fn base64_decode_url_safe_no_pad(input: &[u8]) -> Result<Vec<u8>, base64_simd::Error> {
     base64_simd::URL_SAFE_NO_PAD.decode_to_vec(input)
 }
 
@@ -89,11 +89,11 @@ pub fn hex_sha256_chunk<R>(chunk: &[Bytes], f: impl FnOnce(&str) -> R) -> R {
 fn test_base64_encoding_decoding() {
     let original_uuid_timestamp = "c0194290-d911-45cb-8e12-79ec563f46a8x1735460504394878000";
 
-    let encoded_string = base64_encode(original_uuid_timestamp.as_bytes());
+    let encoded_string = base64_encode_url_safe_no_pad(original_uuid_timestamp.as_bytes());
 
     println!("Encoded: {}", &encoded_string);
 
-    let decoded_bytes = base64_decode(encoded_string.clone().as_bytes()).unwrap();
+    let decoded_bytes = base64_decode_url_safe_no_pad(encoded_string.clone().as_bytes()).unwrap();
     let decoded_string = String::from_utf8(decoded_bytes).unwrap();
 
     assert_eq!(decoded_string, original_uuid_timestamp)

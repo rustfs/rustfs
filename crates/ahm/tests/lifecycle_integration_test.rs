@@ -360,7 +360,7 @@ mod serial_tests {
         set_bucket_lifecycle(bucket_name.as_str())
             .await
             .expect("Failed to set lifecycle configuration");
-        println!("✅ Lifecycle configuration set for bucket: {}", bucket_name);
+        println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
         // Verify lifecycle configuration was set
         match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
@@ -495,7 +495,7 @@ mod serial_tests {
         set_bucket_lifecycle_deletemarker(bucket_name.as_str())
             .await
             .expect("Failed to set lifecycle configuration");
-        println!("✅ Lifecycle configuration set for bucket: {}", bucket_name);
+        println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
         // Verify lifecycle configuration was set
         match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {

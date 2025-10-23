@@ -101,6 +101,7 @@ aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 parking_lot = { workspace = true }
 moka = { workspace = true }
+base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = "1.1.0"
 google-cloud-auth = "1.0.1"

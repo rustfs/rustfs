@@ -289,6 +289,7 @@ impl FileInfo {
         Ok(t)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_object_part(
         &mut self,
         num: usize,
@@ -297,6 +298,7 @@ impl FileInfo {
         mod_time: Option<OffsetDateTime>,
         actual_size: i64,
         index: Option<Bytes>,
+        checksums: Option<HashMap<String, String>>,
     ) {
         let part = ObjectPartInfo {
             etag,
@@ -305,7 +307,7 @@ impl FileInfo {
             mod_time,
             actual_size,
             index,
-            checksums: None,
+            checksums,
             error: None,
         };
 

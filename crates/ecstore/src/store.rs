@@ -59,7 +59,6 @@ use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_filemeta::FileInfo;
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_utils::crypto::base64_decode;
 use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;
@@ -1231,6 +1230,7 @@ impl StorageAPI for ECStore {
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
             let err = to_object_err(err.into(), vec![bucket]);
             if !is_err_bucket_exists(&err) {
+                error!("make bucket failed: {err}");
                 let _ = self
                     .delete_bucket(
                         bucket,
@@ -2424,7 +2424,7 @@ fn check_list_multipart_args(
             }
         }
 
-        if let Err(_e) = base64_decode(upload_id_marker.as_bytes()) {
+        if let Err(_e) = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id_marker.as_bytes()) {
             return Err(StorageError::MalformedUploadID(upload_id_marker.to_owned()));
         }
     }
@@ -2451,7 +2451,7 @@ fn check_new_multipart_args(bucket: &str, object: &str) -> Result<()> {
 }
 
 fn check_multipart_object_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
-    if let Err(e) = base64_decode(upload_id.as_bytes()) {
+    if let Err(e) = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id.as_bytes()) {
         return Err(StorageError::MalformedUploadID(format!("{bucket}/{object}-{upload_id},err:{e}")));
     };
     check_object_args(bucket, object)

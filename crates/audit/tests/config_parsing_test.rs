@@ -81,8 +81,8 @@ fn test_config_section_names() {
 fn test_environment_variable_parsing() {
     // Test environment variable prefix patterns
     let env_prefix = "RUSTFS_";
-    let audit_webhook_prefix = format!("{}AUDIT_WEBHOOK_", env_prefix);
-    let audit_mqtt_prefix = format!("{}AUDIT_MQTT_", env_prefix);
+    let audit_webhook_prefix = format!("{env_prefix}AUDIT_WEBHOOK_");
+    let audit_mqtt_prefix = format!("{env_prefix}AUDIT_MQTT_");
 
     assert_eq!(audit_webhook_prefix, "RUSTFS_AUDIT_WEBHOOK_");
     assert_eq!(audit_mqtt_prefix, "RUSTFS_AUDIT_MQTT_");
@@ -141,13 +141,13 @@ fn test_duration_parsing_formats() {
         let result = parse_duration_test(input);
         match (result, expected_seconds) {
             (Some(duration), Some(expected)) => {
-                assert_eq!(duration.as_secs(), expected, "Failed for input: {}", input);
+                assert_eq!(duration.as_secs(), expected, "Failed for input: {input}");
             }
             (None, None) => {
                 // Both None, test passes
             }
             _ => {
-                panic!("Mismatch for input: {}, got: {:?}, expected: {:?}", input, result, expected_seconds);
+                panic!("Mismatch for input: {input}, got: {result:?}, expected: {expected_seconds:?}");
             }
         }
     }
@@ -188,13 +188,13 @@ fn test_url_validation() {
 
     for url_str in valid_urls {
         let result = Url::parse(url_str);
-        assert!(result.is_ok(), "Valid URL should parse: {}", url_str);
+        assert!(result.is_ok(), "Valid URL should parse: {url_str}");
     }
 
     for url_str in &invalid_urls[..3] {
         // Skip the ftp one as it's technically valid
         let result = Url::parse(url_str);
-        assert!(result.is_err(), "Invalid URL should not parse: {}", url_str);
+        assert!(result.is_err(), "Invalid URL should not parse: {url_str}");
     }
 }
 
@@ -214,6 +214,6 @@ fn test_qos_parsing() {
             0..=2 => Some(q),
             _ => None,
         });
-        assert_eq!(result, expected, "Failed for QoS input: {}", input);
+        assert_eq!(result, expected, "Failed for QoS input: {input}");
     }
 }

@@ -33,7 +33,6 @@ use rustfs_policy::{
         EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
     },
 };
-use rustfs_utils::crypto::base64_encode;
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -555,7 +554,10 @@ where
                     return Err(Error::PolicyTooLarge);
                 }
 
-                m.insert(SESSION_POLICY_NAME.to_owned(), Value::String(base64_encode(&policy_buf)));
+                m.insert(
+                    SESSION_POLICY_NAME.to_owned(),
+                    Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+                );
                 m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
             }
         }

@@ -51,6 +51,7 @@ mod tests {
 
     use crate::{CompressReader, EncryptReader, EtagReader, HashReader};
     use crate::{WarpReader, resolve_etag_generic};
+    use md5::Md5;
     use rustfs_utils::compress::CompressionAlgorithm;
     use std::io::Cursor;
     use tokio::io::BufReader;
@@ -72,7 +73,7 @@ mod tests {
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
         let mut hash_reader =
-            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("hash_etag".to_string()), false).unwrap();
+            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("hash_etag".to_string()), None, false).unwrap();
 
         // Test HashReader ETag resolution
         assert_eq!(resolve_etag_generic(&mut hash_reader), Some("hash_etag".to_string()));
@@ -105,20 +106,30 @@ mod tests {
         assert_eq!(resolve_etag_generic(&mut encrypt_reader), Some("encrypt_etag".to_string()));
     }
 
-    #[test]
-    fn test_complex_nesting() {
+    #[tokio::test]
+    async fn test_complex_nesting() {
+        use md5::Digest;
+        use tokio::io::AsyncReadExt;
         let data = b"test data for complex nesting";
+
+        let mut hasher = Md5::new();
+        hasher.update(data);
+        let etag = hasher.finalize();
+        let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
+
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
         // Create a complex nested structure: CompressReader<EncryptReader<EtagReader<BufReader<Cursor>>>>
-        let etag_reader = EtagReader::new(reader, Some("nested_etag".to_string()));
+        let etag_reader = EtagReader::new(reader, Some(etag_hex.clone()));
         let key = [0u8; 32];
         let nonce = [0u8; 12];
         let encrypt_reader = EncryptReader::new(etag_reader, key, nonce);
         let mut compress_reader = CompressReader::new(encrypt_reader, CompressionAlgorithm::Gzip);
 
+        compress_reader.read_to_end(&mut Vec::new()).await.unwrap();
+
         // Test that nested structure can resolve ETag
-        assert_eq!(resolve_etag_generic(&mut compress_reader), Some("nested_etag".to_string()));
+        assert_eq!(resolve_etag_generic(&mut compress_reader), Some(etag_hex));
     }
 
     #[test]
@@ -127,51 +138,80 @@ mod tests {
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
         // Create nested structure: CompressReader<HashReader<BufReader<Cursor>>>
-        let hash_reader =
-            HashReader::new(reader, data.len() as i64, data.len() as i64, Some("hash_nested_etag".to_string()), false).unwrap();
+        let hash_reader = HashReader::new(
+            reader,
+            data.len() as i64,
+            data.len() as i64,
+            Some("hash_nested_etag".to_string()),
+            None,
+            false,
+        )
+        .unwrap();
         let mut compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Deflate);
 
         // Test that nested HashReader can be resolved
         assert_eq!(resolve_etag_generic(&mut compress_reader), Some("hash_nested_etag".to_string()));
     }
 
-    #[test]
-    fn test_comprehensive_etag_extraction() {
+    #[tokio::test]
+    async fn test_comprehensive_etag_extraction() {
+        use md5::Digest;
+        use tokio::io::AsyncReadExt;
         println!("🔍 Testing comprehensive ETag extraction with real reader types...");
 
         // Test 1: Simple EtagReader
         let data1 = b"simple test";
+        let mut hasher = Md5::new();
+        hasher.update(data1);
+        let etag = hasher.finalize();
+        let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
         let reader1 = BufReader::new(Cursor::new(&data1[..]));
         let reader1 = Box::new(WarpReader::new(reader1));
-        let mut etag_reader = EtagReader::new(reader1, Some("simple_etag".to_string()));
-        assert_eq!(resolve_etag_generic(&mut etag_reader), Some("simple_etag".to_string()));
+        let mut etag_reader = EtagReader::new(reader1, Some(etag_hex.clone()));
+        etag_reader.read_to_end(&mut Vec::new()).await.unwrap();
+        assert_eq!(resolve_etag_generic(&mut etag_reader), Some(etag_hex.clone()));
 
         // Test 2: HashReader with ETag
         let data2 = b"hash test";
+        let mut hasher = Md5::new();
+        hasher.update(data2);
+        let etag = hasher.finalize();
+        let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
         let reader2 = BufReader::new(Cursor::new(&data2[..]));
         let reader2 = Box::new(WarpReader::new(reader2));
         let mut hash_reader =
-            HashReader::new(reader2, data2.len() as i64, data2.len() as i64, Some("hash_etag".to_string()), false).unwrap();
-        assert_eq!(resolve_etag_generic(&mut hash_reader), Some("hash_etag".to_string()));
+            HashReader::new(reader2, data2.len() as i64, data2.len() as i64, Some(etag_hex.clone()), None, false).unwrap();
+        hash_reader.read_to_end(&mut Vec::new()).await.unwrap();
+        assert_eq!(resolve_etag_generic(&mut hash_reader), Some(etag_hex.clone()));
 
         // Test 3: Single wrapper - CompressReader<EtagReader>
         let data3 = b"compress test";
+        let mut hasher = Md5::new();
+        hasher.update(data3);
+        let etag = hasher.finalize();
+        let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
         let reader3 = BufReader::new(Cursor::new(&data3[..]));
         let reader3 = Box::new(WarpReader::new(reader3));
-        let etag_reader3 = EtagReader::new(reader3, Some("compress_wrapped_etag".to_string()));
+        let etag_reader3 = EtagReader::new(reader3, Some(etag_hex.clone()));
         let mut compress_reader = CompressReader::new(etag_reader3, CompressionAlgorithm::Zstd);
-        assert_eq!(resolve_etag_generic(&mut compress_reader), Some("compress_wrapped_etag".to_string()));
+        compress_reader.read_to_end(&mut Vec::new()).await.unwrap();
+        assert_eq!(resolve_etag_generic(&mut compress_reader), Some(etag_hex.clone()));
 
         // Test 4: Double wrapper - CompressReader<EncryptReader<EtagReader>>
         let data4 = b"double wrap test";
+        let mut hasher = Md5::new();
+        hasher.update(data4);
+        let etag = hasher.finalize();
+        let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
         let reader4 = BufReader::new(Cursor::new(&data4[..]));
         let reader4 = Box::new(WarpReader::new(reader4));
-        let etag_reader4 = EtagReader::new(reader4, Some("double_wrapped_etag".to_string()));
+        let etag_reader4 = EtagReader::new(reader4, Some(etag_hex.clone()));
         let key = [1u8; 32];
         let nonce = [1u8; 12];
         let encrypt_reader4 = EncryptReader::new(etag_reader4, key, nonce);
         let mut compress_reader4 = CompressReader::new(encrypt_reader4, CompressionAlgorithm::Gzip);
-        assert_eq!(resolve_etag_generic(&mut compress_reader4), Some("double_wrapped_etag".to_string()));
+        compress_reader4.read_to_end(&mut Vec::new()).await.unwrap();
+        assert_eq!(resolve_etag_generic(&mut compress_reader4), Some(etag_hex.clone()));
 
         println!("✅ All ETag extraction methods work correctly!");
         println!("✅ Trait-based approach handles recursive unwrapping!");
@@ -195,6 +235,7 @@ mod tests {
             data.len() as i64,
             data.len() as i64,
             Some("real_world_etag".to_string()),
+            None,
             false,
         )
         .unwrap();
@@ -239,7 +280,7 @@ mod tests {
         let data = b"no etag test";
         let reader = BufReader::new(Cursor::new(&data[..]));
         let reader = Box::new(WarpReader::new(reader));
-        let mut hash_reader_no_etag = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
+        let mut hash_reader_no_etag = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
         assert_eq!(resolve_etag_generic(&mut hash_reader_no_etag), None);
 
         // Test with EtagReader that has None etag

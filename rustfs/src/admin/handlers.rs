@@ -144,7 +144,7 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let conditions = get_condition_values(&req.headers, &cred_clone);
+        let conditions = get_condition_values(&req.headers, &cred_clone, None, None);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -323,7 +323,7 @@ impl Operation for ServiceHandle {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ServiceHandle");
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
 
@@ -367,7 +367,7 @@ impl Operation for InspectDataHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle InspectDataHandler");
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
 
@@ -431,7 +431,10 @@ impl Operation for DataUsageInfoHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::DataUsageInfoAdminAction)],
+            vec![
+                Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
+                Action::S3Action(S3Action::ListBucketAction),
+            ],
         )
         .await?;
 
@@ -486,7 +489,7 @@ impl Operation for DataUsageInfoHandler {
 
             let mut info_for_refresh = info.clone();
             let store_for_refresh = store.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 if let Err(e) = collect_realtime_data_usage(&mut info_for_refresh, store_for_refresh.clone()).await {
                     warn!("Background data usage refresh failed: {}", e);
                     return;
@@ -638,10 +641,7 @@ impl Operation for MetricsHandler {
         let mp = extract_metrics_init_params(&req.uri);
         info!("mp: {:?}", mp);
 
-        let tick = match parse_duration(&mp.tick) {
-            Ok(i) => i,
-            Err(_) => std_Duration::from_secs(1),
-        };
+        let tick = parse_duration(&mp.tick).unwrap_or_else(|_| std_Duration::from_secs(3));
 
         let mut n = mp.n;
         if n == 0 {
@@ -654,28 +654,18 @@ impl Operation for MetricsHandler {
             MetricType::ALL
         };
 
-        let disks = mp.disks.split(",").map(String::from).collect::<Vec<String>>();
-        let by_disk = mp.by_disk == "true";
-        let mut disk_map = HashSet::new();
-        if !disks.is_empty() && !disks[0].is_empty() {
-            for d in disks.iter() {
-                if !d.is_empty() {
-                    disk_map.insert(d.to_string());
-                }
-            }
+        fn parse_comma_separated(s: &str) -> HashSet<String> {
+            s.split(',').filter(|part| !part.is_empty()).map(String::from).collect()
         }
 
+        let disks = parse_comma_separated(&mp.disks);
+        let by_disk = mp.by_disk == "true";
+        let disk_map = disks;
+
         let job_id = mp.by_job_id;
-        let hosts = mp.hosts.split(",").map(String::from).collect::<Vec<String>>();
+        let hosts = parse_comma_separated(&mp.hosts);
         let by_host = mp.by_host == "true";
-        let mut host_map = HashSet::new();
-        if !hosts.is_empty() && !hosts[0].is_empty() {
-            for d in hosts.iter() {
-                if !d.is_empty() {
-                    host_map.insert(d.to_string());
-                }
-            }
-        }
+        let host_map = hosts;
 
         let d_id = mp.by_dep_id;
         let mut interval = interval(tick);
@@ -691,7 +681,7 @@ impl Operation for MetricsHandler {
             inner: ReceiverStream::new(rx),
         });
         let body = Body::from(in_stream);
-        tokio::spawn(async move {
+        spawn(async move {
             while n > 0 {
                 info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
@@ -929,7 +919,7 @@ impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle BackgroundHealStatusHandler");
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
 
@@ -964,7 +954,7 @@ impl Operation for GetReplicationMetricsHandler {
         }
         //return Err(s3_error!(InvalidArgument, "Invalid bucket name"));
         //Ok(S3Response::with_headers((StatusCode::OK, Body::from()), header))
-        return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
+        Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))))
     }
 }
 
@@ -991,7 +981,7 @@ impl Operation for SetRemoteTargetHandler {
         };
 
         store
-            .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
@@ -1005,7 +995,7 @@ impl Operation for SetRemoteTargetHandler {
         };
 
         let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
-            tracing::error!("Failed to parse BucketTarget from body: {}", e);
+            error!("Failed to parse BucketTarget from body: {}", e);
             ApiError::other(e)
         })?;
 
@@ -1117,10 +1107,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
-            if let Err(err) = store
-                .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
-                .await
-            {
+            if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
                 error!("Error fetching bucket info: {:?}", err);
                 return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
             }
@@ -1149,7 +1136,7 @@ impl Operation for ListRemoteTargetHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-        return Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header))
     }
 }
 
@@ -1174,10 +1161,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
-        if let Err(err) = store
-            .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
-            .await
-        {
+        if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
             error!("Error fetching bucket info: {:?}", err);
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
         }
@@ -1206,7 +1190,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
 
-        return Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))));
+        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
 }
 
@@ -1216,9 +1200,7 @@ async fn collect_realtime_data_usage(
     store: Arc<rustfs_ecstore::store::ECStore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get bucket list and collect basic statistics
-    let buckets = store
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
-        .await?;
+    let buckets = store.list_bucket(&BucketOptions::default()).await?;
 
     info.buckets_count = buckets.len() as u64;
     info.last_update = Some(std::time::SystemTime::now());

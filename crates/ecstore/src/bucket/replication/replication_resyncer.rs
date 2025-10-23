@@ -2,12 +2,8 @@ use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
 use crate::bucket::metadata_sys;
-use crate::bucket::replication::{MrfReplicateEntry, ReplicationWorkerOperation, ResyncStatusType};
-use crate::bucket::replication::{
-    ObjectOpts, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateObjectInfo,
-    ReplicationConfigurationExt as _, ResyncTargetDecision, get_replication_state, parse_replicate_decision,
-    replication_statuses_map, target_reset_header, version_purge_statuses_map,
-};
+use crate::bucket::replication::ResyncStatusType;
+use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -29,14 +25,17 @@ use byteorder::ByteOrder;
 use futures::future::join_all;
 use http::HeaderMap;
 
+use regex::Regex;
 use rustfs_filemeta::{
-    ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType,
-    VersionPurgeStatusType,
+    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateDecision, ReplicateObjectInfo,
+    ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
+    ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
+    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE, SSEC_ALGORITHM_HEADER,
-    SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, headers,
+    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE,
+    RUSTFS_REPLICATION_RESET_STATUS, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, headers,
 };
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
@@ -55,9 +54,6 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-
-use super::replication_type::{ReplicateDecision, ReplicateTargetDecision, ResyncDecision};
-use regex::Regex;
 
 const REPLICATION_DIR: &str = ".replication";
 const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -663,7 +659,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         replication_timestamp: None,
         ssec: false, // TODO: add ssec support
         user_tags: oi.user_tags.clone(),
-        checksum: Vec::new(),
+        checksum: oi.checksum.clone(),
         retry_count: 0,
     }
 }
@@ -849,7 +845,7 @@ impl ReplicationConfig {
             {
                 resync_decision.targets.insert(
                     decision.arn.clone(),
-                    ResyncTargetDecision::resync_target(
+                    resync_target(
                         &oi,
                         &target.arn,
                         &target.reset_id,
@@ -862,6 +858,59 @@ impl ReplicationConfig {
 
         resync_decision
     }
+}
+
+pub fn resync_target(
+    oi: &ObjectInfo,
+    arn: &str,
+    reset_id: &str,
+    reset_before_date: Option<OffsetDateTime>,
+    status: ReplicationStatusType,
+) -> ResyncTargetDecision {
+    let rs = oi
+        .user_defined
+        .get(target_reset_header(arn).as_str())
+        .or(oi.user_defined.get(RUSTFS_REPLICATION_RESET_STATUS))
+        .map(|s| s.to_string());
+
+    let mut dec = ResyncTargetDecision::default();
+
+    let mod_time = oi.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+
+    if rs.is_none() {
+        let reset_before_date = reset_before_date.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        if !reset_id.is_empty() && mod_time < reset_before_date {
+            dec.replicate = true;
+            return dec;
+        }
+
+        dec.replicate = status == ReplicationStatusType::Empty;
+
+        return dec;
+    }
+
+    if reset_id.is_empty() || reset_before_date.is_none() {
+        return dec;
+    }
+
+    let rs = rs.unwrap();
+    let reset_before_date = reset_before_date.unwrap();
+
+    let parts: Vec<&str> = rs.splitn(2, ';').collect();
+
+    if parts.len() != 2 {
+        return dec;
+    }
+
+    let new_reset = parts[0] == reset_id;
+
+    if !new_reset && status == ReplicationStatusType::Completed {
+        return dec;
+    }
+
+    dec.replicate = new_reset && mod_time < reset_before_date;
+
+    dec
 }
 
 pub struct MustReplicateOptions {
@@ -933,7 +982,7 @@ pub async fn check_replicate_delete(
     let rcfg = match get_replication_config(bucket).await {
         Ok(Some(config)) => config,
         Ok(None) => {
-            warn!("No replication config found for bucket: {}", bucket);
+            // warn!("No replication config found for bucket: {}", bucket);
             return ReplicateDecision::default();
         }
         Err(err) => {
