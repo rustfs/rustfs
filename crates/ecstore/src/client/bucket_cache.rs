@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 
 use crate::client::{
     api_error_response::{http_resp_to_error_response, to_error_response},
-    transition_api::{LocationConstraint, CreateBucketConfiguration, TransitionClient},
+    transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use s3s::Body;
@@ -218,7 +218,9 @@ async fn process_bucket_location_response(
         let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();
         location = d.location_constraint;
     } else {
-        if let LocationConstraint { field } = quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()).unwrap() {
+        if let LocationConstraint { field } =
+            quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()).unwrap()
+        {
             location = field;
         }
     }

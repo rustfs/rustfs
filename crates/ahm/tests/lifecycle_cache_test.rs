@@ -22,7 +22,7 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{MakeBucketOptions, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serial_test::serial;
 use std::borrow::Cow;
@@ -36,6 +36,7 @@ use tracing::warn;
 use tracing::{debug, info};
 //use heed_traits::Comparator;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -197,18 +198,19 @@ fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
         name: usage.object.clone(),
         size: usage.total_size as i64,
         delete_marker: !usage.has_live_object && usage.delete_markers_count > 0,
-        mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
+        //mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
         ..Default::default()
     }
 }
 
-fn to_object_info(bucket: &str, name: &str, size: i64, delete_marker: bool, mod_time: OffsetDateTime) -> ObjectInfo {
+fn to_object_info(bucket: &str, object: &str, total_size: i64, delete_marker: bool, mod_time: OffsetDateTime, version_id: &str) -> ObjectInfo {
     ObjectInfo {
         bucket: bucket.to_string(),
         name: object.to_string(),
         size: total_size,
         delete_marker,
-        mod_time,
+        mod_time: Some(mod_time),
+        version_id: Some(Uuid::parse_str(version_id).unwrap()),
         ..Default::default()
     }
 }
@@ -223,6 +225,7 @@ enum LifecycleType {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct LifecycleContent {
+    ver_no: u8,
     ver_id: String,
     mod_time: OffsetDateTime,
     type_: LifecycleType,
@@ -234,48 +237,55 @@ pub struct LifecycleContentCodec;
 impl<'a> BytesEncode<'a> for LifecycleContentCodec {
     type EItem = LifecycleContent;
 
-    /// Encodes the u32 timestamp in big endian followed by the log level with a single byte.
     fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
-        let (ver_id_bytes, timestamp_bytes, type_, object_name_bytes) = match lcc {
+        let (ver_no, ver_id_bytes, timestamp_bytes, type_, object_name_bytes) = match lcc {
             LifecycleContent {
+                ver_no,
                 ver_id,
                 mod_time,
                 type_: LifecycleType::ExpiryCurrent,
                 object_name,
             } => (
+                ver_no,
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 0,
                 object_name.clone().into_bytes(),
             ),
             LifecycleContent {
+                ver_no,
                 ver_id,
                 mod_time,
                 type_: LifecycleType::ExpiryNoncurrent,
                 object_name,
             } => (
+                ver_no,
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 1,
                 object_name.clone().into_bytes(),
             ),
             LifecycleContent {
+                ver_no,
                 ver_id,
                 mod_time,
                 type_: LifecycleType::TransitionCurrent,
                 object_name,
             } => (
+                ver_no,
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 2,
                 object_name.clone().into_bytes(),
             ),
             LifecycleContent {
+                ver_no,
                 ver_id,
                 mod_time,
                 type_: LifecycleType::TransitionNoncurrent,
                 object_name,
             } => (
+                ver_no,
                 ver_id.clone().into_bytes(),
                 mod_time.unix_timestamp().to_be_bytes(),
                 3,
@@ -310,7 +320,10 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
             None => return Err("invalid log key: cannot extract log level".into()),
         };
 
+        let ver_no = 0;
+
         Ok(LifecycleContent {
+            ver_no,
             ver_id: "".to_string(),
             mod_time: OffsetDateTime::from_unix_timestamp(mod_time_timestamp.try_into().unwrap()).unwrap(),
             type_,
@@ -400,6 +413,7 @@ mod serial_tests {
                     &mut wtxn,
                     &123143242,
                     &LifecycleContent {
+                        ver_no: 0,
                         ver_id: "aaa".to_string(),
                         mod_time: OffsetDateTime::now_utc(),
                         type_: LifecycleType::TransitionNoncurrent,
@@ -421,6 +435,7 @@ mod serial_tests {
                     iter.put_current(
                         &123143242,
                         &LifecycleContent {
+                            ver_no: 0,
                             ver_id: "aaa".to_string(),
                             mod_time: OffsetDateTime::now_utc(),
                             type_: LifecycleType::TransitionNoncurrent,
@@ -429,15 +444,17 @@ mod serial_tests {
                     )
                     .unwrap()
                 };
-                let _ = wtxn.commit().unwrap();
+                drop(iter);
+                //let _ = wtxn.commit().unwrap();
 
-                let mut wtxn = lmdb_env.write_txn().unwrap();
+                //let mut wtxn = lmdb_env.write_txn().unwrap();
                 let _ = lmdb.delete(&mut wtxn, &123143242).unwrap();
                 let _ = lmdb
                     .delete_one_duplicate(
                         &mut wtxn,
                         &123143242,
                         &LifecycleContent {
+                            ver_no: 0,
                             ver_id: "aaa".to_string(),
                             mod_time: OffsetDateTime::now_utc(),
                             type_: LifecycleType::TransitionNoncurrent,

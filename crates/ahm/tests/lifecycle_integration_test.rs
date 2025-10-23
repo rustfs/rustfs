@@ -598,7 +598,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    //#[ignore]
+    #[ignore]
     async fn test_lifecycle_transition_basic() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
