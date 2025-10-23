@@ -877,12 +877,12 @@ impl S3 for FS {
                     &object,
                     &mut obj_info,
                     &ObjectOptions {
-                        version_id: obj_info_.version_id.clone().map(|e| e.to_string()),
+                        version_id: obj_info_.version_id.map(|e| e.to_string()),
                         ..Default::default()
                     },
                     &ObjectOptions {
-                        version_id: obj_info_.version_id.clone().map(|e| e.to_string()),
-                        mod_time: obj_info_.mod_time.clone(),
+                        version_id: obj_info_.version_id.map(|e| e.to_string()),
+                        mod_time: obj_info_.mod_time,
                         ..Default::default()
                     },
                 )
@@ -906,7 +906,7 @@ impl S3 for FS {
         //if let Some(rreq) = rreq {
         if let Some(output_location) = &rreq.output_location {
             if let Some(s3) = &output_location.s3 {
-                if s3.bucket_name != "" {
+                if !s3.bucket_name.is_empty() {
                     header.insert(
                         X_AMZ_RESTORE_OUTPUT_PATH,
                         format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse().unwrap(),
@@ -971,7 +971,7 @@ impl S3 for FS {
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq,
-                    restore_expiry: restore_expiry,
+                    restore_expiry,
                     ..Default::default()
                 },
                 version_id: obj_info_.version_id.map(|e| e.to_string()),
@@ -981,7 +981,7 @@ impl S3 for FS {
                 warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string());
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
-                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string()),
+                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err),
                 ));
             }
 

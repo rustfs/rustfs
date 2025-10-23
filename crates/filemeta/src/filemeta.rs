@@ -1787,14 +1787,10 @@ impl MetaObject {
         } else {
             "".to_string()
         };
-        fi.transition_version_id = if let Some(elm) = self
+        fi.transition_version_id = self
             .meta_sys
             .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"))
-        {
-            Some(Uuid::from_slice(elm).unwrap())
-        } else {
-            None
-        };
+            .map(|elm| Uuid::from_slice(elm).unwrap());
         fi.transition_status = if let Some(elm) = self
             .meta_sys
             .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
@@ -2015,14 +2011,10 @@ impl MetaDeleteMarker {
             } else {
                 "".to_string()
             };
-            fi.transition_version_id = if let Some(elm) = self
+            fi.transition_version_id = self
                 .meta_sys
                 .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"))
-            {
-                Some(Uuid::from_slice(elm).unwrap())
-            } else {
-                None
-            };
+                .map(|elm| Uuid::from_slice(elm).unwrap());
             fi.transition_status = if let Some(elm) = self
                 .meta_sys
                 .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))

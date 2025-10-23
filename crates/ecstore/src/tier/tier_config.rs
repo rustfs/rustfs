@@ -208,12 +208,12 @@ impl Clone for TierConfig {
             s3,
             rustfs: r,
             minio: m,
-            aliyun: aliyun,
-            tencent: tencent,
-            huaweicloud: huaweicloud,
-            azure: azure,
-            gcs: gcs,
-            r2: r2,
+            aliyun,
+            tencent,
+            huaweicloud,
+            azure,
+            gcs,
+            r2,
         }
     }
 }
@@ -502,7 +502,7 @@ pub struct TierAzure {
 
 impl TierAzure {
     pub fn is_sp_enabled(&self) -> bool {
-        self.sp_auth.tenant_id != "" && self.sp_auth.client_id != "" && self.sp_auth.client_secret != ""
+        !self.sp_auth.tenant_id.is_empty() && !self.sp_auth.client_id.is_empty() && !self.sp_auth.client_secret.is_empty()
     }
 }
 

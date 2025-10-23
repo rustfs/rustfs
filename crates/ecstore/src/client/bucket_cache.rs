@@ -218,9 +218,7 @@ async fn process_bucket_location_response(
         let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();
         location = d.location_constraint;
     } else {
-        if let LocationConstraint { field } =
-            quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()).unwrap()
-        {
+        if let Ok(LocationConstraint { field }) = quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()) {
             location = field;
         }
     }

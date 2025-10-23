@@ -23,7 +23,7 @@ use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::Deserialize;
 use serde::Serialize;
-use std::{collections::HashMap, fmt::Display};
+use std::collections::HashMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -554,7 +554,7 @@ impl RestoreStatusOps for RestoreStatus {
         if self.on_going() {
             return None;
         }
-        self.restore_expiry_date.clone().map(|e| OffsetDateTime::from(e))
+        self.restore_expiry_date.clone().map(OffsetDateTime::from)
     }
 
     fn on_going(&self) -> bool {

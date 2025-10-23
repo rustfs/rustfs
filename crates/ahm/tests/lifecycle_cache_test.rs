@@ -142,12 +142,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         fs::remove_dir_all(&temp_dir).await.ok();
     }
     fs::create_dir_all(&temp_dir).await.unwrap();
-    let lmdb_env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(100)
-            .open(&test_lmdb_lifecycle_dir)
-            .unwrap()
-    };
+    let lmdb_env = unsafe { EnvOpenOptions::new().max_dbs(100).open(&test_lmdb_lifecycle_dir).unwrap() };
     let bucket_name = format!("test-lc-cache-{}", "00000");
     let mut wtxn = lmdb_env.write_txn().unwrap();
     let db = match lmdb_env
@@ -156,12 +151,13 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         .types::<I64<BigEndian>, LifecycleContentCodec>()
         .flags(DatabaseFlags::DUP_SORT)
         //.dup_sort_comparator::<>()
-        .create(&mut wtxn) {
-            Ok(db) => db,
-            Err(err) => {
-                panic!("lmdb error: {}", err);
-            }
-        };
+        .create(&mut wtxn)
+    {
+        Ok(db) => db,
+        Err(err) => {
+            panic!("lmdb error: {}", err);
+        }
+    };
     let _ = wtxn.commit();
     let _ = GLOBAL_LMDB_ENV.set(lmdb_env);
     let _ = GLOBAL_LMDB_DB.set(db);
@@ -353,17 +349,17 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
             None => return Err("invalid LifecycleContent: cannot extract ver_no".into()),
         };
 
-        let ver_id = match bytes.get(size_of::<u8>()..(36+1)) {
+        let ver_id = match bytes.get(size_of::<u8>()..(36 + 1)) {
             Some(bytes) => unsafe { std::str::from_utf8_unchecked(bytes).to_string() },
             None => return Err("invalid LifecycleContent: cannot extract ver_id".into()),
         };
 
-        let mod_timestamp = match bytes.get((36+1)..(size_of::<i64>()+36+1)) {
+        let mod_timestamp = match bytes.get((36 + 1)..(size_of::<i64>() + 36 + 1)) {
             Some(bytes) => bytes.try_into().map(i64::from_be_bytes).unwrap(),
             None => return Err("invalid LifecycleContent: cannot extract mod_time timestamp".into()),
         };
 
-        let type_ = match bytes.get(size_of::<i64>()+36+1) {
+        let type_ = match bytes.get(size_of::<i64>() + 36 + 1) {
             Some(&0) => LifecycleType::ExpiryCurrent,
             Some(&1) => LifecycleType::ExpiryNoncurrent,
             Some(&2) => LifecycleType::TransitionCurrent,
@@ -372,7 +368,7 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
             None => return Err("invalid LifecycleContent: cannot extract LifecycleType".into()),
         };
 
-        let object_name = match bytes.get((size_of::<i64>()+36+1+1)..) {
+        let object_name = match bytes.get((size_of::<i64>() + 36 + 1 + 1)..) {
             Some(bytes) => unsafe { std::str::from_utf8_unchecked(bytes).to_string() },
             None => return Err("invalid LifecycleContent: cannot extract object_name".into()),
         };

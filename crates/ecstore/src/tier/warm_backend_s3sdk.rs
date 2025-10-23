@@ -89,6 +89,7 @@ impl WarmBackendS3 {
             return Err(std::io::Error::other("insufficient parameters for S3 backend authentication"));
         }
         let region_provider = RegionProviderChain::default_provider().or_else(Region::new(conf.region.clone()));
+        #[allow(deprecated)]
         let config = aws_config::from_env()
             .endpoint_url(conf.endpoint.clone())
             .region(region_provider)

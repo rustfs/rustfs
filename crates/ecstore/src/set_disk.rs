@@ -4557,7 +4557,7 @@ impl StorageAPI for SetDisks {
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
-                return Err(Error::other(format!("remote tier error: {}", err.to_string())));
+                return Err(Error::other(format!("remote tier error: {}", err)));
             }
         };
 
@@ -4714,7 +4714,7 @@ impl StorageAPI for SetDisks {
         let mut oi = ObjectInfo::default();
         let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true).await;
         if let Err(err) = fi {
-            return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
+            return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
         let (actual_fi, _, _) = fi.unwrap();
 
@@ -4722,7 +4722,7 @@ impl StorageAPI for SetDisks {
         let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
         if oi.parts.len() == 1 {
             let rs: Option<HTTPRangeSpec> = None;
-            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &opts).await;
+            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
@@ -4732,7 +4732,7 @@ impl StorageAPI for SetDisks {
                 HashReader::new(Box::new(WarpReader::new(reader)), gr.object_info.size, gr.object_info.size, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
             if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
-                return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
+                return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
             } else {
                 return Ok(());
             }
