@@ -19,6 +19,7 @@ use flexi_logger::{
     WriteMode::{AsyncWith, BufferAndFlush},
     style,
 };
+use metrics::counter;
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
@@ -233,6 +234,13 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             meter_provider
         };
 
+        match metrics_exporter_opentelemetry::Recorder::builder("order-service").install_global() {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Failed to set global metrics recorder: {:?}", e);
+            }
+        }
+
         // initialize logger provider
         let logger_provider = {
             let mut builder = SdkLoggerProvider::builder().with_resource(res);
@@ -307,7 +315,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                 OBSERVABILITY_METER_NAME.set(service_name.to_string()).ok();
             }
         }
-
+        counter!("rustfs.start.total").increment(1);
         return OtelGuard {
             tracer_provider: Some(tracer_provider),
             meter_provider: Some(meter_provider),
