@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 
 use crate::client::{
     api_error_response::{http_resp_to_error_response, to_error_response},
-    transition_api::{Document, Document2, TransitionClient},
+    transition_api::{LocationConstraint, CreateBucketConfiguration, TransitionClient},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use s3s::Body;
@@ -175,7 +175,11 @@ impl TransitionClient {
     }
 }
 
-async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str, tier_type: &str) -> Result<String, std::io::Error> {
+async fn process_bucket_location_response(
+    mut resp: http::Response<Body>,
+    bucket_name: &str,
+    tier_type: &str,
+) -> Result<String, std::io::Error> {
     //if resp != nil {
     if resp.status() != StatusCode::OK {
         let err_resp = http_resp_to_error_response(&resp, vec![], bucket_name, "");
@@ -209,14 +213,16 @@ async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket
     //}
 
     let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-    let mut location;
+    let mut location = "".to_string();
     if tier_type == "huaweicloud" {
-        let Document2(location_constraint) = quick_xml::de::from_str::<Document2>(&String::from_utf8(b).unwrap()).unwrap();
-        location = location_constraint.0;
+        let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();
+        location = d.location_constraint;
     } else {
-        let Document(location_constraint) = quick_xml::de::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
-        location = location_constraint;
+        if let LocationConstraint { field } = quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()).unwrap() {
+            location = field;
+        }
     }
+    //debug!("location: {}", location);
 
     if location == "" {
         location = "us-east-1".to_string();

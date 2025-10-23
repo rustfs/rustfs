@@ -440,7 +440,8 @@ mod tests {
         let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("http://examplebucket.s3.amazonaws.com/?")
-            .body(Body::empty()).unwrap();
+            .body(Body::empty())
+            .unwrap();
         let mut headers = req.headers_mut();
         headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
         headers.insert(
@@ -514,7 +515,8 @@ mod tests {
         let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("http://192.168.1.11:9020/mblock2/?")
-            .body(Body::empty()).unwrap();
+            .body(Body::empty())
+            .unwrap();
 
         let mut headers = req.headers_mut();
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
@@ -694,7 +696,7 @@ mod tests {
                 "20250628T061107Z",
                 "\n",
                 "20250628//s3/aws4_request\n",
-                "9dcfa3d3139baf71a046e7fa17dacab8ee11676771e25e7cd09098bf39f09d5b",  //payload hash
+                "9dcfa3d3139baf71a046e7fa17dacab8ee11676771e25e7cd09098bf39f09d5b", //payload hash
             )
         );
 
@@ -719,7 +721,8 @@ mod tests {
         let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("http://examplebucket.s3.amazonaws.com/test.txt")
-            .body(Body::empty()).unwrap();
+            .body(Body::empty())
+            .unwrap();
 
         let mut headers = req.headers_mut();
         headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());

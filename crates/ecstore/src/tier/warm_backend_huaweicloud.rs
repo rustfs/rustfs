@@ -25,7 +25,7 @@ use crate::client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
     credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore, BucketLookupType},
+    transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 use crate::tier::{
     tier_config::TierHuaweicloud,
@@ -76,8 +76,12 @@ impl WarmBackendHuaweicloud {
         };
         let scheme = u.scheme();
         let default_port = if scheme == "https" { 443 } else { 80 };
-        let client =
-            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts, "huaweicloud").await?;
+        let client = TransitionClient::new(
+            &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
+            opts,
+            "huaweicloud",
+        )
+        .await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

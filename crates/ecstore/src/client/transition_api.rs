@@ -285,8 +285,8 @@ impl TransitionClient {
         let mut resp = resp.unwrap();
         debug!("http_resp: {:?}", resp);
 
-        let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-        debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
+        //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
 
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
@@ -386,9 +386,9 @@ impl TransitionClient {
         method: &http::Method,
         metadata: &mut RequestMetadata,
     ) -> Result<http::Request<Body>, std::io::Error> {
-        let location = metadata.bucket_location.clone();
+        let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
-            let location = self.get_bucket_location(&metadata.bucket_name).await?;
+            location = self.get_bucket_location(&metadata.bucket_name).await?;
         }
 
         let is_makebucket = metadata.object_name == "" && method == http::Method::PUT && metadata.query_values.len() == 0;
@@ -1003,10 +1003,13 @@ impl tower::Service<Request<Body>> for SendRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Document(pub String);
+pub struct LocationConstraint {
+    #[serde(rename = "$value")]
+    pub field: String,
+}
 
 #[derive(Serialize, Deserialize)]
-pub struct LocationConstraint(pub String);
-
-#[derive(Serialize, Deserialize)]
-pub struct Document2(pub LocationConstraint);
+pub struct CreateBucketConfiguration {
+    #[serde(rename = "LocationConstraint")]
+    pub location_constraint: String,
+}

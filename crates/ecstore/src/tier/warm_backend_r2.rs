@@ -75,8 +75,12 @@ impl WarmBackendR2 {
         };
         let scheme = u.scheme();
         let default_port = if scheme == "https" { 443 } else { 80 };
-        let client =
-            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts, "r2").await?;
+        let client = TransitionClient::new(
+            &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
+            opts,
+            "r2",
+        )
+        .await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
