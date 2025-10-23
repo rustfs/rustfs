@@ -27,6 +27,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
+use metrics::counter;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
@@ -488,7 +489,17 @@ fn process_connection(
                             key_request_uri_path = %request.uri().path().to_owned(),
                             "handle request api total",
                         );
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
+                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
+                        let labels = [
+                            ("key_request_method", format!("{}!", request.method())),
+                            ("key_request_uri_path", format!("{}!", request.uri().path())),
+                        ];
+                        let counter = if is_console {
+                            counter!("rustfs_console_requests_total", &labels)
+                        } else {
+                            counter!("rustfs_api_requests_total", &labels)
+                        };
+                        counter.increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
                         _span.record("http response status_code", tracing::field::display(response.status()));

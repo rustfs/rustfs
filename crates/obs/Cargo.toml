@@ -36,6 +36,8 @@ gpu = ["dep:nvml-wrapper"]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
 flexi_logger = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-opentelemetry = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
@@ -47,7 +49,6 @@ opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_ex
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
-tracing-core = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
