@@ -1931,7 +1931,7 @@ impl S3 for FS {
                 .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
                 .map_err(ApiError::from)?;
 
-            warn!("get object metadata checksums: {:?}", checksums);
+            debug!("get object metadata checksums: {:?}", checksums);
             for (key, checksum) in checksums {
                 if key == AMZ_CHECKSUM_TYPE {
                     checksum_type = Some(ChecksumType::from(checksum));
@@ -3316,16 +3316,14 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
             key,
             upload_id,
             ..
-        } = req.input;
-
-        // error!("complete_multipart_upload {:?}", multipart_upload);
-        // mc cp step 5
+        } = input;
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
@@ -3394,17 +3392,23 @@ impl S3 for FS {
             server_side_encryption, ssekms_key_id
         );
 
-        let mut checksum_crc32 = None;
-        let mut checksum_crc32c = None;
-        let mut checksum_sha1 = None;
-        let mut checksum_sha256 = None;
-        let mut checksum_crc64nvme = None;
-        let mut checksum_type = None;
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+        let mut checksum_type = input.checksum_type;
+
+        warn!(
+            "complete_multipart_upload extract checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+        );
 
         // checksum
         let (checksums, _is_multipart) = obj_info
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
+
+        warn!("complete_multipart_upload decrypt checksums: {:?}", checksums);
 
         for (key, checksum) in checksums {
             if key == AMZ_CHECKSUM_TYPE {
@@ -3421,6 +3425,10 @@ impl S3 for FS {
                 _ => (),
             }
         }
+
+        warn!(
+            "complete_multipart_upload final checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+        );
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),

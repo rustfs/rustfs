@@ -102,7 +102,7 @@ export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
 export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
 
-# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
+export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
 
 #export RUSTFS_REGION="us-east-1"
 

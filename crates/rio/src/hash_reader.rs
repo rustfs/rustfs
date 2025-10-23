@@ -331,6 +331,8 @@ impl HashReader {
             } else {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
             }
+
+            tracing::debug!("add_non_trailing_checksum checksum={checksum:?}");
         }
         Ok(())
     }

@@ -5463,23 +5463,30 @@ impl StorageAPI for SetDisks {
             return Err(Error::other("part result number err"));
         }
 
+        let mut checksum_type = rustfs_rio::ChecksumType::NONE;
+
         if let Some(cs) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM) {
-            let Some(checksum_type) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE) else {
+            let Some(ct) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE) else {
                 return Err(Error::other("checksum type not found"));
             };
+
+            debug!("complete_multipart_upload checksum type={ct}, cs={cs}");
+            debug!("complete_multipart_upload opts.want_checksum={:?}", opts.want_checksum);
 
             if opts.want_checksum.is_some()
                 && !opts.want_checksum.as_ref().is_some_and(|v| {
                     v.checksum_type
-                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, checksum_type))
+                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct))
                 })
             {
                 return Err(Error::other(format!(
                     "checksum type mismatch, got {:?}, want {:?}",
                     opts.want_checksum.as_ref().unwrap(),
-                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, checksum_type)
+                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
                 )));
             }
+
+            checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
         }
 
         for (i, part) in object_parts.iter().enumerate() {
@@ -5514,6 +5521,12 @@ impl StorageAPI for SetDisks {
 
         let mut object_size: usize = 0;
         let mut object_actual_size: i64 = 0;
+
+        let mut checksum_combined = bytes::BytesMut::new();
+        let mut checksum = rustfs_rio::Checksum {
+            checksum_type,
+            ..Default::default()
+        };
 
         for (i, p) in uploaded_parts.iter().enumerate() {
             let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
