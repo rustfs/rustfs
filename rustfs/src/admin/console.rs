@@ -40,7 +40,6 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn};
 
-// shadow!(build);
 pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
 const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 
@@ -49,6 +48,17 @@ const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 struct StaticFiles;
 
 /// Static file handler
+///
+/// Serves static files embedded in the binary using rust-embed.
+/// If the requested file is not found, it serves index.html as a fallback.
+/// If index.html is also not found, it returns a 404 Not Found response.
+///
+/// Arguments:
+/// - `uri`: The request URI.
+///
+/// Returns:
+/// - An `impl IntoResponse` containing the static file content or a 404 response.
+///
 pub(crate) async fn static_handler(uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
@@ -71,7 +81,7 @@ pub(crate) async fn static_handler(uri: Uri) -> impl IntoResponse {
     } else {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from("404 Not Found"))
+            .body(Body::from(" 404 Not Found \n RustFS "))
             .unwrap()
     }
 }
@@ -214,8 +224,6 @@ fn _is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[allow(clippy::const_is_empty)]
-#[allow(dead_code)]
 #[instrument(fields(host))]
 pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
@@ -390,8 +398,8 @@ fn setup_console_middleware_stack(
     auth_timeout: u64,
 ) -> Router {
     let mut app = Router::new()
-        .route(&format!("{CONSOLE_PREFIX}/license"), get(crate::admin::console::license_handler))
-        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(crate::admin::console::config_handler))
+        .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
+        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
         .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
@@ -405,7 +413,7 @@ fn setup_console_middleware_stack(
         // Add timeout layer - convert auth_timeout from seconds to Duration
         .layer(TimeoutLayer::new(Duration::from_secs(auth_timeout)))
         // Add request body limit (10MB for console uploads)
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
+        .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 
     // Add rate limiting if enabled
     if rate_limit_enable {

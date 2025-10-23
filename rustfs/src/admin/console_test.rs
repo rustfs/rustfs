@@ -42,23 +42,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_external_address_configuration() {
-        // Test external address configuration
-        let args = vec![
-            "rustfs",
-            "/tmp/test",
-            "--console-address",
-            ":9001",
-            "--external-address",
-            ":9020",
-        ];
-        let opt = Opt::parse_from(args);
-
-        assert_eq!(opt.console_address, ":9001");
-        assert_eq!(opt.external_address, ":9020".to_string());
-    }
-
-    #[tokio::test]
     async fn test_console_tls_configuration() {
         // Test TLS configuration options (now uses shared tls_path)
         let args = vec!["rustfs", "/tmp/test", "--tls-path", "/path/to/tls"];
@@ -103,14 +86,11 @@ mod tests {
             "true",
             "--console-address",
             ":9001",
-            "--external-address",
-            ":9020",
         ];
         let opt = Opt::parse_from(args);
 
         // Verify all console-related configuration is parsed correctly
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
-        assert_eq!(opt.external_address, ":9020".to_string());
     }
 }
