@@ -310,7 +310,6 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::init_global_dns_resolver;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::{collections::HashSet, io::Error as IoError};
 
@@ -437,12 +436,7 @@ mod test {
     #[tokio::test]
     async fn test_get_host_ip() {
         set_mock_dns_resolver(mock_resolver);
-        match init_global_dns_resolver().await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Failed to initialize global DNS resolver: {e}");
-            }
-        }
+
         // Test IPv4 address
         let ipv4_host = Host::Ipv4(Ipv4Addr::new(192, 168, 1, 1));
         let ipv4_result = get_host_ip(ipv4_host).await.unwrap();

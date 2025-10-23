@@ -494,12 +494,7 @@ fn process_connection(
                             ("key_request_method", format!("{}!", request.method())),
                             ("key_request_uri_path", format!("{}!", request.uri().path())),
                         ];
-                        let counter = if is_console {
-                            counter!("rustfs_console_requests_total", &labels)
-                        } else {
-                            counter!("rustfs_api_requests_total", &labels)
-                        };
-                        counter.increment(1);
+                        counter!("rustfs_api_requests_total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
                         _span.record("http response status_code", tracing::field::display(response.status()));
