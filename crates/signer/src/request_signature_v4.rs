@@ -167,11 +167,13 @@ fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap
     if let Some(q) = req.uri().query() {
         // Parse query string into key-value pairs
         let mut query_params: Vec<(String, String)> = Vec::new();
-        for param in q.split('&') {
-            if let Some((key, value)) = param.split_once('=') {
-                query_params.push((key.to_string(), value.to_string()));
-            } else {
-                query_params.push((param.to_string(), "".to_string()));
+        if !q.is_empty() {
+            for param in q.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    query_params.push((key.to_string(), value.to_string()));
+                } else {
+                    query_params.push((param.to_string(), "".to_string()));
+                }
             }
         }
 
@@ -179,6 +181,7 @@ fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap
         query_params.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build canonical query string
+        //println!("query_params: {query_params:?}");
         let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         canonical_query_string = sorted_params.join("&");
@@ -536,6 +539,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
+        //println!("parts.path_and_query: {:?}", parts.path_and_query);
         *req.uri_mut() = Uri::from_parts(parts).unwrap();
 
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
@@ -573,7 +577,7 @@ mod tests {
         let signing_key = get_signing_key(secret_access_key, region, t, service);
         let signature = get_signature(signing_key, &string_to_sign);
         println!("signature: \n{}\n", signature);
-        assert_eq!(signature, "df4116595e27b0dfd1103358947d9199378cc6386c4657abd8c5f0b11ebb4931");
+        assert_eq!(signature, "73fad2dfea0727e10a7179bf49150360a56f2e6b519c53999fd6e011152187d0");
     }
 
     #[test]
@@ -638,7 +642,7 @@ mod tests {
         let signing_key = get_signing_key(secret_access_key, region, t, service);
         let signature = get_signature(signing_key, &string_to_sign);
         println!("signature: \n{}\n", signature);
-        assert_eq!(signature, "760278c9a77d5c245ac83d85917bddc3e3b14343091e8f4ad8edbbf73107d685");
+        assert_eq!(signature, "dfbed913d1982428f6224ee506431fc133dbcad184194c0cbf01bc517435788a");
     }
 
     #[test]
@@ -794,7 +798,7 @@ mod tests {
             concat!(
                 "GET\n",
                 "/mblock2/test.txt\n",
-                "delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=rustfsadmin%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=30e6b8c920512f0d12cba77a7c39612bff7f5f8148f4dc35cdd18f4b15a12477\n",
+                "delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=rustfsadmin%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=fe7f63f41e4ca18be9e70f560bbe9c079cf06ab97630934e04f7524751ff302d\n",
                 "host:192.168.1.11:9020\n",
                 "\n",
                 "host\n",

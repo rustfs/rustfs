@@ -76,8 +76,8 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_filemeta::fileinfo::{ObjectPartInfo, RestoreStatusOps};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_kms::{
     DataKey,
     service_manager::get_global_encryption_service,

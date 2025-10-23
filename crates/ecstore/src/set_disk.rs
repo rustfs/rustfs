@@ -4740,8 +4740,14 @@ impl StorageAPI for SetDisks {
             }
             let gr = gr.unwrap();
             let reader = BufReader::new(gr.stream);
-            let hash_reader =
-                HashReader::new(Box::new(WarpReader::new(reader)), gr.object_info.size, gr.object_info.size, None, None, false)?;
+            let hash_reader = HashReader::new(
+                Box::new(WarpReader::new(reader)),
+                gr.object_info.size,
+                gr.object_info.size,
+                None,
+                None,
+                false,
+            )?;
             let mut p_reader = PutObjReader::new(hash_reader);
             if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;

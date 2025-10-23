@@ -2109,7 +2109,7 @@ impl MetaDeleteMarker {
             fi.transition_version_id = self
                 .meta_sys
                 .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}").as_str())
-                .map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());       
+                .map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());
         }
 
         fi
