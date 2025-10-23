@@ -46,7 +46,6 @@ export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"
-export RUSTFS_EXTERNAL_ADDRESS=":9000"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
