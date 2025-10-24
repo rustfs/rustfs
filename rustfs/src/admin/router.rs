@@ -99,7 +99,7 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(CONSOLE_PREFIX)
+        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || is_console_path(uri.path())
     }
 
     // check_access before call
