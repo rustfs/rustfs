@@ -331,6 +331,8 @@ impl HashReader {
             } else {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
             }
+
+            tracing::debug!("add_non_trailing_checksum checksum={checksum:?}");
         }
         Ok(())
     }
@@ -359,9 +361,10 @@ impl HashReader {
             if checksum.checksum_type.trailing() {
                 if let Some(trailer) = self.trailer_s3s.as_ref() {
                     if let Some(Some(checksum_str)) = trailer.read(|headers| {
-                        headers
-                            .get(checksum.checksum_type.to_string())
-                            .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                        checksum
+                            .checksum_type
+                            .key()
+                            .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
                     }) {
                         map.insert(checksum.checksum_type.to_string(), checksum_str);
                     }
