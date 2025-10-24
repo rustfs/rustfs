@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use crate::config::OtelConfig;
+use crate::global::{IS_OBSERVABILITY_ENABLED, OBSERVABILITY_METER_NAME};
 use flexi_logger::{
     Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
     WriteMode::{AsyncWith, BufferAndFlush},
     style,
 };
+use metrics::counter;
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
@@ -232,6 +234,13 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             meter_provider
         };
 
+        match metrics_exporter_opentelemetry::Recorder::builder("order-service").install_global() {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Failed to set global metrics recorder: {:?}", e);
+            }
+        }
+
         // initialize logger provider
         let logger_provider = {
             let mut builder = SdkLoggerProvider::builder().with_resource(res);
@@ -302,9 +311,11 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     logger_level,
                     env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
                 );
+                IS_OBSERVABILITY_ENABLED.set(true).ok();
+                OBSERVABILITY_METER_NAME.set(service_name.to_string()).ok();
             }
         }
-
+        counter!("rustfs.start.total").increment(1);
         return OtelGuard {
             tracer_provider: Some(tracer_provider),
             meter_provider: Some(meter_provider),

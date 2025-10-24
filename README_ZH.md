@@ -136,6 +136,10 @@ RustFS 变得更好的杰出人员。
 
 <a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
+## Star 历史图
+
+[![Star 历史图](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+
 ## 许可证
 
 [Apache 2.0](https://opensource.org/licenses/Apache-2.0)

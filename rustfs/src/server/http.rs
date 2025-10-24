@@ -27,6 +27,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
+use metrics::counter;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
@@ -151,18 +152,16 @@ pub async fn start_http_server(
             local_addr.ip()
         }
     };
-
-    // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("http://{local_ip}:{server_port}");
-    let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
-
     let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
     let tls_enabled = tls_acceptor.is_some();
+    let protocol = if tls_enabled { "https" } else { "http" };
+    // Detailed endpoint information (showing all API endpoints)
+    let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
+    let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
 
     if opt.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
-        let protocol = if tls_enabled { "https" } else { "http" };
         info!(
             target: "rustfs::console::startup",
             "Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html"
@@ -184,8 +183,8 @@ pub async fn start_http_server(
                 DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
             );
         }
-        info!("For more information, visit https://rustfs.com/docs/");
-        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
+        info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
+        info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
     }
 
     // Setup S3 service
@@ -223,7 +222,6 @@ pub async fn start_http_server(
     };
 
     // Server will be created per connection - this ensures isolation
-
     tokio::spawn(async move {
         // Record the PID-related metrics of the current process
         let meter = opentelemetry::global::meter("system");
@@ -491,7 +489,12 @@ fn process_connection(
                             key_request_uri_path = %request.uri().path().to_owned(),
                             "handle request api total",
                         );
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
+                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
+                        let labels = [
+                            ("key_request_method", format!("{}", request.method())),
+                            ("key_request_uri_path", request.uri().path().to_owned().to_string()),
+                        ];
+                        counter!("rustfs_api_requests_total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
                         _span.record("http response status_code", tracing::field::display(response.status()));

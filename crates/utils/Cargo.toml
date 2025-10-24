@@ -35,7 +35,6 @@ futures = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
-hickory-resolver = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
@@ -43,7 +42,6 @@ libc = { workspace = true, optional = true }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
-moka = { workspace = true, optional = true, features = ["future"] }
 netif = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
@@ -83,7 +81,7 @@ workspace = true
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
-net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:hickory-resolver", "dep:moka", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
+net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
 io = ["dep:tokio"]
 path = []
 notify = ["dep:hyper", "dep:s3s", "dep:hashbrown", "dep:thiserror", "dep:serde", "dep:libc"]  # file system notification features
