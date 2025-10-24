@@ -27,7 +27,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
-use metrics::counter;
+use metrics::{counter, histogram};
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
@@ -501,14 +501,16 @@ fn process_connection(
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                        info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
-                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
+                        // info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
+                        histogram!("request.body.len").record(chunk.len().into());
+                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
                         debug!("http stream closed after {:?}", stream_duration)
                     })
                     .on_failure(|_error, latency: Duration, _span: &Span| {
-                        info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
+                        // info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
+                        counter!("rustfs_api_requests_failure_total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )

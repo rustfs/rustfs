@@ -33,7 +33,7 @@ use tracing::info;
 #[serial]
 async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🏁 开始KMS全功能综合测试");
+    info!("🏁 开始 KMS 全功能综合测试");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -43,25 +43,25 @@ async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
 
     // Phase 1: Test all single encryption types
-    info!("📋 阶段1: 测试所有单文件加密类型");
+    info!("📋 阶段 1: 测试所有单文件加密类型");
     test_sse_s3_encryption(&s3_client, TEST_BUCKET).await?;
     test_sse_kms_encryption(&s3_client, TEST_BUCKET).await?;
     test_sse_c_encryption(&s3_client, TEST_BUCKET).await?;
 
     // Phase 2: Test KMS key management APIs
-    info!("📋 阶段2: 测试KMS密钥管理API");
+    info!("📋 阶段 2: 测试 KMS 密钥管理 API");
     test_kms_key_management(&kms_env.base_env.url, &kms_env.base_env.access_key, &kms_env.base_env.secret_key).await?;
 
     // Phase 3: Test all multipart encryption types
-    info!("📋 阶段3: 测试所有分片上传加密类型");
+    info!("📋 阶段 3: 测试所有分片上传加密类型");
     test_all_multipart_encryption_types(&s3_client, TEST_BUCKET, "comprehensive-multipart-test").await?;
 
     // Phase 4: Mixed workload test
-    info!("📋 阶段4: 混合工作负载测试");
+    info!("📋 阶段 4: 混合工作负载测试");
     test_mixed_encryption_workload(&s3_client, TEST_BUCKET).await?;
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ KMS全功能综合测试通过");
+    info!("✅ KMS 全功能综合测试通过");
     Ok(())
 }
 
@@ -102,7 +102,7 @@ async fn test_mixed_encryption_workload(
 #[serial]
 async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("💪 开始KMS压力测试");
+    info!("💪 开始 KMS 压力测试");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -120,7 +120,7 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
 
     for config in stress_configs {
         info!(
-            "💪 执行压力测试: {:?}, 总大小: {}MB",
+            "💪 执行压力测试：{:?}, 总大小：{}MB",
             config.encryption_type,
             config.total_size() / (1024 * 1024)
         );
@@ -128,7 +128,7 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
     }
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ KMS压力测试通过");
+    info!("✅ KMS 压力测试通过");
     Ok(())
 }
 
@@ -173,10 +173,10 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     );
 
     // Upload with different keys
-    info!("🔐 上传文件用密钥1");
+    info!("🔐 上传文件用密钥 1");
     test_multipart_upload_with_config(&s3_client, TEST_BUCKET, &config1).await?;
 
-    info!("🔐 上传文件用密钥2");
+    info!("🔐 上传文件用密钥 2");
     test_multipart_upload_with_config(&s3_client, TEST_BUCKET, &config2).await?;
 
     // Verify that files cannot be read with wrong keys
@@ -255,7 +255,7 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
 #[serial]
 async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("📊 开始KMS性能基准测试");
+    info!("📊 开始 KMS 性能基准测试");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -286,7 +286,7 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
 
         let throughput_mbps = (config.total_size() as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64();
         info!(
-            "📊 {}文件测试完成: {:.2}秒, 吞吐量: {:.2} MB/s",
+            "📊 {}文件测试完成：{:.2}秒，吞吐量：{:.2} MB/s",
             size_name,
             duration.as_secs_f64(),
             throughput_mbps
@@ -294,6 +294,6 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
     }
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ KMS性能基准测试通过");
+    info!("✅ KMS 性能基准测试通过");
     Ok(())
 }
