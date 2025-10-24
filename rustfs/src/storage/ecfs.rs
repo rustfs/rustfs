@@ -3334,7 +3334,7 @@ impl S3 for FS {
 
         let mut uploaded_parts = Vec::new();
 
-        for part in multipart_upload.parts.into_iter().flatten() {
+        for part in multipart_upload.parts.unwrap_or_default().into_iter() {
             uploaded_parts.push(CompletePart::from(part));
         }
 
@@ -3402,16 +3402,10 @@ impl S3 for FS {
         let mut checksum_crc64nvme = input.checksum_crc64nvme;
         let mut checksum_type = input.checksum_type;
 
-        warn!(
-            "complete_multipart_upload extract checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
-        );
-
         // checksum
         let (checksums, _is_multipart) = obj_info
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
-
-        warn!("complete_multipart_upload decrypt checksums: {:?}", checksums);
 
         for (key, checksum) in checksums {
             if key == AMZ_CHECKSUM_TYPE {
@@ -3428,10 +3422,6 @@ impl S3 for FS {
                 _ => (),
             }
         }
-
-        warn!(
-            "complete_multipart_upload final checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
-        );
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
