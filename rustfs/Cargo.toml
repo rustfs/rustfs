@@ -104,7 +104,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-stream.workspace = true
 tokio-rustls = { workspace = true }
-tokio-tar = { workspace = true }
+astral-tokio-tar = { workspace = true }
 tonic = { workspace = true }
 tower.workspace = true
 tower-http = { workspace = true, features = [

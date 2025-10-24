@@ -14,34 +14,34 @@
 
 [workspace]
 members = [
-    "rustfs", # Core file system implementation
-    "crates/appauth", # Application authentication and authorization
-    "crates/audit", # Audit target management system with multi-target fan-out
-    "crates/common", # Shared utilities and data structures
-    "crates/config", # Configuration management
-    "crates/crypto", # Cryptography and security features
-    "crates/ecstore", # Erasure coding storage implementation
-    "crates/e2e_test", # End-to-end test suite
-    "crates/filemeta", # File metadata management
-    "crates/iam", # Identity and Access Management
-    "crates/lock", # Distributed locking implementation
-    "crates/madmin", # Management dashboard and admin API interface
-    "crates/notify", # Notification system for events
-    "crates/obs", # Observability utilities
-    "crates/policy", # Policy management
-    "crates/protos", # Protocol buffer definitions
-    "crates/rio", # Rust I/O utilities and abstractions
-    "crates/targets", # Target-specific configurations and utilities
-    "crates/s3select-api", # S3 Select API interface
+    "rustfs",                # Core file system implementation
+    "crates/appauth",        # Application authentication and authorization
+    "crates/audit",          # Audit target management system with multi-target fan-out
+    "crates/common",         # Shared utilities and data structures
+    "crates/config",         # Configuration management
+    "crates/crypto",         # Cryptography and security features
+    "crates/ecstore",        # Erasure coding storage implementation
+    "crates/e2e_test",       # End-to-end test suite
+    "crates/filemeta",       # File metadata management
+    "crates/iam",            # Identity and Access Management
+    "crates/lock",           # Distributed locking implementation
+    "crates/madmin",         # Management dashboard and admin API interface
+    "crates/notify",         # Notification system for events
+    "crates/obs",            # Observability utilities
+    "crates/policy",         # Policy management
+    "crates/protos",         # Protocol buffer definitions
+    "crates/rio",            # Rust I/O utilities and abstractions
+    "crates/targets",        # Target-specific configurations and utilities
+    "crates/s3select-api",   # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
-    "crates/signer", # client signer
-    "crates/checksums", # client checksums
-    "crates/utils", # Utility functions and helpers
-    "crates/workers", # Worker thread pools and task scheduling
-    "crates/zip", # ZIP file handling and compression
-    "crates/ahm", # Asynchronous Hash Map for concurrent data structures
-    "crates/mcp", # MCP server for S3 operations
-    "crates/kms", # Key Management Service
+    "crates/signer",         # client signer
+    "crates/checksums",      # client checksums
+    "crates/utils",          # Utility functions and helpers
+    "crates/workers",        # Worker thread pools and task scheduling
+    "crates/zip",            # ZIP file handling and compression
+    "crates/ahm",            # Asynchronous Hash Map for concurrent data structures
+    "crates/mcp",            # MCP server for S3 operations
+    "crates/kms",            # Key Management Service
 ]
 resolver = "2"
 
@@ -54,7 +54,12 @@ version = "0.0.5"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
-categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
+categories = [
+    "web-programming",
+    "development-tools",
+    "filesystem",
+    "network-programming",
+]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -103,10 +108,16 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.8" }
 aws-credential-types = { version = "1.2.8" }
 aws-smithy-types = { version = "1.3.3" }
-aws-sdk-s3 = { version = "1.108.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.108.0", default-features = false, features = [
+    "sigv4a",
+    "rustls",
+    "rt-tokio",
+] }
 axum = "0.8.6"
 axum-extra = "0.10.3"
-axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"], default-features = false }
+axum-server = { version = "0.7.2", features = [
+    "tls-rustls-no-provider",
+], default-features = false }
 base64-simd = "0.8.0"
 base64 = "0.22.1"
 brotli = "8.0.2"
@@ -130,7 +141,12 @@ derive_builder = "0.20.2"
 enumset = "1.1.10"
 flatbuffers = "25.9.23"
 flate2 = "1.1.4"
-flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
+flexi_logger = { version = "0.31.7", features = [
+    "trc",
+    "dont_minimize_extra_stacks",
+    "compress",
+    "kv",
+] }
 form_urlencoded = "1.2.2"
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -146,7 +162,15 @@ hyper-util = { version = "0.1.17", features = [
     "server-auto",
     "server-graceful",
 ] }
-hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
+hyper-rustls = { version = "0.27.7", default-features = false, features = [
+    "native-tokio",
+    "http1",
+    "tls12",
+    "logging",
+    "http2",
+    "ring",
+    "webpki-roots",
+] }
 http = "1.3.1"
 http-body = "1.0.1"
 humantime = "2.3.0"
@@ -175,12 +199,17 @@ opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = [
     "experimental_use_tracing_span_context",
     "experimental_metadata_attributes",
-    "spec_unstable_logs_enabled"
+    "spec_unstable_logs_enabled",
 ] }
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-stdout = { version = "0.31.0" }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
-    "grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"
+    "grpc-tonic",
+    "gzip-tonic",
+    "trace",
+    "metrics",
+    "logs",
+    "internal-logs",
 ] }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = [
     "semconv_experimental",
@@ -214,7 +243,12 @@ rsa = { version = "0.9.8" }
 rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.8.0" }
 rustc-hash = { version = "2.1.1" }
-rustls = { version = "0.23.34", features = ["ring", "logging", "std", "tls12"], default-features = false }
+rustls = { version = "0.23.34", features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+], default-features = false }
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-rc.3", features = ["minio"] }
@@ -248,9 +282,13 @@ time = { version = "0.3.44", features = [
     "serde",
 ] }
 tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+] }
 tokio-stream = { version = "0.1.17" }
-tokio-tar = "0.3.1"
+astral-tokio-tar = "0.5.6"
 tokio-test = "0.4.4"
 tokio-util = { version = "0.7.16", features = ["io", "compat"] }
 tonic = { version = "0.14.2", features = ["gzip"] }
