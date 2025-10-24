@@ -30,6 +30,7 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
+use metrics::counter;
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -610,6 +611,8 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        counter!("rustfs_create_bucket_total").increment(1);
 
         store
             .make_bucket(
