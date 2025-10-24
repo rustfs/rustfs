@@ -25,8 +25,6 @@ pub mod net;
 pub mod http;
 
 #[cfg(feature = "net")]
-pub use dns_resolver::*;
-#[cfg(feature = "net")]
 pub use net::*;
 
 #[cfg(all(feature = "net", feature = "io"))]
