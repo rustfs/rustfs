@@ -483,12 +483,6 @@ fn process_connection(
                         span
                     })
                     .on_request(|request: &HttpRequest<_>, _span: &Span| {
-                        info!(
-                            counter.rustfs_api_requests_total = 1_u64,
-                            key_request_method = %request.method().to_string(),
-                            key_request_uri_path = %request.uri().path().to_owned(),
-                            "handle request api total",
-                        );
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
                         let labels = [
                             ("key_request_method", format!("{}", request.method())),
@@ -501,15 +495,13 @@ fn process_connection(
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                        // info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
-                        histogram!("request.body.len").record(chunk.len().into());
+                        histogram!("request.body.len").record(chunk.len() as f64);
                         debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
                         debug!("http stream closed after {:?}", stream_duration)
                     })
                     .on_failure(|_error, latency: Duration, _span: &Span| {
-                        // info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
                         counter!("rustfs_api_requests_failure_total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
@@ -561,11 +553,7 @@ fn process_connection(
                             "TLS handshake failed: {}", err
                         );
                     }
-                    info!(
-                        counter.rustfs_tls_handshake_failures = 1_u64,
-                        key_failure_type = key_failure_type_str,
-                        "TLS handshake failure metric"
-                    );
+                    counter!("rustfs_tls_handshake_failures", &[("key_failure_type", key_failure_type_str)]).increment(1);
                     // Record detailed diagnostic information
                     debug!(
                         peer_addr = %peer_addr,
