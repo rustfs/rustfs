@@ -78,6 +78,12 @@ impl ChecksumType {
         (self.0 & t.0) == t.0
     }
 
+    /// Merge another checksum type into this one
+    pub fn merge(&mut self, other: ChecksumType) -> &mut Self {
+        self.0 |= other.0;
+        self
+    }
+
     /// Get the base checksum type (without flags)
     pub fn base(self) -> ChecksumType {
         ChecksumType(self.0 & Self::BASE_TYPE_MASK)
