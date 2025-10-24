@@ -33,7 +33,7 @@ use tracing::info;
 #[serial]
 async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🏁 开始KMS全功能综合测试");
+    info!("🏁 Start the KMS full-featured synthesis test");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -43,25 +43,25 @@ async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
 
     // Phase 1: Test all single encryption types
-    info!("📋 阶段1: 测试所有单文件加密类型");
+    info!("📋 Phase 1: Test all single-file encryption types");
     test_sse_s3_encryption(&s3_client, TEST_BUCKET).await?;
     test_sse_kms_encryption(&s3_client, TEST_BUCKET).await?;
     test_sse_c_encryption(&s3_client, TEST_BUCKET).await?;
 
     // Phase 2: Test KMS key management APIs
-    info!("📋 阶段2: 测试KMS密钥管理API");
+    info!("📋 Phase 2: Test the KMS Key Management API");
     test_kms_key_management(&kms_env.base_env.url, &kms_env.base_env.access_key, &kms_env.base_env.secret_key).await?;
 
     // Phase 3: Test all multipart encryption types
-    info!("📋 阶段3: 测试所有分片上传加密类型");
+    info!("📋 Phase 3: Test all shard upload encryption types");
     test_all_multipart_encryption_types(&s3_client, TEST_BUCKET, "comprehensive-multipart-test").await?;
 
     // Phase 4: Mixed workload test
-    info!("📋 阶段4: 混合工作负载测试");
+    info!("📋 Phase 4: Mixed workload testing");
     test_mixed_encryption_workload(&s3_client, TEST_BUCKET).await?;
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ KMS全功能综合测试通过");
+    info!("✅ KMS fully functional comprehensive test passed");
     Ok(())
 }
 
@@ -70,7 +70,7 @@ async fn test_mixed_encryption_workload(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("🔄 测试混合加密工作负载");
+    info!("🔄 Test hybrid crypto workloads");
 
     // Test configuration: different sizes and encryption types
     let test_configs = vec![
@@ -89,11 +89,11 @@ async fn test_mixed_encryption_workload(
     ];
 
     for (i, config) in test_configs.iter().enumerate() {
-        info!("🔄 执行混合测试 {}/{}: {:?}", i + 1, test_configs.len(), config.encryption_type);
+        info!("🔄 Perform hybrid testing {}/{}: {:?}", i + 1, test_configs.len(), config.encryption_type);
         test_multipart_upload_with_config(s3_client, bucket, config).await?;
     }
 
-    info!("✅ 混合加密工作负载测试通过");
+    info!("✅ Hybrid cryptographic workload tests pass");
     Ok(())
 }
 
@@ -102,7 +102,7 @@ async fn test_mixed_encryption_workload(
 #[serial]
 async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("💪 开始KMS压力测试");
+    info!("💪 Start the KMS stress test");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -120,7 +120,7 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
 
     for config in stress_configs {
         info!(
-            "💪 执行压力测试: {:?}, 总大小: {}MB",
+            "💪 Perform stress test: {:?}, Total size: {}MB",
             config.encryption_type,
             config.total_size() / (1024 * 1024)
         );
@@ -128,7 +128,7 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
     }
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ KMS压力测试通过");
+    info!("✅ KMS stress test passed");
     Ok(())
 }
 
@@ -137,7 +137,7 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
 #[serial]
 async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🔐 开始加密密钥隔离综合测试");
+    info!("🔐 Begin the comprehensive test of encryption key isolation");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -173,14 +173,14 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     );
 
     // Upload with different keys
-    info!("🔐 上传文件用密钥1");
+    info!("🔐 Key 1 for uploading files");
     test_multipart_upload_with_config(&s3_client, TEST_BUCKET, &config1).await?;
 
-    info!("🔐 上传文件用密钥2");
+    info!("🔐 Key 2 for uploading files");
     test_multipart_upload_with_config(&s3_client, TEST_BUCKET, &config2).await?;
 
     // Verify that files cannot be read with wrong keys
-    info!("🔒 验证密钥隔离");
+    info!("🔒 Verify key isolation");
     let wrong_key = "11111111111111111111111111111111";
     let wrong_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wrong_key);
     let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
@@ -196,11 +196,11 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
         .send()
         .await;
 
-    assert!(wrong_read_result.is_err(), "应该无法用错误密钥读取加密文件");
-    info!("✅ 确认密钥隔离正常工作");
+    assert!(wrong_read_result.is_err(), "The encrypted file should not be readable with the wrong key");
+    info!("✅ Confirm that key isolation is working correctly");
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ 加密密钥隔离综合测试通过");
+    info!("✅ Encryption key isolation comprehensive test passed");
     Ok(())
 }
 
@@ -209,7 +209,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
 #[serial]
 async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("⚡ 开始并发加密操作综合测试");
+    info!("⚡ Started comprehensive testing of concurrent encryption operations");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -228,7 +228,7 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
     ];
 
     // Execute uploads concurrently
-    info!("⚡ 开始并发上传");
+    info!("⚡ Start concurrent uploads");
     let mut tasks = Vec::new();
     for config in concurrent_configs {
         let client = s3_client.clone();
@@ -243,10 +243,10 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
         task.await??;
     }
 
-    info!("✅ 所有并发操作完成");
+    info!("✅ All concurrent operations are completed");
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ 并发加密操作综合测试通过");
+    info!("✅ The comprehensive test of concurrent encryption operation has passed");
     Ok(())
 }
 
@@ -255,7 +255,7 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
 #[serial]
 async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("📊 开始KMS性能基准测试");
+    info!("📊 Start KMS performance benchmarking");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -278,7 +278,7 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
     ];
 
     for (size_name, config) in perf_configs {
-        info!("📊 测试{}文件性能 ({}MB)", size_name, config.total_size() / (1024 * 1024));
+        info!("📊 Test {} file performance ({}MB)", size_name, config.total_size() / (1024 * 1024));
 
         let start_time = std::time::Instant::now();
         test_multipart_upload_with_config(&s3_client, TEST_BUCKET, &config).await?;
@@ -286,7 +286,7 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
 
         let throughput_mbps = (config.total_size() as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64();
         info!(
-            "📊 {}文件测试完成: {:.2}秒, 吞吐量: {:.2} MB/s",
+            "📊 {} file test completed: {:.2} seconds, throughput: {:.2} MB/s",
             size_name,
             duration.as_secs_f64(),
             throughput_mbps
@@ -294,6 +294,6 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
     }
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ KMS性能基准测试通过");
+    info!("✅ KMS performance benchmark passed");
     Ok(())
 }
