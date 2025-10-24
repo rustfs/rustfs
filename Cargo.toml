@@ -63,95 +63,134 @@ unsafe_code = "deny"
 all = "warn"
 
 [workspace.dependencies]
+# RustFS Internal Crates
+rustfs = { path = "./rustfs", version = "0.0.5" }
 rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
-rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
 rustfs-audit = { path = "crates/audit", version = "0.0.5" }
+rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
+rustfs-config = { path = "./crates/config", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
+rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
 rustfs-iam = { path = "crates/iam", version = "0.0.5" }
+rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 rustfs-lock = { path = "crates/lock", version = "0.0.5" }
 rustfs-madmin = { path = "crates/madmin", version = "0.0.5" }
+rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
+rustfs-notify = { path = "crates/notify", version = "0.0.5" }
+rustfs-obs = { path = "crates/obs", version = "0.0.5" }
 rustfs-policy = { path = "crates/policy", version = "0.0.5" }
 rustfs-protos = { path = "crates/protos", version = "0.0.5" }
-rustfs-s3select-query = { path = "crates/s3select-query", version = "0.0.5" }
-rustfs = { path = "./rustfs", version = "0.0.5" }
-rustfs-zip = { path = "./crates/zip", version = "0.0.5" }
-rustfs-config = { path = "./crates/config", version = "0.0.5" }
-rustfs-obs = { path = "crates/obs", version = "0.0.5" }
-rustfs-notify = { path = "crates/notify", version = "0.0.5" }
-rustfs-utils = { path = "crates/utils", version = "0.0.5" }
 rustfs-rio = { path = "crates/rio", version = "0.0.5" }
-rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
+rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
+rustfs-s3select-query = { path = "crates/s3select-query", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
-rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
-rustfs-workers = { path = "crates/workers", version = "0.0.5" }
-rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
-rustfs-kms = { path = "crates/kms", version = "0.0.5" }
-aes-gcm = { version = "0.10.3", features = ["std"] }
-anyhow = "1.0.100"
-arc-swap = "1.7.1"
-argon2 = { version = "0.5.3", features = ["std"] }
-atoi = "2.0.0"
+rustfs-utils = { path = "crates/utils", version = "0.0.5" }
+rustfs-workers = { path = "crates/workers", version = "0.0.5" }
+rustfs-zip = { path = "./crates/zip", version = "0.0.5" }
+
+# Async Runtime and Networking
 async-channel = "2.5.0"
+async-compression = { version = "0.4.19" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
-async-compression = { version = "0.4.19" }
-atomic_enum = "0.3.0"
-aws-config = { version = "1.8.8" }
-aws-credential-types = { version = "1.2.8" }
-aws-smithy-types = { version = "1.3.3" }
-aws-sdk-s3 = { version = "1.108.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
 axum = "0.8.6"
 axum-extra = "0.10.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"], default-features = false }
-base64-simd = "0.8.0"
-base64 = "0.22.1"
-brotli = "8.0.2"
+futures = "0.3.31"
+futures-core = "0.3.31"
+futures-util = "0.3.31"
+hyper = "1.7.0"
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
+hyper-util = { version = "0.1.17", features = ["tokio", "server-auto", "server-graceful"] }
+http = "1.3.1"
+http-body = "1.0.1"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
+socket2 = "0.6.1"
+tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-stream = { version = "0.1.17" }
+tokio-test = "0.4.4"
+tokio-util = { version = "0.7.16", features = ["io", "compat"] }
+tonic = { version = "0.14.2", features = ["gzip"] }
+tonic-prost = { version = "0.14.2" }
+tonic-prost-build = { version = "0.14.2" }
+tower = { version = "0.5.2", features = ["timeout"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
+
+# Serialization and Data Formats
 bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.1.0"
 byteorder = "1.5.0"
-cfg-if = "1.0.4"
-convert_case = "0.8.0"
-crc-fast = "1.3.0"
+flatbuffers = "25.9.23"
+form_urlencoded = "1.2.2"
+prost = "0.14.1"
+quick-xml = "0.38.3"
+rmcp = { version = "0.8.3" }
+rmp = { version = "0.8.14" }
+rmp-serde = { version = "1.3.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["raw_value"] }
+serde_urlencoded = "0.7.1"
+schemars = "1.0.4"
+
+# Cryptography and Security
+aes-gcm = { version = "0.10.3", features = ["std"] }
+argon2 = { version = "0.5.3", features = ["std"] }
+blake3 = { version = "1.8.2" }
 chacha20poly1305 = { version = "0.10.1" }
+crc-fast = "1.3.0"
+crc32c = "0.6.8"
+crc32fast = "1.5.0"
+crc64fast-nvme = "1.2.0"
+hmac = "0.12.1"
+jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
+pbkdf2 = "0.12.2"
+rsa = { version = "0.9.8" }
+rustls = { version = "0.23.34", features = ["ring", "logging", "std", "tls12"], default-features = false }
+rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.12.0"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+# Time and Date
 chrono = { version = "0.4.42", features = ["serde"] }
+humantime = "2.3.0"
+time = { version = "0.3.44", features = ["std", "parsing", "formatting", "macros", "serde"] }
+
+# Utilities and Tools
+anyhow = "1.0.100"
+arc-swap = "1.7.1"
+astral-tokio-tar = "0.5.6"
+atoi = "2.0.0"
+atomic_enum = "0.3.0"
+aws-config = { version = "1.8.8" }
+aws-credential-types = { version = "1.2.8" }
+aws-sdk-s3 = { version = "1.108.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
+aws-smithy-types = { version = "1.3.3" }
+base64 = "0.22.1"
+base64-simd = "0.8.0"
+brotli = "8.0.2"
+cfg-if = "1.0.4"
 clap = { version = "4.5.50", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
-crc32fast = "1.5.0"
-crc32c = "0.6.8"
-crc64fast-nvme = "1.2.0"
+convert_case = "0.8.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "50.2.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
-flatbuffers = "25.9.23"
 flate2 = "1.1.4"
 flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
-form_urlencoded = "1.2.2"
-futures = "0.3.31"
-futures-core = "0.3.31"
-futures-util = "0.3.31"
 glob = "0.3.3"
 hashbrown = { version = "0.16.0", features = ["serde", "rayon"] }
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
-hmac = "0.12.1"
-hyper = "1.7.0"
-hyper-util = { version = "0.1.17", features = [
-    "tokio",
-    "server-auto",
-    "server-graceful",
-] }
-hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
-http = "1.3.1"
-http-body = "1.0.1"
-humantime = "2.3.0"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
-jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 lazy_static = "1.5.0"
 libc = "0.2.177"
 libsystemd = { version = "0.7.2" }
@@ -171,93 +210,34 @@ num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
 object_store = "0.12.4"
 once_cell = "1.21.3"
-opentelemetry = { version = "0.31.0" }
-opentelemetry-appender-tracing = { version = "0.31.1", features = [
-    "experimental_use_tracing_span_context",
-    "experimental_metadata_attributes",
-    "spec_unstable_logs_enabled"
-] }
-opentelemetry_sdk = { version = "0.31.0" }
-opentelemetry-stdout = { version = "0.31.0" }
-opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
-    "grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"
-] }
-opentelemetry-semantic-conventions = { version = "0.31.0", features = [
-    "semconv_experimental",
-] }
 parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
-blake3 = { version = "1.8.2" }
-pbkdf2 = "0.12.2"
 pin-project-lite = "0.2.16"
-prost = "0.14.1"
 pretty_assertions = "1.4.1"
-quick-xml = "0.38.3"
 rand = "0.9.2"
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.2" }
-reqwest = { version = "0.12.24", default-features = false, features = [
-    "rustls-tls-webpki-roots",
-    "charset",
-    "http2",
-    "system-proxy",
-    "stream",
-    "json",
-    "blocking",
-] }
-rmcp = { version = "0.8.3" }
-rmp = { version = "0.8.14" }
-rmp-serde = { version = "1.3.0" }
-rsa = { version = "0.9.8" }
 rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.8.0" }
 rustc-hash = { version = "2.1.1" }
-rustls = { version = "0.23.34", features = ["ring", "logging", "std", "tls12"], default-features = false }
-rustls-pki-types = "1.12.0"
-rustls-pemfile = "2.2.0"
 s3s = { version = "0.12.0-rc.3", features = ["minio"] }
-schemars = "1.0.4"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.145", features = ["raw_value"] }
-serde_urlencoded = "0.7.1"
 serial_test = "3.2.0"
-sha1 = "0.10.6"
-sha2 = "0.10.9"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.8.9"
 snap = "1.1.1"
-socket2 = "0.6.1"
 starshard = { version = "0.5.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
-sysinfo = "0.37.1"
 sysctl = "0.7.1"
-tempfile = "3.23.0"
+sysinfo = "0.37.1"
 temp-env = "0.3.6"
+tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.17"
-time = { version = "0.3.44", features = [
-    "std",
-    "parsing",
-    "formatting",
-    "macros",
-    "serde",
-] }
-tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
-tokio-stream = { version = "0.1.17" }
-tokio-tar = "0.3.1"
-tokio-test = "0.4.4"
-tokio-util = { version = "0.7.16", features = ["io", "compat"] }
-tonic = { version = "0.14.2", features = ["gzip"] }
-tonic-prost = { version = "0.14.2" }
-tonic-prost-build = { version = "0.14.2" }
-tower = { version = "0.5.2", features = ["timeout"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = { version = "0.1.41" }
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.32.0"
@@ -265,19 +245,23 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.7"
 urlencoding = "2.1.3"
-uuid = { version = "1.18.1", features = [
-    "v4",
-    "fast-rng",
-    "macro-diagnostics",
-] }
+uuid = { version = "1.18.1", features = ["v4", "fast-rng", "macro-diagnostics"] }
 vaultrs = { version = "0.7.4" }
 walkdir = "2.5.0"
 wildmatch = { version = "2.5.0", features = ["serde"] }
-zeroize = { version = "1.8.2", features = ["derive"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "6.0.0"
 zstd = "0.13.3"
+
+# Observability and Metrics
+opentelemetry = { version = "0.31.0" }
+opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
+opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"] }
+opentelemetry_sdk = { version = "0.31.0" }
+opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
+opentelemetry-stdout = { version = "0.31.0" }
+
 
 
 [workspace.metadata.cargo-shear]

@@ -37,7 +37,7 @@ async-compression = { workspace = true, features = [
 ] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
-tokio-tar = { workspace = true }
+astral-tokio-tar = { workspace = true }
 
 
 [lints]
