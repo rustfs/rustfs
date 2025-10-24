@@ -37,96 +37,96 @@ default = []
 workspace = true
 
 [dependencies]
+# RustFS Internal Crates
 rustfs-ahm = { workspace = true }
-rustfs-zip = { workspace = true }
-rustfs-madmin = { workspace = true }
-rustfs-s3select-api = { workspace = true }
 rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
-rustfs-ecstore = { workspace = true }
-rustfs-policy = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-iam = { workspace = true }
-rustfs-filemeta.workspace = true
-rustfs-rio.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
-rustfs-notify = { workspace = true }
-rustfs-obs = { workspace = true }
-rustfs-utils = { workspace = true, features = ["full"] }
-rustfs-protos = { workspace = true }
-rustfs-s3select-query = { workspace = true }
-rustfs-targets = { workspace = true }
+rustfs-ecstore = { workspace = true }
+rustfs-filemeta.workspace = true
+rustfs-iam = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
-atoi = { workspace = true }
-atomic_enum = { workspace = true }
+rustfs-madmin = { workspace = true }
+rustfs-notify = { workspace = true }
+rustfs-obs = { workspace = true }
+rustfs-policy = { workspace = true }
+rustfs-protos = { workspace = true }
+rustfs-rio.workspace = true
+rustfs-s3select-api = { workspace = true }
+rustfs-s3select-query = { workspace = true }
+rustfs-targets = { workspace = true }
+rustfs-utils = { workspace = true, features = ["full"] }
+rustfs-zip = { workspace = true }
+
+# Async Runtime and Networking
+async-trait = { workspace = true }
 axum.workspace = true
 axum-extra = { workspace = true }
 axum-server = { workspace = true }
-async-trait = { workspace = true }
-base64 = { workspace = true }
-bytes = { workspace = true }
-chrono = { workspace = true }
-clap = { workspace = true }
-datafusion = { workspace = true }
-const-str = { workspace = true }
-flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
-matchit = { workspace = true }
-md5.workspace = true
-mime_guess = { workspace = true }
-opentelemetry = { workspace = true }
-pin-project-lite.workspace = true
 reqwest = { workspace = true }
+socket2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio-rustls = { workspace = true }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic = { workspace = true }
+tower.workspace = true
+tower-http = { workspace = true, features = ["trace", "compression-deflate", "compression-gzip", "cors", "catch-panic", "timeout", "limit"] }
+
+# Serialization and Data Formats
+bytes = { workspace = true }
+flatbuffers.workspace = true
 rmp-serde.workspace = true
-rustls = { workspace = true }
-rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
-s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = { workspace = true }
+
+# Cryptography and Security
+rustls = { workspace = true }
+
+# Time and Date
+chrono = { workspace = true }
+time = { workspace = true, features = ["parsing", "formatting", "serde"] }
+
+# Utilities and Tools
+astral-tokio-tar = { workspace = true }
+atoi = { workspace = true }
+atomic_enum = { workspace = true }
+base64 = { workspace = true }
+base64-simd.workspace = true
+clap = { workspace = true }
+const-str = { workspace = true }
+datafusion = { workspace = true }
+hex-simd.workspace = true
+matchit = { workspace = true }
+md5.workspace = true
+mime_guess = { workspace = true }
+pin-project-lite.workspace = true
+rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
+s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
-socket2 = { workspace = true }
 thiserror = { workspace = true }
 tracing.workspace = true
-time = { workspace = true, features = ["parsing", "formatting", "serde"] }
-tokio-util.workspace = true
-tokio = { workspace = true, features = [
-    "rt-multi-thread",
-    "macros",
-    "net",
-    "signal",
-] }
-tokio-stream.workspace = true
-tokio-rustls = { workspace = true }
-tokio-tar = { workspace = true }
-tonic = { workspace = true }
-tower.workspace = true
-tower-http = { workspace = true, features = [
-    "trace",
-    "compression-deflate",
-    "compression-gzip",
-    "cors",
-    "catch-panic",
-    "timeout",
-    "limit",
-] }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
-base64-simd.workspace = true
-hex-simd.workspace = true
+
+# Observability and Metrics
 metrics = { workspace = true }
+opentelemetry = { workspace = true }
+
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
-
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
