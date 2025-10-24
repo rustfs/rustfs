@@ -3332,11 +3332,12 @@ impl S3 for FS {
 
         let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
 
-        let mut uploaded_parts = Vec::new();
-
-        for part in multipart_upload.parts.unwrap_or_default().into_iter() {
-            uploaded_parts.push(CompletePart::from(part));
-        }
+        let uploaded_parts = multipart_upload
+            .parts
+            .unwrap_or_default()
+            .into_iter()
+            .map(CompletePart::from)
+            .collect::<Vec<_>>();
 
         // is part number sorted?
         if !uploaded_parts.is_sorted_by_key(|p| p.part_num) {

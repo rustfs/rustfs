@@ -5599,9 +5599,8 @@ impl StorageAPI for SetDisks {
                     }
                 };
 
-                debug!("complete_multipart_upload part_crc={part_crc:?}, crc={crc}");
-
-                if part_crc.unwrap_or_default() != crc {
+                if part_crc.clone().unwrap_or_default() != crc {
+                    error!("complete_multipart_upload checksum_type={checksum_type:?}, part_crc={part_crc:?}, crc={crc:?}");
                     error!(
                         "complete_multipart_upload checksum mismatch part_id={}, bucket={}, object={}",
                         p.part_num, bucket, object
@@ -5609,7 +5608,7 @@ impl StorageAPI for SetDisks {
                     return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 }
 
-                let Some(cs) = rustfs_rio::Checksum::new_with_type(checksum_type.clone(), &crc) else {
+                let Some(cs) = rustfs_rio::Checksum::new_with_type(checksum_type, &crc) else {
                     error!(
                         "complete_multipart_upload checksum new_with_type failed part_id={}, bucket={}, object={}",
                         p.part_num, bucket, object
