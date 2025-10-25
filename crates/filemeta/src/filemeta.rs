@@ -1386,7 +1386,7 @@ impl From<FileInfo> for FileMetaVersion {
                 FileMetaVersion {
                     version_type: VersionType::Object,
                     delete_marker: None,
-                    object: Some(value.into()),
+                    object: Some(MetaObject::from(value)),
                     write_version: 0,
                 }
             }

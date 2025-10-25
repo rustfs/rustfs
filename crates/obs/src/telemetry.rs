@@ -237,7 +237,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         match metrics_exporter_opentelemetry::Recorder::builder("order-service").install_global() {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("Failed to set global metrics recorder: {:?}", e);
+                eprintln!("Failed to set global metrics recorder: {e:?}");
             }
         }
 
