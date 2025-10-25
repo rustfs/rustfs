@@ -1934,7 +1934,7 @@ impl S3 for FS {
                 .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
                 .map_err(ApiError::from)?;
 
-            warn!("get object metadata checksums: {:?}", checksums);
+            debug!("get object metadata checksums: {:?}", checksums);
             for (key, checksum) in checksums {
                 if key == AMZ_CHECKSUM_TYPE {
                     checksum_type = Some(ChecksumType::from(checksum));
@@ -3319,26 +3319,25 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
             key,
             upload_id,
             ..
-        } = req.input;
-
-        // error!("complete_multipart_upload {:?}", multipart_upload);
-        // mc cp step 5
+        } = input;
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
         let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
 
-        let mut uploaded_parts = Vec::new();
-
-        for part in multipart_upload.parts.into_iter().flatten() {
-            uploaded_parts.push(CompletePart::from(part));
-        }
+        let uploaded_parts = multipart_upload
+            .parts
+            .unwrap_or_default()
+            .into_iter()
+            .map(CompletePart::from)
+            .collect::<Vec<_>>();
 
         // is part number sorted?
         if !uploaded_parts.is_sorted_by_key(|p| p.part_num) {
@@ -3397,12 +3396,12 @@ impl S3 for FS {
             server_side_encryption, ssekms_key_id
         );
 
-        let mut checksum_crc32 = None;
-        let mut checksum_crc32c = None;
-        let mut checksum_sha1 = None;
-        let mut checksum_sha256 = None;
-        let mut checksum_crc64nvme = None;
-        let mut checksum_type = None;
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+        let mut checksum_type = input.checksum_type;
 
         // checksum
         let (checksums, _is_multipart) = obj_info
