@@ -28,7 +28,7 @@ use crate::client::{
     transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 use crate::tier::{
-    tier_config::TierMinIO,
+    tier_config::TierR2,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
     warm_backend_s3::WarmBackendS3,
 };
@@ -39,10 +39,10 @@ const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
-pub struct WarmBackendMinIO(WarmBackendS3);
+pub struct WarmBackendR2(WarmBackendS3);
 
-impl WarmBackendMinIO {
-    pub async fn new(conf: &TierMinIO, tier: &str) -> Result<Self, std::io::Error> {
+impl WarmBackendR2 {
+    pub async fn new(conf: &TierR2, tier: &str) -> Result<Self, std::io::Error> {
         if conf.access_key == "" || conf.secret_key == "" {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
@@ -78,7 +78,7 @@ impl WarmBackendMinIO {
         let client = TransitionClient::new(
             &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
             opts,
-            "minio",
+            "r2",
         )
         .await?;
 
@@ -95,7 +95,7 @@ impl WarmBackendMinIO {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for WarmBackendMinIO {
+impl WarmBackend for WarmBackendR2 {
     async fn put_with_meta(
         &self,
         object: &str,

@@ -18,14 +18,18 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::error::StorageError;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
+use bytes::BytesMut;
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
+use rustfs_filemeta::fileinfo::{NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
 use rustfs_utils::path::encode_dir_object;
+use rustfs_utils::string::strings_has_prefix_fold;
 use s3s::Body;
 use sha2::{Digest, Sha256};
 use std::any::Any;
@@ -62,7 +66,11 @@ use crate::store::ECStore;
 use crate::store_api::StorageAPI;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
-use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
+use s3s::dto::{
+    BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
+    ServerSideEncryption, Timestamp,
+};
+use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_STORAGE_CLASS};
 
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type TraceFn =
@@ -71,9 +79,12 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
 
-const _DISABLED: &str = "Disabled";
+pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
+pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
+pub const AMZ_ENCRYPTION_AES: &str = "AES256";
+pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 
-//pub const ERR_INVALID_STORAGECLASS: &str = "invalid storage class.";
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
 
 lazy_static! {
@@ -762,11 +773,14 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
 pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
     let time_ilm = Metrics::time_ilm(lae.event.action);
 
+    let etag = if let Some(etag) = &oi.etag { etag } else { "" };
+    let etag = etag.to_string();
+
     let opts = ObjectOptions {
         transition: TransitionOptions {
             status: lifecycle::TRANSITION_PENDING.to_string(),
             tier: lae.event.storage_class,
-            etag: oi.etag.clone().expect("err").to_string(),
+            etag,
             ..Default::default()
         },
         //lifecycle_audit_event: lae,
@@ -787,9 +801,9 @@ pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
 pub async fn get_transitioned_object_reader(
     bucket: &str,
     object: &str,
-    rs: HTTPRangeSpec,
-    h: HeaderMap,
-    oi: ObjectInfo,
+    rs: &Option<HTTPRangeSpec>,
+    h: &HeaderMap,
+    oi: &ObjectInfo,
     opts: &ObjectOptions,
 ) -> Result<GetObjectReader, std::io::Error> {
     let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
@@ -815,19 +829,131 @@ pub async fn get_transitioned_object_reader(
     let reader = tgt_client
         .get(&oi.transitioned_object.name, &oi.transitioned_object.version_id, gopts)
         .await?;
-    Ok(get_fn(reader, h))
+    Ok(get_fn(reader, h.clone()))
 }
 
-pub fn post_restore_opts(_r: http::Request<Body>, _bucket: &str, _object: &str) -> Result<ObjectOptions, std::io::Error> {
-    todo!();
+pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, std::io::Error> {
+    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
+    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    let vid = version_id.trim();
+    if vid != "" && vid != NULL_VERSION_ID {
+        if let Err(err) = Uuid::parse_str(vid) {
+            return Err(std::io::Error::other(
+                StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()).to_string(),
+            ));
+        }
+        if !versioned && !version_suspended {
+            return Err(std::io::Error::other(
+                StorageError::InvalidArgument(
+                    bucket.to_string(),
+                    object.to_string(),
+                    format!("version-id specified {} but versioning is not enabled on {}", vid, bucket),
+                )
+                .to_string(),
+            ));
+        }
+    }
+    Ok(ObjectOptions {
+        versioned: versioned,
+        version_suspended: version_suspended,
+        version_id: Some(vid.to_string()),
+        ..Default::default()
+    })
 }
 
-pub fn put_restore_opts(_bucket: &str, _object: &str, _rreq: &RestoreObjectRequest, _oi: &ObjectInfo) -> ObjectOptions {
-    todo!();
+pub async fn put_restore_opts(
+    bucket: &str,
+    object: &str,
+    rreq: &RestoreRequest,
+    oi: &ObjectInfo,
+) -> Result<ObjectOptions, std::io::Error> {
+    let mut meta = HashMap::<String, String>::new();
+    /*let mut b = false;
+    let Some(Some(Some(mut sc))) = rreq.output_location.s3.storage_class else { b = true; };
+    if b || sc == "" {
+        //sc = oi.storage_class;
+        sc = oi.transitioned_object.tier;
+    }
+    meta.insert(X_AMZ_STORAGE_CLASS.as_str().to_lowercase(), sc);*/
+
+    if let Some(type_) = &rreq.type_
+        && type_.as_str() == RestoreRequestType::SELECT
+    {
+        for v in rreq
+            .output_location
+            .as_ref()
+            .unwrap()
+            .s3
+            .as_ref()
+            .unwrap()
+            .user_metadata
+            .as_ref()
+            .unwrap()
+        {
+            if !strings_has_prefix_fold(&v.name.clone().unwrap(), "x-amz-meta") {
+                meta.insert(
+                    format!("x-amz-meta-{}", v.name.as_ref().unwrap()),
+                    v.value.clone().unwrap_or("".to_string()),
+                );
+                continue;
+            }
+            meta.insert(v.name.clone().unwrap(), v.value.clone().unwrap_or("".to_string()));
+        }
+        if let Some(output_location) = rreq.output_location.as_ref() {
+            if let Some(s3) = &output_location.s3 {
+                if let Some(tags) = &s3.tagging {
+                    meta.insert(
+                        AMZ_OBJECT_TAGGING.to_string(),
+                        serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or("".to_string()),
+                    );
+                }
+            }
+        }
+        if let Some(output_location) = rreq.output_location.as_ref() {
+            if let Some(s3) = &output_location.s3 {
+                if let Some(encryption) = &s3.encryption {
+                    if encryption.encryption_type.as_str() != "" {
+                        meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
+                    }
+                }
+            }
+        }
+        return Ok(ObjectOptions {
+            versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
+            version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
+            user_defined: meta,
+            ..Default::default()
+        });
+    }
+    for (k, v) in &oi.user_defined {
+        meta.insert(k.to_string(), v.clone());
+    }
+    if oi.user_tags.len() != 0 {
+        meta.insert(AMZ_OBJECT_TAGGING.to_string(), oi.user_tags.clone());
+    }
+    let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
+    meta.insert(
+        X_AMZ_RESTORE.as_str().to_string(),
+        RestoreStatus {
+            is_restore_in_progress: Some(false),
+            restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+        }
+        .to_string(),
+    );
+    Ok(ObjectOptions {
+        versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
+        version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
+        user_defined: meta,
+        version_id: oi.version_id.map(|e| e.to_string()),
+        mod_time: oi.mod_time,
+        //expires:           oi.expires,
+        ..Default::default()
+    })
 }
 
 pub trait LifecycleOps {
     fn to_lifecycle_opts(&self) -> lifecycle::ObjectOpts;
+    fn is_remote(&self) -> bool;
 }
 
 impl LifecycleOps for ObjectInfo {
@@ -848,29 +974,54 @@ impl LifecycleOps for ObjectInfo {
             ..Default::default()
         }
     }
+
+    fn is_remote(&self) -> bool {
+        if self.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
+            return false;
+        }
+        !is_restored_object_on_disk(&self.user_defined)
+    }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct S3Location {
-    pub bucketname: String,
-    //pub encryption:    Encryption,
-    pub prefix: String,
-    pub storage_class: String,
-    //pub tagging:       Tags,
-    pub user_metadata: HashMap<String, String>,
+pub trait RestoreRequestOps {
+    fn validate(&self, api: Arc<ECStore>) -> Result<(), std::io::Error>;
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct OutputLocation(pub S3Location);
+impl RestoreRequestOps for RestoreRequest {
+    fn validate(&self, api: Arc<ECStore>) -> Result<(), std::io::Error> {
+        /*if self.type_.is_none() && self.select_parameters.is_some() {
+            return Err(std::io::Error::other("Select parameters can only be specified with SELECT request type"));
+        }
+        if let Some(type_) = self.type_ && type_ == RestoreRequestType::SELECT && self.select_parameters.is_none() {
+            return Err(std::io::Error::other("SELECT restore request requires select parameters to be specified"));
+        }
 
-#[derive(Debug, Default, Clone)]
-pub struct RestoreObjectRequest {
-    pub days: i64,
-    pub ror_type: String,
-    pub tier: String,
-    pub description: String,
-    //pub select_parameters: SelectParameters,
-    pub output_location: OutputLocation,
+        if self.type_.is_none() && self.output_location.is_some() {
+            return Err(std::io::Error::other("OutputLocation required only for SELECT request type"));
+        }
+        if let Some(type_) = self.type_ && type_ == RestoreRequestType::SELECT && self.output_location.is_none() {
+            return Err(std::io::Error::other("OutputLocation required for SELECT requests"));
+        }
+
+        if let Some(type_) = self.type_ && type_ == RestoreRequestType::SELECT && self.days != 0 {
+            return Err(std::io::Error::other("Days cannot be specified with SELECT restore request"));
+        }
+        if self.days == 0 && self.type_.is_none() {
+            return Err(std::io::Error::other("restoration days should be at least 1"));
+        }
+        if self.output_location.is_some() {
+            if _, err := api.get_bucket_info(self.output_location.s3.bucket_name, BucketOptions{}); err != nil {
+                return err
+            }
+            if self.output_location.s3.prefix == "" {
+                return Err(std::io::Error::other("Prefix is a required parameter in OutputLocation"));
+            }
+            if self.output_location.s3.encryption.encryption_type.as_str() != ServerSideEncryption::AES256 {
+                return NotImplemented{}
+            }
+        }*/
+        Ok(())
+    }
 }
 
 const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
@@ -975,11 +1126,10 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     //debug!("lc_event.action: {:?}", lc_event.action);
     //debug!("opts: {:?}", opts);
     let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
-        Ok(obj) => obj,
+        Ok(dobj) => dobj,
         Err(e) => {
-            error!("Failed to delete object {}/{}: {:?}", oi.bucket, oi.name, e);
-            // Return the original object info if deletion fails
-            oi.clone()
+            error!("delete_object error: {:?}", e);
+            return false;
         }
     };
     //debug!("dobj: {:?}", dobj);

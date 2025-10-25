@@ -167,11 +167,13 @@ fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap
     if let Some(q) = req.uri().query() {
         // Parse query string into key-value pairs
         let mut query_params: Vec<(String, String)> = Vec::new();
-        for param in q.split('&') {
-            if let Some((key, value)) = param.split_once('=') {
-                query_params.push((key.to_string(), value.to_string()));
-            } else {
-                query_params.push((param.to_string(), "".to_string()));
+        if !q.is_empty() {
+            for param in q.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    query_params.push((key.to_string(), value.to_string()));
+                } else {
+                    query_params.push((param.to_string(), "".to_string()));
+                }
             }
         }
 
@@ -179,6 +181,7 @@ fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap
         query_params.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build canonical query string
+        //println!("query_params: {query_params:?}");
         let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         canonical_query_string = sorted_params.join("&");
@@ -416,4 +419,391 @@ pub fn sign_v4_trailer(
         SERVICE_TYPE_S3,
         trailer,
     )
+}
+
+#[cfg(test)]
+#[allow(unused_variables, unused_mut)]
+mod tests {
+    use http::request;
+    use time::macros::datetime;
+
+    use super::*;
+
+    #[test]
+    fn example_list_objects() {
+        // let access_key_id = "AKIAIOSFODNN7EXAMPLE";
+        let secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let timestamp = "20130524T000000Z";
+        let t = datetime!(2013-05-24 0:00 UTC);
+        // let bucket = "examplebucket";
+        let region = "us-east-1";
+        let service = "s3";
+        let path = "/";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/?")
+            .body(Body::empty())
+            .unwrap();
+        let mut headers = req.headers_mut();
+        headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-amz-date", timestamp.parse().unwrap());
+
+        let query = vec![
+            ("max-keys".to_string(), "2".to_string()),
+            ("prefix".to_string(), "J".to_string()),
+        ];
+        let uri = req.uri().clone();
+        let mut parts = req.uri().clone().into_parts();
+        parts.path_and_query = Some(
+            format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        *req.uri_mut() = Uri::from_parts(parts).unwrap();
+
+        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        assert_eq!(
+            canonical_request,
+            concat!(
+                "GET\n",
+                "/\n",
+                "max-keys=2&prefix=J\n",
+                "host:examplebucket.s3.amazonaws.com\n",
+                "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+                "x-amz-date:",
+                "20130524T000000Z",
+                "\n",
+                "\n",
+                "host;x-amz-content-sha256;x-amz-date\n",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+        );
+
+        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        assert_eq!(
+            string_to_sign,
+            concat!(
+                "AWS4-HMAC-SHA256\n",
+                "20130524T000000Z",
+                "\n",
+                "20130524/us-east-1/s3/aws4_request\n",
+                "df57d21db20da04d7fa30298dd4488ba3a2b47ca3a489c74750e0f1e7df1b9b7",
+            )
+        );
+
+        let signing_key = get_signing_key(secret_access_key, region, t, service);
+        let signature = get_signature(signing_key, &string_to_sign);
+
+        assert_eq!(signature, "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7");
+    }
+
+    #[test]
+    fn example_signature() {
+        // let access_key_id = "rustfsadmin";
+        let secret_access_key = "rustfsadmin";
+        let timestamp = "20250505T011054Z";
+        let t = datetime!(2025-05-05 01:10:54 UTC);
+        // let bucket = "mblock2";
+        let region = "us-east-1";
+        let service = "s3";
+        let path = "/mblock2/";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://192.168.1.11:9020/mblock2/?")
+            .body(Body::empty())
+            .unwrap();
+
+        let mut headers = req.headers_mut();
+        headers.insert("host", "192.168.1.11:9020".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-amz-date", timestamp.parse().unwrap());
+
+        let mut query: Vec<(String, String)> = Vec::new();
+        let uri = req.uri().clone();
+        let mut parts = req.uri().clone().into_parts();
+        parts.path_and_query = Some(
+            format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        //println!("parts.path_and_query: {:?}", parts.path_and_query);
+        *req.uri_mut() = Uri::from_parts(parts).unwrap();
+
+        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        println!("canonical_request: \n{}\n", canonical_request);
+        assert_eq!(
+            canonical_request,
+            concat!(
+                "GET\n",
+                "/mblock2/\n",
+                "\n",
+                "host:192.168.1.11:9020\n",
+                "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+                "x-amz-date:",
+                "20250505T011054Z",
+                "\n",
+                "\n",
+                "host;x-amz-content-sha256;x-amz-date\n",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+        );
+
+        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        println!("string_to_sign: \n{}\n", string_to_sign);
+        assert_eq!(
+            string_to_sign,
+            concat!(
+                "AWS4-HMAC-SHA256\n",
+                "20250505T011054Z",
+                "\n",
+                "20250505/us-east-1/s3/aws4_request\n",
+                "c2960d00cc7de7bed3e2e2d1330ec298ded8f78a231c1d32dedac72ebec7f9b0",
+            )
+        );
+
+        let signing_key = get_signing_key(secret_access_key, region, t, service);
+        let signature = get_signature(signing_key, &string_to_sign);
+        println!("signature: \n{}\n", signature);
+        assert_eq!(signature, "73fad2dfea0727e10a7179bf49150360a56f2e6b519c53999fd6e011152187d0");
+    }
+
+    #[test]
+    fn example_signature2() {
+        // let access_key_id = "rustfsadmin";
+        let secret_access_key = "rustfsadmin";
+        let timestamp = "20250507T051030Z";
+        let t = datetime!(2025-05-07 05:10:30 UTC);
+        // let bucket = "mblock2";
+        let region = "us-east-1";
+        let service = "s3";
+        let path = "/mblock2/";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://192.168.1.11:9020/mblock2/?list-type=2&encoding-type=url&prefix=mypre&delimiter=%2F&fetch-owner=true&max-keys=1")
+            .body(Body::empty()).unwrap();
+
+        let mut headers = req.headers_mut();
+        headers.insert("host", "192.168.1.11:9020".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-amz-date", timestamp.parse().unwrap());
+
+        println!("{:?}", req.uri().query());
+        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        println!("canonical_request: \n{}\n", canonical_request);
+        assert_eq!(
+            canonical_request,
+            concat!(
+                "GET\n",
+                "/mblock2/\n",
+                "delimiter=%2F&encoding-type=url&fetch-owner=true&list-type=2&max-keys=1&prefix=mypre\n",
+                "host:192.168.1.11:9020\n",
+                "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+                "x-amz-date:",
+                "20250507T051030Z",
+                "\n",
+                "\n",
+                "host;x-amz-content-sha256;x-amz-date\n",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+        );
+
+        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        println!("string_to_sign: \n{}\n", string_to_sign);
+        assert_eq!(
+            string_to_sign,
+            concat!(
+                "AWS4-HMAC-SHA256\n",
+                "20250507T051030Z",
+                "\n",
+                "20250507/us-east-1/s3/aws4_request\n",
+                "e6db9e09e9c873aff0b9ca170998b4753f6a6c36c90bc2dca80613affb47f999",
+            )
+        );
+
+        let signing_key = get_signing_key(secret_access_key, region, t, service);
+        let signature = get_signature(signing_key, &string_to_sign);
+        println!("signature: \n{}\n", signature);
+        assert_eq!(signature, "dfbed913d1982428f6224ee506431fc133dbcad184194c0cbf01bc517435788a");
+    }
+
+    #[test]
+    fn example_signature3() {
+        // let access_key_id = "rustfsadmin";
+        let secret_access_key = "rustfsadmin";
+        let timestamp = "20250628T061107Z";
+        let t = datetime!(2025-06-28 06:11:07 UTC);
+        // let bucket = "mbver";
+        let region = "";
+        let service = "s3";
+        let path = "/mbver/";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://192.168.1.11:9020/mbver/?list-type=2&encoding-type=url&prefix=mypre99&delimiter=%2F&fetch-owner=true&max-keys=1")
+            .body(Body::empty()).unwrap();
+
+        let mut headers = req.headers_mut();
+        headers.insert("host", "127.0.0.1:9000".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-amz-date", timestamp.parse().unwrap());
+
+        println!("{:?}", req.uri().query());
+        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        println!("canonical_request: \n{}\n", canonical_request);
+        assert_eq!(
+            canonical_request,
+            concat!(
+                "GET\n",
+                "/mbver/\n",
+                "delimiter=%2F&encoding-type=url&fetch-owner=true&list-type=2&max-keys=1&prefix=mypre99\n",
+                "host:127.0.0.1:9000\n",
+                "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+                "x-amz-date:",
+                "20250628T061107Z",
+                "\n",
+                "\n",
+                "host;x-amz-content-sha256;x-amz-date\n",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+        );
+
+        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        println!("string_to_sign: \n{}\n", string_to_sign);
+        assert_eq!(
+            string_to_sign,
+            concat!(
+                "AWS4-HMAC-SHA256\n",
+                "20250628T061107Z",
+                "\n",
+                "20250628//s3/aws4_request\n",
+                "9dcfa3d3139baf71a046e7fa17dacab8ee11676771e25e7cd09098bf39f09d5b", //payload hash
+            )
+        );
+
+        let signing_key = get_signing_key(secret_access_key, region, t, service);
+        let signature = get_signature(signing_key, &string_to_sign);
+        println!("signature: \n{}\n", signature);
+        assert_eq!(signature, "c7c7c6e12e5709c0c2ffc4707600a86c3cd261dd1de7409126a17f5b08c58dfa");
+    }
+
+    #[test]
+    fn example_presigned_url() {
+        let access_key_id = "AKIAIOSFODNN7EXAMPLE";
+        let secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let timestamp = "20130524T000000Z";
+        let t = datetime!(2013-05-24 0:00 UTC);
+        // let bucket = "mblock2";
+        let region = "us-east-1";
+        let service = "s3";
+        let path = "/";
+        let session_token = "";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/test.txt")
+            .body(Body::empty())
+            .unwrap();
+
+        let mut headers = req.headers_mut();
+        headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        req = pre_sign_v4(req, access_key_id, secret_access_key, "", region, 86400, t);
+
+        let mut canonical_request = req.method().as_str().to_string();
+        canonical_request.push('\n');
+        canonical_request.push_str(req.uri().path());
+        canonical_request.push('\n');
+        canonical_request.push_str(req.uri().query().unwrap());
+        canonical_request.push('\n');
+        canonical_request.push_str(&get_canonical_headers(&req, &v4_ignored_headers));
+        canonical_request.push('\n');
+        canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
+        canonical_request.push('\n');
+        canonical_request.push_str(&get_hashed_payload(&req));
+        //println!("canonical_request: \n{}\n", canonical_request);
+        assert_eq!(
+            canonical_request,
+            concat!(
+                "GET\n",
+                "/test.txt\n",
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=98f1c9f47b39a4c40662680a9b029b046b7da5542c2e35d67edb8ff18d2ccf5c\n",
+                "host:examplebucket.s3.amazonaws.com\n",
+                "\n",
+                "host\n",
+                "UNSIGNED-PAYLOAD",
+            )
+        );
+    }
+
+    #[test]
+    fn example_presigned_url2() {
+        let access_key_id = "rustfsadmin";
+        let secret_access_key = "rustfsadmin";
+        let timestamp = "20130524T000000Z";
+        let t = datetime!(2013-05-24 0:00 UTC);
+        // let bucket = "mblock2";
+        let region = "us-east-1";
+        let service = "s3";
+        let path = "/mblock2/";
+        let session_token = "";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://192.168.1.11:9020/mblock2/test.txt?delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2")
+            .body(Body::empty()).unwrap();
+
+        let mut headers = req.headers_mut();
+        headers.insert("host", "192.168.1.11:9020".parse().unwrap());
+
+        req = pre_sign_v4(req, access_key_id, secret_access_key, "", region, 86400, t);
+
+        let mut canonical_request = req.method().as_str().to_string();
+        canonical_request.push('\n');
+        canonical_request.push_str(req.uri().path());
+        canonical_request.push('\n');
+        canonical_request.push_str(req.uri().query().unwrap());
+        canonical_request.push('\n');
+        canonical_request.push_str(&get_canonical_headers(&req, &v4_ignored_headers));
+        canonical_request.push('\n');
+        canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
+        canonical_request.push('\n');
+        canonical_request.push_str(&get_hashed_payload(&req));
+        //println!("canonical_request: \n{}\n", canonical_request);
+        assert_eq!(
+            canonical_request,
+            concat!(
+                "GET\n",
+                "/mblock2/test.txt\n",
+                "delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=rustfsadmin%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=fe7f63f41e4ca18be9e70f560bbe9c079cf06ab97630934e04f7524751ff302d\n",
+                "host:192.168.1.11:9020\n",
+                "\n",
+                "host\n",
+                "UNSIGNED-PAYLOAD",
+            )
+        );
+    }
 }

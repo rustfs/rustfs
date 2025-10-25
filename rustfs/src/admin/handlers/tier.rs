@@ -116,6 +116,24 @@ impl Operation for AddTier {
             TierType::MinIO => {
                 args.name = args.minio.clone().unwrap().name;
             }
+            TierType::Aliyun => {
+                args.name = args.aliyun.clone().unwrap().name;
+            }
+            TierType::Tencent => {
+                args.name = args.tencent.clone().unwrap().name;
+            }
+            TierType::Huaweicloud => {
+                args.name = args.huaweicloud.clone().unwrap().name;
+            }
+            TierType::Azure => {
+                args.name = args.azure.clone().unwrap().name;
+            }
+            TierType::GCS => {
+                args.name = args.gcs.clone().unwrap().name;
+            }
+            TierType::R2 => {
+                args.name = args.r2.clone().unwrap().name;
+            }
             _ => (),
         }
         debug!("add tier args {:?}", args);

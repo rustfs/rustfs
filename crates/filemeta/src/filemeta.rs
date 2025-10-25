@@ -22,8 +22,9 @@ use byteorder::ByteOrder;
 use bytes::Bytes;
 use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use rustfs_utils::http::headers::{
-    self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX,
-    RESERVED_METADATA_PREFIX_LOWER, VERSION_PURGE_STATUS_KEY,
+    self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS,
+    AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+    VERSION_PURGE_STATUS_KEY,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -67,9 +68,6 @@ pub const TRANSITION_STATUS: &str = "transition-status";
 pub const TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const TRANSITION_TIER: &str = "transition-tier";
-
-const X_AMZ_RESTORE_EXPIRY_DAYS: &str = "X-Amz-Restore-Expiry-Days";
-const X_AMZ_RESTORE_REQUEST_DATE: &str = "X-Amz-Restore-Request-Date";
 
 // type ScanHeaderVersionFn = Box<dyn Fn(usize, &[u8], &[u8]) -> Result<()>>;
 
@@ -693,11 +691,6 @@ impl FileMeta {
             }
         }
 
-        // ???
-        if fi.transition_status == TRANSITION_COMPLETE {
-            update_version = false;
-        }
-
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != fi.version_id {
                 continue;
@@ -1088,13 +1081,24 @@ impl FileMeta {
 
     /// Count shared data directories
     pub fn shared_data_dir_count(&self, version_id: Option<Uuid>, data_dir: Option<Uuid>) -> usize {
+        if self.data.entries().unwrap_or_default() > 0
+            && version_id.is_some()
+            && self
+                .data
+                .find(version_id.unwrap().to_string().as_str())
+                .unwrap_or_default()
+                .is_some()
+        {
+            return 0;
+        }
+
         self.versions
             .iter()
             .filter(|v| {
                 v.header.version_type == VersionType::Object && v.header.version_id != version_id && v.header.user_data_dir()
             })
-            .filter_map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).ok().flatten())
-            .filter(|&dir| Some(dir) == data_dir)
+            .filter_map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).ok())
+            .filter(|&dir| dir == data_dir)
             .count()
     }
 
@@ -1838,8 +1842,8 @@ impl MetaObject {
 
     pub fn remove_restore_hdrs(&mut self) {
         self.meta_user.remove(X_AMZ_RESTORE.as_str());
-        self.meta_user.remove(X_AMZ_RESTORE_EXPIRY_DAYS);
-        self.meta_user.remove(X_AMZ_RESTORE_REQUEST_DATE);
+        self.meta_user.remove(AMZ_RESTORE_EXPIRY_DAYS);
+        self.meta_user.remove(AMZ_RESTORE_REQUEST_DATE);
     }
 
     pub fn uses_data_dir(&self) -> bool {

@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
@@ -67,12 +67,17 @@ impl WarmBackendRustFS {
             secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
+            region: conf.region.clone(),
             ..Default::default()
         };
         let scheme = u.scheme();
         let default_port = if scheme == "https" { 443 } else { 80 };
-        let client =
-            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts).await?;
+        let client = TransitionClient::new(
+            &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
+            opts,
+            "rustfs",
+        )
+        .await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

@@ -1325,7 +1325,7 @@ pub trait StorageAPI: ObjectIO + Debug {
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()>;
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
-    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 

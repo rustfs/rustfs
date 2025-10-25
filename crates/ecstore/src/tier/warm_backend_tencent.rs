@@ -25,10 +25,10 @@ use crate::client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
     credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
+    transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 use crate::tier::{
-    tier_config::TierMinIO,
+    tier_config::TierTencent,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
     warm_backend_s3::WarmBackendS3,
 };
@@ -39,10 +39,10 @@ const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
-pub struct WarmBackendMinIO(WarmBackendS3);
+pub struct WarmBackendTencent(WarmBackendS3);
 
-impl WarmBackendMinIO {
-    pub async fn new(conf: &TierMinIO, tier: &str) -> Result<Self, std::io::Error> {
+impl WarmBackendTencent {
+    pub async fn new(conf: &TierTencent, tier: &str) -> Result<Self, std::io::Error> {
         if conf.access_key == "" || conf.secret_key == "" {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
@@ -71,6 +71,7 @@ impl WarmBackendMinIO {
             //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
             region: conf.region.clone(),
+            bucket_lookup: BucketLookupType::BucketLookupDNS,
             ..Default::default()
         };
         let scheme = u.scheme();
@@ -78,7 +79,7 @@ impl WarmBackendMinIO {
         let client = TransitionClient::new(
             &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
             opts,
-            "minio",
+            "tencent",
         )
         .await?;
 
@@ -95,7 +96,7 @@ impl WarmBackendMinIO {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for WarmBackendMinIO {
+impl WarmBackend for WarmBackendTencent {
     async fn put_with_meta(
         &self,
         object: &str,

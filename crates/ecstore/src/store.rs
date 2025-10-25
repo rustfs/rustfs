@@ -1864,17 +1864,20 @@ impl StorageAPI for ECStore {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         let object = encode_dir_object(object);
         if self.single_pool() {
-            return self.pools[0].restore_transitioned_object(bucket, &object, opts).await;
+            return self.pools[0].clone().restore_transitioned_object(bucket, &object, opts).await;
         }
 
         //opts.skip_decommissioned = true;
         //opts.nolock = true;
         let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
 
-        self.pools[idx].restore_transitioned_object(bucket, &object, opts).await
+        self.pools[idx]
+            .clone()
+            .restore_transitioned_object(bucket, &object, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]

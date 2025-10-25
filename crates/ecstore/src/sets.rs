@@ -646,7 +646,7 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         self.get_disks_by_key(object)
             .restore_transitioned_object(bucket, object, opts)
             .await
