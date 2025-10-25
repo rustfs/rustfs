@@ -31,7 +31,6 @@ use tower::Service;
 use tracing::error;
 
 use crate::admin::ADMIN_PREFIX;
-use crate::admin::console::CONSOLE_PREFIX;
 use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
 use crate::admin::rpc::RPC_PREFIX;
