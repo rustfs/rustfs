@@ -387,7 +387,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 }
 
 pub fn is_console_path(path: &str) -> bool {
-    path.starts_with(CONSOLE_PREFIX)
+    path == "/favicon.ico" || path.starts_with(CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
@@ -398,6 +398,7 @@ fn setup_console_middleware_stack(
     auth_timeout: u64,
 ) -> Router {
     let mut app = Router::new()
+        .route("/favicon.ico", get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
         .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
         .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check))
