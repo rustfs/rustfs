@@ -953,7 +953,7 @@ impl S3 for FS {
                 );
             }
             obj_info.user_defined = metadata;
-            if let Err(err) = store
+            if let Err(_err) = store
                 .clone()
                 .copy_object(
                     &bucket,

@@ -271,7 +271,7 @@ pub struct LifecycleContentCodec;
 impl BytesEncode<'_> for LifecycleContentCodec {
     type EItem = LifecycleContent;
 
-    fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
+    fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<'_, [u8]>, BoxedError> {
         let (ver_no_byte, ver_id_bytes, mod_timestamp_bytes, type_byte, object_name_bytes) = match lcc {
             LifecycleContent {
                 ver_no,
