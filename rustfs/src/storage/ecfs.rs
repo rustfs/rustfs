@@ -2346,6 +2346,7 @@ impl S3 for FS {
             bucket,
             key,
             content_length,
+            content_type,
             tagging,
             metadata,
             version_id,
@@ -2418,7 +2419,11 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
-        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, Some(&key));
+        if let Some(content_type) = content_type {
+            metadata.insert("content-type".to_string(), content_type.to_string());
+        }
+
+        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());

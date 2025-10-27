@@ -952,6 +952,12 @@ async fn gather_results(
     let mut recv = recv;
     let mut entries = Vec::new();
     while let Some(mut entry) = recv.recv().await {
+        #[cfg(windows)]
+        {
+            // normalize windows path separator
+            entry.name = entry.name.replace("\\", "/");
+        }
+
         if returned {
             continue;
         }
