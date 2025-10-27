@@ -28,10 +28,8 @@ use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
-use tracing::{debug, info};
+use tracing::info;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -284,7 +282,7 @@ async fn create_test_tier(server: u32) {
         println!("tier_config_mgr save failed, e: {:?}", e);
         panic!("tier save failed");
     }
-    println!("Created test tier: {}", "COLDTIER44");
+    println!("Created test tier: COLDTIER44");
 }
 
 /// Test helper: Check if object exists

@@ -15,10 +15,8 @@
 use heed::byteorder::BigEndian;
 use heed::types::*;
 use heed::{BoxedError, BytesDecode, BytesEncode, Database, DatabaseFlags, Env, EnvOpenOptions};
-use rustfs_ahm::scanner::Scanner;
 use rustfs_ahm::scanner::local_scan::{self, LocalObjectRecord, LocalScanOutcome};
 use rustfs_ecstore::{
-    bucket::metadata_sys,
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
@@ -28,9 +26,8 @@ use serial_test::serial;
 use std::borrow::Cow;
 use std::sync::Once;
 use std::sync::OnceLock;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 use tokio::fs;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{debug, info};
@@ -136,7 +133,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
             //return path;
         }
     }*/
-    let test_lmdb_lifecycle_dir = format!("/tmp/lmdb_lifecycle");
+    let test_lmdb_lifecycle_dir = "/tmp/lmdb_lifecycle".to_string();
     let temp_dir = std::path::PathBuf::from(&test_lmdb_lifecycle_dir);
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).await.ok();
@@ -484,7 +481,7 @@ mod serial_tests {
                 wtxn.commit().unwrap();
 
                 let mut wtxn = lmdb_env.write_txn().unwrap();
-                let mut iter = lmdb.iter_mut(&mut wtxn).unwrap();
+                let iter = lmdb.iter_mut(&mut wtxn).unwrap();
                 //let _ = unsafe { iter.del_current().unwrap() };
                 for row in iter {
                     if let Ok(ref elm) = row {
@@ -500,7 +497,7 @@ mod serial_tests {
                     println!("row:{:?}", row);
                 }
                 //drop(iter);
-                let _ = wtxn.commit().unwrap();
+                wtxn.commit().unwrap();
             }
         }
 
