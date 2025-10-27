@@ -173,6 +173,9 @@ impl S3PeerSys {
                 Ok(_) => {
                     errors[i] = None;
                 }
+                Err(Error::VolumeExists) => {
+                    errors[i] = None;
+                }
                 Err(e) => {
                     errors[i] = Some(e);
                 }
