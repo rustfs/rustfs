@@ -84,12 +84,13 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
-        if method == Method::GET && uri.path() == "/health" {
+        let path = uri.path();
+        if method == Method::GET && (path == "/health" || path == "/profile/cpu" || path == "/profile/memory") {
             return true;
         }
 
         // AssumeRole
-        if method == Method::POST && uri.path() == "/" {
+        if method == Method::POST && path == "/" {
             if let Some(val) = headers.get(header::CONTENT_TYPE) {
                 if val.as_bytes() == b"application/x-www-form-urlencoded" {
                     return true;
@@ -97,17 +98,18 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || is_console_path(uri.path())
+        path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
     }
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         // Allow unauthenticated access to health check
-        if req.method == Method::GET && req.uri.path() == "/health" {
+        let path = req.uri.path();
+        if req.method == Method::GET && (path == "/health" || path == "/profile/cpu" || path == "/profile/memory") {
             return Ok(());
         }
         // Allow unauthenticated access to console static files if console is enabled
-        if self.console_enabled && is_console_path(req.uri.path()) {
+        if self.console_enabled && is_console_path(path) {
             return Ok(());
         }
 
