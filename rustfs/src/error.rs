@@ -63,7 +63,7 @@ impl From<StorageError> for ApiError {
             StorageError::BucketNotEmpty(_) => S3ErrorCode::BucketNotEmpty,
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
-            StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyExists,
+            StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::PrefixAccessDenied(_, _) => S3ErrorCode::AccessDenied,
