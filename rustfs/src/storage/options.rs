@@ -288,16 +288,21 @@ pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, Str
 
 /// Extracts metadata from headers and returns it as a HashMap.
 pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &mut HashMap<String, String>) {
-    extract_metadata_from_mime_with_object_name(headers, metadata, None);
+    extract_metadata_from_mime_with_object_name(headers, metadata, false, None);
 }
 
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
     metadata: &mut HashMap<String, String>,
+    skip_content_type: bool,
     object_name: Option<&str>,
 ) {
     for (k, v) in headers.iter() {
+        if k.as_str() == "content-type" && skip_content_type {
+            continue;
+        }
+
         if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
             if key.is_empty() {
                 continue;
@@ -977,7 +982,7 @@ mod tests {
         let headers = HeaderMap::new();
         let mut metadata = HashMap::new();
 
-        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("data/test.parquet"));
+        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, false, Some("data/test.parquet"));
 
         assert_eq!(metadata.get("content-type"), Some(&"application/vnd.apache.parquet".to_string()));
     }
@@ -1001,7 +1006,7 @@ mod tests {
             let headers = HeaderMap::new();
             let mut metadata = HashMap::new();
 
-            extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some(filename));
+            extract_metadata_from_mime_with_object_name(&headers, &mut metadata, false, Some(filename));
 
             assert_eq!(
                 metadata.get("content-type"),
@@ -1017,7 +1022,7 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("custom/type"));
 
         let mut metadata = HashMap::new();
-        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, Some("test.parquet"));
+        extract_metadata_from_mime_with_object_name(&headers, &mut metadata, false, Some("test.parquet"));
 
         // Should preserve existing content-type, not overwrite
         assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
