@@ -18,27 +18,22 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
-use http::HeaderMap;
-use std::collections::HashMap;
-use std::io::Cursor;
-use tokio::io::BufReader;
-
 use crate::client::{
     api_error_response::{err_invalid_argument, http_resp_to_error_response},
     api_get_object_acl::AccessControlList,
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
+use bytes::Bytes;
+use http::HeaderMap;
+use s3s::dto::RestoreRequest;
+use std::collections::HashMap;
+use std::io::Cursor;
+use tokio::io::BufReader;
 
 const TIER_STANDARD: &str = "Standard";
 const TIER_BULK: &str = "Bulk";
 const TIER_EXPEDITED: &str = "Expedited";
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct GlacierJobParameters {
-    pub tier: String,
-}
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Encryption {
@@ -65,58 +60,6 @@ pub struct S3 {
     pub user_metadata: MetadataEntry,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
-pub struct SelectParameters {
-    pub expression_type: String,
-    pub expression: String,
-    //input_serialization:  SelectObjectInputSerialization,
-    //output_serialization: SelectObjectOutputSerialization,
-}
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct OutputLocation(pub S3);
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct RestoreRequest {
-    pub restore_type: String,
-    pub tier: String,
-    pub days: i64,
-    pub glacier_job_parameters: GlacierJobParameters,
-    pub description: String,
-    pub select_parameters: SelectParameters,
-    pub output_location: OutputLocation,
-}
-
-impl RestoreRequest {
-    fn set_days(&mut self, v: i64) {
-        self.days = v;
-    }
-
-    fn set_glacier_job_parameters(&mut self, v: GlacierJobParameters) {
-        self.glacier_job_parameters = v;
-    }
-
-    fn set_type(&mut self, v: &str) {
-        self.restore_type = v.to_string();
-    }
-
-    fn set_tier(&mut self, v: &str) {
-        self.tier = v.to_string();
-    }
-
-    fn set_description(&mut self, v: &str) {
-        self.description = v.to_string();
-    }
-
-    fn set_select_parameters(&mut self, v: SelectParameters) {
-        self.select_parameters = v;
-    }
-
-    fn set_output_location(&mut self, v: OutputLocation) {
-        self.output_location = v;
-    }
-}
-
 impl TransitionClient {
     pub async fn restore_object(
         &self,
@@ -125,12 +68,13 @@ impl TransitionClient {
         version_id: &str,
         restore_req: &RestoreRequest,
     ) -> Result<(), std::io::Error> {
-        let restore_request = match quick_xml::se::to_string(restore_req) {
+        /*let restore_request = match quick_xml::se::to_string(restore_req) {
             Ok(buf) => buf,
             Err(e) => {
                 return Err(std::io::Error::other(e));
             }
-        };
+        };*/
+        let restore_request = "".to_string();
         let restore_request_bytes = restore_request.as_bytes().to_vec();
 
         let mut url_values = HashMap::new();

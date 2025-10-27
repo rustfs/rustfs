@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::filemeta::TRANSITION_COMPLETE;
 use crate::error::{Error, Result};
 use crate::{ReplicationState, ReplicationStatusType, VersionPurgeStatusType};
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
+use s3s::dto::{RestoreStatus, Timestamp};
+use s3s::header::X_AMZ_RESTORE;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -34,6 +37,8 @@ pub const NULL_VERSION_ID: &str = "null";
 pub const TIER_FV_ID: &str = "tier-free-versionID";
 pub const TIER_FV_MARKER: &str = "tier-free-marker";
 pub const TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
+
+const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
@@ -394,7 +399,10 @@ impl FileInfo {
 
     /// Check if the object is remote (transitioned to another tier)
     pub fn is_remote(&self) -> bool {
-        !self.transition_tier.is_empty()
+        if self.transition_status != TRANSITION_COMPLETE {
+            return false;
+        }
+        !is_restored_object_on_disk(&self.metadata)
     }
 
     /// Get the data directory for this object
@@ -534,4 +542,102 @@ pub struct RawFileInfo {
 pub struct FilesInfo {
     pub files: Vec<FileInfo>,
     pub is_truncated: bool,
+}
+
+pub trait RestoreStatusOps {
+    fn expiry(&self) -> Option<OffsetDateTime>;
+    fn on_going(&self) -> bool;
+    fn on_disk(&self) -> bool;
+    fn to_string(&self) -> String;
+}
+
+impl RestoreStatusOps for RestoreStatus {
+    fn expiry(&self) -> Option<OffsetDateTime> {
+        if self.on_going() {
+            return None;
+        }
+        self.restore_expiry_date.clone().map(OffsetDateTime::from)
+    }
+
+    fn on_going(&self) -> bool {
+        if let Some(on_going) = self.is_restore_in_progress {
+            return on_going;
+        }
+        false
+    }
+
+    fn on_disk(&self) -> bool {
+        let expiry = self.expiry();
+        if let Some(expiry0) = expiry
+            && OffsetDateTime::now_utc().unix_timestamp() < expiry0.unix_timestamp()
+        {
+            return true;
+        }
+        false
+    }
+
+    fn to_string(&self) -> String {
+        if self.on_going() {
+            return "ongoing-request=\"true\"".to_string();
+        }
+        format!(
+            "ongoing-request=\"false\", expiry-date=\"{}\"",
+            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
+                .format(&Rfc3339)
+                .unwrap()
+        )
+    }
+}
+
+fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
+    let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
+    let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
+    if progress_tokens.len() != 2 {
+        return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
+    }
+    if progress_tokens[0].trim() != "ongoing-request" {
+        return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
+    }
+
+    match progress_tokens[1] {
+        "true" | "\"true\"" => {
+            if tokens.len() == 1 {
+                return Ok(RestoreStatus {
+                    is_restore_in_progress: Some(true),
+                    ..Default::default()
+                });
+            }
+        }
+        "false" | "\"false\"" => {
+            if tokens.len() != 2 {
+                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
+            }
+            let expiry_tokens: Vec<&str> = tokens[1].splitn(2, "=").collect();
+            if expiry_tokens.len() != 2 {
+                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
+            }
+            if expiry_tokens[0].trim() != "expiry-date" {
+                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
+            }
+            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339).unwrap();
+            /*if err != nil {
+                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
+            }*/
+            return Ok(RestoreStatus {
+                is_restore_in_progress: Some(false),
+                restore_expiry_date: Some(Timestamp::from(expiry)),
+            });
+        }
+        _ => (),
+    }
+    Err(Error::other(ERR_RESTORE_HDR_MALFORMED))
+}
+
+pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
+    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str()) {
+        if let Ok(restore_status) = parse_restore_obj_status(restore_hdr) {
+            return restore_status.on_disk();
+        }
+    }
+    false
 }
