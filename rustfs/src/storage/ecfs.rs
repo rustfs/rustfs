@@ -902,9 +902,9 @@ impl S3 for FS {
         }
 
         //let mut api_err;
-        let mut status_code = http::StatusCode::OK;
+        let mut _status_code = http::StatusCode::OK;
         let mut already_restored = false;
-        if let Err(err) = rreq.validate(store.clone()) {
+        if let Err(_err) = rreq.validate(store.clone()) {
             //api_err = to_api_err(ErrMalformedXML);
             //api_err.description = err.to_string();
             return Err(S3Error::with_message(
@@ -919,7 +919,7 @@ impl S3 for FS {
                 ));
             }
             if !obj_info.restore_ongoing && obj_info.restore_expires.unwrap().unix_timestamp() != 0 {
-                status_code = http::StatusCode::ACCEPTED;
+                _status_code = http::StatusCode::ACCEPTED;
                 already_restored = true;
             }
         }

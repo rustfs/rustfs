@@ -38,10 +38,10 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 
-static LIFECYCLE_EXPIRY_CURRENT_DAYS: i32 = 1;
-static LIFECYCLE_EXPIRY_NONCURRENT_DAYS: i32 = 1;
-static LIFECYCLE_TRANSITION_CURRENT_DAYS: i32 = 1;
-static LIFECYCLE_TRANSITION_NONCURRENT_DAYS: i32 = 1;
+static _LIFECYCLE_EXPIRY_CURRENT_DAYS: i32 = 1;
+static _LIFECYCLE_EXPIRY_NONCURRENT_DAYS: i32 = 1;
+static _LIFECYCLE_TRANSITION_CURRENT_DAYS: i32 = 1;
+static _LIFECYCLE_TRANSITION_NONCURRENT_DAYS: i32 = 1;
 static GLOBAL_LMDB_ENV: OnceLock<Env> = OnceLock::new();
 static GLOBAL_LMDB_DB: OnceLock<Database<I64<BigEndian>, LifecycleContentCodec>> = OnceLock::new();
 
@@ -166,6 +166,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 }
 
 /// Test helper: Create a test bucket
+#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -228,6 +229,7 @@ fn convert_record_to_object_info(record: &LocalObjectRecord) -> ObjectInfo {
     }
 }
 
+#[allow(dead_code)]
 fn to_object_info(
     bucket: &str,
     object: &str,
@@ -266,7 +268,7 @@ pub struct LifecycleContent {
 
 pub struct LifecycleContentCodec;
 
-impl<'a> BytesEncode<'a> for LifecycleContentCodec {
+impl BytesEncode<'_> for LifecycleContentCodec {
     type EItem = LifecycleContent;
 
     fn bytes_encode(lcc: &Self::EItem) -> Result<Cow<[u8]>, BoxedError> {
@@ -373,7 +375,7 @@ impl<'a> BytesDecode<'a> for LifecycleContentCodec {
         Ok(LifecycleContent {
             ver_no,
             ver_id,
-            mod_time: OffsetDateTime::from_unix_timestamp(mod_timestamp.try_into().unwrap()).unwrap(),
+            mod_time: OffsetDateTime::from_unix_timestamp(mod_timestamp).unwrap(),
             type_,
             object_name,
         })
