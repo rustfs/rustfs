@@ -26,38 +26,37 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::admin::console::init_console_cfg;
 use crate::admin::handlers::profile::start_profilers;
 use crate::server::{
-    init_event_notifier, shutdown_event_notifier, start_audit_system, start_console_server, start_http_server, stop_audit_system,
-    wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::{
-    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, scanner::data_scanner::ScannerConfig,
-    shutdown_ahm_services, Scanner,
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
+    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
 use rustfs_config::DEFAULT_UPDATE_CHECK;
 use rustfs_config::ENV_UPDATE_CHECK;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::bucket::replication::{init_background_replication, GLOBAL_REPLICATION_POOL};
+use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
+    StorageAPI,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
-    store::init_local_disks,
     store::ECStore,
+    store::init_local_disks,
     update_erasure_type,
-    StorageAPI,
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_notify::global::notifier_instance;
@@ -71,12 +70,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-/// Configure Jemalloc memory analysis parameters
+// Configure Jemalloc memory analysis parameters
 // #[allow(non_upper_case_globals, unsafe_code)]
 // #[unsafe(export_name = "malloc_conf")]
 // pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -208,26 +207,31 @@ async fn async_main() -> Result<()> {
     info!("{}", LOGO);
 
     // Store in global storage
-    set_global_guard(guard).map_err(Error::other)?;
+    match set_global_guard(guard).map_err(Error::other) {
+        Ok(_) => (),
+        Err(e) => {
+            error!("Failed to set global observability guard: {}", e);
+            return Err(e);
+        }
+    }
 
     // Initialize performance profiling if enabled
     #[cfg(not(target_os = "windows"))]
     profiling::start_profiling_if_enabled();
 
     // Run parameters
-    run(opt).await
+    match run(opt).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!("Server encountered an error and is shutting down: {}", e);
+            Err(e)
+        }
+    }
 }
 
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
-
-    // // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
-    // let dns_init = tokio::spawn(async {
-    //     if let Err(e) = rustfs_utils::dns_resolver::init_global_dns_resolver().await {
-    //         warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
-    //     }
-    // });
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -248,14 +252,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
 
     set_global_rustfs_port(server_port);
 
     set_global_addr(&opt.address).await;
-
-    // // Wait for DNS initialization to complete before network-heavy operations
-    // dns_init.await.map_err(Error::other)?;
 
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
@@ -299,53 +300,21 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
-    let shutdown_tx = start_http_server(&opt, state_manager.clone()).await?;
-    // Start console server if enabled
-    let console_shutdown_tx = shutdown_tx.clone();
-    if opt.console_enable && !opt.console_address.is_empty() {
-        // Deal with port mapping issues for virtual machines like docker
-        let (external_addr, external_port) = if !opt.external_address.is_empty() {
-            let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
-            let external_port = external_addr.port();
-            if external_port != server_port {
-                warn!(
-                    "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
-                    external_port, server_port
-                );
-            }
-            info!(
-                target: "rustfs::main::run",
-                external_address = %external_addr,
-                external_port = %external_port,
-                "Using external address {} for endpoint access", external_addr
-            );
-            rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
-            set_global_addr(&opt.external_address).await;
-            (external_addr.ip(), external_port)
-        } else {
-            (server_addr.ip(), server_port)
-        };
-        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
-        // init console configuration
-        init_console_cfg(external_addr, external_port);
+    let s3_shutdown_tx = {
+        let mut s3_opt = opt.clone();
+        s3_opt.console_enable = false;
+        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone()).await?;
+        Some(s3_shutdown_tx)
+    };
 
-        let opt_clone = opt.clone();
-        tokio::spawn(async move {
-            let console_shutdown_rx = console_shutdown_tx.subscribe();
-            if let Err(e) = start_console_server(&opt_clone, console_shutdown_rx).await {
-                error!("Console server failed to start: {}", e);
-            }
-        });
+    let console_shutdown_tx = if opt.console_enable && !opt.console_address.is_empty() {
+        let mut console_opt = opt.clone();
+        console_opt.address = console_opt.console_address.clone();
+        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone()).await?;
+        Some(console_shutdown_tx)
     } else {
-        info!("Console server is disabled.");
-        info!("You can access the RustFS API at {}", &opt.address);
-        info!("For more information, visit https://rustfs.com/docs/");
-        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
-        info!(
-            "Current console address is set to: '{}' ,console enable is set to: '{}'",
-            &opt.console_address, &opt.console_enable
-        );
-    }
+        None
+    };
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
@@ -454,11 +423,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -480,7 +449,8 @@ fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
-    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -537,7 +507,12 @@ async fn handle_shutdown(
         target: "rustfs::main::handle_shutdown",
         "Server is stopping..."
     );
-    let _ = shutdown_tx.send(());
+    if let Some(s3_shutdown_tx) = s3_shutdown_tx {
+        let _ = s3_shutdown_tx.send(());
+    }
+    if let Some(console_shutdown_tx) = console_shutdown_tx {
+        let _ = console_shutdown_tx.send(());
+    }
 
     // Wait for the worker thread to complete the cleaning work
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
@@ -563,7 +538,7 @@ fn init_update_check() {
 
     // Async update check with timeout
     tokio::spawn(async {
-        use crate::update::{check_updates, UpdateCheckError};
+        use crate::update::{UpdateCheckError, check_updates};
 
         // Add timeout to prevent hanging network calls
         match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {

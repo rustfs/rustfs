@@ -2,13 +2,18 @@
 set -e
 
 # 1) Normalize command:
-# - No arguments: default to execute rustfs
+# - No arguments: default to execute rustfs with DATA_VOLUMES
 # - First argument starts with '-': treat as rustfs arguments, auto-prefix rustfs
 # - First argument is 'rustfs': replace with absolute path to avoid PATH interference
-if [ $# -eq 0 ] || [ "${1#-}" != "$1" ]; then
+# - Otherwise: treat as full rustfs arguments (e.g., /data paths)
+if [ $# -eq 0 ]; then
+  set -- /usr/bin/rustfs
+elif [ "${1#-}" != "$1" ]; then
   set -- /usr/bin/rustfs "$@"
 elif [ "$1" = "rustfs" ]; then
   shift
+  set -- /usr/bin/rustfs "$@"
+else
   set -- /usr/bin/rustfs "$@"
 fi
 
@@ -74,6 +79,22 @@ if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rus
   echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
 fi
 
-echo "Starting: $*"
-set -- "$@" $DATA_VOLUMES
+# 5) Append DATA_VOLUMES only if no data paths in arguments
+# Check if any argument looks like a data path (starts with / and not an option)
+HAS_DATA_PATH=false
+for arg in "$@"; do
+  case "$arg" in
+    /usr/bin/rustfs) continue ;;
+    -*) continue ;;
+    /*) HAS_DATA_PATH=true; break ;;
+  esac
+done
+
+if [ "$HAS_DATA_PATH" = "false" ] && [ -n "$DATA_VOLUMES" ]; then
+  echo "Starting: $* $DATA_VOLUMES"
+  set -- "$@" $DATA_VOLUMES
+else
+  echo "Starting: $*"
+fi
+
 exec "$@"

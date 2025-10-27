@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
+use crate::client::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
 use crate::client::{
     api_error_response::{err_invalid_argument, err_unexpected_eof, http_resp_to_error_response},
     api_put_object::PutObjectOptions,
@@ -40,7 +40,8 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 
-use rustfs_utils::{crypto::base64_encode, path::trim_etag};
+use crate::client::utils::base64_encode;
+use rustfs_utils::path::trim_etag;
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 
 pub struct UploadedPartRes {

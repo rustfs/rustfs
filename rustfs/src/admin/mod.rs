@@ -19,20 +19,23 @@ pub mod router;
 mod rpc;
 pub mod utils;
 
-// use ecstore::global::{is_dist_erasure, is_erasure};
+#[cfg(test)]
+mod console_test;
+
 use handlers::{
-    bucket_meta, event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget}, group, kms, kms_dynamic,
-    kms_keys,
-    policies,
-    pools, rebalance, service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount}, sts, tier, user, GetReplicationMetricsHandler,
-    HealthCheckHandler,
-    ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    bucket_meta,
+    event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
+    group, kms, kms_dynamic, kms_keys, policies, pools,
+    profile::{TriggerProfileCPU, TriggerProfileMemory},
+    rebalance,
+    service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
+    sts, tier, user,
 };
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
 use s3s::route::S3Route;
-use crate::admin::handlers::profile::{TriggerProfileCPU, TriggerProfileMemory};
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 // const ADMIN_PREFIX: &str = "/minio/admin";
@@ -42,6 +45,8 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 
     // Health check endpoint for monitoring and orchestration
     r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::GET, "/profile/cpu", AdminOperation(&TriggerProfileCPU {}))?;
+    r.insert(Method::GET, "/profile/memory", AdminOperation(&TriggerProfileMemory {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
@@ -513,23 +518,12 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/reset").as_str(),
         AdminOperation(&RemoveNotificationTarget {}),
     )?;
-    // arns
+
+    // arns list
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
         AdminOperation(&ListTargetsArns {}),
-    )?;
-
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/profile/cpu").as_str(),
-        AdminOperation(&TriggerProfileCPU {}),
-    )?;
-
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/profile/memory").as_str(),
-        AdminOperation(&TriggerProfileMemory {}),
     )?;
 
     Ok(())

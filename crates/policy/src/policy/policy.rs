@@ -154,8 +154,8 @@ impl Validator for Policy {
     type Error = Error;
 
     fn is_valid(&self) -> Result<()> {
-        if !self.id.is_empty() && !self.id.eq(DEFAULT_VERSION) {
-            return Err(IamError::InvalidVersion(self.id.0.clone()).into());
+        if !self.version.is_empty() && !self.version.eq(DEFAULT_VERSION) {
+            return Err(IamError::InvalidVersion(self.version.clone()).into());
         }
 
         for statement in self.statements.iter() {
@@ -213,8 +213,8 @@ impl Validator for BucketPolicy {
     type Error = Error;
 
     fn is_valid(&self) -> Result<()> {
-        if !self.id.is_empty() && !self.id.eq(DEFAULT_VERSION) {
-            return Err(IamError::InvalidVersion(self.id.0.clone()).into());
+        if !self.version.is_empty() && !self.version.eq(DEFAULT_VERSION) {
+            return Err(IamError::InvalidVersion(self.version.clone()).into());
         }
 
         for statement in self.statements.iter() {

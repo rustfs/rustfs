@@ -27,6 +27,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
+use metrics::{counter, histogram};
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
@@ -144,30 +145,46 @@ pub async fn start_http_server(
 
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
-    debug!("Listening on: {}", local_addr);
     let local_ip = match rustfs_utils::get_local_ip() {
-        Some(ip) => {
-            debug!("Obtained local IP address: {}", ip);
-            ip
-        }
+        Some(ip) => ip,
         None => {
             warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
             local_addr.ip()
         }
     };
-
+    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_enabled = tls_acceptor.is_some();
+    let protocol = if tls_enabled { "https" } else { "http" };
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("http://{local_ip}:{server_port}");
-    let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
-    info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-    println!("   API: {}  {}", api_endpoints, localhost_endpoint);
-    info!("   RootUser: {}", opt.access_key.clone());
-    info!("   RootPass: {}", opt.secret_key.clone());
-    if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
-        warn!(
-            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-            DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+    let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
+    let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
+
+    if opt.console_enable {
+        admin::console::init_console_cfg(local_ip, server_port);
+
+        info!(
+            target: "rustfs::console::startup",
+            "Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html"
         );
+        info!(
+            target: "rustfs::console::startup",
+            "Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",
+
+        );
+
+        println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
+        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
+    } else {
+        info!("   API: {}  {}", api_endpoints, localhost_endpoint);
+        println!("   API: {api_endpoints}  {localhost_endpoint}");
+        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+            warn!(
+                "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
+                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+            );
+        }
+        info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
+        info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
     }
 
     // Setup S3 service
@@ -178,13 +195,10 @@ pub async fn start_http_server(
 
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
-        debug!("authentication is enabled {}, {}", &access_key, &secret_key);
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        // When console runs on separate port, disable console routes on main endpoint
-        let console_on_endpoint = opt.console_enable; // Console will run separately
-        b.set_route(admin::make_admin_route(console_on_endpoint)?);
+        b.set_route(admin::make_admin_route(opt.console_enable)?);
 
         if !opt.server_domains.is_empty() {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
@@ -208,7 +222,6 @@ pub async fn start_http_server(
     };
 
     // Server will be created per connection - this ensures isolation
-
     tokio::spawn(async move {
         // Record the PID-related metrics of the current process
         let meter = opentelemetry::global::meter("system");
@@ -223,7 +236,6 @@ pub async fn start_http_server(
         }
     });
 
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
@@ -235,6 +247,8 @@ pub async fn start_http_server(
     } else {
         Some(cors_allowed_origins)
     };
+
+    let is_console = opt.console_enable;
     tokio::spawn(async move {
         // Create CORS layer inside the server loop closure
         let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
@@ -332,6 +346,7 @@ pub async fn start_http_server(
                 s3_service.clone(),
                 graceful.clone(),
                 cors_layer.clone(),
+                is_console,
             );
         }
 
@@ -440,6 +455,7 @@ fn process_connection(
     s3_service: S3Service,
     graceful: Arc<GracefulShutdown>,
     cors_layer: CorsLayer,
+    is_console: bool,
 ) {
     tokio::spawn(async move {
         // Build services inside each connected task to avoid passing complex service types across tasks,
@@ -467,33 +483,33 @@ fn process_connection(
                         span
                     })
                     .on_request(|request: &HttpRequest<_>, _span: &Span| {
-                        info!(
-                            counter.rustfs_api_requests_total = 1_u64,
-                            key_request_method = %request.method().to_string(),
-                            key_request_uri_path = %request.uri().path().to_owned(),
-                            "handle request api total",
-                        );
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
+                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
+                        let labels = [
+                            ("key_request_method", format!("{}", request.method())),
+                            ("key_request_uri_path", request.uri().path().to_owned().to_string()),
+                        ];
+                        counter!("rustfs_api_requests_total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
                         _span.record("http response status_code", tracing::field::display(response.status()));
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                        info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
-                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
+                        histogram!("request.body.len").record(chunk.len() as f64);
+                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
                         debug!("http stream closed after {:?}", stream_duration)
                     })
                     .on_failure(|_error, latency: Duration, _span: &Span| {
-                        info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
+                        counter!("rustfs_api_requests_failure_total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
             .layer(cors_layer)
-            .layer(RedirectLayer)
+            .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
+
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
@@ -537,11 +553,7 @@ fn process_connection(
                             "TLS handshake failed: {}", err
                         );
                     }
-                    info!(
-                        counter.rustfs_tls_handshake_failures = 1_u64,
-                        key_failure_type = key_failure_type_str,
-                        "TLS handshake failure metric"
-                    );
+                    counter!("rustfs_tls_handshake_failures", &[("key_failure_type", key_failure_type_str)]).increment(1);
                     // Record detailed diagnostic information
                     debug!(
                         peer_addr = %peer_addr,
@@ -675,9 +687,8 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
     builder.thread_name(thread_name.clone());
     println!(
         "Starting Tokio runtime with configured parameters:\n\
-    worker_threads: {}, max_blocking_threads: {}, thread_stack_size: {}, thread_keep_alive: {}, \
-    global_queue_interval: {}, thread_name: {}",
-        worker_threads, max_blocking_threads, thread_stack_size, thread_keep_alive, global_queue_interval, thread_name
+    worker_threads: {worker_threads}, max_blocking_threads: {max_blocking_threads}, thread_stack_size: {thread_stack_size}, thread_keep_alive: {thread_keep_alive}, \
+    global_queue_interval: {global_queue_interval}, thread_name: {thread_name}"
     );
     builder
 }

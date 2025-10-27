@@ -37,7 +37,6 @@ use rustfs_policy::auth::{
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
 use rustfs_policy::policy::{EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, iam_policy_claim_name_sa};
-use rustfs_utils::crypto::{base64_decode, base64_encode};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -363,7 +362,10 @@ impl<T: Store> IamSys<T> {
         m.insert("parent".to_owned(), Value::String(parent_user.to_owned()));
 
         if !policy_buf.is_empty() {
-            m.insert(SESSION_POLICY_NAME.to_owned(), Value::String(base64_encode(&policy_buf)));
+            m.insert(
+                SESSION_POLICY_NAME.to_owned(),
+                Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+            );
             m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
         } else {
             m.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
@@ -456,7 +458,9 @@ impl<T: Store> IamSys<T> {
         let op_sp = claims.get(SESSION_POLICY_NAME);
         if let (Some(pt), Some(sp)) = (op_pt, op_sp) {
             if pt == EMBEDDED_POLICY_TYPE {
-                let policy = serde_json::from_slice(&base64_decode(sp.as_str().unwrap_or_default().as_bytes())?)?;
+                let policy = serde_json::from_slice(
+                    &base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?,
+                )?;
                 return Ok((sa, Some(policy)));
             }
         }
@@ -515,7 +519,9 @@ impl<T: Store> IamSys<T> {
         let op_sp = claims.get(SESSION_POLICY_NAME);
         if let (Some(pt), Some(sp)) = (op_pt, op_sp) {
             if pt == EMBEDDED_POLICY_TYPE {
-                let policy = serde_json::from_slice(&base64_decode(sp.as_str().unwrap_or_default().as_bytes())?)?;
+                let policy = serde_json::from_slice(
+                    &base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?,
+                )?;
                 return Ok((sa, Some(policy)));
             }
         }
@@ -528,7 +534,7 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         };
 
-        if u.credentials.is_service_account() {
+        if !u.credentials.is_service_account() {
             return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         }
 
@@ -906,7 +912,9 @@ pub fn get_claims_from_token_with_secret(token: &str, secret: &str) -> Result<Ha
 
     if let Some(session_policy) = ms.claims.get(SESSION_POLICY_NAME) {
         let policy_str = session_policy.as_str().unwrap_or_default();
-        let policy = base64_decode(policy_str.as_bytes()).map_err(|e| Error::other(format!("base64 decode err {e}")))?;
+        let policy = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(policy_str.as_bytes())
+            .map_err(|e| Error::other(format!("base64 decode err {e}")))?;
         ms.claims.insert(
             SESSION_POLICY_NAME_EXTRACTED.to_string(),
             Value::String(String::from_utf8(policy).map_err(|e| Error::other(format!("utf8 decode err {e}")))?),

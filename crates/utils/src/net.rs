@@ -148,17 +148,6 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
-            // match crate::dns_resolver::resolve_domain(domain).await {
-            //     Ok(ips) => {
-            //         info!("Resolved domain {domain} using custom DNS resolver: {ips:?}");
-            //         return Ok(ips.into_iter().collect());
-            //     }
-            //     Err(err) => {
-            //         error!(
-            //             "Failed to resolve domain {domain} using custom DNS resolver, falling back to system resolver,err: {err}"
-            //         );
-            //     }
-            // }
             // Check cache first
             if CUSTOM_DNS_RESOLVER.read().unwrap().is_none() {
                 if let Ok(mut cache) = DNS_CACHE.lock() {
@@ -321,7 +310,6 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::init_global_dns_resolver;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::{collections::HashSet, io::Error as IoError};
 
@@ -448,12 +436,7 @@ mod test {
     #[tokio::test]
     async fn test_get_host_ip() {
         set_mock_dns_resolver(mock_resolver);
-        match init_global_dns_resolver().await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Failed to initialize global DNS resolver: {e}");
-            }
-        }
+
         // Test IPv4 address
         let ipv4_host = Host::Ipv4(Ipv4Addr::new(192, 168, 1, 1));
         let ipv4_result = get_host_ip(ipv4_host).await.unwrap();

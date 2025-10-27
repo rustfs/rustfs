@@ -34,6 +34,11 @@ pub use hardlimit_reader::HardLimitReader;
 
 mod hash_reader;
 pub use hash_reader::*;
+mod checksum;
+pub use checksum::*;
+
+mod errors;
+pub use errors::*;
 
 pub mod reader;
 pub use reader::WarpReader;

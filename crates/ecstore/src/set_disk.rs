@@ -72,13 +72,13 @@ use rustfs_filemeta::{
 };
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
-use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
+use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
-use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::{
     HashAlgorithm,
-    crypto::{base64_decode, base64_encode, hex},
+    crypto::hex,
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
@@ -158,10 +158,7 @@ impl SetDisks {
             LockResult::Conflict {
                 current_owner,
                 current_mode,
-            } => format!(
-                "{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {:?}",
-                current_mode
-            ),
+            } => format!("{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {current_mode:?}"),
             LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
         }
     }
@@ -922,9 +919,8 @@ impl SetDisks {
     }
 
     fn get_upload_id_dir(bucket: &str, object: &str, upload_id: &str) -> String {
-        // warn!("get_upload_id_dir upload_id {:?}", upload_id);
-
-        let upload_uuid = base64_decode(upload_id.as_bytes())
+        let upload_uuid = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload_id.as_bytes())
             .and_then(|v| {
                 String::from_utf8(v).map_or(Ok(upload_id.to_owned()), |v| {
                     let parts: Vec<_> = v.splitn(2, '.').collect();
@@ -2950,6 +2946,7 @@ impl SetDisks {
                                         part.mod_time,
                                         part.actual_size,
                                         part.index.clone(),
+                                        part.checksums.clone(),
                                     );
                                     if is_inline_buffer {
                                         if let Some(writer) = writers[index].take() {
@@ -3528,9 +3525,9 @@ impl ObjectIO for SetDisks {
         // }
 
         if object_info.size == 0 {
-            if let Some(rs) = range {
-                let _ = rs.get_offset_length(object_info.size)?;
-            }
+            // if let Some(rs) = range {
+            //     let _ = rs.get_offset_length(object_info.size)?;
+            // }
 
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(Vec::new())),
@@ -3712,7 +3709,7 @@ impl ObjectIO for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
@@ -3729,7 +3726,12 @@ impl ObjectIO for SetDisks {
         // }
 
         if (w_size as i64) < data.size() {
-            return Err(Error::other("put_object write size < data.size()"));
+            warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            return Err(Error::other(format!(
+                "put_object write size < data.size(), w_size={}, data.size={}",
+                w_size,
+                data.size()
+            )));
         }
 
         if user_defined.contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression")) {
@@ -3756,31 +3758,42 @@ impl ObjectIO for SetDisks {
             }
         }
 
+        if fi.checksum.is_none() {
+            if let Some(content_hash) = data.as_hash_reader().content_hash() {
+                fi.checksum = Some(content_hash.to_bytes(&[]));
+            }
+        }
+
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
             if sc == storageclass::STANDARD {
                 let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
         }
 
-        let now = OffsetDateTime::now_utc();
+        let mod_time = if let Some(mod_time) = opts.mod_time {
+            Some(mod_time)
+        } else {
+            Some(OffsetDateTime::now_utc())
+        };
 
-        for (i, fi) in parts_metadatas.iter_mut().enumerate() {
-            fi.metadata = user_defined.clone();
+        for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
+            pfi.metadata = user_defined.clone();
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
+                    pfi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                 }
 
-                fi.set_inline_data();
+                pfi.set_inline_data();
             }
 
-            fi.mod_time = Some(now);
-            fi.size = w_size as i64;
-            fi.versioned = opts.versioned || opts.version_suspended;
-            fi.add_object_part(1, etag.clone(), w_size, fi.mod_time, actual_size, index_op.clone());
+            pfi.mod_time = mod_time;
+            pfi.size = w_size as i64;
+            pfi.versioned = opts.versioned || opts.version_suspended;
+            pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone(), None);
+            pfi.checksum = fi.checksum.clone();
 
             if opts.data_movement {
-                fi.set_data_moved();
+                pfi.set_data_moved();
             }
         }
 
@@ -3815,7 +3828,8 @@ impl ObjectIO for SetDisks {
 
         fi.replication_state_internal = Some(opts.put_replication_state());
 
-        // TODO: version support
+        fi.is_latest = true;
+
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
 }
@@ -4430,8 +4444,6 @@ impl StorageAPI for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        // warn!("get object_info fi {:?}", &fi);
-
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
@@ -4759,6 +4771,11 @@ impl StorageAPI for SetDisks {
             uploaded_parts.push(CompletePart {
                 part_num: p_info.part_num,
                 etag: p_info.etag,
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
             });
         }
         if let Err(err) = self.complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &ObjectOptions {
@@ -4834,63 +4851,23 @@ impl StorageAPI for SetDisks {
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let disks = self.disks.read().await;
+        if let Some(checksum) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            && !checksum.is_empty()
+            && data
+                .as_hash_reader()
+                .content_crc_type()
+                .is_none_or(|v| v.to_string() != *checksum)
+        {
+            return Err(Error::other(format!("checksum mismatch: {checksum}")));
+        }
 
-        let disks = disks.clone();
+        let disks = self.disks.read().await.clone();
+
         let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
         let part_suffix = format!("part.{part_id}");
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
-
-        // let mut writers = Vec::with_capacity(disks.len());
-        // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
-        // let shared_size = erasure.shard_size(erasure.block_size);
-
-        // let futures = disks.iter().map(|disk| {
-        //     let disk = disk.clone();
-        //     let tmp_part_path = tmp_part_path.clone();
-        //     tokio::spawn(async move {
-        //         if let Some(disk) = disk {
-        //             // let writer = disk.append_file(RUSTFS_META_TMP_BUCKET, &tmp_part_path).await?;
-        //             // let filewriter = disk
-        //             //     .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
-        //             //     .await?;
-        //             match new_bitrot_filewriter(
-        //                 disk.clone(),
-        //                 RUSTFS_META_TMP_BUCKET,
-        //                 &tmp_part_path,
-        //                 false,
-        //                 DEFAULT_BITROT_ALGO,
-        //                 shared_size,
-        //             )
-        //             .await
-        //             {
-        //                 Ok(writer) => Ok(Some(writer)),
-        //                 Err(e) => Err(e),
-        //             }
-        //         } else {
-        //             Ok(None)
-        //         }
-        //     })
-        // });
-        // for x in join_all(futures).await {
-        //     let x = x??;
-        //     writers.push(x);
-        // }
-
-        // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
-
-        // let stream = replace(&mut data.stream, Box::new(empty()));
-        // let etag_stream = EtagReader::new(stream);
-
-        // let (w_size, mut etag) = Arc::new(erasure)
-        //     .encode(etag_stream, &mut writers, data.content_length, write_quorum)
-        //     .await?;
-
-        // if let Err(err) = close_bitrot_writers(&mut writers).await {
-        //     error!("close_bitrot_writers err {:?}", err);
-        // }
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
@@ -4944,7 +4921,7 @@ impl StorageAPI for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
@@ -4952,7 +4929,12 @@ impl StorageAPI for SetDisks {
         let _ = mem::replace(&mut data.stream, reader);
 
         if (w_size as i64) < data.size() {
-            return Err(Error::other("put_object_part write size < data.size()"));
+            warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            return Err(Error::other(format!(
+                "put_object_part write size < data.size(), w_size={}, data.size={}",
+                w_size,
+                data.size()
+            )));
         }
 
         let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
@@ -4971,6 +4953,8 @@ impl StorageAPI for SetDisks {
             }
         }
 
+        let checksums = data.as_hash_reader().content_crc();
+
         let part_info = ObjectPartInfo {
             etag: etag.clone(),
             number: part_id,
@@ -4978,12 +4962,9 @@ impl StorageAPI for SetDisks {
             mod_time: Some(OffsetDateTime::now_utc()),
             actual_size,
             index: index_op,
+            checksums: if checksums.is_empty() { None } else { Some(checksums) },
             ..Default::default()
         };
-
-        // debug!("put_object_part part_info {:?}", part_info);
-
-        // fi.parts = vec![part_info.clone()];
 
         let part_info_buff = part_info.marshal_msg()?;
 
@@ -5227,7 +5208,8 @@ impl StorageAPI for SetDisks {
             uploads.push(MultipartInfo {
                 bucket: bucket.to_owned(),
                 object: object.to_owned(),
-                upload_id: base64_encode(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
+                upload_id: base64_simd::URL_SAFE_NO_PAD
+                    .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
                 initiated: Some(start_time),
                 ..Default::default()
             });
@@ -5334,7 +5316,13 @@ impl StorageAPI for SetDisks {
         }
 
         fi.data_dir = Some(Uuid::new_v4());
-        fi.fresh = true;
+
+        if let Some(cssum) = user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM)
+            && !cssum.is_empty()
+        {
+            fi.checksum = base64_simd::STANDARD.decode_to_vec(cssum).ok().map(Bytes::from);
+            user_defined.remove(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM);
+        }
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 
@@ -5348,21 +5336,30 @@ impl StorageAPI for SetDisks {
             }
         }
 
+        if let Some(checksum) = &opts.want_checksum {
+            user_defined.insert(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM.to_string(), checksum.checksum_type.to_string());
+            user_defined.insert(
+                rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(),
+                checksum.checksum_type.obj_type().to_string(),
+            );
+        }
+
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mod_time = opts.mod_time.unwrap_or(OffsetDateTime::now_utc());
 
-        for fi in parts_metadatas.iter_mut() {
-            fi.metadata = user_defined.clone();
-            fi.mod_time = Some(mod_time);
-            fi.fresh = true;
+        for f in parts_metadatas.iter_mut() {
+            f.metadata = user_defined.clone();
+            f.mod_time = Some(mod_time);
+            f.fresh = true;
         }
 
         // fi.mod_time = Some(now);
 
         let upload_uuid = format!("{}x{}", Uuid::new_v4(), mod_time.unix_timestamp_nanos());
 
-        let upload_id = base64_encode(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
+        let upload_id = base64_simd::URL_SAFE_NO_PAD
+            .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 
@@ -5379,7 +5376,11 @@ impl StorageAPI for SetDisks {
 
         // evalDisks
 
-        Ok(MultipartUploadResult { upload_id })
+        Ok(MultipartUploadResult {
+            upload_id,
+            checksum_algo: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM).cloned(),
+            checksum_type: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE).cloned(),
+        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -5467,6 +5468,29 @@ impl StorageAPI for SetDisks {
             return Err(Error::other("part result number err"));
         }
 
+        let mut checksum_type = rustfs_rio::ChecksumType::NONE;
+
+        if let Some(cs) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM) {
+            let Some(ct) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE) else {
+                return Err(Error::other("checksum type not found"));
+            };
+
+            if opts.want_checksum.is_some()
+                && !opts.want_checksum.as_ref().is_some_and(|v| {
+                    v.checksum_type
+                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct))
+                })
+            {
+                return Err(Error::other(format!(
+                    "checksum type mismatch, got {:?}, want {:?}",
+                    opts.want_checksum.as_ref().unwrap(),
+                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
+                )));
+            }
+
+            checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
+        }
+
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 error!("complete_multipart_upload part error: {:?}", &err);
@@ -5487,6 +5511,7 @@ impl StorageAPI for SetDisks {
                 part.mod_time,
                 part.actual_size,
                 part.index.clone(),
+                part.checksums.clone(),
             );
         }
 
@@ -5498,6 +5523,12 @@ impl StorageAPI for SetDisks {
 
         let mut object_size: usize = 0;
         let mut object_actual_size: i64 = 0;
+
+        let mut checksum_combined = bytes::BytesMut::new();
+        let mut checksum = rustfs_rio::Checksum {
+            checksum_type,
+            ..Default::default()
+        };
 
         for (i, p) in uploaded_parts.iter().enumerate() {
             let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
@@ -5539,6 +5570,75 @@ impl StorageAPI for SetDisks {
                 ));
             }
 
+            if checksum_type.is_set() {
+                let Some(crc) = ext_part
+                    .checksums
+                    .as_ref()
+                    .and_then(|f| f.get(checksum_type.to_string().as_str()))
+                    .cloned()
+                else {
+                    error!(
+                        "complete_multipart_upload fi.checksum not found type={checksum_type}, part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                };
+
+                let part_crc = match checksum_type {
+                    rustfs_rio::ChecksumType::SHA256 => p.checksum_sha256.clone(),
+                    rustfs_rio::ChecksumType::SHA1 => p.checksum_sha1.clone(),
+                    rustfs_rio::ChecksumType::CRC32 => p.checksum_crc32.clone(),
+                    rustfs_rio::ChecksumType::CRC32C => p.checksum_crc32c.clone(),
+                    rustfs_rio::ChecksumType::CRC64_NVME => p.checksum_crc64nvme.clone(),
+                    _ => {
+                        error!(
+                            "complete_multipart_upload checksum type={checksum_type}, part_id={}, bucket={}, object={}",
+                            p.part_num, bucket, object
+                        );
+                        return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                    }
+                };
+
+                if part_crc.clone().unwrap_or_default() != crc {
+                    error!("complete_multipart_upload checksum_type={checksum_type:?}, part_crc={part_crc:?}, crc={crc:?}");
+                    error!(
+                        "complete_multipart_upload checksum mismatch part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                }
+
+                let Some(cs) = rustfs_rio::Checksum::new_with_type(checksum_type, &crc) else {
+                    error!(
+                        "complete_multipart_upload checksum new_with_type failed part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                };
+
+                if !cs.valid() {
+                    error!(
+                        "complete_multipart_upload checksum valid failed part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                }
+
+                if checksum_type.full_object_requested() {
+                    if let Err(err) = checksum.add_part(&cs, ext_part.actual_size) {
+                        error!(
+                            "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}",
+                            p.part_num, bucket, object
+                        );
+                        return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
+                    }
+                }
+
+                checksum_combined.extend_from_slice(cs.raw.as_slice());
+            }
+
+            // TODO: check min part size
+
             object_size += ext_part.size;
             object_actual_size += ext_part.actual_size;
 
@@ -5552,6 +5652,52 @@ impl StorageAPI for SetDisks {
                 ..Default::default()
             });
         }
+
+        if let Some(wtcs) = opts.want_checksum.as_ref() {
+            if checksum_type.full_object_requested() {
+                if wtcs.encoded != checksum.encoded {
+                    error!(
+                        "complete_multipart_upload checksum mismatch want={}, got={}",
+                        wtcs.encoded, checksum.encoded
+                    );
+                    return Err(Error::other(format!(
+                        "complete_multipart_upload checksum mismatch want={}, got={}",
+                        wtcs.encoded, checksum.encoded
+                    )));
+                }
+            } else if let Err(err) = wtcs.matches(&checksum_combined, uploaded_parts.len() as i32) {
+                error!(
+                    "complete_multipart_upload checksum matches failed want={}, got={}",
+                    wtcs.encoded, checksum.encoded
+                );
+                return Err(Error::other(format!(
+                    "complete_multipart_upload checksum matches failed want={}, got={}",
+                    wtcs.encoded, checksum.encoded
+                )));
+            }
+        }
+
+        if let Some(rc_crc) = opts.user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
+            if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(rc_crc) {
+                fi.checksum = Some(Bytes::from(rc_crc_bytes));
+            } else {
+                error!("complete_multipart_upload decode rc_crc failed rc_crc={}", rc_crc);
+            }
+        }
+
+        if checksum_type.is_set() {
+            checksum_type
+                .merge(rustfs_rio::ChecksumType::MULTIPART)
+                .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+            if !checksum_type.full_object_requested() {
+                checksum = rustfs_rio::Checksum::new_from_data(checksum_type, &checksum_combined)
+                    .ok_or_else(|| Error::other("checksum new_from_data failed"))?;
+            }
+            fi.checksum = Some(checksum.to_bytes(&checksum_combined));
+        }
+
+        fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM);
+        fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE);
 
         fi.size = object_size as i64;
         fi.mod_time = opts.mod_time;
@@ -5570,11 +5716,22 @@ impl StorageAPI for SetDisks {
 
         fi.metadata.insert("etag".to_owned(), etag);
 
-        fi.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), object_actual_size.to_string());
-
-        fi.metadata
-            .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
+        if opts.replication_request {
+            if let Some(actual_size) = opts
+                .user_defined
+                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size").as_str())
+            {
+                fi.metadata
+                    .insert(format!("{RESERVED_METADATA_PREFIX}actual-size"), actual_size.clone());
+                fi.metadata
+                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size.to_string());
+            }
+        } else {
+            fi.metadata
+                .insert(format!("{RESERVED_METADATA_PREFIX}actual-size"), object_actual_size.to_string());
+            fi.metadata
+                .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
+        }
 
         if fi.is_compressed() {
             fi.metadata
@@ -5585,9 +5742,6 @@ impl StorageAPI for SetDisks {
             fi.set_data_moved();
         }
 
-        // TODO: object_actual_size
-        let _ = object_actual_size;
-
         for meta in parts_metadatas.iter_mut() {
             if meta.is_valid() {
                 meta.size = fi.size;
@@ -5595,13 +5749,12 @@ impl StorageAPI for SetDisks {
                 meta.parts.clone_from(&fi.parts);
                 meta.metadata = fi.metadata.clone();
                 meta.versioned = opts.versioned || opts.version_suspended;
-
-                // TODO: Checksum
+                meta.checksum = fi.checksum.clone();
             }
         }
 
         let mut parts = Vec::with_capacity(curr_fi.parts.len());
-        // TODO: 优化 cleanupMultipartPath
+
         for p in curr_fi.parts.iter() {
             parts.push(path_join_buf(&[
                 &upload_id_path,
@@ -5616,28 +5769,6 @@ impl StorageAPI for SetDisks {
                     format!("part.{}", p.number).as_str(),
                 ]));
             }
-
-            // let _ = self
-            //     .remove_part_meta(
-            //         bucket,
-            //         object,
-            //         upload_id,
-            //         curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
-            //         p.number,
-            //     )
-            //     .await;
-
-            // if !fi.parts.iter().any(|v| v.number == p.number) {
-            //     let _ = self
-            //         .remove_object_part(
-            //             bucket,
-            //             object,
-            //             upload_id,
-            //             curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
-            //             p.number,
-            //         )
-            //         .await;
-            // }
         }
 
         {
@@ -5656,9 +5787,6 @@ impl StorageAPI for SetDisks {
         )
         .await?;
 
-        // debug!("complete fileinfo {:?}", &fi);
-
-        // TODO: reduce_common_data_dir
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
@@ -6422,10 +6550,20 @@ mod tests {
             CompletePart {
                 part_num: 1,
                 etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
             },
             CompletePart {
                 part_num: 2,
                 etag: Some("098f6bcd4621d373cade4e832627b4f6".to_string()),
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
             },
         ];
 
@@ -6442,6 +6580,11 @@ mod tests {
         let single_part = vec![CompletePart {
             part_num: 1,
             etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_crc64nvme: None,
         }];
         let single_result = get_complete_multipart_md5(&single_part);
         assert!(single_result.ends_with("-1"));

@@ -13,9 +13,6 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
-use crate::bucket::replication::REPLICATION_RESET;
-use crate::bucket::replication::REPLICATION_STATUS;
-use crate::bucket::replication::{ReplicateDecision, replication_statuses_map, version_purge_statuses_map};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
@@ -25,12 +22,15 @@ use crate::{
     bucket::lifecycle::lifecycle::ExpirationOptions,
     bucket::lifecycle::{bucket_lifecycle_ops::TransitionedObject, lifecycle::TransitionOptions},
 };
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
-    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
+    ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
@@ -92,11 +92,28 @@ impl PutObjReader {
         PutObjReader { stream }
     }
 
+    pub fn as_hash_reader(&self) -> &HashReader {
+        &self.stream
+    }
+
     pub fn from_vec(data: Vec<u8>) -> Self {
+        use sha2::{Digest, Sha256};
         let content_length = data.len() as i64;
+        let sha256hex = if content_length > 0 {
+            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
         PutObjReader {
-            stream: HashReader::new(Box::new(WarpReader::new(Cursor::new(data))), content_length, content_length, None, false)
-                .unwrap(),
+            stream: HashReader::new(
+                Box::new(WarpReader::new(Cursor::new(data))),
+                content_length,
+                content_length,
+                None,
+                sha256hex,
+                false,
+            )
+            .unwrap(),
         }
     }
 
@@ -374,6 +391,8 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+
+    pub want_checksum: Option<Checksum>,
 }
 
 impl ObjectOptions {
@@ -456,6 +475,8 @@ pub struct BucketInfo {
 #[derive(Debug, Default, Clone)]
 pub struct MultipartUploadResult {
     pub upload_id: String,
+    pub checksum_algo: Option<String>,
+    pub checksum_type: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -471,13 +492,24 @@ pub struct PartInfo {
 pub struct CompletePart {
     pub part_num: usize,
     pub etag: Option<String>,
+    // pub size: Option<usize>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
 }
 
 impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
-            etag: value.e_tag.map(|e| e.value().to_owned()),
+            etag: value.e_tag.map(|v| v.value().to_owned()),
+            checksum_crc32: value.checksum_crc32,
+            checksum_crc32c: value.checksum_crc32c,
+            checksum_sha1: value.checksum_sha1,
+            checksum_sha256: value.checksum_sha256,
+            checksum_crc64nvme: value.checksum_crc64nvme,
         }
     }
 }
@@ -517,7 +549,7 @@ pub struct ObjectInfo {
     pub version_purge_status_internal: Option<String>,
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
-    pub checksum: Vec<u8>,
+    pub checksum: Option<Bytes>,
 }
 
 impl Clone for ObjectInfo {
@@ -554,7 +586,7 @@ impl Clone for ObjectInfo {
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
-            checksum: Default::default(),
+            checksum: self.checksum.clone(),
             expires: self.expires,
         }
     }
@@ -694,6 +726,7 @@ impl ObjectInfo {
             inlined,
             user_defined: metadata,
             transitioned_object,
+            checksum: fi.checksum.clone(),
             ..Default::default()
         }
     }
@@ -883,6 +916,23 @@ impl ObjectInfo {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
+        if part > 0 {
+            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone()) {
+                return Ok((checksums, true));
+            }
+        }
+
+        // TODO: decrypt checksums
+
+        if let Some(data) = &self.checksum {
+            let (checksums, is_multipart) = rustfs_rio::read_checksums(data.as_ref(), 0);
+            return Ok((checksums, is_multipart));
+        }
+
+        Ok((HashMap::new(), false))
     }
 }
 

@@ -30,7 +30,8 @@ use s3s::header::{
     X_AMZ_STORAGE_CLASS, X_AMZ_WEBSITE_REDIRECT_LOCATION,
 };
 //use crate::disk::{BufferReader, Reader};
-use crate::checksum::ChecksumMode;
+use crate::client::checksum::ChecksumMode;
+use crate::client::utils::base64_encode;
 use crate::client::{
     api_error_response::{err_entity_too_large, err_invalid_argument},
     api_put_object_common::optimal_part_info,
@@ -41,7 +42,6 @@ use crate::client::{
     transition_api::{ReaderImpl, TransitionClient, UploadInfo},
     utils::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},
 };
-use rustfs_utils::crypto::base64_encode;
 
 #[derive(Debug, Clone)]
 pub struct AdvancedPutOptions {

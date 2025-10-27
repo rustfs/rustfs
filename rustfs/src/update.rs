@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::version;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
-
-use crate::version;
 
 /// Update check related errors
 #[derive(Error, Debug)]

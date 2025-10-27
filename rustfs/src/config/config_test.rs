@@ -25,7 +25,6 @@ mod tests {
 
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
-        assert_eq!(opt.external_address, ":9000"); // Now defaults to DEFAULT_ADDRESS
         assert_eq!(opt.address, ":9000");
     }
 
@@ -47,15 +46,6 @@ mod tests {
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":8080");
         assert_eq!(opt.address, ":8000");
-    }
-
-    #[test]
-    fn test_external_address_configuration() {
-        // Test external address configuration for Docker
-        let args = vec!["rustfs", "/test/volume", "--external-address", ":9020"];
-        let opt = Opt::parse_from(args);
-
-        assert_eq!(opt.external_address, ":9020".to_string());
     }
 
     #[test]

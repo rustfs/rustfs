@@ -14,12 +14,31 @@
 
 use crate::AppConfig;
 use crate::telemetry::{OtelGuard, init_telemetry};
+use opentelemetry::metrics::Meter;
+use rustfs_config::APP_NAME;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
 
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
+
+/// Flag indicating if observability is enabled
+pub(crate) static IS_OBSERVABILITY_ENABLED: OnceCell<bool> = OnceCell::const_new();
+
+/// Name of the observability meter
+pub(crate) static OBSERVABILITY_METER_NAME: OnceCell<String> = OnceCell::const_new();
+
+/// Check whether Observability is enabled
+pub fn is_observability_enabled() -> bool {
+    IS_OBSERVABILITY_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// Get the global meter for observability
+pub fn global_meter() -> Meter {
+    let meter_name = OBSERVABILITY_METER_NAME.get().map(|s| s.as_str()).unwrap_or(APP_NAME);
+    opentelemetry::global::meter(meter_name)
+}
 
 /// Error type for global guard operations
 #[derive(Debug, thiserror::Error)]

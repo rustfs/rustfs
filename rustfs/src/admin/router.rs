@@ -12,30 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::routing::get;
-use hyper::http::Extensions;
+use crate::admin::ADMIN_PREFIX;
+use crate::admin::console::is_console_path;
+use crate::admin::console::make_console_server;
+use crate::admin::rpc::RPC_PREFIX;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
 use hyper::Uri;
+use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
 use rustfs_ecstore::rpc::verify_rpc_signature;
-use s3s::header;
-use s3s::route::S3Route;
-use s3s::s3_error;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
+use s3s::header;
+use s3s::route::S3Route;
+use s3s::s3_error;
 use tower::Service;
 use tracing::error;
-
-use crate::admin::console;
-use crate::admin::rpc::RPC_PREFIX;
-use crate::admin::ADMIN_PREFIX;
-
-const CONSOLE_PREFIX: &str = "/rustfs/console";
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -48,12 +45,7 @@ impl<T: Operation> S3Router<T> {
         let router = Router::new();
 
         let console_router = if console_enabled {
-            Some(
-                axum::Router::new()
-                    .nest(CONSOLE_PREFIX, axum::Router::new().fallback_service(get(console::static_handler)))
-                    .fallback_service(get(console::static_handler))
-                    .into_service::<Body>(),
-            )
+            Some(make_console_server().into_service::<Body>())
         } else {
             None
         };
@@ -105,7 +97,7 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(CONSOLE_PREFIX)
+        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || is_console_path(uri.path())
     }
 
     // check_access before call
@@ -115,7 +107,7 @@ where
             return Ok(());
         }
         // Allow unauthenticated access to console static files if console is enabled
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+        if self.console_enabled && is_console_path(req.uri.path()) {
             return Ok(());
         }
 
@@ -139,7 +131,7 @@ where
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+        if self.console_enabled && is_console_path(req.uri.path()) {
             if let Some(console_router) = &self.console_router {
                 let mut console_router = console_router.clone();
                 let req = convert_request(req);
