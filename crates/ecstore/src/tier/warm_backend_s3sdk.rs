@@ -22,12 +22,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::primitives::ByteStream;
+
 use crate::client::{
     api_get_options::GetObjectOptions,
     api_put_object::PutObjectOptions,
     api_remove::RemoveObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
 use crate::error::ErrorResponse;
@@ -39,8 +42,7 @@ use crate::tier::{
 use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
-    pub client: Arc<TransitionClient>,
-    pub core: TransitionCore,
+    pub client: Arc<Client>,
     pub bucket: String,
     pub prefix: String,
     pub storage_class: String,
@@ -74,34 +76,30 @@ impl WarmBackendS3 {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        let creds: Credentials<Static>;
-
+        let creds;
         if conf.access_key != "" && conf.secret_key != "" {
-            //creds = Credentials::new_static_v4(conf.access_key, conf.secret_key, "");
-            creds = Credentials::new(Static(Value {
-                access_key_id: conf.access_key.clone(),
-                secret_access_key: conf.secret_key.clone(),
-                session_token: "".to_string(),
-                signer_type: SignatureType::SignatureV4,
-                ..Default::default()
-            }));
+            creds = Credentials::new(
+                conf.access_key.clone(), // access_key_id
+                conf.secret_key.clone(), // secret_access_key
+                None,                    // session_token (可选)
+                None,
+                "Static",
+            );
         } else {
             return Err(std::io::Error::other("insufficient parameters for S3 backend authentication"));
         }
-        let opts = Options {
-            creds,
-            secure: u.scheme() == "https",
-            //transport: GLOBAL_RemoteTargetTransport,
-            region: conf.region.clone(),
-            ..Default::default()
-        };
-        let client = TransitionClient::new(&u.host().expect("err").to_string(), opts, "s3").await?;
-
+        let region_provider = RegionProviderChain::default_provider().or_else(Region::new(conf.region.clone()));
+        #[allow(deprecated)]
+        let config = aws_config::from_env()
+            .endpoint_url(conf.endpoint.clone())
+            .region(region_provider)
+            .credentials_provider(creds)
+            .load()
+            .await;
+        let client = Client::new(&config);
         let client = Arc::new(client);
-        let core = TransitionCore(Arc::clone(&client));
         Ok(Self {
             client,
-            core,
             bucket: conf.bucket.clone(),
             prefix: conf.prefix.clone().trim_matches('/').to_string(),
             storage_class: conf.storage_class.clone(),
@@ -127,21 +125,21 @@ impl WarmBackend for WarmBackendS3 {
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
         let client = self.client.clone();
-        let res = client
-            .put_object(
-                &self.bucket,
-                &self.get_dest(object),
-                r,
-                length,
-                &PutObjectOptions {
-                    send_content_md5: true,
-                    storage_class: self.storage_class.clone(),
-                    user_metadata: meta,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        Ok(res.version_id)
+        let Ok(res) = client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&self.get_dest(object))
+            .body(match r {
+                ReaderImpl::Body(content_body) => ByteStream::from(content_body.to_vec()),
+                ReaderImpl::ObjectBody(mut content_body) => ByteStream::from(content_body.read_all().await?),
+            })
+            .send()
+            .await
+        else {
+            return Err(std::io::Error::other("put_object error"));
+        };
+
+        Ok(res.version_id().unwrap_or("").to_string())
     }
 
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error> {
@@ -149,38 +147,50 @@ impl WarmBackend for WarmBackendS3 {
     }
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let mut gopts = GetObjectOptions::default();
+        let client = self.client.clone();
+        let Ok(res) = client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&self.get_dest(object))
+            .send()
+            .await
+        else {
+            return Err(std::io::Error::other("get_object error"));
+        };
 
-        if rv != "" {
-            gopts.version_id = rv.to_string();
-        }
-        if opts.start_offset >= 0 && opts.length > 0 {
-            if let Err(err) = gopts.set_range(opts.start_offset, opts.start_offset + opts.length - 1) {
-                return Err(std::io::Error::other(err));
-            }
-        }
-        let c = TransitionCore(Arc::clone(&self.client));
-        let (_, _, r) = c.get_object(&self.bucket, &self.get_dest(object), &gopts).await?;
-
-        Ok(r)
+        Ok(ReadCloser::new(std::io::Cursor::new(
+            res.body.collect().await.map(|data| data.into_bytes().to_vec())?,
+        )))
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
-        let mut ropts = RemoveObjectOptions::default();
-        if rv != "" {
-            ropts.version_id = rv.to_string();
-        }
         let client = self.client.clone();
-        let err = client.remove_object(&self.bucket, &self.get_dest(object), ropts).await;
-        Err(std::io::Error::other(err.expect("err")))
+        if let Err(_) = client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&self.get_dest(object))
+            .send()
+            .await
+        {
+            return Err(std::io::Error::other("delete_object error"));
+        }
+
+        Ok(())
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
-        let result = self
-            .core
-            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
-            .await?;
+        let client = self.client.clone();
+        let Ok(res) = client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            //.max_keys(10)
+            //.into_paginator()
+            .send()
+            .await
+        else {
+            return Err(std::io::Error::other("list_objects_v2 error"));
+        };
 
-        Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)
+        Ok(res.common_prefixes.unwrap().len() > 0 || res.contents.unwrap().len() > 0)
     }
 }

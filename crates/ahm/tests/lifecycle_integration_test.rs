@@ -18,9 +18,9 @@ use rustfs_ecstore::{
     bucket::metadata_sys,
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+    global::GLOBAL_TierConfigMgr,
     store::ECStore,
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
-    tier::tier::TierConfigMgr,
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
 use serial_test::serial;
@@ -28,14 +28,11 @@ use std::sync::Once;
 use std::sync::OnceLock;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::fs;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
-use tracing::{debug, info};
+use tracing::info;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
-static GLOBAL_TIER_CONFIG_MGR: OnceLock<Arc<RwLock<TierConfigMgr>>> = OnceLock::new();
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -121,13 +118,11 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
-    let _ = GLOBAL_TIER_CONFIG_MGR.set(TierConfigMgr::new());
-
     (disk_paths, ecstore)
 }
 
 /// Test helper: Create a test bucket
-async fn _create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
+async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
         .await
@@ -220,7 +215,7 @@ async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dy
         </Filter>
         <Transition>
           <Days>0</Days>
-          <StorageClass>COLDTIER</StorageClass>
+          <StorageClass>COLDTIER44</StorageClass>
         </Transition>
     </Rule>
     <Rule>
@@ -231,7 +226,7 @@ async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dy
         </Filter>
         <NoncurrentVersionTransition>
           <NoncurrentDays>0</NoncurrentDays>
-          <StorageClass>COLDTIER</StorageClass>
+          <StorageClass>COLDTIER44</StorageClass>
         </NoncurrentVersionTransition>
     </Rule>
 </LifecycleConfiguration>"#;
@@ -243,33 +238,51 @@ async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dy
 
 /// Test helper: Create a test tier
 #[allow(dead_code)]
-async fn create_test_tier() {
+async fn create_test_tier(server: u32) {
     let args = TierConfig {
         version: "v1".to_string(),
         tier_type: TierType::MinIO,
-        name: "COLDTIER".to_string(),
+        name: "COLDTIER44".to_string(),
         s3: None,
+        aliyun: None,
+        tencent: None,
+        huaweicloud: None,
+        azure: None,
+        gcs: None,
+        r2: None,
         rustfs: None,
-        minio: Some(TierMinIO {
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
-            bucket: "mblock2".to_string(),
-            endpoint: "http://127.0.0.1:9020".to_string(),
-            prefix: "mypre3/".to_string(),
-            region: "".to_string(),
-            ..Default::default()
-        }),
+        minio: if server == 1 {
+            Some(TierMinIO {
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+                bucket: "hello".to_string(),
+                endpoint: "http://39.105.198.204:9000".to_string(),
+                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
+                region: "".to_string(),
+                ..Default::default()
+            })
+        } else {
+            Some(TierMinIO {
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+                bucket: "mblock2".to_string(),
+                endpoint: "http://127.0.0.1:9020".to_string(),
+                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
+                region: "".to_string(),
+                ..Default::default()
+            })
+        },
     };
-    let mut tier_config_mgr = GLOBAL_TIER_CONFIG_MGR.get().unwrap().write().await;
+    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
     if let Err(err) = tier_config_mgr.add(args, false).await {
-        warn!("tier_config_mgr add failed, e: {:?}", err);
+        println!("tier_config_mgr add failed, e: {:?}", err);
         panic!("tier add failed. {err}");
     }
     if let Err(e) = tier_config_mgr.save().await {
-        warn!("tier_config_mgr save failed, e: {:?}", e);
+        println!("tier_config_mgr save failed, e: {:?}", e);
         panic!("tier save failed");
     }
-    info!("Created test tier: {}", "COLDTIER");
+    println!("Created test tier: COLDTIER44");
 }
 
 /// Test helper: Check if object exists
@@ -284,9 +297,10 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 #[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        debug!("oi: {:?}", oi);
+        println!("oi: {:?}", oi);
         oi.delete_marker
     } else {
+        println!("object_is_delete_marker is error");
         panic!("object_is_delete_marker is error");
     }
 }
@@ -295,9 +309,10 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
 #[allow(dead_code)]
 async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        info!("oi: {:?}", oi);
+        println!("oi: {:?}", oi);
         !oi.transitioned_object.status.is_empty()
     } else {
+        println!("object_is_transitioned is error");
         panic!("object_is_transitioned is error");
     }
 }
@@ -455,8 +470,9 @@ mod serial_tests {
         println!("Lifecycle expiry basic test completed");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    //#[ignore]
     async fn test_lifecycle_expiry_deletemarker() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -578,12 +594,13 @@ mod serial_tests {
         println!("Lifecycle expiry basic test completed");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore]
     async fn test_lifecycle_transition_basic() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
-        //create_test_tier().await;
+        create_test_tier(1).await;
 
         // Create test bucket and object
         let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -591,7 +608,8 @@ mod serial_tests {
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        //create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
         upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
 
         // Verify object exists initially
@@ -599,13 +617,13 @@ mod serial_tests {
         println!("✅ Object exists before lifecycle processing");
 
         // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
-        /*set_bucket_lifecycle_transition(bucket_name)
+        set_bucket_lifecycle_transition(bucket_name.as_str())
             .await
             .expect("Failed to set lifecycle configuration");
         println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
         // Verify lifecycle configuration was set
-        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name).await {
+        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
             Ok(bucket_meta) => {
                 assert!(bucket_meta.lifecycle_config.is_some());
                 println!("✅ Bucket metadata retrieved successfully");
@@ -613,7 +631,7 @@ mod serial_tests {
             Err(e) => {
                 println!("❌ Error retrieving bucket metadata: {e:?}");
             }
-        }*/
+        }
 
         // Create scanner with very short intervals for testing
         let scanner_config = ScannerConfig {
@@ -640,12 +658,11 @@ mod serial_tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // Check if object has been expired (deleted)
-        //let check_result = object_is_transitioned(&ecstore, bucket_name, object_name).await;
-        let check_result = object_exists(&ecstore, bucket_name.as_str(), object_name).await;
+        let check_result = object_is_transitioned(&ecstore, &bucket_name, object_name).await;
         println!("Object exists after lifecycle processing: {check_result}");
 
         if check_result {
-            println!("✅ Object was not deleted by lifecycle processing");
+            println!("✅ Object was transitioned by lifecycle processing");
             // Let's try to get object info to see its details
             match ecstore
                 .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
@@ -663,7 +680,7 @@ mod serial_tests {
                 }
             }
         } else {
-            println!("❌ Object was deleted by lifecycle processing");
+            println!("❌ Object was not transitioned by lifecycle processing");
         }
 
         assert!(check_result);

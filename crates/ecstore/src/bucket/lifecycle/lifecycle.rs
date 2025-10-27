@@ -20,7 +20,7 @@
 
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
-    ObjectLockConfiguration, ObjectLockEnabled, Transition,
+    ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
 };
 use std::cmp::Ordering;
 use std::env;
@@ -31,8 +31,6 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::info;
 
 use crate::bucket::lifecycle::rule::TransitionOps;
-
-use super::bucket_lifecycle_ops::RestoreObjectRequest;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
@@ -325,7 +323,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         }
 
                         if let Some(days) = expiration.days {
-                            let expected_expiry = expected_expiry_time(obj.mod_time.expect("err!"), days /*, date*/);
+                            let expected_expiry = expected_expiry_time(obj.mod_time.unwrap(), days /*, date*/);
                             if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
                                 events.push(Event {
                                     action: IlmAction::DeleteVersionAction,
@@ -402,19 +400,21 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE
                             {
                                 let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
-                                if due.is_some() && (now.unix_timestamp() >= due.unwrap().unix_timestamp()) {
-                                    events.push(Event {
-                                        action: IlmAction::TransitionVersionAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due,
-                                        storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
-                                            .storage_class
-                                            .clone()
-                                            .unwrap()
-                                            .as_str()
-                                            .to_string(),
-                                        ..Default::default()
-                                    });
+                                if let Some(due0) = due {
+                                    if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
+                                        events.push(Event {
+                                            action: IlmAction::TransitionVersionAction,
+                                            rule_id: rule.id.clone().expect("err!"),
+                                            due,
+                                            storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
+                                                .storage_class
+                                                .clone()
+                                                .unwrap()
+                                                .as_str()
+                                                .to_string(),
+                                            ..Default::default()
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -446,7 +446,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 });
                             }
                         } else if let Some(days) = expiration.days {
-                            let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.expect("err!"), days);
+                            let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.unwrap(), days);
                             info!(
                                 "eval_inner: expiration check - days={}, obj_time={:?}, expiry_time={:?}, now={:?}, should_expire={}",
                                 days,
@@ -480,12 +480,12 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     if obj.transition_status != TRANSITION_COMPLETE {
                         if let Some(ref transitions) = rule.transitions {
                             let due = transitions[0].next_due(obj);
-                            if let Some(due) = due {
-                                if due.unix_timestamp() > 0 && (now.unix_timestamp() >= due.unix_timestamp()) {
+                            if let Some(due0) = due {
+                                if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
                                     events.push(Event {
                                         action: IlmAction::TransitionAction,
                                         rule_id: rule.id.clone().expect("err!"),
-                                        due: Some(due),
+                                        due,
                                         storage_class: transitions[0].storage_class.clone().expect("err!").as_str().to_string(),
                                         noncurrent_days: 0,
                                         newer_noncurrent_versions: 0,
@@ -580,8 +580,10 @@ impl LifecycleCalculate for LifecycleExpiration {
         if !obj.is_latest || !obj.delete_marker {
             return None;
         }
-
-        Some(expected_expiry_time(obj.mod_time.unwrap(), self.days.unwrap()))
+        match self.days {
+            Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
+            None => None,
+        }
     }
 }
 
@@ -591,10 +593,16 @@ impl LifecycleCalculate for NoncurrentVersionTransition {
         if obj.is_latest || self.storage_class.is_none() {
             return None;
         }
-        if self.noncurrent_days.is_none() {
-            return obj.successor_mod_time;
+        match self.noncurrent_days {
+            Some(noncurrent_days) => {
+                if let Some(successor_mod_time) = obj.successor_mod_time {
+                    Some(expected_expiry_time(successor_mod_time, noncurrent_days))
+                } else {
+                    Some(expected_expiry_time(OffsetDateTime::now_utc(), noncurrent_days))
+                }
+            }
+            None => obj.successor_mod_time,
         }
-        Some(expected_expiry_time(obj.successor_mod_time.unwrap(), self.noncurrent_days.unwrap()))
     }
 }
 
@@ -609,10 +617,10 @@ impl LifecycleCalculate for Transition {
             return Some(date.into());
         }
 
-        if self.days.is_none() {
-            return obj.mod_time;
+        match self.days {
+            Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
+            None => obj.mod_time,
         }
-        Some(expected_expiry_time(obj.mod_time.unwrap(), self.days.unwrap()))
     }
 }
 
@@ -692,7 +700,7 @@ pub struct TransitionOptions {
     pub status: String,
     pub tier: String,
     pub etag: String,
-    pub restore_request: RestoreObjectRequest,
+    pub restore_request: RestoreRequest,
     pub restore_expiry: OffsetDateTime,
     pub expire_restored: bool,
 }
