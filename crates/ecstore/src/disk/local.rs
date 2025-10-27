@@ -984,7 +984,8 @@ impl LocalDisk {
     #[async_recursion::async_recursion]
     async fn scan_dir<W>(
         &self,
-        current: &mut String,
+        mut current: String,
+        mut prefix: String,
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
@@ -1022,14 +1023,16 @@ impl LocalDisk {
             return Ok(());
         }
 
-        let mut entries = match self.list_dir("", &opts.bucket, current, -1).await {
+        // TODO: add lock
+
+        let mut entries = match self.list_dir("", &opts.bucket, &current, -1).await {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    debug!("scan list_dir {}, err {:?}", &current, &e);
+                    error!("scan list_dir {}, err {:?}", &current, &e);
                 }
 
-                if opts.report_notfound && e == Error::FileNotFound && current == &opts.base_dir {
+                if opts.report_notfound && e == Error::FileNotFound && current == opts.base_dir {
                     return Err(DiskError::FileNotFound);
                 }
 
@@ -1041,8 +1044,7 @@ impl LocalDisk {
             return Ok(());
         }
 
-        let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
-        *current = current.trim_matches(s).to_owned();
+        current = current.trim_matches('/').to_owned();
 
         let bucket = opts.bucket.as_str();
 
@@ -1056,11 +1058,9 @@ impl LocalDisk {
                 return Ok(());
             }
             // check prefix
-            if let Some(filter_prefix) = &opts.filter_prefix {
-                if !entry.starts_with(filter_prefix) {
-                    *item = "".to_owned();
-                    continue;
-                }
+            if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
+                *item = "".to_owned();
+                continue;
             }
 
             if let Some(forward) = &forward {
@@ -1085,15 +1085,20 @@ impl LocalDisk {
             *item = "".to_owned();
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
-                //
                 let metadata = self
                     .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
                     .await?;
 
-                // 用 strip_suffix 只删除一次
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
+
+                // if opts.limit > 0
+                //     && let Ok(meta) = FileMeta::load(&metadata)
+                //     && !meta.all_hidden(true)
+                // {
+                *objs_returned += 1;
+                // }
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
@@ -1101,30 +1106,27 @@ impl LocalDisk {
                     ..Default::default()
                 })
                 .await?;
-                *objs_returned += 1;
 
-                // warn!("scan list_dir {}, write_obj done, name: {:?}", &current, &name);
                 return Ok(());
             }
         }
 
         entries.sort();
 
-        let mut entries = entries.as_slice();
         if let Some(forward) = &forward {
             for (i, entry) in entries.iter().enumerate() {
                 if entry >= forward || forward.starts_with(entry.as_str()) {
-                    entries = &entries[i..];
+                    entries.drain(..i);
                     break;
                 }
             }
         }
 
         let mut dir_stack: Vec<String> = Vec::with_capacity(5);
+        prefix = "".to_owned();
 
         for entry in entries.iter() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                // warn!("scan list_dir {}, limit reached 2", &current);
                 return Ok(());
             }
 
@@ -1132,7 +1134,7 @@ impl LocalDisk {
                 continue;
             }
 
-            let name = path_join_buf(&[current, entry]);
+            let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
             if !dir_stack.is_empty() {
                 if let Some(pop) = dir_stack.last().cloned() {
@@ -1144,9 +1146,7 @@ impl LocalDisk {
                         .await?;
 
                         if opts.recursive {
-                            let mut opts = opts.clone();
-                            opts.filter_prefix = None;
-                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), &opts, out, objs_returned)).await {
+                            if let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned)).await {
                                 error!("scan_dir err {:?}", er);
                             }
                         }
@@ -1181,7 +1181,12 @@ impl LocalDisk {
                     meta.metadata = res;
 
                     out.write_obj(&meta).await?;
+
+                    // if let Ok(meta) = FileMeta::load(&meta.metadata)
+                    //     && !meta.all_hidden(true)
+                    // {
                     *objs_returned += 1;
+                    // }
                 }
                 Err(err) => {
                     if err == Error::FileNotFound || err == Error::IsNotRegular {
@@ -1200,7 +1205,6 @@ impl LocalDisk {
 
         while let Some(dir) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                // warn!("scan list_dir {}, limit reached 3", &current);
                 return Ok(());
             }
 
@@ -1209,19 +1213,14 @@ impl LocalDisk {
                 ..Default::default()
             })
             .await?;
-            *objs_returned += 1;
 
             if opts.recursive {
-                let mut dir = dir;
-                let mut opts = opts.clone();
-                opts.filter_prefix = None;
-                if let Err(er) = Box::pin(self.scan_dir(&mut dir, &opts, out, objs_returned)).await {
+                if let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned)).await {
                     warn!("scan_dir err {:?}", &er);
                 }
             }
         }
 
-        // warn!("scan list_dir {}, done", &current);
         Ok(())
     }
 }
@@ -1884,8 +1883,14 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let mut current = opts.base_dir.clone();
-        self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
+        self.scan_dir(
+            opts.base_dir.clone(),
+            opts.filter_prefix.clone().unwrap_or_default(),
+            &opts,
+            &mut out,
+            &mut objs_returned,
+        )
+        .await?;
 
         Ok(())
     }
