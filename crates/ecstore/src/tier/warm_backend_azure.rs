@@ -21,18 +21,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use azure_core::http::{Body, ClientOptions, RequestContent};
-use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::*;
-
 use crate::client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
-    transition_api::{Options, ReadCloser, ReaderImpl},
+    credentials::{Credentials, SignatureType, Static, Value},
+    transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 use crate::tier::{
     tier_config::TierAzure,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend_s3::WarmBackendS3,
 };
 use tracing::warn;
 
@@ -41,12 +39,7 @@ const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
-pub struct WarmBackendAzure {
-    pub client: Arc<BlobServiceClient>,
-    pub bucket: String,
-    pub prefix: String,
-    pub storage_class: String,
-}
+pub struct WarmBackendAzure(WarmBackendS3);
 
 impl WarmBackendAzure {
     pub async fn new(conf: &TierAzure, tier: &str) -> Result<Self, std::io::Error> {
@@ -58,37 +51,47 @@ impl WarmBackendAzure {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        let creds = StorageCredentials::access_key(conf.access_key.clone(), conf.secret_key.clone());
-        let client = ClientBuilder::new(conf.access_key.clone(), creds)
-            //.endpoint(conf.endpoint)
-            .blob_service_client();
+        let u = match url::Url::parse(&conf.endpoint) {
+            Ok(u) => u,
+            Err(e) => {
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        };
+
+        let creds = Credentials::new(Static(Value {
+            access_key_id: conf.access_key.clone(),
+            secret_access_key: conf.secret_key.clone(),
+            session_token: "".to_string(),
+            signer_type: SignatureType::SignatureV4,
+            ..Default::default()
+        }));
+        let opts = Options {
+            creds,
+            secure: u.scheme() == "https",
+            //transport: GLOBAL_RemoteTargetTransport,
+            trailing_headers: true,
+            region: conf.region.clone(),
+            bucket_lookup: BucketLookupType::BucketLookupDNS,
+            ..Default::default()
+        };
+        let scheme = u.scheme();
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let client = TransitionClient::new(
+            &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
+            opts,
+            "azure",
+        )
+        .await?;
+
         let client = Arc::new(client);
-        Ok(Self {
+        let core = TransitionCore(Arc::clone(&client));
+        Ok(Self(WarmBackendS3 {
             client,
+            core,
             bucket: conf.bucket.clone(),
             prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
             storage_class: "".to_string(),
-        })
-    }
-
-    /*pub fn tier(&self) -> *blob.AccessTier {
-        if self.storage_class == "" {
-            return None;
-        }
-        for t in blob.PossibleAccessTierValues() {
-            if strings.EqualFold(self.storage_class, t) {
-                return &t
-            }
-        }
-        None
-    }*/
-
-    pub fn get_dest(&self, object: &str) -> String {
-        let mut dest_obj = object.to_string();
-        if self.prefix != "" {
-            dest_obj = format!("{}/{}", &self.prefix, object);
-        }
-        return dest_obj;
+        }))
     }
 }
 
@@ -101,39 +104,25 @@ impl WarmBackend for WarmBackendAzure {
         length: i64,
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
-        let part_size = length;
-        let client = self.client.clone();
-        let container_client = client.container_client(self.bucket.clone());
-        let blob_client = container_client.blob_client(self.get_dest(object));
-        /*let res = blob_client
-            .upload(
-                RequestContent::from(match r {
-                    ReaderImpl::Body(content_body) => content_body.to_vec(),
-                    ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
-                }),
-                false,
-                length as u64,
-                None,
+        let part_size = optimal_part_size(length)?;
+        let client = self.0.client.clone();
+        let res = client
+            .put_object(
+                &self.0.bucket,
+                &self.0.get_dest(object),
+                r,
+                length,
+                &PutObjectOptions {
+                    storage_class: self.0.storage_class.clone(),
+                    part_size: part_size as u64,
+                    disable_content_sha256: true,
+                    user_metadata: meta,
+                    ..Default::default()
+                },
             )
-            .await
-        else {
-            return Err(std::io::Error::other("upload error"));
-        };*/
-
-        let Ok(res) = blob_client
-            .put_block_blob(match r {
-                ReaderImpl::Body(content_body) => content_body.to_vec(),
-                ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
-            })
-            .content_type("text/plain")
-            .into_future()
-            .await
-        else {
-            return Err(std::io::Error::other("put_block_blob error"));
-        };
-
+            .await?;
         //self.ToObjectError(err, object)
-        Ok(res.request_id.to_string())
+        Ok(res.version_id)
     }
 
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error> {
@@ -141,91 +130,35 @@ impl WarmBackend for WarmBackendAzure {
     }
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let client = self.client.clone();
-        let container_client = client.container_client(self.bucket.clone());
-        let blob_client = container_client.blob_client(self.get_dest(object));
-        blob_client.get();
-        todo!();
+        self.0.get(object, rv, opts).await
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
-        let client = self.client.clone();
-        let container_client = client.container_client(self.bucket.clone());
-        let blob_client = container_client.blob_client(self.get_dest(object));
-        blob_client.delete();
-        todo!();
+        self.0.remove(object, rv).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
-        /*let result = self.client
-            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
-            .await?;
-
-        Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)*/
-        Ok(false)
+        self.0.in_use().await
     }
 }
 
-/*fn azure_to_object_error(err: Error, params: Vec<String>) -> Option<error> {
-    if err == nil {
-      return nil
+fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
+    let mut object_size = object_size;
+    if object_size == -1 {
+        object_size = MAX_MULTIPART_PUT_OBJECT_SIZE;
     }
 
-    bucket := ""
-    object := ""
-    if len(params) >= 1 {
-      bucket = params[0]
-    }
-    if len(params) == 2 {
-      object = params[1]
+    if object_size > MAX_MULTIPART_PUT_OBJECT_SIZE {
+        return Err(std::io::Error::other("entity too large"));
     }
 
-    azureErr, ok := err.(*azcore.ResponseError)
-    if !ok {
-      // We don't interpret non Azure errors. As azure errors will
-      // have StatusCode to help to convert to object errors.
-      return err
-    }
+    let configured_part_size = MIN_PART_SIZE;
+    let mut part_size_flt = object_size as f64 / MAX_PARTS_COUNT as f64;
+    part_size_flt = (part_size_flt as f64 / configured_part_size as f64).ceil() * configured_part_size as f64;
 
-    serviceCode := azureErr.ErrorCode
-    statusCode := azureErr.StatusCode
-
-    azureCodesToObjectError(err, serviceCode, statusCode, bucket, object)
-}*/
-
-/*fn azure_codes_to_object_error(err: Error, service_code: String, status_code: i32, bucket: String, object: String) -> Option<Error> {
-  switch serviceCode {
-  case "ContainerNotFound", "ContainerBeingDeleted":
-    err = BucketNotFound{Bucket: bucket}
-  case "ContainerAlreadyExists":
-    err = BucketExists{Bucket: bucket}
-  case "InvalidResourceName":
-    err = BucketNameInvalid{Bucket: bucket}
-  case "RequestBodyTooLarge":
-    err = PartTooBig{}
-  case "InvalidMetadata":
-    err = UnsupportedMetadata{}
-  case "BlobAccessTierNotSupportedForAccountType":
-    err = NotImplemented{}
-  case "OutOfRangeInput":
-    err = ObjectNameInvalid{
-      Bucket: bucket,
-      Object: object,
+    let part_size = part_size_flt as i64;
+    if part_size == 0 {
+        return Ok(MIN_PART_SIZE);
     }
-  default:
-    switch statusCode {
-    case http.StatusNotFound:
-      if object != "" {
-        err = ObjectNotFound{
-          Bucket: bucket,
-          Object: object,
-        }
-      } else {
-        err = BucketNotFound{Bucket: bucket}
-      }
-    case http.StatusBadRequest:
-      err = BucketNameInvalid{Bucket: bucket}
-    }
-  }
-  return err
-}*/
+    Ok(part_size)
+}

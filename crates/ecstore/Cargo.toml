@@ -105,9 +105,6 @@ base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = "1.1.0"
 google-cloud-auth = "1.0.1"
-azure_core = "0.29.1"
-azure_storage = "0.21.0"
-azure_storage_blobs = "0.21.0"
 aws-config = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
