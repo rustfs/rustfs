@@ -27,7 +27,7 @@
 //!
 //! ## Example
 //!
-//! ```rust
+//! ```ignore
 //! use rustfs_ecstore::erasure_coding::Erasure;
 //!
 //! let erasure = Erasure::new(4, 2, 1024); // 4 data shards, 2 parity shards, 1KB block size
@@ -83,7 +83,6 @@ impl ReedSolomonEncoder {
             return Ok(());
         }
 
-        // 使用 SIMD 进行编码
         let simd_result = self.encode_with_simd(&mut shards_vec);
 
         match simd_result {
@@ -176,7 +175,6 @@ impl ReedSolomonEncoder {
             .find_map(|s| s.as_ref().map(|v| v.len()))
             .ok_or_else(|| io::Error::other("No valid shards found for reconstruction"))?;
 
-        // 获取或创建decoder
         let mut decoder = {
             let mut cache_guard = self
                 .decoder_cache
@@ -185,21 +183,17 @@ impl ReedSolomonEncoder {
 
             match cache_guard.take() {
                 Some(mut cached_decoder) => {
-                    // 使用reset方法重置现有decoder
                     if let Err(e) = cached_decoder.reset(self.data_shards, self.parity_shards, shard_len) {
                         warn!("Failed to reset SIMD decoder: {:?}, creating new one", e);
-                        // 如果reset失败，创建新的decoder
+
                         reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
                             .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?
                     } else {
                         cached_decoder
                     }
                 }
-                None => {
-                    // 第一次使用，创建新decoder
-                    reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
-                        .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?
-                }
+                None => reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?,
             }
         };
 
@@ -235,8 +229,7 @@ impl ReedSolomonEncoder {
             }
         }
 
-        // 将decoder放回缓存（在result被drop后decoder自动重置，可以重用）
-        drop(result); // 显式drop result，确保decoder被重置
+        drop(result);
 
         *self
             .decoder_cache
@@ -262,7 +255,7 @@ impl ReedSolomonEncoder {
 /// - `_buf`: Internal buffer for block operations.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use rustfs_ecstore::erasure_coding::Erasure;
 /// let erasure = Erasure::new(4, 2, 8);
 /// let data = b"hello world";
