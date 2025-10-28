@@ -210,7 +210,7 @@ mod tests {
                 StorageError::ObjectNameInvalid("test".into(), "test".into()),
                 S3ErrorCode::InvalidArgument,
             ),
-            (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyExists),
+            (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
             (StorageError::PrefixAccessDenied("test".into(), "test".into()), S3ErrorCode::AccessDenied),
