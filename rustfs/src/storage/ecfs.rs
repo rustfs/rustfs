@@ -2172,8 +2172,24 @@ impl S3 for FS {
         };
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
-        let continuation_token = continuation_token.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
+
+        let continuation_token = continuation_token.filter(|v| !v.is_empty());
+
+        // Save the original encoded continuation_token for response
+        let encoded_continuation_token = continuation_token.clone();
+
+        // Decode continuation_token from base64 for internal use
+        let continuation_token = continuation_token
+            .map(|token| {
+                base64_simd::STANDARD
+                    .decode_to_vec(token.as_bytes())
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    })
+            })
+            .transpose()?;
 
         let store = get_validated_store(&bucket).await?;
 
@@ -2223,12 +2239,17 @@ impl S3 for FS {
             .map(|v| CommonPrefix { prefix: Some(v) })
             .collect();
 
+        // Encode next_continuation_token to base64
+        let next_continuation_token = object_infos
+            .next_continuation_token
+            .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
+
         let output = ListObjectsV2Output {
             is_truncated: Some(object_infos.is_truncated),
-            continuation_token: object_infos.continuation_token,
-            next_continuation_token: object_infos.next_continuation_token,
+            continuation_token: encoded_continuation_token,
+            next_continuation_token,
             key_count: Some(key_count),
-            max_keys: Some(key_count),
+            max_keys: Some(max_keys),
             contents: Some(objects),
             delimiter,
             name: Some(bucket),
