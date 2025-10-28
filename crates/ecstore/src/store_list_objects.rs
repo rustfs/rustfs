@@ -1056,6 +1056,10 @@ async fn merge_entry_channels(
     out_channel: Sender<MetaCacheEntry>,
     read_quorum: usize,
 ) -> Result<()> {
+    if in_channels.is_empty() {
+        return Ok(());
+    }
+
     let mut in_channels = in_channels;
     if in_channels.len() == 1 {
         loop {
