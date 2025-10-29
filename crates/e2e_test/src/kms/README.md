@@ -1,267 +1,253 @@
 # KMS End-to-End Tests
 
-本目录包含 RustFS KMS (Key Management Service) 的端到端集成测试，用于验证完整的 KMS 功能流程。
+This directory contains the integration suites used to validate the full RustFS KMS (Key Management Service) workflow.
 
-## 📁 测试文件说明
+## 📁 Test Overview
 
 ### `kms_local_test.rs`
-本地KMS后端的端到端测试，包含：
-- 自动启动和配置本地KMS后端
-- 通过动态配置API配置KMS服务
-- 测试SSE-C（客户端提供密钥）加密流程
-- 验证S3兼容的对象加密/解密操作
-- 密钥生命周期管理测试
+End-to-end coverage for the local KMS backend:
+- Auto-start and configure the local backend
+- Configure KMS through the dynamic configuration API
+- Verify SSE-C (client-provided keys)
+- Exercise S3-compatible encryption/decryption
+- Validate key lifecycle management
 
 ### `kms_vault_test.rs`
-Vault KMS后端的端到端测试，包含：
-- 自动启动Vault开发服务器
-- 配置Vault transit engine和密钥
-- 通过动态配置API配置KMS服务
-- 测试完整的Vault KMS集成
-- 验证Token认证和加密操作
+End-to-end coverage for the Vault backend:
+- Launch a Vault dev server automatically
+- Configure the transit engine and encryption keys
+- Configure KMS via the dynamic configuration API
+- Run the full Vault integration flow
+- Validate token authentication and encryption operations
 
 ### `kms_comprehensive_test.rs`
-**完整的KMS功能测试套件**（当前因AWS SDK API兼容性问题暂时禁用），包含：
-- **Bucket加密配置**: SSE-S3和SSE-KMS默认加密设置
-- **完整的SSE加密模式测试**:
-  - SSE-S3: S3管理的服务端加密
-  - SSE-KMS: KMS管理的服务端加密
-  - SSE-C: 客户端提供密钥的服务端加密
-- **对象操作测试**: 上传、下载、验证三种SSE模式
-- **分片上传测试**: 多部分上传支持所有SSE模式
-- **对象复制测试**: 不同SSE模式间的复制操作
-- **完整KMS API管理**:
-  - 密钥生命周期管理（创建、列表、描述、删除、取消删除）
-  - 直接加密/解密操作
-  - 数据密钥生成和操作
-  - KMS服务管理（启动、停止、状态查询）
+**Full KMS capability suite** (currently disabled because of AWS SDK compatibility issues):
+- **Bucket encryption configuration**: SSE-S3 and SSE-KMS defaults
+- **All SSE encryption modes**:
+  - SSE-S3 (S3-managed server-side encryption)
+  - SSE-KMS (KMS-managed server-side encryption)
+  - SSE-C (client-provided keys)
+- **Object operations**: upload, download, and validation for every SSE mode
+- **Multipart uploads**: cover each SSE mode
+- **Object replication**: cross-mode replication scenarios
+- **Complete KMS API management**:
+  - Key lifecycle (create, list, describe, delete, cancel delete)
+  - Direct encrypt/decrypt operations
+  - Data key generation and handling
+  - KMS service lifecycle (start, stop, status)
 
 ### `kms_integration_test.rs`
-综合性KMS集成测试，包含：
-- 多后端兼容性测试
-- KMS服务生命周期测试
-- 错误处理和恢复测试
-- **注意**: 当前因AWS SDK API兼容性问题暂时禁用
+Broad integration tests that exercise:
+- Multiple backends
+- KMS lifecycle management
+- Error handling and recovery
+- **Note**: currently disabled because of AWS SDK compatibility gaps
 
-## 🚀 如何运行测试
+## 🚀 Running Tests
 
-### 前提条件
+### Prerequisites
 
-1. **系统依赖**：
+1. **System dependencies**
    ```bash
    # macOS
    brew install vault awscurl
-   
+
    # Ubuntu/Debian
    apt-get install vault
    pip install awscurl
    ```
 
-2. **构建RustFS**：
+2. **Build RustFS**
    ```bash
-   # 在项目根目录
    cargo build
    ```
 
-### 运行单个测试
+### Run individual suites
 
-#### 本地KMS测试
+#### Local backend
 ```bash
 cd crates/e2e_test
 cargo test test_local_kms_end_to_end -- --nocapture
 ```
 
-#### Vault KMS测试
+#### Vault backend
 ```bash
 cd crates/e2e_test
 cargo test test_vault_kms_end_to_end -- --nocapture
 ```
 
-#### 高可用性测试
+#### High availability
 ```bash
 cd crates/e2e_test
 cargo test test_vault_kms_high_availability -- --nocapture
 ```
 
-#### 完整功能测试（开发中）
+#### Comprehensive features (disabled)
 ```bash
 cd crates/e2e_test
-# 注意：以下测试因AWS SDK API兼容性问题暂时禁用
+# Disabled due to AWS SDK compatibility gaps
 # cargo test test_comprehensive_kms_functionality -- --nocapture
-# cargo test test_sse_modes_compatibility -- --nocapture  
+# cargo test test_sse_modes_compatibility -- --nocapture
 # cargo test test_kms_api_comprehensive -- --nocapture
 ```
 
-### 运行所有KMS测试
+### Run all KMS suites
 ```bash
 cd crates/e2e_test
 cargo test kms -- --nocapture
 ```
 
-### 串行运行（避免端口冲突）
+### Run serially (avoid port conflicts)
 ```bash
 cd crates/e2e_test
 cargo test kms -- --nocapture --test-threads=1
 ```
 
-## 🔧 测试配置
+## 🔧 Configuration
 
-### 环境变量
+### Environment variables
 ```bash
-# 可选：自定义端口（默认使用9050）
+# Optional: custom RustFS port (default 9050)
 export RUSTFS_TEST_PORT=9050
 
-# 可选：自定义Vault端口（默认使用8200）
+# Optional: custom Vault port (default 8200)
 export VAULT_TEST_PORT=8200
 
-# 可选：启用详细日志
+# Optional: enable verbose logging
 export RUST_LOG=debug
 ```
 
-### 依赖的二进制文件路径
+### Required binaries
 
-测试会自动查找以下二进制文件：
-- `../../target/debug/rustfs` - RustFS服务器
-- `vault` - Vault (需要在PATH中)
-- `/Users/dandan/Library/Python/3.9/bin/awscurl` - AWS签名工具
+Tests look for:
+- `../../target/debug/rustfs` – RustFS server
+- `vault` – Vault CLI (must be on PATH)
+- `/Users/dandan/Library/Python/3.9/bin/awscurl` – AWS SigV4 helper
 
-## 📋 测试流程说明
+## 📋 Test Flow
 
-### Local KMS测试流程
-1. **环境准备**：创建临时目录，设置KMS密钥存储路径
-2. **启动服务**：启动RustFS服务器，启用KMS功能
-3. **等待就绪**：检查端口监听和S3 API响应
-4. **配置KMS**：通过awscurl发送配置请求到admin API
-5. **启动KMS**：激活KMS服务
-6. **功能测试**：
-   - 创建测试存储桶
-   - 测试SSE-C加密（客户端提供密钥）
-   - 验证对象加密/解密
-7. **清理**：终止进程，清理临时文件
+### Local backend
+1. **Prepare environment** – create temporary directories and key storage paths
+2. **Start RustFS** – launch the server with KMS enabled
+3. **Wait for readiness** – confirm the port listener and S3 API
+4. **Configure KMS** – send configuration via awscurl to the admin API
+5. **Start KMS** – activate the KMS service
+6. **Exercise functionality**
+   - Create a test bucket
+   - Run SSE-C encryption with client-provided keys
+   - Validate encryption/decryption behavior
+7. **Cleanup** – stop processes and remove temporary files
 
-### Vault KMS测试流程
-1. **启动Vault**：使用开发模式启动Vault服务器
-2. **配置Vault**：
-   - 启用transit secrets engine
-   - 创建加密密钥（rustfs-master-key）
-3. **启动RustFS**：启用KMS功能的RustFS服务器
-4. **配置KMS**：通过API配置Vault后端，包含：
-   - Vault地址和Token认证
-   - Transit engine配置
-   - 密钥路径设置
-5. **功能测试**：完整的加密/解密流程测试
-6. **清理**：终止所有进程
+### Vault backend
+1. **Launch Vault** – start the dev-mode server
+2. **Configure Vault**
+   - Enable the transit secrets engine
+   - Create the `rustfs-master-key`
+3. **Start RustFS** – run the server with KMS enabled
+4. **Configure KMS** – point RustFS at Vault (address, token, transit config, key path)
+5. **Exercise functionality** – complete the encryption/decryption workflow
+6. **Cleanup** – stop all services
 
-## 🛠️ 故障排除
+## 🛠️ Troubleshooting
 
-### 常见问题
+### Common issues
 
-**Q: 测试失败 "RustFS server failed to become ready"**
-```
-A: 检查端口是否被占用：
+**Q: `RustFS server failed to become ready`**
+```bash
 lsof -i :9050
-kill -9 <PID>  # 如果有进程占用端口
+kill -9 <PID>  # Free the port if necessary
 ```
 
-**Q: Vault服务启动失败**
-```
-A: 确保Vault已安装且在PATH中：
+**Q: Vault fails to start**
+```bash
 which vault
 vault version
 ```
 
-**Q: awscurl认证失败**
-```
-A: 检查awscurl路径是否正确：
+**Q: awscurl authentication fails**
+```bash
 ls /Users/dandan/Library/Python/3.9/bin/awscurl
-# 或安装到不同路径：
+# Or install elsewhere
 pip install awscurl
-which awscurl  # 然后更新测试中的路径
+which awscurl  # Update the path in tests accordingly
 ```
 
-**Q: 测试超时**
-```
-A: 增加等待时间或检查日志：
+**Q: Tests time out**
+```bash
 RUST_LOG=debug cargo test test_local_kms_end_to_end -- --nocapture
 ```
 
-### 调试技巧
+### Debug tips
 
-1. **查看详细日志**：
+1. **Enable verbose logs**
    ```bash
    RUST_LOG=rustfs_kms=debug,rustfs=info cargo test -- --nocapture
    ```
 
-2. **保留临时文件**：
-   修改测试代码，注释掉清理部分，检查生成的配置文件
+2. **Keep temporary files** – comment out cleanup logic to inspect generated configs
 
-3. **单步调试**：
-   在测试中添加 `std::thread::sleep` 来暂停执行，手动检查服务状态
+3. **Pause execution** – add `std::thread::sleep` for manual inspection during tests
 
-4. **端口检查**：
+4. **Monitor ports**
    ```bash
-   # 测试运行时检查端口状态
    netstat -an | grep 9050
    curl http://127.0.0.1:9050/minio/health/ready
    ```
 
-## 📊 测试覆盖范围
+## 📊 Coverage
 
-### 功能覆盖
-- ✅ KMS服务动态配置
-- ✅ 本地和Vault后端支持  
-- ✅ AWS S3兼容加密接口
-- ✅ 密钥管理和生命周期
-- ✅ 错误处理和恢复
-- ✅ 高可用性场景
+### Functional
+- ✅ Dynamic KMS configuration
+- ✅ Local and Vault backends
+- ✅ AWS S3-compatible encryption APIs
+- ✅ Key lifecycle management
+- ✅ Error handling and recovery paths
+- ✅ High-availability behavior
 
-### 加密模式覆盖
-- ✅ SSE-C (Server-Side Encryption with Customer-Provided Keys)
-- ✅ SSE-S3 (Server-Side Encryption with S3-Managed Keys)
-- ✅ SSE-KMS (Server-Side Encryption with KMS-Managed Keys)
+### Encryption modes
+- ✅ SSE-C (customer-provided)
+- ✅ SSE-S3 (S3-managed)
+- ✅ SSE-KMS (KMS-managed)
 
-### S3操作覆盖
-- ✅ 对象上传/下载 (SSE-C模式)
-- 🚧 分片上传 (需要AWS SDK兼容性修复)
-- 🚧 对象复制 (需要AWS SDK兼容性修复)
-- 🚧 Bucket加密配置 (需要AWS SDK兼容性修复)
+### S3 operations
+- ✅ Object upload/download (SSE-C)
+- 🚧 Multipart uploads (pending AWS SDK fixes)
+- 🚧 Object replication (pending AWS SDK fixes)
+- 🚧 Bucket encryption defaults (pending AWS SDK fixes)
 
-### KMS API覆盖
-- ✅ 基础密钥管理 (创建、列表)
-- 🚧 完整密钥生命周期 (需要AWS SDK兼容性修复)
-- 🚧 直接加密/解密操作 (需要AWS SDK兼容性修复)
-- 🚧 数据密钥生成和解密 (需要AWS SDK兼容性修复)
-- ✅ KMS服务管理 (配置、启动、停止、状态)
+### KMS API
+- ✅ Basic key management (create/list)
+- 🚧 Full key lifecycle (pending AWS SDK fixes)
+- 🚧 Direct encrypt/decrypt (pending AWS SDK fixes)
+- 🚧 Data key operations (pending AWS SDK fixes)
+- ✅ Service lifecycle (configure/start/stop/status)
 
-### 认证方式覆盖
-- ✅ Vault Token认证
-- 🚧 Vault AppRole认证
+### Authentication
+- ✅ Vault token auth
+- 🚧 Vault AppRole auth
 
-## 🔄 持续集成
+## 🔄 CI Integration
 
-这些测试设计为可在CI/CD环境中运行：
+Designed to run inside CI/CD pipelines:
 
 ```yaml
-# GitHub Actions 示例
 - name: Run KMS E2E Tests
   run: |
-    # 安装依赖
     sudo apt-get update
     sudo apt-get install -y vault
     pip install awscurl
-    
-    # 构建并测试
+
     cargo build
     cd crates/e2e_test
     cargo test kms -- --nocapture --test-threads=1
 ```
 
-## 📚 相关文档
+## 📚 References
 
-- [KMS 配置文档](../../../../docs/kms/README.md) - KMS功能完整文档
-- [动态配置API](../../../../docs/kms/http-api.md) - REST API接口说明
-- [故障排除指南](../../../../docs/kms/troubleshooting.md) - 常见问题解决
+- [KMS configuration guide](../../../../docs/kms/README.md)
+- [Dynamic configuration API](../../../../docs/kms/http-api.md)
+- [Troubleshooting](../../../../docs/kms/troubleshooting.md)
 
 ---
 
-*这些测试确保KMS功能的稳定性和可靠性，为生产环境部署提供信心。*
+*These suites ensure KMS stability and reliability, building confidence for production deployments.*

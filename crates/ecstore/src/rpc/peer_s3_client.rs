@@ -536,7 +536,7 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
-        // errVolumeNotEmpty 不删除，把已经删除的重新创建
+        // For errVolumeNotEmpty, do not delete; recreate only the entries already removed
 
         for (idx, err) in errs.into_iter().enumerate() {
             if err.is_none() && recreate {

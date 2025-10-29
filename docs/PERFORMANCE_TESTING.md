@@ -1,139 +1,141 @@
-# RustFS 性能测试指南
+# RustFS Performance Testing Guide
 
-本文档提供了对 RustFS 进行性能测试和性能分析的完整方法和工具。
+This document describes the recommended tools and workflows for benchmarking RustFS and analyzing performance bottlenecks.
 
-## 概览
+## Overview
 
-RustFS 提供了多种性能测试和分析工具：
+RustFS exposes several complementary tooling options:
 
-1. **性能分析（Profiling）** - 使用内置的 pprof 接口收集 CPU 性能数据
-2. **负载测试（Load Testing）** - 使用多种客户端工具模拟高并发请求
-3. **监控和分析** - 查看性能指标和识别性能瓶颈
+1. **Profiling** – collect CPU samples through the built-in `pprof` endpoints.
+2. **Load testing** – drive concurrent requests with dedicated client utilities.
+3. **Monitoring and analysis** – inspect collected metrics to locate hotspots.
 
-## 前置条件
+## Prerequisites
 
-### 1. 启用性能分析
+### 1. Enable profiling support
 
-在启动 RustFS 时，需要设置环境变量启用性能分析功能：
+Set the profiling environment variable before launching RustFS:
 
 ```bash
 export RUSTFS_ENABLE_PROFILING=true
 ./rustfs
 ```
 
-### 2. 安装依赖工具
+### 2. Install required tooling
 
-确保系统中安装了以下工具：
+Make sure the following dependencies are available:
 
 ```bash
-# 基础工具
-curl       # HTTP 请求
-jq         # JSON 处理 (可选)
+# Base tools
+curl       # HTTP requests
+jq         # JSON processing (optional)
 
-# 分析工具
-go         # Go pprof 工具 (可选，用于 protobuf 格式)
-python3    # Python 负载测试脚本
+# Analysis tools
+go         # Go pprof CLI (optional, required for protobuf output)
+python3    # Python load-testing scripts
 
-# macOS 用户
+# macOS users
 brew install curl jq go python3
 
-# Ubuntu/Debian 用户  
+# Ubuntu/Debian users
 sudo apt-get install curl jq golang-go python3
 ```
 
-## 性能测试方法
+## Performance Testing Methods
 
-### 方法 1：使用专业脚本（推荐）
+### Method 1: Use the dedicated profiling script (recommended)
 
-项目提供了完整的性能分析脚本：
+The repository ships with a helper script for common profiling flows:
 
 ```bash
-# 查看脚本帮助
+# Show command help
 ./scripts/profile_rustfs.sh help
 
-# 检查性能分析状态
+# Check profiler status
 ./scripts/profile_rustfs.sh status
 
-# 收集火焰图（30秒）
+# Capture a 30 second flame graph
 ./scripts/profile_rustfs.sh flamegraph
 
-# 收集 protobuf 格式性能数据
+# Download protobuf-formatted samples
 ./scripts/profile_rustfs.sh protobuf
 
-# 收集两种格式的性能数据
+# Collect both formats
 ./scripts/profile_rustfs.sh both
 
-# 自定义参数
+# Provide custom arguments
 ./scripts/profile_rustfs.sh -d 60 -u http://192.168.1.100:9000 both
 ```
 
-### 方法 2：使用 Python 综合测试
+### Method 2: Run the Python end-to-end tester
 
-Python 脚本提供了负载测试和性能分析的一体化解决方案：
+A Python utility combines background load generation with profiling:
 
 ```bash
-# 运行综合性能分析
+# Launch the integrated test harness
 python3 test_load.py
 ```
 
-此脚本会：
-1. 启动后台负载测试（多线程 S3 操作）
-2. 并行收集性能分析数据
-3. 生成火焰图用于分析
+The script will:
 
-### 方法 3：使用简单负载测试
+1. Launch multi-threaded S3 operations as load.
+2. Pull profiling samples in parallel.
+3. Produce a flame graph for investigation.
 
-对于快速测试，可以使用 bash 脚本：
+### Method 3: Simple shell-based load test
+
+For quick smoke checks, a lightweight bash script is also provided:
 
 ```bash
-# 运行简单负载测试
+# Execute a lightweight benchmark
 ./simple_load_test.sh
 ```
 
-## 性能分析输出格式
+## Profiling Output Formats
 
-### 1. 火焰图（SVG 格式）
+### 1. Flame graph (SVG)
 
-- **用途**: 可视化 CPU 使用情况
-- **文件**: `rustfs_profile_TIMESTAMP.svg`
-- **查看方式**: 使用浏览器打开 SVG 文件
-- **分析要点**:
-  - 宽度表示 CPU 使用时间
-  - 高度表示调用栈深度
-  - 点击可以放大特定函数
+- **Purpose**: Visualize CPU time distribution.
+- **File name**: `rustfs_profile_TIMESTAMP.svg`
+- **How to view**: Open the SVG in a browser.
+- **Interpretation tips**:
+  - Width reflects CPU time per function.
+  - Height illustrates call-stack depth.
+  - Click to zoom into specific frames.
 
 ```bash
-# 在浏览器中打开
+# Example: open the file in a browser
 open profiles/rustfs_profile_20240911_143000.svg
 ```
 
-### 2. Protobuf 格式
+### 2. Protobuf samples
 
-- **用途**: 使用 Go pprof 工具进行详细分析
-- **文件**: `rustfs_profile_TIMESTAMP.pb` 
-- **分析工具**: `go tool pprof`
+- **Purpose**: Feed data to the `go tool pprof` command.
+- **File name**: `rustfs_profile_TIMESTAMP.pb`
+- **Tooling**: `go tool pprof`
 
 ```bash
-# 使用 Go pprof 分析
+# Analyze the protobuf output
 go tool pprof profiles/rustfs_profile_20240911_143000.pb
 
-# pprof 常用命令
-(pprof) top        # 显示 CPU 使用率最高的函数
-(pprof) list func  # 显示指定函数的源代码
-(pprof) web        # 生成 web 界面（需要 graphviz）
-(pprof) png        # 生成 PNG 图片
-(pprof) help       # 查看所有命令
+# Common pprof commands
+(pprof) top        # Show hottest call sites
+(pprof) list func  # Display annotated source for a function
+(pprof) web        # Launch the web UI (requires graphviz)
+(pprof) png        # Render a PNG flame chart
+(pprof) help       # List available commands
 ```
 
-## API 接口使用
+## API Usage
 
-### 检查性能分析状态
+### Check profiling status
 
 ```bash
 curl "http://127.0.0.1:9000/rustfs/admin/debug/pprof/status"
 ```
 
-返回示例：
+Sample response:
+
 ```json
 {
   "enabled": "true",
@@ -141,186 +143,187 @@ curl "http://127.0.0.1:9000/rustfs/admin/debug/pprof/status"
 }
 ```
 
-### 收集性能数据
+### Capture profiling data
 
 ```bash
-# 收集 30 秒的火焰图
+# Fetch a 30-second flame graph
 curl "http://127.0.0.1:9000/rustfs/admin/debug/pprof/profile?seconds=30&format=flamegraph" \
   -o profile.svg
 
-# 收集 protobuf 格式数据
+# Fetch protobuf output
 curl "http://127.0.0.1:9000/rustfs/admin/debug/pprof/profile?seconds=30&format=protobuf" \
   -o profile.pb
 ```
 
-**参数说明**:
-- `seconds`: 收集时长（1-300 秒）
-- `format`: 输出格式（`flamegraph`/`svg` 或 `protobuf`/`pb`）
+**Parameters**
+- `seconds`: Duration between 1 and 300 seconds.
+- `format`: Output format (`flamegraph`/`svg` or `protobuf`/`pb`).
 
-## 负载测试场景
+## Load Testing Scenarios
 
-### 1. S3 API 负载测试
+### 1. S3 API workload
 
-使用 Python 脚本进行完整的 S3 操作负载测试：
+Use the Python harness to exercise a complete S3 workflow:
 
 ```python
-# 基本配置
+# Basic configuration
 tester = S3LoadTester(
     endpoint="http://127.0.0.1:9000",
-    access_key="rustfsadmin", 
+    access_key="rustfsadmin",
     secret_key="rustfsadmin"
 )
 
-# 运行负载测试
-# 4 个线程，每个线程执行 10 次操作
+# Execute the load test
+# Four threads, ten operations each
 tester.run_load_test(num_threads=4, operations_per_thread=10)
 ```
 
-每次操作包括：
-1. 上传 1MB 对象
-2. 下载对象
-3. 删除对象
+Each iteration performs:
+1. Upload a 1 MB object.
+2. Download the object.
+3. Delete the object.
 
-### 2. 自定义负载测试
+### 2. Custom load scenarios
 
 ```bash
-# 创建测试桶
+# Create a test bucket
 curl -X PUT "http://127.0.0.1:9000/test-bucket"
 
-# 并发上传测试
+# Concurrent uploads
 for i in {1..10}; do
   echo "test data $i" | curl -X PUT "http://127.0.0.1:9000/test-bucket/object-$i" -d @- &
 done
 wait
 
-# 并发下载测试  
+# Concurrent downloads
 for i in {1..10}; do
   curl "http://127.0.0.1:9000/test-bucket/object-$i" > /dev/null &
 done
 wait
 ```
 
-## 性能分析最佳实践
+## Profiling Best Practices
 
-### 1. 测试环境准备
+### 1. Environment preparation
 
-- 确保 RustFS 已启用性能分析: `RUSTFS_ENABLE_PROFILING=true`
-- 使用独立的测试环境，避免其他程序干扰
-- 确保有足够的磁盘空间存储分析文件
+- Confirm that `RUSTFS_ENABLE_PROFILING=true` is set.
+- Use an isolated benchmark environment to avoid interference.
+- Reserve disk space for generated profile artifacts.
 
-### 2. 数据收集建议
+### 2. Data collection tips
 
-- **预热阶段**: 先运行 5-10 分钟的轻量负载
-- **数据收集**: 在稳定负载下收集 30-60 秒的性能数据
-- **多次采样**: 收集多个样本进行对比分析
+- **Warm-up**: Run a light workload for 5–10 minutes before sampling.
+- **Sampling window**: Capture 30–60 seconds under steady load.
+- **Multiple samples**: Take several runs to compare results.
 
-### 3. 分析重点
+### 3. Analysis focus areas
 
-在火焰图中重点关注：
+When inspecting flame graphs, pay attention to:
 
-1. **宽度最大的函数** - CPU 使用时间最长
-2. **平顶函数** - 可能的性能瓶颈
-3. **深度调用栈** - 可能的递归或复杂逻辑
-4. **意外的系统调用** - I/O 或内存分配问题
+1. **The widest frames** – most CPU time consumed.
+2. **Flat plateaus** – likely bottlenecks.
+3. **Deep call stacks** – recursion or complex logic.
+4. **Unexpected syscalls** – I/O stalls or allocation churn.
 
-### 4. 常见性能问题
+### 4. Common issues
 
-- **锁竞争**: 查找 `std::sync` 相关函数
-- **内存分配**: 查找 `alloc` 相关函数
-- **I/O 等待**: 查找文件系统或网络 I/O 函数
-- **序列化开销**: 查找 JSON/XML 解析函数
+- **Lock contention**: Investigate frames under `std::sync`.
+- **Memory allocation**: Search for `alloc`-related frames.
+- **I/O wait**: Review filesystem or network call stacks.
+- **Serialization overhead**: Look for JSON/XML parsing hotspots.
 
-## 故障排除
+## Troubleshooting
 
-### 1. 性能分析未启用
+### 1. Profiling disabled
 
-错误信息：`{"enabled":"false"}`
+Error: `{"enabled":"false"}`
 
-解决方案：
+**Fix**:
+
 ```bash
 export RUSTFS_ENABLE_PROFILING=true
-# 重启 RustFS
+# Restart RustFS
 ```
 
-### 2. 连接被拒绝
+### 2. Connection refused
 
-错误信息：`Connection refused`
+Error: `Connection refused`
 
-检查项：
-- RustFS 是否正在运行
-- 端口是否正确（默认 9000）
-- 防火墙设置
+**Checklist**:
+- Confirm RustFS is running.
+- Ensure the port number is correct (default 9000).
+- Verify firewall rules.
 
-### 3. 分析文件过大
+### 3. Oversized profile output
 
-如果生成的分析文件过大：
-- 减少收集时间（如 15-30 秒）
-- 降低负载测试的并发度
-- 使用 protobuf 格式而非 SVG
+If artifacts become too large:
+- Shorten the capture window (e.g., 15–30 seconds).
+- Reduce load-test concurrency.
+- Prefer protobuf output instead of SVG.
 
-## 配置参数
+## Configuration Parameters
 
-### 环境变量
+### Environment variables
 
-| 变量 | 默认值 | 描述 |
+| Variable | Default | Description |
 |------|--------|------|
-| `RUSTFS_ENABLE_PROFILING` | `false` | 启用性能分析 |
-| `RUSTFS_URL` | `http://127.0.0.1:9000` | RustFS 服务器地址 |
-| `PROFILE_DURATION` | `30` | 性能数据收集时长（秒） |
-| `OUTPUT_DIR` | `./profiles` | 输出文件目录 |
+| `RUSTFS_ENABLE_PROFILING` | `false` | Enable profiling support |
+| `RUSTFS_URL` | `http://127.0.0.1:9000` | RustFS endpoint |
+| `PROFILE_DURATION` | `30` | Profiling duration in seconds |
+| `OUTPUT_DIR` | `./profiles` | Output directory |
 
-### 脚本参数
+### Script arguments
 
 ```bash
 ./scripts/profile_rustfs.sh [OPTIONS] [COMMAND]
 
 OPTIONS:
   -u, --url URL           RustFS URL
-  -d, --duration SECONDS  Profile duration  
+  -d, --duration SECONDS  Profile duration
   -o, --output DIR        Output directory
 
 COMMANDS:
-  status      检查状态
-  flamegraph  收集火焰图
-  protobuf    收集 protobuf 数据
-  both        收集两种格式（默认）
+  status      Check profiler status
+  flamegraph  Collect a flame graph
+  protobuf    Collect protobuf samples
+  both        Collect both formats (default)
 ```
 
-## 输出文件位置
+## Output Locations
 
-- **脚本输出**: `./profiles/` 目录
-- **Python 脚本**: `/tmp/rustfs_profiles/` 目录
-- **文件命名**: `rustfs_profile_TIMESTAMP.{svg|pb}`
+- **Script output**: `./profiles/`
+- **Python script**: `/tmp/rustfs_profiles/`
+- **File naming**: `rustfs_profile_TIMESTAMP.{svg|pb}`
 
-## 示例工作流程
+## Example Workflow
 
-1. **启动 RustFS**:
+1. **Launch RustFS**
    ```bash
    RUSTFS_ENABLE_PROFILING=true ./rustfs
    ```
 
-2. **验证性能分析可用**:
+2. **Verify profiling availability**
    ```bash
    ./scripts/profile_rustfs.sh status
    ```
 
-3. **开始负载测试**:
+3. **Start a load test**
    ```bash
    python3 test_load.py &
    ```
 
-4. **收集性能数据**:
+4. **Collect samples**
    ```bash
    ./scripts/profile_rustfs.sh -d 60 both
    ```
 
-5. **分析结果**:
+5. **Inspect the results**
    ```bash
-   # 查看火焰图
+   # Review the flame graph
    open profiles/rustfs_profile_*.svg
-   
-   # 或使用 pprof 分析
+
+   # Or analyze the protobuf output
    go tool pprof profiles/rustfs_profile_*.pb
    ```
 
-通过这个完整的性能测试流程，你可以系统地分析 RustFS 的性能特征，识别瓶颈，并进行有针对性的优化。
+Following this workflow helps you understand RustFS performance characteristics, locate bottlenecks, and implement targeted optimizations.

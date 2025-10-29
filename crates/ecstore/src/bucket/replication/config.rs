@@ -46,7 +46,7 @@ pub trait ReplicationConfigurationExt {
 }
 
 impl ReplicationConfigurationExt for ReplicationConfiguration {
-    /// 检查是否有现有对象复制规则
+    /// Check whether any object-replication rules exist
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
         let mut has_arn = false;
 
@@ -117,7 +117,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         rules
     }
 
-    /// 获取目标配置
+    /// Retrieve the destination configuration
     fn get_destination(&self) -> Destination {
         if !self.rules.is_empty() {
             self.rules[0].destination.clone()
@@ -134,7 +134,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         }
     }
 
-    /// 判断对象是否应该被复制
+    /// Determine whether an object should be replicated
     fn replicate(&self, obj: &ObjectOpts) -> bool {
         let rules = self.filter_actionable_rules(obj);
 
@@ -164,16 +164,16 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 }
             }
 
-            // 常规对象/元数据复制
+            // Regular object/metadata replication
             return rule.metadata_replicate(obj);
         }
         false
     }
 
-    /// 检查是否有活跃的规则
-    /// 可选择性地提供前缀
-    /// 如果recursive为true，函数还会在前缀下的任何级别有活跃规则时返回true
-    /// 如果没有指定前缀，recursive实际上为true
+    /// Check for an active rule
+    /// Optionally accept a prefix
+    /// When recursive is true, return true if any level under the prefix has an active rule
+    /// Without a prefix, recursive behaves as true
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
         if self.rules.is_empty() {
             return false;
@@ -187,13 +187,13 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             if let Some(filter) = &rule.filter {
                 if let Some(filter_prefix) = &filter.prefix {
                     if !prefix.is_empty() && !filter_prefix.is_empty() {
-                        // 传入的前缀必须在规则前缀中
+                        // The provided prefix must fall within the rule prefix
                         if !recursive && !prefix.starts_with(filter_prefix) {
                             continue;
                         }
                     }
 
-                    // 如果是递归的，我们可以跳过这个规则，如果它不匹配测试前缀或前缀下的级别不匹配
+                    // When recursive, skip this rule if it does not match the test prefix or hierarchy
                     if recursive && !rule.prefix().starts_with(prefix) && !prefix.starts_with(rule.prefix()) {
                         continue;
                     }
@@ -204,7 +204,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
         false
     }
 
-    /// 过滤目标ARN，返回配置中不同目标ARN的切片
+    /// Filter target ARNs and return a slice of the distinct values in the config
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String> {
         let mut arns = Vec::new();
         let mut targets_map: HashSet<String> = HashSet::new();
@@ -216,7 +216,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             }
 
             if !self.role.is_empty() {
-                arns.push(self.role.clone()); // 如果存在，使用传统的RoleArn
+                arns.push(self.role.clone()); // Use the legacy RoleArn when present
                 return arns;
             }
 
