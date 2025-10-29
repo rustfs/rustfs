@@ -181,10 +181,10 @@ const-str = { version = "0.7.0", features = ["std", "proc"] }
 convert_case = "0.8.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
-datafusion = "50.2.0"
+datafusion = "50.3.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
-flate2 = "1.1.4"
+flate2 = "1.1.5"
 flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
 glob = "0.3.3"
 hashbrown = { version = "0.16.0", features = ["serde", "rayon"] }

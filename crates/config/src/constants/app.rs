@@ -24,9 +24,9 @@ pub const APP_NAME: &str = "RustFS";
 pub const VERSION: &str = "0.0.1";
 
 /// Default configuration logger level
-/// Default value: info
+/// Default value: error
 /// Environment variable: RUSTFS_LOG_LEVEL
-pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_LOG_LEVEL: &str = "error";
 
 /// Default configuration use stdout
 /// Default value: false
@@ -40,21 +40,12 @@ pub const SAMPLE_RATIO: f64 = 1.0;
 pub const METER_INTERVAL: u64 = 30;
 
 /// Default configuration service version
-/// Default value: 0.0.1
-pub const SERVICE_VERSION: &str = "0.0.1";
+/// Default value: 1.0.0
+pub const SERVICE_VERSION: &str = "1.0.0";
 
 /// Default configuration environment
 /// Default value: production
 pub const ENVIRONMENT: &str = "production";
-
-/// maximum number of connections
-/// This is the maximum number of connections that the server will accept.
-/// This is used to limit the number of connections to the server.
-pub const MAX_CONNECTIONS: usize = 100;
-/// timeout for connections
-/// This is the timeout for connections to the server.
-/// This is used to limit the time that a connection can be open.
-pub const DEFAULT_TIMEOUT_MS: u64 = 3000;
 
 /// Default Access Key
 /// Default value: rustfsadmin
@@ -154,6 +145,13 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 
+/// Default log local logging enabled for rustfs
+/// This is the default log local logging enabled for rustfs.
+/// It is used to enable or disable local logging of the application.
+/// Default value: false
+/// Environment variable: RUSTFS_OBS_LOCAL_LOGGING_ENABLED
+pub const DEFAULT_LOG_LOCAL_LOGGING_ENABLED: bool = false;
+
 /// 1 KiB
 pub const KI_B: usize = 1024;
 /// 1 MiB
@@ -178,7 +176,7 @@ mod tests {
     #[test]
     fn test_logging_constants() {
         // Test logging related constants
-        assert_eq!(DEFAULT_LOG_LEVEL, "info");
+        assert_eq!(DEFAULT_LOG_LEVEL, "error");
         assert!(
             ["trace", "debug", "info", "warn", "error"].contains(&DEFAULT_LOG_LEVEL),
             "Log level should be a valid tracing level"
@@ -197,14 +195,6 @@ mod tests {
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"
         );
-    }
-
-    #[test]
-    fn test_connection_constants() {
-        // Test connection related constants
-        assert_eq!(MAX_CONNECTIONS, 100);
-
-        assert_eq!(DEFAULT_TIMEOUT_MS, 3000);
     }
 
     #[test]

@@ -18,8 +18,8 @@ use rustfs_config::observability::{
     ENV_OBS_METER_INTERVAL, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
-    DEFAULT_OBS_LOG_FILENAME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_LOCAL_LOGGING_ENABLED, DEFAULT_LOG_ROTATION_SIZE_MB,
+    DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ impl OtelConfig {
             local_logging_enabled: env::var(ENV_OBS_LOCAL_LOGGING_ENABLED)
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(false)),
+                .or(Some(DEFAULT_LOG_LOCAL_LOGGING_ENABLED)),
             log_directory: Some(get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY)),
             log_filename: env::var(ENV_OBS_LOG_FILENAME)
                 .ok()
