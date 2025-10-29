@@ -139,10 +139,14 @@ observability. If you want to start redis as well as nginx container, you can sp
    make help-docker                      # Show all Docker-related commands
    ```
 
-4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console,
+4. **Build with helm chart(Option 4) - Cloud Native environment**
+
+   Following the instructions on [helm chart README](./helm/README.md) to install RustFS on kubernetes cluster.
+
+5. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console,
    default username and password is `rustfsadmin` .
-5. **Create a Bucket**: Use the console to create a new bucket for your objects.
-6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your
+6. **Create a Bucket**: Use the console to create a new bucket for your objects.
+7. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your
    RustFS instance.
 
 **NOTE**: If you want to access RustFS instance with `https`, you can refer
