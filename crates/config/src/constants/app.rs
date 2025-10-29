@@ -43,7 +43,7 @@ pub const METER_INTERVAL: u64 = 30;
 /// Default value: 1.0.0
 /// Environment variable: RUSTFS_OBS_SERVICE_VERSION
 /// Uses the same value as VERSION constant
-pub const SERVICE_VERSION: &str = VERSION;
+pub const SERVICE_VERSION: &str = "1.0.0";
 
 /// Default configuration environment
 /// Default value: production

@@ -40,7 +40,7 @@ use std::env;
 /// * `log_directory`: Log file directory
 /// * `log_filename`: The name of the log file
 /// * `log_rotation_size_mb`: Log file size cut threshold (MB)
-/// * `log_rotation_time`: Logs are cut by time (Hour， Day，Minute， Second)
+/// * `log_rotation_time`: Logs are cut by time (Hour,Day,Minute,Second)
 /// * `log_keep_files`: Number of log files to be retained
 /// # Returns
 /// A new instance of OtelConfig

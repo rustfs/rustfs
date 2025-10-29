@@ -92,7 +92,7 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
     let worker_threads = rustfs_utils::get_env_usize(rustfs_config::ENV_WORKER_THREADS, default_worker_threads);
     builder.worker_threads(worker_threads);
 
-    // Max blocking threads：Prioritize environment variables, otherwise the default value is dynamically calculated based on sysinfo
+    // Max blocking threads: Prioritize environment variables, otherwise the default value is dynamically calculated based on sysinfo
     let default_max_blocking_threads = compute_default_max_blocking_threads();
     let max_blocking_threads = rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_BLOCKING_THREADS, default_max_blocking_threads);
     builder.max_blocking_threads(max_blocking_threads);
