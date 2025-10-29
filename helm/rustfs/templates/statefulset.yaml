@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rustfs.fullname" . }}
+spec:
+  serviceName: {{ include "rustfs.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: {{ include "rustfs.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "rustfs.name" . }}
+    spec:
+      initContainers:
+        - name: init-step
+          image: busybox
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: REPLICA_COUNT
+              value: "{{ .Values.replicaCount }}"
+          command:
+            - sh
+            - -c
+            - |
+              if [ "$REPLICA_COUNT" -eq 4 ]; then
+                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+                  mkdir -p /data/rustfs$i
+                done;
+              elif [ "$REPLICA_COUNT" -eq 16 ]; then
+                mkdir -p /data
+              fi
+
+              chown -R 1000:1000 /data
+              chown -R 1000:1000 /logs
+          volumeMounts:
+            {{- if eq (int .Values.replicaCount) 4 }}
+            {{- range $i := until (int .Values.replicaCount) }}
+            - name: data-rustfs-{{ $i }}
+              mountPath: /data/rustfs{{ $i }}
+            {{- end }}
+            {{- else if eq (int .Values.replicaCount) 16 }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+            - name: logs
+              mountPath: /logs
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["/usr/bin/rustfs"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 1000
+          ports:
+            - containerPort: {{ .Values.service.ep_port }}
+              name: endpoint
+            - containerPort: {{ .Values.service.console_port }}
+              name: console
+          env:
+            - name: REPLICA_COUNT
+              value: "{{ .Values.replicaCount }}"
+          envFrom:
+            - configMapRef:
+                name: {{ include "rustfs.fullname" . }}-config
+            - secretRef:
+                name: {{ include "rustfs.fullname" . }}-secret
+          resources:
+            requests:
+              memory: {{ .Values.resources.requests.memory }}
+              cpu: {{ .Values.resources.requests.cpu }}
+            limits:
+              memory: {{ .Values.resources.limits.memory }}
+              cpu: {{ .Values.resources.limits.cpu }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            exec:
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: logs
+              mountPath: /logs
+            {{- if eq (int .Values.replicaCount) 4 }}
+            {{- range $i := until (int .Values.replicaCount) }}
+            - name: data-rustfs-{{ $i }}
+              mountPath: /data/rustfs{{ $i }}
+            {{- end }}
+            {{- else if eq (int .Values.replicaCount) 16 }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+      volumes:
+        - name: logs
+          emptyDir: {}
+  volumeClaimTemplates:
+  {{- if eq (int .Values.replicaCount) 4 }}
+  {{- range $i := until (int .Values.replicaCount) }}
+    - metadata:
+        name: data-rustfs-{{ $i }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.storageclass.name }}
+        resources:
+          requests:
+            storage: {{ $.Values.storageclass.size}}
+  {{- end }}
+  {{- else if eq (int .Values.replicaCount) 16 }}
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.storageclass.name }}
+        resources:
+          requests:
+            storage: {{ $.Values.storageclass.size}}
+  {{- end }}
