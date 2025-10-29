@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::config::OtelConfig;
-use crate::global::{IS_OBSERVABILITY_ENABLED, OBSERVABILITY_METER_NAME};
+use crate::global::IS_OBSERVABILITY_ENABLED;
 use flexi_logger::{
     Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
     WriteMode::{AsyncWith, BufferAndFlush},
@@ -313,7 +313,6 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
                 );
                 IS_OBSERVABILITY_ENABLED.set(true).ok();
-                OBSERVABILITY_METER_NAME.set(service_name.to_string()).ok();
             }
         }
         counter!("rustfs.start.total").increment(1);

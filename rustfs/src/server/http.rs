@@ -29,7 +29,6 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
@@ -220,21 +219,6 @@ pub async fn start_http_server(
 
         b.build()
     };
-
-    // Server will be created per connection - this ensures isolation
-    tokio::spawn(async move {
-        // Record the PID-related metrics of the current process
-        let meter = opentelemetry::global::meter("system");
-        let obs_result = SystemObserver::init_process_observer(meter).await;
-        match obs_result {
-            Ok(_) => {
-                info!("Process observer initialized successfully");
-            }
-            Err(e) => {
-                error!("Failed to initialize process observer: {}", e);
-            }
-        }
-    });
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);

@@ -34,7 +34,7 @@ fn compute_default_thread_stack_size() -> usize {
 
 #[inline]
 fn detect_cores() -> usize {
-    // Priority physical kernels, fallback logic cores, minimum 1
+    // Priority physical cores, fallback logic cores, minimum 1
     let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
     sys.refresh_cpu_all();
     sys.cpus().len()

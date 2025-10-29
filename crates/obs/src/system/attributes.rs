@@ -16,10 +16,10 @@ use crate::GlobalError;
 use opentelemetry::KeyValue;
 use sysinfo::{Pid, System};
 
-pub const PROCESS_PID: opentelemetry::Key = opentelemetry::Key::from_static_str("process.pid");
-pub const PROCESS_EXECUTABLE_NAME: opentelemetry::Key = opentelemetry::Key::from_static_str("process.executable.name");
-pub const PROCESS_EXECUTABLE_PATH: opentelemetry::Key = opentelemetry::Key::from_static_str("process.executable.path");
-pub const PROCESS_COMMAND: opentelemetry::Key = opentelemetry::Key::from_static_str("process.command");
+pub(crate) const PROCESS_PID: opentelemetry::Key = opentelemetry::Key::from_static_str("process.pid");
+pub(crate) const PROCESS_EXECUTABLE_NAME: opentelemetry::Key = opentelemetry::Key::from_static_str("process.executable.name");
+pub(crate) const PROCESS_EXECUTABLE_PATH: opentelemetry::Key = opentelemetry::Key::from_static_str("process.executable.path");
+pub(crate) const PROCESS_COMMAND: opentelemetry::Key = opentelemetry::Key::from_static_str("process.command");
 
 /// Struct to hold process attributes
 pub struct ProcessAttributes {

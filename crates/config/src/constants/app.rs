@@ -154,9 +154,11 @@ pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 /// Environment variable: RUSTFS_OBS_LOCAL_LOGGING_ENABLED
 pub const DEFAULT_LOG_LOCAL_LOGGING_ENABLED: bool = false;
 
-/// 1 KiB
+/// Constant representing 1 Kibibyte (1024 bytes)
+/// Default value: 1024
 pub const KI_B: usize = 1024;
-/// 1 MiB
+/// Constant representing 1 Mebibyte (1024 * 1024 bytes)
+/// Default value: 1048576
 pub const MI_B: usize = 1024 * 1024;
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 //! provides tools for system and service monitoring
 //!
 //! ## feature mark
-//!
+//! - `default`: default monitoring function
 //! - `gpu`: gpu monitoring function
 //! - `full`: includes all functions
 //!
