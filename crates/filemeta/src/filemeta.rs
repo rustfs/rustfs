@@ -2724,7 +2724,11 @@ mod test {
 
         // Verify basic properties
         assert_eq!(fm.meta_ver, XL_META_VERSION);
-        assert_eq!(fm.versions.len(), 3, "Should have three versions (one object, one delete marker, one Legacy)");
+        assert_eq!(
+            fm.versions.len(),
+            3,
+            "Should have three versions (one object, one delete marker, one Legacy)"
+        );
 
         // Verify version types
         let mut object_count = 0;

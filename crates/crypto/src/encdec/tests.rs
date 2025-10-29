@@ -226,7 +226,7 @@ fn test_password_variations() -> Result<(), crate::Error> {
         b"12345".as_slice(),            // Numeric
         b"!@#$%^&*()".as_slice(),       // Special characters
         b"\x00\x01\x02\x03".as_slice(), // Binary password
-        "пароль тест".as_bytes(),          // Unicode password
+        "пароль тест".as_bytes(),       // Unicode password
         &[0xFF; 64],                    // Long binary password
     ];
 
