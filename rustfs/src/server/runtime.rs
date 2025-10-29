@@ -17,7 +17,7 @@ use sysinfo::{RefreshKind, System};
 
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
-    // Baseline：Release 1 MiB，Debug 2 MiB；macOS at least 2 MiB
+    // Baseline: Release 1 MiB，Debug 2 MiB；macOS at least 2 MiB
     #[cfg(debug_assertions)]
     let mut size = 2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE;
     #[cfg(not(debug_assertions))]
@@ -37,7 +37,7 @@ fn detect_cores() -> usize {
     // Priority physical cores, fallback logic cores, minimum 1
     let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
     sys.refresh_cpu_all();
-    sys.cpus().len()
+    sys.cpus().len().max(1)
 }
 
 #[inline]

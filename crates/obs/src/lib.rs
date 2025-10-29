@@ -47,6 +47,6 @@ mod metrics;
 mod system;
 mod telemetry;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, OtelConfig};
 pub use global::*;
 pub use system::SystemObserver;
