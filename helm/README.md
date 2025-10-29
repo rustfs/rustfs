@@ -9,9 +9,9 @@ You can use this helm chart to deploy rustfs on k8s cluster.
 | replicaCount   | Number of cluster nodes.   |  Default is `4`. |
 | image.repository  | docker image repository.   |  rustfs/rustfs.  |
 | image.tag | the tag for rustfs docker image | "latest" |
-| secret.rustfs.access_key | RustFS Acccess Key ID | `rustfsadmin` |
+| secret.rustfs.access_key | RustFS Access Key ID | `rustfsadmin` |
 | secret.rustfs.secret_key | RustFS Secret Key ID | `rustfsadmin` |
-| storageclass.name | The name for StroageClass. | `local-path` |
+| storageclass.name | The name for StorageClass. | `local-path` |
 | ingress.className | Specify the ingress class, traefik or nginx. | `nginx` |
 
 
@@ -41,7 +41,7 @@ If your ingress class is `nginx`, running the command:
 helm install rustfs -n rustfs --create-namespace ./ --set ingress.className="nginx"
 ```
 
-> `traefik` or `nginx`, the different is the session sticky/affinity annoations.
+> `traefik` or `nginx`, the different is the session sticky/affinity annotations.
 
 Check the pod status
 
