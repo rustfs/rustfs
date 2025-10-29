@@ -203,7 +203,7 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     }
 
     if let Some(parent) = dir_path.as_ref().parent() {
-        // 不支持递归，直接 create_dir_all 了
+        // Without recursion support, fall back to create_dir_all
         if let Err(e) = super::fs::make_dir_all(&parent).await {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 return Ok(());

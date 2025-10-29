@@ -620,7 +620,7 @@ mod test {
         assert!(!is_socket_addr(&long_string));
 
         // Test unicode characters
-        assert!(!is_socket_addr("测试.example.com"));
+        assert!(!is_socket_addr("пример.example.com"));
 
         // Test special characters
         assert!(!is_socket_addr("test@example.com:8080"));

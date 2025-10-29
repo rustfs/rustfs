@@ -58,7 +58,7 @@ impl Clone for ReedSolomonEncoder {
         Self {
             data_shards: self.data_shards,
             parity_shards: self.parity_shards,
-            // 为新实例创建空的缓存，不共享缓存
+            // Create an empty cache for the new instance instead of sharing one
             encoder_cache: std::sync::RwLock::new(None),
             decoder_cache: std::sync::RwLock::new(None),
         }
@@ -947,7 +947,7 @@ mod tests {
             let block_size = 1024 * 1024; // 1MB block size
             let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
-            // 创建2MB的测试数据，这样可以测试多个1MB块的处理
+            // Build 2 MB of test data so multiple 1 MB chunks are exercised
             let mut data = Vec::with_capacity(2 * 1024 * 1024);
             for i in 0..(2 * 1024 * 1024) {
                 data.push((i % 256) as u8);
@@ -961,7 +961,7 @@ mod tests {
                 data.len() / 1024
             );
 
-            // 编码数据
+            // Encode the data
             let start = std::time::Instant::now();
             let shards = erasure.encode_data(&data).unwrap();
             let encode_duration = start.elapsed();

@@ -727,14 +727,14 @@ mod tests {
                 assert_eq!(final_data.len() as i64, actual_size);
                 assert_eq!(&final_data, &data);
             } else {
-                // 如果没有压缩，直接比较解密后的数据
+                // Without compression we can compare the decrypted bytes directly
                 assert_eq!(decrypted_data.len() as i64, actual_size);
                 assert_eq!(&decrypted_data, &data);
             }
             return;
         }
 
-        // 如果不加密，直接处理压缩/解压缩
+        // When encryption is disabled, only handle compression/decompression
         if is_compress {
             let decompress_reader =
                 DecompressReader::new(WarpReader::new(Cursor::new(compressed_data)), CompressionAlgorithm::Gzip);
@@ -749,7 +749,7 @@ mod tests {
             assert_eq!(&compressed_data, &data);
         }
 
-        // 验证 etag（注意：压缩会改变数据，所以这里的 etag 验证可能需要调整）
+        // Validate the etag (compression alters the payload, so this may require adjustments)
         println!("Test completed successfully with compression: {is_compress}, encryption: {is_encrypt}");
     }
 
