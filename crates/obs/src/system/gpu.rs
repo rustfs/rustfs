@@ -12,29 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "gpu")]
 use crate::GlobalError;
-#[cfg(feature = "gpu")]
 use crate::system::attributes::ProcessAttributes;
-#[cfg(feature = "gpu")]
 use crate::system::metrics::Metrics;
-#[cfg(feature = "gpu")]
 use nvml_wrapper::Nvml;
-#[cfg(feature = "gpu")]
 use nvml_wrapper::enums::device::UsedGpuMemory;
-#[cfg(feature = "gpu")]
 use sysinfo::Pid;
-#[cfg(feature = "gpu")]
 use tracing::warn;
 
 /// `GpuCollector` is responsible for collecting GPU memory usage metrics.
-#[cfg(feature = "gpu")]
 pub struct GpuCollector {
     nvml: Nvml,
     pid: Pid,
 }
 
-#[cfg(feature = "gpu")]
 impl GpuCollector {
     pub fn new(pid: Pid) -> Result<Self, GlobalError> {
         let nvml = Nvml::init().map_err(|e| GlobalError::GpuInitError(e.to_string()))?;
@@ -61,24 +52,6 @@ impl GpuCollector {
             return Err(GlobalError::GpuDeviceError("No GPU device found".to_string()));
         }
         metrics.gpu_memory_usage.record(0, &attributes.attributes);
-        Ok(())
-    }
-}
-
-#[cfg(not(feature = "gpu"))]
-pub struct GpuCollector;
-
-#[cfg(not(feature = "gpu"))]
-impl GpuCollector {
-    pub fn new(_pid: sysinfo::Pid) -> Result<Self, crate::GlobalError> {
-        Ok(GpuCollector)
-    }
-
-    pub fn collect(
-        &self,
-        _metrics: &crate::system::metrics::Metrics,
-        _attributes: &crate::system::attributes::ProcessAttributes,
-    ) -> Result<(), crate::GlobalError> {
         Ok(())
     }
 }

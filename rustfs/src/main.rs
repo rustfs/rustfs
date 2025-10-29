@@ -97,25 +97,9 @@ fn print_server_info() {
 }
 
 fn main() -> Result<()> {
-    let mut builder = server::get_tokio_runtime_builder();
-    builder.enable_all();
-    if server::print_tokio_thread_enable() {
-        builder.on_thread_start(|| {
-            println!(
-                "RustFS Worker Thread running - initializing resources time: {:?}, thread id: {:?}",
-                chrono::Utc::now().to_rfc3339(),
-                std::thread::current().id()
-            );
-        });
-        builder.on_thread_stop(|| {
-            println!(
-                "RustFS Worker Thread stopping - cleaning up resources time: {:?}, thread id: {:?}",
-                chrono::Utc::now().to_rfc3339(),
-                std::thread::current().id()
-            )
-        });
-    }
-    let runtime = builder.build().expect("Failed to build Tokio runtime");
+    let runtime = server::get_tokio_runtime_builder()
+        .build()
+        .expect("Failed to build Tokio runtime");
     runtime.block_on(async_main())
 }
 async fn async_main() -> Result<()> {
