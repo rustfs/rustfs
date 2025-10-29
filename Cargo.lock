@@ -6708,6 +6708,7 @@ dependencies = [
  "shadow-rs",
  "socket2 0.6.1",
  "sysctl",
+ "sysinfo",
  "thiserror 2.0.17",
  "tikv-jemallocator",
  "time",
@@ -8468,6 +8469,7 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "objc2-io-kit",
+ "rayon",
  "windows",
 ]
 

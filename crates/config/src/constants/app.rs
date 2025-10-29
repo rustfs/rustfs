@@ -169,9 +169,9 @@ mod tests {
         assert_eq!(APP_NAME, "RustFS");
         assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
 
-        assert_eq!(VERSION, "0.0.1");
+        assert_eq!(VERSION, "1.0.0");
 
-        assert_eq!(SERVICE_VERSION, "0.0.1");
+        assert_eq!(SERVICE_VERSION, "1.0.0");
         assert_eq!(VERSION, SERVICE_VERSION, "Version and service version should be consistent");
     }
 
@@ -301,8 +301,8 @@ mod tests {
         // assert!(DEFAULT_TIMEOUT_MS < u64::MAX, "Timeout should be reasonable");
 
         // These are const non-zero values, so zero checks are redundant
-        // assert!(DEFAULT_PORT != 0, "Default port should not be zero");
-        // assert!(DEFAULT_CONSOLE_PORT != 0, "Console port should not be zero");
+        assert_ne!(DEFAULT_PORT, 0, "Default port should not be zero");
+        assert_ne!(DEFAULT_CONSOLE_PORT, 0, "Console port should not be zero");
     }
 
     #[test]
