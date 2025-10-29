@@ -21,7 +21,7 @@ pub const APP_NAME: &str = "RustFS";
 /// Application version
 /// Default value: 1.0.0
 /// Environment variable: RUSTFS_VERSION
-pub const VERSION: &str = "0.0.1";
+pub const VERSION: &str = "1.0.0";
 
 /// Default configuration logger level
 /// Default value: error
@@ -41,7 +41,9 @@ pub const METER_INTERVAL: u64 = 30;
 
 /// Default configuration service version
 /// Default value: 1.0.0
-pub const SERVICE_VERSION: &str = "1.0.0";
+/// Environment variable: RUSTFS_OBS_SERVICE_VERSION
+/// Uses the same value as VERSION constant
+pub const SERVICE_VERSION: &str = VERSION;
 
 /// Default configuration environment
 /// Default value: production
