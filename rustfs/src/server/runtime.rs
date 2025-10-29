@@ -18,18 +18,20 @@ use sysinfo::{RefreshKind, System};
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
     // Baseline: Release 1 MiB，Debug 2 MiB；macOS at least 2 MiB
-    #[cfg(debug_assertions)]
-    let mut size = 2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE;
-    #[cfg(not(debug_assertions))]
-    let mut size = 1 * rustfs_config::DEFAULT_THREAD_STACK_SIZE;
-
     // macOS is more conservative: many system libraries and backtracking are more "stack-eating"
-    #[cfg(target_os = "macos")]
+    #[cfg(debug_assertions)]
     {
-        size = size.max(2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE);
+        2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
     }
 
-    size
+    #[cfg(not(debug_assertions))]
+    {
+        #[cfg(target_os = "macos")]
+        {
+            return 2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE;
+        }
+        rustfs_config::DEFAULT_THREAD_STACK_SIZE
+    }
 }
 
 #[inline]
