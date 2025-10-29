@@ -547,9 +547,9 @@ pub async fn test_multipart_upload_with_config(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let total_size = config.total_size();
 
-    info!("🧪 开始分片上传测试 - {:?}", config.encryption_type);
+    info!("🧪 Starting multipart upload test - {:?}", config.encryption_type);
     info!(
-        "   对象: {}, 分片: {}个, 每片: {}MB, 总计: {}MB",
+        "   Object: {}, parts: {}, part size: {} MB, total: {} MB",
         config.object_key,
         config.total_parts,
         config.part_size / (1024 * 1024),
@@ -589,7 +589,7 @@ pub async fn test_multipart_upload_with_config(
 
     let create_multipart_output = create_request.send().await?;
     let upload_id = create_multipart_output.upload_id().unwrap();
-    info!("📋 创建分片上传，ID: {}", upload_id);
+    info!("📋 Created multipart upload, ID: {}", upload_id);
 
     // Step 2: Upload parts
     let mut completed_parts = Vec::new();
@@ -598,7 +598,7 @@ pub async fn test_multipart_upload_with_config(
         let end = std::cmp::min(start + config.part_size, total_size);
         let part_data = &test_data[start..end];
 
-        info!("📤 上传分片 {} ({:.2}MB)", part_number, part_data.len() as f64 / (1024.0 * 1024.0));
+        info!("📤 Uploading part {} ({:.2} MB)", part_number, part_data.len() as f64 / (1024.0 * 1024.0));
 
         let mut upload_request = s3_client
             .upload_part()
@@ -625,7 +625,7 @@ pub async fn test_multipart_upload_with_config(
                 .build(),
         );
 
-        debug!("分片 {} 上传完成，ETag: {}", part_number, etag);
+        debug!("Part {} uploaded with ETag {}", part_number, etag);
     }
 
     // Step 3: Complete multipart upload
@@ -633,7 +633,7 @@ pub async fn test_multipart_upload_with_config(
         .set_parts(Some(completed_parts))
         .build();
 
-    info!("🔗 完成分片上传");
+    info!("🔗 Completing multipart upload");
     let complete_output = s3_client
         .complete_multipart_upload()
         .bucket(bucket)
@@ -643,10 +643,10 @@ pub async fn test_multipart_upload_with_config(
         .send()
         .await?;
 
-    debug!("完成分片上传，ETag: {:?}", complete_output.e_tag());
+    debug!("Multipart upload finalized with ETag {:?}", complete_output.e_tag());
 
     // Step 4: Download and verify
-    info!("📥 下载文件并验证");
+    info!("📥 Downloading object for verification");
     let mut get_request = s3_client.get_object().bucket(bucket).key(&config.object_key);
 
     // Add encryption headers for SSE-C GET
@@ -680,7 +680,7 @@ pub async fn test_multipart_upload_with_config(
     assert_eq!(downloaded_data.len(), total_size);
     assert_eq!(&downloaded_data[..], &test_data[..]);
 
-    info!("✅ 分片上传测试通过 - {:?}", config.encryption_type);
+    info!("✅ Multipart upload test passed - {:?}", config.encryption_type);
     Ok(())
 }
 
@@ -700,7 +700,7 @@ pub async fn test_all_multipart_encryption_types(
     bucket: &str,
     base_object_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("🧪 测试所有加密类型的分片上传");
+    info!("🧪 Testing multipart uploads for every encryption type");
 
     let part_size = 5 * 1024 * 1024; // 5MB per part
     let total_parts = 2;
@@ -718,7 +718,7 @@ pub async fn test_all_multipart_encryption_types(
         test_multipart_upload_with_config(s3_client, bucket, &config).await?;
     }
 
-    info!("✅ 所有加密类型的分片上传测试通过");
+    info!("✅ Multipart uploads succeeded for every encryption type");
     Ok(())
 }
 

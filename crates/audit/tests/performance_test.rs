@@ -94,7 +94,7 @@ async fn test_audit_log_dispatch_performance() {
     let start_result = system.start(config).await;
     if start_result.is_err() {
         println!("AuditSystem failed to start: {start_result:?}");
-        return; // 或 assert!(false, "AuditSystem failed to start");
+        return; // Alternatively: assert!(false, "AuditSystem failed to start");
     }
 
     use chrono::Utc;

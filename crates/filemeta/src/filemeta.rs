@@ -2712,21 +2712,25 @@ mod test {
 
     #[test]
     fn test_real_xlmeta_compatibility() {
-        // 测试真实的 xl.meta 文件格式兼容性
-        let data = create_real_xlmeta().expect("创建真实测试数据失败");
+        // Test compatibility with real xl.meta formats
+        let data = create_real_xlmeta().expect("Failed to create realistic test data");
 
-        // 验证文件头
-        assert_eq!(&data[0..4], b"XL2 ", "文件头应该是 'XL2 '");
-        assert_eq!(&data[4..8], &[1, 0, 3, 0], "版本号应该是 1.3.0");
+        // Verify the file header
+        assert_eq!(&data[0..4], b"XL2 ", "File header should be 'XL2 '");
+        assert_eq!(&data[4..8], &[1, 0, 3, 0], "Version number should be 1.3.0");
 
-        // 解析元数据
-        let fm = FileMeta::load(&data).expect("解析真实数据失败");
+        // Parse metadata
+        let fm = FileMeta::load(&data).expect("Failed to parse realistic data");
 
-        // 验证基本属性
+        // Verify basic properties
         assert_eq!(fm.meta_ver, XL_META_VERSION);
-        assert_eq!(fm.versions.len(), 3, "应该有 3 个版本（1 个对象，1 个删除标记，1 个 Legacy）");
+        assert_eq!(
+            fm.versions.len(),
+            3,
+            "Should have three versions (one object, one delete marker, one Legacy)"
+        );
 
-        // 验证版本类型
+        // Verify version types
         let mut object_count = 0;
         let mut delete_count = 0;
         let mut legacy_count = 0;
@@ -2736,21 +2740,21 @@ mod test {
                 VersionType::Object => object_count += 1,
                 VersionType::Delete => delete_count += 1,
                 VersionType::Legacy => legacy_count += 1,
-                VersionType::Invalid => panic!("不应该有无效版本"),
+                VersionType::Invalid => panic!("No invalid versions should be present"),
             }
         }
 
-        assert_eq!(object_count, 1, "应该有 1 个对象版本");
-        assert_eq!(delete_count, 1, "应该有 1 个删除标记");
-        assert_eq!(legacy_count, 1, "应该有 1 个 Legacy 版本");
+        assert_eq!(object_count, 1, "Should have one object version");
+        assert_eq!(delete_count, 1, "Should have one delete marker");
+        assert_eq!(legacy_count, 1, "Should have one Legacy version");
 
-        // 验证兼容性
-        assert!(fm.is_compatible_with_meta(), "应该与 xl 格式兼容");
+        // Verify compatibility
+        assert!(fm.is_compatible_with_meta(), "Should be compatible with the xl format");
 
-        // 验证完整性
-        fm.validate_integrity().expect("完整性验证失败");
+        // Verify integrity
+        fm.validate_integrity().expect("Integrity validation failed");
 
-        // 验证版本统计
+        // Verify version statistics
         let stats = fm.get_version_stats();
         assert_eq!(stats.total_versions, 3);
         assert_eq!(stats.object_versions, 1);
@@ -2760,61 +2764,61 @@ mod test {
 
     #[test]
     fn test_complex_xlmeta_handling() {
-        // 测试复杂的多版本 xl.meta 文件
-        let data = create_complex_xlmeta().expect("创建复杂测试数据失败");
-        let fm = FileMeta::load(&data).expect("解析复杂数据失败");
+        // Test complex xl.meta files with many versions
+        let data = create_complex_xlmeta().expect("Failed to create complex test data");
+        let fm = FileMeta::load(&data).expect("Failed to parse complex data");
 
-        // 验证版本数量
-        assert!(fm.versions.len() >= 10, "应该有至少 10 个版本");
+        // Verify version count
+        assert!(fm.versions.len() >= 10, "Should have at least 10 versions");
 
-        // 验证版本排序
-        assert!(fm.is_sorted_by_mod_time(), "版本应该按修改时间排序");
+        // Verify version ordering
+        assert!(fm.is_sorted_by_mod_time(), "Versions should be sorted by modification time");
 
-        // 验证不同版本类型的存在
+        // Verify presence of different version types
         let stats = fm.get_version_stats();
-        assert!(stats.object_versions > 0, "应该有对象版本");
-        assert!(stats.delete_markers > 0, "应该有删除标记");
+        assert!(stats.object_versions > 0, "Should include object versions");
+        assert!(stats.delete_markers > 0, "Should include delete markers");
 
-        // 测试版本合并功能
+        // Test version merge functionality
         let merged = merge_file_meta_versions(1, false, 0, std::slice::from_ref(&fm.versions));
-        assert!(!merged.is_empty(), "合并后应该有版本");
+        assert!(!merged.is_empty(), "Merged output should contain versions");
     }
 
     #[test]
     fn test_inline_data_handling() {
-        // 测试内联数据处理
-        let data = create_xlmeta_with_inline_data().expect("创建内联数据测试失败");
-        let fm = FileMeta::load(&data).expect("解析内联数据失败");
+        // Test inline data handling
+        let data = create_xlmeta_with_inline_data().expect("Failed to create inline test data");
+        let fm = FileMeta::load(&data).expect("Failed to parse inline data");
 
-        assert_eq!(fm.versions.len(), 1, "应该有 1 个版本");
-        assert!(!fm.data.as_slice().is_empty(), "应该包含内联数据");
+        assert_eq!(fm.versions.len(), 1, "Should have one version");
+        assert!(!fm.data.as_slice().is_empty(), "Should contain inline data");
 
-        // 验证内联数据内容
+        // Verify inline data contents
         let inline_data = fm.data.as_slice();
-        assert!(!inline_data.is_empty(), "内联数据不应为空");
+        assert!(!inline_data.is_empty(), "Inline data should not be empty");
     }
 
     #[test]
     fn test_error_handling_and_recovery() {
-        // 测试错误处理和恢复
+        // Test error handling and recovery
         let corrupted_data = create_corrupted_xlmeta();
         let result = FileMeta::load(&corrupted_data);
-        assert!(result.is_err(), "损坏的数据应该解析失败");
+        assert!(result.is_err(), "Corrupted data should fail to parse");
 
-        // 测试空文件处理
-        let empty_data = create_empty_xlmeta().expect("创建空数据失败");
-        let fm = FileMeta::load(&empty_data).expect("解析空数据失败");
-        assert_eq!(fm.versions.len(), 0, "空文件应该没有版本");
+        // Test handling of empty files
+        let empty_data = create_empty_xlmeta().expect("Failed to create empty test data");
+        let fm = FileMeta::load(&empty_data).expect("Failed to parse empty data");
+        assert_eq!(fm.versions.len(), 0, "An empty file should have no versions");
     }
 
     #[test]
     fn test_version_type_legacy_support() {
-        // 专门测试 Legacy 版本类型支持
+        // Validate support for Legacy version types
         assert_eq!(VersionType::Legacy.to_u8(), 3);
         assert_eq!(VersionType::from_u8(3), VersionType::Legacy);
-        assert!(VersionType::Legacy.valid(), "Legacy 类型应该是有效的");
+        assert!(VersionType::Legacy.valid(), "Legacy type should be valid");
 
-        // 测试 Legacy 版本的创建和处理
+        // Exercise creation and handling of Legacy versions
         let legacy_version = FileMetaVersion {
             version_type: VersionType::Legacy,
             object: None,
@@ -2822,101 +2826,101 @@ mod test {
             write_version: 1,
         };
 
-        assert!(legacy_version.is_legacy(), "应该识别为 Legacy 版本");
+        assert!(legacy_version.is_legacy(), "Should be recognized as a Legacy version");
     }
 
     #[test]
     fn test_signature_calculation() {
-        // 测试签名计算功能
-        let data = create_real_xlmeta().expect("创建测试数据失败");
-        let fm = FileMeta::load(&data).expect("解析失败");
+        // Test signature calculation
+        let data = create_real_xlmeta().expect("Failed to create test data");
+        let fm = FileMeta::load(&data).expect("Parsing failed");
 
         for version in &fm.versions {
             let signature = version.header.get_signature();
-            assert_eq!(signature.len(), 4, "签名应该是 4 字节");
+            assert_eq!(signature.len(), 4, "Signature should be 4 bytes");
 
-            // 验证相同版本的签名一致性
+            // Verify signature consistency for identical versions
             let signature2 = version.header.get_signature();
-            assert_eq!(signature, signature2, "相同版本的签名应该一致");
+            assert_eq!(signature, signature2, "Identical versions should produce identical signatures");
         }
     }
 
     #[test]
     fn test_metadata_validation() {
-        // 测试元数据验证功能
-        let data = create_real_xlmeta().expect("创建测试数据失败");
-        let fm = FileMeta::load(&data).expect("解析失败");
+        // Test metadata validation
+        let data = create_real_xlmeta().expect("Failed to create test data");
+        let fm = FileMeta::load(&data).expect("Parsing failed");
 
-        // 测试完整性验证
-        fm.validate_integrity().expect("完整性验证应该通过");
+        // Test integrity validation
+        fm.validate_integrity().expect("Integrity validation should succeed");
 
-        // 测试兼容性检查
-        assert!(fm.is_compatible_with_meta(), "应该与 xl 格式兼容");
+        // Test compatibility checks
+        assert!(fm.is_compatible_with_meta(), "Should be compatible with the xl format");
 
-        // 测试版本排序检查
-        assert!(fm.is_sorted_by_mod_time(), "版本应该按时间排序");
+        // Test version ordering checks
+        assert!(fm.is_sorted_by_mod_time(), "Versions should be time-ordered");
     }
 
     #[test]
     fn test_round_trip_serialization() {
-        // 测试序列化和反序列化的往返一致性
-        let original_data = create_real_xlmeta().expect("创建原始数据失败");
-        let fm = FileMeta::load(&original_data).expect("解析原始数据失败");
+        // Test round-trip serialization consistency
+        let original_data = create_real_xlmeta().expect("Failed to create original test data");
+        let fm = FileMeta::load(&original_data).expect("Failed to parse original data");
 
-        // 重新序列化
-        let serialized_data = fm.marshal_msg().expect("重新序列化失败");
+        // Serialize again
+        let serialized_data = fm.marshal_msg().expect("Re-serialization failed");
 
-        // 再次解析
-        let fm2 = FileMeta::load(&serialized_data).expect("解析序列化数据失败");
+        // Parse again
+        let fm2 = FileMeta::load(&serialized_data).expect("Failed to parse serialized data");
 
-        // 验证一致性
-        assert_eq!(fm.versions.len(), fm2.versions.len(), "版本数量应该一致");
-        assert_eq!(fm.meta_ver, fm2.meta_ver, "元数据版本应该一致");
+        // Verify consistency
+        assert_eq!(fm.versions.len(), fm2.versions.len(), "Version counts should match");
+        assert_eq!(fm.meta_ver, fm2.meta_ver, "Metadata versions should match");
 
-        // 验证版本内容一致性
+        // Verify version content consistency
         for (v1, v2) in fm.versions.iter().zip(fm2.versions.iter()) {
-            assert_eq!(v1.header.version_type, v2.header.version_type, "版本类型应该一致");
-            assert_eq!(v1.header.version_id, v2.header.version_id, "版本 ID 应该一致");
+            assert_eq!(v1.header.version_type, v2.header.version_type, "Version types should match");
+            assert_eq!(v1.header.version_id, v2.header.version_id, "Version IDs should match");
         }
     }
 
     #[test]
     fn test_performance_with_large_metadata() {
-        // 测试大型元数据文件的性能
+        // Test performance with large metadata files
         use std::time::Instant;
 
         let start = Instant::now();
-        let data = create_complex_xlmeta().expect("创建大型测试数据失败");
+        let data = create_complex_xlmeta().expect("Failed to create large test data");
         let creation_time = start.elapsed();
 
         let start = Instant::now();
-        let fm = FileMeta::load(&data).expect("解析大型数据失败");
+        let fm = FileMeta::load(&data).expect("Failed to parse large data");
         let parsing_time = start.elapsed();
 
         let start = Instant::now();
-        let _serialized = fm.marshal_msg().expect("序列化失败");
+        let _serialized = fm.marshal_msg().expect("Serialization failed");
         let serialization_time = start.elapsed();
 
-        println!("性能测试结果：");
-        println!("  创建时间：{creation_time:?}");
-        println!("  解析时间：{parsing_time:?}");
-        println!("  序列化时间：{serialization_time:?}");
+        println!("Performance results:");
+        println!("  Creation time: {creation_time:?}");
+        println!("  Parsing time: {parsing_time:?}");
+        println!("  Serialization time: {serialization_time:?}");
 
-        // 基本性能断言（这些值可能需要根据实际性能调整）
-        assert!(parsing_time.as_millis() < 100, "解析时间应该小于 100ms");
-        assert!(serialization_time.as_millis() < 100, "序列化时间应该小于 100ms");
+        // Basic performance assertions (adjust as needed for real workloads)
+        assert!(parsing_time.as_millis() < 100, "Parsing time should be under 100 ms");
+        assert!(serialization_time.as_millis() < 100, "Serialization time should be under 100 ms");
     }
 
     #[test]
     fn test_edge_cases() {
-        // 测试边界情况
+        // Test edge cases
 
-        // 1. 测试空版本 ID
+        // 1. Test empty version IDs
         let mut fm = FileMeta::new();
         let version = FileMetaVersion {
             version_type: VersionType::Object,
             object: Some(MetaObject {
-                version_id: None, // 空版本 ID
+                version_id: None, // Empty version ID
                 data_dir: None,
                 erasure_algorithm: crate::fileinfo::ErasureAlgo::ReedSolomon,
                 erasure_m: 1,
@@ -2939,35 +2943,35 @@ mod test {
             write_version: 1,
         };
 
-        let shallow_version = FileMetaShallowVersion::try_from(version).expect("转换失败");
+        let shallow_version = FileMetaShallowVersion::try_from(version).expect("Conversion failed");
         fm.versions.push(shallow_version);
 
-        // 应该能够序列化和反序列化
-        let data = fm.marshal_msg().expect("序列化失败");
-        let fm2 = FileMeta::load(&data).expect("解析失败");
+        // Should support serialization and deserialization
+        let data = fm.marshal_msg().expect("Serialization failed");
+        let fm2 = FileMeta::load(&data).expect("Parsing failed");
         assert_eq!(fm2.versions.len(), 1);
 
-        // 2. 测试极大的文件大小
+        // 2. Test extremely large file sizes
         let large_object = MetaObject {
             size: i64::MAX,
             part_sizes: vec![usize::MAX],
             ..Default::default()
         };
 
-        // 应该能够处理大数值
+        // Should handle very large numbers
         assert_eq!(large_object.size, i64::MAX);
     }
 
     #[tokio::test]
     async fn test_concurrent_operations() {
-        // 测试并发操作的安全性
+        // Test thread safety for concurrent operations
         use std::sync::Arc;
         use std::sync::Mutex;
 
         let fm = Arc::new(Mutex::new(FileMeta::new()));
         let mut handles = vec![];
 
-        // 并发添加版本
+        // Add versions concurrently
         for i in 0..10 {
             let fm_clone: Arc<Mutex<FileMeta>> = Arc::clone(&fm);
             let handle = tokio::spawn(async move {
@@ -2981,7 +2985,7 @@ mod test {
             handles.push(handle);
         }
 
-        // 等待所有任务完成
+        // Wait for all tasks to finish
         for handle in handles {
             handle.await.unwrap();
         }
@@ -2992,15 +2996,15 @@ mod test {
 
     #[test]
     fn test_memory_efficiency() {
-        // 测试内存使用效率
+        // Test memory efficiency
         use std::mem;
 
-        // 测试空结构体的内存占用
+        // Measure memory usage for empty structs
         let empty_fm = FileMeta::new();
         let empty_size = mem::size_of_val(&empty_fm);
         println!("Empty FileMeta size: {empty_size} bytes");
 
-        // 测试包含大量版本的内存占用
+        // Measure memory usage with many versions
         let mut large_fm = FileMeta::new();
         for i in 0..100 {
             let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
@@ -3012,18 +3016,18 @@ mod test {
         let large_size = mem::size_of_val(&large_fm);
         println!("Large FileMeta size: {large_size} bytes");
 
-        // 验证内存使用是合理的（注意：size_of_val 只计算栈上的大小，不包括堆分配）
-        // 对于包含 Vec 的结构体，size_of_val 可能相同，因为 Vec 的容量在堆上
-        println!("版本数量：{}", large_fm.versions.len());
-        assert!(!large_fm.versions.is_empty(), "应该有版本数据");
+        // Ensure memory usage is reasonable (size_of_val covers only stack allocations)
+        // For structs containing Vec, size_of_val may match because capacity lives on the heap
+        println!("Number of versions: {}", large_fm.versions.len());
+        assert!(!large_fm.versions.is_empty(), "Should contain version data");
     }
 
     #[test]
     fn test_version_ordering_edge_cases() {
-        // 测试版本排序的边界情况
+        // Test boundary cases for version ordering
         let mut fm = FileMeta::new();
 
-        // 添加相同时间戳的版本
+        // Add versions with identical timestamps
         let same_time = OffsetDateTime::now_utc();
         for i in 0..5 {
             let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
@@ -3032,18 +3036,18 @@ mod test {
             fm.add_version(fi).unwrap();
         }
 
-        // 验证排序稳定性
+        // Verify stable ordering
         let original_order: Vec<_> = fm.versions.iter().map(|v| v.header.version_id).collect();
         fm.sort_by_mod_time();
         let sorted_order: Vec<_> = fm.versions.iter().map(|v| v.header.version_id).collect();
 
-        // 对于相同时间戳，排序应该保持稳定
+        // Sorting should remain stable for identical timestamps
         assert_eq!(original_order.len(), sorted_order.len());
     }
 
     #[test]
     fn test_checksum_algorithms() {
-        // 测试不同的校验和算法
+        // Test different checksum algorithms
         let algorithms = vec![ChecksumAlgo::Invalid, ChecksumAlgo::HighwayHash];
 
         for algo in algorithms {
@@ -3052,7 +3056,7 @@ mod test {
                 ..Default::default()
             };
 
-            // 验证算法的有效性检查
+            // Verify checksum validation logic
             match algo {
                 ChecksumAlgo::Invalid => assert!(!algo.valid()),
                 ChecksumAlgo::HighwayHash => assert!(algo.valid()),
@@ -3068,12 +3072,12 @@ mod test {
 
     #[test]
     fn test_erasure_coding_parameters() {
-        // 测试纠删码参数的各种组合
+        // Test combinations of erasure coding parameters
         let test_cases = vec![
-            (1, 1), // 最小配置
-            (2, 1), // 常见配置
-            (4, 2), // 标准配置
-            (8, 4), // 高冗余配置
+            (1, 1), // Minimum configuration
+            (2, 1), // Common configuration
+            (4, 2), // Standard configuration
+            (8, 4), // High redundancy configuration
         ];
 
         for (data_blocks, parity_blocks) in test_cases {
@@ -3084,9 +3088,9 @@ mod test {
                 ..Default::default()
             };
 
-            // 验证参数的合理性
-            assert!(obj.erasure_m > 0, "数据块数量必须大于 0");
-            assert!(obj.erasure_n > 0, "校验块数量必须大于 0");
+            // Verify parameter validity
+            assert!(obj.erasure_m > 0, "Data block count must be greater than 0");
+            assert!(obj.erasure_n > 0, "Parity block count must be greater than 0");
             assert_eq!(obj.erasure_dist.len(), data_blocks + parity_blocks);
 
             // Verify serialization and deserialization
@@ -3101,20 +3105,20 @@ mod test {
 
     #[test]
     fn test_metadata_size_limits() {
-        // 测试元数据大小限制
+        // Test metadata size limits
         let mut obj = MetaObject::default();
 
-        // 测试适量用户元数据
+        // Test moderate amounts of user metadata
         for i in 0..10 {
             obj.meta_user
                 .insert(format!("key-{i:04}"), format!("value-{:04}-{}", i, "x".repeat(10)));
         }
 
-        // 验证可以序列化元数据
+        // Verify metadata can be serialized
         let data = obj.marshal_msg().unwrap();
-        assert!(data.len() > 100, "序列化后的数据应该有合理大小");
+        assert!(data.len() > 100, "Serialized data should have a reasonable size");
 
-        // 验证可以反序列化
+        // Verify deserialization succeeds
         let mut obj2 = MetaObject::default();
         obj2.unmarshal_msg(&data).unwrap();
         assert_eq!(obj.meta_user.len(), obj2.meta_user.len());
@@ -3122,14 +3126,14 @@ mod test {
 
     #[test]
     fn test_version_statistics_accuracy() {
-        // 测试版本统计的准确性
+        // Test accuracy of version statistics
         let mut fm = FileMeta::new();
 
-        // 添加不同类型的版本
+        // Add different version types
         let object_count = 3;
         let delete_count = 2;
 
-        // 添加对象版本
+        // Add object versions
         for i in 0..object_count {
             let mut fi = crate::fileinfo::FileInfo::new(&format!("obj-{i}"), 2, 1);
             fi.version_id = Some(Uuid::new_v4());
@@ -3137,7 +3141,7 @@ mod test {
             fm.add_version(fi).unwrap();
         }
 
-        // 添加删除标记
+        // Add delete markers
         for i in 0..delete_count {
             let delete_marker = MetaDeleteMarker {
                 version_id: Some(Uuid::new_v4()),
@@ -3156,13 +3160,13 @@ mod test {
             fm.versions.push(shallow_version);
         }
 
-        // 验证统计准确性
+        // Verify overall statistics
         let stats = fm.get_version_stats();
         assert_eq!(stats.total_versions, object_count + delete_count);
         assert_eq!(stats.object_versions, object_count);
         assert_eq!(stats.delete_markers, delete_count);
 
-        // 验证详细统计
+        // Verify detailed statistics
         let detailed_stats = fm.get_detailed_version_stats();
         assert_eq!(detailed_stats.total_versions, object_count + delete_count);
         assert_eq!(detailed_stats.object_versions, object_count);
@@ -3171,15 +3175,15 @@ mod test {
 
     #[test]
     fn test_cross_platform_compatibility() {
-        // 测试跨平台兼容性（字节序、路径分隔符等）
+        // Test cross-platform compatibility (endianness, separators, etc.)
         let mut fm = FileMeta::new();
 
-        // 使用不同平台风格的路径
+        // Use platform-specific path styles
         let paths = vec![
             "unix/style/path",
             "windows\\style\\path",
             "mixed/style\\path",
-            "unicode/路径/测试",
+            "unicode/path/test",
         ];
 
         for path in paths {
@@ -3189,14 +3193,14 @@ mod test {
             fm.add_version(fi).unwrap();
         }
 
-        // 验证序列化和反序列化在不同平台上的一致性
+        // Verify serialization/deserialization consistency across platforms
         let data = fm.marshal_msg().unwrap();
         let mut fm2 = FileMeta::default();
         fm2.unmarshal_msg(&data).unwrap();
 
         assert_eq!(fm.versions.len(), fm2.versions.len());
 
-        // 验证 UUID 的字节序一致性
+        // Verify UUID endianness consistency
         for (v1, v2) in fm.versions.iter().zip(fm2.versions.iter()) {
             assert_eq!(v1.header.version_id, v2.header.version_id);
         }
@@ -3204,26 +3208,26 @@ mod test {
 
     #[test]
     fn test_data_integrity_validation() {
-        // 测试数据完整性验证
+        // Test data integrity checks
         let mut fm = FileMeta::new();
 
-        // 添加一个正常版本
+        // Add a normal version
         let mut fi = crate::fileinfo::FileInfo::new("test", 2, 1);
         fi.version_id = Some(Uuid::new_v4());
         fi.mod_time = Some(OffsetDateTime::now_utc());
         fm.add_version(fi).unwrap();
 
-        // 验证正常情况下的完整性
+        // Verify integrity under normal conditions
         assert!(fm.validate_integrity().is_ok());
     }
 
     #[test]
     fn test_version_merge_scenarios() {
-        // 测试版本合并的各种场景
+        // Test various version merge scenarios
         let mut versions1 = vec![];
         let mut versions2 = vec![];
 
-        // 创建两组不同的版本
+        // Create two distinct sets of versions
         for i in 0..3 {
             let mut fi1 = crate::fileinfo::FileInfo::new(&format!("test1-{i}"), 2, 1);
             fi1.version_id = Some(Uuid::new_v4());
@@ -3240,37 +3244,37 @@ mod test {
             versions2.push(FileMetaShallowVersion::try_from(version2).unwrap());
         }
 
-        // 测试简单的合并场景
+        // Test a simple merge scenario
         let merged = merge_file_meta_versions(1, false, 0, &[versions1.clone()]);
-        assert!(!merged.is_empty(), "单个版本列表的合并结果不应为空");
+        assert!(!merged.is_empty(), "Merging a single version list should not be empty");
 
-        // 测试多个版本列表的合并
+        // Test merging multiple version lists
         let merged = merge_file_meta_versions(1, false, 0, &[versions1.clone(), versions2.clone()]);
-        // 合并结果可能为空，这取决于版本的兼容性，这是正常的
-        println!("合并结果数量：{}", merged.len());
+        // Merge results may be empty depending on compatibility, which is acceptable
+        println!("Merge result count: {}", merged.len());
     }
 
     #[test]
     fn test_flags_operations() {
-        // 测试标志位操作
+        // Test flag operations
         let flags = vec![Flags::FreeVersion, Flags::UsesDataDir, Flags::InlineData];
 
         for flag in flags {
             let flag_value = flag as u8;
-            assert!(flag_value > 0, "标志位值应该大于 0");
+            assert!(flag_value > 0, "Flag value should be greater than 0");
 
-            // 测试标志位组合
+            // Test flag combinations
             let combined = Flags::FreeVersion as u8 | Flags::UsesDataDir as u8;
-            // 对于位运算，组合值可能不总是大于单个值，这是正常的
-            assert!(combined > 0, "组合标志位应该大于 0");
+            // For bitwise operations, combined values may not exceed individual ones; this is normal
+            assert!(combined > 0, "Combined flag value should be greater than 0");
         }
     }
 
     #[test]
     fn test_uuid_handling_edge_cases() {
-        // 测试 UUID 处理的边界情况
+        // Test UUID edge cases
         let test_uuids = vec![
-            Uuid::new_v4(), // 随机 UUID
+            Uuid::new_v4(), // Random UUID
         ];
 
         for uuid in test_uuids {
@@ -3280,7 +3284,7 @@ mod test {
                 ..Default::default()
             };
 
-            // 验证序列化和反序列化
+            // Verify serialization and deserialization
             let data = obj.marshal_msg().unwrap();
             let mut obj2 = MetaObject::default();
             obj2.unmarshal_msg(&data).unwrap();
@@ -3289,7 +3293,7 @@ mod test {
             assert_eq!(obj.data_dir, obj2.data_dir);
         }
 
-        // 单独测试 nil UUID，因为它在序列化时会被转换为 None
+        // Test nil UUID separately because serialization converts it to None
         let obj = MetaObject {
             version_id: Some(Uuid::nil()),
             data_dir: Some(Uuid::nil()),
@@ -3300,24 +3304,24 @@ mod test {
         let mut obj2 = MetaObject::default();
         obj2.unmarshal_msg(&data).unwrap();
 
-        // nil UUID 在序列化时可能被转换为 None，这是预期行为
-        // 检查实际的序列化行为
-        println!("原始 version_id: {:?}", obj.version_id);
-        println!("反序列化后 version_id: {:?}", obj2.version_id);
-        // 只要反序列化成功就认为测试通过
+        // nil UUIDs may be converted to None during serialization; this is expected
+        // Inspect the actual serialization behavior
+        println!("Original version_id: {:?}", obj.version_id);
+        println!("Deserialized version_id: {:?}", obj2.version_id);
+        // Consider the test successful as long as deserialization succeeds
     }
 
     #[test]
     fn test_part_handling_edge_cases() {
-        // 测试分片处理的边界情况
+        // Test edge cases for shard handling
         let mut obj = MetaObject::default();
 
-        // 测试空分片列表
+        // Test an empty shard list
         assert!(obj.part_numbers.is_empty());
         assert!(obj.part_etags.is_empty());
         assert!(obj.part_sizes.is_empty());
 
-        // 测试单个分片
+        // Test a single shard
         obj.part_numbers = vec![1];
         obj.part_etags = vec!["etag1".to_string()];
         obj.part_sizes = vec![1024];
@@ -3332,7 +3336,7 @@ mod test {
         assert_eq!(obj.part_sizes, obj2.part_sizes);
         assert_eq!(obj.part_actual_sizes, obj2.part_actual_sizes);
 
-        // 测试多个分片
+        // Test multiple shards
         obj.part_numbers = vec![1, 2, 3];
         obj.part_etags = vec!["etag1".to_string(), "etag2".to_string(), "etag3".to_string()];
         obj.part_sizes = vec![1024, 2048, 512];
@@ -3350,7 +3354,7 @@ mod test {
 
     #[test]
     fn test_version_header_validation() {
-        // 测试版本头的验证功能
+        // Test version header validation
         let mut header = FileMetaVersionHeader {
             version_type: VersionType::Object,
             mod_time: Some(OffsetDateTime::now_utc()),
@@ -3360,27 +3364,27 @@ mod test {
         };
         assert!(header.is_valid());
 
-        // 测试无效的版本类型
+        // Test invalid version types
         header.version_type = VersionType::Invalid;
         assert!(!header.is_valid());
 
-        // 重置为有效状态
+        // Reset to a valid state
         header.version_type = VersionType::Object;
         assert!(header.is_valid());
 
-        // 测试无效的纠删码参数
-        // 当 ec_m = 0 时，has_ec() 返回 false，所以不会检查纠删码参数
+        // Test invalid erasure coding parameters
+        // When ec_m = 0, has_ec() returns false so parity parameters are skipped
         header.ec_m = 0;
         header.ec_n = 1;
-        assert!(header.is_valid()); // 这是有效的，因为没有启用纠删码
+        assert!(header.is_valid()); // Valid because erasure coding is disabled
 
-        // 启用纠删码但参数无效
+        // Enable erasure coding with invalid parameters
         header.ec_m = 2;
         header.ec_n = 0;
-        // 当 ec_n = 0 时，has_ec() 返回 false，所以不会检查纠删码参数
-        assert!(header.is_valid()); // 这实际上是有效的，因为 has_ec() 返回 false
+        // When ec_n = 0, has_ec() returns false so parity parameters are skipped
+        assert!(header.is_valid()); // This remains valid because has_ec() returns false
 
-        // 重置为有效状态
+        // Reset to a valid state
         header.ec_n = 1;
         assert!(header.is_valid());
     }
@@ -3405,7 +3409,7 @@ mod test {
             obj.meta_user.insert(key.to_string(), value.to_string());
         }
 
-        // 验证序列化和反序列化
+        // Verify serialization and deserialization
         let data = obj.marshal_msg().unwrap();
         let mut obj2 = MetaObject::default();
         obj2.unmarshal_msg(&data).unwrap();
@@ -3451,7 +3455,7 @@ async fn test_read_xl_meta_no_data() {
     let filepath = "./test_xl.meta";
 
     let mut file = File::create(filepath).await.unwrap();
-    // 写入字符串
+    // Write string data
     file.write_all(&buff).await.unwrap();
 
     let mut f = File::open(filepath).await.unwrap();

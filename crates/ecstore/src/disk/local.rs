@@ -319,8 +319,8 @@ impl LocalDisk {
         }
 
         if cfg!(target_os = "windows") {
-            // 在 Windows 上，卷名不应该包含保留字符。
-            // 这个正则表达式匹配了不允许的字符。
+            // Windows volume names must not include reserved characters.
+            // This regular expression matches disallowed characters.
             if volname.contains('|')
                 || volname.contains('<')
                 || volname.contains('>')
@@ -333,7 +333,7 @@ impl LocalDisk {
                 return false;
             }
         } else {
-            // 对于非 Windows 系统，可能需要其他的验证逻辑。
+            // Non-Windows systems may require additional validation rules.
         }
 
         true
@@ -563,7 +563,7 @@ impl LocalDisk {
 
         // return Ok(());
 
-        // TODO: 异步通知 检测硬盘空间 清空回收站
+        // TODO: async notifications for disk space checks and trash cleanup
 
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
         // if let Some(parent) = trash_path.parent() {
@@ -846,13 +846,13 @@ impl LocalDisk {
             }
         }
 
-        // 没有版本了，删除 xl.meta
+        // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
             return Ok(());
         }
 
-        // 更新 xl.meta
+        // Update xl.meta
         let buf = fm.marshal_msg()?;
 
         let volume_dir = self.get_bucket_path(volume)?;
@@ -1050,7 +1050,7 @@ impl LocalDisk {
 
         let mut dir_objes = HashSet::new();
 
-        // 第一层过滤
+        // First-level filtering
         for item in entries.iter_mut() {
             let entry = item.clone();
             // check limit
@@ -1229,7 +1229,7 @@ fn is_root_path(path: impl AsRef<Path>) -> bool {
     path.as_ref().components().count() == 1 && path.as_ref().has_root()
 }
 
-// 过滤 std::io::ErrorKind::NotFound
+// Filter std::io::ErrorKind::NotFound
 pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metadata>)> {
     let p = path.as_ref();
     let (data, meta) = match read_file_all(&p).await {
@@ -1920,11 +1920,11 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        // xl.meta 路径
+        // xl.meta path
         let src_file_path = src_volume_dir.join(Path::new(format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str()));
         let dst_file_path = dst_volume_dir.join(Path::new(format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str()));
 
-        // data_dir 路径
+        // data_dir path
         let has_data_dir_path = {
             let has_data_dir = {
                 if !fi.is_remote() {
@@ -1952,7 +1952,7 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // 读旧 xl.meta
+        // Read the previous xl.meta
 
         let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
             Ok(res) => Some(res),
@@ -2437,7 +2437,7 @@ impl DiskAPI for LocalDisk {
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
-        // TODO: 不能用递归删除，如果目录下面有文件，返回 errVolumeNotEmpty
+        // TODO: avoid recursive deletion; return errVolumeNotEmpty when files remain
 
         if let Err(err) = fs::remove_dir_all(&p).await {
             let e: DiskError = to_volume_error(err).into();
@@ -2591,7 +2591,7 @@ mod test {
         assert!(object_path.to_string_lossy().contains("test-bucket"));
         assert!(object_path.to_string_lossy().contains("test-object"));
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -2656,7 +2656,7 @@ mod test {
             disk.delete_volume(vol).await.unwrap();
         }
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -2680,7 +2680,7 @@ mod test {
         assert!(!disk_info.fs_type.is_empty());
         assert!(disk_info.total > 0);
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 

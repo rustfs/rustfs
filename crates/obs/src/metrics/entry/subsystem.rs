@@ -123,7 +123,7 @@ impl MetricSubsystem {
             // Debug related subsystems
             "/debug/go" => Self::DebugGo,
 
-            // 集群相关子系统
+            // Cluster-related subsystems
             "/cluster/health" => Self::ClusterHealth,
             "/cluster/usage/objects" => Self::ClusterUsageObjects,
             "/cluster/usage/buckets" => Self::ClusterUsageBuckets,
@@ -131,7 +131,7 @@ impl MetricSubsystem {
             "/cluster/iam" => Self::ClusterIam,
             "/cluster/config" => Self::ClusterConfig,
 
-            // 其他服务相关子系统
+            // Other service-related subsystems
             "/ilm" => Self::Ilm,
             "/audit" => Self::Audit,
             "/logger/webhook" => Self::LoggerWebhook,
@@ -139,7 +139,7 @@ impl MetricSubsystem {
             "/notification" => Self::Notification,
             "/scanner" => Self::Scanner,
 
-            // 其他路径作为自定义处理
+            // Treat other paths as custom subsystems
             _ => Self::Custom(path.to_string()),
         }
     }

@@ -1,49 +1,48 @@
 [Unit]
 Description=RustFS Object Storage Server
-# 定义服务的描述，说明这是一个 RustFS 对象存储服务器，显示在 systemctl status 中。
+# Describe the RustFS object storage service as shown in `systemctl status`.
 Documentation=https://rustfs.com/docs/
-# 提供服务的官方文档链接，方便管理员查阅，占位符需替换为实际 URL。
+# Provide a documentation link for operators.
 After=network-online.target
-# 指定服务在 network-online.target（网络就绪）之后启动，确保网络可用。
+# Ensure the service starts only after the network is online.
 Wants=network-online.target
-# 表示服务希望依赖 network-online.target，但不是强依赖，即使网络未就绪也尝试启动。
+# Express a soft dependency on `network-online.target` so we still attempt to start if the network is late.
 # If you're using a database, you'll need to add the corresponding dependencies
-# 如果服务依赖数据库，可以添加数据库相关的依赖项（当前为注释，未启用）。
+# Uncomment these directives when a database is required.
 # After=postgresql.service
-# 示例：若依赖 PostgreSQL，则在 PostgreSQL 服务后启动（当前未启用）。
+# Example: start after PostgreSQL when the dependency is needed.
 # Requires=postgresql.service
-# 示例：若强制依赖 PostgreSQL，则要求其启动成功（当前未启用）。
+# Example: make PostgreSQL a hard requirement.
 
 [Service]
 Type=notify
-# 服务类型为 notify，表示服务通过 sd_notify 通知 systemd 其状态（如就绪）。
+# Use the `notify` type so the process reports readiness via `sd_notify`.
 NotifyAccess=main
-# 指定只有主进程可以发送通知给 systemd，避免子进程干扰。
+# Only the main process can send notifications back to systemd.
 User=rustfs
-# 以 rustfs 用户身份运行服务，需预先创建此用户，提升安全性。
+# Run as the dedicated `rustfs` user (create it ahead of time for security).
 Group=rustfs
-# 以 rustfs 组身份运行服务，与 User 配合使用。
+# Use the matching `rustfs` group.
 
 # working directory
 WorkingDirectory=/opt/rustfs
-# 设置服务的工作目录为 /opt/rustfs，影响相对路径的解析。
+# Set the working directory so relative paths resolve consistently.
 
-# 定义环境变量配置，用于传递给服务程序。
+# Inline environment variables for authentication.
 Environment=RUSTFS_ACCESS_KEY=rustfsadmin
-# 设置访问密钥为 rustfsadmin，用于 RustFS 的认证。
+# Access key used by RustFS authentication.
 Environment=RUSTFS_SECRET_KEY=rustfsadmin
-# 设置秘密密钥为 rustfsadmin，与访问密钥配套使用。
+# Secret key that pairs with the access key.
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
     --console-enable
-# 定义启动命令，运行 /usr/local/bin/rustfs，带参数：
-# --address 0.0.0.0:9000：服务监听所有接口的 9000 端口。
-# --volumes：指定存储卷路径为 /data/rustfs/vol1 和 /data/rustfs/vol2。
-# --console-enable：启用控制台功能。
+# Launch RustFS with common arguments:
+# --address 0.0.0.0:9000 listens on every interface.
+# --volumes mounts /data/rustfs/vol1 and /data/rustfs/vol2.
+# --console-enable turns on the management console.
 
-# 定义环境变量配置，用于传递给服务程序，推荐使用且简洁
-# rustfs 示例文件 详见: `../config/rustfs-zh.env`
+# Optionally load additional environment variables (see ../config/rustfs-zh.env).
 EnvironmentFile=-/etc/default/rustfs
 ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 
@@ -53,50 +52,50 @@ StandardError=append:/data/deploy/rust/logs/rustfs-err.log
 
 # resource constraints
 LimitNOFILE=1048576
-# 设置文件描述符上限为 1048576，支持高并发连接。
+# Allow up to 1,048,576 file descriptors for high concurrency.
 LimitNPROC=32768
-# 设置进程数上限为 32768，限制子进程数量。
+# Cap the number of processes at 32,768.
 TasksMax=infinity
-# 允许服务创建无限数量的线程（谨慎使用，可能耗尽资源）。
+# Permit unlimited tasks (use carefully to avoid resource exhaustion).
 
 # restart the policy
 Restart=always
-# 服务异常退出时总是重启，提高可用性。
+# Always restart the service on failure to improve availability.
 RestartSec=10s
-# 重启前等待 10 秒，避免频繁重启导致资源浪费。
+# Wait 10 seconds between restart attempts.
 
 # graceful exit configuration
 TimeoutStartSec=30s
-# 启动超时时间为 30 秒，若超时则认为启动失败。
+# Treat startups that exceed 30 seconds as failures.
 TimeoutStopSec=30s
-# 停止超时时间为 30 秒，若超时则强制停止。
+# Force-stop the service if it does not exit within 30 seconds.
 
 # security settings
 NoNewPrivileges=true
-# 禁止服务提升权限，增强安全性。
+# Disable privilege escalation.
 ProtectSystem=full
-# 保护系统目录（如 /usr、/boot、/etc）为只读，防止服务修改。
+# Mount critical system directories read-only.
 ProtectHome=true
-# 保护用户主目录（如 /home、/root），禁止服务访问。
+# Prevent access to user home directories.
 PrivateTmp=true
-# 为服务提供私有 /tmp 目录，隔离临时文件。
+# Provide a private /tmp namespace.
 PrivateDevices=true
-# 禁止服务访问硬件设备（如 /dev），提升安全性。
+# Deny direct hardware device access.
 ProtectClock=true
-# 保护系统时钟，禁止服务修改时间。
+# Block modifications to the system clock.
 ProtectKernelTunables=true
-# 保护内核参数（/proc/sys），禁止服务修改。
+# Protect /proc/sys kernel tunables.
 ProtectKernelModules=true
-# 禁止服务加载或卸载内核模块。
+# Prevent kernel module load/unload.
 ProtectControlGroups=true
-# 保护控制组（cgroups），禁止服务修改。
+# Block cgroup modifications.
 RestrictSUIDSGID=true
-# 禁止服务使用 SUID/SGID 文件，提升安全性。
+# Disallow SUID/SGID binaries.
 RestrictRealtime=true
-# 禁止服务使用实时调度，防止资源滥用。
+# Disallow real-time scheduling.
 ReadWritePaths=/data/rustfs
-# 允许服务对 /data/rustfs 目录读写，限制其他路径访问。
+# Grant read/write access only to /data/rustfs.
 
 [Install]
 WantedBy=multi-user.target
-# 服务在多用户模式下自动启动，配合 systemctl enable 使用。
+# Enable the service in multi-user mode (compatible with `systemctl enable`).

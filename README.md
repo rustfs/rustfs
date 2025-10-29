@@ -25,7 +25,7 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简�
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=fr">français</a> |
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ja">日本語</a> |
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ko">한국어</a> |
-  <a href="https://readme-i18n.com/rustfs/rustfs?lang=pt">Português</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=pt">Portuguese</a> |
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 

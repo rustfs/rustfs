@@ -346,7 +346,7 @@ impl KMSTestSuite {
     /// Run the complete test suite
     pub async fn run_test_suite(&self) -> Vec<TestResult> {
         init_logging();
-        info!("🚀 开始KMS统一测试套件");
+        info!("🚀 Starting unified KMS test suite");
 
         let start_time = Instant::now();
         let mut results = Vec::new();
@@ -359,17 +359,17 @@ impl KMSTestSuite {
             .filter(|test| !self.config.include_critical_only || test.is_critical)
             .collect();
 
-        info!("📊 测试计划: {} 个测试将被执行", tests_to_run.len());
+        info!("📊 Test plan: {} test(s) scheduled", tests_to_run.len());
         for (i, test) in tests_to_run.iter().enumerate() {
             info!("  {}. {} ({})", i + 1, test.name, test.category.as_str());
         }
 
         // Execute tests
         for (i, test_def) in tests_to_run.iter().enumerate() {
-            info!("🧪 执行测试 {}/{}: {}", i + 1, tests_to_run.len(), test_def.name);
-            info!("   📝 描述: {}", test_def.description);
-            info!("   🏷️  分类: {}", test_def.category.as_str());
-            info!("   ⏱️  预计时间: {:?}", test_def.estimated_duration);
+            info!("🧪 Running test {}/{}: {}", i + 1, tests_to_run.len(), test_def.name);
+            info!("   📝 Description: {}", test_def.description);
+            info!("   🏷️  Category: {}", test_def.category.as_str());
+            info!("   ⏱️  Estimated duration: {:?}", test_def.estimated_duration);
 
             let test_start = Instant::now();
             let result = self.run_single_test(test_def).await;
@@ -377,11 +377,11 @@ impl KMSTestSuite {
 
             match result {
                 Ok(_) => {
-                    info!("✅ 测试通过: {} ({:.2}s)", test_def.name, test_duration.as_secs_f64());
+                    info!("✅ Test passed: {} ({:.2}s)", test_def.name, test_duration.as_secs_f64());
                     results.push(TestResult::success(test_def.name.clone(), test_def.category.clone(), test_duration));
                 }
                 Err(e) => {
-                    error!("❌ 测试失败: {} ({:.2}s): {}", test_def.name, test_duration.as_secs_f64(), e);
+                    error!("❌ Test failed: {} ({:.2}s): {}", test_def.name, test_duration.as_secs_f64(), e);
                     results.push(TestResult::failure(
                         test_def.name.clone(),
                         test_def.category.clone(),
@@ -393,7 +393,7 @@ impl KMSTestSuite {
 
             // Add delay between tests to avoid resource conflicts
             if i < tests_to_run.len() - 1 {
-                debug!("⏸️  等待2秒后执行下一个测试...");
+                debug!("⏸️  Waiting two seconds before the next test...");
                 sleep(Duration::from_secs(2)).await;
             }
         }
@@ -408,22 +408,22 @@ impl KMSTestSuite {
     async fn run_single_test(&self, test_def: &TestDefinition) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // This is a placeholder for test dispatch logic
         // In a real implementation, this would dispatch to actual test functions
-        warn!("⚠️  测试函数 '{}' 在统一运行器中尚未实现，跳过", test_def.name);
+        warn!("⚠️  Test '{}' is not implemented in the unified runner; skipping", test_def.name);
         Ok(())
     }
 
     /// Print comprehensive test summary
     fn print_test_summary(&self, results: &[TestResult], total_duration: Duration) {
-        info!("📊 KMS测试套件总结");
-        info!("⏱️  总执行时间: {:.2}秒", total_duration.as_secs_f64());
-        info!("📈 总测试数量: {}", results.len());
+        info!("📊 KMS test suite summary");
+        info!("⏱️  Total duration: {:.2} seconds", total_duration.as_secs_f64());
+        info!("📈 Total tests: {}", results.len());
 
         let passed = results.iter().filter(|r| r.success).count();
         let failed = results.iter().filter(|r| !r.success).count();
 
-        info!("✅ 通过: {}", passed);
-        info!("❌ 失败: {}", failed);
-        info!("📊 成功率: {:.1}%", (passed as f64 / results.len() as f64) * 100.0);
+        info!("✅ Passed: {}", passed);
+        info!("❌ Failed: {}", failed);
+        info!("📊 Success rate: {:.1}%", (passed as f64 / results.len() as f64) * 100.0);
 
         // Summary by category
         let mut category_summary: std::collections::HashMap<TestCategory, (usize, usize)> = std::collections::HashMap::new();
@@ -435,7 +435,7 @@ impl KMSTestSuite {
             }
         }
 
-        info!("📊 分类汇总:");
+        info!("📊 Category summary:");
         for (category, (total, passed_count)) in category_summary {
             info!(
                 "  🏷️  {}: {}/{} ({:.1}%)",
@@ -448,7 +448,7 @@ impl KMSTestSuite {
 
         // List failed tests
         if failed > 0 {
-            warn!("❌ 失败的测试:");
+            warn!("❌ Failing tests:");
             for result in results.iter().filter(|r| !r.success) {
                 warn!(
                     "  - {}: {}",
@@ -479,7 +479,7 @@ async fn test_kms_critical_suite() -> Result<(), Box<dyn std::error::Error + Sen
         return Err(format!("Critical test suite failed: {failed_count} tests failed").into());
     }
 
-    info!("✅ 所有关键测试通过");
+    info!("✅ All critical tests passed");
     Ok(())
 }
 
@@ -494,13 +494,13 @@ async fn test_kms_full_suite() -> Result<(), Box<dyn std::error::Error + Send + 
     let failed_count = results.iter().filter(|r| !r.success).count();
     let success_rate = ((total_tests - failed_count) as f64 / total_tests as f64) * 100.0;
 
-    info!("📊 完整测试套件结果: {:.1}% 成功率", success_rate);
+    info!("📊 Full suite success rate: {:.1}%", success_rate);
 
     // Allow up to 10% failure rate for non-critical tests
     if success_rate < 90.0 {
         return Err(format!("Test suite success rate too low: {success_rate:.1}%").into());
     }
 
-    info!("✅ 完整测试套件通过");
+    info!("✅ Full test suite succeeded");
     Ok(())
 }

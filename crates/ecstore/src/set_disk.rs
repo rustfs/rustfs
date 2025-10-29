@@ -401,7 +401,7 @@ impl SetDisks {
 
         let mut futures = Vec::with_capacity(disks.len());
         if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: 并发
+            // TODO: add concurrency
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
@@ -891,7 +891,7 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: 并发
+            // TODO: add concurrency
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
@@ -1700,7 +1700,7 @@ impl SetDisks {
 
         let disks = rl.clone();
 
-        //  主动释放锁
+        // Explicitly release the lock
         drop(rl);
 
         for (i, opdisk) in disks.iter().enumerate() {
@@ -1744,7 +1744,7 @@ impl SetDisks {
             }
         };
 
-        // check endpoint 是否一致
+        // Check that the endpoint matches
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
 
@@ -1959,7 +1959,7 @@ impl SetDisks {
         Ok(())
     }
 
-    // 打乱顺序
+    // Shuffle the order
     fn shuffle_disks_and_parts_metadata_by_index(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
@@ -1998,7 +1998,7 @@ impl SetDisks {
         Self::shuffle_disks_and_parts_metadata(disks, parts_metadata, fi)
     }
 
-    // 打乱顺序
+    // Shuffle the order
     fn shuffle_disks_and_parts_metadata(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
@@ -2075,7 +2075,7 @@ impl SetDisks {
 
         let vid = opts.version_id.clone().unwrap_or_default();
 
-        // TODO: 优化并发 可用数量中断
+        // TODO: optimize concurrency and break once enough slots are available
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await?;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
@@ -3722,7 +3722,7 @@ impl ObjectIO for SetDisks {
                 error!("encode err {:?}", e);
                 return Err(e.into());
             }
-        }; // TODO: 出错，删除临时目录
+        }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
         // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -4050,7 +4050,7 @@ impl StorageAPI for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        // 默认返回值
+        // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
@@ -4107,7 +4107,7 @@ impl StorageAPI for SetDisks {
 
             vr.set_tier_free_version_id(&Uuid::new_v4().to_string());
 
-            // 删除
+            // Delete
             // del_objects[i].object_name.clone_from(&vr.name);
             // del_objects[i].version_id = vr.version_id.map(|v| v.to_string());
 
@@ -4200,9 +4200,9 @@ impl StorageAPI for SetDisks {
 
         let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
 
-        // 每个磁盘, 删除所有对象
+        // For each disk delete all objects
         for (disk_idx, errors) in results.into_iter().enumerate() {
-            // 所有对象的删除结果
+            // Deletion results for all objects
             for idx in 0..vers.len() {
                 if errors[idx].is_some() {
                     for fi in vers[idx].versions.iter() {
@@ -4964,7 +4964,7 @@ impl StorageAPI for SetDisks {
             HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
         );
 
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
+        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -5453,7 +5453,7 @@ impl StorageAPI for SetDisks {
 
         self.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await
     }
-    // complete_multipart_upload 完成
+    // complete_multipart_upload finished
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
         self: Arc<Self>,
@@ -6567,7 +6567,7 @@ mod tests {
         // Test that all CHECK_PART constants have expected values
         assert_eq!(CHECK_PART_UNKNOWN, 0);
         assert_eq!(CHECK_PART_SUCCESS, 1);
-        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4); // 实际值是 4，不是 2
+        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4); // The actual value is 4, not 2
         assert_eq!(CHECK_PART_VOLUME_NOT_FOUND, 3);
         assert_eq!(CHECK_PART_FILE_CORRUPT, 5);
     }
@@ -6847,7 +6847,7 @@ mod tests {
         assert_eq!(conv_part_err_to_int(&Some(disk_err)), CHECK_PART_FILE_NOT_FOUND);
 
         let other_err = DiskError::other("other error");
-        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // other 错误应该返回 UNKNOWN，不是 SUCCESS
+        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // Other errors should return UNKNOWN, not SUCCESS
     }
 
     #[test]
@@ -6919,7 +6919,7 @@ mod tests {
         let errs = vec![None, Some(DiskError::other("error1")), Some(DiskError::other("error2"))];
         let joined = join_errs(&errs);
         assert!(joined.contains("<nil>"));
-        assert!(joined.contains("io error")); // DiskError::other 显示为 "io error"
+        assert!(joined.contains("io error")); // DiskError::other is rendered as "io error"
 
         // Test with different error types
         let errs2 = vec![None, Some(DiskError::FileNotFound), Some(DiskError::FileCorrupt)];

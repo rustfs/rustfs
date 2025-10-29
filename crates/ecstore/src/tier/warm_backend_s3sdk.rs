@@ -81,7 +81,7 @@ impl WarmBackendS3 {
             creds = Credentials::new(
                 conf.access_key.clone(), // access_key_id
                 conf.secret_key.clone(), // secret_access_key
-                None,                    // session_token (可选)
+                None,                    // session_token (optional)
                 None,
                 "Static",
             );

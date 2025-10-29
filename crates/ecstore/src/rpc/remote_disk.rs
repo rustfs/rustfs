@@ -83,7 +83,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
-        // TODO: 连接状态
+        // TODO: connection status tracking
         if node_service_time_out_client(&self.addr).await.is_ok() {
             return true;
         }

@@ -1,89 +1,89 @@
-# RustFS 服务安装配置教程
+# RustFS Service Installation Guide
 
-## 1. 准备工作
+## 1. Preparation
 
-### 1.1 创建系统用户
+### 1.1 Create a system user
 
 ```bash
-# 创建 rustfs 系统用户和用户组，禁止登录shell
+# Create the rustfs system user and group without shell access
 sudo useradd -r -s /sbin/nologin rustfs
 ```
 
-### 1.2 创建必要目录
+### 1.2 Create required directories
 
 ```bash
-# 创建程序目录
+# Application directory
 sudo mkdir -p /opt/rustfs
 
-# 创建数据目录
+# Data directories
 sudo mkdir -p /data/rustfs/{vol1,vol2}
 
-# 创建配置目录
+# Configuration directory
 sudo mkdir -p /etc/rustfs
 
-# 设置目录权限
+# Assign ownership and permissions
 sudo chown -R rustfs:rustfs /opt/rustfs /data/rustfs
 sudo chmod 755 /opt/rustfs /data/rustfs
 ```
 
-## 2. 安装 RustFS
+## 2. Install RustFS
 
 ```bash
-# 复制 RustFS 二进制文件
+# Copy the RustFS binary
 sudo cp rustfs /usr/local/bin/
 sudo chmod +x /usr/local/bin/rustfs
 
-# 复制配置文件
+# Copy configuration files
 sudo cp obs.yaml /etc/rustfs/
 sudo chown -R rustfs:rustfs /etc/rustfs
 ```
 
-## 3. 配置 Systemd 服务
+## 3. Configure the systemd service
 
 ```bash
-# 复制服务单元文件
+# Install the service unit
 sudo cp rustfs.service /etc/systemd/system/
 
-# 重新加载 systemd 配置
+# Reload systemd units
 sudo systemctl daemon-reload
 ```
 
-## 4. 服务管理
+## 4. Service management
 
-### 4.1 启动服务
+### 4.1 Start the service
 
 ```bash
 sudo systemctl start rustfs
 ```
 
-### 4.2 查看服务状态
+### 4.2 Check service status
 
 ```bash
 sudo systemctl status rustfs
 ```
 
-### 4.3 启用开机自启
+### 4.3 Enable auto-start on boot
 
 ```bash
 sudo systemctl enable rustfs
 ```
 
-### 4.4 查看服务日志
+### 4.4 Inspect logs
 
 ```bash
-# 查看实时日志
+# Follow live logs
 sudo journalctl -u rustfs -f
 
-# 查看今天的日志
+# View today's logs
 sudo journalctl -u rustfs --since today
 ```
 
-## 5. 验证安装
+## 5. Validate the installation
 
 ```bash
-# 检查服务端口
+# Confirm the service port
 ss -tunlp | grep 9000
 
-# 测试服务可用性
+# Verify availability
 curl -I http://localhost:9000
 ```

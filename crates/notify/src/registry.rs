@@ -150,7 +150,7 @@ impl TargetRegistry {
                         // Case 1: The format is <FIELD_NAME>_<INSTANCE_ID>
                         // e.g., rest = "ENDPOINT_PRIMARY" -> field_name="ENDPOINT", instance_id="PRIMARY"
                         Some(field) => (field.to_lowercase(), instance_id_part.to_lowercase()),
-                        // Case 2: The format is <FIELD_NAME> (无 INSTANCE_ID)
+                        // Case 2: The format is <FIELD_NAME> (without INSTANCE_ID)
                         // e.g., rest = "ENABLE" -> field_name="ENABLE", instance_id="" (Universal configuration `_ DEFAULT_DELIMITER`)
                         None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
                     };

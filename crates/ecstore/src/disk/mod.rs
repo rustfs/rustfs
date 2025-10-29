@@ -431,7 +431,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
     async fn delete_volume(&self, volume: &str) -> Result<()>;
 
-    // 并发边读边写 w <- MetaCacheEntry
+    // Concurrent read/write pipeline w <- MetaCacheEntry
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;
 
     // Metadata operations
@@ -466,7 +466,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<RenameDataResp>;
 
     // File operations.
-    // 读目录下的所有文件、目录
+    // Read every file and directory within the folder
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
@@ -1000,7 +1000,7 @@ mod tests {
         // Note: is_online() might return false for local disks without proper initialization
         // This is expected behavior for test environments
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -1031,7 +1031,7 @@ mod tests {
         let location = disk.get_disk_location();
         assert!(location.valid() || (!location.valid() && endpoint.pool_idx < 0));
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 }
