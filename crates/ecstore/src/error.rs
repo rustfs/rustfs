@@ -564,6 +564,7 @@ impl StorageError {
             0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
             0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
             0x3B => Some(StorageError::PreconditionFailed),
+            0x3C => Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default())),
             _ => None,
         }
     }
