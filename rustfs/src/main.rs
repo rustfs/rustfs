@@ -70,11 +70,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-// Configure Jemalloc memory analysis parameters
-// #[allow(non_upper_case_globals, unsafe_code)]
-// #[unsafe(export_name = "malloc_conf")]
-// pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
-
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

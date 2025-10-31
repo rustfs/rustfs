@@ -146,9 +146,7 @@ pub async fn check_jemalloc_profiling() {
         info!("jemalloc profiling controller is NOT available");
     }
 
-    if let Err(e) = epoch::advance() {
-        let _ = e;
-    }
+    let _ = epoch::advance();
     macro_rules! show {
         ($name:literal, $reader:expr) => {
             match $reader {

@@ -266,7 +266,7 @@ opentelemetry-stdout = { version = "0.31.0" }
 
 # Performance Analysis and Memory Profiling
 # Use tikv-jemallocator as memory allocator and enable performance analysis
-tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
 # Used to control and obtain statistics for jemalloc at runtime
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profiling"] }
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
