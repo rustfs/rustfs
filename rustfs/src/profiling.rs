@@ -89,7 +89,7 @@ pub async fn dump_cpu_pprof_for(duration: Duration) -> Result<PathBuf, String> {
     if let Some(cell) = CPU_CONT_GUARD.get() {
         let guard_slot = cell.lock().await;
         if let Some(ref guard) = *guard_slot {
-            debug!("profiling: using continuous guard snapshot for CPU dump");
+            debug!("profiling: using continuous profiler guard for CPU dump");
             return dump_cpu_with_guard(guard).await;
         }
     }
