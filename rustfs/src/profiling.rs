@@ -14,7 +14,6 @@
 
 use chrono::Utc;
 use jemalloc_pprof::PROF_CTL;
-#[allow(unused_imports)]
 use pprof::protos::Message;
 use rustfs_config::{
     DEFAULT_CPU_DURATION_SECS, DEFAULT_CPU_FREQ, DEFAULT_CPU_INTERVAL_SECS, DEFAULT_CPU_MODE, DEFAULT_ENABLE_PROFILING,
@@ -70,7 +69,7 @@ fn ts() -> String {
 fn write_pprof_report_pb(report: &pprof::Report, path: &Path) -> Result<(), String> {
     let profile = report.pprof().map_err(|e| format!("pprof() failed: {e}"))?;
     let mut buf = Vec::with_capacity(512 * 1024);
-    profile.encode(&mut buf).map_err(|e| format!("encode failed: {e}"))?;
+    profile.write_to_vec(&mut buf).map_err(|e| format!("encode failed: {e}"))?;
     let mut f = File::create(path).map_err(|e| format!("create file failed: {e}"))?;
     f.write_all(&buf).map_err(|e| format!("write file failed: {e}"))?;
     Ok(())
