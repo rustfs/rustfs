@@ -83,6 +83,7 @@ impl From<StorageError> for ApiError {
             StorageError::InvalidPart(_, _, _) => S3ErrorCode::InvalidPart,
             StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
             StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
+            StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
             _ => S3ErrorCode::InternalError,
         };
 

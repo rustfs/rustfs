@@ -291,7 +291,7 @@ impl HTTPRangeSpec {
             let suffix_len = if self.start < 0 {
                 self.start
                     .checked_neg()
-                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
             } else {
                 self.start
             };
@@ -304,14 +304,14 @@ impl HTTPRangeSpec {
     }
     pub fn get_length(&self, res_size: i64) -> Result<i64> {
         if res_size < 0 {
-            return Err(Error::other("The requested range is not satisfiable"));
+            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
         }
 
         if self.is_suffix_length {
             let specified_len = if self.start < 0 {
                 self.start
                     .checked_neg()
-                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
             } else {
                 self.start
             };
@@ -325,7 +325,7 @@ impl HTTPRangeSpec {
         }
 
         if self.start >= res_size {
-            return Err(Error::other("The requested range is not satisfiable"));
+            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
         }
 
         if self.end > -1 {
@@ -343,7 +343,7 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        Err(Error::other(format!(
+        Err(Error::InvalidRangeSpec(format!(
             "range value invalid: start={}, end={}, expected start <= end and end >= -1",
             self.start, self.end
         )))
@@ -1361,7 +1361,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> RangedDecompressReader<R> {
         // Validate the range request
         if offset >= total_size {
             tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
-            return Err(Error::other("Range offset exceeds file size"));
+            return Err(Error::InvalidRangeSpec("Range offset exceeds file size".to_string()));
         }
 
         // Adjust length if it extends beyond file end
