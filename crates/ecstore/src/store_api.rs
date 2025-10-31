@@ -520,7 +520,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
-    pub storage_class: String,
+    pub storage_class: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: i64,
     // Actual size is the real size of the object uploaded by client.
@@ -697,7 +697,7 @@ impl ObjectInfo {
         let storage_class = metadata
             .get(AMZ_STORAGE_CLASS)
             .cloned()
-            .unwrap_or_else(|| storageclass::STANDARD.to_string());
+            .or_else(|| Some(storageclass::STANDARD.to_string()));
 
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
         let parts = fi
