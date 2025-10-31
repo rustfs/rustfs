@@ -133,7 +133,6 @@ libsystemd.workspace = true
 [target.'cfg(all(not(target_env = "msvc"), not(target_os = "windows")))'.dependencies]
 tikv-jemallocator = { workspace = true, features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
 tikv-jemalloc-ctl = { workspace = true }
-tikv-jemalloc-sys = { workspace = true }
 jemalloc_pprof = { workspace = true }
 pprof = { workspace = true }
 
