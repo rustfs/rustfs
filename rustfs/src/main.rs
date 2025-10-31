@@ -26,7 +26,7 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::admin::handlers::profile::start_profilers;
+use crate::profiling::check_jemalloc_profiling;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -64,6 +64,7 @@ use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::s3_error;
+use std::env;
 use std::io::{Error, Result};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -82,69 +83,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(all(target_os = "linux", target_env = "musl"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(not(target_env = "msvc"))]
-pub async fn check_jemalloc_profiling() {
-    use jemalloc_pprof;
-    use std::env;
-    use tikv_jemalloc_ctl::{config, epoch, stats};
-
-    // Refresh Jemalloc's statistics
-    epoch::advance().expect("Failed to advance epoch");
-
-    // 1. Check malloc_conf
-    match config::malloc_conf::read() {
-        Ok(conf_val) => println!("Jemalloc malloc_conf: {}", conf_val),
-        Err(e) => println!("Failed to read Jemalloc malloc_conf: {}", e),
-    }
-
-    // 2. Check environment variable MALLOC_CONF
-    match env::var("MALLOC_CONF") {
-        Ok(val) => println!("MALLOC_CONF: {}", val),
-        Err(_) => println!("MALLOC_CONF is not set"),
-    }
-
-    // 3. Check if the profiling controller is available
-    if let Some(prof_ctl) = jemalloc_pprof::PROF_CTL.as_ref() {
-        println!("Jemalloc profiling controller is available");
-        let mut prof_ctl = prof_ctl.lock().await;
-        // 4.Check whether profiling is activated
-        if prof_ctl.activated() {
-            println!("Jemalloc profiling is activated");
-            if let Ok(data) = prof_ctl.dump_pprof() {
-                std::fs::write("memory_profile.pb", data).expect("Failed to write a Profiling file");
-                println!("Memory Profiling Data has been generated: memory_profile.pb");
-            }
-        } else {
-            println!("Jemalloc profiling is NOT activated");
-        }
-    } else {
-        println!("Jemalloc profiling controller is NOT available");
-    }
-
-    // Get the memory usage statistics of Jemalloc
-    match stats::allocated::read() {
-        Ok(allocated) => println!("Currently allocated memory: {} bytes", allocated),
-        Err(e) => println!("Failed to read allocated memory stats: {}", e),
-    }
-
-    match stats::resident::read() {
-        Ok(resident) => println!("Currently resident memory: {} bytes", resident),
-        Err(e) => println!("Failed to read resident memory stats: {}", e),
-    }
-    match stats::mapped::read() {
-        Ok(mapped) => println!("Currently mapped memory: {} bytes", mapped),
-        Err(e) => println!("Failed to read mapped memory stats: {}", e),
-    }
-    match stats::metadata::read() {
-        Ok(metadata) => println!("Currently metadata memory: {} bytes", metadata),
-        Err(e) => println!("Failed to read metadata memory stats: {}", e),
-    }
-    match stats::active::read() {
-        Ok(active) => println!("Currently active memory: {} bytes", active),
-        Err(e) => println!("Failed to read active memory stats: {}", e),
-    }
-}
 
 const LOGO: &str = r#"
 
@@ -173,11 +111,6 @@ fn main() -> Result<()> {
     runtime.block_on(async_main())
 }
 async fn async_main() -> Result<()> {
-    #[cfg(not(target_env = "msvc"))]
-    {
-        check_jemalloc_profiling().await;
-        start_profilers();
-    }
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
@@ -201,7 +134,7 @@ async fn async_main() -> Result<()> {
 
     // Initialize performance profiling if enabled
     #[cfg(not(target_os = "windows"))]
-    profiling::start_profiling_if_enabled();
+    profiling::init_from_env().await;
 
     // Run parameters
     match run(opt).await {
@@ -424,7 +357,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 /// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
 /// false if set to false/0/no/off/disabled
 fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
-    std::env::var(var_name)
+    env::var(var_name)
         .unwrap_or_else(|_| default.to_string())
         .parse::<bool>()
         .unwrap_or(default)
@@ -511,7 +444,7 @@ async fn handle_shutdown(
 }
 
 fn init_update_check() {
-    let update_check_enable = std::env::var(ENV_UPDATE_CHECK)
+    let update_check_enable = env::var(ENV_UPDATE_CHECK)
         .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
         .parse::<bool>()
         .unwrap_or(DEFAULT_UPDATE_CHECK);
