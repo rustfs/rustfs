@@ -2218,6 +2218,7 @@ impl S3 for FS {
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                     ..Default::default()
                 };
 
