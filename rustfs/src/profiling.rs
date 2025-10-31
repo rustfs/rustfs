@@ -14,6 +14,8 @@
 
 use chrono::Utc;
 use jemalloc_pprof::PROF_CTL;
+#[allow(unused_imports)]
+use pprof::protos::Message;
 use rustfs_config::{
     DEFAULT_CPU_DURATION_SECS, DEFAULT_CPU_FREQ, DEFAULT_CPU_INTERVAL_SECS, DEFAULT_CPU_MODE, DEFAULT_ENABLE_PROFILING,
     DEFAULT_MEM_INTERVAL_SECS, DEFAULT_MEM_PERIODIC, DEFAULT_OUTPUT_DIR, ENV_CPU_DURATION_SECS, ENV_CPU_FREQ,
@@ -171,7 +173,11 @@ async fn start_cpu_continuous(freq_hz: i32) {
         warn!("profiling: continuous CPU guard already running");
         return;
     }
-    match pprof::ProfilerGuardBuilder::default().frequency(freq_hz).build() {
+    match pprof::ProfilerGuardBuilder::default()
+        .frequency(freq_hz)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+    {
         Ok(guard) => {
             *slot = Some(guard);
             info!(freq = freq_hz, "start continuous CPU profiling");
