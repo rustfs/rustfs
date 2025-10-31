@@ -123,7 +123,6 @@ zip = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
-opentelemetry = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
