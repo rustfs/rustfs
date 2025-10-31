@@ -138,7 +138,7 @@ pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 /// It is used to rotate the logs of the application.
 /// Default value: hour, eg: day,hour,minute,second
 /// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
-pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
+pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.

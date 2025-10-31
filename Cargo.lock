@@ -3162,6 +3162,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_filter"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c863f0904021b108aa8b2f55046443e6b1ebde8fd4a15c399893aae4fa069f"
+dependencies = [
+ "env_filter",
+ "log",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3609,7 +3628,7 @@ dependencies = [
  "http-body-util",
  "opentelemetry-semantic-conventions",
  "percent-encoding",
- "prost",
+ "prost 0.14.1",
  "prost-types",
  "reqwest",
  "rustc_version",
@@ -3717,7 +3736,7 @@ dependencies = [
  "mime",
  "percent-encoding",
  "pin-project",
- "prost",
+ "prost 0.14.1",
  "prost-types",
  "reqwest",
  "serde",
@@ -4358,6 +4377,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "inferno"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e96d2465363ed2d81857759fc864cf6bb7997f79327aec028d65bd7989393685"
+dependencies = [
+ "ahash",
+ "clap",
+ "crossbeam-channel",
+ "crossbeam-utils",
+ "dashmap",
+ "env_logger",
+ "indexmap 2.12.0",
+ "itoa",
+ "log",
+ "num-format",
+ "once_cell",
+ "quick-xml 0.37.5",
+ "rgb",
+ "str_stack",
+]
+
+[[package]]
 name = "inotify"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4463,6 +4504,23 @@ name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+
+[[package]]
+name = "jemalloc_pprof"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74ff642505c7ce8d31c0d43ec0e235c6fd4585d9b8172d8f9dd04d36590200b5"
+dependencies = [
+ "anyhow",
+ "libc",
+ "mappings",
+ "once_cell",
+ "pprof_util",
+ "tempfile",
+ "tikv-jemalloc-ctl",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "jobserver"
@@ -4791,6 +4849,19 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "mappings"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db4d277bb50d4508057e7bddd7fcd19ef4a4cc38051b6a5a36868d75ae2cbeb9"
+dependencies = [
+ "anyhow",
+ "libc",
+ "once_cell",
+ "pprof_util",
+ "tracing",
 ]
 
 [[package]]
@@ -5405,7 +5476,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk 0.31.0",
- "prost",
+ "prost 0.14.1",
  "thiserror 2.0.17",
  "tokio",
  "tonic",
@@ -5420,7 +5491,7 @@ checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
 dependencies = [
  "opentelemetry 0.31.0",
  "opentelemetry_sdk 0.31.0",
- "prost",
+ "prost 0.14.1",
  "tonic",
  "tonic-prost",
 ]
@@ -5919,7 +5990,7 @@ dependencies = [
  "backtrace",
  "cfg-if",
  "findshlibs",
- "inferno",
+ "inferno 0.11.21",
  "libc",
  "log",
  "nix 0.26.4",
@@ -5931,6 +6002,21 @@ dependencies = [
  "symbolic-demangle",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "pprof_util"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9aba4251d95ac86f14c33e688d57a9344bfcff29e9b0c5a063fc66b5facc8a1"
+dependencies = [
+ "anyhow",
+ "backtrace",
+ "flate2",
+ "inferno 0.12.3",
+ "num",
+ "paste",
+ "prost 0.13.5",
 ]
 
 [[package]]
@@ -5982,12 +6068,22 @@ dependencies = [
 
 [[package]]
 name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.14.1",
 ]
 
 [[package]]
@@ -6003,13 +6099,26 @@ dependencies = [
  "once_cell",
  "petgraph 0.7.1",
  "prettyplease",
- "prost",
+ "prost 0.14.1",
  "prost-types",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
  "syn 2.0.108",
  "tempfile",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
 ]
 
 [[package]]
@@ -6031,7 +6140,7 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9b4db3d6da204ed77bb26ba83b6122a73aeb2e87e25fbf7ad2e84c4ccbf8f72"
 dependencies = [
- "prost",
+ "prost 0.14.1",
 ]
 
 [[package]]
@@ -6676,13 +6785,13 @@ dependencies = [
  "http-body 1.0.1",
  "hyper 1.7.0",
  "hyper-util",
+ "jemalloc_pprof",
  "libsystemd",
  "matchit",
  "md5",
  "metrics",
  "mimalloc",
  "mime_guess",
- "opentelemetry 0.31.0",
  "pin-project-lite",
  "pprof",
  "reqwest",
@@ -6719,6 +6828,7 @@ dependencies = [
  "sysctl",
  "sysinfo",
  "thiserror 2.0.17",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "time",
  "tokio",
@@ -7146,7 +7256,7 @@ name = "rustfs-protos"
 version = "0.0.5"
 dependencies = [
  "flatbuffers",
- "prost",
+ "prost 0.14.1",
  "rustfs-common",
  "tonic",
  "tonic-prost",
@@ -8624,6 +8734,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "tikv-jemalloc-sys"
 version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8898,7 +9019,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66bd50ad6ce1252d87ef024b3d64fe4c3cf54a86fb9ef4c631fdd0ded7aeaa67"
 dependencies = [
  "bytes",
- "prost",
+ "prost 0.14.1",
  "tonic",
 ]
 

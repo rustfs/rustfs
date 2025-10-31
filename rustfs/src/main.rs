@@ -25,6 +25,7 @@ mod storage;
 mod update;
 mod version;
 
+// Ensure the correct path for parse_license is imported
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -62,6 +63,7 @@ use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::s3_error;
+use std::env;
 use std::io::{Error, Result};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -126,7 +128,7 @@ async fn async_main() -> Result<()> {
 
     // Initialize performance profiling if enabled
     #[cfg(not(target_os = "windows"))]
-    profiling::start_profiling_if_enabled();
+    profiling::init_from_env().await;
 
     // Run parameters
     match run(opt).await {
@@ -349,7 +351,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 /// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
 /// false if set to false/0/no/off/disabled
 fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
-    std::env::var(var_name)
+    env::var(var_name)
         .unwrap_or_else(|_| default.to_string())
         .parse::<bool>()
         .unwrap_or(default)
@@ -436,7 +438,7 @@ async fn handle_shutdown(
 }
 
 fn init_update_check() {
-    let update_check_enable = std::env::var(ENV_UPDATE_CHECK)
+    let update_check_enable = env::var(ENV_UPDATE_CHECK)
         .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
         .parse::<bool>()
         .unwrap_or(DEFAULT_UPDATE_CHECK);
