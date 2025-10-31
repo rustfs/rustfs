@@ -26,7 +26,6 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::profiling::check_jemalloc_profiling;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
