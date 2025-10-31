@@ -89,9 +89,6 @@ pub mod tier;
 pub mod trace;
 pub mod user;
 
-#[cfg(not(target_os = "windows"))]
-use pprof::protos::Message;
-
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
