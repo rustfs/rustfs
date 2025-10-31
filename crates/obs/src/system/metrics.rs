@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const PROCESS_CPU_USAGE: &str = "process.cpu.usage";
-pub const PROCESS_CPU_UTILIZATION: &str = "process.cpu.utilization";
-pub const PROCESS_MEMORY_USAGE: &str = "process.memory.usage";
-pub const PROCESS_MEMORY_VIRTUAL: &str = "process.memory.virtual";
-pub const PROCESS_DISK_IO: &str = "process.disk.io";
-pub const PROCESS_NETWORK_IO: &str = "process.network.io";
-pub const PROCESS_NETWORK_IO_PER_INTERFACE: &str = "process.network.io.per_interface";
-pub const PROCESS_STATUS: &str = "process.status";
+use opentelemetry::metrics::{Gauge, Meter};
+
+pub(crate) const PROCESS_CPU_USAGE: &str = "process.cpu.usage";
+pub(crate) const PROCESS_CPU_UTILIZATION: &str = "process.cpu.utilization";
+pub(crate) const PROCESS_MEMORY_USAGE: &str = "process.memory.usage";
+pub(crate) const PROCESS_MEMORY_VIRTUAL: &str = "process.memory.virtual";
+pub(crate) const PROCESS_DISK_IO: &str = "process.disk.io";
+pub(crate) const PROCESS_NETWORK_IO: &str = "process.network.io";
+pub(crate) const PROCESS_NETWORK_IO_PER_INTERFACE: &str = "process.network.io.per_interface";
+pub(crate) const PROCESS_STATUS: &str = "process.status";
 #[cfg(feature = "gpu")]
 pub const PROCESS_GPU_MEMORY_USAGE: &str = "process.gpu.memory.usage";
-pub const DIRECTION: opentelemetry::Key = opentelemetry::Key::from_static_str("direction");
-pub const STATUS: opentelemetry::Key = opentelemetry::Key::from_static_str("status");
-pub const INTERFACE: opentelemetry::Key = opentelemetry::Key::from_static_str("interface");
+pub(crate) const DIRECTION: opentelemetry::Key = opentelemetry::Key::from_static_str("direction");
+pub(crate) const STATUS: opentelemetry::Key = opentelemetry::Key::from_static_str("status");
+pub(crate) const INTERFACE: opentelemetry::Key = opentelemetry::Key::from_static_str("interface");
 
 /// `Metrics` struct holds the OpenTelemetry metrics for process monitoring.
 /// It contains various metrics such as CPU usage, memory usage,
@@ -36,20 +38,20 @@ pub const INTERFACE: opentelemetry::Key = opentelemetry::Key::from_static_str("i
 /// The `new` method initializes the metrics using the provided
 /// `opentelemetry::metrics::Meter`.
 pub struct Metrics {
-    pub cpu_usage: opentelemetry::metrics::Gauge<f64>,
-    pub cpu_utilization: opentelemetry::metrics::Gauge<f64>,
-    pub memory_usage: opentelemetry::metrics::Gauge<i64>,
-    pub memory_virtual: opentelemetry::metrics::Gauge<i64>,
-    pub disk_io: opentelemetry::metrics::Gauge<i64>,
-    pub network_io: opentelemetry::metrics::Gauge<i64>,
-    pub network_io_per_interface: opentelemetry::metrics::Gauge<i64>,
-    pub process_status: opentelemetry::metrics::Gauge<i64>,
+    pub cpu_usage: Gauge<f64>,
+    pub cpu_utilization: Gauge<f64>,
+    pub memory_usage: Gauge<i64>,
+    pub memory_virtual: Gauge<i64>,
+    pub disk_io: Gauge<i64>,
+    pub network_io: Gauge<i64>,
+    pub network_io_per_interface: Gauge<i64>,
+    pub process_status: Gauge<i64>,
     #[cfg(feature = "gpu")]
-    pub gpu_memory_usage: opentelemetry::metrics::Gauge<u64>,
+    pub gpu_memory_usage: Gauge<u64>,
 }
 
 impl Metrics {
-    pub fn new(meter: &opentelemetry::metrics::Meter) -> Self {
+    pub fn new(meter: &Meter) -> Self {
         let cpu_usage = meter
             .f64_gauge(PROCESS_CPU_USAGE)
             .with_description("The percentage of CPU in use.")

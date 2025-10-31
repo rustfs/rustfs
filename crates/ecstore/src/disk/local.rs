@@ -319,8 +319,8 @@ impl LocalDisk {
         }
 
         if cfg!(target_os = "windows") {
-            // 在 Windows 上，卷名不应该包含保留字符。
-            // 这个正则表达式匹配了不允许的字符。
+            // Windows volume names must not include reserved characters.
+            // This regular expression matches disallowed characters.
             if volname.contains('|')
                 || volname.contains('<')
                 || volname.contains('>')
@@ -333,7 +333,7 @@ impl LocalDisk {
                 return false;
             }
         } else {
-            // 对于非 Windows 系统，可能需要其他的验证逻辑。
+            // Non-Windows systems may require additional validation rules.
         }
 
         true
@@ -563,7 +563,7 @@ impl LocalDisk {
 
         // return Ok(());
 
-        // TODO: 异步通知 检测硬盘空间 清空回收站
+        // TODO: async notifications for disk space checks and trash cleanup
 
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
         // if let Some(parent) = trash_path.parent() {
@@ -846,13 +846,13 @@ impl LocalDisk {
             }
         }
 
-        // 没有版本了，删除 xl.meta
+        // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
             return Ok(());
         }
 
-        // 更新 xl.meta
+        // Update xl.meta
         let buf = fm.marshal_msg()?;
 
         let volume_dir = self.get_bucket_path(volume)?;
@@ -984,7 +984,8 @@ impl LocalDisk {
     #[async_recursion::async_recursion]
     async fn scan_dir<W>(
         &self,
-        current: &mut String,
+        mut current: String,
+        mut prefix: String,
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
@@ -1022,14 +1023,16 @@ impl LocalDisk {
             return Ok(());
         }
 
-        let mut entries = match self.list_dir("", &opts.bucket, current, -1).await {
+        // TODO: add lock
+
+        let mut entries = match self.list_dir("", &opts.bucket, &current, -1).await {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    debug!("scan list_dir {}, err {:?}", &current, &e);
+                    error!("scan list_dir {}, err {:?}", &current, &e);
                 }
 
-                if opts.report_notfound && e == Error::FileNotFound && current == &opts.base_dir {
+                if opts.report_notfound && e == Error::FileNotFound && current == opts.base_dir {
                     return Err(DiskError::FileNotFound);
                 }
 
@@ -1041,14 +1044,13 @@ impl LocalDisk {
             return Ok(());
         }
 
-        let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
-        *current = current.trim_matches(s).to_owned();
+        current = current.trim_matches('/').to_owned();
 
         let bucket = opts.bucket.as_str();
 
         let mut dir_objes = HashSet::new();
 
-        // 第一层过滤
+        // First-level filtering
         for item in entries.iter_mut() {
             let entry = item.clone();
             // check limit
@@ -1056,11 +1058,9 @@ impl LocalDisk {
                 return Ok(());
             }
             // check prefix
-            if let Some(filter_prefix) = &opts.filter_prefix {
-                if !entry.starts_with(filter_prefix) {
-                    *item = "".to_owned();
-                    continue;
-                }
+            if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
+                *item = "".to_owned();
+                continue;
             }
 
             if let Some(forward) = &forward {
@@ -1085,15 +1085,20 @@ impl LocalDisk {
             *item = "".to_owned();
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
-                //
                 let metadata = self
                     .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
                     .await?;
 
-                // 用 strip_suffix 只删除一次
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
+
+                // if opts.limit > 0
+                //     && let Ok(meta) = FileMeta::load(&metadata)
+                //     && !meta.all_hidden(true)
+                // {
+                *objs_returned += 1;
+                // }
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
@@ -1101,30 +1106,27 @@ impl LocalDisk {
                     ..Default::default()
                 })
                 .await?;
-                *objs_returned += 1;
 
-                // warn!("scan list_dir {}, write_obj done, name: {:?}", &current, &name);
                 return Ok(());
             }
         }
 
         entries.sort();
 
-        let mut entries = entries.as_slice();
         if let Some(forward) = &forward {
             for (i, entry) in entries.iter().enumerate() {
                 if entry >= forward || forward.starts_with(entry.as_str()) {
-                    entries = &entries[i..];
+                    entries.drain(..i);
                     break;
                 }
             }
         }
 
         let mut dir_stack: Vec<String> = Vec::with_capacity(5);
+        prefix = "".to_owned();
 
         for entry in entries.iter() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                // warn!("scan list_dir {}, limit reached 2", &current);
                 return Ok(());
             }
 
@@ -1132,7 +1134,7 @@ impl LocalDisk {
                 continue;
             }
 
-            let name = path_join_buf(&[current, entry]);
+            let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
             if !dir_stack.is_empty() {
                 if let Some(pop) = dir_stack.last().cloned() {
@@ -1144,9 +1146,7 @@ impl LocalDisk {
                         .await?;
 
                         if opts.recursive {
-                            let mut opts = opts.clone();
-                            opts.filter_prefix = None;
-                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), &opts, out, objs_returned)).await {
+                            if let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned)).await {
                                 error!("scan_dir err {:?}", er);
                             }
                         }
@@ -1181,7 +1181,12 @@ impl LocalDisk {
                     meta.metadata = res;
 
                     out.write_obj(&meta).await?;
+
+                    // if let Ok(meta) = FileMeta::load(&meta.metadata)
+                    //     && !meta.all_hidden(true)
+                    // {
                     *objs_returned += 1;
+                    // }
                 }
                 Err(err) => {
                     if err == Error::FileNotFound || err == Error::IsNotRegular {
@@ -1200,7 +1205,6 @@ impl LocalDisk {
 
         while let Some(dir) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                // warn!("scan list_dir {}, limit reached 3", &current);
                 return Ok(());
             }
 
@@ -1209,19 +1213,14 @@ impl LocalDisk {
                 ..Default::default()
             })
             .await?;
-            *objs_returned += 1;
 
             if opts.recursive {
-                let mut dir = dir;
-                let mut opts = opts.clone();
-                opts.filter_prefix = None;
-                if let Err(er) = Box::pin(self.scan_dir(&mut dir, &opts, out, objs_returned)).await {
+                if let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned)).await {
                     warn!("scan_dir err {:?}", &er);
                 }
             }
         }
 
-        // warn!("scan list_dir {}, done", &current);
         Ok(())
     }
 }
@@ -1230,7 +1229,7 @@ fn is_root_path(path: impl AsRef<Path>) -> bool {
     path.as_ref().components().count() == 1 && path.as_ref().has_root()
 }
 
-// 过滤 std::io::ErrorKind::NotFound
+// Filter std::io::ErrorKind::NotFound
 pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metadata>)> {
     let p = path.as_ref();
     let (data, meta) = match read_file_all(&p).await {
@@ -1884,8 +1883,14 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let mut current = opts.base_dir.clone();
-        self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
+        self.scan_dir(
+            opts.base_dir.clone(),
+            opts.filter_prefix.clone().unwrap_or_default(),
+            &opts,
+            &mut out,
+            &mut objs_returned,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1915,11 +1920,11 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        // xl.meta 路径
+        // xl.meta path
         let src_file_path = src_volume_dir.join(Path::new(format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str()));
         let dst_file_path = dst_volume_dir.join(Path::new(format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str()));
 
-        // data_dir 路径
+        // data_dir path
         let has_data_dir_path = {
             let has_data_dir = {
                 if !fi.is_remote() {
@@ -1947,7 +1952,7 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // 读旧 xl.meta
+        // Read the previous xl.meta
 
         let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
             Ok(res) => Some(res),
@@ -2432,7 +2437,7 @@ impl DiskAPI for LocalDisk {
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
-        // TODO: 不能用递归删除，如果目录下面有文件，返回 errVolumeNotEmpty
+        // TODO: avoid recursive deletion; return errVolumeNotEmpty when files remain
 
         if let Err(err) = fs::remove_dir_all(&p).await {
             let e: DiskError = to_volume_error(err).into();
@@ -2586,7 +2591,7 @@ mod test {
         assert!(object_path.to_string_lossy().contains("test-bucket"));
         assert!(object_path.to_string_lossy().contains("test-object"));
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -2651,7 +2656,7 @@ mod test {
             disk.delete_volume(vol).await.unwrap();
         }
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -2675,7 +2680,7 @@ mod test {
         assert!(!disk_info.fs_type.is_empty());
         assert!(disk_info.total > 0);
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 

@@ -219,7 +219,7 @@ impl ECStore {
             disk_map.insert(i, disks);
         }
 
-        // 替换本地磁盘
+        // Replace the local disk
         if !is_dist_erasure().await {
             let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
             for disk in local_disks {
@@ -243,7 +243,7 @@ impl ECStore {
             decommission_cancelers,
         });
 
-        // 只有在全局部署ID尚未设置时才设置它
+        // Only set it when the global deployment ID is not yet configured
         if let Some(dep_id) = deployment_id {
             if get_global_deployment_id().is_none() {
                 set_global_deployment_id(dep_id);
@@ -383,7 +383,7 @@ impl ECStore {
     //     Ok(info)
     // }
 
-    // 读所有
+    // Read all entries
     // define in store_list_objects.rs
     // async fn list_merged(&self, opts: &ListPathOptions, delimiter: &str) -> Result<Vec<ObjectInfo>> {
     //     let walk_opts = WalkDirOptions {
@@ -425,7 +425,7 @@ impl ECStore {
 
     //                 if !uniq.contains(&entry.name) {
     //                     uniq.insert(entry.name.clone());
-    //                     // TODO: 过滤
+    //                     // TODO: filter
 
     //                     if opts.limit > 0 && ress.len() as i32 >= opts.limit {
     //                         return Ok(ress);
@@ -516,7 +516,7 @@ impl ECStore {
     }
 
     async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
-        // // 先随机返回一个
+        // // Return a random one first
 
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
         server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
@@ -546,7 +546,7 @@ impl ECStore {
         let mut n_sets = vec![0; self.pools.len()];
         let mut infos = vec![Vec::new(); self.pools.len()];
 
-        // TODO: 并发
+        // TODO: add concurrency
         for (idx, pool) in self.pools.iter().enumerate() {
             if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
                 continue;
@@ -713,7 +713,7 @@ impl ECStore {
 
         let mut ress = Vec::new();
 
-        // join_all 结果跟输入顺序一致
+        // join_all preserves the input order
         for (i, res) in results.into_iter().enumerate() {
             let index = i;
 
@@ -984,7 +984,7 @@ pub async fn all_local_disk() -> Vec<DiskStore> {
         .collect()
 }
 
-// init_local_disks 初始化本地磁盘，server 启动前必须初始化成功
+// init_local_disks must succeed before the server starts
 pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
     let opt = &DiskOption {
         cleanup: true,
@@ -1317,7 +1317,7 @@ impl StorageAPI for ECStore {
 
         // TODO: replication opts.srdelete_op
 
-        // 删除 meta
+        // Delete the metadata
         self.delete_all(RUSTFS_META_BUCKET, format!("{BUCKET_META_PREFIX}/{bucket}").as_str())
             .await?;
         Ok(())
@@ -1469,7 +1469,7 @@ impl StorageAPI for ECStore {
         let mut gopts = opts.clone();
         gopts.no_lock = true;
 
-        // 查询在哪个 pool
+        // Determine which pool contains it
         let (mut pinfo, errs) = self
             .get_pool_info_existing_with_opts(bucket, object, &gopts)
             .await
@@ -1543,7 +1543,7 @@ impl StorageAPI for ECStore {
             })
             .collect();
 
-        // 默认返回值
+        // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
@@ -1625,7 +1625,7 @@ impl StorageAPI for ECStore {
         // //     results.push(jh.await.unwrap());
         // // }
 
-        // // 记录 pool Index 对应的 objects pool_idx -> objects idx
+        // // Record the mapping pool_idx -> object index
         // let mut pool_obj_idx_map = HashMap::new();
         // let mut orig_index_map = HashMap::new();
 
@@ -1675,9 +1675,9 @@ impl StorageAPI for ECStore {
 
         // if !pool_obj_idx_map.is_empty() {
         //     for (i, sets) in self.pools.iter().enumerate() {
-        //         //  取 pool idx 对应的 objects index
+        //         // Retrieve the object index for a pool idx
         //         if let Some(objs) = pool_obj_idx_map.get(&i) {
-        //             //  取对应 obj，理论上不会 none
+        //             // Fetch the corresponding object (should never be None)
         //             // let objs: Vec<ObjectToDelete> = obj_idxs.iter().filter_map(|&idx| objects.get(idx).cloned()).collect();
 
         //             if objs.is_empty() {
@@ -1686,10 +1686,10 @@ impl StorageAPI for ECStore {
 
         //             let (pdel_objs, perrs) = sets.delete_objects(bucket, objs.clone(), opts.clone()).await?;
 
-        //             // 同时存入不可能为 none
+        //             // Insert simultaneously (should never be None)
         //             let org_indexes = orig_index_map.get(&i).unwrap();
 
-        //             // perrs 的顺序理论上跟 obj_idxs 顺序一致
+        //             // perrs should follow the same order as obj_idxs
         //             for (i, err) in perrs.into_iter().enumerate() {
         //                 let obj_idx = org_indexes[i];
 

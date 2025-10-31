@@ -297,24 +297,24 @@ impl Erasure {
     pub fn encode_data(self: Arc<Self>, data: &[u8]) -> Result<Vec<Bytes>> {
         let (shard_size, total_size) = self.need_size(data.len());
 
-        // 生成一个新的 所需的所有分片数据长度
+        // Generate the total length required for all shards
         let mut data_buffer = BytesMut::with_capacity(total_size);
 
-        // 复制源数据
+        // Copy the source data
         data_buffer.extend_from_slice(data);
         data_buffer.resize(total_size, 0u8);
 
         {
-            // ec encode, 结果会写进 data_buffer
+            // Perform EC encoding; the results go into data_buffer
             let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(shard_size).collect();
 
-            // parity 数量大于 0 才 ec
+            // Only perform EC encoding when parity shards are present
             if self.parity_shards > 0 {
                 self.encoder.as_ref().unwrap().encode(data_slices).map_err(Error::other)?;
             }
         }
 
-        // 零拷贝分片，所有 shard 引用 data_buffer
+        // Zero-copy shards: every shard references data_buffer
         let mut data_buffer = data_buffer.freeze();
         let mut shards = Vec::with_capacity(self.total_shard_count());
         for _ in 0..self.total_shard_count() {
@@ -333,13 +333,13 @@ impl Erasure {
         Ok(())
     }
 
-    // 每个分片长度，所需要的总长度
+    // The length per shard and the total required length
     fn need_size(&self, data_size: usize) -> (usize, usize) {
         let shard_size = self.shard_size(data_size);
         (shard_size, shard_size * (self.total_shard_count()))
     }
 
-    // 算出每个分片大小
+    // Compute each shard size
     pub fn shard_size(&self, data_size: usize) -> usize {
         data_size.div_ceil(self.data_shards)
     }
@@ -354,7 +354,7 @@ impl Erasure {
         let last_shard_size = last_block_size.div_ceil(self.data_shards);
         num_shards * self.shard_size(self.block_size) + last_shard_size
 
-        // // 因为写入的时候 ec 需要补全，所以最后一个长度应该也是一样的
+        // When writing, EC pads the data so the last shard length should match
         // if last_block_size != 0 {
         //     num_shards += 1
         // }
@@ -447,12 +447,12 @@ pub trait ReadAt {
 }
 
 pub struct ShardReader {
-    readers: Vec<Option<BitrotReader>>, // 磁盘
-    data_block_count: usize,            // 总的分片数量
+    readers: Vec<Option<BitrotReader>>, // Disk readers
+    data_block_count: usize,            // Total number of shards
     parity_block_count: usize,
-    shard_size: usize,      // 每个分片的块大小 一次读取一块
-    shard_file_size: usize, // 分片文件总长度
-    offset: usize,          // 在分片中的 offset
+    shard_size: usize,      // Block size per shard (read one block at a time)
+    shard_file_size: usize, // Total size of the shard file
+    offset: usize,          // Offset within the shard
 }
 
 impl ShardReader {
@@ -470,7 +470,7 @@ impl ShardReader {
     pub async fn read(&mut self) -> Result<Vec<Option<Vec<u8>>>> {
         // let mut disks = self.readers;
         let reader_length = self.readers.len();
-        // 需要读取的块长度
+        // Length of the block to read
         let mut read_length = self.shard_size;
         if self.offset + read_length > self.shard_file_size {
             read_length = self.shard_file_size - self.offset

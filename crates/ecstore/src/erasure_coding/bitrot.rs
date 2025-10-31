@@ -387,7 +387,7 @@ mod tests {
         }
         assert_eq!(n, data.len());
 
-        // 读
+        // Read
         let reader = bitrot_writer.into_inner();
         let reader = Cursor::new(reader.into_inner());
         let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256);
@@ -433,7 +433,7 @@ mod tests {
             let res = bitrot_reader.read(&mut buf).await;
 
             if idx == count - 1 {
-                // 最后一个块，应该返回错误
+                // The last chunk should trigger an error
                 assert!(res.is_err());
                 assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
                 break;

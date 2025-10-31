@@ -73,7 +73,7 @@ http.workspace = true
 http-body.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process"] }
 tokio-rustls = { workspace = true }
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -113,6 +113,7 @@ pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
+sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
 tracing.workspace = true
 url = { workspace = true }

@@ -1,239 +1,239 @@
-# RustFS 文档中心
+# RustFS Documentation Center
 
-欢迎来到 RustFS 分布式文件系统文档中心！
+Welcome to the RustFS distributed file system documentation center!
 
-## 📚 文档导航
+## 📚 Documentation Navigation
 
-### 🔐 KMS (密钥管理服务)
+### 🔐 KMS (Key Management Service)
 
-RustFS KMS 提供企业级密钥管理和数据加密服务。
+RustFS KMS delivers enterprise-grade key management and data encryption.
 
-| 文档 | 描述 | 适用场景 |
+| Document | Description | Audience |
 |------|------|----------|
-| [KMS 使用指南](./kms/README.md) | 完整的 KMS 使用文档，包含快速开始、配置和部署 | 所有用户必读 |
-| [HTTP API 接口](./kms/http-api.md) | HTTP REST API 接口文档和使用示例 | 管理员和运维 |
-| [编程 API 接口](./kms/api.md) | Rust 库编程接口和代码示例 | 开发者集成 |
-| [配置参考](./kms/configuration.md) | 完整的配置选项和环境变量说明 | 系统管理员 |
-| [故障排除](./kms/troubleshooting.md) | 常见问题诊断和解决方案 | 运维人员 |
-| [安全指南](./kms/security.md) | 安全最佳实践和合规指导 | 安全架构师 |
+| [KMS User Guide](./kms/README.md) | Comprehensive KMS guide with quick start, configuration, and deployment steps | Required reading for all users |
+| [HTTP API Reference](./kms/http-api.md) | HTTP REST API reference with usage examples | Administrators and operators |
+| [Programming API Reference](./kms/api.md) | Rust library APIs and code samples | Developers |
+| [Configuration Reference](./kms/configuration.md) | Complete configuration options and environment variables | System administrators |
+| [Troubleshooting](./kms/troubleshooting.md) | Diagnosis tips and solutions for common issues | Operations engineers |
+| [Security Guide](./kms/security.md) | Security best practices and compliance guidance | Security architects |
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 1. KMS 5分钟快速部署
+### 1. Deploy KMS in 5 Minutes
 
-**生产环境（使用 Vault）**
+**Production (Vault backend)**
 
 ```bash
-# 1. 启用 Vault 功能编译
+# 1. Enable the Vault feature flag
 cargo build --features vault --release
 
-# 2. 配置环境变量
+# 2. Configure environment variables
 export RUSTFS_VAULT_ADDRESS=https://vault.company.com:8200
 export RUSTFS_VAULT_TOKEN=hvs.CAESIJ...
 
-# 3. 启动服务
+# 3. Launch the service
 ./target/release/rustfs server
 ```
 
-**开发测试（使用本地后端）**
+**Development & Testing (Local backend)**
 
 ```bash
-# 1. 编译测试版本
+# 1. Build a release binary
 cargo build --release
 
-# 2. 配置本地存储
+# 2. Configure local storage
 export RUSTFS_KMS_BACKEND=Local
 export RUSTFS_KMS_LOCAL_KEY_DIR=/tmp/rustfs-keys
 
-# 3. 启动服务
+# 3. Launch the service
 ./target/release/rustfs server
 ```
 
-### 2. S3 兼容加密
+### 2. S3-Compatible Encryption
 
 ```bash
-# 上传加密文件
+# Upload an encrypted object
 curl -X PUT https://rustfs.company.com/bucket/sensitive.txt \
   -H "x-amz-server-side-encryption: AES256" \
   --data-binary @sensitive.txt
 
-# 自动解密下载
+# Download with automatic decryption
 curl https://rustfs.company.com/bucket/sensitive.txt
 ```
 
-## 🏗️ 架构概览
+## 🏗️ Architecture Overview
 
-### KMS 三层安全架构
+### Three-Layer KMS Security Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                  应用层                          │
+│                  Application Layer              │
 │  ┌─────────────┐    ┌─────────────┐             │
-│  │   S3 API    │    │   REST API  │             │
+│  │    S3 API    │    │   REST API  │             │
 │  └─────────────┘    └─────────────┘             │
 ├─────────────────────────────────────────────────┤
-│                  加密层                          │
-│  ┌─────────────┐ 加密 ┌─────────────────┐        │
-│  │  对象数据    │ ◄───► │  数据密钥 (DEK) │        │
-│  └─────────────┘      └─────────────────┘        │
+│                  Encryption Layer               │
+│  ┌─────────────┐ Encrypt ┌─────────────────┐    │
+│  │ Object Data │ ◄──────► │ Data Key (DEK) │    │
+│  └─────────────┘          └─────────────────┘   │
 ├─────────────────────────────────────────────────┤
-│                 密钥管理层                        │
-│  ┌─────────────────┐ 加密 ┌──────────────┐       │
-│  │  数据密钥 (DEK) │ ◄────│   主密钥     │       │
-│  └─────────────────┘      │ (Vault/HSM)  │       │
-│                           └──────────────┘       │
+│                 Key Management Layer            │
+│  ┌─────────────────┐ Encrypt ┌──────────────┐   │
+│  │ Data Key (DEK) │ ◄───────│  Master Key   │   │
+│  └─────────────────┘        │ (Vault/HSM)  │   │
+│                             └──────────────┘   │
 └─────────────────────────────────────────────────┘
 ```
 
-### 核心特性
+### Key Features
 
-- ✅ **多层加密**: Master Key → DEK → Object Data
-- ✅ **高性能**: 1MB 流式加密，支持大文件
-- ✅ **多后端**: Vault (生产) + Local (测试)
-- ✅ **S3 兼容**: 支持标准 SSE-S3/SSE-KMS 头
-- ✅ **企业级**: 审计、监控、合规支持
+- ✅ **Multi-layer encryption**: Master Key → DEK → Object Data
+- ✅ **High performance**: 1 MB streaming encryption with large file support
+- ✅ **Multiple backends**: Vault (production) + Local (testing)
+- ✅ **S3 compatibility**: Supports standard SSE-S3/SSE-KMS headers
+- ✅ **Enterprise-ready**: Auditing, monitoring, and compliance features
 
-## 📖 学习路径
+## 📖 Learning Paths
 
-### 👨‍💻 开发者
+### 👨‍💻 Developers
 
-1. 阅读 [编程 API 接口](./kms/api.md) 了解 Rust 库使用
-2. 查看代码示例学习集成方法
-3. 参考 [故障排除](./kms/troubleshooting.md) 解决问题
+1. Read the [Programming API Reference](./kms/api.md) to learn the Rust library
+2. Review the sample code to understand integration patterns
+3. Consult [Troubleshooting](./kms/troubleshooting.md) when issues occur
 
-### 👨‍💼 系统管理员
+### 👨‍💼 System Administrators
 
-1. 从 [KMS 使用指南](./kms/README.md) 开始
-2. 学习 [HTTP API 接口](./kms/http-api.md) 进行管理
-3. 详细阅读 [配置参考](./kms/configuration.md)
-4. 设置监控和日志
+1. Start with the [KMS User Guide](./kms/README.md)
+2. Learn the [HTTP API Reference](./kms/http-api.md) for management tasks
+3. Study the [Configuration Reference](./kms/configuration.md) in depth
+4. Configure monitoring and logging
 
-### 👨‍🔧 运维工程师
+### 👨‍🔧 Operations Engineers
 
-1. 熟悉 [HTTP API 接口](./kms/http-api.md) 进行日常管理
-2. 掌握 [故障排除](./kms/troubleshooting.md) 技能
-3. 了解 [安全指南](./kms/security.md) 要求
-4. 建立运维流程
+1. Become familiar with the [HTTP API Reference](./kms/http-api.md) for day-to-day work
+2. Master the [Troubleshooting](./kms/troubleshooting.md) procedures
+3. Understand the requirements in the [Security Guide](./kms/security.md)
+4. Establish operational runbooks
 
-### 🔒 安全架构师
+### 🔒 Security Architects
 
-1. 深入学习 [安全指南](./kms/security.md)
-2. 评估威胁模型和风险
-3. 制定安全策略
+1. Dive into the [Security Guide](./kms/security.md)
+2. Evaluate threat models and risk posture
+3. Define security policies
 
-## 🤝 贡献指南
+## 🤝 Contribution Guide
 
-我们欢迎社区贡献！
+We welcome community contributions!
 
-### 文档贡献
+### Documentation Contributions
 
 ```bash
-# 1. Fork 项目
+# 1. Fork the repository
 git clone https://github.com/your-username/rustfs.git
 
-# 2. 创建文档分支
+# 2. Create a documentation branch
 git checkout -b docs/improve-kms-guide
 
-# 3. 编辑文档
-# 编辑 docs/kms/ 下的 Markdown 文件
+# 3. Edit the documentation
+# Update Markdown files under docs/kms/
 
-# 4. 提交更改
+# 4. Commit the changes
 git add docs/
 git commit -m "docs: improve KMS configuration examples"
 
-# 5. 创建 Pull Request
+# 5. Open a Pull Request
 gh pr create --title "Improve KMS documentation"
 ```
 
-### 文档规范
+### Documentation Guidelines
 
-- 使用清晰的标题和结构
-- 提供可运行的代码示例
-- 包含适当的警告和提示
-- 支持多种使用场景
-- 保持内容最新
+- Use clear headings and structure
+- Provide runnable code examples
+- Include warnings and tips where appropriate
+- Support multiple usage scenarios
+- Keep the content up to date
 
-## 📞 支持与反馈
+## 📞 Support & Feedback
 
-### 获取帮助
+### Getting Help
 
 - **GitHub Issues**: https://github.com/rustfs/rustfs/issues
-- **讨论区**: https://github.com/rustfs/rustfs/discussions  
-- **文档问题**: 在相关文档页面创建 Issue
-- **安全问题**: security@rustfs.com
+- **Discussion Forum**: https://github.com/rustfs/rustfs/discussions
+- **Documentation Questions**: Open an issue on the relevant document
+- **Security Concerns**: security@rustfs.com
 
-### 问题报告模板
+### Issue Reporting Template
 
-报告问题时请提供：
+When reporting a problem, please provide:
 
 ```markdown
-**环境信息**
-- RustFS 版本: v1.0.0
-- 操作系统: Ubuntu 20.04
-- Rust 版本: 1.75.0
+**Environment**
+- RustFS version: v1.0.0
+- Operating system: Ubuntu 20.04
+- Rust version: 1.75.0
 
-**问题描述**
-简要描述遇到的问题...
+**Issue Description**
+Summarize the problem you encountered...
 
-**重现步骤**
-1. 步骤一
-2. 步骤二
-3. 步骤三
+**Reproduction Steps**
+1. Step one
+2. Step two
+3. Step three
 
-**期望行为**
-描述期望的正确行为...
+**Expected Behavior**
+Describe what you expected to happen...
 
-**实际行为**
-描述实际发生的情况...
+**Actual Behavior**
+Describe what actually happened...
 
-**相关日志**
+**Relevant Logs**
 ```bash
-# 粘贴相关日志
+# Paste relevant log excerpts
 ```
 
-**附加信息**
-其他可能有用的信息...
+**Additional Information**
+Any other details that may help...
 ```
 
-## 📈 版本历史
+## 📈 Release History
 
-| 版本 | 发布日期 | 主要特性 |
+| Version | Release Date | Highlights |
 |------|----------|----------|
-| v1.0.0 | 2024-01-15 | 🎉 首个正式版本，完整 KMS 功能 |
-| v0.9.0 | 2024-01-01 | 🔐 KMS 系统重构，性能优化 |
-| v0.8.0 | 2023-12-15 | ⚡ 流式加密，1MB 块大小优化 |
+| v1.0.0 | 2024-01-15 | 🎉 First official release with full KMS functionality |
+| v0.9.0 | 2024-01-01 | 🔐 KMS system refactor with performance optimizations |
+| v0.8.0 | 2023-12-15 | ⚡ Streaming encryption with 1 MB block size tuning |
 
-## 🗺️ 开发路线图
+## 🗺️ Roadmap
 
-### 即将发布 (v1.1.0)
+### Coming Soon (v1.1.0)
 
-- [ ] 密钥自动轮转
-- [ ] HSM 集成支持
-- [ ] Web UI 管理界面
-- [ ] 更多合规性支持 (SOC2, HIPAA)
+- [ ] Automatic key rotation
+- [ ] HSM integration support
+- [ ] Web UI management console
+- [ ] Additional compliance support (SOC2, HIPAA)
 
-### 长期规划
+### Long-Term Plans
 
-- [ ] 多租户密钥隔离
-- [ ] 密钥导入/导出工具
-- [ ] 性能基准测试套件
+- [ ] Multi-tenant key isolation
+- [ ] Key import/export tooling
+- [ ] Performance benchmarking suite
 - [ ] Kubernetes Operator
 
-## 📋 文档反馈
+## 📋 Documentation Feedback
 
-帮助我们改进文档！
+Help us improve the documentation!
 
-**这些文档对您有帮助吗？**
-- 👍 很有帮助
-- 👌 基本满意  
-- 👎 需要改进
+**Was this documentation helpful?**
+- 👍 Very helpful
+- 👌 Mostly satisfied
+- 👎 Needs improvement
 
-**改进建议**：
-请在 GitHub Issues 中提出具体的改进建议。
+**Suggestions for improvement:**
+Share specific ideas via GitHub Issues.
 
 ---
 
-**最后更新**: 2024-01-15  
-**文档版本**: v1.0.0
+**Last Updated**: 2024-01-15
+**Documentation Version**: v1.0.0
 
-*感谢使用 RustFS！我们致力于为您提供最好的分布式文件系统解决方案。*
+*Thank you for using RustFS! We are committed to delivering the best distributed file system solution.*

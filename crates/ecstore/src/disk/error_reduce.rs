@@ -49,12 +49,12 @@ pub fn reduce_quorum_errs(errors: &[Option<Error>], ignored_errs: &[Error], quor
 pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, Option<Error>) {
     let nil_error = Error::other("nil".to_string());
 
-    // 首先统计 None 的数量（作为 nil 错误）
+    // First count the number of None values (treated as nil errors)
     let nil_count = errors.iter().filter(|e| e.is_none()).count();
 
     let err_counts = errors
         .iter()
-        .filter_map(|e| e.as_ref()) // 只处理 Some 的错误
+        .filter_map(|e| e.as_ref()) // Only process errors stored in Some
         .fold(std::collections::HashMap::new(), |mut acc, e| {
             if is_ignored_err(ignored_errs, e) {
                 return acc;
@@ -63,13 +63,13 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
             acc
         });
 
-    // 找到最高频率的非 nil 错误
+    // Find the most frequent non-nil error
     let (best_err, best_count) = err_counts
         .into_iter()
         .max_by(|(_, c1), (_, c2)| c1.cmp(c2))
         .unwrap_or((nil_error.clone(), 0));
 
-    // 比较 nil 错误和最高频率的非 nil 错误, 优先选择 nil 错误
+    // Compare nil errors with the top non-nil error and prefer the nil error
     if nil_count > best_count || (nil_count == best_count && nil_count > 0) {
         (nil_count, None)
     } else {

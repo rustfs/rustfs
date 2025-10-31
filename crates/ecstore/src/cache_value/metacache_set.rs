@@ -108,7 +108,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             }
 
             if cancel_rx_clone.is_cancelled() {
-                // warn!("list_path_raw: cancel_rx_clone.try_recv().await.is_ok()");
+                // warn!("list_path_raw: cancel_rx_clone.is_cancelled()");
                 return Ok(());
             }
 

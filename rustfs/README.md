@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简体中文</a>
+English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">Simplified Chinese</a>
 </p>
 
 RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages
