@@ -138,7 +138,7 @@ fi
 # To run with profiling enabled, uncomment the following line and comment the next line
 #cargo run --profile profiling --bin rustfs
 # To run in release mode, use the following line
-cargo run --profile release --bin rustfs
+#cargo run --profile release --bin rustfs
 # To run in debug mode, use the following line
-#cargo run --bin rustfs
+cargo run --bin rustfs
 
