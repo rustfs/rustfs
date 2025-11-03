@@ -73,7 +73,7 @@ http.workspace = true
 http-body.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process"] }
 tokio-rustls = { workspace = true }
 tokio-stream.workspace = true
 tokio-util.workspace = true
@@ -114,6 +114,7 @@ rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 scopeguard.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
+sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
 tracing.workspace = true
 url = { workspace = true }
@@ -123,8 +124,6 @@ zip = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
-opentelemetry = { workspace = true }
-
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }
@@ -132,14 +131,14 @@ sysctl = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = "0.6.1"
-
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
-mimalloc = "0.1"
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
+mimalloc = { workspace = true }
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "windows")))'.dependencies]
+tikv-jemalloc-ctl = { workspace = true }
+jemalloc_pprof = { workspace = true }
+pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }

@@ -1056,6 +1056,10 @@ async fn merge_entry_channels(
     out_channel: Sender<MetaCacheEntry>,
     read_quorum: usize,
 ) -> Result<()> {
+    if in_channels.is_empty() {
+        return Ok(());
+    }
+
     let mut in_channels = in_channels;
     if in_channels.len() == 1 {
         loop {
@@ -1092,18 +1096,18 @@ async fn merge_entry_channels(
             return Ok(());
         }
 
-        let mut best: Option<MetaCacheEntry> = None;
+        let mut best = top[0].clone();
         let mut best_idx = 0;
         to_merge.clear();
 
         // FIXME: top move when select_from call
-        let vtop = top.clone();
+        // let vtop = top.clone();
 
-        for (i, other) in vtop.iter().enumerate() {
-            if let Some(other_entry) = other {
+        // let vtop = top.as_slice();
+
+        for other_idx in 1..top.len() {
+            if let Some(other_entry) = &top[other_idx] {
                 if let Some(best_entry) = &best {
-                    let other_idx = i;
-
                     // println!("get other_entry {:?}", other_entry.name);
 
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
@@ -1130,21 +1134,20 @@ async fn merge_entry_channels(
                             best_idx = other_idx;
                             continue;
                         }
-                    } else if best_entry.name > other_entry.name {
+                    }
+
+                    if best_entry.name > other_entry.name {
                         to_merge.clear();
                         best = Some(other_entry.clone());
-                        best_idx = i;
+                        best_idx = other_idx;
                     }
                 } else {
                     best = Some(other_entry.clone());
-                    best_idx = i;
+                    best_idx = other_idx;
                 }
             }
         }
 
-        // println!("get best_entry {} {:?}", &best_idx, &best.clone().unwrap_or_default().name);
-
-        // TODO:
         if !to_merge.is_empty() {
             if let Some(entry) = &best {
                 let mut versions = Vec::with_capacity(to_merge.len() + 1);
@@ -1156,9 +1159,9 @@ async fn merge_entry_channels(
                 }
 
                 for &idx in to_merge.iter() {
-                    let has_entry = { top.get(idx).cloned() };
+                    let has_entry = top[idx].clone();
 
-                    if let Some(Some(entry)) = has_entry {
+                    if let Some(entry) = has_entry {
                         let xl2 = match entry.clone().xl_meta() {
                             Ok(res) => res,
                             Err(_) => {
@@ -1204,9 +1207,9 @@ async fn merge_entry_channels(
                 out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
                 last = best_entry.name.clone();
             }
-            top[best_idx] = None; // Replace entry we just sent
-            select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
         }
+
+        select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
     }
 }
 

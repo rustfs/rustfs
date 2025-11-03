@@ -63,7 +63,7 @@ impl From<StorageError> for ApiError {
             StorageError::BucketNotEmpty(_) => S3ErrorCode::BucketNotEmpty,
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
-            StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyExists,
+            StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::PrefixAccessDenied(_, _) => S3ErrorCode::AccessDenied,
@@ -83,6 +83,7 @@ impl From<StorageError> for ApiError {
             StorageError::InvalidPart(_, _, _) => S3ErrorCode::InvalidPart,
             StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
             StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
+            StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
             _ => S3ErrorCode::InternalError,
         };
 
@@ -210,7 +211,7 @@ mod tests {
                 StorageError::ObjectNameInvalid("test".into(), "test".into()),
                 S3ErrorCode::InvalidArgument,
             ),
-            (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyExists),
+            (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
             (StorageError::PrefixAccessDenied("test".into(), "test".into()), S3ErrorCode::AccessDenied),

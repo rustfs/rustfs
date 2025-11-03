@@ -21,6 +21,7 @@
 
 use http::HeaderMap;
 use s3s::dto::ETag;
+use std::pin::Pin;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
@@ -54,7 +55,7 @@ impl PutObjReader {
     }
 }
 
-pub type ObjReaderFn = Arc<dyn Fn(BufReader<Cursor<Vec<u8>>>, HeaderMap) -> GetObjectReader + 'static>;
+pub type ObjReaderFn<'a> = Arc<dyn Fn(BufReader<Cursor<Vec<u8>>>, HeaderMap) -> GetObjectReader + Send + Sync + 'a>;
 
 fn part_number_to_rangespec(oi: ObjectInfo, part_number: usize) -> Option<HTTPRangeSpec> {
     if oi.size == 0 || oi.parts.len() == 0 {
@@ -108,19 +109,24 @@ fn get_compressed_offsets(oi: ObjectInfo, offset: i64) -> (i64, i64, i64, i64, u
     (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
 }
 
-pub fn new_getobjectreader(
-    rs: HTTPRangeSpec,
-    oi: &ObjectInfo,
+pub fn new_getobjectreader<'a>(
+    rs: &Option<HTTPRangeSpec>,
+    oi: &'a ObjectInfo,
     opts: &ObjectOptions,
-    h: &HeaderMap,
-) -> Result<(ObjReaderFn, i64, i64), ErrorResponse> {
+    _h: &HeaderMap,
+) -> Result<(ObjReaderFn<'a>, i64, i64), ErrorResponse> {
     //let (_, mut is_encrypted) = crypto.is_encrypted(oi.user_defined)?;
     let mut is_encrypted = false;
     let is_compressed = false; //oi.is_compressed_ok();
 
+    let mut rs_ = None;
+    if rs.is_none() && opts.part_number.is_some() && opts.part_number.unwrap() > 0 {
+        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.unwrap());
+    }
+
     let mut get_fn: ObjReaderFn;
 
-    let (off, length) = match rs.get_offset_length(oi.size) {
+    let (off, length) = match rs_.unwrap().get_offset_length(oi.size) {
         Ok(x) => x,
         Err(err) => {
             return Err(ErrorResponse {
@@ -136,12 +142,11 @@ pub fn new_getobjectreader(
     };
     get_fn = Arc::new(move |input_reader: BufReader<Cursor<Vec<u8>>>, _: HeaderMap| {
         //Box::pin({
-        /*let r = GetObjectReader {
+        let r = GetObjectReader {
             object_info: oi.clone(),
-            stream: StreamingBlob::new(HashReader::new(input_reader, 10, None, None, 10)),
+            stream: Box::new(input_reader),
         };
-        r*/
-        todo!();
+        r
         //})
     });
 

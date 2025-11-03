@@ -14,7 +14,6 @@
 
 use crate::GlobalError;
 use crate::system::attributes::ProcessAttributes;
-use crate::system::gpu::GpuCollector;
 use crate::system::metrics::{DIRECTION, INTERFACE, Metrics, STATUS};
 use opentelemetry::KeyValue;
 use std::time::SystemTime;
@@ -27,7 +26,8 @@ use tokio::time::{Duration, sleep};
 pub struct Collector {
     metrics: Metrics,
     attributes: ProcessAttributes,
-    gpu_collector: GpuCollector,
+    #[cfg(feature = "gpu")]
+    gpu_collector: crate::system::gpu::GpuCollector,
     pid: Pid,
     system: System,
     networks: Networks,
@@ -41,12 +41,14 @@ impl Collector {
         let attributes = ProcessAttributes::new(pid, &mut system)?;
         let core_count = System::physical_core_count().ok_or(GlobalError::CoreCountError)?;
         let metrics = Metrics::new(&meter);
-        let gpu_collector = GpuCollector::new(pid)?;
+        #[cfg(feature = "gpu")]
+        let gpu_collector = crate::system::gpu::GpuCollector::new(pid)?;
         let networks = Networks::new_with_refreshed_list();
 
         Ok(Collector {
             metrics,
             attributes,
+            #[cfg(feature = "gpu")]
             gpu_collector,
             pid,
             system,
@@ -163,6 +165,7 @@ impl Collector {
         );
 
         // GPU Metrics (Optional) Non-MacOS
+        #[cfg(feature = "gpu")]
         self.gpu_collector.collect(&self.metrics, &self.attributes)?;
 
         Ok(())

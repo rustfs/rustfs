@@ -16,16 +16,16 @@ use crate::error::Result;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
-// 定义 QuotaType 枚举类型
+// Define the QuotaType enum
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuotaType {
     Hard,
 }
 
-// 定义 BucketQuota 结构体
+// Define the BucketQuota structure
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketQuota {
-    quota: Option<u64>, // 使用 Option 来表示可能不存在的字段
+    quota: Option<u64>, // Use Option to represent optional fields
 
     size: u64,
 

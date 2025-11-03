@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "rustfs.fullname" . }}-test-connection"
+  labels:
+    {{- include "rustfs.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args: ['{{ include "rustfs.fullname" . }}:{{ .Values.service.port }}']
+  restartPolicy: Never

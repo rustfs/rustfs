@@ -27,9 +27,15 @@ use crate::tier::{
     tier::ERR_TIER_TYPE_UNSUPPORTED,
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_PERM_ERR},
+    warm_backend_aliyun::WarmBackendAliyun,
+    warm_backend_azure::WarmBackendAzure,
+    warm_backend_gcs::WarmBackendGCS,
+    warm_backend_huaweicloud::WarmBackendHuaweicloud,
     warm_backend_minio::WarmBackendMinIO,
+    warm_backend_r2::WarmBackendR2,
     warm_backend_rustfs::WarmBackendRustFS,
     warm_backend_s3::WarmBackendS3,
+    warm_backend_tencent::WarmBackendTencent,
 };
 use bytes::Bytes;
 use http::StatusCode;
@@ -118,6 +124,78 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         }
         TierType::MinIO => {
             let dd = WarmBackendMinIO::new(tier.minio.as_ref().expect("err"), &tier.name).await;
+            if let Err(err) = dd {
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+            d = Some(Box::new(dd.expect("err")));
+        }
+        TierType::Aliyun => {
+            let dd = WarmBackendAliyun::new(tier.aliyun.as_ref().expect("err"), &tier.name).await;
+            if let Err(err) = dd {
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+            d = Some(Box::new(dd.expect("err")));
+        }
+        TierType::Tencent => {
+            let dd = WarmBackendTencent::new(tier.tencent.as_ref().expect("err"), &tier.name).await;
+            if let Err(err) = dd {
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+            d = Some(Box::new(dd.expect("err")));
+        }
+        TierType::Huaweicloud => {
+            let dd = WarmBackendHuaweicloud::new(tier.huaweicloud.as_ref().expect("err"), &tier.name).await;
+            if let Err(err) = dd {
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+            d = Some(Box::new(dd.expect("err")));
+        }
+        TierType::Azure => {
+            let dd = WarmBackendAzure::new(tier.azure.as_ref().expect("err"), &tier.name).await;
+            if let Err(err) = dd {
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+            d = Some(Box::new(dd.expect("err")));
+        }
+        TierType::GCS => {
+            let dd = WarmBackendGCS::new(tier.gcs.as_ref().expect("err"), &tier.name).await;
+            if let Err(err) = dd {
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+            d = Some(Box::new(dd.expect("err")));
+        }
+        TierType::R2 => {
+            let dd = WarmBackendR2::new(tier.r2.as_ref().expect("err"), &tier.name).await;
             if let Err(err) = dd {
                 warn!("{}", err);
                 return Err(AdminError {

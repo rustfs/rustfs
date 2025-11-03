@@ -81,14 +81,13 @@ pub mod kms_dynamic;
 pub mod kms_keys;
 pub mod policies;
 pub mod pools;
+pub mod profile;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;
 pub mod tier;
 pub mod trace;
 pub mod user;
-#[cfg(not(target_os = "windows"))]
-use pprof::protos::Message;
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
@@ -1264,14 +1263,8 @@ impl Operation for ProfileHandler {
 
         #[cfg(not(target_os = "windows"))]
         {
-            use crate::profiling;
-
-            if !profiling::is_profiler_enabled() {
-                return Ok(S3Response::new((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Body::from("Profiler not enabled. Set RUSTFS_ENABLE_PROFILING=true to enable profiling".to_string()),
-                )));
-            }
+            use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
+            use rustfs_utils::get_env_usize;
 
             let queries = extract_query_params(&req.uri);
             let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
@@ -1284,72 +1277,55 @@ impl Operation for ProfileHandler {
                 )));
             }
 
-            let guard = match profiling::get_profiler_guard() {
-                Some(guard) => guard,
-                None => {
-                    return Ok(S3Response::new((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Body::from("Profiler not initialized".to_string()),
-                    )));
-                }
-            };
-
-            info!("Starting CPU profile collection for {} seconds", seconds);
-
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-
-            let guard_lock = match guard.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    error!("Failed to acquire profiler guard lock");
-                    return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from("Failed to acquire profiler lock".to_string()),
-                    )));
-                }
-            };
-
-            let report = match guard_lock.report().build() {
-                Ok(report) => report,
-                Err(e) => {
-                    error!("Failed to build profiler report: {}", e);
-                    return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from(format!("Failed to build profile report: {e}")),
-                    )));
-                }
-            };
-
-            info!("CPU profile collection completed");
-
             match format.as_str() {
-                "protobuf" | "pb" => {
-                    let profile = report.pprof().unwrap();
-                    let mut body = Vec::new();
-                    if let Err(e) = profile.write_to_vec(&mut body) {
-                        error!("Failed to serialize protobuf profile: {}", e);
-                        return Ok(S3Response::new((
+                "protobuf" | "pb" => match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(seconds)).await {
+                    Ok(path) => match tokio::fs::read(&path).await {
+                        Ok(bytes) => {
+                            let mut headers = HeaderMap::new();
+                            headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+                            Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
+                        }
+                        Err(e) => Ok(S3Response::new((
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Body::from("Failed to serialize profile".to_string()),
-                        )));
-                    }
-
-                    let mut headers = HeaderMap::new();
-                    headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
-                }
+                            Body::from(format!("Failed to read profile file: {e}")),
+                        ))),
+                    },
+                    Err(e) => Ok(S3Response::new((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from(format!("Failed to collect CPU profile: {e}")),
+                    ))),
+                },
                 "flamegraph" | "svg" => {
-                    let mut flamegraph_buf = Vec::new();
-                    match report.flamegraph(&mut flamegraph_buf) {
-                        Ok(()) => (),
+                    let freq = get_env_usize(ENV_CPU_FREQ, DEFAULT_CPU_FREQ) as i32;
+                    let guard = match pprof::ProfilerGuard::new(freq) {
+                        Ok(g) => g,
                         Err(e) => {
-                            error!("Failed to generate flamegraph: {}", e);
                             return Ok(S3Response::new((
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to generate flamegraph: {e}")),
+                                Body::from(format!("Failed to create profiler: {e}")),
                             )));
                         }
                     };
+
+                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+
+                    let report = match guard.report().build() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Ok(S3Response::new((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from(format!("Failed to build profile report: {e}")),
+                            )));
+                        }
+                    };
+
+                    let mut flamegraph_buf = Vec::new();
+                    if let Err(e) = report.flamegraph(&mut flamegraph_buf) {
+                        return Ok(S3Response::new((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Body::from(format!("Failed to generate flamegraph: {e}")),
+                        )));
+                    }
 
                     let mut headers = HeaderMap::new();
                     headers.insert(CONTENT_TYPE, "image/svg+xml".parse().unwrap());
@@ -1380,9 +1356,11 @@ impl Operation for ProfileStatusHandler {
 
         #[cfg(not(target_os = "windows"))]
         let status = {
-            use crate::profiling;
+            use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
+            use rustfs_utils::get_env_bool;
 
-            if profiling::is_profiler_enabled() {
+            let enabled = get_env_bool(ENV_ENABLE_PROFILING, DEFAULT_ENABLE_PROFILING);
+            if enabled {
                 HashMap::from([
                     ("enabled", "true"),
                     ("status", "running"),

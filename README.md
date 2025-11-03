@@ -25,7 +25,7 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简�
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=fr">français</a> |
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ja">日本語</a> |
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ko">한국어</a> |
-  <a href="https://readme-i18n.com/rustfs/rustfs?lang=pt">Português</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=pt">Portuguese</a> |
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
@@ -139,10 +139,14 @@ observability. If you want to start redis as well as nginx container, you can sp
    make help-docker                      # Show all Docker-related commands
    ```
 
-4. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console,
+4. **Build with helm chart(Option 4) - Cloud Native environment**
+
+   Following the instructions on [helm chart README](./helm/README.md) to install RustFS on kubernetes cluster.
+
+5. **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console,
    default username and password is `rustfsadmin` .
-5. **Create a Bucket**: Use the console to create a new bucket for your objects.
-6. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your
+6. **Create a Bucket**: Use the console to create a new bucket for your objects.
+7. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your
    RustFS instance.
 
 **NOTE**: If you want to access RustFS instance with `https`, you can refer

@@ -31,13 +31,15 @@ use crate::disk::{
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result, is_err_version_not_found};
-use crate::error::{ObjectApiError, is_err_object_not_found};
+use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::store_api::ListObjectVersionsInfo;
 use crate::store_api::{ListPartsInfo, ObjectOptions, ObjectToDelete};
 use crate::store_api::{ObjectInfoOrErr, WalkOptions};
 use crate::{
-    bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
+    bucket::lifecycle::bucket_lifecycle_ops::{
+        LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
+    },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::{GLOBAL_STORAGE_CLASS, storageclass},
     disk::{
@@ -96,7 +98,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::{
-    io::AsyncWrite,
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{RwLock, broadcast},
 };
 use tokio::{
@@ -399,7 +401,7 @@ impl SetDisks {
 
         let mut futures = Vec::with_capacity(disks.len());
         if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: 并发
+            // TODO: add concurrency
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
@@ -889,7 +891,7 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: 并发
+            // TODO: add concurrency
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
@@ -1698,7 +1700,7 @@ impl SetDisks {
 
         let disks = rl.clone();
 
-        //  主动释放锁
+        // Explicitly release the lock
         drop(rl);
 
         for (i, opdisk) in disks.iter().enumerate() {
@@ -1742,7 +1744,7 @@ impl SetDisks {
             }
         };
 
-        // check endpoint 是否一致
+        // Check that the endpoint matches
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
 
@@ -1957,7 +1959,7 @@ impl SetDisks {
         Ok(())
     }
 
-    // 打乱顺序
+    // Shuffle the order
     fn shuffle_disks_and_parts_metadata_by_index(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
@@ -1996,7 +1998,7 @@ impl SetDisks {
         Self::shuffle_disks_and_parts_metadata(disks, parts_metadata, fi)
     }
 
-    // 打乱顺序
+    // Shuffle the order
     fn shuffle_disks_and_parts_metadata(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
@@ -2073,7 +2075,7 @@ impl SetDisks {
 
         let vid = opts.version_id.clone().unwrap_or_default();
 
-        // TODO: 优化并发 可用数量中断
+        // TODO: optimize concurrency and break once enough slots are available
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await?;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
@@ -3419,7 +3421,7 @@ impl SetDisks {
         oi.user_defined.remove(X_AMZ_RESTORE.as_str());
 
         let version_id = oi.version_id.map(|v| v.to_string());
-        let obj = self
+        let _obj = self
             .copy_object(
                 bucket,
                 object,
@@ -3435,8 +3437,7 @@ impl SetDisks {
                     ..Default::default()
                 },
             )
-            .await;
-        obj?;
+            .await?;
         Ok(())
     }
 
@@ -3536,7 +3537,10 @@ impl ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        // TODO: remote
+        if object_info.is_remote() {
+            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, opts).await?;
+            return Ok(gr);
+        }
 
         let (rd, wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
 
@@ -3718,7 +3722,7 @@ impl ObjectIO for SetDisks {
                 error!("encode err {:?}", e);
                 return Err(e.into());
             }
-        }; // TODO: 出错，删除临时目录
+        }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
         // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -4046,7 +4050,7 @@ impl StorageAPI for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        // 默认返回值
+        // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
@@ -4103,7 +4107,7 @@ impl StorageAPI for SetDisks {
 
             vr.set_tier_free_version_id(&Uuid::new_v4().to_string());
 
-            // 删除
+            // Delete
             // del_objects[i].object_name.clone_from(&vr.name);
             // del_objects[i].version_id = vr.version_id.map(|v| v.to_string());
 
@@ -4196,9 +4200,9 @@ impl StorageAPI for SetDisks {
 
         let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
 
-        // 每个磁盘, 删除所有对象
+        // For each disk delete all objects
         for (disk_idx, errors) in results.into_iter().enumerate() {
-            // 所有对象的删除结果
+            // Deletion results for all objects
             for idx in 0..vers.len() {
                 if errors[idx].is_some() {
                     for fi in vers[idx].versions.iter() {
@@ -4565,7 +4569,7 @@ impl StorageAPI for SetDisks {
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
-                return Err(Error::other(err.to_string()));
+                return Err(Error::other(format!("remote tier error: {}", err)));
             }
         };
 
@@ -4594,10 +4598,10 @@ impl StorageAPI for SetDisks {
         // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
         let transition_etag = rustfs_utils::path::trim_etag(&opts.transition.etag);
         let stored_etag = rustfs_utils::path::trim_etag(&get_raw_etag(&fi.metadata));
-        if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp()
+        if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
             || transition_etag != stored_etag
         {
-            return Err(to_object_err(Error::from(DiskError::FileNotFound), vec![bucket, object]));
+            return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
         }
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
@@ -4699,7 +4703,7 @@ impl StorageAPI for SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         // Acquire write-lock early for the restore operation
         // if !opts.no_lock {
         //     let guard_opt = self
@@ -4711,6 +4715,7 @@ impl StorageAPI for SetDisks {
         //     }
         //     _lock_guard = guard_opt;
         // }
+        let self_ = self.clone();
         let set_restore_header_fn = async move |oi: &mut ObjectInfo, rerr: Option<Error>| -> Result<()> {
             if rerr.is_none() {
                 return Ok(());
@@ -4719,54 +4724,79 @@ impl StorageAPI for SetDisks {
             Err(rerr.unwrap())
         };
         let mut oi = ObjectInfo::default();
-        let fi = self.get_object_fileinfo(bucket, object, opts, true).await;
+        let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true).await;
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
         let (actual_fi, _, _) = fi.unwrap();
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
-        let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi);
-        /*if oi.parts.len() == 1 {
-            let mut rs: HTTPRangeSpec;
-            let gr = get_transitioned_object_reader(bucket, object, rs, HeaderMap::new(), oi, opts);
-            //if err != nil {
-            //    return set_restore_header_fn(&mut oi, Some(toObjectErr(err, bucket, object)));
-            //}
-            let hash_reader = HashReader::new(gr, gr.obj_info.size, "", "", gr.obj_info.size);
-            let p_reader = PutObjReader::new(StreamingBlob::from(Box::pin(hash_reader)), hash_reader.size());
-            if let Err(err) = self.put_object(bucket, object, &mut p_reader, &ropts).await {
-                return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object])));
+        let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
+        if oi.parts.len() == 1 {
+            let rs: Option<HTTPRangeSpec> = None;
+            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
+            if let Err(err) = gr {
+                return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
+            }
+            let gr = gr.unwrap();
+            let reader = BufReader::new(gr.stream);
+            let hash_reader = HashReader::new(
+                Box::new(WarpReader::new(reader)),
+                gr.object_info.size,
+                gr.object_info.size,
+                None,
+                None,
+                false,
+            )?;
+            let mut p_reader = PutObjReader::new(hash_reader);
+            if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
+                return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
             } else {
                 return Ok(());
             }
         }
 
-        let res = self.new_multipart_upload(bucket, object, &ropts).await?;
+        let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
         //if err != nil {
-        //    return set_restore_header_fn(&mut oi, err);
+        //    return set_restore_header_fn(&mut oi, err).await;
         //}
 
         let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let mut rs: HTTPRangeSpec;
-        let gr = get_transitioned_object_reader(bucket, object, rs, HeaderMap::new(), oi, opts).await?;
-        //if err != nil {
-        //    return set_restore_header_fn(&mut oi, err);
-        //}
+        let rs: Option<HTTPRangeSpec> = None;
+        let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
+        if let Err(err) = gr {
+            return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
+        }
+        let gr = gr.unwrap();
 
-        for part_info in oi.parts {
-            //let hr = HashReader::new(LimitReader(gr, part_info.size), part_info.size, "", "", part_info.size);
-            let hr = HashReader::new(gr, part_info.size as i64, part_info.size as i64, None, false);
-            //if err != nil {
-            //    return set_restore_header_fn(&mut oi, err);
-            //}
-            let mut p_reader = PutObjReader::new(hr, hr.size());
-            let p_info = self.put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default()).await?;
+        for part_info in &oi.parts {
+            let reader = BufReader::new(Cursor::new(vec![] /*gr.stream*/));
+            let hash_reader = HashReader::new(
+                Box::new(WarpReader::new(reader)),
+                part_info.size as i64,
+                part_info.size as i64,
+                None,
+                None,
+                false,
+            )?;
+            let mut p_reader = PutObjReader::new(hash_reader);
+            let p_info = self_
+                .clone()
+                .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
+                .await?;
             //if let Err(err) = p_info {
-            //    return set_restore_header_fn(&mut oi, err);
+            //    return set_restore_header_fn(&mut oi, err).await;
             //}
             if p_info.size != part_info.size {
-                return set_restore_header_fn(&mut oi, Some(Error::from(ObjectApiError::InvalidObjectState(GenericError{bucket: bucket.to_string(), object: object.to_string(), ..Default::default()}))));
+                return set_restore_header_fn(
+                    &mut oi,
+                    Some(Error::other(ObjectApiError::InvalidObjectState(GenericError {
+                        bucket: bucket.to_string(),
+                        object: object.to_string(),
+                        ..Default::default()
+                    }))),
+                )
+                .await;
             }
             uploaded_parts.push(CompletePart {
                 part_num: p_info.part_num,
@@ -4778,12 +4808,22 @@ impl StorageAPI for SetDisks {
                 checksum_crc64nvme: None,
             });
         }
-        if let Err(err) = self.complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &ObjectOptions {
-            mod_time: oi.mod_time,
-            ..Default::default()
-        }).await {
-            set_restore_header_fn(&mut oi, Some(err));
-        }*/
+        if let Err(err) = self_
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &res.upload_id,
+                uploaded_parts,
+                &ObjectOptions {
+                    mod_time: oi.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            return set_restore_header_fn(&mut oi, Some(err)).await;
+        }
         Ok(())
     }
 
@@ -4924,7 +4964,7 @@ impl StorageAPI for SetDisks {
             HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
         );
 
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
+        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -5413,7 +5453,7 @@ impl StorageAPI for SetDisks {
 
         self.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await
     }
-    // complete_multipart_upload 完成
+    // complete_multipart_upload finished
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
         self: Arc<Self>,
@@ -6527,7 +6567,7 @@ mod tests {
         // Test that all CHECK_PART constants have expected values
         assert_eq!(CHECK_PART_UNKNOWN, 0);
         assert_eq!(CHECK_PART_SUCCESS, 1);
-        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4); // 实际值是 4，不是 2
+        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4); // The actual value is 4, not 2
         assert_eq!(CHECK_PART_VOLUME_NOT_FOUND, 3);
         assert_eq!(CHECK_PART_FILE_CORRUPT, 5);
     }
@@ -6807,7 +6847,7 @@ mod tests {
         assert_eq!(conv_part_err_to_int(&Some(disk_err)), CHECK_PART_FILE_NOT_FOUND);
 
         let other_err = DiskError::other("other error");
-        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // other 错误应该返回 UNKNOWN，不是 SUCCESS
+        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // Other errors should return UNKNOWN, not SUCCESS
     }
 
     #[test]
@@ -6879,7 +6919,7 @@ mod tests {
         let errs = vec![None, Some(DiskError::other("error1")), Some(DiskError::other("error2"))];
         let joined = join_errs(&errs);
         assert!(joined.contains("<nil>"));
-        assert!(joined.contains("io error")); // DiskError::other 显示为 "io error"
+        assert!(joined.contains("io error")); // DiskError::other is rendered as "io error"
 
         // Test with different error types
         let errs2 = vec![None, Some(DiskError::FileNotFound), Some(DiskError::FileCorrupt)];

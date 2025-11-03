@@ -43,7 +43,7 @@ async fn run(service_name: String) {
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
 
-    match SystemObserver::init_process_observer(meter).await {
+    match SystemObserver::init_process_observer().await {
         Ok(_) => info!("Process observer initialized successfully"),
         Err(e) => error!("Failed to initialize process observer: {:?}", e),
     }

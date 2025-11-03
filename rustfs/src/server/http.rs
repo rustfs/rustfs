@@ -29,7 +29,6 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_obs::SystemObserver;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
@@ -220,21 +219,6 @@ pub async fn start_http_server(
 
         b.build()
     };
-
-    // Server will be created per connection - this ensures isolation
-    tokio::spawn(async move {
-        // Record the PID-related metrics of the current process
-        let meter = opentelemetry::global::meter("system");
-        let obs_result = SystemObserver::init_process_observer(meter).await;
-        match obs_result {
-            Ok(_) => {
-                info!("Process observer initialized successfully");
-            }
-            Err(e) => {
-                error!("Failed to initialize process observer: {}", e);
-            }
-        }
-    });
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -650,51 +634,4 @@ fn get_listen_backlog() -> i32 {
         // Fallback for Windows and other operating systems
         DEFAULT_BACKLOG
     }
-}
-
-/// Customize the Tokio runtime configuration
-/// These configurations can be adjusted by environment variables
-/// to optimize performance based on the deployment environment
-pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-
-    // Worker threads
-    let worker_threads = rustfs_utils::get_env_usize(rustfs_config::ENV_WORKER_THREADS, rustfs_config::DEFAULT_WORKER_THREADS);
-    builder.worker_threads(worker_threads);
-
-    // Max blocking threads
-    let max_blocking_threads =
-        rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_BLOCKING_THREADS, rustfs_config::DEFAULT_MAX_BLOCKING_THREADS);
-    builder.max_blocking_threads(max_blocking_threads);
-
-    // Thread stack size
-    let thread_stack_size =
-        rustfs_utils::get_env_usize(rustfs_config::ENV_THREAD_STACK_SIZE, rustfs_config::DEFAULT_THREAD_STACK_SIZE);
-    builder.thread_stack_size(thread_stack_size);
-
-    // Thread keep alive
-    let thread_keep_alive =
-        rustfs_utils::get_env_u64(rustfs_config::ENV_THREAD_KEEP_ALIVE, rustfs_config::DEFAULT_THREAD_KEEP_ALIVE);
-    builder.thread_keep_alive(Duration::from_secs(thread_keep_alive));
-
-    // Global queue interval
-    let global_queue_interval =
-        rustfs_utils::get_env_u32(rustfs_config::ENV_GLOBAL_QUEUE_INTERVAL, rustfs_config::DEFAULT_GLOBAL_QUEUE_INTERVAL);
-    builder.global_queue_interval(global_queue_interval);
-
-    // Thread name
-    let thread_name = rustfs_utils::get_env_str(rustfs_config::ENV_THREAD_NAME, rustfs_config::DEFAULT_THREAD_NAME);
-    builder.thread_name(thread_name.clone());
-    println!(
-        "Starting Tokio runtime with configured parameters:\n\
-    worker_threads: {worker_threads}, max_blocking_threads: {max_blocking_threads}, thread_stack_size: {thread_stack_size}, thread_keep_alive: {thread_keep_alive}, \
-    global_queue_interval: {global_queue_interval}, thread_name: {thread_name}"
-    );
-    builder
-}
-
-/// Whether to print tokio threads
-/// This can be useful for debugging purposes
-pub(crate) fn print_tokio_thread_enable() -> bool {
-    rustfs_utils::get_env_bool(rustfs_config::ENV_THREAD_PRINT_ENABLED, rustfs_config::DEFAULT_THREAD_PRINT_ENABLED)
 }
