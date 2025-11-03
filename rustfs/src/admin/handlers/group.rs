@@ -62,7 +62,7 @@ impl Operation for ListGroups {
 
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        let groups = iam_store.list_groups().await.map_err(|e| {
+        let groups = iam_store.list_groups_load().await.map_err(|e| {
             warn!("list groups failed, e: {:?}", e);
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
