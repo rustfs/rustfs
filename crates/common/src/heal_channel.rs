@@ -85,17 +85,12 @@ impl Display for DriveState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HealScanMode {
     Unknown,
+    #[default]
     Normal,
     Deep,
-}
-
-impl Default for HealScanMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -175,22 +170,17 @@ pub struct HealChannelResponse {
 }
 
 /// Heal priority
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum HealChannelPriority {
     /// Low priority
     Low,
     /// Normal priority
+    #[default]
     Normal,
     /// High priority
     High,
     /// Critical priority
     Critical,
-}
-
-impl Default for HealChannelPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// Heal channel sender

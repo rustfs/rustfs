@@ -18,21 +18,39 @@ use rustfs_config::observability::{
     ENV_OBS_METER_INTERVAL, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
-    DEFAULT_OBS_LOG_FILENAME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_LOCAL_LOGGING_ENABLED, DEFAULT_LOG_ROTATION_SIZE_MB,
+    DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
 use serde::{Deserialize, Serialize};
 use std::env;
 
-/// OpenTelemetry Configuration
-/// Add service name, service version, environment
-/// Add interval time for metric collection
-/// Add sample ratio for trace sampling
-/// Add endpoint for metric collection
-/// Add use_stdout for output to stdout
-/// Add logger level for log level
-/// Add local_logging_enabled for local logging enabled
+/// Observability: OpenTelemetry configuration
+/// # Fields
+/// * `endpoint`: Endpoint for metric collection
+/// * `use_stdout`: Output to stdout
+/// * `sample_ratio`: Trace sampling ratio
+/// * `meter_interval`: Metric collection interval
+/// * `service_name`: Service name
+/// * `service_version`: Service version
+/// * `environment`: Environment
+/// * `logger_level`: Logger level
+/// * `local_logging_enabled`: Local logging enabled
+/// # Added flexi_logger related configurations
+/// * `log_directory`: Log file directory
+/// * `log_filename`: The name of the log file
+/// * `log_rotation_size_mb`: Log file size cut threshold (MB)
+/// * `log_rotation_time`: Logs are cut by time (Hour,Day,Minute,Second)
+/// * `log_keep_files`: Number of log files to be retained
+/// # Returns
+/// A new instance of OtelConfig
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::OtelConfig;
+///
+/// let config = OtelConfig::new();
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
     pub endpoint: String,                    // Endpoint for metric collection
@@ -102,7 +120,7 @@ impl OtelConfig {
             local_logging_enabled: env::var(ENV_OBS_LOCAL_LOGGING_ENABLED)
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(false)),
+                .or(Some(DEFAULT_LOG_LOCAL_LOGGING_ENABLED)),
             log_directory: Some(get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY)),
             log_filename: env::var(ENV_OBS_LOG_FILENAME)
                 .ok()
@@ -127,11 +145,28 @@ impl OtelConfig {
     ///
     /// # Returns
     /// A new instance of OtelConfig
+    ///
+    /// # Example
+    /// ```no_run
+    /// use rustfs_obs::OtelConfig;
+    ///
+    /// let config = OtelConfig::new();
+    /// ```
     pub fn new() -> Self {
         Self::extract_otel_config_from_env(None)
     }
 }
 
+/// Implement Default trait for OtelConfig
+/// This allows creating a default instance of OtelConfig using OtelConfig::default()
+/// which internally calls OtelConfig::new()
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::OtelConfig;
+///
+/// let config = OtelConfig::default();
+/// ```
 impl Default for OtelConfig {
     fn default() -> Self {
         Self::new()
@@ -165,6 +200,20 @@ impl AppConfig {
         }
     }
 
+    /// Create a new instance of AppConfig with specified endpoint
+    ///
+    /// # Arguments
+    /// * `endpoint` - An optional string representing the endpoint for metric collection
+    ///
+    /// # Returns
+    /// A new instance of AppConfig
+    ///
+    /// # Example
+    /// ```no_run
+    /// use rustfs_obs::AppConfig;
+    ///
+    /// let config = AppConfig::new_with_endpoint(Some("http://localhost:4317".to_string()));
+    /// ```
     pub fn new_with_endpoint(endpoint: Option<String>) -> Self {
         Self {
             observability: OtelConfig::extract_otel_config_from_env(endpoint),
@@ -172,7 +221,16 @@ impl AppConfig {
     }
 }
 
-// implement default for AppConfig
+/// Implement Default trait for AppConfig
+/// This allows creating a default instance of AppConfig using AppConfig::default()
+/// which internally calls AppConfig::new()
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::AppConfig;
+///
+/// let config = AppConfig::default();
+/// ```
 impl Default for AppConfig {
     fn default() -> Self {
         Self::new()

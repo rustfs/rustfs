@@ -193,6 +193,9 @@ pub enum StorageError {
 
     #[error("Precondition failed")]
     PreconditionFailed,
+
+    #[error("Invalid range specified: {0}")]
+    InvalidRangeSpec(String),
 }
 
 impl StorageError {
@@ -424,6 +427,7 @@ impl Clone for StorageError {
             StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
             StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
             StorageError::PreconditionFailed => StorageError::PreconditionFailed,
+            StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
         }
     }
 }
@@ -491,6 +495,7 @@ impl StorageError {
             StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
             StorageError::PreconditionFailed => 0x3B,
             StorageError::EntityTooSmall(_, _, _) => 0x3C,
+            StorageError::InvalidRangeSpec(_) => 0x3D,
         }
     }
 
@@ -559,6 +564,8 @@ impl StorageError {
             0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
             0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
             0x3B => Some(StorageError::PreconditionFailed),
+            0x3C => Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default())),
+            0x3D => Some(StorageError::InvalidRangeSpec(Default::default())),
             _ => None,
         }
     }

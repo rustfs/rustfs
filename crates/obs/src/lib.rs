@@ -17,7 +17,7 @@
 //! provides tools for system and service monitoring
 //!
 //! ## feature mark
-//!
+//! - `default`: default monitoring function
 //! - `gpu`: gpu monitoring function
 //! - `full`: includes all functions
 //!
@@ -47,6 +47,6 @@ mod metrics;
 mod system;
 mod telemetry;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, OtelConfig};
 pub use global::*;
 pub use system::SystemObserver;

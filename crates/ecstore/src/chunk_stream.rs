@@ -39,13 +39,13 @@
 //             #[allow(clippy::shadow_same)] // necessary for `pin_mut!`
 //             Box::pin(async move {
 //                 pin_mut!(body);
-//                 // 上一次没用完的数据
+//                 // Data left over from the previous call
 //                 let mut prev_bytes = Bytes::new();
 //                 let mut read_size = 0;
 
 //                 loop {
 //                     let data: Vec<Bytes> = {
-//                         // 读固定大小的数据
+//                         // Read a fixed-size chunk
 //                         match Self::read_data(body.as_mut(), prev_bytes, chunk_size).await {
 //                             None => break,
 //                             Some(Err(e)) => return Err(e),
@@ -72,13 +72,13 @@
 
 //                     if read_size + prev_bytes.len() >= content_length {
 //                         // debug!(
-//                         //     "读完了 read_size:{} + prev_bytes.len({}) == content_length {}",
+//                         //     "Finished reading: read_size:{} + prev_bytes.len({}) == content_length {}",
 //                         //     read_size,
 //                         //     prev_bytes.len(),
 //                         //     content_length,
 //                         // );
 
-//                         // 填充 0？
+//                         // Pad with zeros?
 //                         if !need_padding {
 //                             y.yield_ok(prev_bytes).await;
 //                             break;
@@ -115,7 +115,7 @@
 //     {
 //         let mut bytes_buffer = Vec::new();
 
-//         // 只执行一次
+//         // Run only once
 //         let mut push_data_bytes = |mut bytes: Bytes| {
 //             // debug!("read from body {} split per {}, prev_bytes: {}", bytes.len(), data_size, prev_bytes.len());
 
@@ -127,11 +127,11 @@
 //                 return Some(bytes);
 //             }
 
-//             // 合并上一次数据
+//             // Merge with the previous data
 //             if !prev_bytes.is_empty() {
 //                 let need_size = data_size.wrapping_sub(prev_bytes.len());
 //                 // debug!(
-//                 //     " 上一次有剩余{},从这一次中取{},共：{}",
+//                 //     "Previous leftover {}, take {} now, total: {}",
 //                 //     prev_bytes.len(),
 //                 //     need_size,
 //                 //     prev_bytes.len() + need_size
@@ -143,7 +143,7 @@
 //                     combined.extend_from_slice(&data);
 
 //                     // debug!(
-//                     //     "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes 剩余：{}",
+//                     //     "Fetched more bytes than needed: {}, merged result {}, remaining bytes {}",
 //                     //     need_size,
 //                     //     combined.len(),
 //                     //     bytes.len(),
@@ -156,7 +156,7 @@
 //                     combined.extend_from_slice(&bytes);
 
 //                     // debug!(
-//                     //     "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes 剩余：{}，直接返回",
+//                     //     "Fetched fewer bytes than needed: {}, merged result {}, remaining bytes {}, return immediately",
 //                     //     need_size,
 //                     //     combined.len(),
 //                     //     bytes.len(),
@@ -166,29 +166,29 @@
 //                 }
 //             }
 
-//             // 取到的数据比需要的块大，从 bytes 中截取需要的块大小
+//             // If the fetched data exceeds the chunk, slice the required size
 //             if data_size <= bytes.len() {
 //                 let n = bytes.len() / data_size;
 
 //                 for _ in 0..n {
 //                     let data = bytes.split_to(data_size);
 
-//                     // println!("bytes_buffer.push: {}，剩余：{}", data.len(), bytes.len());
+//                     // println!("bytes_buffer.push: {}, remaining: {}", data.len(), bytes.len());
 //                     bytes_buffer.push(data);
 //                 }
 
 //                 Some(bytes)
 //             } else {
-//                 // 不够
+//                 // Insufficient data
 //                 Some(bytes)
 //             }
 //         };
 
-//         // 剩余数据
+//         // Remaining data
 //         let remaining_bytes = 'outer: {
-//             // // 如果上一次数据足够，跳出
+//             // // Exit if the previous data was sufficient
 //             // if let Some(remaining_bytes) = push_data_bytes(prev_bytes) {
-//             //     println!("从剩下的取");
+//             //     println!("Consuming leftovers");
 //             //     break 'outer remaining_bytes;
 //             // }
 

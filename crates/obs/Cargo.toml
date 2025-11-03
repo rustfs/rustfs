@@ -31,6 +31,7 @@ workspace = true
 [features]
 default = []
 gpu = ["dep:nvml-wrapper"]
+full = ["gpu"]
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }

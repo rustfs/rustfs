@@ -21,19 +21,13 @@ use std::time::Duration;
 use url::Url;
 
 /// KMS backend types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KmsBackend {
     /// Vault backend (recommended for production)
     Vault,
     /// Local file-based backend for development and testing only
+    #[default]
     Local,
-}
-
-impl Default for KmsBackend {
-    fn default() -> Self {
-        // Default to Local backend since Vault requires configuration
-        Self::Local
-    }
 }
 
 /// Main KMS configuration

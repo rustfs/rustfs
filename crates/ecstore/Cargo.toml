@@ -103,8 +103,8 @@ parking_lot = { workspace = true }
 moka = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
-google-cloud-storage = "1.1.0"
-google-cloud-auth = "1.0.1"
+google-cloud-storage = { workspace = true }
+google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
@@ -118,7 +118,6 @@ winapi = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true }
-heed = "0.22.0"
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }

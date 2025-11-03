@@ -49,22 +49,17 @@ pub enum HealType {
 }
 
 /// Heal priority
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HealPriority {
     /// Low priority
     Low = 0,
     /// Normal priority
+    #[default]
     Normal = 1,
     /// High priority
     High = 2,
     /// Urgent priority
     Urgent = 3,
-}
-
-impl Default for HealPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// Heal options

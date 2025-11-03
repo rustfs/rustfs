@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::config::OtelConfig;
-use crate::global::{IS_OBSERVABILITY_ENABLED, OBSERVABILITY_METER_NAME};
+use crate::global::IS_OBSERVABILITY_ENABLED;
 use flexi_logger::{
     Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
     WriteMode::{AsyncWith, BufferAndFlush},
@@ -36,7 +36,8 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_LOCAL_LOGGING_ENABLED, ENVIRONMENT, METER_INTERVAL,
+    SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
     observability::{
         DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
         ENV_OBS_LOG_DIRECTORY,
@@ -294,7 +295,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(ErrorLayer::default())
-                .with(if config.local_logging_enabled.unwrap_or(false) {
+                .with(if config.local_logging_enabled.unwrap_or(DEFAULT_LOG_LOCAL_LOGGING_ENABLED) {
                     Some(fmt_layer)
                 } else {
                     None
@@ -312,7 +313,6 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
                 );
                 IS_OBSERVABILITY_ENABLED.set(true).ok();
-                OBSERVABILITY_METER_NAME.set(service_name.to_string()).ok();
             }
         }
         counter!("rustfs.start.total").increment(1);

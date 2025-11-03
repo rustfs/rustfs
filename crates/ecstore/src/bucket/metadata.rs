@@ -428,8 +428,8 @@ where
     let sec = t.unix_timestamp() - 62135596800;
     let nsec = t.nanosecond();
     buf[0] = 0xc7; // mext8
-    buf[1] = 0x0c; // 长度
-    buf[2] = 0x05; // 时间扩展类型
+    buf[1] = 0x0c; // Length
+    buf[2] = 0x05; // Time extension type
     BigEndian::write_u64(&mut buf[3..], sec as u64);
     BigEndian::write_u32(&mut buf[11..], nsec);
     s.serialize_bytes(&buf)

@@ -14,6 +14,7 @@
 
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
+use crate::config::storageclass;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
 use crate::store_utils::clean_metadata;
@@ -33,6 +34,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
@@ -291,7 +293,7 @@ impl HTTPRangeSpec {
             let suffix_len = if self.start < 0 {
                 self.start
                     .checked_neg()
-                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
             } else {
                 self.start
             };
@@ -304,14 +306,14 @@ impl HTTPRangeSpec {
     }
     pub fn get_length(&self, res_size: i64) -> Result<i64> {
         if res_size < 0 {
-            return Err(Error::other("The requested range is not satisfiable"));
+            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
         }
 
         if self.is_suffix_length {
             let specified_len = if self.start < 0 {
                 self.start
                     .checked_neg()
-                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
             } else {
                 self.start
             };
@@ -325,7 +327,7 @@ impl HTTPRangeSpec {
         }
 
         if self.start >= res_size {
-            return Err(Error::other("The requested range is not satisfiable"));
+            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
         }
 
         if self.end > -1 {
@@ -343,7 +345,7 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        Err(Error::other(format!(
+        Err(Error::InvalidRangeSpec(format!(
             "range value invalid: start={}, end={}, expected start <= end and end >= -1",
             self.start, self.end
         )))
@@ -518,6 +520,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
+    pub storage_class: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: i64,
     // Actual size is the real size of the object uploaded by client.
@@ -557,6 +560,7 @@ impl Clone for ObjectInfo {
         Self {
             bucket: self.bucket.clone(),
             name: self.name.clone(),
+            storage_class: self.storage_class.clone(),
             mod_time: self.mod_time,
             size: self.size,
             actual_size: self.actual_size,
@@ -689,6 +693,12 @@ impl ObjectInfo {
             v
         };
 
+        // Extract storage class from metadata, default to STANDARD if not found
+        let storage_class = metadata
+            .get(AMZ_STORAGE_CLASS)
+            .cloned()
+            .or_else(|| Some(storageclass::STANDARD.to_string()));
+
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
         let parts = fi
             .parts
@@ -727,6 +737,7 @@ impl ObjectInfo {
             user_defined: metadata,
             transitioned_object,
             checksum: fi.checksum.clone(),
+            storage_class,
             ..Default::default()
         }
     }
@@ -1361,7 +1372,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> RangedDecompressReader<R> {
         // Validate the range request
         if offset >= total_size {
             tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
-            return Err(Error::other("Range offset exceeds file size"));
+            return Err(Error::InvalidRangeSpec("Range offset exceeds file size".to_string()));
         }
 
         // Adjust length if it extends beyond file end

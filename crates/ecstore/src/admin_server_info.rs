@@ -96,21 +96,21 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
     let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
     assert!(decoded_payload.is_ok());
 
-    // 创建客户端
+    // Create the client
     let mut client = node_service_time_out_client(&addr)
         .await
         .map_err(|err| Error::other(err.to_string()))?;
 
-    // 构造 PingRequest
+    // Build the PingRequest
     let request = Request::new(PingRequest {
         version: 1,
         body: bytes::Bytes::copy_from_slice(finished_data),
     });
 
-    // 发送请求并获取响应
+    // Send the request and obtain the response
     let response: PingResponse = client.ping(request).await?.into_inner();
 
-    // 打印响应
+    // Print the response
     let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
     if let Err(e) = ping_response_body {
         eprintln!("{e}");

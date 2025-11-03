@@ -2218,6 +2218,7 @@ impl S3 for FS {
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                     ..Default::default()
                 };
 
@@ -3202,7 +3203,7 @@ impl S3 for FS {
 
             range_spec
                 .get_offset_length(validation_size)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {e}")))?
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
         } else {
             (0, src_info.size)
         };
