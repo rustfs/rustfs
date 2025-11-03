@@ -16,7 +16,7 @@ use crate::admin::router::Operation;
 use http::header::CONTENT_TYPE;
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response, S3Result};
 use tracing::info;
 
 pub struct TriggerProfileCPU {}
@@ -29,7 +29,10 @@ impl Operation for TriggerProfileCPU {
             let mut header = HeaderMap::new();
             header.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
             return Ok(S3Response::with_headers(
-                (StatusCode::NOT_IMPLEMENTED, Body::from("CPU profiling is not supported on Windows")),
+                (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Body::from("CPU profiling is not supported on Windows".to_string()),
+                ),
                 header,
             ));
         }
@@ -43,7 +46,7 @@ impl Operation for TriggerProfileCPU {
                     header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
                     Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
                 }
-                Err(e) => Err(s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
+                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
             }
         }
     }
@@ -59,7 +62,10 @@ impl Operation for TriggerProfileMemory {
             let mut header = HeaderMap::new();
             header.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
             return Ok(S3Response::with_headers(
-                (StatusCode::NOT_IMPLEMENTED, Body::from("Memory profiling is not supported on Windows")),
+                (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Body::from("Memory profiling is not supported on Windows".to_string()),
+                ),
                 header,
             ));
         }
@@ -72,7 +78,7 @@ impl Operation for TriggerProfileMemory {
                     header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
                     Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
                 }
-                Err(e) => Err(s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
+                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
             }
         }
     }
