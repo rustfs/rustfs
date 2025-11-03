@@ -31,7 +31,7 @@ use serde_json::Value;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
@@ -116,6 +116,10 @@ impl Operation for AssumeRoleHandle {
         };
 
         if let Err(_err) = iam_store.policy_db_get(&cred.access_key, &cred.groups).await {
+            error!(
+                "AssumeRole get policy failed, err: {:?}, access_key: {:?}, groups: {:?}",
+                _err, cred.access_key, cred.groups
+            );
             return Err(s3_error!(InvalidArgument, "invalid policy arg"));
         }
 

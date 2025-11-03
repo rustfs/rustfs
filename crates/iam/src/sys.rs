@@ -626,7 +626,17 @@ impl<T: Store> IamSys<T> {
 
                 Ok((Some(res), ok))
             }
-            None => Ok((None, false)),
+            None => {
+                let _ = self.store.load_user(access_key).await;
+
+                if let Some(res) = self.store.get_user(access_key).await {
+                    let ok = res.credentials.is_valid();
+
+                    Ok((Some(res), ok))
+                } else {
+                    Ok((None, false))
+                }
+            }
         }
     }
 
@@ -665,6 +675,10 @@ impl<T: Store> IamSys<T> {
     }
     pub async fn get_group_description(&self, group: &str) -> Result<GroupDesc> {
         self.store.get_group_description(group).await
+    }
+
+    pub async fn list_groups_load(&self) -> Result<Vec<String>> {
+        self.store.update_groups().await
     }
 
     pub async fn list_groups(&self) -> Result<Vec<String>> {

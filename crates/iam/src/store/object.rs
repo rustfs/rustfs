@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{GroupInfo, MappedPolicy, Store, UserType};
-use crate::error::{Error, Result, is_err_config_not_found};
+use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
@@ -563,7 +563,11 @@ impl Store for ObjectStore {
 
             if let Some(item) = v.item {
                 let name = rustfs_utils::path::dir(&item);
-                self.load_group(&name, m).await?;
+                if let Err(err) = self.load_group(&name, m).await {
+                    if !is_err_no_such_group(&err) {
+                        return Err(err);
+                    }
+                }
             }
         }
         let _ = ctx.cancel();
