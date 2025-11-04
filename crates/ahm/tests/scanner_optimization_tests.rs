@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
-use tempfile::TempDir;
-
 use rustfs_ahm::scanner::{
     checkpoint::{CheckpointData, CheckpointManager},
     io_monitor::{AdvancedIOMonitor, IOMonitorConfig},
@@ -23,6 +20,8 @@ use rustfs_ahm::scanner::{
     node_scanner::{LoadLevel, NodeScanner, NodeScannerConfig, ScanProgress},
     stats_aggregator::{DecentralizedStatsAggregator, DecentralizedStatsAggregatorConfig},
 };
+use std::time::Duration;
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn test_checkpoint_manager_save_and_load() {

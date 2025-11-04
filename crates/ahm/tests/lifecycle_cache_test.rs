@@ -23,16 +23,16 @@ use rustfs_ecstore::{
     store_api::{MakeBucketOptions, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serial_test::serial;
-use std::borrow::Cow;
-use std::sync::Once;
-use std::sync::OnceLock;
-use std::{path::PathBuf, sync::Arc};
-use tokio::fs;
-use tokio_util::sync::CancellationToken;
-use tracing::warn;
-use tracing::{debug, info};
+use std::{
+    borrow::Cow,
+    path::PathBuf,
+    sync::{Arc, Once, OnceLock},
+};
 //use heed_traits::Comparator;
 use time::OffsetDateTime;
+use tokio::fs;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();

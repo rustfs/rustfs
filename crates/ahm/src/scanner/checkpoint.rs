@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::scanner::node_scanner::ScanProgress;
+use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
-
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-
-use super::node_scanner::ScanProgress;
-use crate::{Error, error::Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CheckpointData {

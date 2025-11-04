@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
+use crate::{Error, Result};
 use async_trait::async_trait;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{

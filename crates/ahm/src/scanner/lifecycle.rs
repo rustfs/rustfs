@@ -12,25 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::error::Result;
+use crate::Result;
 use rustfs_common::data_usage::SizeSummary;
 use rustfs_common::metrics::IlmAction;
-use rustfs_ecstore::bucket::lifecycle::{
-    bucket_lifecycle_audit::LcEventSrc,
-    bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_lifecycle_action, eval_action_from_lifecycle},
-    lifecycle,
-    lifecycle::Lifecycle,
+use rustfs_ecstore::bucket::{
+    lifecycle::{
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_lifecycle_action, eval_action_from_lifecycle},
+        lifecycle,
+        lifecycle::Lifecycle,
+    },
+    metadata_sys::get_object_lock_config,
+    object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion},
+    versioning::VersioningApi,
+    versioning_sys::BucketVersioningSys,
 };
-use rustfs_ecstore::bucket::metadata_sys::get_object_lock_config;
-use rustfs_ecstore::bucket::object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion};
-use rustfs_ecstore::bucket::versioning::VersioningApi;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_filemeta::FileInfo;
 use s3s::dto::{BucketLifecycleConfiguration as LifecycleConfig, VersioningConfiguration};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use time::OffsetDateTime;
 use tracing::info;
 

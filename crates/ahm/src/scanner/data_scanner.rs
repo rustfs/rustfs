@@ -12,28 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
-use time::OffsetDateTime;
-
-use ecstore::{
-    disk::{Disk, DiskAPI, DiskStore, WalkDirOptions},
-    set_disk::SetDisks,
-};
-use rustfs_ecstore::store_api::ObjectInfo;
-use rustfs_ecstore::{
-    self as ecstore, StorageAPI,
-    data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
-};
-use rustfs_filemeta::{MetacacheReader, VersionType};
-use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
-use tokio::sync::{Mutex, RwLock};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-
 use super::metrics::{BucketMetrics, DiskMetrics, MetricsCollector, ScannerMetrics};
 use super::node_scanner::{NodeScanner, NodeScannerConfig};
 use super::stats_aggregator::{DecentralizedStatsAggregator, DecentralizedStatsAggregatorConfig};
@@ -46,12 +24,28 @@ use crate::{
     error::{Error, Result},
     get_ahm_services_cancel_token,
 };
-
 use rustfs_common::data_usage::{DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, globalMetrics};
-use rustfs_ecstore::bucket::versioning::VersioningApi;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
+use rustfs_ecstore::{
+    self as ecstore, StorageAPI,
+    bucket::versioning::VersioningApi,
+    bucket::versioning_sys::BucketVersioningSys,
+    data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
+    disk::{Disk, DiskAPI, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions},
+    set_disk::SetDisks,
+    store_api::ObjectInfo,
+};
+use rustfs_filemeta::{MetacacheReader, VersionType};
+use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use time::OffsetDateTime;
+use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use uuid;
 
 /// Custom scan mode enum for AHM scanner

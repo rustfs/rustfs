@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
+use crate::Result;
 use crate::heal::{
     manager::HealManager,
     task::{HealOptions, HealPriority, HealRequest, HealType},
 };
-
 use rustfs_common::heal_channel::{
     HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Heal channel processor
 pub struct HealChannelProcessor {
@@ -60,7 +59,7 @@ impl HealChannelProcessor {
                             }
                         }
                         None => {
-                            info!("Heal channel receiver closed, stopping processor");
+                            debug!("Heal channel receiver closed, stopping processor");
                             break;
                         }
                     }

@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
-
-use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// Scanner metrics

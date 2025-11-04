@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::scanner::node_scanner::{BucketStats, DiskStats, LocalScanStats};
+use crate::{Error, Result};
+use rustfs_common::data_usage::DataUsageInfo;
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
-
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-
-use rustfs_common::data_usage::DataUsageInfo;
-
-use super::node_scanner::{BucketStats, DiskStats, LocalScanStats};
-use crate::{Error, error::Result};
 
 /// local stats manager
 pub struct LocalStatsManager {
