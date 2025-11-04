@@ -317,6 +317,7 @@ impl HealManager {
                                 continue;
                             };
                             // skip if already queued or healing
+                            // Use consistent lock order: queue first, then active_heals to avoid deadlock
                             let mut skip = false;
                             {
                                 let queue = heal_queue.lock().await;

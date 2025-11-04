@@ -179,7 +179,10 @@ impl HealStorageAPI for ECStoreHealStorage {
                             "Object data exceeds cap ({} bytes), aborting full read to prevent OOM: {}/{}",
                             MAX_READ_BYTES, bucket, object
                         );
-                        return Ok(None);
+                        return Err(Error::other(format!(
+                            "Object too large: {} bytes (max: {} bytes) for {}/{}",
+                            n_read, MAX_READ_BYTES, bucket, object
+                        )));
                     }
                 }
                 Err(e) => {

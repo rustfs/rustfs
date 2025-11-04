@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -198,6 +198,8 @@ pub struct HealTask {
     pub started_at: Arc<RwLock<Option<SystemTime>>>,
     /// Completed time
     pub completed_at: Arc<RwLock<Option<SystemTime>>>,
+    /// Task start instant for timeout calculation (monotonic)
+    task_start_instant: Arc<RwLock<Option<Instant>>>,
     /// Cancel token
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Storage layer interface
@@ -215,6 +217,7 @@ impl HealTask {
             created_at: request.created_at,
             started_at: Arc::new(RwLock::new(None)),
             completed_at: Arc::new(RwLock::new(None)),
+            task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
         }
@@ -222,14 +225,13 @@ impl HealTask {
 
     async fn remaining_timeout(&self) -> Result<Option<Duration>> {
         if let Some(total) = self.options.timeout {
-            let started = { *self.started_at.read().await };
-            if let Some(started_at) = started {
-                if let Ok(elapsed) = SystemTime::now().duration_since(started_at) {
-                    if elapsed >= total {
-                        return Err(Error::TaskTimeout);
-                    }
-                    return Ok(Some(total - elapsed));
+            let start_instant = { *self.task_start_instant.read().await };
+            if let Some(started_at) = start_instant {
+                let elapsed = started_at.elapsed();
+                if elapsed >= total {
+                    return Err(Error::TaskTimeout);
                 }
+                return Ok(Some(total - elapsed));
             }
             Ok(Some(total))
         } else {
@@ -270,14 +272,16 @@ impl HealTask {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // update status to running
+        // update status and timestamps atomically to avoid race conditions
+        let now = SystemTime::now();
+        let start_instant = Instant::now();
         {
             let mut status = self.status.write().await;
-            *status = HealTaskStatus::Running;
-        }
-        {
             let mut started_at = self.started_at.write().await;
-            *started_at = Some(SystemTime::now());
+            let mut task_start_instant = self.task_start_instant.write().await;
+            *status = HealTaskStatus::Running;
+            *started_at = Some(now);
+            *task_start_instant = Some(start_instant);
         }
 
         info!("Starting heal task: {} with type: {:?}", self.id, self.heal_type);

@@ -240,23 +240,6 @@ pub fn subscribe_heal_responses() -> broadcast::Receiver<HealChannelResponse> {
     heal_response_sender().subscribe()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn heal_response_broadcast_reaches_subscriber() {
-        let mut receiver = subscribe_heal_responses();
-        let response = create_heal_response("req-1".to_string(), true, None, None);
-
-        publish_heal_response(response.clone()).expect("publish should succeed");
-
-        let received = receiver.recv().await.expect("should receive heal response");
-        assert_eq!(received.request_id, response.request_id);
-        assert!(received.success);
-    }
-}
-
 /// Send heal start request
 pub async fn send_heal_request(request: HealChannelRequest) -> Result<(), String> {
     send_heal_command(HealChannelCommand::Start(request)).await
@@ -453,4 +436,21 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         timeout_seconds: None,
     };
     send_heal_request(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn heal_response_broadcast_reaches_subscriber() {
+        let mut receiver = subscribe_heal_responses();
+        let response = create_heal_response("req-1".to_string(), true, None, None);
+
+        publish_heal_response(response.clone()).expect("publish should succeed");
+
+        let received = receiver.recv().await.expect("should receive heal response");
+        assert_eq!(received.request_id, response.request_id);
+        assert!(received.success);
+    }
 }

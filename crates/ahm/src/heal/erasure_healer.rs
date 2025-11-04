@@ -360,7 +360,8 @@ impl ErasureSetHealer {
             let cancel_token = self.cancel_token.clone();
 
             async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = semaphore.acquire().await
+                    .map_err(|e| Error::other(format!("Failed to acquire semaphore for bucket heal: {}", e)))?;
 
                 if cancel_token.is_cancelled() {
                     return Err(Error::TaskCancelled);
@@ -455,7 +456,8 @@ impl ErasureSetHealer {
             let semaphore = semaphore.clone();
 
             async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = semaphore.acquire().await
+                    .map_err(|e| Error::other(format!("Failed to acquire semaphore for object heal: {}", e)))?;
 
                 match storage.heal_object(&bucket, &object, None, &heal_opts).await {
                     Ok((_result, None)) => {
