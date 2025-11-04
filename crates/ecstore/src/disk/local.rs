@@ -1085,9 +1085,16 @@ impl LocalDisk {
             *item = "".to_owned();
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
-                let metadata = self
+                let metadata = match self
                     .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
-                    .await?;
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(err) => {
+                        warn!("scan dir read_metadata error, continue {:?}", err);
+                        continue;
+                    }
+                };
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
@@ -1189,6 +1196,9 @@ impl LocalDisk {
                     // }
                 }
                 Err(err) => {
+                    if err == Error::DiskNotDir {
+                        continue;
+                    }
                     if err == Error::FileNotFound || err == Error::IsNotRegular {
                         // NOT an object, append to stack (with slash)
                         // If dirObject, but no metadata (which is unexpected) we skip it.
@@ -1203,7 +1213,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some(dir) = dir_stack.pop() {
+        while let Some(dir) = dir_stack.last() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -1215,10 +1225,11 @@ impl LocalDisk {
             .await?;
 
             if opts.recursive {
-                if let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned)).await {
+                if let Err(er) = Box::pin(self.scan_dir(dir.clone(), prefix.clone(), opts, out, objs_returned)).await {
                     warn!("scan_dir err {:?}", &er);
                 }
             }
+            dir_stack.pop();
         }
 
         Ok(())
