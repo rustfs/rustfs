@@ -149,10 +149,12 @@ impl HealEvent {
                 // Note: This requires access to storage to get bucket list, which is not available here
                 // The actual bucket list will need to be provided by the caller or retrieved differently
                 let set_disk_id = crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx)
-                    .ok_or_else(|| Error::InvalidHealType {
-                        heal_type: format!("Invalid pool/set indices: pool={}, set={}", endpoint.pool_idx, endpoint.set_idx),
-                    })
-                    .expect("Invalid pool/set indices for disk status change event");
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Invalid pool/set indices for disk status change event: pool={}, set={}",
+                            endpoint.pool_idx, endpoint.set_idx
+                        );
+                    });
                 HealRequest::new(
                     HealType::ErasureSet {
                         buckets: vec![], // Empty bucket list - caller should populate this
