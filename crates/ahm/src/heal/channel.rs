@@ -227,7 +227,7 @@ impl HealChannelProcessor {
             error!("Failed to enqueue heal response locally: {}", e);
         }
         // Always attempt to broadcast, even if local send failed
-        // Use the original response to avoid unnecessary clone
+        // Use the original response for broadcast; local send uses a clone
         if let Err(e) = publish_heal_response(response) {
             error!("Failed to broadcast heal response: {}", e);
         }
