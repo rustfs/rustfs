@@ -932,8 +932,8 @@ impl HealTask {
         }
 
         // Step 3: Heal bucket structure
-        // Each heal_bucket call is wrapped with timeout control internally,
-        // but we also check control flags before each iteration to ensure timely cancellation
+        // Check control flags before each iteration to ensure timely cancellation.
+        // Each heal_bucket call may handle timeout/cancellation internally, see its implementation for details.
         for bucket in buckets.iter() {
             // Check control flags before starting each bucket heal
             self.check_control_flags().await?;
