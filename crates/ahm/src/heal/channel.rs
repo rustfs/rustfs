@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::heal::{
     manager::HealManager,
     task::{HealOptions, HealPriority, HealRequest, HealType},
+    utils,
 };
 
 use rustfs_common::heal_channel::{
     HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
+    publish_heal_response,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -99,7 +101,6 @@ impl HealChannelProcessor {
             Ok(task_id) => {
                 info!("Successfully submitted heal request: {} as task: {}", request.id, task_id);
 
-                // Send success response
                 let response = HealChannelResponse {
                     request_id: request.id,
                     success: true,
@@ -107,9 +108,7 @@ impl HealChannelProcessor {
                     error: None,
                 };
 
-                if let Err(e) = self.response_sender.send(response) {
-                    error!("Failed to send heal response: {}", e);
-                }
+                self.publish_response(response);
             }
             Err(e) => {
                 error!("Failed to submit heal request: {} - {}", request.id, e);
@@ -122,9 +121,7 @@ impl HealChannelProcessor {
                     error: Some(e.to_string()),
                 };
 
-                if let Err(e) = self.response_sender.send(response) {
-                    error!("Failed to send heal error response: {}", e);
-                }
+                self.publish_response(response);
             }
         }
 
@@ -144,9 +141,7 @@ impl HealChannelProcessor {
             error: None,
         };
 
-        if let Err(e) = self.response_sender.send(response) {
-            error!("Failed to send query response: {}", e);
-        }
+        self.publish_response(response);
 
         Ok(())
     }
@@ -164,9 +159,7 @@ impl HealChannelProcessor {
             error: None,
         };
 
-        if let Err(e) = self.response_sender.send(response) {
-            error!("Failed to send cancel response: {}", e);
-        }
+        self.publish_response(response);
 
         Ok(())
     }
@@ -174,9 +167,12 @@ impl HealChannelProcessor {
     /// Convert channel request to heal request
     fn convert_to_heal_request(&self, request: HealChannelRequest) -> Result<HealRequest> {
         let heal_type = if let Some(disk_id) = &request.disk {
+            let set_disk_id = utils::normalize_set_disk_id(disk_id).ok_or_else(|| Error::InvalidHealType {
+                heal_type: format!("erasure-set({disk_id})"),
+            })?;
             HealType::ErasureSet {
                 buckets: vec![],
-                set_disk_id: disk_id.clone(),
+                set_disk_id,
             }
         } else if let Some(prefix) = &request.object_prefix {
             if !prefix.is_empty() {
@@ -224,6 +220,18 @@ impl HealChannelProcessor {
         }
 
         Ok(HealRequest::new(heal_type, options, priority))
+    }
+
+    fn publish_response(&self, response: HealChannelResponse) {
+        // Try to send to local channel first, but don't block broadcast on failure
+        if let Err(e) = self.response_sender.send(response.clone()) {
+            error!("Failed to enqueue heal response locally: {}", e);
+        }
+        // Always attempt to broadcast, even if local send failed
+        // Use the original response to avoid unnecessary clone
+        if let Err(e) = publish_heal_response(response) {
+            error!("Failed to broadcast heal response: {}", e);
+        }
     }
 
     /// Get response sender for external use

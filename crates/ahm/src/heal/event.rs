@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::error::Error;
 use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
 use rustfs_ecstore::disk::endpoint::Endpoint;
 use serde::{Deserialize, Serialize};
@@ -147,10 +148,15 @@ impl HealEvent {
                 // Convert disk status change to erasure set heal
                 // Note: This requires access to storage to get bucket list, which is not available here
                 // The actual bucket list will need to be provided by the caller or retrieved differently
+                let set_disk_id = crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx)
+                    .ok_or_else(|| Error::InvalidHealType {
+                        heal_type: format!("Invalid pool/set indices: pool={}, set={}", endpoint.pool_idx, endpoint.set_idx),
+                    })
+                    .expect("Invalid pool/set indices for disk status change event");
                 HealRequest::new(
                     HealType::ErasureSet {
                         buckets: vec![], // Empty bucket list - caller should populate this
-                        set_disk_id: format!("{}_{}", endpoint.pool_idx, endpoint.set_idx),
+                        set_disk_id,
                     },
                     HealOptions::default(),
                     HealPriority::High,
