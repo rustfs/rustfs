@@ -25,6 +25,7 @@ use tracing::warn;
 
 use super::error::DiskError;
 
+/// Check path length according to OS limits.
 pub fn check_path_length(path_name: &str) -> Result<()> {
     // Apple OS X path length is limited to 1016
     if cfg!(target_os = "macos") && path_name.len() > 1016 {
@@ -64,6 +65,10 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if the given disk path is the root disk.
+/// On Windows, always return false.
+/// On Unix, compare the disk paths.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn is_root_disk(disk_path: &str, root_disk: &str) -> Result<bool> {
     if cfg!(target_os = "windows") {
         return Ok(false);
@@ -72,6 +77,8 @@ pub fn is_root_disk(disk_path: &str, root_disk: &str) -> Result<bool> {
     rustfs_utils::os::same_disk(disk_path, root_disk).map_err(|e| to_file_error(e).into())
 }
 
+/// Create a directory and all its parent components if they are missing.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> Result<()> {
     check_path_length(path.as_ref().to_string_lossy().to_string().as_str())?;
 
@@ -82,11 +89,16 @@ pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) ->
     Ok(())
 }
 
+/// Check if a directory is empty.
+/// Only reads one entry to determine if the directory is empty.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn is_empty_dir(path: impl AsRef<Path>) -> bool {
     read_dir(path.as_ref(), 1).await.is_ok_and(|v| v.is_empty())
 }
 
 // read_dir  count read limit. when count == 0 unlimit.
+/// Return file names in the directory.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec<String>> {
     let mut entries = fs::read_dir(path.as_ref()).await?;
 
@@ -197,6 +209,10 @@ pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Pat
     Ok(())
 }
 
+/// Create a directory and all its parent components if they are missing.
+/// Without recursion support, fall back to create_dir_all
+/// This function will not create directories under base_dir.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
     if !base_dir.as_ref().to_string_lossy().is_empty() && base_dir.as_ref().starts_with(dir_path.as_ref()) {
         return Ok(());
@@ -225,6 +241,9 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     Ok(())
 }
 
+/// Check if a file exists.
+/// Returns true if the file exists, false otherwise.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn file_exists(path: impl AsRef<Path>) -> bool {
     std::fs::metadata(path.as_ref()).map(|_| true).unwrap_or(false)
 }

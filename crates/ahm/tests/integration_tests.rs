@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{sync::Arc, time::Duration};
-use tempfile::TempDir;
-
 use rustfs_ahm::scanner::{
     io_throttler::MetricsSnapshot,
     local_stats::StatsSummary,
     node_scanner::{LoadLevel, NodeScanner, NodeScannerConfig},
     stats_aggregator::{DecentralizedStatsAggregator, DecentralizedStatsAggregatorConfig, NodeInfo},
 };
-
-mod scanner_optimization_tests;
 use scanner_optimization_tests::{PerformanceBenchmark, create_test_scanner};
-
+use std::{sync::Arc, time::Duration};
+use tempfile::TempDir;
+mod scanner_optimization_tests;
 #[tokio::test]
 async fn test_end_to_end_scanner_lifecycle() {
     let temp_dir = TempDir::new().unwrap();

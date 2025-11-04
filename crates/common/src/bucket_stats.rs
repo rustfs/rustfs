@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::last_minute::{self};
 use std::collections::HashMap;
 
-use crate::last_minute::{self};
 pub struct ReplicationLatency {
     // Delays for single and multipart PUT requests
     upload_histogram: last_minute::LastMinuteHistogram,

@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::Result;
+use crate::scanner::{
+    AdvancedIOMonitor, AdvancedIOThrottler, BatchScanResult, CheckpointManager, IOMonitorConfig, IOThrottlerConfig,
+    LocalStatsManager, MetricsSnapshot, ScanResultEntry,
+};
+use rustfs_common::data_usage::DataUsageInfo;
+use rustfs_ecstore::StorageAPI;
+use rustfs_ecstore::disk::{DiskAPI, DiskStore};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -21,21 +30,9 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-use rustfs_common::data_usage::DataUsageInfo;
-use rustfs_ecstore::StorageAPI;
-use rustfs_ecstore::disk::{DiskAPI, DiskStore}; // Add this import
-
-use super::checkpoint::CheckpointManager;
-use super::io_monitor::{AdvancedIOMonitor, IOMonitorConfig};
-use super::io_throttler::{AdvancedIOThrottler, IOThrottlerConfig, MetricsSnapshot};
-use super::local_stats::{BatchScanResult, LocalStatsManager, ScanResultEntry};
-use crate::error::Result;
 
 /// SystemTime serde
 mod system_time_serde {

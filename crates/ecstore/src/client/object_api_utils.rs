@@ -21,13 +21,12 @@
 
 use http::HeaderMap;
 use s3s::dto::ETag;
-use std::pin::Pin;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions};
-use rustfs_filemeta::fileinfo::ObjectPartInfo;
+use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
 use s3s::S3ErrorCode;
 

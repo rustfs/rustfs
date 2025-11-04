@@ -14,26 +14,31 @@
 
 use crate::config::build;
 use crate::license::get_license;
-use axum::Json;
-use axum::body::Body;
-use axum::response::{IntoResponse, Response};
-use axum::{Router, extract::Request, middleware, routing::get};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::Request,
+    middleware,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
-use http::{HeaderMap, HeaderName, StatusCode, Uri};
-use http::{HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use serde::Serialize;
 use serde_json::json;
-use std::io::Result;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::{
+    io::Result,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio_rustls::rustls::ServerConfig;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -274,7 +279,6 @@ async fn console_logging_middleware(req: Request, next: axum::middleware::Next) 
     let method = req.method().clone();
     let uri = req.uri().clone();
     let start = std::time::Instant::now();
-
     let response = next.run(req).await;
     let duration = start.elapsed();
 
@@ -409,6 +413,8 @@ fn setup_console_middleware_stack(
     app = app
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
+        // Compress responses
+        .layer(CompressionLayer::new())
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)
         // Add timeout layer - convert auth_timeout from seconds to Duration

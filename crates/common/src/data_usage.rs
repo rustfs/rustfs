@@ -14,10 +14,10 @@
 
 use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
+    path::Path,
     time::SystemTime,
 };
 

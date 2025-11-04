@@ -79,7 +79,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true }
 tower.workspace = true
-tower-http = { workspace = true, features = ["trace", "compression-deflate", "compression-gzip", "cors", "catch-panic", "timeout", "limit"] }
+tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id"] }
 
 # Serialization and Data Formats
 bytes = { workspace = true }
@@ -112,6 +112,7 @@ mime_guess = { workspace = true }
 pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
+scopeguard.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }

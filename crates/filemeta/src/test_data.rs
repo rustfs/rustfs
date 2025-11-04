@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
-use crate::filemeta::*;
+use crate::{ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, MetaDeleteMarker, MetaObject, Result, VersionType};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -257,6 +256,7 @@ pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileMeta;
 
     #[test]
     fn test_create_real_xlmeta() {

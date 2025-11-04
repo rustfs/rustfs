@@ -24,9 +24,11 @@ use rustfs_ecstore::{
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
 use serial_test::serial;
-use std::sync::Once;
-use std::sync::OnceLock;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Once, OnceLock},
+    time::Duration,
+};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use tracing::info;

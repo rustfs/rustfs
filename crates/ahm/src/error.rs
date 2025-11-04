@@ -14,6 +14,10 @@
 
 use thiserror::Error;
 
+/// Custom error type for AHM operations
+/// This enum defines various error variants that can occur during
+/// the execution of AHM-related tasks, such as I/O errors, storage errors,
+/// configuration errors, and specific errors related to healing operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -85,9 +89,13 @@ pub enum Error {
     ProgressTrackingFailed { message: String },
 }
 
+/// A specialized Result type for AHM operations
+///This type is a convenient alias for results returned by functions in the AHM crate,
+/// using the custom Error type defined above.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
+    /// Create an Other error from any error type
     pub fn other<E>(error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>>,

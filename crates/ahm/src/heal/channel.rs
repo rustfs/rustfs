@@ -18,14 +18,13 @@ use crate::heal::{
     task::{HealOptions, HealPriority, HealRequest, HealType},
     utils,
 };
-
 use rustfs_common::heal_channel::{
     HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
     publish_heal_response,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Heal channel processor
 pub struct HealChannelProcessor {
@@ -62,7 +61,7 @@ impl HealChannelProcessor {
                             }
                         }
                         None => {
-                            info!("Heal channel receiver closed, stopping processor");
+                            debug!("Heal channel receiver closed, stopping processor");
                             break;
                         }
                     }
