@@ -98,7 +98,7 @@ async-compression = { version = "0.4.19" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.6"
-axum-extra = "0.12.0"
+axum-extra = "0.12.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"], default-features = false }
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -135,7 +135,7 @@ rmp-serde = { version = "1.3.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
-schemars = "1.0.4"
+schemars = "1.0.5"
 
 # Cryptography and Security
 aes-gcm = { version = "0.10.3", features = ["std"] }
@@ -150,7 +150,7 @@ hmac = "0.12.1"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 pbkdf2 = "0.12.2"
 rsa = { version = "0.9.8" }
-rustls = { version = "0.23.34", features = ["ring", "logging", "std", "tls12"], default-features = false }
+rustls = { version = "0.23.35", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.13.0"
 sha1 = "0.10.6"
@@ -190,6 +190,7 @@ glob = "0.3.3"
 google-cloud-storage = "1.2.0"
 google-cloud-auth = "1.1.0"
 hashbrown = { version = "0.16.0", features = ["serde", "rayon"] }
+heed = { version = "0.22.0" }
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
@@ -225,6 +226,7 @@ rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
 s3s = { version = "0.12.0-rc.3", features = ["minio"] }
+scopeguard = "1.2.0"
 serial_test = "3.2.0"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
@@ -241,6 +243,7 @@ tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.17"
 tracing = { version = "0.1.41" }
+tracing-appender = "0.2.3"
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
@@ -277,7 +280,7 @@ mimalloc = "0.1"
 
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rustfs-mcp", "tokio-test"]
+ignored = ["rustfs", "rustfs-mcp", "tokio-test", "scopeguard"]
 
 [profile.release]
 opt-level = 3

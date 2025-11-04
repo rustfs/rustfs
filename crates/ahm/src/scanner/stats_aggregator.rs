@@ -12,23 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::scanner::{
+    local_stats::StatsSummary,
+    node_scanner::{BucketStats, LoadLevel, ScanProgress},
+};
+use crate::{Error, Result};
+use rustfs_common::data_usage::DataUsageInfo;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime},
 };
-
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-
-use rustfs_common::data_usage::DataUsageInfo;
-
-use super::{
-    local_stats::StatsSummary,
-    node_scanner::{BucketStats, LoadLevel, ScanProgress},
-};
-use crate::{Error, error::Result};
 
 /// node client config
 #[derive(Debug, Clone)]

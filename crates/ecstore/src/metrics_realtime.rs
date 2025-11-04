@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
-
-use chrono::Utc;
-use rustfs_common::{
-    globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr},
-    heal_channel::DriveState,
-    metrics::globalMetrics,
-};
-use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
-use rustfs_utils::os::get_drive_stats;
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
-
 use crate::{
     admin_server_info::get_local_server_property,
     new_object_layer_fn,
     store_api::StorageAPI,
     // utils::os::get_drive_stats,
 };
+use chrono::Utc;
+use rustfs_common::{
+    globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr},
+    heal_channel::DriveState,
+    metrics::global_metrics,
+};
+use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
+use rustfs_utils::os::get_drive_stats;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, info};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CollectMetricsOpts {
@@ -118,7 +116,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     if types.contains(&MetricType::SCANNER) {
         debug!("start get scanner metrics");
-        let metrics = globalMetrics.report().await;
+        let metrics = global_metrics().report().await;
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
 

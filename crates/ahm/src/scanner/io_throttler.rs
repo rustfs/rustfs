@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::scanner::LoadLevel;
 use std::{
     sync::{
         Arc,
@@ -19,11 +20,8 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-
-use super::node_scanner::LoadLevel;
 
 /// IO throttler config
 #[derive(Debug, Clone)]

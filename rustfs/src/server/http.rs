@@ -43,7 +43,9 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 
@@ -448,11 +450,18 @@ fn process_connection(
         let service = hybrid(s3_service, rpc_service);
 
         let hybrid_service = ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
+                        let trace_id = request
+                            .headers()
+                            .get(http::header::HeaderName::from_static("x-request-id"))
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("unknown");
                         let span = tracing::info_span!("http-request",
+                            trace_id = %trace_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
                             uri = %request.uri(),
@@ -466,7 +475,8 @@ fn process_connection(
 
                         span
                     })
-                    .on_request(|request: &HttpRequest<_>, _span: &Span| {
+                    .on_request(|request: &HttpRequest<_>, span: &Span| {
+                        let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
                         let labels = [
                             ("key_request_method", format!("{}", request.method())),
@@ -474,23 +484,31 @@ fn process_connection(
                         ];
                         counter!("rustfs_api_requests_total", &labels).increment(1);
                     })
-                    .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
-                        _span.record("http response status_code", tracing::field::display(response.status()));
+                    .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
+                        span.record("status_code", tracing::field::display(response.status()));
+                        let _enter = span.enter();
+                        histogram!("request.latency.ms").record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
                     })
-                    .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                    .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                        let _enter = span.enter();
                         histogram!("request.body.len").record(chunk.len() as f64);
                         debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
-                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                        let _enter = span.enter();
                         debug!("http stream closed after {:?}", stream_duration)
                     })
-                    .on_failure(|_error, latency: Duration, _span: &Span| {
+                    .on_failure(|_error, latency: Duration, span: &Span| {
+                        let _enter = span.enter();
                         counter!("rustfs_api_requests_failure_total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
+            .layer(PropagateRequestIdLayer::x_request_id())
             .layer(cors_layer)
+            // Compress responses
+            .layer(CompressionLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 

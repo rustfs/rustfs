@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
 use crate::heal::{
     progress::HealProgress,
     resume::{CheckpointManager, ResumeManager, ResumeUtils},
     storage::HealStorageAPI,
 };
+use crate::{Error, Result};
 use futures::future::join_all;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::disk::DiskStore;
@@ -182,7 +182,7 @@ impl ErasureSetHealer {
 
             // check cancel status
             if self.cancel_token.is_cancelled() {
-                info!("Heal task cancelled");
+                warn!("Heal task cancelled");
                 return Err(Error::TaskCancelled);
             }
 
@@ -222,7 +222,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        info!("Starting heal for bucket: {} from object index {}", bucket, current_object_index);
+        info!(target: "rustfs:ahm:heal_bucket_with_resume" ,"Starting heal for bucket: {} from object index {}", bucket, current_object_index);
 
         // 1. get bucket info
         let _bucket_info = match self.storage.get_bucket_info(bucket).await? {
@@ -260,7 +260,7 @@ impl ErasureSetHealer {
 
             if !object_exists {
                 info!(
-                    "Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
+                    target: "rustfs:ahm:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
                     bucket, object
                 );
                 checkpoint_manager.add_processed_object(object.clone()).await?;

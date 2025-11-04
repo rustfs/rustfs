@@ -12,22 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
-use lazy_static::lazy_static;
 use rustfs_madmin::metrics::ScannerMetrics as M_ScannerMetrics;
 use std::{
     collections::HashMap,
     fmt::Display,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
 use tokio::sync::{Mutex, RwLock};
-
-use crate::last_minute::{AccElem, LastMinuteLatency};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IlmAction {
@@ -73,8 +71,10 @@ impl Display for IlmAction {
     }
 }
 
-lazy_static! {
-    pub static ref globalMetrics: Arc<Metrics> = Arc::new(Metrics::new());
+pub static GLOBAL_METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
+
+pub fn global_metrics() -> &'static Arc<Metrics> {
+    GLOBAL_METRICS.get_or_init(|| Arc::new(Metrics::new()))
 }
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
@@ -294,13 +294,13 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
             // Update operation count
-            globalMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
+            global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
 
             // Update latency for realtime metrics (spawn async task for this)
             if (metric) < Metric::LastRealtime as usize {
                 let metric_index = metric;
                 tokio::spawn(async move {
-                    globalMetrics.latency[metric_index].add(duration).await;
+                    global_metrics().latency[metric_index].add(duration).await;
                 });
             }
 
@@ -319,13 +319,13 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
             // Update operation count
-            globalMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
+            global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
 
             // Update latency for realtime metrics with size (spawn async task)
             if (metric) < Metric::LastRealtime as usize {
                 let metric_index = metric;
                 tokio::spawn(async move {
-                    globalMetrics.latency[metric_index].add_size(duration, size).await;
+                    global_metrics().latency[metric_index].add_size(duration, size).await;
                 });
             }
         }
@@ -339,13 +339,13 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
             // Update operation count
-            globalMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
+            global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
 
             // Update latency for realtime metrics (spawn async task)
             if (metric) < Metric::LastRealtime as usize {
                 let metric_index = metric;
                 tokio::spawn(async move {
-                    globalMetrics.latency[metric_index].add(duration).await;
+                    global_metrics().latency[metric_index].add(duration).await;
                 });
             }
         }
@@ -360,13 +360,13 @@ impl Metrics {
                 let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
                 // Update operation count
-                globalMetrics.operations[metric].fetch_add(count as u64, Ordering::Relaxed);
+                global_metrics().operations[metric].fetch_add(count as u64, Ordering::Relaxed);
 
                 // Update latency for realtime metrics (spawn async task)
                 if (metric) < Metric::LastRealtime as usize {
                     let metric_index = metric;
                     tokio::spawn(async move {
-                        globalMetrics.latency[metric_index].add(duration).await;
+                        global_metrics().latency[metric_index].add(duration).await;
                     });
                 }
             })
@@ -384,8 +384,8 @@ impl Metrics {
             Box::new(move || {
                 let duration = SystemTime::now().duration_since(start).unwrap_or(Duration::from_secs(0));
                 tokio::spawn(async move {
-                    globalMetrics.actions[a_clone].fetch_add(versions, Ordering::Relaxed);
-                    globalMetrics.actions_latency[a_clone].add(duration).await;
+                    global_metrics().actions[a_clone].fetch_add(versions, Ordering::Relaxed);
+                    global_metrics().actions_latency[a_clone].add(duration).await;
                 });
             })
         })
@@ -395,11 +395,11 @@ impl Metrics {
     pub async fn inc_time(metric: Metric, duration: Duration) {
         let metric = metric as usize;
         // Update operation count
-        globalMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
+        global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
 
         // Update latency for realtime metrics
         if (metric) < Metric::LastRealtime as usize {
-            globalMetrics.latency[metric].add(duration).await;
+            global_metrics().latency[metric].add(duration).await;
         }
     }
 
@@ -501,7 +501,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
     let tracker_clone = Arc::clone(&tracker);
     let disk_clone = disk_name.clone();
     tokio::spawn(async move {
-        globalMetrics.current_paths.write().await.insert(disk_clone, tracker_clone);
+        global_metrics().current_paths.write().await.insert(disk_clone, tracker_clone);
     });
 
     let update_fn = {
@@ -520,7 +520,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
         Arc::new(move || -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
             let disk_name = disk_name.clone();
             Box::pin(async move {
-                globalMetrics.current_paths.write().await.remove(&disk_name);
+                global_metrics().current_paths.write().await.remove(&disk_name);
             })
         })
     };

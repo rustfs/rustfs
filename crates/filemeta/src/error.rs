@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// FileMeta error type and Result alias.
+/// This module defines a custom error type `Error` for handling various
+/// error scenarios related to file metadata operations. It also provides
+/// a `Result` type alias for convenience.
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]

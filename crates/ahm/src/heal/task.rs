@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
 use crate::heal::ErasureSetHealer;
 use crate::heal::{progress::HealProgress, storage::HealStorageAPI};
+use crate::{Error, Result};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

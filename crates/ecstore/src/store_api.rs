@@ -134,7 +134,7 @@ pub struct GetObjectReader {
 }
 
 impl GetObjectReader {
-    #[tracing::instrument(level = "debug", skip(reader))]
+    #[tracing::instrument(level = "debug", skip(reader, rs, opts, _h))]
     pub fn new(
         reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
         rs: Option<HTTPRangeSpec>,

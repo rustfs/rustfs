@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod error;
-pub mod fileinfo;
+mod fileinfo;
 mod filemeta;
 mod filemeta_inline;
 // pub mod headers;

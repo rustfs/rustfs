@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, OnceLock};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
-
-pub mod error;
+mod error;
 pub mod heal;
 pub mod scanner;
 
 pub use error::{Error, Result};
 pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
 pub use scanner::Scanner;
+use std::sync::{Arc, OnceLock};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 // Global cancellation token for AHM services (scanner and other background tasks)
 static GLOBAL_AHM_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
