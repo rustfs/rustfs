@@ -459,7 +459,7 @@ fn process_connection(
                             .headers()
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
-                            .unwrap_or(|| "unknown");
+                            .unwrap_or("unknown");
                         let span = tracing::info_span!("http-request",
                             trace_id = %trace_id,
                             status_code = tracing::field::Empty,
