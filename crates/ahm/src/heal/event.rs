@@ -149,10 +149,8 @@ impl HealEvent {
                 // Note: This requires access to storage to get bucket list, which is not available here
                 // The actual bucket list will need to be provided by the caller or retrieved differently
                 let set_disk_id = crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx)
-                    .ok_or_else(|| {
-                        Error::InvalidHealType {
-                            heal_type: format!("erasure-set(pool={}, set={})", endpoint.pool_idx, endpoint.set_idx),
-                        }
+                    .ok_or_else(|| Error::InvalidHealType {
+                        heal_type: format!("erasure-set(pool={}, set={})", endpoint.pool_idx, endpoint.set_idx),
                     })?;
                 Ok(HealRequest::new(
                     HealType::ErasureSet {
@@ -191,9 +189,11 @@ impl HealEvent {
                 HealOptions::default(),
                 HealPriority::High,
             )),
-            HealEvent::BucketMetadataCorruption { bucket, .. } => {
-                Ok(HealRequest::new(HealType::Bucket { bucket: bucket.clone() }, HealOptions::default(), HealPriority::High))
-            }
+            HealEvent::BucketMetadataCorruption { bucket, .. } => Ok(HealRequest::new(
+                HealType::Bucket { bucket: bucket.clone() },
+                HealOptions::default(),
+                HealPriority::High,
+            )),
             HealEvent::MRFMetadataCorruption { meta_path, .. } => Ok(HealRequest::new(
                 HealType::MRF {
                     meta_path: meta_path.clone(),

@@ -8,7 +8,7 @@ The workspace root hosts shared dependencies in `Cargo.toml`. The service binary
 
 ## Build, Test, and Development Commands
 Run `cargo check --all-targets` for fast validation. Build release binaries via `cargo build --release` or the pipeline-aligned `make build`. Use `./build-rustfs.sh --dev` for iterative development and `./build-rustfs.sh --platform <target>` for cross-compiles. Prefer `make pre-commit` before pushing to cover formatting, clippy, checks, and tests.
-Always ensure `cargo test --workspace --exclude e2e_test` and `cargo clippy --all-targets --all-features -- -D warnings` complete successfully after each code change to keep the tree healthy and warning-free.
+Always ensure `cargo fmt --all --check`, `cargo test --workspace --exclude e2e_test`, and `cargo clippy --all-targets --all-features -- -D warnings` complete successfully after each code change to keep the tree healthy and warning-free.
 
 ## Coding Style & Naming Conventions
 Formatting follows the repo `rustfmt.toml` (130-column width). Use `snake_case` for items, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Avoid `unwrap()` or `expect()` outside tests; bubble errors with `Result` and crate-specific `thiserror` types. Keep async code non-blocking and offload CPU-heavy work with `tokio::task::spawn_blocking` when necessary.

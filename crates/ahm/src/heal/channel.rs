@@ -281,10 +281,7 @@ mod tests {
         async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> crate::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(
-            &self,
-            _bucket: &str,
-        ) -> crate::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
             Ok(None)
         }
         async fn heal_bucket_metadata(&self, _bucket: &str) -> crate::Result<()> {

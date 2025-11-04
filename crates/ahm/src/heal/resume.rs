@@ -274,22 +274,13 @@ impl ResumeManager {
 
         // ignore delete errors, files may not exist
         if let Ok(path_str) = path_to_str(&state_file) {
-            let _ = self
-                .disk
-                .delete(RUSTFS_META_BUCKET, path_str, Default::default())
-                .await;
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
         if let Ok(path_str) = path_to_str(&progress_file) {
-            let _ = self
-                .disk
-                .delete(RUSTFS_META_BUCKET, path_str, Default::default())
-                .await;
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
         if let Ok(path_str) = path_to_str(&checkpoint_file) {
-            let _ = self
-                .disk
-                .delete(RUSTFS_META_BUCKET, path_str, Default::default())
-                .await;
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
 
         info!("Cleaned up resume state for task: {}", task_id);
@@ -477,10 +468,7 @@ impl CheckpointManager {
 
         let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
         if let Ok(path_str) = path_to_str(&checkpoint_file) {
-            let _ = self
-                .disk
-                .delete(RUSTFS_META_BUCKET, path_str, Default::default())
-                .await;
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
         }
 
         info!("Cleaned up checkpoint for task: {}", task_id);

@@ -39,10 +39,7 @@ fn test_heal_event_to_heal_request_no_panic() {
         // Should return error instead of panicking
         let result = event.to_heal_request();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid heal type"));
+        assert!(result.unwrap_err().to_string().contains("Invalid heal type"));
     }
 }
 
@@ -165,8 +162,8 @@ fn test_path_to_str_helper() {
 
 #[test]
 fn test_heal_task_status_atomic_update() {
-    use rustfs_ahm::heal::task::{HealOptions, HealRequest, HealTask, HealTaskStatus};
     use rustfs_ahm::heal::storage::HealStorageAPI;
+    use rustfs_ahm::heal::task::{HealOptions, HealRequest, HealTask, HealTaskStatus};
     use std::sync::Arc;
 
     // Mock storage for testing
@@ -204,10 +201,7 @@ fn test_heal_task_status_atomic_update() {
         async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_ahm::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(
-            &self,
-            _bucket: &str,
-        ) -> rustfs_ahm::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_ahm::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
             Ok(None)
         }
         async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_ahm::Result<()> {
@@ -232,10 +226,7 @@ fn test_heal_task_status_atomic_update() {
             _version_id: Option<&str>,
             _opts: &rustfs_common::heal_channel::HealOpts,
         ) -> rustfs_ahm::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_ahm::Error>)> {
-            Ok((
-                rustfs_madmin::heal_commands::HealResultItem::default(),
-                None,
-            ))
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
         async fn heal_bucket(
             &self,
@@ -248,10 +239,7 @@ fn test_heal_task_status_atomic_update() {
             &self,
             _dry_run: bool,
         ) -> rustfs_ahm::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_ahm::Error>)> {
-            Ok((
-                rustfs_madmin::heal_commands::HealResultItem::default(),
-                None,
-            ))
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_ahm::Result<Vec<String>> {
             Ok(vec![])
@@ -285,4 +273,3 @@ fn test_heal_task_status_atomic_update() {
     // Note: We can't directly access private fields, but creation without panic
     // confirms the fix works
 }
-
