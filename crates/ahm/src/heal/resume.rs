@@ -34,6 +34,9 @@ pub struct ResumeState {
     pub task_id: String,
     /// task type
     pub task_type: String,
+    /// set disk identifier (for erasure set tasks)
+    #[serde(default)]
+    pub set_disk_id: String,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -67,10 +70,11 @@ pub struct ResumeState {
 }
 
 impl ResumeState {
-    pub fn new(task_id: String, task_type: String, buckets: Vec<String>) -> Self {
+    pub fn new(task_id: String, task_type: String, set_disk_id: String, buckets: Vec<String>) -> Self {
         Self {
             task_id,
             task_type,
+            set_disk_id,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             completed: false,
@@ -156,8 +160,14 @@ pub struct ResumeManager {
 
 impl ResumeManager {
     /// create new resume manager
-    pub async fn new(disk: DiskStore, task_id: String, task_type: String, buckets: Vec<String>) -> Result<Self> {
-        let state = ResumeState::new(task_id, task_type, buckets);
+    pub async fn new(
+        disk: DiskStore,
+        task_id: String,
+        task_type: String,
+        set_disk_id: String,
+        buckets: Vec<String>,
+    ) -> Result<Self> {
+        let state = ResumeState::new(task_id, task_type, set_disk_id, buckets);
         let manager = Self {
             disk,
             state: Arc::new(RwLock::new(state)),
@@ -562,7 +572,7 @@ mod tests {
     async fn test_resume_state_creation() {
         let task_id = ResumeUtils::generate_task_id();
         let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let state = ResumeState::new(task_id.clone(), "erasure_set".to_string(), buckets);
+        let state = ResumeState::new(task_id.clone(), "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
 
         assert_eq!(state.task_id, task_id);
         assert_eq!(state.task_type, "erasure_set");
@@ -575,7 +585,7 @@ mod tests {
     async fn test_resume_state_progress() {
         let task_id = ResumeUtils::generate_task_id();
         let buckets = vec!["bucket1".to_string()];
-        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), buckets);
+        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
 
         state.update_progress(10, 8, 1, 1);
         assert_eq!(state.processed_objects, 10);
@@ -595,7 +605,7 @@ mod tests {
     async fn test_resume_state_bucket_completion() {
         let task_id = ResumeUtils::generate_task_id();
         let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), buckets);
+        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
 
         assert_eq!(state.pending_buckets.len(), 2);
         assert_eq!(state.completed_buckets.len(), 0);
@@ -650,6 +660,7 @@ mod tests {
             let state = ResumeState::new(
                 task_id.clone(),
                 "erasure_set".to_string(),
+                "pool_0_set_0".to_string(),
                 vec!["bucket1".to_string(), "bucket2".to_string()],
             );
 

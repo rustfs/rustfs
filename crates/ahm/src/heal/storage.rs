@@ -515,21 +515,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         debug!("Getting disk for resume: {}", set_disk_id);
 
         // Parse set_disk_id to extract pool and set indices
-        // Format: "pool_{pool_idx}_set_{set_idx}"
-        let parts: Vec<&str> = set_disk_id.split('_').collect();
-        if parts.len() != 4 || parts[0] != "pool" || parts[2] != "set" {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Invalid set_disk_id format: {set_disk_id}"),
-            });
-        }
-
-        let pool_idx: usize = parts[1].parse().map_err(|_| Error::TaskExecutionFailed {
-            message: format!("Invalid pool index in set_disk_id: {set_disk_id}"),
-        })?;
-
-        let set_idx: usize = parts[3].parse().map_err(|_| Error::TaskExecutionFailed {
-            message: format!("Invalid set index in set_disk_id: {set_disk_id}"),
-        })?;
+        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
 
         // Get the first available disk from the set
         let disks = self

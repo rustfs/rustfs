@@ -20,6 +20,7 @@ pub mod progress;
 pub mod resume;
 pub mod storage;
 pub mod task;
+pub mod utils;
 
 pub use erasure_healer::ErasureSetHealer;
 pub use manager::HealManager;
