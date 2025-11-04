@@ -150,7 +150,7 @@ hmac = "0.12.1"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 pbkdf2 = "0.12.2"
 rsa = { version = "0.9.8" }
-rustls = { version = "0.23.34", features = ["ring", "logging", "std", "tls12"], default-features = false }
+rustls = { version = "0.23.35", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.13.0"
 sha1 = "0.10.6"
