@@ -243,14 +243,16 @@ async fn test_performance_impact_measurement() {
     io_monitor.start().await.unwrap();
 
     // Baseline test: no scanner load - measure multiple times for stability
+    const MEASUREMENT_COUNT: usize = 5;
     let mut baseline_measurements = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..MEASUREMENT_COUNT {
         let duration = measure_workload(10_000, Duration::ZERO).await;
         baseline_measurements.push(duration);
     }
     // Use median to reduce impact of outliers
     baseline_measurements.sort();
-    let baseline_duration = baseline_measurements[2].max(Duration::from_millis(20));
+    let median_idx = baseline_measurements.len() / 2;
+    let baseline_duration = baseline_measurements[median_idx].max(Duration::from_millis(20));
 
     // Simulate scanner activity
     scanner.update_business_metrics(50, 500, 0, 25).await;
@@ -259,12 +261,13 @@ async fn test_performance_impact_measurement() {
 
     // Performance test: with scanner load - measure multiple times for stability
     let mut scanner_measurements = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..MEASUREMENT_COUNT {
         let duration = measure_workload(10_000, Duration::ZERO).await;
         scanner_measurements.push(duration);
     }
     scanner_measurements.sort();
-    let with_scanner_duration = scanner_measurements[2].max(baseline_duration);
+    let median_idx = scanner_measurements.len() / 2;
+    let with_scanner_duration = scanner_measurements[median_idx].max(baseline_duration);
 
     // Calculate performance impact
     let baseline_ns = baseline_duration.as_nanos().max(1) as f64;

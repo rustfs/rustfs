@@ -243,6 +243,8 @@ impl HealTask {
         if self.cancel_token.is_cancelled() {
             return Err(Error::TaskCancelled);
         }
+        // Only interested in propagating an error if the timeout has expired;
+        // the actual Duration value is not needed here
         let _ = self.remaining_timeout().await?;
         Ok(())
     }
