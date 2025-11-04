@@ -481,7 +481,7 @@ async fn new_and_save_tiering_config<S: StorageAPI>(api: Arc<S>) -> Result<TierC
     Ok(cfg)
 }
 
-#[tracing::instrument(level = "debug")]
+#[tracing::instrument(level = "debug", name = "load_tier_config", skip(api))]
 async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMgr, std::io::Error> {
     let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, TIER_CONFIG_FILE);
     let data = read_config(api.clone(), config_file.as_str()).await;

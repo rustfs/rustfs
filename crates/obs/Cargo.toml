@@ -50,6 +50,7 @@ opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_ex
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
+tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }

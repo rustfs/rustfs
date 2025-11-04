@@ -79,7 +79,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true }
 tower.workspace = true
-tower-http = { workspace = true, features = ["trace", "compression-deflate", "compression-gzip", "cors", "catch-panic", "timeout", "limit"] }
+tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id"] }
 
 # Serialization and Data Formats
 bytes = { workspace = true }

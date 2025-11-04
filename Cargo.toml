@@ -243,6 +243,7 @@ tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.17"
 tracing = { version = "0.1.41" }
+tracing-appender = "0.2.3"
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }

@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
-use crate::fileinfo::{ErasureAlgo, ErasureInfo, FileInfo, FileInfoVersions, ObjectPartInfo, RawFileInfo};
-use crate::filemeta_inline::InlineData;
 use crate::{
-    ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+    ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, ObjectPartInfo, RawFileInfo, ReplicationState,
+    ReplicationStatusType, Result, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
@@ -3402,7 +3400,7 @@ mod test {
             ("tabs", "col1\tcol2\tcol3"),
             ("quotes", "\"quoted\" and 'single'"),
             ("backslashes", "path\\to\\file"),
-            ("mixed", "Mixed: Chinese，English, 123, !@#$%"),
+            ("mixed", "Mixed: Chinese, English, 123, !@#$%"),
         ];
 
         for (key, value) in special_cases {
@@ -3424,7 +3422,7 @@ mod test {
             ("tabs", "col1\tcol2\tcol3"),
             ("quotes", "\"quoted\" and 'single'"),
             ("backslashes", "path\\to\\file"),
-            ("mixed", "Mixed: Chinese，English, 123, !@#$%"),
+            ("mixed", "Mixed: Chinese, English, 123, !@#$%"),
         ] {
             assert_eq!(obj2.meta_user.get(key), Some(&expected_value.to_string()));
         }

@@ -184,7 +184,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         );
 
         if eps.drives_per_set > 1 {
-            warn!("WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.");
+            warn!(target: "rustfs::main::run","WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.");
         }
     }
 
