@@ -50,6 +50,7 @@ use std::io::IsTerminal;
 use std::time::Duration;
 use std::{env, fs};
 use tracing::info;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -363,7 +364,13 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     if endpoint.is_empty() && !is_production {
         // Create a file appender (rolling by day), add the -tracing suffix to the file name to avoid conflicts
-        let file_appender = tracing_appender::rolling::hourly(log_directory, format!("{log_filename}-tracing.log"));
+        // let file_appender = tracing_appender::rolling::hourly(log_directory, format!("{log_filename}-tracing.log"));
+        let file_appender = RollingFileAppender::builder()
+            .rotation(Rotation::HOURLY) // rotate log files once every hour
+            .filename_prefix(format!("{log_filename}-tracing")) // log file names will be prefixed with `myapp.`
+            .filename_suffix("log") // log file names will be suffixed with `.log`
+            .build(log_directory) // try to build an appender that stores log files in `/var/log`
+            .expect("initializing rolling file appender failed");
         let (nb_writer, guard) = tracing_appender::non_blocking(file_appender);
 
         let enable_color = std::io::stdout().is_terminal();

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
+use crate::heal::{HealOptions, HealPriority, HealRequest, HealType};
 use crate::{Error, Result};
 use rustfs_ecstore::disk::endpoint::Endpoint;
 use serde::{Deserialize, Serialize};

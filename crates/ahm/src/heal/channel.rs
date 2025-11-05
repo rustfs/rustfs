@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
 use crate::heal::{
     manager::HealManager,
     task::{HealOptions, HealPriority, HealRequest, HealType},
     utils,
 };
+use crate::{Error, Result};
 use rustfs_common::heal_channel::{
     HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
     publish_heal_response,

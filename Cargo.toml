@@ -129,7 +129,7 @@ flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
 prost = "0.14.1"
 quick-xml = "0.38.3"
-rmcp = { version = "0.8.3" }
+rmcp = { version = "0.8.4" }
 rmp = { version = "0.8.14" }
 rmp-serde = { version = "1.3.0" }
 serde = { version = "1.0.228", features = ["derive"] }
