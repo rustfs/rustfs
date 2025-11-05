@@ -2164,12 +2164,7 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        let max_keys = match max_keys {
-            Some(v) if v > 0 && v <= 1000 => v,
-            Some(v) if v > 1000 => 1000,
-            None => 1000,
-            _ => return Err(s3_error!(InvalidArgument, "max-keys must be between 1 and 1000")),
-        };
+        let max_keys = max_keys.unwrap_or(1000);
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
