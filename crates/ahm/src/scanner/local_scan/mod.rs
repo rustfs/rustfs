@@ -1,16 +1,18 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{from_slice, to_vec};
-use tokio::{fs, task};
-use tracing::warn;
-use walkdir::WalkDir;
-
-use crate::error::{Error, Result};
-
+use crate::{Error, Result};
 use rustfs_common::data_usage::DiskUsageStatus;
 use rustfs_ecstore::data_usage::{
     LocalUsageSnapshot, LocalUsageSnapshotMeta, data_usage_state_dir, ensure_data_usage_layout, snapshot_file_name,
@@ -20,6 +22,15 @@ use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_filemeta::{FileInfo, FileMeta, FileMetaVersion, VersionType};
+use serde::{Deserialize, Serialize};
+use serde_json::{from_slice, to_vec};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::{fs, task};
+use tracing::warn;
+use walkdir::WalkDir;
 
 const STATE_FILE_EXTENSION: &str = "";
 
