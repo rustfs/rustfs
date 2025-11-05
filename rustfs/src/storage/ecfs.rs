@@ -4160,6 +4160,13 @@ impl S3 for FS {
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ObjectLockConfigurationNotFoundError,
+                        "Object Lock configuration does not exist for this bucket".to_string(),
+                    ));
+                }
+
                 debug!("get_object_lock_config err {:?}", err);
                 None
             }
