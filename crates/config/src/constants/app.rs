@@ -151,8 +151,8 @@ pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 /// This is the default log local logging enabled for rustfs.
 /// It is used to enable or disable local logging of the application.
 /// Default value: false
-/// Environment variable: RUSTFS_OBS_LOCAL_LOGGING_ENABLED
-pub const DEFAULT_LOG_LOCAL_LOGGING_ENABLED: bool = false;
+/// Environment variable: RUSTFS_OBS_LOGL_STDOUT_ENABLED
+pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 
 /// Constant representing 1 Kibibyte (1024 bytes)
 /// Default value: 1024

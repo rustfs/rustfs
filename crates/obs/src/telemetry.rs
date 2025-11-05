@@ -36,7 +36,7 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_LOCAL_LOGGING_ENABLED, ENVIRONMENT, METER_INTERVAL,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL,
     SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
     observability::{
         DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
@@ -304,7 +304,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(ErrorLayer::default())
-                .with(if config.local_logging_enabled.unwrap_or(DEFAULT_LOG_LOCAL_LOGGING_ENABLED) {
+                .with(if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
                     Some(fmt_layer)
                 } else {
                     None
@@ -395,6 +395,23 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with(env_filter)
             .with(ErrorLayer::default())
             .with(fmt_layer)
+            .with(if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
+                let stdout_fmt_layer = tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTime::rfc_3339())
+                    .with_target(true)
+                    .with_thread_names(true)
+                    .with_thread_ids(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_writer(std::io::stdout) // Specify writing file
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(true)
+                    .with_span_events(FmtSpan::CLOSE); // Log span lifecycle events, including trace_id;
+                Some(stdout_fmt_layer)
+            } else {
+                None
+            })
             .init();
 
         info!("Tracing telemetry initialized for non-production with trace_id logging.");
