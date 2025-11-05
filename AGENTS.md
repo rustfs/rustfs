@@ -8,12 +8,14 @@ The workspace root hosts shared dependencies in `Cargo.toml`. The service binary
 
 ## Build, Test, and Development Commands
 Run `cargo check --all-targets` for fast validation. Build release binaries via `cargo build --release` or the pipeline-aligned `make build`. Use `./build-rustfs.sh --dev` for iterative development and `./build-rustfs.sh --platform <target>` for cross-compiles. Prefer `make pre-commit` before pushing to cover formatting, clippy, checks, and tests.
+Always ensure `cargo fmt --all --check`, `cargo test --workspace --exclude e2e_test`, and `cargo clippy --all-targets --all-features -- -D warnings` complete successfully after each code change to keep the tree healthy and warning-free.
 
 ## Coding Style & Naming Conventions
 Formatting follows the repo `rustfmt.toml` (130-column width). Use `snake_case` for items, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Avoid `unwrap()` or `expect()` outside tests; bubble errors with `Result` and crate-specific `thiserror` types. Keep async code non-blocking and offload CPU-heavy work with `tokio::task::spawn_blocking` when necessary.
 
 ## Testing Guidelines
 Co-locate unit tests with their modules and give behavior-led names such as `handles_expired_token`. Integration suites belong in each crate’s `tests/` directory, while exhaustive end-to-end scenarios live in `crates/e2e_test/`. Run `cargo test --workspace --exclude e2e_test` during iteration, `cargo nextest run --all --exclude e2e_test` when available, and finish with `cargo test --all` before requesting review. Use `NO_PROXY=127.0.0.1,localhost HTTP_PROXY= HTTPS_PROXY=` for KMS e2e tests.
+When fixing bugs or adding features, include regression tests that capture the new behavior so future changes cannot silently break it.
 
 ## Commit & Pull Request Guidelines
 Work on feature branches (e.g., `feat/...`) after syncing `main`. Follow Conventional Commits under 72 characters (e.g., `feat: add kms key rotation`). Each commit must compile, format cleanly, and pass `make pre-commit`. Open PRs with a concise summary, note verification commands, link relevant issues, and wait for reviewer approval.

@@ -27,6 +27,12 @@ const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 
+/// Helper function to convert Path to &str, returning an error if conversion fails
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {:?}", path)))
+}
+
 /// resume state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeState {
@@ -34,6 +40,9 @@ pub struct ResumeState {
     pub task_id: String,
     /// task type
     pub task_type: String,
+    /// set disk identifier (for erasure set tasks)
+    #[serde(default)]
+    pub set_disk_id: String,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -67,12 +76,13 @@ pub struct ResumeState {
 }
 
 impl ResumeState {
-    pub fn new(task_id: String, task_type: String, buckets: Vec<String>) -> Self {
+    pub fn new(task_id: String, task_type: String, set_disk_id: String, buckets: Vec<String>) -> Self {
         Self {
             task_id,
             task_type,
-            start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            set_disk_id,
+            start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
             total_objects: 0,
             processed_objects: 0,
@@ -94,13 +104,13 @@ impl ResumeState {
         self.successful_objects = successful;
         self.failed_objects = failed;
         self.skipped_objects = skipped;
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn set_current_item(&mut self, bucket: Option<String>, object: Option<String>) {
         self.current_bucket = bucket;
         self.current_object = object;
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn complete_bucket(&mut self, bucket: &str) {
@@ -110,22 +120,22 @@ impl ResumeState {
         if let Some(pos) = self.pending_buckets.iter().position(|b| b == bucket) {
             self.pending_buckets.remove(pos);
         }
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn mark_completed(&mut self) {
         self.completed = true;
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn set_error(&mut self, error: String) {
         self.error_message = Some(error);
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn increment_retry(&mut self) {
         self.retry_count += 1;
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn can_retry(&self) -> bool {
@@ -156,8 +166,14 @@ pub struct ResumeManager {
 
 impl ResumeManager {
     /// create new resume manager
-    pub async fn new(disk: DiskStore, task_id: String, task_type: String, buckets: Vec<String>) -> Result<Self> {
-        let state = ResumeState::new(task_id, task_type, buckets);
+    pub async fn new(
+        disk: DiskStore,
+        task_id: String,
+        task_type: String,
+        set_disk_id: String,
+        buckets: Vec<String>,
+    ) -> Result<Self> {
+        let state = ResumeState::new(task_id, task_type, set_disk_id, buckets);
         let manager = Self {
             disk,
             state: Arc::new(RwLock::new(state)),
@@ -184,8 +200,11 @@ impl ResumeManager {
     /// check if resume state exists
     pub async fn has_resume_state(disk: &DiskStore, task_id: &str) -> bool {
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
-        match disk.read_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap()).await {
-            Ok(data) => !data.is_empty(),
+        match path_to_str(&file_path) {
+            Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
+                Ok(data) => !data.is_empty(),
+                Err(_) => false,
+            },
             Err(_) => false,
         }
     }
@@ -254,18 +273,15 @@ impl ResumeManager {
         let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
 
         // ignore delete errors, files may not exist
-        let _ = self
-            .disk
-            .delete(RUSTFS_META_BUCKET, state_file.to_str().unwrap(), Default::default())
-            .await;
-        let _ = self
-            .disk
-            .delete(RUSTFS_META_BUCKET, progress_file.to_str().unwrap(), Default::default())
-            .await;
-        let _ = self
-            .disk
-            .delete(RUSTFS_META_BUCKET, checkpoint_file.to_str().unwrap(), Default::default())
-            .await;
+        if let Ok(path_str) = path_to_str(&state_file) {
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
+        }
+        if let Ok(path_str) = path_to_str(&progress_file) {
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
+        }
+        if let Ok(path_str) = path_to_str(&checkpoint_file) {
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
+        }
 
         info!("Cleaned up resume state for task: {}", task_id);
         Ok(())
@@ -280,8 +296,9 @@ impl ResumeManager {
 
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", state.task_id, RESUME_STATE_FILE));
 
+        let path_str = path_to_str(&file_path)?;
         self.disk
-            .write_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), state_data.into())
+            .write_all(RUSTFS_META_BUCKET, path_str, state_data.into())
             .await
             .map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to save resume state: {e}"),
@@ -295,7 +312,8 @@ impl ResumeManager {
     async fn read_state_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
 
-        disk.read_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap())
+        let path_str = path_to_str(&file_path)?;
+        disk.read_all(RUSTFS_META_BUCKET, path_str)
             .await
             .map(|bytes| bytes.to_vec())
             .map_err(|e| Error::TaskExecutionFailed {
@@ -327,7 +345,7 @@ impl ResumeCheckpoint {
     pub fn new(task_id: String) -> Self {
         Self {
             task_id,
-            checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             current_bucket_index: 0,
             current_object_index: 0,
             processed_objects: Vec::new(),
@@ -339,7 +357,7 @@ impl ResumeCheckpoint {
     pub fn update_position(&mut self, bucket_index: usize, object_index: usize) {
         self.current_bucket_index = bucket_index;
         self.current_object_index = object_index;
-        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
     pub fn add_processed_object(&mut self, object: String) {
@@ -397,8 +415,11 @@ impl CheckpointManager {
     /// check if checkpoint exists
     pub async fn has_checkpoint(disk: &DiskStore, task_id: &str) -> bool {
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
-        match disk.read_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap()).await {
-            Ok(data) => !data.is_empty(),
+        match path_to_str(&file_path) {
+            Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
+                Ok(data) => !data.is_empty(),
+                Err(_) => false,
+            },
             Err(_) => false,
         }
     }
@@ -446,10 +467,9 @@ impl CheckpointManager {
         let task_id = &checkpoint.task_id;
 
         let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
-        let _ = self
-            .disk
-            .delete(RUSTFS_META_BUCKET, checkpoint_file.to_str().unwrap(), Default::default())
-            .await;
+        if let Ok(path_str) = path_to_str(&checkpoint_file) {
+            let _ = self.disk.delete(RUSTFS_META_BUCKET, path_str, Default::default()).await;
+        }
 
         info!("Cleaned up checkpoint for task: {}", task_id);
         Ok(())
@@ -464,8 +484,9 @@ impl CheckpointManager {
 
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", checkpoint.task_id, RESUME_CHECKPOINT_FILE));
 
+        let path_str = path_to_str(&file_path)?;
         self.disk
-            .write_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), checkpoint_data.into())
+            .write_all(RUSTFS_META_BUCKET, path_str, checkpoint_data.into())
             .await
             .map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to save checkpoint: {e}"),
@@ -479,7 +500,8 @@ impl CheckpointManager {
     async fn read_checkpoint_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
 
-        disk.read_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap())
+        let path_str = path_to_str(&file_path)?;
+        disk.read_all(RUSTFS_META_BUCKET, path_str)
             .await
             .map(|bytes| bytes.to_vec())
             .map_err(|e| Error::TaskExecutionFailed {
@@ -562,7 +584,7 @@ mod tests {
     async fn test_resume_state_creation() {
         let task_id = ResumeUtils::generate_task_id();
         let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let state = ResumeState::new(task_id.clone(), "erasure_set".to_string(), buckets);
+        let state = ResumeState::new(task_id.clone(), "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
 
         assert_eq!(state.task_id, task_id);
         assert_eq!(state.task_type, "erasure_set");
@@ -575,7 +597,7 @@ mod tests {
     async fn test_resume_state_progress() {
         let task_id = ResumeUtils::generate_task_id();
         let buckets = vec!["bucket1".to_string()];
-        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), buckets);
+        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
 
         state.update_progress(10, 8, 1, 1);
         assert_eq!(state.processed_objects, 10);
@@ -595,7 +617,7 @@ mod tests {
     async fn test_resume_state_bucket_completion() {
         let task_id = ResumeUtils::generate_task_id();
         let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
-        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), buckets);
+        let mut state = ResumeState::new(task_id, "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
 
         assert_eq!(state.pending_buckets.len(), 2);
         assert_eq!(state.completed_buckets.len(), 0);
@@ -650,6 +672,7 @@ mod tests {
             let state = ResumeState::new(
                 task_id.clone(),
                 "erasure_set".to_string(),
+                "pool_0_set_0".to_string(),
                 vec!["bucket1".to_string(), "bucket2".to_string()],
             );
 

@@ -310,17 +310,36 @@ impl HealManager {
 
                         // Create erasure set heal requests for each endpoint
                         for ep in endpoints {
+                            let Some(set_disk_id) =
+                                crate::heal::utils::format_set_disk_id_from_i32(ep.pool_idx, ep.set_idx)
+                            else {
+                                warn!("Skipping endpoint {} without valid pool/set index", ep);
+                                continue;
+                            };
                             // skip if already queued or healing
+                            // Use consistent lock order: queue first, then active_heals to avoid deadlock
                             let mut skip = false;
                             {
                                 let queue = heal_queue.lock().await;
-                                if queue.iter().any(|req| matches!(&req.heal_type, crate::heal::task::HealType::ErasureSet { set_disk_id, .. } if set_disk_id == &format!("{}_{}", ep.pool_idx, ep.set_idx))) {
+                                if queue.iter().any(|req| {
+                                    matches!(
+                                        &req.heal_type,
+                                        crate::heal::task::HealType::ErasureSet { set_disk_id: queued_id, .. }
+                                        if queued_id == &set_disk_id
+                                    )
+                                }) {
                                     skip = true;
                                 }
                             }
                             if !skip {
                                 let active = active_heals.lock().await;
-                                if active.values().any(|task| matches!(&task.heal_type, crate::heal::task::HealType::ErasureSet { set_disk_id, .. } if set_disk_id == &format!("{}_{}", ep.pool_idx, ep.set_idx))) {
+                                if active.values().any(|task| {
+                                    matches!(
+                                        &task.heal_type,
+                                        crate::heal::task::HealType::ErasureSet { set_disk_id: active_id, .. }
+                                        if active_id == &set_disk_id
+                                    )
+                                }) {
                                     skip = true;
                                 }
                             }
@@ -330,11 +349,10 @@ impl HealManager {
                             }
 
                             // enqueue erasure set heal request for this disk
-                            let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
                             let req = HealRequest::new(
                                 HealType::ErasureSet {
                                     buckets: buckets.clone(),
-                                    set_disk_id: set_disk_id.clone()
+                                    set_disk_id: set_disk_id.clone(),
                                 },
                                 HealOptions::default(),
                                 HealPriority::Normal,

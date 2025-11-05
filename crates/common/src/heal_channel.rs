@@ -18,7 +18,7 @@ use std::{
     fmt::{self, Display},
     sync::OnceLock,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 pub const HEAL_DELETE_DANGLING: bool = true;
@@ -192,6 +192,11 @@ pub type HealChannelReceiver = mpsc::UnboundedReceiver<HealChannelCommand>;
 /// Global heal channel sender
 static GLOBAL_HEAL_CHANNEL_SENDER: OnceLock<HealChannelSender> = OnceLock::new();
 
+type HealResponseSender = broadcast::Sender<HealChannelResponse>;
+
+/// Global heal response broadcaster
+static GLOBAL_HEAL_RESPONSE_SENDER: OnceLock<HealResponseSender> = OnceLock::new();
+
 /// Initialize global heal channel
 pub fn init_heal_channel() -> HealChannelReceiver {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -216,6 +221,23 @@ pub async fn send_heal_command(command: HealChannelCommand) -> Result<(), String
     } else {
         Err("Heal channel not initialized".to_string())
     }
+}
+
+fn heal_response_sender() -> &'static HealResponseSender {
+    GLOBAL_HEAL_RESPONSE_SENDER.get_or_init(|| {
+        let (tx, _rx) = broadcast::channel(1024);
+        tx
+    })
+}
+
+/// Publish a heal response to subscribers.
+pub fn publish_heal_response(response: HealChannelResponse) -> Result<(), broadcast::error::SendError<HealChannelResponse>> {
+    heal_response_sender().send(response).map(|_| ())
+}
+
+/// Subscribe to heal responses.
+pub fn subscribe_heal_responses() -> broadcast::Receiver<HealChannelResponse> {
+    heal_response_sender().subscribe()
 }
 
 /// Send heal start request
@@ -414,4 +436,21 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         timeout_seconds: None,
     };
     send_heal_request(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn heal_response_broadcast_reaches_subscriber() {
+        let mut receiver = subscribe_heal_responses();
+        let response = create_heal_response("req-1".to_string(), true, None, None);
+
+        publish_heal_response(response.clone()).expect("publish should succeed");
+
+        let received = receiver.recv().await.expect("should receive heal response");
+        assert_eq!(received.request_id, response.request_id);
+        assert!(received.success);
+    }
 }

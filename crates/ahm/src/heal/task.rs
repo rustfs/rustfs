@@ -17,8 +17,11 @@ use crate::heal::{progress::HealProgress, storage::HealStorageAPI};
 use crate::{Error, Result};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -195,6 +198,8 @@ pub struct HealTask {
     pub started_at: Arc<RwLock<Option<SystemTime>>>,
     /// Completed time
     pub completed_at: Arc<RwLock<Option<SystemTime>>>,
+    /// Task start instant for timeout calculation (monotonic)
+    task_start_instant: Arc<RwLock<Option<Instant>>>,
     /// Cancel token
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Storage layer interface
@@ -212,20 +217,73 @@ impl HealTask {
             created_at: request.created_at,
             started_at: Arc::new(RwLock::new(None)),
             completed_at: Arc::new(RwLock::new(None)),
+            task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
         }
     }
 
+    async fn remaining_timeout(&self) -> Result<Option<Duration>> {
+        if let Some(total) = self.options.timeout {
+            let start_instant = { *self.task_start_instant.read().await };
+            if let Some(started_at) = start_instant {
+                let elapsed = started_at.elapsed();
+                if elapsed >= total {
+                    return Err(Error::TaskTimeout);
+                }
+                return Ok(Some(total - elapsed));
+            }
+            Ok(Some(total))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn check_control_flags(&self) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            return Err(Error::TaskCancelled);
+        }
+        // Only interested in propagating an error if the timeout has expired;
+        // the actual Duration value is not needed here
+        let _ = self.remaining_timeout().await?;
+        Ok(())
+    }
+
+    async fn await_with_control<F, T>(&self, fut: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>> + Send,
+        T: Send,
+    {
+        let cancel_token = self.cancel_token.clone();
+        if let Some(remaining) = self.remaining_timeout().await? {
+            if remaining.is_zero() {
+                return Err(Error::TaskTimeout);
+            }
+            let mut fut = Box::pin(fut);
+            tokio::select! {
+                _ = cancel_token.cancelled() => Err(Error::TaskCancelled),
+                _ = tokio::time::sleep(remaining) => Err(Error::TaskTimeout),
+                result = &mut fut => result,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel_token.cancelled() => Err(Error::TaskCancelled),
+                result = fut => result,
+            }
+        }
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // update status to running
+        // update status and timestamps atomically to avoid race conditions
+        let now = SystemTime::now();
+        let start_instant = Instant::now();
         {
             let mut status = self.status.write().await;
-            *status = HealTaskStatus::Running;
-        }
-        {
             let mut started_at = self.started_at.write().await;
-            *started_at = Some(SystemTime::now());
+            let mut task_start_instant = self.task_start_instant.write().await;
+            *status = HealTaskStatus::Running;
+            *started_at = Some(now);
+            *task_start_instant = Some(start_instant);
         }
 
         info!("Starting heal task: {} with type: {:?}", self.id, self.heal_type);
@@ -259,6 +317,16 @@ impl HealTask {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
                 info!("Heal task completed successfully: {}", self.id);
+            }
+            Err(Error::TaskCancelled) => {
+                let mut status = self.status.write().await;
+                *status = HealTaskStatus::Cancelled;
+                info!("Heal task was cancelled: {}", self.id);
+            }
+            Err(Error::TaskTimeout) => {
+                let mut status = self.status.write().await;
+                *status = HealTaskStatus::Timeout;
+                warn!("Heal task timed out: {}", self.id);
             }
             Err(e) => {
                 let mut status = self.status.write().await;
@@ -299,7 +367,8 @@ impl HealTask {
 
         // Step 1: Check if object exists and get metadata
         info!("Step 1: Checking object existence and metadata");
-        let object_exists = self.storage.object_exists(bucket, object).await?;
+        self.check_control_flags().await?;
+        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             if self.options.recreate_missing {
@@ -331,7 +400,11 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
+        let heal_result = self
+            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
+            .await;
+
+        match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     // Check if this is a "File not found" error during delete operations
@@ -354,7 +427,7 @@ impl HealTask {
                     if self.options.remove_corrupted {
                         warn!("Removing corrupted object: {}/{}", bucket, object);
                         if !self.options.dry_run {
-                            self.storage.delete_object(bucket, object).await?;
+                            self.await_with_control(self.storage.delete_object(bucket, object)).await?;
                             info!("Successfully deleted corrupted object: {}/{}", bucket, object);
                         } else {
                             info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
@@ -388,6 +461,8 @@ impl HealTask {
                 }
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 // Check if this is a "File not found" error during delete operations
                 let error_msg = format!("{e}");
@@ -409,7 +484,7 @@ impl HealTask {
                 if self.options.remove_corrupted {
                     warn!("Removing corrupted object: {}/{}", bucket, object);
                     if !self.options.dry_run {
-                        self.storage.delete_object(bucket, object).await?;
+                        self.await_with_control(self.storage.delete_object(bucket, object)).await?;
                         info!("Successfully deleted corrupted object: {}/{}", bucket, object);
                     } else {
                         info!("Dry run mode - would delete corrupted object: {}/{}", bucket, object);
@@ -445,7 +520,10 @@ impl HealTask {
             set: None,
         };
 
-        match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
+        match self
+            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
+            .await
+        {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
@@ -463,6 +541,8 @@ impl HealTask {
                 }
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 error!("Failed to recreate missing object: {}/{} - {}", bucket, object, e);
                 Err(Error::TaskExecutionFailed {
@@ -484,7 +564,8 @@ impl HealTask {
 
         // Step 1: Check if bucket exists
         info!("Step 1: Checking bucket existence");
-        let bucket_exists = self.storage.get_bucket_info(bucket).await?.is_some();
+        self.check_control_flags().await?;
+        let bucket_exists = self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_some();
         if !bucket_exists {
             warn!("Bucket does not exist: {}", bucket);
             return Err(Error::TaskExecutionFailed {
@@ -511,7 +592,9 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        match self.storage.heal_bucket(bucket, &heal_opts).await {
+        let heal_result = self.await_with_control(self.storage.heal_bucket(bucket, &heal_opts)).await;
+
+        match heal_result {
             Ok(result) => {
                 info!("Bucket heal completed successfully: {} ({} drives)", bucket, result.after.drives.len());
 
@@ -521,6 +604,8 @@ impl HealTask {
                 }
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 error!("Bucket heal failed: {} - {}", bucket, e);
                 {
@@ -546,7 +631,8 @@ impl HealTask {
 
         // Step 1: Check if object exists
         info!("Step 1: Checking object existence");
-        let object_exists = self.storage.object_exists(bucket, object).await?;
+        self.check_control_flags().await?;
+        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             return Err(Error::TaskExecutionFailed {
@@ -573,7 +659,11 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        match self.storage.heal_object(bucket, object, None, &heal_opts).await {
+        let heal_result = self
+            .await_with_control(self.storage.heal_object(bucket, object, None, &heal_opts))
+            .await;
+
+        match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
@@ -599,6 +689,8 @@ impl HealTask {
                 }
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 error!("Metadata heal failed: {}/{} - {}", bucket, object, e);
                 {
@@ -647,7 +739,11 @@ impl HealTask {
             set: None,
         };
 
-        match self.storage.heal_object(bucket, &object, None, &heal_opts).await {
+        let heal_result = self
+            .await_with_control(self.storage.heal_object(bucket, &object, None, &heal_opts))
+            .await;
+
+        match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     error!("MRF heal failed: {} - {}", meta_path, e);
@@ -668,6 +764,8 @@ impl HealTask {
                 }
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 error!("MRF heal failed: {} - {}", meta_path, e);
                 {
@@ -693,7 +791,8 @@ impl HealTask {
 
         // Step 1: Check if object exists
         info!("Step 1: Checking object existence");
-        let object_exists = self.storage.object_exists(bucket, object).await?;
+        self.check_control_flags().await?;
+        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             return Err(Error::TaskExecutionFailed {
@@ -720,7 +819,11 @@ impl HealTask {
             set: None,
         };
 
-        match self.storage.heal_object(bucket, object, version_id, &heal_opts).await {
+        let heal_result = self
+            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
+            .await;
+
+        match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
@@ -748,6 +851,8 @@ impl HealTask {
                 }
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 error!("EC decode heal failed: {}/{} - {}", bucket, object, e);
                 {
@@ -773,7 +878,7 @@ impl HealTask {
 
         let buckets = if buckets.is_empty() {
             info!("No buckets specified, listing all buckets");
-            let bucket_infos = self.storage.list_buckets().await?;
+            let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
             bucket_infos.into_iter().map(|info| info.name).collect()
         } else {
             buckets
@@ -781,7 +886,9 @@ impl HealTask {
 
         // Step 1: Perform disk format heal using ecstore
         info!("Step 1: Performing disk format heal using ecstore");
-        match self.storage.heal_format(self.options.dry_run).await {
+        let format_result = self.await_with_control(self.storage.heal_format(self.options.dry_run)).await;
+
+        match format_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
                     error!("Disk format heal failed: {} - {}", set_disk_id, e);
@@ -800,6 +907,8 @@ impl HealTask {
                     result.after.drives.len()
                 );
             }
+            Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
             Err(e) => {
                 error!("Disk format heal failed: {} - {}", set_disk_id, e);
                 {
@@ -819,7 +928,9 @@ impl HealTask {
 
         // Step 2: Get disk for resume functionality
         info!("Step 2: Getting disk for resume functionality");
-        let disk = self.storage.get_disk_for_resume(&set_disk_id).await?;
+        let disk = self
+            .await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
+            .await?;
 
         {
             let mut progress = self.progress.write().await;
@@ -827,9 +938,18 @@ impl HealTask {
         }
 
         // Step 3: Heal bucket structure
+        // Check control flags before each iteration to ensure timely cancellation.
+        // Each heal_bucket call may handle timeout/cancellation internally, see its implementation for details.
         for bucket in buckets.iter() {
+            // Check control flags before starting each bucket heal
+            self.check_control_flags().await?;
+            // heal_bucket internally uses await_with_control for timeout/cancellation handling
             if let Err(err) = self.heal_bucket(bucket).await {
-                info!("{}", err.to_string());
+                // Check if error is due to cancellation or timeout
+                if matches!(err, Error::TaskCancelled | Error::TaskTimeout) {
+                    return Err(err);
+                }
+                info!("Bucket heal failed: {}", err.to_string());
             }
         }
 
@@ -856,6 +976,8 @@ impl HealTask {
                 info!("Erasure set heal completed successfully: {} ({} buckets)", set_disk_id, buckets.len());
                 Ok(())
             }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
                 error!("Erasure set heal failed: {} - {}", set_disk_id, e);
                 Err(Error::TaskExecutionFailed {

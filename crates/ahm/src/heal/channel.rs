@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Result;
+use crate::error::{Error, Result};
 use crate::heal::{
     manager::HealManager,
     task::{HealOptions, HealPriority, HealRequest, HealType},
+    utils,
 };
 use rustfs_common::heal_channel::{
     HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
+    publish_heal_response,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -98,7 +100,6 @@ impl HealChannelProcessor {
             Ok(task_id) => {
                 info!("Successfully submitted heal request: {} as task: {}", request.id, task_id);
 
-                // Send success response
                 let response = HealChannelResponse {
                     request_id: request.id,
                     success: true,
@@ -106,9 +107,7 @@ impl HealChannelProcessor {
                     error: None,
                 };
 
-                if let Err(e) = self.response_sender.send(response) {
-                    error!("Failed to send heal response: {}", e);
-                }
+                self.publish_response(response);
             }
             Err(e) => {
                 error!("Failed to submit heal request: {} - {}", request.id, e);
@@ -121,9 +120,7 @@ impl HealChannelProcessor {
                     error: Some(e.to_string()),
                 };
 
-                if let Err(e) = self.response_sender.send(response) {
-                    error!("Failed to send heal error response: {}", e);
-                }
+                self.publish_response(response);
             }
         }
 
@@ -143,9 +140,7 @@ impl HealChannelProcessor {
             error: None,
         };
 
-        if let Err(e) = self.response_sender.send(response) {
-            error!("Failed to send query response: {}", e);
-        }
+        self.publish_response(response);
 
         Ok(())
     }
@@ -163,9 +158,7 @@ impl HealChannelProcessor {
             error: None,
         };
 
-        if let Err(e) = self.response_sender.send(response) {
-            error!("Failed to send cancel response: {}", e);
-        }
+        self.publish_response(response);
 
         Ok(())
     }
@@ -173,9 +166,12 @@ impl HealChannelProcessor {
     /// Convert channel request to heal request
     fn convert_to_heal_request(&self, request: HealChannelRequest) -> Result<HealRequest> {
         let heal_type = if let Some(disk_id) = &request.disk {
+            let set_disk_id = utils::normalize_set_disk_id(disk_id).ok_or_else(|| Error::InvalidHealType {
+                heal_type: format!("erasure-set({disk_id})"),
+            })?;
             HealType::ErasureSet {
                 buckets: vec![],
-                set_disk_id: disk_id.clone(),
+                set_disk_id,
             }
         } else if let Some(prefix) = &request.object_prefix {
             if !prefix.is_empty() {
@@ -225,8 +221,332 @@ impl HealChannelProcessor {
         Ok(HealRequest::new(heal_type, options, priority))
     }
 
+    fn publish_response(&self, response: HealChannelResponse) {
+        // Try to send to local channel first, but don't block broadcast on failure
+        if let Err(e) = self.response_sender.send(response.clone()) {
+            error!("Failed to enqueue heal response locally: {}", e);
+        }
+        // Always attempt to broadcast, even if local send failed
+        // Use the original response for broadcast; local send uses a clone
+        if let Err(e) = publish_heal_response(response) {
+            error!("Failed to broadcast heal response: {}", e);
+        }
+    }
+
     /// Get response sender for external use
     pub fn get_response_sender(&self) -> mpsc::UnboundedSender<HealChannelResponse> {
         self.response_sender.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heal::storage::HealStorageAPI;
+    use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealScanMode};
+    use std::sync::Arc;
+
+    // Mock storage for testing
+    struct MockStorage;
+    #[async_trait::async_trait]
+    impl HealStorageAPI for MockStorage {
+        async fn get_object_meta(
+            &self,
+            _bucket: &str,
+            _object: &str,
+        ) -> crate::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+            Ok(None)
+        }
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> crate::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> crate::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        async fn get_disk_status(
+            &self,
+            _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint,
+        ) -> crate::Result<crate::heal::storage::DiskStatus> {
+            Ok(crate::heal::storage::DiskStatus::Ok)
+        }
+        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
+            Ok(None)
+        }
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn list_buckets(&self) -> crate::Result<Vec<rustfs_ecstore::store_api::BucketInfo>> {
+            Ok(vec![])
+        }
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
+            Ok(false)
+        }
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> crate::Result<Option<u64>> {
+            Ok(None)
+        }
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> crate::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: Option<&str>,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
+        }
+        async fn heal_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> crate::Result<rustfs_madmin::heal_commands::HealResultItem> {
+            Ok(rustfs_madmin::heal_commands::HealResultItem::default())
+        }
+        async fn heal_format(
+            &self,
+            _dry_run: bool,
+        ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
+        }
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> crate::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> crate::Result<rustfs_ecstore::disk::DiskStore> {
+            Err(crate::Error::other("Not implemented in mock"))
+        }
+    }
+
+    fn create_test_heal_manager() -> Arc<HealManager> {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        Arc::new(HealManager::new(storage, None))
+    }
+
+    #[test]
+    fn test_heal_channel_processor_new() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        // Verify processor is created successfully
+        let _sender = processor.get_response_sender();
+        // If we can get the sender, processor was created correctly
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_bucket() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: None,
+            disk: None,
+            priority: HealChannelPriority::Normal,
+            scan_mode: None,
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(matches!(heal_request.heal_type, HealType::Bucket { .. }));
+        assert_eq!(heal_request.priority, HealPriority::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_object() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("test-object".to_string()),
+            disk: None,
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Deep),
+            remove_corrupted: Some(true),
+            recreate_missing: Some(true),
+            update_parity: Some(true),
+            recursive: Some(false),
+            dry_run: Some(false),
+            timeout_seconds: Some(300),
+            pool_index: Some(0),
+            set_index: Some(1),
+            force_start: false,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(matches!(heal_request.heal_type, HealType::Object { .. }));
+        assert_eq!(heal_request.priority, HealPriority::High);
+        assert_eq!(heal_request.options.scan_mode, HealScanMode::Deep);
+        assert!(heal_request.options.remove_corrupted);
+        assert!(heal_request.options.recreate_missing);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_erasure_set() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: None,
+            disk: Some("pool_0_set_1".to_string()),
+            priority: HealChannelPriority::Critical,
+            scan_mode: None,
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(matches!(heal_request.heal_type, HealType::ErasureSet { .. }));
+        assert_eq!(heal_request.priority, HealPriority::Urgent);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_invalid_disk_id() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: None,
+            disk: Some("invalid-disk-id".to_string()),
+            priority: HealChannelPriority::Normal,
+            scan_mode: None,
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+        };
+
+        let result = processor.convert_to_heal_request(channel_request);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_priority_mapping() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let priorities = vec![
+            (HealChannelPriority::Low, HealPriority::Low),
+            (HealChannelPriority::Normal, HealPriority::Normal),
+            (HealChannelPriority::High, HealPriority::High),
+            (HealChannelPriority::Critical, HealPriority::Urgent),
+        ];
+
+        for (channel_priority, expected_heal_priority) in priorities {
+            let channel_request = HealChannelRequest {
+                id: "test-id".to_string(),
+                bucket: "test-bucket".to_string(),
+                object_prefix: None,
+                disk: None,
+                priority: channel_priority,
+                scan_mode: None,
+                remove_corrupted: None,
+                recreate_missing: None,
+                update_parity: None,
+                recursive: None,
+                dry_run: None,
+                timeout_seconds: None,
+                pool_index: None,
+                set_index: None,
+                force_start: false,
+            };
+
+            let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+            assert_eq!(heal_request.priority, expected_heal_priority);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_force_start() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: None,
+            disk: None,
+            priority: HealChannelPriority::Normal,
+            scan_mode: None,
+            remove_corrupted: Some(false),
+            recreate_missing: Some(false),
+            update_parity: Some(false),
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: true, // Should override the above false values
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(heal_request.options.remove_corrupted);
+        assert!(heal_request.options.recreate_missing);
+        assert!(heal_request.options.update_parity);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_empty_object_prefix() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("".to_string()), // Empty prefix should be treated as bucket heal
+            disk: None,
+            priority: HealChannelPriority::Normal,
+            scan_mode: None,
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(matches!(heal_request.heal_type, HealType::Bucket { .. }));
     }
 }
