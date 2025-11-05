@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use rustfs_config::observability::{
-    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOCAL_LOGGING_ENABLED, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FILENAME,
-    ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOGGER_LEVEL,
+    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES,
+    ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL,
     ENV_OBS_METER_INTERVAL, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_LOCAL_LOGGING_ENABLED, DEFAULT_LOG_ROTATION_SIZE_MB,
-    DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
+    DEFAULT_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION,
+    USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
 use serde::{Deserialize, Serialize};
@@ -53,15 +54,15 @@ use std::env;
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
-    pub endpoint: String,                    // Endpoint for metric collection
-    pub use_stdout: Option<bool>,            // Output to stdout
-    pub sample_ratio: Option<f64>,           // Trace sampling ratio
-    pub meter_interval: Option<u64>,         // Metric collection interval
-    pub service_name: Option<String>,        // Service name
-    pub service_version: Option<String>,     // Service version
-    pub environment: Option<String>,         // Environment
-    pub logger_level: Option<String>,        // Logger level
-    pub local_logging_enabled: Option<bool>, // Local logging enabled
+    pub endpoint: String,                 // Endpoint for metric collection
+    pub use_stdout: Option<bool>,         // Output to stdout
+    pub sample_ratio: Option<f64>,        // Trace sampling ratio
+    pub meter_interval: Option<u64>,      // Metric collection interval
+    pub service_name: Option<String>,     // Service name
+    pub service_version: Option<String>,  // Service version
+    pub environment: Option<String>,      // Environment
+    pub logger_level: Option<String>,     // Logger level
+    pub log_stdout_enabled: Option<bool>, // Stdout logging enabled
     // Added flexi_logger related configurations
     pub log_directory: Option<String>,     // LOG FILE DIRECTORY
     pub log_filename: Option<String>,      // The name of the log file
@@ -117,10 +118,10 @@ impl OtelConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_LEVEL.to_string())),
-            local_logging_enabled: env::var(ENV_OBS_LOCAL_LOGGING_ENABLED)
+            log_stdout_enabled: env::var(ENV_OBS_LOG_STDOUT_ENABLED)
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_LOCAL_LOGGING_ENABLED)),
+                .or(Some(DEFAULT_OBS_LOG_STDOUT_ENABLED)),
             log_directory: Some(get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY)),
             log_filename: env::var(ENV_OBS_LOG_FILENAME)
                 .ok()

@@ -16,8 +16,8 @@
 //! This module defines the configuration for audit systems, including
 //! webhook and MQTT audit-related settings.
 
-pub(crate) mod mqtt;
-pub(crate) mod webhook;
+mod mqtt;
+mod webhook;
 
 pub use mqtt::*;
 pub use webhook::*;

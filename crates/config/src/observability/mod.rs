@@ -22,7 +22,7 @@ pub const ENV_OBS_SERVICE_NAME: &str = "RUSTFS_OBS_SERVICE_NAME";
 pub const ENV_OBS_SERVICE_VERSION: &str = "RUSTFS_OBS_SERVICE_VERSION";
 pub const ENV_OBS_ENVIRONMENT: &str = "RUSTFS_OBS_ENVIRONMENT";
 pub const ENV_OBS_LOGGER_LEVEL: &str = "RUSTFS_OBS_LOGGER_LEVEL";
-pub const ENV_OBS_LOCAL_LOGGING_ENABLED: &str = "RUSTFS_OBS_LOCAL_LOGGING_ENABLED";
+pub const ENV_OBS_LOG_STDOUT_ENABLED: &str = "RUSTFS_OBS_LOG_STDOUT_ENABLED";
 pub const ENV_OBS_LOG_DIRECTORY: &str = "RUSTFS_OBS_LOG_DIRECTORY";
 pub const ENV_OBS_LOG_FILENAME: &str = "RUSTFS_OBS_LOG_FILENAME";
 pub const ENV_OBS_LOG_ROTATION_SIZE_MB: &str = "RUSTFS_OBS_LOG_ROTATION_SIZE_MB";
@@ -46,12 +46,6 @@ pub const DEFAULT_OBS_LOG_MESSAGE_CAPA: usize = 32768;
 
 /// Default values for flush interval in milliseconds
 pub const DEFAULT_OBS_LOG_FLUSH_MS: u64 = 200;
-
-/// Audit logger queue capacity environment variable key
-pub const ENV_AUDIT_LOGGER_QUEUE_CAPACITY: &str = "RUSTFS_AUDIT_LOGGER_QUEUE_CAPACITY";
-
-/// Default values for observability configuration
-pub const DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY: usize = 10000;
 
 /// Default values for observability configuration
 // ### Supported Environment Values
@@ -78,18 +72,16 @@ mod tests {
         assert_eq!(ENV_OBS_SERVICE_VERSION, "RUSTFS_OBS_SERVICE_VERSION");
         assert_eq!(ENV_OBS_ENVIRONMENT, "RUSTFS_OBS_ENVIRONMENT");
         assert_eq!(ENV_OBS_LOGGER_LEVEL, "RUSTFS_OBS_LOGGER_LEVEL");
-        assert_eq!(ENV_OBS_LOCAL_LOGGING_ENABLED, "RUSTFS_OBS_LOCAL_LOGGING_ENABLED");
+        assert_eq!(ENV_OBS_LOG_STDOUT_ENABLED, "RUSTFS_OBS_LOG_STDOUT_ENABLED");
         assert_eq!(ENV_OBS_LOG_DIRECTORY, "RUSTFS_OBS_LOG_DIRECTORY");
         assert_eq!(ENV_OBS_LOG_FILENAME, "RUSTFS_OBS_LOG_FILENAME");
         assert_eq!(ENV_OBS_LOG_ROTATION_SIZE_MB, "RUSTFS_OBS_LOG_ROTATION_SIZE_MB");
         assert_eq!(ENV_OBS_LOG_ROTATION_TIME, "RUSTFS_OBS_LOG_ROTATION_TIME");
         assert_eq!(ENV_OBS_LOG_KEEP_FILES, "RUSTFS_OBS_LOG_KEEP_FILES");
-        assert_eq!(ENV_AUDIT_LOGGER_QUEUE_CAPACITY, "RUSTFS_AUDIT_LOGGER_QUEUE_CAPACITY");
     }
 
     #[test]
     fn test_default_values() {
-        assert_eq!(DEFAULT_AUDIT_LOGGER_QUEUE_CAPACITY, 10000);
         assert_eq!(DEFAULT_OBS_ENVIRONMENT_PRODUCTION, "production");
         assert_eq!(DEFAULT_OBS_ENVIRONMENT_DEVELOPMENT, "development");
         assert_eq!(DEFAULT_OBS_ENVIRONMENT_TEST, "test");
