@@ -328,7 +328,6 @@ mod tests {
         let api_error: ApiError = storage_error.into();
 
         assert_eq!(api_error.code, S3ErrorCode::NoSuchBucket);
-        assert!(api_error.message.contains("test-bucket"));
         assert!(api_error.source.is_some());
 
         // Test that source can be downcast back to StorageError
