@@ -14,6 +14,9 @@
 
 // Observability Keys
 
+mod metrics;
+pub use metrics::*;
+
 pub const ENV_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
 pub const ENV_OBS_USE_STDOUT: &str = "RUSTFS_OBS_USE_STDOUT";
 pub const ENV_OBS_SAMPLE_RATIO: &str = "RUSTFS_OBS_SAMPLE_RATIO";
