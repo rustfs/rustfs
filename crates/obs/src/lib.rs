@@ -49,4 +49,5 @@ mod telemetry;
 
 pub use config::{AppConfig, OtelConfig};
 pub use global::*;
+pub use metrics::*;
 pub use system::SystemObserver;

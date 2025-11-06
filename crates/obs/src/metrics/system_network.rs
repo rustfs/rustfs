@@ -20,7 +20,7 @@
 /// - Error counts for connection and general internode calls
 /// - Network dial performance metrics
 /// - Data transfer volume in both directions
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 /// Total number of failed internode calls counter

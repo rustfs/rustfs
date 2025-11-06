@@ -19,7 +19,7 @@
 /// This module defines various system process metrics used for monitoring
 /// the RustFS process performance, resource usage, and system integration.
 /// Metrics are implemented using std::sync::LazyLock for thread-safe lazy initialization.
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 /// Number of current READ locks on this peer

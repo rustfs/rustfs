@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// Drive-related metric descriptors
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 /// drive related labels

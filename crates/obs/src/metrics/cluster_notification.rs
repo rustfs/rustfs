@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// Notify the relevant metric descriptor
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, subsystems};
 use std::sync::LazyLock;
 
 pub static NOTIFICATION_CURRENT_SEND_IN_PROGRESS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {

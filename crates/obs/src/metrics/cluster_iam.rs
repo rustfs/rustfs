@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// IAM related metric descriptors
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, subsystems};
 use std::sync::LazyLock;
 
 pub static LAST_SYNC_DURATION_MILLIS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {

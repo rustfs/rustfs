@@ -6918,7 +6918,9 @@ name = "rustfs-audit"
 version = "0.0.5"
 dependencies = [
  "chrono",
+ "const-str",
  "futures",
+ "metrics",
  "rumqttc",
  "rustfs-config",
  "rustfs-ecstore",
