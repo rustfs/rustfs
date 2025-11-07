@@ -145,7 +145,7 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
 /// It is used to keep the logs of the application.
 /// Default value: 30
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
-pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
+pub const DEFAULT_LOG_KEEP_FILES: usize = 30;
 
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.

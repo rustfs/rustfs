@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use rustfs_config::observability::{
-    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FILENAME,
-    ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED,
+    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES,
+    ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL,
     ENV_OBS_METER_INTERVAL, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
@@ -23,7 +23,7 @@ use rustfs_config::{
     USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
-use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u16, get_env_u64};
+use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -72,7 +72,7 @@ pub struct OtelConfig {
     pub log_filename: Option<String>,      // The name of the log file
     pub log_rotation_size_mb: Option<u64>, // Log file size cut threshold (MB)
     pub log_rotation_time: Option<String>, // Logs are cut by time (Hour， Day，Minute， Second)
-    pub log_keep_files: Option<u16>,       // Number of log files to be retained
+    pub log_keep_files: Option<usize>,     // Number of log files to be retained
 }
 
 impl OtelConfig {
@@ -109,7 +109,7 @@ impl OtelConfig {
             log_filename: Some(get_env_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
             log_rotation_size_mb: Some(get_env_u64(ENV_OBS_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
             log_rotation_time: Some(get_env_str(ENV_OBS_LOG_ROTATION_TIME, DEFAULT_LOG_ROTATION_TIME)), // Default to "Hour"
-            log_keep_files: Some(get_env_u16(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
+            log_keep_files: Some(get_env_usize(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
         }
     }
 

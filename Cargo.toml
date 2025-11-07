@@ -262,7 +262,7 @@ zstd = "0.13.3"
 # Observability and Metrics
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
-opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["http-proto", "zstd-http"] }
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
