@@ -69,7 +69,7 @@ pub enum GlobalError {
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// #    match init_obs(None) {
+/// #    match init_obs(None).await {
 /// #         Ok(guard) => {}
 /// #         Err(e) => { eprintln!("Failed to initialize observability: {}", e); }
 /// #     }
