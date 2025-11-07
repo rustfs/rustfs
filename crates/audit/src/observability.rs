@@ -136,7 +136,7 @@ impl AuditMetrics {
         self.total_events_failed.fetch_add(1, Ordering::Relaxed);
         self.total_dispatch_time_ns
             .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
-        // buried dots
+        // Record metrics
         self.emit_event_failure_metrics(dispatch_time);
     }
 

@@ -291,7 +291,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
     let log_spec = LogSpecification::parse(logger_level)
         .unwrap_or_else(|_| LogSpecification::parse(DEFAULT_LOG_LEVEL).unwrap_or(LogSpecification::error()));
 
-    // switch by size mb, Build log cutting conditions
+    // Switch by size (MB), Build log cutting conditions
     let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
         // Cut by time and size at the same time
         (Some(time), Some(size)) => {
