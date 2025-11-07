@@ -271,6 +271,9 @@ impl ECStore {
 
         set_object_layer(ec.clone()).await;
 
+        // Initialize metacache manager
+        crate::cache_value::metacache_manager::init_metacache_manager();
+
         Ok(ec)
     }
 

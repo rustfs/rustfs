@@ -2366,7 +2366,7 @@ impl S3 for FS {
             bucket,
             key,
             content_length,
-            content_type,
+            // content_type,
             tagging,
             metadata,
             version_id,
@@ -2443,9 +2443,9 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
-        if let Some(content_type) = content_type {
-            metadata.insert("content-type".to_string(), content_type.to_string());
-        }
+        // if let Some(content_type) = content_type {
+        //     metadata.insert("content-type".to_string(), content_type.to_string());
+        // }
 
         extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
 

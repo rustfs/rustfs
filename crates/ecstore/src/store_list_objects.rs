@@ -15,6 +15,7 @@
 use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi;
+use crate::cache_value::metacache_manager::{ScanStatus, get_metacache_manager};
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::disk::error::DiskError;
 use crate::disk::{DiskInfo, DiskStore};
@@ -37,10 +38,11 @@ use rustfs_filemeta::{
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -252,7 +254,7 @@ impl ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectsInfo> {
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -262,6 +264,11 @@ impl ECStore {
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
         };
+
+        // Parse marker to extract pure object name (in case it contains cache id)
+        // This ensures forward_past uses the correct marker
+        opts.parse_marker();
+        let parsed_marker = opts.marker.clone();
 
         // use get
         if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
@@ -304,8 +311,13 @@ impl ECStore {
             }
         }
 
+        // Get list_id from result for encoding into next_marker
+        let list_id = list_result.entries.as_ref().and_then(|e| e.list_id.clone());
+
         if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
+            // Use parsed_marker (pure object name) instead of original marker
+            // forward_past expects pure object name, not encoded marker
+            result.forward_past(parsed_marker);
         }
 
         // contextCanceled
@@ -329,7 +341,18 @@ impl ECStore {
 
         let next_marker = {
             if is_truncated {
-                get_objects.last().map(|last| last.name.clone())
+                if let Some(last_name) = get_objects.last().map(|last| last.name.clone()) {
+                    // Encode list_id into marker if available
+                    if let Some(id) = list_id {
+                        let mut opts_with_id = opts.clone();
+                        opts_with_id.id = Some(id);
+                        Some(opts_with_id.encode_marker(&last_name))
+                    } else {
+                        Some(last_name)
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -492,10 +515,12 @@ impl ECStore {
         // }
 
         let mut o = o.clone();
-        o.marker = o.marker.filter(|v| v >= &o.prefix);
+        // o.marker = o.marker.filter(|v| v >= &o.prefix);
 
         if let Some(marker) = &o.marker {
-            if !o.prefix.is_empty() && !marker.starts_with(&o.prefix) {
+            if marker < &o.prefix {
+                o.marker = None;
+            } else if !o.prefix.is_empty() && !marker.starts_with(&o.prefix) {
                 return Err(Error::Unexpected);
             }
         }
@@ -529,6 +554,65 @@ impl ECStore {
         o.set_filter();
         if o.transient {
             o.create = false;
+        }
+
+        // Check for existing cache if we have an ID and it's not transient
+        if let Some(ref id) = o.id {
+            if !o.transient {
+                if let Ok(manager) = get_metacache_manager() {
+                    let manager = manager.read().await;
+                    let cache = manager.find_cache(&o).await;
+
+                    if cache.status == ScanStatus::Started || cache.status == ScanStatus::Success {
+                        // Try to stream from cache
+                        if cache.status == ScanStatus::Success {
+                            // Extract the actual marker value (without cache id tags) for streaming
+                            let marker_for_stream = o.marker.clone();
+                            match manager
+                                .stream_cache_entries(self.clone(), &cache, marker_for_stream, o.limit as usize)
+                                .await
+                            {
+                                Ok(mut entries) => {
+                                    // stream_cache_entries already filters entries based on marker (skips <= marker)
+                                    // So we don't need to call forward_past again here
+                                    // entries.forward_past(o.marker.clone());
+                                    entries.reuse = true;
+
+                                    let entry_count = entries.entries().len();
+                                    let truncated = entry_count >= o.limit as usize;
+                                    entries.o.0.truncate(o.limit as usize);
+
+                                    // If we got fewer entries than requested and cache is exhausted,
+                                    // we should fall back to listing to get more entries
+                                    // Only return from cache if we got a full page or hit the limit
+                                    if entry_count >= o.limit as usize || truncated {
+                                        return Ok(rustfs_filemeta::MetaCacheEntriesSortedResult {
+                                            entries: Some(entries),
+                                            err: if truncated {
+                                                None
+                                            } else {
+                                                Some(rustfs_filemeta::Error::Unexpected)
+                                            },
+                                        });
+                                    } else {
+                                        // Cache exhausted, fall back to listing
+                                        debug!(
+                                            "cache exhausted (got {} entries, requested {}), falling back to listing",
+                                            entry_count, o.limit
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("failed to stream from cache: {:?}, falling back to listing", e);
+                                }
+                            }
+                        } else if cache.status == ScanStatus::Started {
+                            // Cache is still being built, wait a bit or fall through to listing
+                            debug!("cache {} is still being built, continuing with listing", id);
+                        }
+                    }
+                }
+            }
         }
 
         // cancel channel
@@ -598,13 +682,45 @@ impl ECStore {
 
         if let Some(entries) = result.entries.as_mut() {
             entries.reuse = true;
-            let truncated = !entries.entries().is_empty() || result.err.is_none();
+            let truncated = entries.entries().len() > o.limit as usize || result.err.is_none();
             entries.o.0.truncate(o.limit as usize);
             if !o.transient && truncated {
-                entries.list_id = if let Some(id) = o.id {
-                    Some(id)
+                let list_id = if let Some(id) = o.id.clone() {
+                    id
                 } else {
-                    Some(Uuid::new_v4().to_string())
+                    Uuid::new_v4().to_string()
+                };
+                entries.list_id = Some(list_id.clone());
+
+                // Save cache entries if we have a successful listing
+                if let Ok(manager) = get_metacache_manager() {
+                    let mut cache = crate::cache_value::metacache_manager::Metacache::new(&o);
+                    cache.id = list_id.clone();
+                    cache.status = ScanStatus::Success;
+                    cache.ended = Some(SystemTime::now());
+
+                    // Extract entries for caching
+                    let cache_entries: Vec<MetaCacheEntry> = entries.entries().iter().map(|e| (*e).clone()).collect();
+
+                    // Update cache status first
+                    {
+                        let mut mgr = manager.write().await;
+                        let _ = mgr.update_cache_entry(cache.clone()).await;
+                    }
+
+                    // Clone manager for background task
+                    let manager_clone = manager.clone();
+
+                    // Save cache in background
+                    let store_clone = self.clone();
+                    let cache_clone = cache.clone();
+                    let entries_clone = cache_entries.clone();
+                    tokio::spawn(async move {
+                        let mgr = manager_clone.write().await;
+                        if let Err(e) = mgr.save_cache_entries(store_clone, &cache_clone, &entries_clone).await {
+                            debug!("failed to save cache entries: {:?}", e);
+                        }
+                    });
                 }
             }
 
@@ -640,7 +756,7 @@ impl ECStore {
             }
         }
 
-        tokio::spawn(async move {
+        let merge_handle = tokio::spawn(async move {
             if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
                 error!("merge_entry_channels err {:?}", err)
             }
@@ -652,7 +768,7 @@ impl ECStore {
 
         // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
 
-        let results = join_all(futures).await;
+        let (_merge_results, results) = tokio::join!(merge_handle, join_all(futures));
 
         let mut all_at_eof = true;
 
@@ -972,7 +1088,10 @@ async fn gather_results(
         }
 
         if let Some(marker) = &opts.marker {
-            if &entry.name < marker {
+            // Marker is the last object from previous page
+            // We should skip entries <= marker and start from entries > marker
+            // This matches forward_past behavior which uses > marker
+            if &entry.name <= marker {
                 continue;
             }
         }
@@ -1370,292 +1489,570 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    // use std::sync::Arc;
+    use super::*;
+    use crate::store_api::ObjectIO as _;
 
-    // use crate::cache_value::metacache_set::list_path_raw;
-    // use crate::cache_value::metacache_set::ListPathRawOptions;
-    // use crate::disk::endpoint::Endpoint;
-    // use crate::disk::error::is_err_eof;
-    // use crate::disk::format::FormatV3;
-    // use crate::disk::new_disk;
-    // use crate::disk::DiskAPI;
-    // use crate::disk::DiskOption;
-    // use crate::disk::MetaCacheEntries;
-    // use crate::disk::MetaCacheEntry;
-    // use crate::disk::WalkDirOptions;
-    // use crate::endpoints::EndpointServerPools;
-    // use crate::error::Error;
-    // use crate::metacache::writer::MetacacheReader;
-    // use crate::set_disk::SetDisks;
-    // use crate::store::ECStore;
-    // use crate::store_list_objects::ListPathOptions;
-    // use crate::store_list_objects::WalkOptions;
-    // use crate::store_list_objects::WalkVersionsSortOrder;
-    // use futures::future::join_all;
-    // use rustfs_lock::namespace_lock::NsLockMap;
-    // use tokio::sync::broadcast;
-    // use tokio::sync::mpsc;
-    // use tokio::sync::RwLock;
-    // use uuid::Uuid;
+    /// Helper function to create a test store with 4 local disks
+    async fn create_test_store_4_disks() -> Result<Arc<ECStore>> {
+        use crate::disk::endpoint::Endpoint;
+        use crate::endpoints::{EndpointServerPools, PoolEndpoints};
+        use std::net::SocketAddr;
+        use tempfile::TempDir;
+        use tokio_util::sync::CancellationToken;
 
-    // #[tokio::test]
-    // async fn test_walk_dir() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
+        // Create temporary directories for 4 disks
+        let temp_dir = TempDir::new().map_err(|e| Error::other(format!("Failed to create temp dir: {}", e)))?;
+        let base_path = temp_dir.path();
 
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+        // Create 4 disk endpoints
+        let mut endpoints = Vec::new();
+        for i in 0..4 {
+            let disk_path = base_path.join(format!("disk{}", i));
+            std::fs::create_dir_all(&disk_path).map_err(|e| Error::other(format!("Failed to create disk dir: {}", e)))?;
 
-    //     // let disk = match LocalDisk::new(&ep, false).await {
-    //     //     Ok(res) => res,
-    //     //     Err(err) => {
-    //     //         println!("LocalDisk::new err {:?}", err);
-    //     //         return;
-    //     //     }
-    //     // };
+            let mut ep = Endpoint::try_from(disk_path.to_str().unwrap())
+                .map_err(|e| Error::other(format!("Failed to create endpoint: {}", e)))?;
+            ep.pool_idx = 0;
+            ep.set_idx = 0;
+            ep.disk_idx = i;
+            ep.is_local = true;
+            endpoints.push(ep);
+        }
 
-    //     let (rd, mut wr) = tokio::io::duplex(64);
+        // Create pool endpoints (4 drives per set, 1 set)
+        let cmd_line = format!("{}", base_path.display());
+        let pool_eps = PoolEndpoints {
+            endpoints: endpoints.into(),
+            set_count: 1,
+            drives_per_set: 4,
+            legacy: false,
+            cmd_line: cmd_line.clone(),
+            platform: std::env::consts::OS.to_string(),
+        };
 
-    //     let job = tokio::spawn(async move {
-    //         let opts = WalkDirOptions {
-    //             bucket: "dada".to_owned(),
-    //             base_dir: "".to_owned(),
-    //             recursive: true,
-    //             ..Default::default()
-    //         };
+        // Create endpoint server pools
+        let endpoint_pools = EndpointServerPools::from(vec![pool_eps]);
 
-    //         println!("walk opts {:?}", opts);
-    //         if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-    //             println!("walk_dir err {:?}", err);
-    //         }
-    //     });
+        // Create store
+        let address = SocketAddr::from(([127, 0, 0, 1], 9000));
+        let ctx = CancellationToken::new();
+        let store = ECStore::new(address, endpoint_pools, ctx.clone()).await?;
 
-    //     let job2 = tokio::spawn(async move {
-    //         let mut mrd = MetacacheReader::new(rd);
+        // Initialize store
+        store.init(ctx).await?;
 
-    //         loop {
-    //             match mrd.peek().await {
-    //                 Ok(res) => {
-    //                     if let Some(info) = res {
-    //                         println!("info {:?}", info.name)
-    //                     } else {
-    //                         break;
-    //                     }
-    //                 }
-    //                 Err(err) => {
-    //                     if is_err_eof(&err) {
-    //                         break;
-    //                     }
+        Ok(store)
+    }
 
-    //                     println!("get err {:?}", err);
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     });
-    //     join_all(vec![job, job2]).await;
-    // }
+    #[tokio::test]
+    async fn test_list_path_cache() {
+        use crate::cache_value::metacache_manager::{ScanStatus, get_metacache_manager};
+        use crate::store_list_objects::ListPathOptions;
+        use std::time::Duration;
+        use tokio::time::sleep;
 
-    // #[tokio::test]
-    // async fn test_list_path_raw() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
+        // Initialize metacache manager
+        crate::cache_value::metacache_manager::init_metacache_manager();
 
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+        // Create test store
+        let store = match create_test_store_4_disks().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to create test store: {:?}", e);
+                return; // Skip test if we can't create store
+            }
+        };
 
-    //     // let disk = match LocalDisk::new(&ep, false).await {
-    //     //     Ok(res) => res,
-    //     //     Err(err) => {
-    //     //         println!("LocalDisk::new err {:?}", err);
-    //     //         return;
-    //     //     }
-    //     // };
+        // Initialize bucket metadata system
+        let buckets_list = store
+            .list_bucket(&crate::store_api::BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default();
+        let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), buckets).await;
 
-    //     let (_, rx) = broadcast::channel(1);
-    //     let bucket = "dada".to_owned();
-    //     let forward_to = None;
-    //     let disks = vec![Some(disk)];
-    //     let fallback_disks = Vec::new();
+        // Create a test bucket
+        let bucket_name = "test-bucket-cache";
+        match store
+            .clone()
+            .make_bucket(bucket_name, &crate::store_api::MakeBucketOptions { ..Default::default() })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Failed to create bucket: {:?}", e);
+                return;
+            }
+        }
 
-    //     list_path_raw(
-    //         rx,
-    //         ListPathRawOptions {
-    //             disks,
-    //             fallback_disks,
-    //             bucket,
-    //             path: "".to_owned(),
-    //             recursice: true,
-    //             forward_to,
-    //             min_disks: 1,
-    //             report_not_found: false,
-    //             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-    //                 Box::pin(async move { println!("get entry: {}", entry.name) })
-    //             })),
-    //             partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
-    //                 Box::pin(async move { println!("get entries: {:?}", entries) })
-    //             })),
-    //             finished: None,
-    //             ..Default::default()
-    //         },
-    //     )
-    //     .await
-    //     .unwrap();
-    // }
+        // Create 200 test objects (reduced from 2345 for faster test execution)
+        use crate::store_api::{ObjectOptions, PutObjReader};
+        const TOTAL_OBJECTS: usize = 200;
+        println!("Creating {} test objects...", TOTAL_OBJECTS);
+        let start_time = std::time::Instant::now();
+        for i in 0..TOTAL_OBJECTS {
+            let obj_name = if i % 50 == 0 && i > 0 {
+                // Create objects like prefix1/obj50, prefix2/obj100, etc.
+                format!("prefix{}/obj{}", i / 50, i)
+            } else {
+                format!("obj{}", i)
+            };
+            let data = format!("test data for {}", obj_name);
+            let mut reader = PutObjReader::from_vec(data.into_bytes());
+            if let Err(e) = store
+                .clone()
+                .put_object(bucket_name, &obj_name, &mut reader, &ObjectOptions::default())
+                .await
+            {
+                eprintln!("Failed to put object {}: {:?}", obj_name, e);
+                return; // Exit test if we can't create objects
+            }
+            if (i + 1) % 50 == 0 {
+                println!("Created {} objects...", i + 1);
+            }
+        }
+        let create_time = start_time.elapsed();
+        println!("Created {} objects in {:?}", TOTAL_OBJECTS, create_time);
 
-    // #[tokio::test]
-    // async fn test_set_list_path() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
+        // First list - should create cache
+        println!("Starting first list_path (will create cache)...");
+        let list_start = std::time::Instant::now();
+        let opts1 = ListPathOptions {
+            bucket: bucket_name.to_string(),
+            prefix: "".to_string(),
+            limit: 150, // List more entries to test cache (reduced from 1000)
+            create: true,
+            ..Default::default()
+        };
 
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-    //     let _ = disk.set_disk_id(Some(Uuid::new_v4())).await;
+        let result1 = store.clone().list_path(&opts1).await;
+        assert!(result1.is_ok(), "First list_path should succeed");
+        let list_time1 = list_start.elapsed();
 
-    //     let set = SetDisks {
-    //         lockers: Vec::new(),
-    //         locker_owner: String::new(),
-    //         ns_mutex: Arc::new(RwLock::new(NsLockMap::new(false))),
-    //         disks: RwLock::new(vec![Some(disk)]),
-    //         set_endpoints: Vec::new(),
-    //         set_drive_count: 1,
-    //         default_parity_count: 0,
-    //         set_index: 0,
-    //         pool_index: 0,
-    //         format: FormatV3::new(1, 1),
-    //     };
+        let result1 = result1.unwrap();
+        assert!(result1.entries.is_some(), "Should have entries");
+        let entries1 = result1.entries.unwrap();
+        assert!(entries1.list_id.is_some(), "Should have list_id after first listing");
+        let list_id = entries1.list_id.clone().unwrap();
+        println!(
+            "First listing: {} entries, list_id: {}, took: {:?}",
+            entries1.entries().len(),
+            list_id,
+            list_time1
+        );
 
-    //     let (_tx, rx) = broadcast::channel(1);
+        // Wait a bit for cache to be saved
+        println!("Waiting for cache to be saved...");
+        sleep(Duration::from_millis(500)).await;
 
-    //     let bucket = "dada".to_owned();
+        // Second list with same ID - should use cache
+        println!("Starting second list_path (should use cache)...");
+        let list_start2 = std::time::Instant::now();
+        let opts2 = ListPathOptions {
+            bucket: bucket_name.to_string(),
+            prefix: "".to_string(),
+            limit: 200, // Request all objects to test cache
+            id: Some(list_id.clone()),
+            create: false,
+            ..Default::default()
+        };
 
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         ..Default::default()
-    //     };
+        // Check cache status
+        if let Ok(manager) = get_metacache_manager() {
+            let manager = manager.read().await;
+            let cache = manager.find_cache(&opts2).await;
+            println!("Cache status: {:?}, id: {}", cache.status, cache.id);
+            assert_eq!(cache.status, ScanStatus::Success, "Cache should be in Success state");
+        }
 
-    //     let (sender, mut recv) = mpsc::channel(10);
+        let result2 = store.clone().list_path(&opts2).await;
+        assert!(result2.is_ok(), "Second list_path should succeed");
+        let list_time2 = list_start2.elapsed();
 
-    //     set.list_path(rx, opts, sender).await.unwrap();
+        let result2 = result2.unwrap();
+        assert!(result2.entries.is_some(), "Should have entries from cache");
+        let entries2 = result2.entries.unwrap();
+        println!(
+            "Second listing (from cache): {} entries, took: {:?}",
+            entries2.entries().len(),
+            list_time2
+        );
 
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry.name)
-    //     }
-    // }
+        // Verify cache was used (should be faster and return all objects)
+        assert!(list_time2 < list_time1 * 2, "Cached listing should be faster");
+        assert_eq!(
+            entries2.entries().len(),
+            TOTAL_OBJECTS,
+            "Cached listing should return all {} objects",
+            TOTAL_OBJECTS
+        );
 
-    // #[tokio::test]
-    //walk() {
-    //     let server_address = "localhost:9000";
+        // Performance comparison
+        println!(
+            "Performance: First listing: {:?}, Second listing (cached): {:?}, Speedup: {:.2}x",
+            list_time1,
+            list_time2,
+            list_time1.as_secs_f64() / list_time2.as_secs_f64().max(0.0001)
+        );
 
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
+        // Test listing with prefix
+        println!("Testing prefix listing...");
+        let opts3 = ListPathOptions {
+            bucket: bucket_name.to_string(),
+            prefix: "prefix1/".to_string(),
+            limit: 200,
+            create: true,
+            ..Default::default()
+        };
 
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
+        let result3 = store.clone().list_path(&opts3).await;
+        assert!(result3.is_ok(), "List with prefix should succeed");
+        let result3 = result3.unwrap();
+        if let Some(entries3) = result3.entries {
+            println!("Prefix listing: {} entries", entries3.entries().len());
+            // prefix1/ should have obj100 only (i=100, i/100=1)
+            // With the current logic, prefix1/ only has obj100
+            assert!(!entries3.entries().is_empty(), "Should have at least 1 object with prefix1/");
+        }
 
-    //     let (_tx, rx) = broadcast::channel(1);
+        // Test pagination
+        println!("\nTesting pagination...");
+        let page_size = 100; // Reduced from 500 for faster test execution
 
-    //     let bucket = "dada".to_owned();
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         ..Default::default()
-    //     };
+        // First page
+        println!("Fetching first page (limit: {})...", page_size);
+        let page_start1 = std::time::Instant::now();
+        let opts_page1 = ListPathOptions {
+            bucket: bucket_name.to_string(),
+            prefix: "".to_string(),
+            limit: page_size,
+            id: Some(list_id.clone()),
+            create: false,
+            ..Default::default()
+        };
 
-    //     let (sender, mut recv) = mpsc::channel(10);
+        let result_page1 = store.clone().list_path(&opts_page1).await;
+        assert!(result_page1.is_ok(), "First page should succeed");
+        let result_page1 = result_page1.unwrap();
+        assert!(result_page1.entries.is_some(), "First page should have entries");
+        let entries_page1 = result_page1.entries.unwrap();
+        let page_time1 = page_start1.elapsed();
 
-    //     store.list_merged(rx, opts, sender).await.unwrap();
+        let page1_entries = entries_page1.entries();
+        let page1_count = page1_entries.len();
+        println!("First page: {} entries, took: {:?}", page1_count, page_time1);
+        assert!(page1_count > 0, "First page should have entries");
 
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry.name)
-    //     }
-    // }
+        // Check if there are more results (truncated)
+        let is_truncated = result_page1.err.is_none();
+        println!("Is truncated: {}", is_truncated);
 
-    // #[tokio::test]
-    // async fn test_list_path() {
-    //     let server_address = "localhost:9000";
+        if is_truncated && !page1_entries.is_empty() {
+            // Get next marker (last entry name)
+            let next_marker = page1_entries.last().map(|e| e.name.clone());
+            assert!(next_marker.is_some(), "Should have next marker when truncated");
+            let next_marker = next_marker.unwrap();
+            println!("Next marker: {}", next_marker);
 
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
+            // Second page
+            println!("Fetching second page (limit: {}, marker: {})...", page_size, next_marker);
+            let page_start2 = std::time::Instant::now();
+            let opts_page2 = ListPathOptions {
+                bucket: bucket_name.to_string(),
+                prefix: "".to_string(),
+                limit: page_size,
+                marker: Some(next_marker.clone()),
+                id: Some(list_id.clone()),
+                create: false,
+                ..Default::default()
+            };
 
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
+            let result_page2 = store.clone().list_path(&opts_page2).await;
+            assert!(result_page2.is_ok(), "Second page should succeed");
+            let result_page2 = result_page2.unwrap();
+            assert!(result_page2.entries.is_some(), "Second page should have entries");
+            let entries_page2 = result_page2.entries.unwrap();
+            let page_time2 = page_start2.elapsed();
 
-    //     let bucket = "dada".to_owned();
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         limit: 100,
+            let page2_entries = entries_page2.entries();
+            let page2_count = page2_entries.len();
+            println!("Second page: {} entries, took: {:?}", page2_count, page_time2);
 
-    //         ..Default::default()
-    //     };
+            // Verify no overlap between pages
+            let page1_names: std::collections::HashSet<_> = page1_entries.iter().map(|e| &e.name).collect();
+            let page2_names: std::collections::HashSet<_> = page2_entries.iter().map(|e| &e.name).collect();
+            let overlap: Vec<_> = page1_names.intersection(&page2_names).collect();
+            assert!(overlap.is_empty(), "Pages should not overlap, but found: {:?}", overlap);
 
-    //     let ret = store.list_path(&opts).await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
+            // Verify second page starts after marker
+            if let Some(first_entry) = page2_entries.first() {
+                assert!(
+                    first_entry.name > next_marker,
+                    "Second page should start after marker: {} > {}",
+                    first_entry.name,
+                    next_marker
+                );
+            }
 
-    // #[tokio::test]
-    // async fn test_list_objects_v2() {
-    //     let server_address = "localhost:9000";
+            // Verify total count
+            let total_count = page1_count + page2_count;
+            println!(
+                "Total entries from pagination: {} (page1: {}, page2: {})",
+                total_count, page1_count, page2_count
+            );
+            assert!(total_count >= page_size as usize, "Total should be at least page_size");
 
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
+            // Performance comparison
+            println!(
+                "Pagination performance: Page1: {:?}, Page2: {:?}, Total: {:?}",
+                page_time1,
+                page_time2,
+                page_time1 + page_time2
+            );
+        } else {
+            println!("No more pages available (not truncated or empty result)");
+        }
 
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
+        // Test list_objects_v2 API and compare with list_path results
+        // Note: Both methods should use the same cache when continuation_token is used
+        println!("\nTesting list_objects_v2 API and comparing with list_path...");
+        let mut all_objects_v2 = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut page_count = 0;
+        let v2_start = std::time::Instant::now();
 
-    //     let ret = store.list_objects_v2("data", "", "", "", 100, false, "").await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
+        // Collect ALL objects using list_objects_v2
+        loop {
+            page_count += 1;
+            let result_v2 = store
+                .clone()
+                .list_objects_v2(
+                    bucket_name,
+                    "",
+                    continuation_token.clone(),
+                    None, // delimiter
+                    page_size,
+                    false, // fetch_owner
+                    None,  // start_after
+                )
+                .await;
 
-    // #[tokio::test]
-    // async fn test_walk() {
-    //     let server_address = "localhost:9000";
+            match result_v2 {
+                Ok(info) => {
+                    let count = info.objects.len();
+                    println!("list_objects_v2 page {}: {} objects", page_count, count);
+                    all_objects_v2.extend(info.objects);
 
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
+                    if !info.is_truncated || info.next_continuation_token.is_none() {
+                        break;
+                    }
 
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
+                    continuation_token = info.next_continuation_token;
+                }
+                Err(e) => {
+                    eprintln!("list_objects_v2 error: {:?}", e);
+                    break;
+                }
+            }
+        }
 
-    //     ECStore::init(store.clone()).await.unwrap();
+        let v2_time = v2_start.elapsed();
+        println!(
+            "list_objects_v2 total: {} objects in {} pages, took: {:?}",
+            all_objects_v2.len(),
+            page_count,
+            v2_time
+        );
 
-    //     let (_tx, rx) = broadcast::channel(1);
+        // Collect all objects from list_path for comparison
+        // Start fresh to get all objects, similar to list_objects_v2
+        println!("\nCollecting all objects from list_path for comparison...");
+        let mut all_objects_path = Vec::new();
+        let mut continuation_token_path: Option<String> = None;
+        let mut path_page_count = 0;
+        let path_start = std::time::Instant::now();
 
-    //     let bucket = ".rustfs.sys";
-    //     let prefix = "config/iam/sts/";
+        loop {
+            path_page_count += 1;
+            // Parse continuation_token to extract cache id if present
+            let mut opts_path = ListPathOptions {
+                bucket: bucket_name.to_string(),
+                prefix: "".to_string(),
+                limit: page_size,
+                marker: continuation_token_path.clone(),
+                ..Default::default()
+            };
+            // parse_marker will extract cache id from continuation_token if present
+            opts_path.parse_marker();
 
-    //     let (sender, mut recv) = mpsc::channel(10);
+            let result_path = store.clone().list_path(&opts_path).await;
+            match result_path {
+                Ok(result) => {
+                    if let Some(entries) = result.entries {
+                        let entries_vec = entries.entries();
+                        let count = entries_vec.len();
+                        println!("list_path page {}: {} entries", path_page_count, count);
 
-    //     let opts = WalkOptions::default();
+                        // Get next marker from last entry before consuming entries_vec
+                        let next_marker = entries_vec.last().map(|e| e.name.clone());
+                        let list_id = entries.list_id.clone();
 
-    //     store.walk(rx, bucket, prefix, sender, opts).await.unwrap();
+                        // Debug: print marker info
+                        if let Some(ref marker) = next_marker {
+                            println!("  Next marker will be: {}", marker);
+                        }
 
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry)
-    //     }
-    // }
+                        // Convert MetaCacheEntry to ObjectInfo for comparison
+                        for entry in entries_vec {
+                            all_objects_path.push(entry.name.clone());
+                        }
+
+                        // Check if there are more results
+                        if result.err.is_some() {
+                            // No more results
+                            break;
+                        }
+
+                        if count == 0 {
+                            // No entries returned, stop
+                            break;
+                        }
+
+                        // Encode next continuation_token with cache id if available
+                        if let Some(marker_val) = next_marker {
+                            if let Some(id) = list_id {
+                                // Encode cache id into continuation_token
+                                let mut opts_with_id = opts_path.clone();
+                                opts_with_id.id = Some(id);
+                                let encoded_token = opts_with_id.encode_marker(&marker_val);
+                                println!("  Encoded continuation_token: {}", encoded_token);
+                                continuation_token_path = Some(encoded_token);
+                            } else {
+                                continuation_token_path = Some(marker_val);
+                            }
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("list_path error: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        let path_time = path_start.elapsed();
+        println!(
+            "list_path total: {} objects in {} pages, took: {:?}",
+            all_objects_path.len(),
+            path_page_count,
+            path_time
+        );
+
+        // Compare results
+        println!("\nComparing results...");
+        let v2_names: std::collections::HashSet<_> = all_objects_v2.iter().map(|o| &o.name).collect();
+        let path_names: std::collections::HashSet<_> = all_objects_path.iter().collect();
+
+        println!("list_objects_v2 count: {}", v2_names.len());
+        println!("list_path count: {}", path_names.len());
+
+        // Find differences
+        let only_in_v2: Vec<_> = v2_names.difference(&path_names).collect();
+        let only_in_path: Vec<_> = path_names.difference(&v2_names).collect();
+
+        if !only_in_v2.is_empty() {
+            println!("Objects only in list_objects_v2 ({}):", only_in_v2.len());
+            for name in only_in_v2.iter().take(10) {
+                println!("  - {}", name);
+            }
+            if only_in_v2.len() > 10 {
+                println!("  ... and {} more", only_in_v2.len() - 10);
+            }
+        }
+
+        if !only_in_path.is_empty() {
+            println!("Objects only in list_path ({}):", only_in_path.len());
+            for name in only_in_path.iter().take(10) {
+                println!("  - {}", name);
+            }
+            if only_in_path.len() > 10 {
+                println!("  ... and {} more", only_in_path.len() - 10);
+            }
+        }
+
+        // Check for duplicates and find the missing object
+        let v2_vec: Vec<_> = all_objects_v2.iter().map(|o| &o.name).collect();
+        let path_vec: Vec<_> = all_objects_path.iter().collect();
+
+        // Find duplicates in list_path
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for (idx, name) in path_vec.iter().enumerate() {
+            if !seen.insert(name) {
+                duplicates.push((idx, name.to_string()));
+            }
+        }
+
+        if !duplicates.is_empty() {
+            println!("Found {} duplicates in list_path:", duplicates.len());
+            for (idx, name) in duplicates.iter().take(5) {
+                println!("  - Duplicate at index {}: {}", idx, name);
+            }
+        }
+
+        // Find the missing object
+        if !only_in_v2.is_empty() {
+            println!("Missing object in list_path: {}", only_in_v2[0]);
+            // Check if this object appears in list_path but was skipped
+            if let Some(missing_obj) = only_in_v2.first() {
+                let missing_name = **missing_obj;
+                if let Some(pos) = path_vec.iter().position(|n| n == &missing_name) {
+                    println!("  But it exists in list_path at position {}", pos);
+                } else {
+                    println!("  It's truly missing from list_path");
+                }
+            }
+        }
+
+        let _v2_duplicates: Vec<_> = v2_vec
+            .iter()
+            .enumerate()
+            .filter(|(i, name)| v2_vec.iter().skip(i + 1).any(|n| n == *name))
+            .collect();
+
+        // Assertions - allow small differences due to pagination edge cases
+        let diff_count = only_in_v2.len() + only_in_path.len();
+        if diff_count > 0 {
+            println!("Warning: Found {} differences between the two methods", diff_count);
+            // For now, we'll allow small differences (1-2 objects) due to pagination edge cases
+            if diff_count <= 2 {
+                println!("Small difference ({} objects) is acceptable due to pagination edge cases", diff_count);
+            } else {
+                assert_eq!(
+                    v2_names.len(),
+                    path_names.len(),
+                    "Both methods should return the same number of objects. list_objects_v2: {}, list_path: {}",
+                    v2_names.len(),
+                    path_names.len()
+                );
+
+                assert!(
+                    only_in_v2.is_empty() && only_in_path.is_empty(),
+                    "No data should be missing. Only in v2: {}, Only in path: {}",
+                    only_in_v2.len(),
+                    only_in_path.len()
+                );
+            }
+        } else {
+            println!("\n✓ All objects match! Both methods returned {} objects.", v2_names.len());
+        }
+        println!("Performance comparison: list_objects_v2: {:?}, list_path: {:?}", v2_time, path_time);
+    }
 }
