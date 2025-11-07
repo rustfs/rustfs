@@ -474,7 +474,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
         builder.build()
     };
 
-    // Tracing 层
+    // Tracing layer
     let fmt_layer_opt = {
         if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
             let enable_color = std::io::stdout().is_terminal();
