@@ -103,7 +103,7 @@ impl AuditMetrics {
         }
     }
 
-    // Suggestion: Call this auxiliary function in the existing "Successful Event Recording" method body to complete the burying point
+    // Suggestion: Call this auxiliary function in the existing "Successful Event Recording" method body to complete the instrumentation
     #[inline]
     fn emit_event_success_metrics(&self, dispatch_time: Duration) {
         // count + histogram
@@ -236,7 +236,7 @@ impl AuditMetrics {
         let mut reset_time = self.last_reset_time.write().await;
         *reset_time = Instant::now();
 
-        // 重置后将 EPS 置零
+        // Reset EPS to zero after reset
         init_observability_metrics();
         gauge!(M_AUDIT_EPS).set(0.0);
 
