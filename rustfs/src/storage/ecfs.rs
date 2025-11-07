@@ -2165,6 +2165,9 @@ impl S3 for FS {
 
         let prefix = prefix.unwrap_or_default();
         let max_keys = max_keys.unwrap_or(1000);
+        if max_keys < 0 {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
+        }
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
@@ -2391,6 +2394,10 @@ impl S3 for FS {
                 }
             }
         };
+
+        if size == -1 {
+            return Err(s3_error!(UnexpectedContent));
+        }
 
         let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
 
@@ -3658,11 +3665,6 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
-        // Validate tag_set length doesn't exceed 10
-        if tagging.tag_set.len() > 10 {
-            return Err(s3_error!(InvalidArgument, "Object tags cannot be greater than 10"));
-        }
 
         let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
         for tag in &tagging.tag_set {
