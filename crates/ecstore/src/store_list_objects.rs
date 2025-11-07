@@ -204,7 +204,7 @@ impl ListPathOptions {
                 MARKER_TAG_VERSION,
                 id.to_owned(),
                 self.pool_idx.unwrap_or_default(),
-                self.pool_idx.unwrap_or_default(),
+                self.set_idx.unwrap_or_default(),
             )
         } else {
             format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
@@ -683,7 +683,18 @@ impl ECStore {
         if let Some(entries) = result.entries.as_mut() {
             entries.reuse = true;
             let truncated = entries.entries().len() > o.limit as usize || result.err.is_none();
+
+            // Extract entries for caching BEFORE truncating
+            // This ensures we cache all available entries, not just the truncated subset
+            let cache_entries: Option<Vec<MetaCacheEntry>> = if !o.transient && truncated {
+                Some(entries.entries().iter().map(|e| (*e).clone()).collect())
+            } else {
+                None
+            };
+
+            // Truncate entries for return to user
             entries.o.0.truncate(o.limit as usize);
+
             if !o.transient && truncated {
                 let list_id = if let Some(id) = o.id.clone() {
                     id
@@ -699,28 +710,28 @@ impl ECStore {
                     cache.status = ScanStatus::Success;
                     cache.ended = Some(SystemTime::now());
 
-                    // Extract entries for caching
-                    let cache_entries: Vec<MetaCacheEntry> = entries.entries().iter().map(|e| (*e).clone()).collect();
-
-                    // Update cache status first
-                    {
-                        let mut mgr = manager.write().await;
-                        let _ = mgr.update_cache_entry(cache.clone()).await;
-                    }
-
-                    // Clone manager for background task
-                    let manager_clone = manager.clone();
-
-                    // Save cache in background
-                    let store_clone = self.clone();
-                    let cache_clone = cache.clone();
-                    let entries_clone = cache_entries.clone();
-                    tokio::spawn(async move {
-                        let mgr = manager_clone.write().await;
-                        if let Err(e) = mgr.save_cache_entries(store_clone, &cache_clone, &entries_clone).await {
-                            debug!("failed to save cache entries: {:?}", e);
+                    // Use the entries we extracted before truncating
+                    if let Some(cache_entries) = cache_entries {
+                        // Update cache status first
+                        {
+                            let mut mgr = manager.write().await;
+                            let _ = mgr.update_cache_entry(cache.clone()).await;
                         }
-                    });
+
+                        // Clone manager for background task
+                        let manager_clone = manager.clone();
+
+                        // Save cache in background
+                        let store_clone = self.clone();
+                        let cache_clone = cache.clone();
+                        let entries_clone = cache_entries.clone();
+                        tokio::spawn(async move {
+                            let mgr = manager_clone.write().await;
+                            if let Err(e) = mgr.save_cache_entries(store_clone, &cache_clone, &entries_clone).await {
+                                debug!("failed to save cache entries: {:?}", e);
+                            }
+                        });
+                    }
                 }
             }
 
