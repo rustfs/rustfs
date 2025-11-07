@@ -14,17 +14,13 @@
 
 use crate::config::OtelConfig;
 use crate::global::IS_OBSERVABILITY_ENABLED;
-use flexi_logger::{
-    Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode,
-    WriteMode::{AsyncWith, BufferAndFlush},
-    style,
-};
+use flexi_logger::{DeferredNow, Record, WriteMode, WriteMode::AsyncWith, style};
 use metrics::counter;
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     Resource,
     logs::SdkLoggerProvider,
@@ -35,22 +31,22 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
+use rustfs_config::observability::{ENV_OBS_LOG_FLUSH_MS, ENV_OBS_LOG_MESSAGE_CAPA, ENV_OBS_LOG_POOL_CAPA};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL,
-    SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    SAMPLE_RATIO, SERVICE_VERSION,
     observability::{
         DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
         ENV_OBS_LOG_DIRECTORY,
     },
 };
-use rustfs_utils::get_local_ip_with_default;
+use rustfs_utils::{get_env_u64, get_env_usize, get_local_ip_with_default};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::time::Duration;
 use std::{env, fs};
 use tracing::info;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -74,20 +70,19 @@ pub struct OtelGuard {
     meter_provider: Option<SdkMeterProvider>,
     logger_provider: Option<SdkLoggerProvider>,
     // Add a flexi_logger handle to keep the logging alive
-    _flexi_logger_handles: Option<flexi_logger::LoggerHandle>,
+    flexi_logger_handles: Option<flexi_logger::LoggerHandle>,
     // WorkerGuard for writing tracing files
-    _tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
-// Implement debug manually and avoid relying on all fields to implement debug
 impl std::fmt::Debug for OtelGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OtelGuard")
             .field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some())
-            .field("_flexi_logger_handles", &self._flexi_logger_handles.is_some())
-            .field("_tracing_guard", &self._tracing_guard.is_some())
+            .field("flexi_logger_handles", &self.flexi_logger_handles.is_some())
+            .field("tracing_guard", &self.tracing_guard.is_some())
             .finish()
     }
 }
@@ -110,8 +105,41 @@ impl Drop for OtelGuard {
                 eprintln!("Logger shutdown error: {err:?}");
             }
         }
+
+        if let Some(handle) = self.flexi_logger_handles.take() {
+            handle.shutdown();
+            println!("flexi_logger shutdown completed");
+        }
+
+        if let Some(guard) = self.tracing_guard.take() {
+            // The guard will be dropped here, flushing any remaining logs
+            drop(guard);
+            println!("Tracing guard dropped, flushing logs.");
+        }
     }
 }
+
+#[derive(Debug)]
+pub enum TelemetryError {
+    BuildSpanExporter(String),
+    BuildMetricExporter(String),
+    BuildLogExporter(String),
+    InstallMetricsRecorder(String),
+    SubscriberInit(String),
+}
+
+impl std::fmt::Display for TelemetryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TelemetryError::BuildSpanExporter(e) => write!(f, "Span exporter build failed: {e}"),
+            TelemetryError::BuildMetricExporter(e) => write!(f, "Metric exporter build failed: {e}"),
+            TelemetryError::BuildLogExporter(e) => write!(f, "Log exporter build failed: {e}"),
+            TelemetryError::InstallMetricsRecorder(e) => write!(f, "Install metrics recorder failed: {e}"),
+            TelemetryError::SubscriberInit(e) => write!(f, "Tracing subscriber init failed: {e}"),
+        }
+    }
+}
+impl std::error::Error for TelemetryError {}
 
 /// create OpenTelemetry Resource
 fn resource(config: &OtelConfig) -> Resource {
@@ -141,456 +169,17 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
         .build()
 }
 
-/// Initialize Telemetry
-pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
-    // avoid repeated access to configuration fields
-    let endpoint = &config.endpoint;
-    let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
-
-    // Environment-aware stdout configuration
-    // Check for explicit environment control via RUSTFS_OBS_ENVIRONMENT
-    let is_production = environment.to_lowercase() == DEFAULT_OBS_ENVIRONMENT_PRODUCTION;
-
-    // Default stdout behavior based on environment
-    let default_use_stdout = if is_production {
-        false // Disable stdout in production for security and log aggregation
-    } else {
-        USE_STDOUT // Use configured default for dev/test environments
-    };
-
-    let use_stdout = config.use_stdout.unwrap_or(default_use_stdout);
-    let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
-    let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
-    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
-
-    // Configure flexi_logger to cut by time and size
-    let mut flexi_logger_handle = None;
-    if !endpoint.is_empty() {
-        // Pre-create resource objects to avoid repeated construction
-        let res = resource(config);
-
-        // initialize tracer provider
-        let tracer_provider = {
-            let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
-            let sampler = if (0.0..1.0).contains(&sample_ratio) {
-                Sampler::TraceIdRatioBased(sample_ratio)
-            } else {
-                Sampler::AlwaysOn
-            };
-
-            let builder = SdkTracerProvider::builder()
-                .with_sampler(sampler)
-                .with_id_generator(RandomIdGenerator::default())
-                .with_resource(res.clone());
-
-            let tracer_provider = if endpoint.is_empty() {
-                builder
-                    .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
-                    .build()
-            } else {
-                let exporter = opentelemetry_otlp::SpanExporter::builder()
-                    .with_tonic()
-                    .with_endpoint(endpoint)
-                    .build()
-                    .unwrap();
-
-                let builder = if use_stdout {
-                    builder
-                        .with_batch_exporter(exporter)
-                        .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
-                } else {
-                    builder.with_batch_exporter(exporter)
-                };
-
-                builder.build()
-            };
-
-            global::set_tracer_provider(tracer_provider.clone());
-            tracer_provider
-        };
-
-        // initialize meter provider
-        let meter_provider = {
-            let mut builder = MeterProviderBuilder::default().with_resource(res.clone());
-
-            if endpoint.is_empty() {
-                builder = builder.with_reader(create_periodic_reader(meter_interval));
-            } else {
-                let exporter = opentelemetry_otlp::MetricExporter::builder()
-                    .with_tonic()
-                    .with_endpoint(endpoint)
-                    .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
-                    .build()
-                    .unwrap();
-
-                builder = builder.with_reader(
-                    PeriodicReader::builder(exporter)
-                        .with_interval(Duration::from_secs(meter_interval))
-                        .build(),
-                );
-
-                if use_stdout {
-                    builder = builder.with_reader(create_periodic_reader(meter_interval));
-                }
-            }
-
-            let meter_provider = builder.build();
-            global::set_meter_provider(meter_provider.clone());
-            meter_provider
-        };
-
-        match metrics_exporter_opentelemetry::Recorder::builder("order-service").install_global() {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Failed to set global metrics recorder: {e:?}");
-            }
-        }
-
-        // initialize logger provider
-        let logger_provider = {
-            let mut builder = SdkLoggerProvider::builder().with_resource(res);
-
-            if endpoint.is_empty() {
-                builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
-            } else {
-                let exporter = opentelemetry_otlp::LogExporter::builder()
-                    .with_tonic()
-                    .with_endpoint(endpoint)
-                    .build()
-                    .unwrap();
-
-                builder = builder.with_batch_exporter(exporter);
-
-                if use_stdout {
-                    builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
-                }
-            }
-
-            builder.build()
-        };
-
-        // configuring tracing
-        {
-            // configure the formatting layer
-            let fmt_layer = {
-                let enable_color = std::io::stdout().is_terminal();
-                let mut layer = tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime::rfc_3339())
-                    .with_target(true)
-                    .with_ansi(enable_color)
-                    .with_thread_names(true)
-                    .with_thread_ids(true)
-                    .with_file(true)
-                    .with_line_number(true)
-                    .json()
-                    .with_current_span(true)
-                    .with_span_list(true);
-                let span_event = if is_production {
-                    FmtSpan::CLOSE
-                } else {
-                    // Only add full span events tracking in the development environment
-                    FmtSpan::FULL
-                };
-
-                layer = layer.with_span_events(span_event);
-                layer.with_filter(build_env_filter(logger_level, None))
-            };
-
-            let filter = build_env_filter(logger_level, None);
-            let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(build_env_filter(logger_level, None));
-            let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
-
-            // Configure registry to avoid repeated calls to filter methods
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(ErrorLayer::default())
-                .with(if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
-                    Some(fmt_layer)
-                } else {
-                    None
-                })
-                .with(OpenTelemetryLayer::new(tracer))
-                .with(otel_layer)
-                .with(MetricsLayer::new(meter_provider.clone()))
-                .init();
-
-            if !endpoint.is_empty() {
-                info!(
-                    "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
-                    endpoint,
-                    logger_level,
-                    env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
-                );
-                IS_OBSERVABILITY_ENABLED.set(true).ok();
-            }
-        }
-        counter!("rustfs.start.total").increment(1);
-        return OtelGuard {
-            tracer_provider: Some(tracer_provider),
-            meter_provider: Some(meter_provider),
-            logger_provider: Some(logger_provider),
-            _flexi_logger_handles: flexi_logger_handle,
-            _tracing_guard: None,
-        };
-    }
-
-    // Obtain the log directory and file name configuration
-    let default_log_directory = rustfs_utils::dirs::get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY);
-    let log_directory = config.log_directory.as_deref().unwrap_or(default_log_directory.as_str());
-    let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
-
-    // Enhanced error handling for directory creation
-    if let Err(e) = fs::create_dir_all(log_directory) {
-        eprintln!("ERROR: Failed to create log directory '{log_directory}': {e}");
-        eprintln!("Ensure the parent directory exists and you have write permissions.");
-        eprintln!("Attempting to continue with logging, but file logging may fail.");
-    } else {
-        eprintln!("Log directory ready: {log_directory}");
-    }
-
-    #[cfg(unix)]
-    {
-        // Linux/macOS Setting Permissions with better error handling
-        use std::fs::Permissions;
-        use std::os::unix::fs::PermissionsExt;
-        match fs::set_permissions(log_directory, Permissions::from_mode(0o755)) {
-            Ok(_) => eprintln!("Log directory permissions set to 755: {log_directory}"),
-            Err(e) => {
-                eprintln!("WARNING: Failed to set log directory permissions for '{log_directory}': {e}");
-                eprintln!("This may affect log file access. Consider checking directory ownership and permissions.");
-            }
-        }
-    }
-
-    if endpoint.is_empty() && !is_production {
-        // Create a file appender (rolling by day), add the -tracing suffix to the file name to avoid conflicts
-        // let file_appender = tracing_appender::rolling::hourly(log_directory, format!("{log_filename}-tracing.log"));
-        let file_appender = RollingFileAppender::builder()
-            .rotation(Rotation::HOURLY) // rotate log files once every hour
-            .filename_prefix(format!("{log_filename}-tracing")) // log file names will be prefixed with `myapp.`
-            .filename_suffix("log") // log file names will be suffixed with `.log`
-            .build(log_directory) // try to build an appender that stores log files in `/var/log`
-            .expect("initializing rolling file appender failed");
-        let (nb_writer, guard) = tracing_appender::non_blocking(file_appender);
-
-        let enable_color = std::io::stdout().is_terminal();
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_timer(LocalTime::rfc_3339())
-            .with_target(true)
-            .with_ansi(enable_color)
-            .with_thread_names(true)
-            .with_thread_ids(true)
-            .with_file(true)
-            .with_line_number(true)
-            .with_writer(nb_writer) // Specify writing file
-            .json()
-            .with_current_span(true)
-            .with_span_list(true)
-            .with_span_events(FmtSpan::CLOSE); // Log span lifecycle events, including trace_id
-
-        let env_filter = build_env_filter(logger_level, None);
-
-        // Use registry() to register fmt_layer directly to ensure trace_id is output to the log
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(ErrorLayer::default())
-            .with(fmt_layer)
-            .with(if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
-                let stdout_fmt_layer = tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime::rfc_3339())
-                    .with_target(true)
-                    .with_thread_names(true)
-                    .with_thread_ids(true)
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_writer(std::io::stdout) // Specify writing file
-                    .json()
-                    .with_current_span(true)
-                    .with_span_list(true)
-                    .with_span_events(FmtSpan::CLOSE); // Log span lifecycle events, including trace_id;
-                Some(stdout_fmt_layer)
-            } else {
-                None
-            })
-            .init();
-
-        info!("Tracing telemetry initialized for non-production with trace_id logging.");
-        IS_OBSERVABILITY_ENABLED.set(false).ok();
-
-        return OtelGuard {
-            tracer_provider: None,
-            meter_provider: None,
-            logger_provider: None,
-            _flexi_logger_handles: None,
-            _tracing_guard: Some(guard),
-        };
-    }
-
-    // Build log cutting conditions
-    let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
-        // Cut by time and size at the same time
-        (Some(time), Some(size)) => {
-            let age = match time.to_lowercase().as_str() {
-                "hour" => Age::Hour,
-                "day" => Age::Day,
-                "minute" => Age::Minute,
-                "second" => Age::Second,
-                _ => Age::Day, // The default is by day
-            };
-            Criterion::AgeOrSize(age, size * 1024 * 1024) // Convert to bytes
-        }
-        // Cut by time only
-        (Some(time), None) => {
-            let age = match time.to_lowercase().as_str() {
-                "hour" => Age::Hour,
-                "day" => Age::Day,
-                "minute" => Age::Minute,
-                "second" => Age::Second,
-                _ => Age::Day, // The default is by day
-            };
-            Criterion::Age(age)
-        }
-        // Cut by size only
-        (None, Some(size)) => {
-            Criterion::Size(size * 1024 * 1024) // Convert to bytes
-        }
-        // By default, it is cut by the day
-        _ => Criterion::Age(Age::Day),
-    };
-
-    // The number of log files retained
-    let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
-
-    // Parsing the log level
-    let log_spec = LogSpecification::parse(logger_level).unwrap_or_else(|e| {
-        eprintln!("WARNING: Invalid logger level '{logger_level}': {e}. Using default 'info' level.");
-        LogSpecification::info()
-    });
-
-    // Environment-aware stdout configuration
-    // In production: disable stdout completely (Duplicate::None)
-    // In development/test: use level-based filtering
-    let level_filter = if is_production {
-        flexi_logger::Duplicate::None // No stdout output in production
-    } else {
-        // Convert the logger_level string to the corresponding LevelFilter for dev/test
-        match logger_level.to_lowercase().as_str() {
-            "trace" => flexi_logger::Duplicate::Trace,
-            "debug" => flexi_logger::Duplicate::Debug,
-            "info" => flexi_logger::Duplicate::Info,
-            "warn" | "warning" => flexi_logger::Duplicate::Warn,
-            "error" => flexi_logger::Duplicate::Error,
-            "off" => flexi_logger::Duplicate::None,
-            _ => flexi_logger::Duplicate::Info, // the default is info
-        }
-    };
-
-    // Choose write mode based on environment
-    let write_mode = if is_production {
-        get_env_async_with().unwrap_or_else(|| {
-            eprintln!(
-                "Using default Async write mode in production. To customize, set RUSTFS_OBS_LOG_POOL_CAPA, RUSTFS_OBS_LOG_MESSAGE_CAPA, and RUSTFS_OBS_LOG_FLUSH_MS environment variables."
-            );
-            AsyncWith {
-                pool_capa: DEFAULT_OBS_LOG_POOL_CAPA,
-                message_capa: DEFAULT_OBS_LOG_MESSAGE_CAPA,
-                flush_interval: Duration::from_millis(DEFAULT_OBS_LOG_FLUSH_MS),
-            }
-        })
-    } else {
-        BufferAndFlush
-    };
-
-    // Configure the flexi_logger with enhanced error handling
-    let mut flexi_logger_builder = flexi_logger::Logger::try_with_env_or_str(logger_level)
-        .unwrap_or_else(|e| {
-            eprintln!("WARNING: Invalid logger configuration '{logger_level}': {e:?}");
-            eprintln!("Falling back to default configuration with level: {DEFAULT_LOG_LEVEL}");
-            flexi_logger::Logger::with(log_spec.clone())
-        })
-        .log_to_file(
-            FileSpec::default()
-                .directory(log_directory)
-                .basename(log_filename)
-                .suppress_timestamp(),
-        )
-        .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files.into()))
-        .format_for_files(format_for_file) // Add a custom formatting function for file output
-        .write_mode(write_mode)
-        .append(); // Avoid clearing existing logs at startup
-
-    // Environment-aware stdout configuration
-    flexi_logger_builder = flexi_logger_builder.duplicate_to_stdout(level_filter);
-    // Only add stdout formatting and startup messages in non-production environments
-    if !is_production {
-        flexi_logger_builder = flexi_logger_builder
-            .format_for_stdout(format_with_color) // Add a custom formatting function for terminal output
-            .print_message(); // Startup information output to console
-    }
-
-    let flexi_logger_result = flexi_logger_builder.start();
-
-    if let Ok(logger) = flexi_logger_result {
-        // Save the logger handle to keep the logging
-        flexi_logger_handle = Some(logger);
-
-        // Environment-aware success messages
-        if is_production {
-            eprintln!("Production logging initialized: file-only mode to {log_directory}/{log_filename}.log");
-            eprintln!("Stdout logging disabled in production environment for security and log aggregation.");
-        } else {
-            eprintln!("Development/Test logging initialized with file logging to {log_directory}/{log_filename}.log");
-            eprintln!("Stdout logging enabled for debugging. Environment: {environment}");
-        }
-
-        // Log rotation configuration details
-        match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
-            (Some(time), Some(size)) => {
-                eprintln!("Log rotation configured for: every {time} or when size exceeds {size}MB, keeping {keep_files} files")
-            }
-            (Some(time), None) => eprintln!("Log rotation configured for: every {time}, keeping {keep_files} files"),
-            (None, Some(size)) => {
-                eprintln!("Log rotation configured for: when size exceeds {size}MB, keeping {keep_files} files")
-            }
-            _ => eprintln!("Log rotation configured for: daily, keeping {keep_files} files"),
-        }
-    } else {
-        eprintln!("CRITICAL: Failed to initialize flexi_logger: {:?}", flexi_logger_result.err());
-        eprintln!("Possible causes:");
-        eprintln!("  1. Insufficient permissions to write to log directory: {log_directory}");
-        eprintln!("  2. Log directory does not exist or is not accessible");
-        eprintln!("  3. Invalid log configuration parameters");
-        eprintln!("  4. Disk space issues");
-        eprintln!("Application will continue but logging to files will not work properly.");
-    }
-
-    OtelGuard {
-        tracer_provider: None,
-        meter_provider: None,
-        logger_provider: None,
-        _flexi_logger_handles: flexi_logger_handle,
-        _tracing_guard: None,
-    }
-}
-
 // Read the AsyncWith parameter from the environment variable
 fn get_env_async_with() -> Option<WriteMode> {
-    let pool_capa = env::var("RUSTFS_OBS_LOG_POOL_CAPA")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let message_capa = env::var("RUSTFS_OBS_LOG_MESSAGE_CAPA")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let flush_ms = env::var("RUSTFS_OBS_LOG_FLUSH_MS").ok().and_then(|v| v.parse::<u64>().ok());
+    let pool_capa = get_env_usize(ENV_OBS_LOG_POOL_CAPA, DEFAULT_OBS_LOG_POOL_CAPA);
+    let message_capa = get_env_usize(ENV_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_MESSAGE_CAPA);
+    let flush_ms = get_env_u64(ENV_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_FLUSH_MS);
 
-    match (pool_capa, message_capa, flush_ms) {
-        (Some(pool), Some(msg), Some(flush)) => Some(AsyncWith {
-            pool_capa: pool,
-            message_capa: msg,
-            flush_interval: Duration::from_millis(flush),
-        }),
-        _ => None,
-    }
+    Some(AsyncWith {
+        pool_capa,
+        message_capa,
+        flush_interval: Duration::from_millis(flush_ms),
+    })
 }
 
 fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
@@ -655,9 +244,339 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
     )
 }
 
+/// stdout + span information (fix: retain WorkerGuard to avoid releasing after initialization)
+fn init_stdout_logging(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+    let env_filter = build_env_filter(logger_level, None);
+
+    let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
+
+    let enable_color = std::io::stdout().is_terminal();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_timer(LocalTime::rfc_3339())
+        .with_target(true)
+        .with_ansi(enable_color)
+        .with_thread_names(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_writer(nb)
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_span_events(if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL });
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(ErrorLayer::default())
+        .with(fmt_layer)
+        .init();
+
+    IS_OBSERVABILITY_ENABLED.set(false).ok();
+    counter!("rustfs.start.total").increment(1);
+    info!("Init stdout logging (level: {})", logger_level);
+
+    OtelGuard {
+        tracer_provider: None,
+        meter_provider: None,
+        logger_provider: None,
+        flexi_logger_handles: None,
+        tracing_guard: Some(guard),
+    }
+}
+
+/// File rolling log (size switching + number retained)
+fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+    use flexi_logger::{
+        Age, Cleanup, Criterion, FileSpec, LogSpecification, Naming,
+        WriteMode::{AsyncWith, BufferAndFlush},
+    };
+
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
+    let default_log_directory = rustfs_utils::dirs::get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY);
+    let log_directory = config.log_directory.as_deref().unwrap_or(default_log_directory.as_str());
+    let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
+    let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
+
+    if let Err(e) = fs::create_dir_all(log_directory) {
+        eprintln!("ERROR: create log dir '{}': {e}", log_directory);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(log_directory, Permissions::from_mode(0o755));
+    }
+
+    // parsing level
+    let log_spec = LogSpecification::parse(logger_level)
+        .unwrap_or_else(|_| LogSpecification::parse(DEFAULT_LOG_LEVEL).unwrap_or(LogSpecification::error()));
+
+    // Switch by size (MB), Build log cutting conditions
+    let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
+        // Cut by time and size at the same time
+        (Some(time), Some(size)) => {
+            let age = match time.to_lowercase().as_str() {
+                "hour" => Age::Hour,
+                "day" => Age::Day,
+                "minute" => Age::Minute,
+                "second" => Age::Second,
+                _ => Age::Day, // The default is by day
+            };
+            Criterion::AgeOrSize(age, size * 1024 * 1024) // Convert to bytes
+        }
+        // Cut by time only
+        (Some(time), None) => {
+            let age = match time.to_lowercase().as_str() {
+                "hour" => Age::Hour,
+                "day" => Age::Day,
+                "minute" => Age::Minute,
+                "second" => Age::Second,
+                _ => Age::Day, // The default is by day
+            };
+            Criterion::Age(age)
+        }
+        // Cut by size only
+        (None, Some(size)) => {
+            Criterion::Size(size * 1024 * 1024) // Convert to bytes
+        }
+        // By default, it is cut by the day
+        _ => Criterion::Age(Age::Day),
+    };
+
+    // write mode
+    let write_mode = get_env_async_with().unwrap_or(if is_production {
+        AsyncWith {
+            pool_capa: DEFAULT_OBS_LOG_POOL_CAPA,
+            message_capa: DEFAULT_OBS_LOG_MESSAGE_CAPA,
+            flush_interval: Duration::from_millis(DEFAULT_OBS_LOG_FLUSH_MS),
+        }
+    } else {
+        BufferAndFlush
+    });
+
+    // Build
+    let mut builder = flexi_logger::Logger::try_with_env_or_str(logger_level)
+        .unwrap_or_else(|e| {
+            eprintln!("WARNING: Invalid logger configuration '{logger_level}': {e:?}");
+            eprintln!("Falling back to default configuration with level: {DEFAULT_LOG_LEVEL}");
+            flexi_logger::Logger::with(log_spec.clone())
+        })
+        .format_for_stderr(format_with_color)
+        .format_for_files(format_for_file)
+        .log_to_file(
+            FileSpec::default()
+                .directory(log_directory)
+                .basename(log_filename)
+                .suppress_timestamp(),
+        )
+        .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files))
+        .write_mode(write_mode);
+
+    // Optional copy to stdout (for local observation)
+    if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
+        builder = builder.duplicate_to_stdout(flexi_logger::Duplicate::All);
+    } else {
+        builder = builder.duplicate_to_stdout(flexi_logger::Duplicate::None);
+    }
+
+    let handle = match builder.start() {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("ERROR: start flexi_logger failed: {e}");
+            None
+        }
+    };
+
+    IS_OBSERVABILITY_ENABLED.set(false).ok();
+    counter!("rustfs.start.total").increment(1);
+    info!(
+        "Init file logging at '{}', roll size {:?}MB, keep {}",
+        log_directory, config.log_rotation_size_mb, keep_files
+    );
+
+    OtelGuard {
+        tracer_provider: None,
+        meter_provider: None,
+        logger_provider: None,
+        flexi_logger_handles: handle,
+        tracing_guard: None,
+    }
+}
+
+/// Observability (HTTP export, supports three sub-endpoints; if not, fallback to unified endpoint)
+fn init_observability_http(config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
+    // Resources and sampling
+    let res = resource(config);
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
+    let use_stdout = config.use_stdout.unwrap_or(!is_production);
+    let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
+    let sampler = if (0.0..1.0).contains(&sample_ratio) {
+        Sampler::TraceIdRatioBased(sample_ratio)
+    } else {
+        Sampler::AlwaysOn
+    };
+
+    // Endpoint
+    let root_ep = config.endpoint.as_str();
+    let trace_ep = config.trace_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
+    let metric_ep = config.metric_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
+    let log_ep = config.log_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
+
+    // Tracer（HTTP）
+    let tracer_provider = {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(trace_ep)
+            .with_protocol(Protocol::HttpBinary)
+            .with_compression(Compression::Zstd)
+            .build()
+            .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
+
+        let mut builder = SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_id_generator(RandomIdGenerator::default())
+            .with_resource(res.clone())
+            .with_batch_exporter(exporter);
+
+        if use_stdout {
+            builder = builder.with_batch_exporter(opentelemetry_stdout::SpanExporter::default());
+        }
+
+        let provider = builder.build();
+        global::set_tracer_provider(provider.clone());
+        provider
+    };
+
+    // Meter（HTTP）
+    let meter_provider = {
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(metric_ep)
+            .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
+            .with_protocol(Protocol::HttpBinary)
+            .with_compression(Compression::Zstd)
+            .build()
+            .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
+        let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+        let mut builder = MeterProviderBuilder::default().with_resource(res.clone());
+        builder = builder.with_reader(
+            PeriodicReader::builder(exporter)
+                .with_interval(Duration::from_secs(meter_interval))
+                .build(),
+        );
+        if use_stdout {
+            builder = builder.with_reader(create_periodic_reader(meter_interval));
+        }
+
+        let provider = builder.build();
+        global::set_meter_provider(provider.clone());
+        provider
+    };
+
+    // metrics crate -> OTel
+    let _ = metrics_exporter_opentelemetry::Recorder::builder(service_name.clone()).install_global();
+
+    // Logger（HTTP）
+    let logger_provider = {
+        let exporter = opentelemetry_otlp::LogExporter::builder()
+            .with_http()
+            .with_endpoint(log_ep)
+            .with_protocol(Protocol::HttpBinary)
+            .with_compression(Compression::Zstd)
+            .build()
+            .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
+
+        let mut builder = SdkLoggerProvider::builder().with_resource(res);
+        builder = builder.with_batch_exporter(exporter);
+        if use_stdout {
+            builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+        }
+        builder.build()
+    };
+
+    // Tracing layer
+    let fmt_layer_opt = {
+        if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
+            let enable_color = std::io::stdout().is_terminal();
+            let mut layer = tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime::rfc_3339())
+                .with_target(true)
+                .with_ansi(enable_color)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true)
+                .json()
+                .with_current_span(true)
+                .with_span_list(true);
+            let span_event = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+            layer = layer.with_span_events(span_event);
+            Some(layer.with_filter(build_env_filter(logger_level, None)))
+        } else {
+            None
+        }
+    };
+
+    let filter = build_env_filter(logger_level, None);
+    let otel_bridge = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(build_env_filter(logger_level, None));
+    let tracer = tracer_provider.tracer(service_name.to_string());
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(ErrorLayer::default())
+        .with(fmt_layer_opt)
+        .with(OpenTelemetryLayer::new(tracer))
+        .with(otel_bridge)
+        .with(MetricsLayer::new(meter_provider.clone()))
+        .init();
+
+    IS_OBSERVABILITY_ENABLED.set(true).ok();
+    counter!("rustfs.start.total").increment(1);
+    info!(
+        "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
+        trace_ep, metric_ep, log_ep
+    );
+
+    Ok(OtelGuard {
+        tracer_provider: Some(tracer_provider),
+        meter_provider: Some(meter_provider),
+        logger_provider: Some(logger_provider),
+        flexi_logger_handles: None,
+        tracing_guard: None,
+    })
+}
+
+/// Initialize Telemetry,Entrance: three rules
+pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, TelemetryError> {
+    let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
+    let is_production = environment.eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION);
+    let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
+
+    // Rule 3: Observability (any endpoint is enabled if it is not empty)
+    let has_obs = !config.endpoint.is_empty()
+        || config.trace_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        || config.metric_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        || config.log_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+
+    if has_obs {
+        return init_observability_http(config, logger_level, is_production);
+    }
+
+    // Rule 2: The user has explicitly customized the log directory (determined by whether ENV_OBS_LOG_DIRECTORY is set)
+    let user_set_log_dir = env::var(ENV_OBS_LOG_DIRECTORY).is_ok();
+    if user_set_log_dir {
+        return Ok(init_file_logging(config, logger_level, is_production));
+    }
+
+    // Rule 1: Default stdout (error level)
+    Ok(init_stdout_logging(config, DEFAULT_LOG_LEVEL, is_production))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::USE_STDOUT;
 
     #[test]
     fn test_production_environment_detection() {

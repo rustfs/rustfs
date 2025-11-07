@@ -129,13 +129,13 @@ flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
 prost = "0.14.1"
 quick-xml = "0.38.3"
-rmcp = { version = "0.8.4" }
+rmcp = { version = "0.8.5" }
 rmp = { version = "0.8.14" }
 rmp-serde = { version = "1.3.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
-schemars = "1.0.5"
+schemars = "1.1.0"
 
 # Cryptography and Security
 aes-gcm = { version = "0.10.3", features = ["std"] }
@@ -147,7 +147,7 @@ crc32c = "0.6.8"
 crc32fast = "1.5.0"
 crc64fast-nvme = "1.2.0"
 hmac = "0.12.1"
-jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 pbkdf2 = "0.12.2"
 rsa = { version = "0.9.8" }
 rustls = { version = "0.23.35", features = ["ring", "logging", "std", "tls12"], default-features = false }
@@ -169,8 +169,8 @@ astral-tokio-tar = "0.5.6"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.10" }
-aws-credential-types = { version = "1.2.8" }
-aws-sdk-s3 = { version = "1.110.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
+aws-credential-types = { version = "1.2.9" }
+aws-sdk-s3 = { version = "1.112.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
 aws-smithy-types = { version = "1.3.4" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -178,7 +178,7 @@ brotli = "8.0.2"
 cfg-if = "1.0.4"
 clap = { version = "4.5.51", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
-convert_case = "0.8.0"
+convert_case = "0.9.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "50.3.0"
@@ -253,7 +253,7 @@ urlencoding = "2.1.3"
 uuid = { version = "1.18.1", features = ["v4", "fast-rng", "macro-diagnostics"] }
 vaultrs = { version = "0.7.4" }
 walkdir = "2.5.0"
-wildmatch = { version = "2.5.0", features = ["serde"] }
+wildmatch = { version = "2.6.0", features = ["serde"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 zip = "6.0.0"
@@ -262,7 +262,7 @@ zstd = "0.13.3"
 # Observability and Metrics
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
-opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["http-proto", "zstd-http"] }
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }

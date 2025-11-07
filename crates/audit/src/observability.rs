@@ -21,11 +21,46 @@
 //! - Error rate monitoring
 //! - Queue depth monitoring
 
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::info;
+
+const RUSTFS_AUDIT_METRICS_NAMESPACE: &str = "rustfs.audit.";
+
+const M_AUDIT_EVENTS_TOTAL: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "events.total");
+const M_AUDIT_EVENTS_FAILED: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "events.failed");
+const M_AUDIT_DISPATCH_NS: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "dispatch.ns");
+const M_AUDIT_EPS: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "eps");
+const M_AUDIT_TARGET_OPS: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "target.ops");
+const M_AUDIT_CONFIG_RELOADS: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "config.reloads");
+const M_AUDIT_SYSTEM_STARTS: &str = const_str::concat!(RUSTFS_AUDIT_METRICS_NAMESPACE, "system.starts");
+
+const L_RESULT: &str = "result";
+const L_STATUS: &str = "status";
+
+const V_SUCCESS: &str = "success";
+const V_FAILURE: &str = "failure";
+
+/// One-time registration of indicator meta information
+/// This function ensures that metric descriptors are registered only once.
+pub fn init_observability_metrics() {
+    static METRICS_DESC_INIT: OnceLock<()> = OnceLock::new();
+    METRICS_DESC_INIT.get_or_init(|| {
+        // Event/Time-consuming
+        describe_counter!(M_AUDIT_EVENTS_TOTAL, "Total audit events (labeled by result).");
+        describe_counter!(M_AUDIT_EVENTS_FAILED, "Total failed audit events.");
+        describe_histogram!(M_AUDIT_DISPATCH_NS, "Dispatch time per event (ns).");
+        describe_gauge!(M_AUDIT_EPS, "Events per second since last reset.");
+
+        // Target operation/system event
+        describe_counter!(M_AUDIT_TARGET_OPS, "Total target operations (labeled by status).");
+        describe_counter!(M_AUDIT_CONFIG_RELOADS, "Total configuration reloads.");
+        describe_counter!(M_AUDIT_SYSTEM_STARTS, "Total system starts.");
+    });
+}
 
 /// Metrics collector for audit system observability
 #[derive(Debug)]
@@ -56,6 +91,7 @@ impl Default for AuditMetrics {
 impl AuditMetrics {
     /// Creates a new metrics collector
     pub fn new() -> Self {
+        init_observability_metrics();
         Self {
             total_events_processed: AtomicU64::new(0),
             total_events_failed: AtomicU64::new(0),
@@ -68,11 +104,28 @@ impl AuditMetrics {
         }
     }
 
+    // Suggestion: Call this auxiliary function in the existing "Successful Event Recording" method body to complete the instrumentation
+    #[inline]
+    fn emit_event_success_metrics(&self, dispatch_time: Duration) {
+        // count + histogram
+        counter!(M_AUDIT_EVENTS_TOTAL, L_RESULT => V_SUCCESS).increment(1);
+        histogram!(M_AUDIT_DISPATCH_NS).record(dispatch_time.as_nanos() as f64);
+    }
+
+    // Suggestion: Call this auxiliary function in the existing "Failure Event Recording" method body to complete the instrumentation
+    #[inline]
+    fn emit_event_failure_metrics(&self, dispatch_time: Duration) {
+        counter!(M_AUDIT_EVENTS_TOTAL, L_RESULT => V_FAILURE).increment(1);
+        counter!(M_AUDIT_EVENTS_FAILED).increment(1);
+        histogram!(M_AUDIT_DISPATCH_NS).record(dispatch_time.as_nanos() as f64);
+    }
+
     /// Records a successful event dispatch
     pub fn record_event_success(&self, dispatch_time: Duration) {
         self.total_events_processed.fetch_add(1, Ordering::Relaxed);
         self.total_dispatch_time_ns
             .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
+        self.emit_event_success_metrics(dispatch_time);
     }
 
     /// Records a failed event dispatch
@@ -80,27 +133,32 @@ impl AuditMetrics {
         self.total_events_failed.fetch_add(1, Ordering::Relaxed);
         self.total_dispatch_time_ns
             .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
+        self.emit_event_failure_metrics(dispatch_time);
     }
 
     /// Records a successful target operation
     pub fn record_target_success(&self) {
         self.target_success_count.fetch_add(1, Ordering::Relaxed);
+        counter!(M_AUDIT_TARGET_OPS, L_STATUS => V_SUCCESS).increment(1);
     }
 
     /// Records a failed target operation
     pub fn record_target_failure(&self) {
         self.target_failure_count.fetch_add(1, Ordering::Relaxed);
+        counter!(M_AUDIT_TARGET_OPS, L_STATUS => V_FAILURE).increment(1);
     }
 
     /// Records a configuration reload
     pub fn record_config_reload(&self) {
         self.config_reload_count.fetch_add(1, Ordering::Relaxed);
+        counter!(M_AUDIT_CONFIG_RELOADS).increment(1);
         info!("Audit configuration reloaded");
     }
 
     /// Records a system start
     pub fn record_system_start(&self) {
         self.system_start_count.fetch_add(1, Ordering::Relaxed);
+        counter!(M_AUDIT_SYSTEM_STARTS).increment(1);
         info!("Audit system started");
     }
 
@@ -110,11 +168,14 @@ impl AuditMetrics {
         let elapsed = reset_time.elapsed();
         let total_events = self.total_events_processed.load(Ordering::Relaxed) + self.total_events_failed.load(Ordering::Relaxed);
 
-        if elapsed.as_secs_f64() > 0.0 {
+        let eps = if elapsed.as_secs_f64() > 0.0 {
             total_events as f64 / elapsed.as_secs_f64()
         } else {
             0.0
-        }
+        };
+        // EPS is reported in gauge
+        gauge!(M_AUDIT_EPS).set(eps);
+        eps
     }
 
     /// Gets the average dispatch latency in milliseconds
@@ -166,6 +227,8 @@ impl AuditMetrics {
         let mut reset_time = self.last_reset_time.write().await;
         *reset_time = Instant::now();
 
+        // Reset EPS to zero after reset
+        gauge!(M_AUDIT_EPS).set(0.0);
         info!("Audit metrics reset");
     }
 

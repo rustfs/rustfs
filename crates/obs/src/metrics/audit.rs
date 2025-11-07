@@ -17,10 +17,15 @@
 /// audit related metric descriptors
 ///
 /// This module contains the metric descriptors for the audit subsystem.
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 const TARGET_ID: &str = "target_id";
+pub const RESULT: &str = "result"; // success / failure
+pub const STATUS: &str = "status"; // success / failure
+
+pub const SUCCESS: &str = "success";
+pub const FAILURE: &str = "failure";
 
 pub static AUDIT_FAILED_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(

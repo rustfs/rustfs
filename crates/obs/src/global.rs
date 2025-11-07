@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::telemetry::{OtelGuard, init_telemetry};
-use crate::{AppConfig, SystemObserver};
+use crate::{AppConfig, OtelGuard, SystemObserver, TelemetryError, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
@@ -52,6 +51,8 @@ pub enum GlobalError {
     SendFailed(&'static str),
     #[error("Operation timed out: {0}")]
     Timeout(&'static str),
+    #[error("Telemetry initialization failed: {0}")]
+    TelemetryError(#[from] TelemetryError),
 }
 
 /// Initialize the observability module
@@ -68,14 +69,17 @@ pub enum GlobalError {
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// #    let guard = init_obs(None).await;
+/// #    match init_obs(None).await {
+/// #         Ok(guard) => {}
+/// #         Err(e) => { eprintln!("Failed to initialize observability: {}", e); }
+/// #     }
 /// # }
 /// ```
-pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
+pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError> {
     // Load the configuration file
     let config = AppConfig::new_with_endpoint(endpoint);
 
-    let otel_guard = init_telemetry(&config.observability);
+    let otel_guard = init_telemetry(&config.observability)?;
     // Server will be created per connection - this ensures isolation
     tokio::spawn(async move {
         // Record the PID-related metrics of the current process
@@ -90,7 +94,7 @@ pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
         }
     });
 
-    otel_guard
+    Ok(otel_guard)
 }
 
 /// Set the global guard for OpenTelemetry
@@ -107,7 +111,10 @@ pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
 /// # use rustfs_obs::{ init_obs, set_global_guard};
 ///
 /// # async fn init() -> Result<(), Box<dyn std::error::Error>> {
-/// #    let guard = init_obs(None).await;
+/// #    let guard = match init_obs(None).await{
+/// #         Ok(g) => g,
+/// #         Err(e) => { return Err(Box::new(e)); }
+/// #    };
 /// #    set_global_guard(guard)?;
 /// #    Ok(())
 /// # }

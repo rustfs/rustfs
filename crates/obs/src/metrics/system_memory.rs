@@ -20,7 +20,7 @@
 /// These descriptors are initialized lazily using `std::sync::LazyLock` to ensure
 /// they are only created when actually needed, improving performance and reducing
 /// startup overhead.
-use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 /// Total memory available on the node

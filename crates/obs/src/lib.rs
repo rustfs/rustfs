@@ -38,7 +38,19 @@
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// #   let guard = init_obs(None).await;
+/// #   let _guard = match init_obs(None).await {
+/// #         Ok(g) => g,
+/// #         Err(e) => {
+/// #             panic!("Failed to initialize observability: {:?}", e);
+/// #         }
+/// #     };
+/// #   // Application logic here
+/// #   {
+/// #       // Simulate some work
+/// #       tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+/// #       println!("Application is running...");
+/// #   }
+/// #   // Guard will be dropped here, flushing telemetry data
 /// # }
 /// ```
 mod config;
@@ -49,4 +61,6 @@ mod telemetry;
 
 pub use config::{AppConfig, OtelConfig};
 pub use global::*;
+pub use metrics::*;
 pub use system::SystemObserver;
+pub use telemetry::{OtelGuard, TelemetryError};

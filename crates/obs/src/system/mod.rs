@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::{GlobalError, is_observability_enabled};
-use opentelemetry::global::meter;
+use opentelemetry::{global::meter, metrics::Meter};
+use sysinfo::Pid;
 
 mod attributes;
 mod collector;
@@ -30,7 +31,8 @@ impl SystemObserver {
     pub async fn init_process_observer() -> Result<(), GlobalError> {
         if is_observability_enabled() {
             let meter = meter("system");
-            return SystemObserver::init_process_observer_for_pid(meter, 30000).await;
+            let pid = sysinfo::get_current_pid().map_err(|e| GlobalError::PidError(e.to_string()))?;
+            return SystemObserver::init_process_observer_for_pid(meter, pid).await;
         }
         Ok(())
     }
@@ -38,9 +40,12 @@ impl SystemObserver {
     /// Initialize the metric collector for the specified PID process
     /// This function will create a new `Collector` instance and start collecting metrics.
     /// It will run indefinitely until the process is terminated.
-    pub async fn init_process_observer_for_pid(meter: opentelemetry::metrics::Meter, pid: u32) -> Result<(), GlobalError> {
-        let pid = sysinfo::Pid::from_u32(pid);
-        let mut collector = collector::Collector::new(pid, meter, 30000)?;
+    pub async fn init_process_observer_for_pid(meter: Meter, pid: Pid) -> Result<(), GlobalError> {
+        let interval_ms = rustfs_utils::get_env_u64(
+            rustfs_config::observability::ENV_OBS_METRICS_SYSTEM_INTERVAL_MS,
+            rustfs_config::observability::DEFAULT_METRICS_SYSTEM_INTERVAL_MS,
+        );
+        let mut collector = collector::Collector::new(pid, meter, interval_ms)?;
         collector.run().await
     }
 }

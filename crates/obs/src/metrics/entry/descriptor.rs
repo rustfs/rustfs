@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::metrics::{MetricName, MetricNamespace, MetricSubsystem, MetricType};
+use crate::{MetricName, MetricNamespace, MetricSubsystem, MetricType};
 use std::collections::HashSet;
 
 /// MetricDescriptor - Metric descriptors

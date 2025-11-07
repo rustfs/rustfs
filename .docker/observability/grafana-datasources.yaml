@@ -30,3 +30,79 @@ datasources:
         datasourceUid: prometheus
       streamingEnabled:
         search: true
+      tracesToLogsV2:
+        # Field with an internal link pointing to a logs data source in Grafana.
+        # datasourceUid value must match the uid value of the logs data source.
+        datasourceUid: 'loki'
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        tags: [ 'job', 'instance', 'pod', 'namespace' ]
+        filterByTraceID: false
+        filterBySpanID: false
+        customQuery: true
+        query: 'method="$${__span.tags.method}"'
+        tracesToMetrics:
+          datasourceUid: 'prom'
+          spanStartTimeShift: '-1h'
+          spanEndTimeShift: '1h'
+          tags: [ { key: 'service.name', value: 'service' }, { key: 'job' } ]
+          queries:
+            - name: 'Sample query'
+              query: 'sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m]))'
+        tracesToProfiles:
+          datasourceUid: 'grafana-pyroscope-datasource'
+          tags: [ 'job', 'instance', 'pod', 'namespace' ]
+          profileTypeId: 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
+          customQuery: true
+          query: 'method="$${__span.tags.method}"'
+        serviceMap:
+          datasourceUid: 'prometheus'
+        nodeGraph:
+          enabled: true
+        search:
+          hide: false
+        traceQuery:
+          timeShiftEnabled: true
+          spanStartTimeShift: '-1h'
+          spanEndTimeShift: '1h'
+        spanBar:
+          type: 'Tag'
+          tag: 'http.path'
+        streamingEnabled:
+          search: true
+  - name: Jaeger
+    type: jaeger
+    uid: Jaeger
+    url: http://jaeger:16686
+    basicAuth: false
+    access: proxy
+    readOnly: false
+    isDefault: false
+    jsonData:
+      tracesToLogsV2:
+        # Field with an internal link pointing to a logs data source in Grafana.
+        # datasourceUid value must match the uid value of the logs data source.
+        datasourceUid: 'loki'
+        spanStartTimeShift: '1h'
+        spanEndTimeShift: '-1h'
+        tags: [ 'job', 'instance', 'pod', 'namespace' ]
+        filterByTraceID: false
+        filterBySpanID: false
+        customQuery: true
+        query: 'method="$${__span.tags.method}"'
+      tracesToMetrics:
+        datasourceUid: 'prom'
+        spanStartTimeShift: '1h'
+        spanEndTimeShift: '-1h'
+        tags: [ { key: 'service.name', value: 'service' }, { key: 'job' } ]
+        queries:
+          - name: 'Sample query'
+            query: 'sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m]))'
+      nodeGraph:
+        enabled: true
+      traceQuery:
+        timeShiftEnabled: true
+        spanStartTimeShift: '1h'
+        spanEndTimeShift: '-1h'
+      spanBar:
+        type: 'None'

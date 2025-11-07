@@ -89,7 +89,6 @@ const LOGO: &str = r#"
 #[instrument]
 fn print_server_info() {
     let current_year = chrono::Utc::now().year();
-
     // Use custom macros to print server information
     info!("RustFS Object Storage Server");
     info!("Copyright: 2024-{} RustFS, Inc", current_year);
@@ -112,10 +111,13 @@ async fn async_main() -> Result<()> {
     init_license(opt.license.clone());
 
     // Initialize Observability
-    let guard = init_obs(Some(opt.clone().obs_endpoint)).await;
-
-    // print startup logo
-    info!("{}", LOGO);
+    let guard = match init_obs(Some(opt.clone().obs_endpoint)).await {
+        Ok(g) => g,
+        Err(e) => {
+            println!("Failed to initialize observability: {}", e);
+            return Err(Error::other(e));
+        }
+    };
 
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
@@ -125,6 +127,9 @@ async fn async_main() -> Result<()> {
             return Err(e);
         }
     }
+
+    // print startup logo
+    info!("{}", LOGO);
 
     // Initialize performance profiling if enabled
     #[cfg(not(target_os = "windows"))]

@@ -14,7 +14,7 @@
 
 #![allow(dead_code)]
 
-use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 /// CPU system-related metric descriptors
 use std::sync::LazyLock;
 

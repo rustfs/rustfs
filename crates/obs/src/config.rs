@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use rustfs_config::observability::{
-    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES,
-    ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL,
-    ENV_OBS_METER_INTERVAL, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_USE_STDOUT,
+    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_ENDPOINT, ENV_OBS_LOG_FILENAME,
+    ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED,
+    ENV_OBS_LOGGER_LEVEL, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME,
+    ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
@@ -23,6 +24,7 @@ use rustfs_config::{
     USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
+use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -55,6 +57,9 @@ use std::env;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
     pub endpoint: String,                 // Endpoint for metric collection
+    pub trace_endpoint: Option<String>,   // Endpoint for trace collection
+    pub metric_endpoint: Option<String>,  // Endpoint for metric collection
+    pub log_endpoint: Option<String>,     // Endpoint for log collection
     pub use_stdout: Option<bool>,         // Output to stdout
     pub sample_ratio: Option<f64>,        // Trace sampling ratio
     pub meter_interval: Option<u64>,      // Metric collection interval
@@ -68,7 +73,7 @@ pub struct OtelConfig {
     pub log_filename: Option<String>,      // The name of the log file
     pub log_rotation_size_mb: Option<u64>, // Log file size cut threshold (MB)
     pub log_rotation_time: Option<String>, // Logs are cut by time (Hour， Day，Minute， Second)
-    pub log_keep_files: Option<u16>,       // Number of log files to be retained
+    pub log_keep_files: Option<usize>,     // Number of log files to be retained
 }
 
 impl OtelConfig {
@@ -83,62 +88,29 @@ impl OtelConfig {
         } else {
             env::var(ENV_OBS_ENDPOINT).unwrap_or_else(|_| "".to_string())
         };
-        let mut use_stdout = env::var(ENV_OBS_USE_STDOUT)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(USE_STDOUT));
+        let mut use_stdout = get_env_bool(ENV_OBS_USE_STDOUT, USE_STDOUT);
         if endpoint.is_empty() {
-            use_stdout = Some(true);
+            use_stdout = true;
         }
 
         OtelConfig {
             endpoint,
-            use_stdout,
-            sample_ratio: env::var(ENV_OBS_SAMPLE_RATIO)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(SAMPLE_RATIO)),
-            meter_interval: env::var(ENV_OBS_METER_INTERVAL)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(METER_INTERVAL)),
-            service_name: env::var(ENV_OBS_SERVICE_NAME)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(APP_NAME.to_string())),
-            service_version: env::var(ENV_OBS_SERVICE_VERSION)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(SERVICE_VERSION.to_string())),
-            environment: env::var(ENV_OBS_ENVIRONMENT)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(ENVIRONMENT.to_string())),
-            logger_level: env::var(ENV_OBS_LOGGER_LEVEL)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_LEVEL.to_string())),
-            log_stdout_enabled: env::var(ENV_OBS_LOG_STDOUT_ENABLED)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_OBS_LOG_STDOUT_ENABLED)),
+            trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
+            metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
+            log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
+            use_stdout: Some(use_stdout),
+            sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
+            meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
+            service_name: Some(get_env_str(ENV_OBS_SERVICE_NAME, APP_NAME)),
+            service_version: Some(get_env_str(ENV_OBS_SERVICE_VERSION, SERVICE_VERSION)),
+            environment: Some(get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT)),
+            logger_level: Some(get_env_str(ENV_OBS_LOGGER_LEVEL, DEFAULT_LOG_LEVEL)),
+            log_stdout_enabled: Some(get_env_bool(ENV_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOG_STDOUT_ENABLED)),
             log_directory: Some(get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY)),
-            log_filename: env::var(ENV_OBS_LOG_FILENAME)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_OBS_LOG_FILENAME.to_string())),
-            log_rotation_size_mb: env::var(ENV_OBS_LOG_ROTATION_SIZE_MB)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
-            log_rotation_time: env::var(ENV_OBS_LOG_ROTATION_TIME)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_ROTATION_TIME.to_string())), // Default to "Day"
-            log_keep_files: env::var(ENV_OBS_LOG_KEEP_FILES)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
+            log_filename: Some(get_env_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
+            log_rotation_size_mb: Some(get_env_u64(ENV_OBS_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
+            log_rotation_time: Some(get_env_str(ENV_OBS_LOG_ROTATION_TIME, DEFAULT_LOG_ROTATION_TIME)), // Default to "Hour"
+            log_keep_files: Some(get_env_usize(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
         }
     }
 
