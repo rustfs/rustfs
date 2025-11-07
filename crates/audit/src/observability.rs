@@ -91,6 +91,7 @@ impl Default for AuditMetrics {
 impl AuditMetrics {
     /// Creates a new metrics collector
     pub fn new() -> Self {
+        init_observability_metrics();
         Self {
             total_events_processed: AtomicU64::new(0),
             total_events_failed: AtomicU64::new(0),
@@ -111,7 +112,7 @@ impl AuditMetrics {
         histogram!(M_AUDIT_DISPATCH_NS).record(dispatch_time.as_nanos() as f64);
     }
 
-    // Suggestion: Call this auxiliary function in the existing "Failure Event Recording" method body to complete the burying point
+    // Suggestion: Call this auxiliary function in the existing "Failure Event Recording" method body to complete the instrumentation
     #[inline]
     fn emit_event_failure_metrics(&self, dispatch_time: Duration) {
         counter!(M_AUDIT_EVENTS_TOTAL, L_RESULT => V_FAILURE).increment(1);
@@ -124,40 +125,32 @@ impl AuditMetrics {
         self.total_events_processed.fetch_add(1, Ordering::Relaxed);
         self.total_dispatch_time_ns
             .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
-        init_observability_metrics();
         self.emit_event_success_metrics(dispatch_time);
     }
 
     /// Records a failed event dispatch
     pub fn record_event_failure(&self, dispatch_time: Duration) {
-        // Make sure the indicator is registered
-        init_observability_metrics();
-        // Send indicator
         self.total_events_failed.fetch_add(1, Ordering::Relaxed);
         self.total_dispatch_time_ns
             .fetch_add(dispatch_time.as_nanos() as u64, Ordering::Relaxed);
-        // Record metrics
         self.emit_event_failure_metrics(dispatch_time);
     }
 
     /// Records a successful target operation
     pub fn record_target_success(&self) {
         self.target_success_count.fetch_add(1, Ordering::Relaxed);
-        init_observability_metrics();
         counter!(M_AUDIT_TARGET_OPS, L_STATUS => V_SUCCESS).increment(1);
     }
 
     /// Records a failed target operation
     pub fn record_target_failure(&self) {
         self.target_failure_count.fetch_add(1, Ordering::Relaxed);
-        init_observability_metrics();
         counter!(M_AUDIT_TARGET_OPS, L_STATUS => V_FAILURE).increment(1);
     }
 
     /// Records a configuration reload
     pub fn record_config_reload(&self) {
         self.config_reload_count.fetch_add(1, Ordering::Relaxed);
-        init_observability_metrics();
         counter!(M_AUDIT_CONFIG_RELOADS).increment(1);
         info!("Audit configuration reloaded");
     }
@@ -165,7 +158,6 @@ impl AuditMetrics {
     /// Records a system start
     pub fn record_system_start(&self) {
         self.system_start_count.fetch_add(1, Ordering::Relaxed);
-        init_observability_metrics();
         counter!(M_AUDIT_SYSTEM_STARTS).increment(1);
         info!("Audit system started");
     }
@@ -182,7 +174,6 @@ impl AuditMetrics {
             0.0
         };
         // EPS is reported in gauge
-        init_observability_metrics();
         gauge!(M_AUDIT_EPS).set(eps);
         eps
     }
@@ -237,9 +228,7 @@ impl AuditMetrics {
         *reset_time = Instant::now();
 
         // Reset EPS to zero after reset
-        init_observability_metrics();
         gauge!(M_AUDIT_EPS).set(0.0);
-
         info!("Audit metrics reset");
     }
 

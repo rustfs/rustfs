@@ -88,9 +88,9 @@ impl OtelConfig {
         } else {
             env::var(ENV_OBS_ENDPOINT).unwrap_or_else(|_| "".to_string())
         };
-        let mut use_stdout_opt = get_env_bool(ENV_OBS_USE_STDOUT, USE_STDOUT);
+        let mut use_stdout = get_env_bool(ENV_OBS_USE_STDOUT, USE_STDOUT);
         if endpoint.is_empty() {
-            use_stdout_opt = true;
+            use_stdout = true;
         }
 
         OtelConfig {
@@ -98,7 +98,7 @@ impl OtelConfig {
             trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
             metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
             log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
-            use_stdout: Some(use_stdout_opt),
+            use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
             service_name: Some(get_env_str(ENV_OBS_SERVICE_NAME, APP_NAME)),

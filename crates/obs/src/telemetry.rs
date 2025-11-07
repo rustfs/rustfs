@@ -75,7 +75,6 @@ pub struct OtelGuard {
     tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
-// Implement debug manually and avoid relying on all fields to implement debug
 impl std::fmt::Debug for OtelGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OtelGuard")
@@ -119,6 +118,28 @@ impl Drop for OtelGuard {
         }
     }
 }
+
+#[derive(Debug)]
+pub enum TelemetryError {
+    BuildSpanExporter(String),
+    BuildMetricExporter(String),
+    BuildLogExporter(String),
+    InstallMetricsRecorder(String),
+    SubscriberInit(String),
+}
+
+impl std::fmt::Display for TelemetryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TelemetryError::BuildSpanExporter(e) => write!(f, "Span exporter build failed: {e}"),
+            TelemetryError::BuildMetricExporter(e) => write!(f, "Metric exporter build failed: {e}"),
+            TelemetryError::BuildLogExporter(e) => write!(f, "Log exporter build failed: {e}"),
+            TelemetryError::InstallMetricsRecorder(e) => write!(f, "Install metrics recorder failed: {e}"),
+            TelemetryError::SubscriberInit(e) => write!(f, "Tracing subscriber init failed: {e}"),
+        }
+    }
+}
+impl std::error::Error for TelemetryError {}
 
 /// create OpenTelemetry Resource
 fn resource(config: &OtelConfig) -> Resource {
@@ -384,7 +405,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
 }
 
 /// Observability (HTTP export, supports three sub-endpoints; if not, fallback to unified endpoint)
-fn init_observability_http(config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+fn init_observability_http(config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
     // Resources and sampling
     let res = resource(config);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
@@ -410,7 +431,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
             .with_protocol(Protocol::HttpBinary)
             .with_compression(Compression::Zstd)
             .build()
-            .expect("build otlp http span exporter");
+            .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
 
         let mut builder = SdkTracerProvider::builder()
             .with_sampler(sampler)
@@ -436,7 +457,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
             .with_protocol(Protocol::HttpBinary)
             .with_compression(Compression::Zstd)
             .build()
-            .expect("build otlp http metric exporter");
+            .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
         let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
         let mut builder = MeterProviderBuilder::default().with_resource(res.clone());
         builder = builder.with_reader(
@@ -464,7 +485,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
             .with_protocol(Protocol::HttpBinary)
             .with_compression(Compression::Zstd)
             .build()
-            .expect("build otlp http log exporter");
+            .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
 
         let mut builder = SdkLoggerProvider::builder().with_resource(res);
         builder = builder.with_batch_exporter(exporter);
@@ -517,17 +538,17 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
         trace_ep, metric_ep, log_ep
     );
 
-    OtelGuard {
+    Ok(OtelGuard {
         tracer_provider: Some(tracer_provider),
         meter_provider: Some(meter_provider),
         logger_provider: Some(logger_provider),
         flexi_logger_handles: None,
         tracing_guard: None,
-    }
+    })
 }
 
 /// Initialize Telemetry,Entrance: three rules
-pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
+pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, TelemetryError> {
     let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
     let is_production = environment.eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION);
     let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
@@ -545,11 +566,11 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     // Rule 2: The user has explicitly customized the log directory (determined by whether ENV_OBS_LOG_DIRECTORY is set)
     let user_set_log_dir = env::var(ENV_OBS_LOG_DIRECTORY).is_ok();
     if user_set_log_dir {
-        return init_file_logging(config, logger_level, is_production);
+        return Ok(init_file_logging(config, logger_level, is_production));
     }
 
     // Rule 1: Default stdout (error level)
-    init_stdout_logging(config, DEFAULT_LOG_LEVEL, is_production)
+    Ok(init_stdout_logging(config, DEFAULT_LOG_LEVEL, is_production))
 }
 
 #[cfg(test)]
