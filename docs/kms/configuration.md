@@ -16,7 +16,7 @@ This guide describes the configuration surfaces for the RustFS Key Management Se
 | CLI flag                    | Env variable                   | Description |
 |-----------------------------|--------------------------------|-------------|
 | `--kms-enable`              | `RUSTFS_KMS_ENABLE`            | Enables KMS at startup. Defaults to `false`. |
-| `--kms-backend <local|vault>` | `RUSTFS_KMS_BACKEND`         | Selects the backend implementation. Defaults to `local`. |
+| `--kms-backend <local\|vault>` | `RUSTFS_KMS_BACKEND`         | Selects the backend implementation. Defaults to `local`. |
 | `--kms-key-dir <path>`      | `RUSTFS_KMS_KEY_DIR`           | Required when `kms-backend=local`; directory that stores wrapped master keys. |
 | `--kms-vault-address <url>` | `RUSTFS_KMS_VAULT_ADDRESS`     | Vault base URL (e.g. `https://vault.example.com:8200`). |
 | `--kms-vault-token <token>` | `RUSTFS_KMS_VAULT_TOKEN`       | Token used for Vault authentication. Prefer AppRole or short-lived tokens. |
