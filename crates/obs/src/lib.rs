@@ -38,7 +38,7 @@
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// #   let _guard = match init_obs(None).await{
+/// #   let _guard = match init_obs(None).await {
 /// #         Ok(g) => g,
 /// #         Err(e) => {
 /// #             panic!("Failed to initialize observability: {:?}", e);

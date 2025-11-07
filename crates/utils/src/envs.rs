@@ -16,6 +16,14 @@ use std::env;
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
 /// 8-bit type: signed i8
+///
+/// #Parameters
+/// - `key`: The environment variable key to look up.
+/// - `default`: The default value to return if the environment variable is not set or parsing fails.
+///
+/// #Returns
+/// - `i8`: The parsed value as i8 if successful, otherwise the default value.
+///
 pub fn get_env_i8(key: &str, default: i8) -> i8 {
     env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
