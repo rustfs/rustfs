@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// Metrics for replication subsystem
-use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 pub static REPLICATION_AVERAGE_ACTIVE_WORKERS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {

@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 /// A descriptor for metrics related to webhook logs
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 /// Define label constants for webhook metrics

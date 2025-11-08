@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::metrics::entry::path_utils::format_path_to_metric_name;
+use crate::entry::path_utils::format_path_to_metric_name;
 
 /// The metrics subsystem is a subgroup of metrics within a namespace
 /// The metrics subsystem, which represents a subgroup of metrics within a namespace
@@ -204,8 +204,8 @@ pub mod subsystems {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::MetricType;
-    use crate::metrics::{MetricDescriptor, MetricName, MetricNamespace};
+    use crate::MetricType;
+    use crate::{MetricDescriptor, MetricName, MetricNamespace};
 
     #[test]
     fn test_metric_subsystem_formatting() {

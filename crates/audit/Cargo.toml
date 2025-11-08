@@ -30,7 +30,9 @@ rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "constants"] }
 rustfs-ecstore = { workspace = true }
 chrono = { workspace = true }
+const-str = { workspace = true }
 futures = { workspace = true }
+metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -38,6 +40,7 @@ tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "
 tracing = { workspace = true, features = ["std", "attributes"] }
 url = { workspace = true }
 rumqttc = { workspace = true }
+
 
 [lints]
 workspace = true

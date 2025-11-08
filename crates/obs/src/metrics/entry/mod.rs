@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::metrics::{MetricDescriptor, MetricName, MetricNamespace, MetricSubsystem, MetricType};
+use crate::{MetricDescriptor, MetricName, MetricNamespace, MetricSubsystem, MetricType};
 
 pub(crate) mod descriptor;
 pub(crate) mod metric_name;
@@ -76,7 +76,7 @@ pub fn new_histogram_md(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::subsystems;
+    use crate::subsystems;
 
     #[test]
     fn test_new_histogram_md() {

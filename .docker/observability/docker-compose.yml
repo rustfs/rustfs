@@ -16,7 +16,7 @@ services:
 
   tempo-init:
     image: busybox:latest
-    command: ["sh", "-c", "chown -R 10001:10001 /var/tempo"]
+    command: [ "sh", "-c", "chown -R 10001:10001 /var/tempo" ]
     volumes:
       - ./tempo-data:/var/tempo
     user: root
@@ -39,7 +39,7 @@ services:
       - otel-network
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.129.1
+    image: otel/opentelemetry-collector-contrib:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -55,7 +55,7 @@ services:
     networks:
       - otel-network
   jaeger:
-    image: jaegertracing/jaeger:2.8.0
+    image: jaegertracing/jaeger:latest
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -65,17 +65,21 @@ services:
     networks:
       - otel-network
   prometheus:
-    image: prom/prometheus:v3.4.2
+    image: prom/prometheus:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-otlp-receiver' # Enable OTLP
+      - '--enable-feature=promql-experimental-functions' # Enable info()
     networks:
       - otel-network
   loki:
-    image: grafana/loki:3.5.1
+    image: grafana/loki:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -86,7 +90,7 @@ services:
     networks:
       - otel-network
   grafana:
-    image: grafana/grafana:12.0.2
+    image: grafana/grafana:latest
     ports:
       - "3000:3000"  # Web UI
     volumes:

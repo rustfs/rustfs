@@ -51,7 +51,14 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # Observability related configuration
-#export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector address
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+# RustFS OR OTEL exporter configuration
+#export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
+#export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+#export RUSTFS_OBS_METRIC_ENDPOINT=http://localhost:9090/api/v1/otlp # OpenTelemetry Collector metric address
+#export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://localhost:9090/api/v1/otlp/v1/metrics
+#export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
+#export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
 #export RUSTFS_OBS_USE_STDOUT=false # Whether to use standard output
 #export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
@@ -60,7 +67,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
-export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
+#export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
 export RUSTFS_OBS_LOG_POOL_CAPA=10240

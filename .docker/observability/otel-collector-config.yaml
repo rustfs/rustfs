@@ -43,7 +43,6 @@ exporters:
     send_timestamps: true  # 发送时间戳
     # enable_open_metrics: true
   otlphttp/loki: # Loki 导出器，用于日志数据
-    # endpoint: "http://loki:3100/otlp/v1/logs"
     endpoint: "http://loki:3100/otlp/v1/logs"
     tls:
       insecure: true
