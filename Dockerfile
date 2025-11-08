@@ -64,8 +64,12 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
 COPY entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh && \
+RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+
+RUN addgroup -g 1000 -S rustfs && \
+    adduser -u 1000 -G rustfs -S rustfs -D && \
     mkdir -p /data /logs && \
+    chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
 ENV RUSTFS_ADDRESS=":9000" \
@@ -82,7 +86,10 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_SINKS_FILE_PATH="/logs"
 
 EXPOSE 9000 9001
+
 VOLUME ["/data", "/logs"]
+
+USER rustfs
 
 ENTRYPOINT ["/entrypoint.sh"]
 
