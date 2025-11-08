@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use rustfs_config::observability::{
-    ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_ENDPOINT, ENV_OBS_LOG_FILENAME,
-    ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED,
-    ENV_OBS_LOGGER_LEVEL, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME,
-    ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_USE_STDOUT,
+    DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_ENDPOINT,
+    ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME,
+    ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_SAMPLE_RATIO,
+    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
@@ -207,5 +207,38 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Check if the current environment is development
+///
+/// # Returns
+/// true if development, false otherwise
+pub fn is_develop_environment() -> bool {
+    !get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
+}
+
+/// Check if the current environment is production
+///
+/// # Returns
+/// true if production, false otherwise
+pub fn is_production_environment() -> bool {
+    get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_otel_config_default() {
+        let config = OtelConfig::default();
+        assert!(!config.endpoint.is_empty());
+    }
+
+    #[test]
+    fn test_app_config_default() {
+        let config = AppConfig::default();
+        assert!(!config.observability.endpoint.is_empty());
     }
 }
