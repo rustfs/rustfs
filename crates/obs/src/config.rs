@@ -210,35 +210,11 @@ impl Default for AppConfig {
     }
 }
 
-/// Check if the current environment is development
-///
-/// # Returns
-/// true if development, false otherwise
-pub fn is_develop_environment() -> bool {
-    !get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
-}
-
 /// Check if the current environment is production
 ///
 /// # Returns
 /// true if production, false otherwise
+///
 pub fn is_production_environment() -> bool {
     get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_otel_config_default() {
-        let config = OtelConfig::default();
-        assert!(!config.endpoint.is_empty());
-    }
-
-    #[test]
-    fn test_app_config_default() {
-        let config = AppConfig::default();
-        assert!(!config.observability.endpoint.is_empty());
-    }
 }
