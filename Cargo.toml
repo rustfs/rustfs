@@ -185,7 +185,7 @@ datafusion = "50.3.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
 flate2 = "1.1.5"
-flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv"] }
+flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.2.0"
 google-cloud-auth = "1.1.0"

@@ -358,11 +358,14 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
     // Build
     let mut builder = flexi_logger::Logger::try_with_env_or_str(logger_level)
         .unwrap_or_else(|e| {
-            eprintln!("WARNING: Invalid logger configuration '{logger_level}': {e:?}");
-            eprintln!("Falling back to default configuration with level: {DEFAULT_LOG_LEVEL}");
+            if !is_production {
+                eprintln!("WARNING: Invalid logger configuration '{logger_level}': {e:?}");
+                eprintln!("Falling back to default configuration with level: {DEFAULT_LOG_LEVEL}");
+            }
             flexi_logger::Logger::with(log_spec.clone())
         })
         .format_for_stderr(format_with_color)
+        .format_for_stdout(format_with_color)
         .format_for_files(format_for_file)
         .log_to_file(
             FileSpec::default()
@@ -371,7 +374,9 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
                 .suppress_timestamp(),
         )
         .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files))
-        .write_mode(write_mode);
+        .write_mode(write_mode)
+        .append()
+        .use_utc();
 
     // Optional copy to stdout (for local observation)
     if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
