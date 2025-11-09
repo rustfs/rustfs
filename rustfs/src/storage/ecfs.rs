@@ -32,10 +32,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
-use rustfs_audit::{
-    entity::{ApiDetails, ApiDetailsBuilder, AuditEntry, AuditEntryBuilder},
-    global::AuditLogger,
-};
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -108,8 +104,7 @@ use rustfs_targets::{
     arn::{TargetID, TargetIDError},
 };
 use rustfs_utils::{
-    CompressionAlgorithm, extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host,
-    get_request_user_agent,
+    CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
@@ -2275,7 +2270,7 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -2292,7 +2287,6 @@ impl S3 for FS {
                 return Err(s3_error!(InvalidStorageClass));
             }
         }
-        let event_version_id = input.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
         let PutObjectInput {
             body,
             bucket,
@@ -2544,7 +2538,6 @@ impl S3 for FS {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
-        let event_info = obj_info.clone();
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
         let repoptions =

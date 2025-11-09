@@ -51,17 +51,17 @@ pub async fn start_audit_system(config: Config) -> AuditResult<()> {
 
 /// Stop the global audit system
 pub async fn stop_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.close())
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.close().await })
 }
 
 /// Pause the global audit system
 pub async fn pause_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.pause())
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.close().await })
 }
 
 /// Resume the global audit system
 pub async fn resume_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.resume())
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.close().await })
 }
 
 /// Dispatch an audit log entry to all targets
@@ -86,7 +86,7 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
 
 /// Reload the global audit system configuration
 pub async fn reload_audit_config(config: Config) -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.reload_config(config))
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.reload_config(config).await })
 }
 
 /// Check if the global audit system is running

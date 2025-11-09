@@ -134,7 +134,7 @@ impl Operation for NotificationTarget {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         // 3. Get notification system instance
-        let Some(ns) = rustfs_notify::global::notification_system() else {
+        let Some(ns) = rustfs_notify::notification_system() else {
             return Err(s3_error!(InternalError, "notification system not initialized"));
         };
 
@@ -300,7 +300,7 @@ impl Operation for ListNotificationTargets {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         // 2. Get notification system instance
-        let Some(ns) = rustfs_notify::global::notification_system() else {
+        let Some(ns) = rustfs_notify::notification_system() else {
             return Err(s3_error!(InternalError, "notification system not initialized"));
         };
 
@@ -351,7 +351,7 @@ impl Operation for ListTargetsArns {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         // 2. Get notification system instance
-        let Some(ns) = rustfs_notify::global::notification_system() else {
+        let Some(ns) = rustfs_notify::notification_system() else {
             return Err(s3_error!(InternalError, "notification system not initialized"));
         };
 
@@ -401,7 +401,7 @@ impl Operation for RemoveNotificationTarget {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         // 3. Get notification system instance
-        let Some(ns) = rustfs_notify::global::notification_system() else {
+        let Some(ns) = rustfs_notify::notification_system() else {
             return Err(s3_error!(InternalError, "notification system not initialized"));
         };
 
