@@ -31,6 +31,10 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
+use rustfs_audit::{
+    entity::{ApiDetails, ApiDetailsBuilder, AuditEntry, AuditEntryBuilder},
+    global::AuditLogger,
+};
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -102,11 +106,11 @@ use rustfs_targets::{
     EventName,
     arn::{TargetID, TargetIDError},
 };
-use rustfs_utils::http::{AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE};
 use rustfs_utils::{
-    CompressionAlgorithm,
+    CompressionAlgorithm, extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host,
+    get_request_user_agent,
     http::{
-        AMZ_BUCKET_REPLICATION_STATUS,
+        AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
             AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
             RESERVED_METADATA_PREFIX_LOWER,
@@ -346,6 +350,85 @@ fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }
 
+/// A helper to build and dispatch an audit log entry at the end of an S3 operation's scope.
+struct AuditHelper {
+    builder: Option<AuditEntryBuilder>,
+    api_builder: ApiDetailsBuilder,
+    start_time: std::time::Instant,
+}
+
+impl AuditHelper {
+    /// Creates a new AuditHelper for an S3 request.
+    fn new(req: &S3Request<impl Send + Sync>, event: EventName, trigger: &'static str) -> Self {
+        let mut api_builder = ApiDetailsBuilder::new().name(trigger);
+        if let Some(bucket) = req.bucket() {
+            api_builder = api_builder.bucket(bucket);
+        }
+        if let Some(key) = req.key() {
+            api_builder = api_builder.object(key);
+        }
+
+        let mut builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
+            .remote_host(req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default())
+            .user_agent(get_request_user_agent(&req.headers))
+            .req_host(get_request_host(&req.headers))
+            .req_path(req.uri().path().to_string())
+            .req_query(extract_req_params(&req.headers));
+
+        if let Some(req_id) = req.headers.get("x-amz-request-id") {
+            if let Ok(id_str) = req_id.to_str() {
+                builder = builder.request_id(id_str);
+            }
+        }
+
+        Self {
+            builder: Some(builder),
+            api_builder,
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    /// Completes the audit log with the operation's result and prepares it for sending.
+    fn complete(mut self, result: &S3Result<S3Response<impl Send + Sync>>) {
+        if let Some(builder) = self.builder.take() {
+            let (status, status_code, error_msg) = match result {
+                Ok(res) => ("success".to_string(), res.status.unwrap_or(StatusCode::OK).as_u16() as i32, None),
+                Err(e) => (
+                    "failure".to_string(),
+                    e.status_code().unwrap_or(StatusCode::BAD_REQUEST).as_u16() as i32,
+                    Some(e.message().unwrap_or_default().to_string()),
+                ),
+            };
+
+            let ttr = self.start_time.elapsed();
+            let api_details = self
+                .api_builder
+                .status(status)
+                .status_code(status_code)
+                .time_to_response(format!("{:.2?}", ttr))
+                .time_to_response_in_ns(ttr.as_nanos().to_string())
+                .build();
+
+            let mut final_builder = builder.api(api_details);
+            if let Some(err) = error_msg {
+                final_builder = final_builder.error(err);
+            }
+
+            self.builder = Some(final_builder);
+        }
+    }
+}
+
+impl Drop for AuditHelper {
+    fn drop(&mut self) {
+        if let Some(builder) = self.builder.take() {
+            tokio::spawn(async move {
+                AuditLogger::log(builder.build()).await;
+            });
+        }
+    }
+}
+
 impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
@@ -499,8 +582,8 @@ impl FS {
                     event_name: EventName::ObjectCreatedPut,
                     bucket_name: bucket.clone(),
                     object: _obj_info.clone(),
-                    req_params: rustfs_utils::extract_req_params_header(&req.headers),
-                    resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+                    req_params: extract_req_params_header(&req.headers),
+                    resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                     version_id: version_id.clone(),
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -602,6 +685,8 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+        let audit_helper = AuditHelper::new(&req, EventName::BucketCreated, "s3:CreateBucket");
+
         let CreateBucketInput {
             bucket,
             object_lock_enabled_for_bucket,
@@ -632,11 +717,11 @@ impl S3 for FS {
             event_name: EventName::BucketCreated,
             bucket_name: bucket.clone(),
             object: ObjectInfo { ..Default::default() },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id: String::new(),
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
+            host: get_request_host(&req.headers),
+            user_agent: get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
@@ -644,7 +729,9 @@ impl S3 for FS {
             notifier_instance().notify(event_args).await;
         });
 
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        audit_helper.complete(&result);
+        result
     }
 
     /// Copy an object from one location to another
@@ -839,8 +926,8 @@ impl S3 for FS {
             event_name: EventName::ObjectCreatedCopy,
             bucket_name: bucket.clone(),
             object: object_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -1113,8 +1200,8 @@ impl S3 for FS {
             event_name: EventName::BucketRemoved,
             bucket_name: input.bucket,
             object: ObjectInfo { ..Default::default() },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
             version_id: String::new(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -1241,8 +1328,8 @@ impl S3 for FS {
                 bucket: bucket.clone(),
                 ..Default::default()
             },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
             version_id: version_id.map(|v| v.to_string()).unwrap_or_default(),
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -1501,10 +1588,8 @@ impl S3 for FS {
                         bucket: bucket.clone(),
                         ..Default::default()
                     },
-                    req_params: rustfs_utils::extract_req_params_header(&req.headers),
-                    resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteObjectsOutput {
-                        ..Default::default()
-                    })),
+                    req_params: extract_req_params_header(&req.headers),
+                    resp_elements: extract_resp_elements(&S3Response::new(DeleteObjectsOutput { ..Default::default() })),
                     version_id,
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -1887,8 +1972,8 @@ impl S3 for FS {
             event_name: EventName::ObjectAccessedGet,
             bucket_name: bucket.clone(),
             object: event_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(GetObjectOutput { ..Default::default() })),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(GetObjectOutput { ..Default::default() })),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -2063,8 +2148,8 @@ impl S3 for FS {
             event_name: EventName::ObjectAccessedGet,
             bucket_name: bucket,
             object: event_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -2344,6 +2429,8 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let audit_helper = AuditHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -2675,11 +2762,11 @@ impl S3 for FS {
             event_name: EventName::ObjectCreatedPut,
             bucket_name: bucket.clone(),
             object: event_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id: event_version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
+            host: get_request_host(&req.headers),
+            user_agent: get_request_user_agent(&req.headers),
         };
 
         // Asynchronous call will not block the response of the current request
@@ -2687,7 +2774,9 @@ impl S3 for FS {
             notifier_instance().notify(event_args).await;
         });
 
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        audit_helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -2852,8 +2941,8 @@ impl S3 for FS {
                 bucket: bucket_name,
                 ..Default::default()
             },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -3718,8 +3807,8 @@ impl S3 for FS {
                 bucket,
                 ..Default::default()
             },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(PutObjectTaggingOutput { version_id: None })),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(PutObjectTaggingOutput { version_id: None })),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -3785,8 +3874,8 @@ impl S3 for FS {
                 bucket,
                 ..Default::default()
             },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(DeleteObjectTaggingOutput { version_id: None })),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(DeleteObjectTaggingOutput { version_id: None })),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -4562,8 +4651,8 @@ impl S3 for FS {
                 bucket,
                 ..Default::default()
             },
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -4740,8 +4829,8 @@ impl S3 for FS {
             event_name: EventName::ObjectAccessedGetLegalHold,
             bucket_name: bucket.clone(),
             object: object_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -4819,8 +4908,8 @@ impl S3 for FS {
             event_name: EventName::ObjectCreatedPutLegalHold,
             bucket_name: bucket.clone(),
             object: info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -4880,8 +4969,8 @@ impl S3 for FS {
             event_name: EventName::ObjectAccessedGetRetention,
             bucket_name: bucket.clone(),
             object: object_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),
@@ -4955,8 +5044,8 @@ impl S3 for FS {
             event_name: EventName::ObjectCreatedPutRetention,
             bucket_name: bucket.clone(),
             object: object_info,
-            req_params: rustfs_utils::extract_req_params_header(&req.headers),
-            resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
+            req_params: extract_req_params_header(&req.headers),
+            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
             version_id,
             host: rustfs_utils::get_request_host(&req.headers),
             user_agent: rustfs_utils::get_request_user_agent(&req.headers),

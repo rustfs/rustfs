@@ -204,6 +204,22 @@ impl AuditEntryBuilder {
         })
     }
 
+    // event
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.0.version = version.into();
+        self
+    }
+
+    pub fn event(mut self, event: EventName) -> Self {
+        self.0.event = event;
+        self
+    }
+
+    pub fn api(mut self, api_details: ApiDetails) -> Self {
+        self.0.api = api_details;
+        self
+    }
+
     pub fn deployment_id(mut self, id: impl Into<String>) -> Self {
         self.0.deployment_id = Some(id.into());
         self
