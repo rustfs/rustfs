@@ -317,6 +317,24 @@ impl EventArgsBuilder {
         }
     }
 
+    /// Sets the event name.
+    pub fn event_name(mut self, event_name: EventName) -> Self {
+        self.event_name = event_name;
+        self
+    }
+
+    /// Sets the bucket name.
+    pub fn bucket_name(mut self, bucket_name: impl Into<String>) -> Self {
+        self.bucket_name = bucket_name.into();
+        self
+    }
+
+    /// Sets the object information.
+    pub fn object(mut self, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
+        self.object = object;
+        self
+    }
+
     /// Sets the request parameters.
     pub fn req_params(mut self, req_params: HashMap<String, String>) -> Self {
         self.req_params = req_params;

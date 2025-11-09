@@ -14,6 +14,6 @@
 
 pub mod access;
 pub mod ecfs;
-// pub mod error;
+pub(crate) mod helper;
 pub mod options;
 pub mod tonic_service;

@@ -14,6 +14,7 @@
 
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
+use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
     access::{ReqInfo, authorize_request},
@@ -88,7 +89,7 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_notify::notifier_global;
+use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::{
     auth,
     policy::{
@@ -350,85 +351,6 @@ fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }
 
-/// A helper to build and dispatch an audit log entry at the end of an S3 operation's scope.
-struct AuditHelper {
-    builder: Option<AuditEntryBuilder>,
-    api_builder: ApiDetailsBuilder,
-    start_time: std::time::Instant,
-}
-
-impl AuditHelper {
-    /// Creates a new AuditHelper for an S3 request.
-    fn new(req: &S3Request<impl Send + Sync>, event: EventName, trigger: &'static str) -> Self {
-        let mut api_builder = ApiDetailsBuilder::new().name(trigger);
-        if let Some(bucket) = req.bucket() {
-            api_builder = api_builder.bucket(bucket);
-        }
-        if let Some(key) = req.key() {
-            api_builder = api_builder.object(key);
-        }
-
-        let mut builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
-            .remote_host(req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default())
-            .user_agent(get_request_user_agent(&req.headers))
-            .req_host(get_request_host(&req.headers))
-            .req_path(req.uri().path().to_string())
-            .req_query(extract_req_params(&req.headers));
-
-        if let Some(req_id) = req.headers.get("x-amz-request-id") {
-            if let Ok(id_str) = req_id.to_str() {
-                builder = builder.request_id(id_str);
-            }
-        }
-
-        Self {
-            builder: Some(builder),
-            api_builder,
-            start_time: std::time::Instant::now(),
-        }
-    }
-
-    /// Completes the audit log with the operation's result and prepares it for sending.
-    fn complete(mut self, result: &S3Result<S3Response<impl Send + Sync>>) {
-        if let Some(builder) = self.builder.take() {
-            let (status, status_code, error_msg) = match result {
-                Ok(res) => ("success".to_string(), res.status.unwrap_or(StatusCode::OK).as_u16() as i32, None),
-                Err(e) => (
-                    "failure".to_string(),
-                    e.status_code().unwrap_or(StatusCode::BAD_REQUEST).as_u16() as i32,
-                    Some(e.message().unwrap_or_default().to_string()),
-                ),
-            };
-
-            let ttr = self.start_time.elapsed();
-            let api_details = self
-                .api_builder
-                .status(status)
-                .status_code(status_code)
-                .time_to_response(format!("{:.2?}", ttr))
-                .time_to_response_in_ns(ttr.as_nanos().to_string())
-                .build();
-
-            let mut final_builder = builder.api(api_details);
-            if let Some(err) = error_msg {
-                final_builder = final_builder.error(err);
-            }
-
-            self.builder = Some(final_builder);
-        }
-    }
-}
-
-impl Drop for AuditHelper {
-    fn drop(&mut self) {
-        if let Some(builder) = self.builder.take() {
-            tokio::spawn(async move {
-                AuditLogger::log(builder.build()).await;
-            });
-        }
-    }
-}
-
 impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
@@ -685,8 +607,7 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
-        let audit_helper = AuditHelper::new(&req, EventName::BucketCreated, "s3:CreateBucket");
-
+        let helper = OperationHelper::new(&req, EventName::BucketCreated, "s3:CreateBucket");
         let CreateBucketInput {
             bucket,
             object_lock_enabled_for_bucket,
@@ -730,13 +651,14 @@ impl S3 for FS {
         });
 
         let result = Ok(S3Response::new(output));
-        audit_helper.complete(&result);
+        let _ = helper.complete(&result);
         result
     }
 
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, "s3:CopyObject");
         let CopyObjectInput {
             copy_source,
             bucket,
@@ -917,28 +839,12 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(object_info).version_id(version_id);
 
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedCopy,
-            bucket_name: bucket.clone(),
-            object: object_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
-
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
@@ -1173,12 +1079,13 @@ impl S3 for FS {
             restore_output_path: None,
         };
 
-        return Ok(S3Response::with_headers(output, header));
+        Ok(S3Response::with_headers(output, header))
     }
 
     /// Delete a bucket
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let helper = OperationHelper::new(&req, EventName::BucketRemoved, "s3:DeleteBucket");
         let input = req.input;
         // TODO: DeleteBucketInput doesn't have force parameter?
         let Some(store) = new_object_layer_fn() else {
@@ -1196,28 +1103,15 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::BucketRemoved,
-            bucket_name: input.bucket,
-            object: ObjectInfo { ..Default::default() },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: String::new(),
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
-
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(DeleteBucketOutput {}))
+        let result = Ok(S3Response::new(DeleteBucketOutput {}));
+        let _ = helper.complete(&result);
+        result
     }
 
     /// Delete an object
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObject");
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -1320,32 +1214,20 @@ impl S3 for FS {
             EventName::ObjectRemovedDelete
         };
 
-        let event_args = rustfs_notify::EventArgs {
-            event_name,
-            bucket_name: bucket.clone(),
-            object: ObjectInfo {
-                name: key.clone(),
-                bucket: bucket.clone(),
-                ..Default::default()
-            },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(DeleteBucketOutput {})),
-            version_id: version_id.map(|v| v.to_string()).unwrap_or_default(),
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        helper = helper.event_name(event_name);
+        helper = helper
+            .object(obj_info)
+            .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     /// Delete multiple objects
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObjects").suppress_event();
         let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
         if delete.objects.is_empty() || delete.objects.len() > 1000 {
@@ -1480,10 +1362,12 @@ impl S3 for FS {
                 .map(|v| v.as_ref().map(|v| v.clone().into()))
                 .collect::<Vec<Option<DiskError>>>() as &[Option<DiskError>],
         ) {
-            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+            let result = Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+            let _ = helper.complete(&result);
+            return result;
         }
 
-        for (i, err) in errs.into_iter().enumerate() {
+        for (i, err) in errs.iter().enumerate() {
             let obj = dobjs[i].clone();
 
             // let replication_state = obj.replication_state.clone().unwrap_or_default();
@@ -1513,7 +1397,7 @@ impl S3 for FS {
                 continue;
             }
 
-            if let Some(err) = err {
+            if let Some(err) = err.clone() {
                 delete_results[*didx].error = Some(Error {
                     code: Some(err.to_string()),
                     key: Some(object_to_delete[i].object_name.clone()),
@@ -1568,37 +1452,39 @@ impl S3 for FS {
             }
         }
 
-        // Asynchronous call will not block the response of the current request
+        let req_headers = req.headers.clone();
         tokio::spawn(async move {
-            for dobj in dobjs {
-                let version_id = match dobj.version_id {
-                    None => String::new(),
-                    Some(v) => v.to_string(),
-                };
-                let mut event_name = EventName::ObjectRemovedDelete;
-                if dobj.delete_marker {
-                    event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-                }
+            for res in delete_results {
+                if let Some(dobj) = res.delete_object {
+                    let event_name = if dobj.delete_marker {
+                        EventName::ObjectRemovedDeleteMarkerCreated
+                    } else {
+                        EventName::ObjectRemovedDelete
+                    };
+                    let event_args = EventArgsBuilder::new(
+                        event_name,
+                        bucket.clone(),
+                        ObjectInfo {
+                            name: dobj.object_name.clone(),
+                            bucket: bucket.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
+                    .req_params(extract_req_params_header(&req_headers))
+                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .host(get_request_host(&req_headers))
+                    .user_agent(get_request_user_agent(&req_headers))
+                    .build();
 
-                let event_args = rustfs_notify::EventArgs {
-                    event_name,
-                    bucket_name: bucket.clone(),
-                    object: ObjectInfo {
-                        name: dobj.object_name,
-                        bucket: bucket.clone(),
-                        ..Default::default()
-                    },
-                    req_params: extract_req_params_header(&req.headers),
-                    resp_elements: extract_resp_elements(&S3Response::new(DeleteObjectsOutput { ..Default::default() })),
-                    version_id,
-                    host: rustfs_utils::get_request_host(&req.headers),
-                    user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-                };
-                notifier_global::notify(event_args).await;
+                    notifier_global::notify(event_args).await;
+                }
             }
         });
 
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     /// Get bucket location
@@ -1633,6 +1519,7 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
         // mc get 3
 
         let GetObjectInput {
@@ -1964,27 +1851,12 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
-            None => String::new(),
-            Some(v) => v.to_string(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectAccessedGet,
-            bucket_name: bucket.clone(),
-            object: event_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(GetObjectOutput { ..Default::default() })),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(event_info).version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -2006,6 +1878,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadBucket");
         // mc get 2
         let HeadObjectInput {
             bucket,
@@ -2140,27 +2013,13 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
-            None => String::new(),
-            Some(v) => v.to_string(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectAccessedGet,
-            bucket_name: bucket,
-            object: event_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(event_info).version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
 
-        Ok(S3Response::new(output))
+        result
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2429,8 +2288,7 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let audit_helper = AuditHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
-
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -2758,24 +2616,8 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedPut,
-            bucket_name: bucket.clone(),
-            object: event_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id: event_version_id,
-            host: get_request_host(&req.headers),
-            user_agent: get_request_user_agent(&req.headers),
-        };
-
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
         let result = Ok(S3Response::new(output));
-        audit_helper.complete(&result);
+        let _ = helper.complete(&result);
         result
     }
 
@@ -2784,6 +2626,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:CreateMultipartUpload");
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -2915,8 +2758,6 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let object_name = key.clone();
-        let bucket_name = bucket.clone();
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
@@ -2929,31 +2770,11 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedCompleteMultipartUpload,
-            bucket_name: bucket_name.clone(),
-            object: ObjectInfo {
-                name: object_name,
-                bucket: bucket_name,
-                ..Default::default()
-            },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
-
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let version_id = req.input.version_id.clone().unwrap_or_default().to_string();
+        let result = Ok(S3Response::new(output));
+        helper = helper.version_id(version_id);
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -3519,6 +3340,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
         let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
@@ -3658,7 +3480,9 @@ impl S3 for FS {
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -3744,6 +3568,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, "s3:PutObjectTagging");
         let PutObjectTaggingInput {
             bucket,
             key: object,
@@ -3795,31 +3620,12 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedPutTagging,
-            bucket_name: bucket.clone(),
-            object: ObjectInfo {
-                name: object.clone(),
-                bucket,
-                ..Default::default()
-            },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(PutObjectTaggingOutput { version_id: None })),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
+        let result = Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -3849,6 +3655,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, "s3:DeleteObjectTagging");
         let DeleteObjectTaggingInput { bucket, key: object, .. } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
@@ -3862,31 +3669,12 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => Uuid::new_v4().to_string(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedDeleteTagging,
-            bucket_name: bucket.clone(),
-            object: ObjectInfo {
-                name: object.clone(),
-                bucket,
-                ..Default::default()
-            },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(DeleteObjectTaggingOutput { version_id: None })),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        helper = helper.version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
+        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4778,6 +4566,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectLegalHoldInput>,
     ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, "s3:GetObjectLegalHold");
         let GetObjectLegalHoldInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -4820,33 +4609,19 @@ impl S3 for FS {
             }),
         };
 
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => Uuid::new_v4().to_string(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectAccessedGetLegalHold,
-            bucket_name: bucket.clone(),
-            object: object_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        helper = helper.object(object_info).version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     async fn put_object_legal_hold(
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
     ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, "s3:PutObjectLegalHold");
         let PutObjectLegalHoldInput {
             bucket,
             key,
@@ -4899,33 +4674,19 @@ impl S3 for FS {
         let output = PutObjectLegalHoldOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         };
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedPutLegalHold,
-            bucket_name: bucket.clone(),
-            object: info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(info).version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     async fn get_object_retention(
         &self,
         req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, "s3:GetObjectRetention");
         let GetObjectRetentionInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -4960,33 +4721,19 @@ impl S3 for FS {
         let output = GetObjectRetentionOutput {
             retention: Some(ObjectLockRetention { mode, retain_until_date }),
         };
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectAccessedGetRetention,
-            bucket_name: bucket.clone(),
-            object: object_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(object_info).version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     async fn put_object_retention(
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, "s3:PutObjectRetention");
         let PutObjectRetentionInput {
             bucket,
             key,
@@ -5035,27 +4782,12 @@ impl S3 for FS {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         };
 
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => Uuid::new_v4().to_string(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectCreatedPutRetention,
-            bucket_name: bucket.clone(),
-            object: object_info,
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        helper = helper.object(object_info).version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 }
 

@@ -65,8 +65,8 @@ pub struct ApiDetails {
 }
 
 /// Builder for `ApiDetails`.
-#[derive(Default)]
-pub struct ApiDetailsBuilder(ApiDetails);
+#[derive(Default, Clone)]
+pub struct ApiDetailsBuilder(pub ApiDetails);
 
 impl ApiDetailsBuilder {
     pub fn new() -> Self {

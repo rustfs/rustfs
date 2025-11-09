@@ -112,7 +112,6 @@ mime_guess = { workspace = true }
 pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
-scopeguard.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
