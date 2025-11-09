@@ -280,7 +280,7 @@ mimalloc = "0.1"
 
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rustfs-mcp", "tokio-test", "scopeguard"]
+ignored = ["rustfs", "rustfs-mcp", "tokio-test"]
 
 [profile.release]
 opt-level = 3
