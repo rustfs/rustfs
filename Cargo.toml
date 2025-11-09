@@ -226,7 +226,6 @@ rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
 s3s = { version = "0.12.0-rc.3", features = ["minio"] }
-scopeguard = "1.2.0"
 serial_test = "3.2.0"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
