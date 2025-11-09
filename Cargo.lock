@@ -7209,7 +7209,6 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hashbrown 0.16.0",
- "once_cell",
  "quick-xml 0.38.3",
  "rayon",
  "rumqttc",
