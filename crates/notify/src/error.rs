@@ -66,4 +66,7 @@ pub enum NotificationError {
 
     #[error("System initialization error: {0}")]
     Initialization(String),
+
+    #[error("Storage not available: {0}")]
+    StorageNotAvailable(String),
 }

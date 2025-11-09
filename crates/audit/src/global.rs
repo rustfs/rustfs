@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditError, AuditResult, AuditSystem};
+use crate::{AuditEntry, AuditResult, AuditSystem};
 use rustfs_ecstore::config::Config;
 use std::sync::{Arc, OnceLock};
 use tracing::{error, trace, warn};
@@ -35,7 +35,7 @@ pub fn audit_system() -> Option<Arc<AuditSystem>> {
 macro_rules! with_audit_system {
     ($async_closure:expr) => {
         if let Some(system) = audit_system() {
-            $async_closure(system).await
+            (async move { $async_closure(system).await }).await
         } else {
             warn!("Audit system not initialized, operation skipped.");
             Ok(())
@@ -51,17 +51,17 @@ pub async fn start_audit_system(config: Config) -> AuditResult<()> {
 
 /// Stop the global audit system
 pub async fn stop_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.close()).await
+    with_audit_system!(|system: Arc<AuditSystem>| system.close())
 }
 
 /// Pause the global audit system
 pub async fn pause_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.pause()).await
+    with_audit_system!(|system: Arc<AuditSystem>| system.pause())
 }
 
 /// Resume the global audit system
 pub async fn resume_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.resume()).await
+    with_audit_system!(|system: Arc<AuditSystem>| system.resume())
 }
 
 /// Dispatch an audit log entry to all targets
@@ -77,7 +77,7 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
         }
     } else {
         // The system is not initialized at all. This is a more important state.
-        //It might be better to return an error or log a warning.
+        // It might be better to return an error or log a warning.
         warn!("Audit system not initialized, dropping audit entry.");
         // If this should be a hard failure, you can return Err(AuditError::NotInitialized("..."))
         Ok(())
@@ -86,7 +86,7 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
 
 /// Reload the global audit system configuration
 pub async fn reload_audit_config(config: Config) -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| system.reload_config(config)).await
+    with_audit_system!(|system: Arc<AuditSystem>| system.reload_config(config))
 }
 
 /// Check if the global audit system is running

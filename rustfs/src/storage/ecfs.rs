@@ -1865,7 +1865,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadBucket");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadObject");
         // mc get 2
         let HeadObjectInput {
             bucket,
@@ -2613,7 +2613,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:CreateMultipartUpload");
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:CreateMultipartUpload");
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -2757,9 +2757,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default().to_string();
         let result = Ok(S3Response::new(output));
-        helper = helper.version_id(version_id);
         let _ = helper.complete(&result);
         result
     }

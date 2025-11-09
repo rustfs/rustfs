@@ -16,7 +16,7 @@ use crate::{BucketNotificationConfig, Event, EventArgs, LifecycleError, Notifica
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::{Arc, OnceLock};
-use tracing::{error, instrument};
+use tracing::error;
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
 

@@ -24,6 +24,24 @@ use rustfs_utils::{
     extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
 };
 use s3s::{S3Request, S3Response, S3Result};
+use tokio::runtime::{Builder, Handle};
+
+/// Schedules an asynchronous task on the current runtime;
+/// if there is no runtime, creates a minimal runtime execution on a new thread.
+fn spawn_background<F>(fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = Handle::try_current() {
+        let _ = handle.spawn(fut);
+    } else {
+        std::thread::spawn(|| {
+            if let Ok(rt) = Builder::new_current_thread().enable_all().build() {
+                rt.block_on(fut);
+            }
+        });
+    }
+}
 
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
 pub struct OperationHelper {
@@ -157,7 +175,7 @@ impl Drop for OperationHelper {
     fn drop(&mut self) {
         // --- Distribute audit logs ---
         if let Some(builder) = self.audit_builder.take() {
-            tokio::spawn(async move {
+            spawn_background(async move {
                 AuditLogger::log(builder.build()).await;
             });
         }
@@ -168,7 +186,7 @@ impl Drop for OperationHelper {
                 let event_args = builder.build();
                 // Avoid generating notifications for copy requests
                 if !event_args.is_replication_request() {
-                    tokio::spawn(async move {
+                    spawn_background(async move {
                         notifier_global::notify(event_args).await;
                     });
                 }
