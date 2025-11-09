@@ -358,6 +358,7 @@ impl FS {
     }
 
     async fn put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject").suppress_event();
         let input = req.input;
 
         let PutObjectInput {
@@ -507,8 +508,8 @@ impl FS {
                     req_params: extract_req_params_header(&req.headers),
                     resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                     version_id: version_id.clone(),
-                    host: rustfs_utils::get_request_host(&req.headers),
-                    user_agent: rustfs_utils::get_request_user_agent(&req.headers),
+                    host: get_request_host(&req.headers),
+                    user_agent: get_request_user_agent(&req.headers),
                 };
 
                 // Asynchronous call will not block the response of the current request
@@ -580,7 +581,9 @@ impl FS {
             checksum_crc64nvme,
             ..Default::default()
         };
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 }
 
@@ -633,22 +636,6 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let output = CreateBucketOutput::default();
-
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::BucketCreated,
-            bucket_name: bucket.clone(),
-            object: ObjectInfo { ..Default::default() },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id: String::new(),
-            host: get_request_host(&req.headers),
-            user_agent: get_request_user_agent(&req.headers),
-        };
-
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
@@ -4408,6 +4395,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
         let GetObjectAttributesInput { bucket, key, .. } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
@@ -4426,31 +4414,19 @@ impl S3 for FS {
             object_parts: None,
             ..Default::default()
         };
-        let version_id = match req.input.version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
-        let event_args = rustfs_notify::EventArgs {
-            event_name: EventName::ObjectAccessedAttributes,
-            bucket_name: bucket.clone(),
-            object: ObjectInfo {
+
+        let version_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper
+            .object(ObjectInfo {
                 name: key.clone(),
                 bucket,
                 ..Default::default()
-            },
-            req_params: extract_req_params_header(&req.headers),
-            resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-            version_id,
-            host: rustfs_utils::get_request_host(&req.headers),
-            user_agent: rustfs_utils::get_request_user_agent(&req.headers),
-        };
+            })
+            .version_id(version_id);
 
-        // Asynchronous call will not block the response of the current request
-        tokio::spawn(async move {
-            notifier_global::notify(event_args).await;
-        });
-
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
