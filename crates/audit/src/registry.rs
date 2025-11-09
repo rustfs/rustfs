@@ -277,7 +277,7 @@ impl AuditRegistry {
 
             // 7. Save the new configuration to the system
             let Some(store) = rustfs_ecstore::new_object_layer_fn() else {
-                return Err(AuditError::ServerNotInitialized(
+                return Err(AuditError::StorageNotAvailable(
                     "Failed to save target configuration: server storage not initialized".to_string(),
                 ));
             };
@@ -286,7 +286,7 @@ impl AuditRegistry {
                 Ok(_) => info!("New audit configuration saved to system successfully"),
                 Err(e) => {
                     error!(error = %e, "Failed to save new audit configuration");
-                    return Err(AuditError::SaveConfig(e.to_string()));
+                    return Err(AuditError::SaveConfig(Box::new(e)));
                 }
             }
         }

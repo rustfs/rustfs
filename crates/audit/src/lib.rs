@@ -25,7 +25,7 @@ pub mod observability;
 pub mod registry;
 pub mod system;
 
-pub use entity::{ApiDetails, AuditEntry, LogRecord, ObjectVersion};
+pub use entity::{ApiDetails, AuditEntry, ObjectVersion};
 pub use error::{AuditError, AuditResult};
 pub use global::*;
 pub use observability::{AuditMetrics, AuditMetricsReport, PerformanceValidation};
