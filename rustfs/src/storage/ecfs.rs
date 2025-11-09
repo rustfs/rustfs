@@ -88,7 +88,7 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_notify::global::notifier_instance;
+use rustfs_notify::notifier_global;
 use rustfs_policy::{
     auth,
     policy::{
@@ -578,7 +578,7 @@ impl FS {
                     ..Default::default()
                 };
 
-                let event_args = rustfs_notify::event::EventArgs {
+                let event_args = rustfs_notify::EventArgs {
                     event_name: EventName::ObjectCreatedPut,
                     bucket_name: bucket.clone(),
                     object: _obj_info.clone(),
@@ -591,7 +591,7 @@ impl FS {
 
                 // Asynchronous call will not block the response of the current request
                 tokio::spawn(async move {
-                    notifier_instance().notify(event_args).await;
+                    notifier_global::notify(event_args).await;
                 });
             }
         }
@@ -713,7 +713,7 @@ impl S3 for FS {
 
         let output = CreateBucketOutput::default();
 
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::BucketCreated,
             bucket_name: bucket.clone(),
             object: ObjectInfo { ..Default::default() },
@@ -726,7 +726,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         let result = Ok(S3Response::new(output));
@@ -922,7 +922,7 @@ impl S3 for FS {
             None => String::new(),
         };
 
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedCopy,
             bucket_name: bucket.clone(),
             object: object_info,
@@ -935,7 +935,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1196,7 +1196,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::BucketRemoved,
             bucket_name: input.bucket,
             object: ObjectInfo { ..Default::default() },
@@ -1209,7 +1209,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(DeleteBucketOutput {}))
@@ -1320,7 +1320,7 @@ impl S3 for FS {
             EventName::ObjectRemovedDelete
         };
 
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name,
             bucket_name: bucket.clone(),
             object: ObjectInfo {
@@ -1337,7 +1337,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -1580,7 +1580,7 @@ impl S3 for FS {
                     event_name = EventName::ObjectRemovedDeleteMarkerCreated;
                 }
 
-                let event_args = rustfs_notify::event::EventArgs {
+                let event_args = rustfs_notify::EventArgs {
                     event_name,
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -1594,7 +1594,7 @@ impl S3 for FS {
                     host: rustfs_utils::get_request_host(&req.headers),
                     user_agent: rustfs_utils::get_request_user_agent(&req.headers),
                 };
-                notifier_instance().notify(event_args).await;
+                notifier_global::notify(event_args).await;
             }
         });
 
@@ -1968,7 +1968,7 @@ impl S3 for FS {
             None => String::new(),
             Some(v) => v.to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectAccessedGet,
             bucket_name: bucket.clone(),
             object: event_info,
@@ -1981,7 +1981,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -2144,7 +2144,7 @@ impl S3 for FS {
             None => String::new(),
             Some(v) => v.to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectAccessedGet,
             bucket_name: bucket,
             object: event_info,
@@ -2157,7 +2157,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -2758,7 +2758,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedPut,
             bucket_name: bucket.clone(),
             object: event_info,
@@ -2771,7 +2771,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         let result = Ok(S3Response::new(output));
@@ -2933,7 +2933,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedCompleteMultipartUpload,
             bucket_name: bucket_name.clone(),
             object: ObjectInfo {
@@ -2950,7 +2950,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -3799,7 +3799,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedPutTagging,
             bucket_name: bucket.clone(),
             object: ObjectInfo {
@@ -3816,7 +3816,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
@@ -3866,7 +3866,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedDeleteTagging,
             bucket_name: bucket.clone(),
             object: ObjectInfo {
@@ -3883,7 +3883,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
@@ -4480,7 +4480,7 @@ impl S3 for FS {
         let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| req.region.clone().unwrap_or_default());
 
         // Purge old rules and resolve new rules in parallel
-        let clear_rules = notifier_instance().clear_bucket_notification_rules(&bucket);
+        let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
@@ -4508,8 +4508,7 @@ impl S3 for FS {
         clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
 
         // Add a new notification rule
-        notifier_instance()
-            .add_event_specific_rules(&bucket, &region, &event_rules)
+        notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
@@ -4643,7 +4642,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectAccessedAttributes,
             bucket_name: bucket.clone(),
             object: ObjectInfo {
@@ -4660,7 +4659,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -4825,7 +4824,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectAccessedGetLegalHold,
             bucket_name: bucket.clone(),
             object: object_info,
@@ -4838,7 +4837,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -4904,7 +4903,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedPutLegalHold,
             bucket_name: bucket.clone(),
             object: info,
@@ -4917,7 +4916,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -4965,7 +4964,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => String::new(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectAccessedGetRetention,
             bucket_name: bucket.clone(),
             object: object_info,
@@ -4978,7 +4977,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
@@ -5040,7 +5039,7 @@ impl S3 for FS {
             Some(v) => v.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let event_args = rustfs_notify::event::EventArgs {
+        let event_args = rustfs_notify::EventArgs {
             event_name: EventName::ObjectCreatedPutRetention,
             bucket_name: bucket.clone(),
             object: object_info,
@@ -5053,7 +5052,7 @@ impl S3 for FS {
 
         // Asynchronous call will not block the response of the current request
         tokio::spawn(async move {
-            notifier_instance().notify(event_args).await;
+            notifier_global::notify(event_args).await;
         });
 
         Ok(S3Response::new(output))
