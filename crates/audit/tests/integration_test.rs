@@ -52,7 +52,7 @@ async fn test_config_parsing_webhook() {
     // We expect this to fail due to server storage not being initialized
     // but the parsing should work correctly
     match result {
-        Err(AuditError::ServerNotInitialized(_)) => {
+        Err(AuditError::StorageNotAvailable(_)) => {
             // This is expected in test environment
         }
         Err(e) => {

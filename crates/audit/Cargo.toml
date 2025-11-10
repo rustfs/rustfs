@@ -32,6 +32,7 @@ rustfs-ecstore = { workspace = true }
 chrono = { workspace = true }
 const-str = { workspace = true }
 futures = { workspace = true }
+hashbrown = { workspace = true }
 metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

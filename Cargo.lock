@@ -6921,6 +6921,7 @@ dependencies = [
  "chrono",
  "const-str",
  "futures",
+ "hashbrown 0.16.0",
  "metrics",
  "rumqttc",
  "rustfs-config",

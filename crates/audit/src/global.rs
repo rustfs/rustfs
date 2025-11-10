@@ -56,12 +56,12 @@ pub async fn stop_audit_system() -> AuditResult<()> {
 
 /// Pause the global audit system
 pub async fn pause_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| async move { system.close().await })
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.pause().await })
 }
 
 /// Resume the global audit system
 pub async fn resume_audit_system() -> AuditResult<()> {
-    with_audit_system!(|system: Arc<AuditSystem>| async move { system.close().await })
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.resume().await })
 }
 
 /// Dispatch an audit log entry to all targets

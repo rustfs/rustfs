@@ -14,6 +14,7 @@
 
 use crate::{AuditEntry, AuditError, AuditResult};
 use futures::{StreamExt, stream::FuturesUnordered};
+use hashbrown::{HashMap, HashSet};
 use rustfs_config::{
     DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
     MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
@@ -25,7 +26,6 @@ use rustfs_targets::{
     Target, TargetError,
     target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs},
 };
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -251,7 +251,7 @@ impl AuditRegistry {
             sections.extend(successes_by_section.keys().cloned());
 
             for section_name in sections {
-                let mut section_map: HashMap<String, KVS> = HashMap::new();
+                let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
 
                 // The default entry (if present) is written back to `_`
                 if let Some(default_cfg) = section_defaults.get(&section_name) {

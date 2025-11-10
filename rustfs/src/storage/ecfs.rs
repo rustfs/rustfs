@@ -14,6 +14,7 @@
 
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
+use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
@@ -3317,7 +3318,7 @@ impl S3 for FS {
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+    ) -> S3Result<S3Response<entity::CompleteMultipartUploadOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
         let input = req.input;
         let CompleteMultipartUploadInput {
@@ -3458,6 +3459,8 @@ impl S3 for FS {
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
+        output.future = None;
+        let output: entity::CompleteMultipartUploadOutput = entity::CompleteMultipartUploadOutput::from(output);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         result

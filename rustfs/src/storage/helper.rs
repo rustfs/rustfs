@@ -18,7 +18,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_ecstore::store_api::ObjectInfo;
-use rustfs_notify::{EventArgsBuilder, notifier_global};
+use rustfs_notify::{notifier_global, EventArgsBuilder};
 use rustfs_targets::EventName;
 use rustfs_utils::{
     extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
@@ -70,8 +70,8 @@ impl OperationHelper {
             .remote_host(req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default())
             .user_agent(get_request_user_agent(&req.headers))
             .req_host(get_request_host(&req.headers))
-            .req_path(req.uri().path().to_string())
-            .req_query(extract_req_params(&req.headers));
+            .req_path(req.uri.path().to_string())
+            .req_query(extract_req_params(&req));
 
         if let Some(req_id) = req.headers.get("x-amz-request-id") {
             if let Ok(id_str) = req_id.to_str() {

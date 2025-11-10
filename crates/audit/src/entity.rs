@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use chrono::{DateTime, Utc};
+use hashbrown::HashMap;
 use rustfs_targets::EventName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// ObjectVersion represents an object version with key and versionId
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
