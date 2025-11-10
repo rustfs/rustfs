@@ -12,10 +12,21 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use rustfs_targets::TargetError;
-use rustfs_targets::arn::TargetID;
+use rustfs_targets::{TargetError, arn::TargetID};
 use std::io;
 use thiserror::Error;
+
+/// Errors related to the notification system's lifecycle.
+#[derive(Debug, Error)]
+pub enum LifecycleError {
+    /// Error indicating the system has already been initialized.
+    #[error("System has already been initialized")]
+    AlreadyInitialized,
+
+    /// Error indicating the system has not been initialized yet.
+    #[error("System has not been initialized")]
+    NotInitialized,
+}
 
 /// Error types for the notification system
 #[derive(Debug, Error)]
@@ -38,11 +49,8 @@ pub enum NotificationError {
     #[error("Rule configuration error: {0}")]
     RuleConfiguration(String),
 
-    #[error("System initialization error: {0}")]
-    Initialization(String),
-
-    #[error("Notification system has already been initialized")]
-    AlreadyInitialized,
+    #[error("System lifecycle error: {0}")]
+    Lifecycle(#[from] LifecycleError),
 
     #[error("I/O error: {0}")]
     Io(io::Error),
@@ -56,6 +64,9 @@ pub enum NotificationError {
     #[error("Target '{0}' not found")]
     TargetNotFound(TargetID),
 
-    #[error("Server not initialized")]
-    ServerNotInitialized,
+    #[error("System initialization error: {0}")]
+    Initialization(String),
+
+    #[error("Storage not available: {0}")]
+    StorageNotAvailable(String),
 }

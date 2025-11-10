@@ -15,7 +15,7 @@
 use crate::{AuditEntry, AuditResult, AuditSystem};
 use rustfs_ecstore::config::Config;
 use std::sync::{Arc, OnceLock};
-use tracing::{error, warn};
+use tracing::{error, trace, warn};
 
 /// Global audit system instance
 static AUDIT_SYSTEM: OnceLock<Arc<AuditSystem>> = OnceLock::new();
@@ -30,6 +30,19 @@ pub fn audit_system() -> Option<Arc<AuditSystem>> {
     AUDIT_SYSTEM.get().cloned()
 }
 
+/// A helper macro for executing closures if the global audit system is initialized.
+/// If not initialized, log a warning and return `Ok(())`.
+macro_rules! with_audit_system {
+    ($async_closure:expr) => {
+        if let Some(system) = audit_system() {
+            (async move { $async_closure(system).await }).await
+        } else {
+            warn!("Audit system not initialized, operation skipped.");
+            Ok(())
+        }
+    };
+}
+
 /// Start the global audit system with configuration
 pub async fn start_audit_system(config: Config) -> AuditResult<()> {
     let system = init_audit_system();
@@ -38,32 +51,17 @@ pub async fn start_audit_system(config: Config) -> AuditResult<()> {
 
 /// Stop the global audit system
 pub async fn stop_audit_system() -> AuditResult<()> {
-    if let Some(system) = audit_system() {
-        system.close().await
-    } else {
-        warn!("Audit system not initialized, cannot stop");
-        Ok(())
-    }
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.close().await })
 }
 
 /// Pause the global audit system
 pub async fn pause_audit_system() -> AuditResult<()> {
-    if let Some(system) = audit_system() {
-        system.pause().await
-    } else {
-        warn!("Audit system not initialized, cannot pause");
-        Ok(())
-    }
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.pause().await })
 }
 
 /// Resume the global audit system
 pub async fn resume_audit_system() -> AuditResult<()> {
-    if let Some(system) = audit_system() {
-        system.resume().await
-    } else {
-        warn!("Audit system not initialized, cannot resume");
-        Ok(())
-    }
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.resume().await })
 }
 
 /// Dispatch an audit log entry to all targets
@@ -72,23 +70,23 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
         if system.is_running().await {
             system.dispatch(entry).await
         } else {
-            // System not running, just drop the log entry without error
+            // The system is initialized but not running (for example, it is suspended). Silently discard log entries based on original logic.
+            // For debugging purposes, it can be useful to add a trace log here.
+            trace!("Audit system is not running, dropping audit entry.");
             Ok(())
         }
     } else {
-        // System not initialized, just drop the log entry without error
+        // The system is not initialized at all. This is a more important state.
+        // It might be better to return an error or log a warning.
+        warn!("Audit system not initialized, dropping audit entry.");
+        // If this should be a hard failure, you can return Err(AuditError::NotInitialized("..."))
         Ok(())
     }
 }
 
 /// Reload the global audit system configuration
 pub async fn reload_audit_config(config: Config) -> AuditResult<()> {
-    if let Some(system) = audit_system() {
-        system.reload_config(config).await
-    } else {
-        warn!("Audit system not initialized, cannot reload config");
-        Ok(())
-    }
+    with_audit_system!(|system: Arc<AuditSystem>| async move { system.reload_config(config).await })
 }
 
 /// Check if the global audit system is running

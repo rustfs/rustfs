@@ -199,7 +199,9 @@ impl NotificationSystem {
         F: FnMut(&mut Config) -> bool, // The closure returns a boolean value indicating whether the configuration has been changed
     {
         let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::ServerNotInitialized);
+            return Err(NotificationError::StorageNotAvailable(
+                "Failed to save target configuration: server storage not initialized".to_string(),
+            ));
         };
 
         let mut new_config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())

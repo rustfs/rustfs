@@ -35,7 +35,7 @@ async fn test_complete_audit_system_lifecycle() {
 
     // Should fail in test environment but state handling should work
     match start_result {
-        Err(AuditError::ServerNotInitialized(_)) => {
+        Err(AuditError::StorageNotAvailable(_)) => {
             // Expected in test environment
             assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
         }
@@ -168,7 +168,7 @@ async fn test_config_parsing_with_multiple_instances() {
 
     // Should fail due to server storage not initialized, but parsing should work
     match result {
-        Err(AuditError::ServerNotInitialized(_)) => {
+        Err(AuditError::StorageNotAvailable(_)) => {
             // Expected - parsing worked but save failed
         }
         Err(e) => {
@@ -181,48 +181,6 @@ async fn test_config_parsing_with_multiple_instances() {
         }
     }
 }
-
-// #[tokio::test]
-// async fn test_environment_variable_precedence() {
-//     // Test that environment variables override config file settings
-//     // This test validates the ENV > file instance > file default precedence
-//     // Set some test environment variables
-//     std::env::set_var("RUSTFS_AUDIT_WEBHOOK_ENABLE_TEST", "on");
-//     std::env::set_var("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_TEST", "http://env.example.com/audit");
-//     std::env::set_var("RUSTFS_AUDIT_WEBHOOK_AUTH_TOKEN_TEST", "env-token");
-//     let mut registry = AuditRegistry::new();
-//
-//     // Create config that should be overridden by env vars
-//     let mut config = Config(HashMap::new());
-//     let mut webhook_section = HashMap::new();
-//
-//     let mut test_kvs = KVS::new();
-//     test_kvs.insert("enable".to_string(), "off".to_string()); // Should be overridden
-//     test_kvs.insert("endpoint".to_string(), "http://file.example.com/audit".to_string()); // Should be overridden
-//     test_kvs.insert("batch_size".to_string(), "10".to_string()); // Should remain from file
-//     webhook_section.insert("test".to_string(), test_kvs);
-//
-//     config.0.insert("audit_webhook".to_string(), webhook_section);
-//
-//     // Try to create targets - should use env vars for endpoint/enable, file for batch_size
-//     let result = registry.create_targets_from_config(&config).await;
-//     // Clean up env vars
-//     std::env::remove_var("RUSTFS_AUDIT_WEBHOOK_ENABLE_TEST");
-//     std::env::remove_var("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_TEST");
-//     std::env::remove_var("RUSTFS_AUDIT_WEBHOOK_AUTH_TOKEN_TEST");
-//     // Should fail due to server storage, but precedence logic should work
-//     match result {
-//         Err(AuditError::ServerNotInitialized(_)) => {
-//             // Expected - precedence parsing worked but save failed
-//         }
-//         Err(e) => {
-//             println!("Environment precedence test error: {}", e);
-//         }
-//         Ok(_) => {
-//             println!("Unexpected success in environment precedence test");
-//         }
-//     }
-// }
 
 #[test]
 fn test_target_type_validation() {
@@ -315,19 +273,18 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
     use chrono::Utc;
     use rustfs_targets::EventName;
     use serde_json::json;
-    use std::collections::HashMap;
 
-    let mut req_header = HashMap::new();
+    let mut req_header = hashbrown::HashMap::new();
     req_header.insert("authorization".to_string(), format!("Bearer test-token-{id}"));
     req_header.insert("content-type".to_string(), "application/octet-stream".to_string());
 
-    let mut resp_header = HashMap::new();
+    let mut resp_header = hashbrown::HashMap::new();
     resp_header.insert("x-response".to_string(), "ok".to_string());
 
-    let mut tags = HashMap::new();
+    let mut tags = hashbrown::HashMap::new();
     tags.insert(format!("tag-{id}"), json!("sample"));
 
-    let mut req_query = HashMap::new();
+    let mut req_query = hashbrown::HashMap::new();
     req_query.insert("id".to_string(), id.to_string());
 
     let api_details = ApiDetails {

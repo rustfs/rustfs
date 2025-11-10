@@ -276,3 +276,120 @@ impl EventArgs {
         self.req_params.contains_key("x-rustfs-source-replication-request")
     }
 }
+
+/// Builder for [`EventArgs`].
+///
+/// This builder provides a fluent API to construct an `EventArgs` instance,
+/// ensuring that all required fields are provided.
+///
+/// # Example
+///
+/// ```ignore
+/// let args = EventArgsBuilder::new(
+///     EventName::ObjectCreatedPut,
+///     "my-bucket",
+///     object_info,
+/// )
+/// .host("localhost:9000")
+/// .user_agent("my-app/1.0")
+/// .build();
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct EventArgsBuilder {
+    event_name: EventName,
+    bucket_name: String,
+    object: rustfs_ecstore::store_api::ObjectInfo,
+    req_params: HashMap<String, String>,
+    resp_elements: HashMap<String, String>,
+    version_id: String,
+    host: String,
+    user_agent: String,
+}
+
+impl EventArgsBuilder {
+    /// Creates a new builder with the required fields.
+    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
+        Self {
+            event_name,
+            bucket_name: bucket_name.into(),
+            object,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the event name.
+    pub fn event_name(mut self, event_name: EventName) -> Self {
+        self.event_name = event_name;
+        self
+    }
+
+    /// Sets the bucket name.
+    pub fn bucket_name(mut self, bucket_name: impl Into<String>) -> Self {
+        self.bucket_name = bucket_name.into();
+        self
+    }
+
+    /// Sets the object information.
+    pub fn object(mut self, object: rustfs_ecstore::store_api::ObjectInfo) -> Self {
+        self.object = object;
+        self
+    }
+
+    /// Sets the request parameters.
+    pub fn req_params(mut self, req_params: HashMap<String, String>) -> Self {
+        self.req_params = req_params;
+        self
+    }
+
+    /// Adds a single request parameter.
+    pub fn req_param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.req_params.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets the response elements.
+    pub fn resp_elements(mut self, resp_elements: HashMap<String, String>) -> Self {
+        self.resp_elements = resp_elements;
+        self
+    }
+
+    /// Adds a single response element.
+    pub fn resp_element(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.resp_elements.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets the version ID.
+    pub fn version_id(mut self, version_id: impl Into<String>) -> Self {
+        self.version_id = version_id.into();
+        self
+    }
+
+    /// Sets the host.
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.host = host.into();
+        self
+    }
+
+    /// Sets the user agent.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Builds the final `EventArgs` instance.
+    ///
+    /// This method consumes the builder and returns the constructed `EventArgs`.
+    pub fn build(self) -> EventArgs {
+        EventArgs {
+            event_name: self.event_name,
+            bucket_name: self.bucket_name,
+            object: self.object,
+            req_params: self.req_params,
+            resp_elements: self.resp_elements,
+            version_id: self.version_id,
+            host: self.host,
+            user_agent: self.user_agent,
+        }
+    }
+}

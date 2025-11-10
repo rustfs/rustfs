@@ -35,7 +35,6 @@ chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true }
-once_cell = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 rayon = { workspace = true }
 rumqttc = { workspace = true }

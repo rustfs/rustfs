@@ -73,7 +73,7 @@ async fn test_concurrent_target_creation() {
 
     // Verify it fails with expected error (server not initialized)
     match result {
-        Err(AuditError::ServerNotInitialized(_)) => {
+        Err(AuditError::StorageNotAvailable(_)) => {
             // Expected in test environment
         }
         Err(e) => {
@@ -103,17 +103,17 @@ async fn test_audit_log_dispatch_performance() {
     use std::collections::HashMap;
     let id = 1;
 
-    let mut req_header = HashMap::new();
+    let mut req_header = hashbrown::HashMap::new();
     req_header.insert("authorization".to_string(), format!("Bearer test-token-{id}"));
     req_header.insert("content-type".to_string(), "application/octet-stream".to_string());
 
-    let mut resp_header = HashMap::new();
+    let mut resp_header = hashbrown::HashMap::new();
     resp_header.insert("x-response".to_string(), "ok".to_string());
 
-    let mut tags = HashMap::new();
+    let mut tags = hashbrown::HashMap::new();
     tags.insert(format!("tag-{id}"), json!("sample"));
 
-    let mut req_query = HashMap::new();
+    let mut req_query = hashbrown::HashMap::new();
     req_query.insert("id".to_string(), id.to_string());
 
     let api_details = ApiDetails {

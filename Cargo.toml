@@ -123,7 +123,7 @@ tower-http = { version = "0.6.6", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.10.1", features = ["serde"] }
-bytesize = "2.1.0"
+bytesize = "2.2.0"
 byteorder = "1.5.0"
 flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
@@ -226,7 +226,6 @@ rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
 s3s = { version = "0.12.0-rc.3", features = ["minio"] }
-scopeguard = "1.2.0"
 serial_test = "3.2.0"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
@@ -280,7 +279,7 @@ mimalloc = "0.1"
 
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rustfs-mcp", "tokio-test", "scopeguard"]
+ignored = ["rustfs", "rustfs-mcp", "tokio-test"]
 
 [profile.release]
 opt-level = 3
