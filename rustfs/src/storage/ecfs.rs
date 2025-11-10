@@ -3459,7 +3459,6 @@ impl S3 for FS {
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
-        output.future = None;
         let output: entity::CompleteMultipartUploadOutput = entity::CompleteMultipartUploadOutput::from(output);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);

@@ -18,7 +18,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_ecstore::store_api::ObjectInfo;
-use rustfs_notify::{notifier_global, EventArgsBuilder};
+use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_targets::EventName;
 use rustfs_utils::{
     extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
