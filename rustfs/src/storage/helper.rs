@@ -83,7 +83,7 @@ impl OperationHelper {
             .user_agent(get_request_user_agent(&req.headers))
             .req_host(get_request_host(&req.headers))
             .req_path(req.uri.path().to_string())
-            .req_query(extract_req_params(&req));
+            .req_query(extract_req_params(req));
 
         if let Some(req_id) = req.headers.get("x-amz-request-id") {
             if let Ok(id_str) = req_id.to_str() {
