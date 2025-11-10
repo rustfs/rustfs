@@ -139,6 +139,8 @@ observability. If you want to start redis as well as nginx container, you can sp
    make help-docker                      # Show all Docker-related commands
    ```
 
+   > **Heads-up (macOS cross-compilation)**: macOS keeps the default `ulimit -n` at 256, so `cargo zigbuild` or `./build-rustfs.sh --platform ...` may fail with `ProcessFdQuotaExceeded` when targeting Linux. The build script now tries to raise the limit automatically, but if you still see the warning, run `ulimit -n 4096` (or higher) in your shell before building.
+
 4. **Build with helm chart(Option 4) - Cloud Native environment**
 
    Following the instructions on [helm chart README](./helm/README.md) to install RustFS on kubernetes cluster.
@@ -207,4 +209,3 @@ top charts.
 [Apache 2.0](https://opensource.org/licenses/Apache-2.0)
 
 **RustFS** is a trademark of RustFS, Inc. All other trademarks are the property of their respective owners.
-
