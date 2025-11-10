@@ -13,18 +13,10 @@
 // limitations under the License.
 
 use chrono::{DateTime, Utc};
+use hashbrown::HashMap;
 use rustfs_targets::EventName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-
-/// Trait for types that can be serialized to JSON and have a timestamp
-pub trait LogRecord {
-    /// Serialize the record to a JSON string
-    fn to_json(&self) -> String;
-    /// Get the timestamp of the record
-    fn get_timestamp(&self) -> chrono::DateTime<chrono::Utc>;
-}
 
 /// ObjectVersion represents an object version with key and versionId
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -36,19 +28,12 @@ pub struct ObjectVersion {
 }
 
 impl ObjectVersion {
-    /// Set the object name (chainable)
-    pub fn set_object_name(&mut self, name: String) -> &mut Self {
-        self.object_name = name;
-        self
-    }
-    /// Set the version ID (chainable)
-    pub fn set_version_id(&mut self, version_id: Option<String>) -> &mut Self {
-        self.version_id = version_id;
-        self
+    pub fn new(object_name: String, version_id: Option<String>) -> Self {
+        Self { object_name, version_id }
     }
 }
 
-/// ApiDetails contains API information for the audit entry
+/// `ApiDetails` contains API information for the audit entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApiDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,75 +64,86 @@ pub struct ApiDetails {
     pub time_to_response_in_ns: Option<String>,
 }
 
-impl ApiDetails {
-    /// Set API name (chainable)
-    pub fn set_name(&mut self, name: Option<String>) -> &mut Self {
-        self.name = name;
+/// Builder for `ApiDetails`.
+#[derive(Default, Clone)]
+pub struct ApiDetailsBuilder(pub ApiDetails);
+
+impl ApiDetailsBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.0.name = Some(name.into());
         self
     }
-    /// Set bucket name (chainable)
-    pub fn set_bucket(&mut self, bucket: Option<String>) -> &mut Self {
-        self.bucket = bucket;
+
+    pub fn bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.0.bucket = Some(bucket.into());
         self
     }
-    /// Set object name (chainable)
-    pub fn set_object(&mut self, object: Option<String>) -> &mut Self {
-        self.object = object;
+
+    pub fn object(mut self, object: impl Into<String>) -> Self {
+        self.0.object = Some(object.into());
         self
     }
-    /// Set objects list (chainable)
-    pub fn set_objects(&mut self, objects: Option<Vec<ObjectVersion>>) -> &mut Self {
-        self.objects = objects;
+
+    pub fn objects(mut self, objects: Vec<ObjectVersion>) -> Self {
+        self.0.objects = Some(objects);
         self
     }
-    /// Set status (chainable)
-    pub fn set_status(&mut self, status: Option<String>) -> &mut Self {
-        self.status = status;
+
+    pub fn status(mut self, status: impl Into<String>) -> Self {
+        self.0.status = Some(status.into());
         self
     }
-    /// Set status code (chainable)
-    pub fn set_status_code(&mut self, code: Option<i32>) -> &mut Self {
-        self.status_code = code;
+
+    pub fn status_code(mut self, code: i32) -> Self {
+        self.0.status_code = Some(code);
         self
     }
-    /// Set input bytes (chainable)
-    pub fn set_input_bytes(&mut self, bytes: Option<i64>) -> &mut Self {
-        self.input_bytes = bytes;
+
+    pub fn input_bytes(mut self, bytes: i64) -> Self {
+        self.0.input_bytes = Some(bytes);
         self
     }
-    /// Set output bytes (chainable)
-    pub fn set_output_bytes(&mut self, bytes: Option<i64>) -> &mut Self {
-        self.output_bytes = bytes;
+
+    pub fn output_bytes(mut self, bytes: i64) -> Self {
+        self.0.output_bytes = Some(bytes);
         self
     }
-    /// Set header bytes (chainable)
-    pub fn set_header_bytes(&mut self, bytes: Option<i64>) -> &mut Self {
-        self.header_bytes = bytes;
+
+    pub fn header_bytes(mut self, bytes: i64) -> Self {
+        self.0.header_bytes = Some(bytes);
         self
     }
-    /// Set time to first byte (chainable)
-    pub fn set_time_to_first_byte(&mut self, t: Option<String>) -> &mut Self {
-        self.time_to_first_byte = t;
+
+    pub fn time_to_first_byte(mut self, t: impl Into<String>) -> Self {
+        self.0.time_to_first_byte = Some(t.into());
         self
     }
-    /// Set time to first byte in nanoseconds (chainable)
-    pub fn set_time_to_first_byte_in_ns(&mut self, t: Option<String>) -> &mut Self {
-        self.time_to_first_byte_in_ns = t;
+
+    pub fn time_to_first_byte_in_ns(mut self, t: impl Into<String>) -> Self {
+        self.0.time_to_first_byte_in_ns = Some(t.into());
         self
     }
-    /// Set time to response (chainable)
-    pub fn set_time_to_response(&mut self, t: Option<String>) -> &mut Self {
-        self.time_to_response = t;
+
+    pub fn time_to_response(mut self, t: impl Into<String>) -> Self {
+        self.0.time_to_response = Some(t.into());
         self
     }
-    /// Set time to response in nanoseconds (chainable)
-    pub fn set_time_to_response_in_ns(&mut self, t: Option<String>) -> &mut Self {
-        self.time_to_response_in_ns = t;
+
+    pub fn time_to_response_in_ns(mut self, t: impl Into<String>) -> Self {
+        self.0.time_to_response_in_ns = Some(t.into());
         self
+    }
+
+    pub fn build(self) -> ApiDetails {
+        self.0
     }
 }
 
-/// AuditEntry represents an audit log entry
+/// `AuditEntry` represents an audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuditEntry {
     pub version: String,
@@ -155,6 +151,7 @@ pub struct AuditEntry {
     pub deployment_id: Option<String>,
     #[serde(rename = "siteName", skip_serializing_if = "Option::is_none")]
     pub site_name: Option<String>,
+    #[serde(with = "chrono::serde::ts_milliseconds")]
     pub time: DateTime<Utc>,
     pub event: EventName,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -191,200 +188,130 @@ pub struct AuditEntry {
     pub error: Option<String>,
 }
 
-impl AuditEntry {
-    /// Create a new AuditEntry with required fields
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        version: String,
-        deployment_id: Option<String>,
-        site_name: Option<String>,
-        time: DateTime<Utc>,
-        event: EventName,
-        entry_type: Option<String>,
-        trigger: String,
-        api: ApiDetails,
-    ) -> Self {
-        AuditEntry {
-            version,
-            deployment_id,
-            site_name,
-            time,
+/// Constructor for `AuditEntry`.
+pub struct AuditEntryBuilder(AuditEntry);
+
+impl AuditEntryBuilder {
+    /// Create a new builder with all required fields.
+    pub fn new(version: impl Into<String>, event: EventName, trigger: impl Into<String>, api: ApiDetails) -> Self {
+        Self(AuditEntry {
+            version: version.into(),
+            time: Utc::now(),
             event,
-            entry_type,
-            trigger,
+            trigger: trigger.into(),
             api,
-            remote_host: None,
-            request_id: None,
-            user_agent: None,
-            req_path: None,
-            req_host: None,
-            req_node: None,
-            req_claims: None,
-            req_query: None,
-            req_header: None,
-            resp_header: None,
-            tags: None,
-            access_key: None,
-            parent_user: None,
-            error: None,
-        }
+            ..Default::default()
+        })
     }
 
-    /// Set version (chainable)
-    pub fn set_version(&mut self, version: String) -> &mut Self {
-        self.version = version;
-        self
-    }
-    /// Set deployment ID (chainable)
-    pub fn set_deployment_id(&mut self, id: Option<String>) -> &mut Self {
-        self.deployment_id = id;
-        self
-    }
-    /// Set site name (chainable)
-    pub fn set_site_name(&mut self, name: Option<String>) -> &mut Self {
-        self.site_name = name;
-        self
-    }
-    /// Set time (chainable)
-    pub fn set_time(&mut self, time: DateTime<Utc>) -> &mut Self {
-        self.time = time;
-        self
-    }
-    /// Set event (chainable)
-    pub fn set_event(&mut self, event: EventName) -> &mut Self {
-        self.event = event;
-        self
-    }
-    /// Set entry type (chainable)
-    pub fn set_entry_type(&mut self, entry_type: Option<String>) -> &mut Self {
-        self.entry_type = entry_type;
-        self
-    }
-    /// Set trigger (chainable)
-    pub fn set_trigger(&mut self, trigger: String) -> &mut Self {
-        self.trigger = trigger;
-        self
-    }
-    /// Set API details (chainable)
-    pub fn set_api(&mut self, api: ApiDetails) -> &mut Self {
-        self.api = api;
-        self
-    }
-    /// Set remote host (chainable)
-    pub fn set_remote_host(&mut self, host: Option<String>) -> &mut Self {
-        self.remote_host = host;
-        self
-    }
-    /// Set request ID (chainable)
-    pub fn set_request_id(&mut self, id: Option<String>) -> &mut Self {
-        self.request_id = id;
-        self
-    }
-    /// Set user agent (chainable)
-    pub fn set_user_agent(&mut self, agent: Option<String>) -> &mut Self {
-        self.user_agent = agent;
-        self
-    }
-    /// Set request path (chainable)
-    pub fn set_req_path(&mut self, path: Option<String>) -> &mut Self {
-        self.req_path = path;
-        self
-    }
-    /// Set request host (chainable)
-    pub fn set_req_host(&mut self, host: Option<String>) -> &mut Self {
-        self.req_host = host;
-        self
-    }
-    /// Set request node (chainable)
-    pub fn set_req_node(&mut self, node: Option<String>) -> &mut Self {
-        self.req_node = node;
-        self
-    }
-    /// Set request claims (chainable)
-    pub fn set_req_claims(&mut self, claims: Option<HashMap<String, Value>>) -> &mut Self {
-        self.req_claims = claims;
-        self
-    }
-    /// Set request query (chainable)
-    pub fn set_req_query(&mut self, query: Option<HashMap<String, String>>) -> &mut Self {
-        self.req_query = query;
-        self
-    }
-    /// Set request header (chainable)
-    pub fn set_req_header(&mut self, header: Option<HashMap<String, String>>) -> &mut Self {
-        self.req_header = header;
-        self
-    }
-    /// Set response header (chainable)
-    pub fn set_resp_header(&mut self, header: Option<HashMap<String, String>>) -> &mut Self {
-        self.resp_header = header;
-        self
-    }
-    /// Set tags (chainable)
-    pub fn set_tags(&mut self, tags: Option<HashMap<String, Value>>) -> &mut Self {
-        self.tags = tags;
-        self
-    }
-    /// Set access key (chainable)
-    pub fn set_access_key(&mut self, key: Option<String>) -> &mut Self {
-        self.access_key = key;
-        self
-    }
-    /// Set parent user (chainable)
-    pub fn set_parent_user(&mut self, user: Option<String>) -> &mut Self {
-        self.parent_user = user;
-        self
-    }
-    /// Set error message (chainable)
-    pub fn set_error(&mut self, error: Option<String>) -> &mut Self {
-        self.error = error;
+    // event
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.0.version = version.into();
         self
     }
 
-    /// Build AuditEntry from context or parameters (example, can be extended)
-    pub fn from_context(
-        version: String,
-        deployment_id: Option<String>,
-        time: DateTime<Utc>,
-        event: EventName,
-        trigger: String,
-        api: ApiDetails,
-        tags: Option<HashMap<String, Value>>,
-    ) -> Self {
-        AuditEntry {
-            version,
-            deployment_id,
-            site_name: None,
-            time,
-            event,
-            entry_type: None,
-            trigger,
-            api,
-            remote_host: None,
-            request_id: None,
-            user_agent: None,
-            req_path: None,
-            req_host: None,
-            req_node: None,
-            req_claims: None,
-            req_query: None,
-            req_header: None,
-            resp_header: None,
-            tags,
-            access_key: None,
-            parent_user: None,
-            error: None,
-        }
+    pub fn event(mut self, event: EventName) -> Self {
+        self.0.event = event;
+        self
     }
-}
 
-impl LogRecord for AuditEntry {
-    /// Serialize AuditEntry to JSON string
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| String::from("{}"))
+    pub fn api(mut self, api_details: ApiDetails) -> Self {
+        self.0.api = api_details;
+        self
     }
-    /// Get the timestamp of the audit entry
-    fn get_timestamp(&self) -> DateTime<Utc> {
-        self.time
+
+    pub fn deployment_id(mut self, id: impl Into<String>) -> Self {
+        self.0.deployment_id = Some(id.into());
+        self
+    }
+
+    pub fn site_name(mut self, name: impl Into<String>) -> Self {
+        self.0.site_name = Some(name.into());
+        self
+    }
+
+    pub fn time(mut self, time: DateTime<Utc>) -> Self {
+        self.0.time = time;
+        self
+    }
+
+    pub fn entry_type(mut self, entry_type: impl Into<String>) -> Self {
+        self.0.entry_type = Some(entry_type.into());
+        self
+    }
+
+    pub fn remote_host(mut self, host: impl Into<String>) -> Self {
+        self.0.remote_host = Some(host.into());
+        self
+    }
+
+    pub fn request_id(mut self, id: impl Into<String>) -> Self {
+        self.0.request_id = Some(id.into());
+        self
+    }
+
+    pub fn user_agent(mut self, agent: impl Into<String>) -> Self {
+        self.0.user_agent = Some(agent.into());
+        self
+    }
+
+    pub fn req_path(mut self, path: impl Into<String>) -> Self {
+        self.0.req_path = Some(path.into());
+        self
+    }
+
+    pub fn req_host(mut self, host: impl Into<String>) -> Self {
+        self.0.req_host = Some(host.into());
+        self
+    }
+
+    pub fn req_node(mut self, node: impl Into<String>) -> Self {
+        self.0.req_node = Some(node.into());
+        self
+    }
+
+    pub fn req_claims(mut self, claims: HashMap<String, Value>) -> Self {
+        self.0.req_claims = Some(claims);
+        self
+    }
+
+    pub fn req_query(mut self, query: HashMap<String, String>) -> Self {
+        self.0.req_query = Some(query);
+        self
+    }
+
+    pub fn req_header(mut self, header: HashMap<String, String>) -> Self {
+        self.0.req_header = Some(header);
+        self
+    }
+
+    pub fn resp_header(mut self, header: HashMap<String, String>) -> Self {
+        self.0.resp_header = Some(header);
+        self
+    }
+
+    pub fn tags(mut self, tags: HashMap<String, Value>) -> Self {
+        self.0.tags = Some(tags);
+        self
+    }
+
+    pub fn access_key(mut self, key: impl Into<String>) -> Self {
+        self.0.access_key = Some(key.into());
+        self
+    }
+
+    pub fn parent_user(mut self, user: impl Into<String>) -> Self {
+        self.0.parent_user = Some(user.into());
+        self
+    }
+
+    pub fn error(mut self, error: impl Into<String>) -> Self {
+        self.0.error = Some(error.into());
+        self
+    }
+
+    /// Construct the final `AuditEntry`.
+    pub fn build(self) -> AuditEntry {
+        self.0
     }
 }

@@ -145,15 +145,15 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
                 )
             });
     }
-
-    println!(
-        "Starting Tokio runtime with configured parameters:\n\
+    if !rustfs_obs::is_production_environment() {
+        println!(
+            "Starting Tokio runtime with configured parameters:\n\
          worker_threads: {worker_threads}, max_blocking_threads: {max_blocking_threads}, \
          thread_stack_size: {thread_stack_size}, thread_keep_alive: {thread_keep_alive}, \
          global_queue_interval: {global_queue_interval}, event_interval: {event_interval}, \
          max_io_events_per_tick: {max_io_events_per_tick}, thread_name: {thread_name}"
-    );
-
+        );
+    }
     builder
 }
 
