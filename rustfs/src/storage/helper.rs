@@ -24,6 +24,7 @@ use rustfs_utils::{
     extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
 };
 use s3s::{S3Request, S3Response, S3Result};
+use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 
 /// Schedules an asynchronous task on the current runtime;
