@@ -54,10 +54,22 @@ pub struct OperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, trigger: &'static str) -> Self {
-        let bucket = req.bucket().unwrap_or_default().to_string();
-        let object_key = req.key().unwrap_or_default().to_string();
+        // Parse path -> bucket/object
+        let path = req.uri.path().trim_start_matches('/');
+        let mut segs = path.splitn(2, '/');
+        let bucket = segs.next().unwrap_or("").to_string();
+        let object_key = segs.next().unwrap_or("").to_string();
 
-        // ---Initialize audit builder ---
+        // Infer remote address
+        let remote_host = req
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+            .unwrap_or("")
+            .to_string();
+
+        // Initialize audit builder
         let mut api_builder = ApiDetailsBuilder::new().name(trigger);
         if !bucket.is_empty() {
             api_builder = api_builder.bucket(&bucket);
@@ -65,9 +77,9 @@ impl OperationHelper {
         if !object_key.is_empty() {
             api_builder = api_builder.object(&object_key);
         }
-
+        // Audit builder
         let mut audit_builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
-            .remote_host(req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default())
+            .remote_host(remote_host)
             .user_agent(get_request_user_agent(&req.headers))
             .req_host(get_request_host(&req.headers))
             .req_path(req.uri.path().to_string())
@@ -79,7 +91,7 @@ impl OperationHelper {
             }
         }
 
-        // ---Initialize event builder ---
+        // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = EventArgsBuilder::new(event, bucket, ObjectInfo::default())
             .host(get_request_host(&req.headers))
@@ -127,7 +139,7 @@ impl OperationHelper {
     /// This method should be called immediately before the function returns.
     /// It consumes and prepares auxiliary structures for use during `drop`.
     pub fn complete(mut self, result: &S3Result<S3Response<impl Send + Sync>>) -> Self {
-        // --- Complete audit log ---
+        // Complete audit log
         if let Some(builder) = self.audit_builder.take() {
             let (status, status_code, error_msg) = match result {
                 Ok(res) => ("success".to_string(), res.status.unwrap_or(StatusCode::OK).as_u16() as i32, None),
@@ -156,7 +168,7 @@ impl OperationHelper {
             self.api_builder = ApiDetailsBuilder(api_details); // Store final details for Drop use
         }
 
-        // --- Completion event notification (only on success) ---
+        // Completion event notification (only on success)
         if let (Some(builder), Ok(res)) = (self.event_builder.take(), result) {
             self.event_builder = Some(builder.resp_elements(extract_resp_elements(res)));
         }
@@ -173,14 +185,14 @@ impl OperationHelper {
 
 impl Drop for OperationHelper {
     fn drop(&mut self) {
-        // --- Distribute audit logs ---
+        // Distribute audit logs
         if let Some(builder) = self.audit_builder.take() {
             spawn_background(async move {
                 AuditLogger::log(builder.build()).await;
             });
         }
 
-        // --- Distribute event notification (only on success) ---
+        // Distribute event notification (only on success)
         if self.api_builder.0.status.as_deref() == Some("success") {
             if let Some(builder) = self.event_builder.take() {
                 let event_args = builder.build();

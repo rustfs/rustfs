@@ -878,7 +878,7 @@ impl S3 for FS {
         }
 
         //let mut api_err;
-        let mut _status_code = http::StatusCode::OK;
+        let mut _status_code = StatusCode::OK;
         let mut already_restored = false;
         if let Err(_err) = rreq.validate(store.clone()) {
             //api_err = to_api_err(ErrMalformedXML);
@@ -895,7 +895,7 @@ impl S3 for FS {
                 ));
             }
             if !obj_info.restore_ongoing && obj_info.restore_expires.unwrap().unix_timestamp() != 0 {
-                _status_code = http::StatusCode::ACCEPTED;
+                _status_code = StatusCode::ACCEPTED;
                 already_restored = true;
             }
         }
@@ -3318,7 +3318,7 @@ impl S3 for FS {
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<entity::CompleteMultipartUploadOutput>> {
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
         let input = req.input;
         let CompleteMultipartUploadInput {
@@ -3430,6 +3430,26 @@ impl S3 for FS {
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
             location: Some("us-east-1".to_string()),
+            server_side_encryption: server_side_encryption.clone(), // TDD: Return encryption info
+            ssekms_key_id: ssekms_key_id.clone(),                   // TDD: Return KMS key ID if present
+            checksum_crc32: checksum_crc32.clone(),
+            checksum_crc32c: checksum_crc32c.clone(),
+            checksum_sha1: checksum_sha1.clone(),
+            checksum_sha256: checksum_sha256.clone(),
+            checksum_crc64nvme: checksum_crc64nvme.clone(),
+            checksum_type: checksum_type.clone(),
+            ..Default::default()
+        };
+        info!(
+            "TDD: Created output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption, output.ssekms_key_id
+        );
+
+        let helper_output = entity::CompleteMultipartUploadOutput {
+            bucket: Some(bucket.clone()),
+            key: Some(key.clone()),
+            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
+            location: Some("us-east-1".to_string()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
             checksum_crc32,
@@ -3440,10 +3460,6 @@ impl S3 for FS {
             checksum_type,
             ..Default::default()
         };
-        info!(
-            "TDD: Created output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
 
         let mt2 = HashMap::new();
         let repoptions =
@@ -3459,10 +3475,9 @@ impl S3 for FS {
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
-        let output: entity::CompleteMultipartUploadOutput = entity::CompleteMultipartUploadOutput::from(output);
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
+        let helper_result = Ok(S3Response::new(helper_output));
+        let _ = helper.complete(&helper_result);
+        Ok(S3Response::new(output))
     }
 
     #[instrument(level = "debug", skip(self))]
