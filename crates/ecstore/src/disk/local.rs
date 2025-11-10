@@ -1136,23 +1136,21 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            if !dir_stack.is_empty() {
-                if let Some(pop) = dir_stack.last().cloned() {
-                    if pop < name {
-                        out.write_obj(&MetaCacheEntry {
-                            name: pop.clone(),
-                            ..Default::default()
-                        })
-                        .await?;
+            while let Some(pop) = dir_stack.last().cloned()
+                && pop < name
+            {
+                out.write_obj(&MetaCacheEntry {
+                    name: pop.clone(),
+                    ..Default::default()
+                })
+                .await?;
 
-                        if opts.recursive {
-                            if let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned)).await {
-                                error!("scan_dir err {:?}", er);
-                            }
-                        }
-                        dir_stack.pop();
+                if opts.recursive {
+                    if let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned)).await {
+                        error!("scan_dir err {:?}", er);
                     }
                 }
+                dir_stack.pop();
             }
 
             let mut meta = MetaCacheEntry {
