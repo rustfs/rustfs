@@ -34,7 +34,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     if let Ok(handle) = Handle::try_current() {
-        let _ = handle.spawn(fut);
+        drop(handle.spawn(fut));
     } else {
         std::thread::spawn(|| {
             if let Ok(rt) = Builder::new_current_thread().enable_all().build() {
