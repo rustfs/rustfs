@@ -21,7 +21,7 @@ pub type AuditResult<T> = Result<T, AuditError>;
 #[derive(Error, Debug)]
 pub enum AuditError {
     #[error("Configuration error: {0}")]
-    Configuration(String),
+    Configuration(String, #[source] Option<Box<dyn std::error::Error + Send + Sync>>),
 
     #[error("config not loaded")]
     ConfigNotLoaded,
@@ -35,11 +35,14 @@ pub enum AuditError {
     #[error("System already initialized")]
     AlreadyInitialized,
 
+    #[error("Storage not available: {0}")]
+    StorageNotAvailable(String),
+
     #[error("Failed to save configuration: {0}")]
-    SaveConfig(String),
+    SaveConfig(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Failed to load configuration: {0}")]
-    LoadConfig(String),
+    LoadConfig(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -49,7 +52,4 @@ pub enum AuditError {
 
     #[error("Join error: {0}")]
     Join(#[from] tokio::task::JoinError),
-
-    #[error("Server storage not initialized: {0}")]
-    ServerNotInitialized(String),
 }

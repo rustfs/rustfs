@@ -146,7 +146,7 @@ impl AuditSystem {
                 warn!("Audit system is already paused");
                 Ok(())
             }
-            _ => Err(AuditError::Configuration("Cannot pause audit system in current state".to_string())),
+            _ => Err(AuditError::Configuration("Cannot pause audit system in current state".to_string(), None)),
         }
     }
 
@@ -164,7 +164,7 @@ impl AuditSystem {
                 warn!("Audit system is already running");
                 Ok(())
             }
-            _ => Err(AuditError::Configuration("Cannot resume audit system in current state".to_string())),
+            _ => Err(AuditError::Configuration("Cannot resume audit system in current state".to_string(), None)),
         }
     }
 
@@ -460,7 +460,7 @@ impl AuditSystem {
             info!(target_id = %target_id, "Target enabled");
             Ok(())
         } else {
-            Err(AuditError::Configuration(format!("Target not found: {target_id}")))
+            Err(AuditError::Configuration(format!("Target not found: {target_id}"), None))
         }
     }
 
@@ -473,7 +473,7 @@ impl AuditSystem {
             info!(target_id = %target_id, "Target disabled");
             Ok(())
         } else {
-            Err(AuditError::Configuration(format!("Target not found: {target_id}")))
+            Err(AuditError::Configuration(format!("Target not found: {target_id}"), None))
         }
     }
 
@@ -487,7 +487,7 @@ impl AuditSystem {
             info!(target_id = %target_id, "Target removed");
             Ok(())
         } else {
-            Err(AuditError::Configuration(format!("Target not found: {target_id}")))
+            Err(AuditError::Configuration(format!("Target not found: {target_id}"), None))
         }
     }
 

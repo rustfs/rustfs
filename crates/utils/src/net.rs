@@ -14,6 +14,8 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
+#[cfg(test)]
+use std::sync::MutexGuard;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
@@ -71,18 +73,41 @@ fn clear_dns_cache() {
 }
 
 #[cfg(test)]
-pub fn set_mock_dns_resolver<F>(resolver: F)
-where
-    F: Fn(&str) -> std::io::Result<HashSet<IpAddr>> + Send + Sync + 'static,
-{
-    *CUSTOM_DNS_RESOLVER.write().unwrap() = Some(Arc::new(resolver));
+static DNS_RESOLVER_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
+fn reset_dns_resolver_inner() {
+    *CUSTOM_DNS_RESOLVER.write().unwrap() = None;
     clear_dns_cache();
 }
 
 #[cfg(test)]
-pub fn reset_dns_resolver() {
-    *CUSTOM_DNS_RESOLVER.write().unwrap() = None;
+pub struct MockResolverGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for MockResolverGuard {
+    fn drop(&mut self) {
+        reset_dns_resolver_inner();
+    }
+}
+
+#[cfg(test)]
+pub fn set_mock_dns_resolver<F>(resolver: F) -> MockResolverGuard
+where
+    F: Fn(&str) -> std::io::Result<HashSet<IpAddr>> + Send + Sync + 'static,
+{
+    let lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
+    *CUSTOM_DNS_RESOLVER.write().unwrap() = Some(Arc::new(resolver));
     clear_dns_cache();
+    MockResolverGuard { _lock: lock }
+}
+
+#[cfg(test)]
+pub fn reset_dns_resolver() {
+    let _lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
+    reset_dns_resolver_inner();
 }
 
 /// helper for validating if the provided arg is an ip address.
@@ -403,7 +428,7 @@ mod test {
 
     #[test]
     fn test_is_local_host() {
-        set_mock_dns_resolver(mock_resolver);
+        let _resolver_guard = set_mock_dns_resolver(mock_resolver);
 
         // Test localhost domain
         let localhost_host = Host::Domain("localhost");
@@ -429,13 +454,11 @@ mod test {
         // Test invalid domain should return error
         let invalid_host = Host::Domain("invalid.nonexistent.domain.example");
         assert!(is_local_host(invalid_host, 0, 0).is_err());
-
-        reset_dns_resolver();
     }
 
     #[tokio::test]
     async fn test_get_host_ip() {
-        set_mock_dns_resolver(mock_resolver);
+        let _resolver_guard = set_mock_dns_resolver(mock_resolver);
 
         // Test IPv4 address
         let ipv4_host = Host::Ipv4(Ipv4Addr::new(192, 168, 1, 1));
@@ -462,8 +485,6 @@ mod test {
         // Test invalid domain
         let invalid_host = Host::Domain("invalid.nonexistent.domain.example");
         assert!(get_host_ip(invalid_host).await.is_err());
-
-        reset_dns_resolver();
     }
 
     #[test]

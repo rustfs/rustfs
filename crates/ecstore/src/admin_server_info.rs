@@ -34,15 +34,18 @@ use rustfs_protos::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use time::OffsetDateTime;
+use tokio::time::timeout;
 use tonic::Request;
 use tracing::warn;
 
 use shadow_rs::shadow;
 
 shadow!(build);
+
+const SERVER_PING_TIMEOUT: Duration = Duration::from_secs(1);
 
 // pub const ITEM_OFFLINE: &str = "offline";
 // pub const ITEM_INITIALIZING: &str = "initializing";
@@ -83,42 +86,45 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
         endpoint.url.host_str().unwrap(),
         endpoint.url.port().unwrap()
     );
-    let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let payload = fbb.create_vector(b"hello world");
 
-    let mut builder = PingBodyBuilder::new(&mut fbb);
-    builder.add_payload(payload);
-    let root = builder.finish();
-    fbb.finish(root, None);
+    let ping_task = async {
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let payload = fbb.create_vector(b"hello world");
 
-    let finished_data = fbb.finished_data();
+        let mut builder = PingBodyBuilder::new(&mut fbb);
+        builder.add_payload(payload);
+        let root = builder.finish();
+        fbb.finish(root, None);
 
-    let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
-    assert!(decoded_payload.is_ok());
+        let finished_data = fbb.finished_data();
 
-    // Create the client
-    let mut client = node_service_time_out_client(&addr)
+        let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
+        assert!(decoded_payload.is_ok());
+
+        let mut client = node_service_time_out_client(&addr)
+            .await
+            .map_err(|err| Error::other(err.to_string()))?;
+
+        let request = Request::new(PingRequest {
+            version: 1,
+            body: bytes::Bytes::copy_from_slice(finished_data),
+        });
+
+        let response: PingResponse = client.ping(request).await?.into_inner();
+
+        let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
+        if let Err(e) = ping_response_body {
+            eprintln!("{e}");
+        } else {
+            println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
+        }
+
+        Ok(())
+    };
+
+    timeout(SERVER_PING_TIMEOUT, ping_task)
         .await
-        .map_err(|err| Error::other(err.to_string()))?;
-
-    // Build the PingRequest
-    let request = Request::new(PingRequest {
-        version: 1,
-        body: bytes::Bytes::copy_from_slice(finished_data),
-    });
-
-    // Send the request and obtain the response
-    let response: PingResponse = client.ping(request).await?.into_inner();
-
-    // Print the response
-    let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
-    if let Err(e) = ping_response_body {
-        eprintln!("{e}");
-    } else {
-        println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
-    }
-
-    Ok(())
+        .map_err(|_| Error::other("server ping timeout"))?
 }
 
 pub async fn get_local_server_property() -> ServerProperties {

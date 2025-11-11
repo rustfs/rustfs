@@ -18,18 +18,18 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
-pub mod error;
-pub mod event;
+mod error;
+mod event;
 pub mod factory;
-pub mod global;
+mod global;
 pub mod integration;
 pub mod notifier;
 pub mod registry;
 pub mod rules;
 pub mod stream;
-// Re-exports
-pub use error::NotificationError;
-pub use event::{Event, EventArgs};
-pub use global::{initialize, is_notification_system_initialized, notification_system};
+
+pub use error::{LifecycleError, NotificationError};
+pub use event::{Event, EventArgs, EventArgsBuilder};
+pub use global::{initialize, is_notification_system_initialized, notification_system, notifier_global};
 pub use integration::NotificationSystem;
 pub use rules::BucketNotificationConfig;

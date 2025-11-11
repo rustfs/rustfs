@@ -14,6 +14,7 @@
 
 use crate::{AuditEntry, AuditError, AuditResult};
 use futures::{StreamExt, stream::FuturesUnordered};
+use hashbrown::{HashMap, HashSet};
 use rustfs_config::{
     DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
     MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
@@ -25,7 +26,6 @@ use rustfs_targets::{
     Target, TargetError,
     target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs},
 };
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -251,7 +251,7 @@ impl AuditRegistry {
             sections.extend(successes_by_section.keys().cloned());
 
             for section_name in sections {
-                let mut section_map: HashMap<String, KVS> = HashMap::new();
+                let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
 
                 // The default entry (if present) is written back to `_`
                 if let Some(default_cfg) = section_defaults.get(&section_name) {
@@ -277,7 +277,7 @@ impl AuditRegistry {
 
             // 7. Save the new configuration to the system
             let Some(store) = rustfs_ecstore::new_object_layer_fn() else {
-                return Err(AuditError::ServerNotInitialized(
+                return Err(AuditError::StorageNotAvailable(
                     "Failed to save target configuration: server storage not initialized".to_string(),
                 ));
             };
@@ -286,7 +286,7 @@ impl AuditRegistry {
                 Ok(_) => info!("New audit configuration saved to system successfully"),
                 Err(e) => {
                     error!(error = %e, "Failed to save new audit configuration");
-                    return Err(AuditError::SaveConfig(e.to_string()));
+                    return Err(AuditError::SaveConfig(Box::new(e)));
                 }
             }
         }

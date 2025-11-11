@@ -58,7 +58,7 @@ use rustfs_ecstore::{
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
-use rustfs_notify::global::notifier_instance;
+use rustfs_notify::notifier_global;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -517,8 +517,7 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
                 process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), TargetID::from_str);
                 process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), TargetID::from_str);
 
-                if let Err(e) = notifier_instance()
-                    .add_event_specific_rules(bucket, region, &event_rules)
+                if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
                     .await
                     .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
                 {

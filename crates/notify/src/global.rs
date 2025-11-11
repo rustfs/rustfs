@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{BucketNotificationConfig, Event, EventArgs, NotificationError, NotificationSystem};
-use once_cell::sync::Lazy;
+use crate::{BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationSystem};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::EventName;
-use rustfs_targets::arn::TargetID;
+use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::{Arc, OnceLock};
-use tracing::{error, instrument};
+use tracing::error;
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
-// Create a globally unique Notifier instance
-static GLOBAL_NOTIFIER: Lazy<Notifier> = Lazy::new(|| Notifier {});
 
 /// Initialize the global notification system with the given configuration.
 /// This function should only be called once throughout the application life cycle.
@@ -34,7 +30,7 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
 
     match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
         Ok(_) => Ok(()),
-        Err(_) => Err(NotificationError::AlreadyInitialized),
+        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
     }
 }
 
@@ -49,14 +45,11 @@ pub fn is_notification_system_initialized() -> bool {
     NOTIFICATION_SYSTEM.get().is_some()
 }
 
-/// Returns a reference to the global Notifier instance.
-pub fn notifier_instance() -> &'static Notifier {
-    &GLOBAL_NOTIFIER
-}
+/// A module providing the public API for event notification.
+pub mod notifier_global {
+    use super::*;
+    use tracing::instrument;
 
-pub struct Notifier {}
-
-impl Notifier {
     /// Notify an event asynchronously.
     /// This is the only entry point for all event notifications in the system.
     /// # Parameter
@@ -67,8 +60,8 @@ impl Notifier {
     ///
     /// # Using
     /// This function is used to notify events in the system, such as object creation, deletion, or updates.
-    #[instrument(skip(self, args))]
-    pub async fn notify(&self, args: EventArgs) {
+    #[instrument(skip(args))]
+    pub async fn notify(args: EventArgs) {
         // Dependency injection or service positioning mode obtain NotificationSystem instance
         let notification_sys = match notification_system() {
             // If the notification system itself cannot be retrieved, it will be returned directly
@@ -110,7 +103,6 @@ impl Notifier {
     /// # Using
     /// This function allows you to dynamically add notification rules for a specific bucket.
     pub async fn add_bucket_notification_rule(
-        &self,
         bucket_name: &str,
         region: &str,
         event_names: &[EventName],
@@ -137,7 +129,7 @@ impl Notifier {
         // Get global NotificationSystem
         let notification_sys = match notification_system() {
             Some(sys) => sys,
-            None => return Err(NotificationError::ServerNotInitialized),
+            None => return Err(NotificationError::Lifecycle(LifecycleError::NotInitialized)),
         };
 
         // Loading configuration
@@ -159,7 +151,6 @@ impl Notifier {
     /// # Using
     /// Supports notification rules for adding multiple event types, prefixes, suffixes, and targets to the same bucket in batches.
     pub async fn add_event_specific_rules(
-        &self,
         bucket_name: &str,
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
@@ -176,10 +167,7 @@ impl Notifier {
         }
 
         // Get global NotificationSystem instance
-        let notification_sys = match notification_system() {
-            Some(sys) => sys,
-            None => return Err(NotificationError::ServerNotInitialized),
-        };
+        let notification_sys = notification_system().ok_or(NotificationError::Lifecycle(LifecycleError::NotInitialized))?;
 
         // Loading configuration
         notification_sys
@@ -196,12 +184,9 @@ impl Notifier {
     /// This function allows you to clear all notification rules for a specific bucket.
     /// This is useful when you want to reset the notification configuration for a bucket.
     ///
-    pub async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
+    pub async fn clear_bucket_notification_rules(bucket_name: &str) -> Result<(), NotificationError> {
         // Get global NotificationSystem instance
-        let notification_sys = match notification_system() {
-            Some(sys) => sys,
-            None => return Err(NotificationError::ServerNotInitialized),
-        };
+        let notification_sys = notification_system().ok_or(NotificationError::Lifecycle(LifecycleError::NotInitialized))?;
 
         // Clear configuration
         notification_sys.remove_bucket_notification_config(bucket_name).await;

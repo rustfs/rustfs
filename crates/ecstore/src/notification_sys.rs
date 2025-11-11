@@ -26,9 +26,11 @@ use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties};
 use std::collections::hash_map::DefaultHasher;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use tokio::time::timeout;
 use tracing::{error, warn};
 
 lazy_static! {
@@ -220,24 +222,21 @@ impl NotificationSys {
 
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
+        let endpoints = get_global_endpoints();
+        let peer_timeout = Duration::from_secs(2);
 
         for client in self.peer_clients.iter() {
+            let endpoints = endpoints.clone();
             futures.push(async move {
                 if let Some(client) = client {
-                    match client.server_info().await {
-                        Ok(info) => info,
-                        Err(_) => ServerProperties {
-                            uptime: SystemTime::now()
-                                .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
-                                .unwrap_or_default()
-                                .as_secs(),
-                            version: get_commit_id(),
-                            endpoint: client.host.to_string(),
-                            state: ItemState::Offline.to_string().to_owned(),
-                            disks: get_offline_disks(&client.host.to_string(), &get_global_endpoints()),
-                            ..Default::default()
-                        },
-                    }
+                    let host = client.host.to_string();
+                    call_peer_with_timeout(
+                        peer_timeout,
+                        &host,
+                        || client.server_info(),
+                        || offline_server_properties(&host, &endpoints),
+                    )
+                    .await
                 } else {
                     ServerProperties::default()
                 }
@@ -694,6 +693,43 @@ impl NotificationSys {
     }
 }
 
+async fn call_peer_with_timeout<F, Fut>(
+    timeout_dur: Duration,
+    host_label: &str,
+    op: F,
+    fallback: impl FnOnce() -> ServerProperties,
+) -> ServerProperties
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<ServerProperties>> + Send,
+{
+    match timeout(timeout_dur, op()).await {
+        Ok(Ok(info)) => info,
+        Ok(Err(err)) => {
+            warn!("peer {host_label} server_info failed: {err}");
+            fallback()
+        }
+        Err(_) => {
+            warn!("peer {host_label} server_info timed out after {:?}", timeout_dur);
+            fallback()
+        }
+    }
+}
+
+fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> ServerProperties {
+    ServerProperties {
+        uptime: SystemTime::now()
+            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+            .unwrap_or_default()
+            .as_secs(),
+        version: get_commit_id(),
+        endpoint: host.to_string(),
+        state: ItemState::Offline.to_string().to_owned(),
+        disks: get_offline_disks(host, endpoints),
+        ..Default::default()
+    }
+}
+
 fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec<rustfs_madmin::Disk> {
     let mut offline_disks = Vec::new();
 
@@ -713,4 +749,58 @@ fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec
     }
 
     offline_disks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_props(endpoint: &str) -> ServerProperties {
+        ServerProperties {
+            endpoint: endpoint.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn call_peer_with_timeout_returns_value_when_fast() {
+        let result = call_peer_with_timeout(
+            Duration::from_millis(50),
+            "peer-1",
+            || async { Ok::<_, Error>(build_props("fast")) },
+            || build_props("fallback"),
+        )
+        .await;
+
+        assert_eq!(result.endpoint, "fast");
+    }
+
+    #[tokio::test]
+    async fn call_peer_with_timeout_uses_fallback_on_error() {
+        let result = call_peer_with_timeout(
+            Duration::from_millis(50),
+            "peer-2",
+            || async { Err::<ServerProperties, _>(Error::other("boom")) },
+            || build_props("fallback"),
+        )
+        .await;
+
+        assert_eq!(result.endpoint, "fallback");
+    }
+
+    #[tokio::test]
+    async fn call_peer_with_timeout_uses_fallback_on_timeout() {
+        let result = call_peer_with_timeout(
+            Duration::from_millis(5),
+            "peer-3",
+            || async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok::<_, Error>(build_props("slow"))
+            },
+            || build_props("fallback"),
+        )
+        .await;
+
+        assert_eq!(result.endpoint, "fallback");
+    }
 }
