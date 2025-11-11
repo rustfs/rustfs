@@ -88,7 +88,7 @@ use s3s::header::X_AMZ_RESTORE;
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
@@ -104,7 +104,7 @@ use tokio::{
 use tokio::{
     select,
     sync::mpsc::{self, Sender},
-    time::interval,
+    time::{interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -113,6 +113,8 @@ use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
+const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
+const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
@@ -125,6 +127,23 @@ pub struct SetDisks {
     pub set_index: usize,
     pub pool_index: usize,
     pub format: FormatV3,
+    disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
+}
+
+#[derive(Clone, Debug)]
+struct DiskHealthEntry {
+    last_check: Instant,
+    online: bool,
+}
+
+impl DiskHealthEntry {
+    fn cached_value(&self) -> Option<bool> {
+        if self.last_check.elapsed() <= DISK_HEALTH_CACHE_TTL {
+            Some(self.online)
+        } else {
+            None
+        }
+    }
 }
 
 impl SetDisks {
@@ -150,7 +169,59 @@ impl SetDisks {
             pool_index,
             format,
             set_endpoints,
+            disk_health_cache: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    async fn cached_disk_health(&self, index: usize) -> Option<bool> {
+        let cache = self.disk_health_cache.read().await;
+        cache
+            .get(index)
+            .and_then(|entry| entry.as_ref().and_then(|state| state.cached_value()))
+    }
+
+    async fn update_disk_health(&self, index: usize, online: bool) {
+        let mut cache = self.disk_health_cache.write().await;
+        if cache.len() <= index {
+            cache.resize(index + 1, None);
+        }
+        cache[index] = Some(DiskHealthEntry {
+            last_check: Instant::now(),
+            online,
+        });
+    }
+
+    async fn is_disk_online_cached(&self, index: usize, disk: &DiskStore) -> bool {
+        if let Some(online) = self.cached_disk_health(index).await {
+            return online;
+        }
+
+        let disk_clone = disk.clone();
+        let online = timeout(DISK_ONLINE_TIMEOUT, async move { disk_clone.is_online().await })
+            .await
+            .unwrap_or(false);
+        self.update_disk_health(index, online).await;
+        online
+    }
+
+    async fn filter_online_disks(&self, disks: Vec<Option<DiskStore>>) -> (Vec<Option<DiskStore>>, usize) {
+        let mut filtered = Vec::with_capacity(disks.len());
+        let mut online_count = 0;
+
+        for (idx, disk) in disks.into_iter().enumerate() {
+            if let Some(disk_store) = disk {
+                if self.is_disk_online_cached(idx, &disk_store).await {
+                    filtered.push(Some(disk_store));
+                    online_count += 1;
+                } else {
+                    filtered.push(None);
+                }
+            } else {
+                filtered.push(None);
+            }
+        }
+
+        (filtered, online_count)
     }
     fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
@@ -187,25 +258,9 @@ impl SetDisks {
     }
 
     async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
-        let mut disks = self.get_disks_internal().await;
-
-        // TODO: diskinfo filter online
-
-        let mut new_disk = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            if let Some(d) = disk {
-                if d.is_online().await {
-                    new_disk.push(disk.clone());
-                }
-            }
-        }
-
-        let mut rng = rand::rng();
-
-        disks.shuffle(&mut rng);
-
-        new_disk
+        let disks = self.get_disks_internal().await;
+        let (filtered, _) = self.filter_online_disks(disks).await;
+        filtered.into_iter().filter(|disk| disk.is_some()).collect()
     }
     async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_online_disks().await;
@@ -3581,7 +3636,8 @@ impl ObjectIO for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let disks = self.disks.read().await;
+        let disks_snapshot = self.get_disks_internal().await;
+        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
 
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
         let _object_lock_guard = if !opts.no_lock {
@@ -3620,6 +3676,14 @@ impl ObjectIO for SetDisks {
         let mut write_quorum = data_drives;
         if data_drives == parity_drives {
             write_quorum += 1
+        }
+
+        if filtered_online < write_quorum {
+            warn!(
+                "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
+                filtered_online, write_quorum, bucket, object
+            );
+            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
         }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
@@ -4901,7 +4965,16 @@ impl StorageAPI for SetDisks {
             return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }
 
-        let disks = self.disks.read().await.clone();
+        let disks_snapshot = self.get_disks_internal().await;
+        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
+
+        if filtered_online < write_quorum {
+            warn!(
+                "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
+                filtered_online, write_quorum, bucket, object
+            );
+            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        }
 
         let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
@@ -6561,6 +6634,26 @@ mod tests {
     use rustfs_filemeta::ErasureInfo;
     use std::collections::HashMap;
     use time::OffsetDateTime;
+
+    #[test]
+    fn disk_health_entry_returns_cached_value_within_ttl() {
+        let entry = DiskHealthEntry {
+            last_check: Instant::now(),
+            online: true,
+        };
+
+        assert_eq!(entry.cached_value(), Some(true));
+    }
+
+    #[test]
+    fn disk_health_entry_expires_after_ttl() {
+        let entry = DiskHealthEntry {
+            last_check: Instant::now() - (DISK_HEALTH_CACHE_TTL + Duration::from_millis(100)),
+            online: true,
+        };
+
+        assert!(entry.cached_value().is_none());
+    }
 
     #[test]
     fn test_check_part_constants() {

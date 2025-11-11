@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use futures::lock::Mutex;
@@ -40,7 +40,7 @@ use crate::{
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
-use tokio::io::AsyncWrite;
+use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
 use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
@@ -53,6 +53,8 @@ pub struct RemoteDisk {
     pub root: PathBuf,
     endpoint: Endpoint,
 }
+
+const REMOTE_DISK_ONLINE_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
@@ -83,11 +85,19 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
-        // TODO: connection status tracking
-        if node_service_time_out_client(&self.addr).await.is_ok() {
-            return true;
+        let Some(host) = self.endpoint.url.host_str().map(|host| host.to_string()) else {
+            return false;
+        };
+
+        let port = self.endpoint.url.port_or_known_default().unwrap_or(80);
+
+        match timeout(REMOTE_DISK_ONLINE_PROBE_TIMEOUT, TcpStream::connect((host, port))).await {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                true
+            }
+            _ => false,
         }
-        false
     }
 
     #[tracing::instrument(skip(self))]
@@ -957,6 +967,7 @@ impl DiskAPI for RemoteDisk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -1038,6 +1049,58 @@ mod tests {
 
         // Remote disk path should be based on the URL path
         assert!(path.to_string_lossy().contains("storage"));
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_is_online_detects_active_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        assert!(remote_disk.is_online().await);
+
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_is_online_detects_missing_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ip = addr.ip();
+        let port = addr.port();
+
+        drop(listener);
+
+        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", ip, port)).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        assert!(!remote_disk.is_online().await);
     }
 
     #[tokio::test]

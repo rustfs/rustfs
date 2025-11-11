@@ -113,12 +113,14 @@ RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建�
 
    你也可以使用 Makefile 提供的目标命令以提升便捷性：
 
-   ```bash
-   make docker-buildx                    # 本地构建
-   make docker-buildx-push               # 构建并推送
-   make docker-buildx-version VERSION=v1.0.0  # 构建指定版本
-   make help-docker                      # 显示全部 Docker 相关命令
-   ```
+  ```bash
+  make docker-buildx                    # 本地构建
+  make docker-buildx-push               # 构建并推送
+  make docker-buildx-version VERSION=v1.0.0  # 构建指定版本
+  make help-docker                      # 显示全部 Docker 相关命令
+  ```
+
+   > **提示（macOS 交叉编译）**：macOS 默认的 `ulimit -n` 只有 256，使用 `cargo zigbuild` 或 `./build-rustfs.sh --platform ...` 编译 Linux 目标时容易触发 `ProcessFdQuotaExceeded` 链接错误。脚本会尝试自动提升该限制，如仍提示失败，请在构建前手动执行 `ulimit -n 4096`（或更大的值）。
 
 4. **使用 Helm Chart 部署（方案四）- 云原生环境**
 

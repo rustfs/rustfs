@@ -163,6 +163,35 @@ print_message() {
     echo -e "${color}${message}${NC}"
 }
 
+# Prevent zig/ld from hitting macOS file descriptor defaults during linking
+ensure_file_descriptor_limit() {
+    local required_limit=4096
+    local current_limit
+    current_limit=$(ulimit -Sn 2>/dev/null || echo "")
+
+    if [ -z "$current_limit" ] || [ "$current_limit" = "unlimited" ]; then
+        return
+    fi
+
+    if (( current_limit >= required_limit )); then
+        return
+    fi
+
+    local hard_limit target_limit
+    hard_limit=$(ulimit -Hn 2>/dev/null || echo "")
+    target_limit=$required_limit
+
+    if [ -n "$hard_limit" ] && [ "$hard_limit" != "unlimited" ] && (( hard_limit < required_limit )); then
+        target_limit=$hard_limit
+    fi
+
+    if ulimit -Sn "$target_limit" 2>/dev/null; then
+        print_message $YELLOW "🔧 Increased open file limit from $current_limit to $target_limit to avoid ProcessFdQuotaExceeded"
+    else
+        print_message $YELLOW "⚠️ Unable to raise ulimit -n automatically (current: $current_limit, needed: $required_limit). Please run 'ulimit -n $required_limit' manually before building."
+    fi
+}
+
 # Get version from git
 get_version() {
     if git describe --abbrev=0 --tags >/dev/null 2>&1; then
@@ -570,10 +599,11 @@ main() {
         fi
     fi
 
+    ensure_file_descriptor_limit
+
     # Start build process
     build_rustfs
 }
 
 # Run main function
 main
-
