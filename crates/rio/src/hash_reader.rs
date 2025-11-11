@@ -660,7 +660,8 @@ mod tests {
         let mut hasher = Md5::new();
         hasher.update(&data);
 
-        let expected = format!("{:x}", hasher.finalize());
+        let hex = faster_hex::hex_string(hasher.finalize().as_slice());
+        let expected = hex.to_string();
 
         println!("expected: {expected}");
 

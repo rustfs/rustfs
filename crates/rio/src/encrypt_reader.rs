@@ -20,6 +20,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use pin_project_lite::pin_project;
 use rustfs_utils::{put_uvarint, put_uvarint_len};
+use std::io::Error;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -98,13 +99,13 @@ where
                 } else {
                     // Encrypt the chunk
                     let cipher = Aes256Gcm::new_from_slice(this.key).expect("key");
-                    let nonce = Nonce::from_slice(this.nonce);
+                    let nonce = Nonce::try_from(this.nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
                     let plaintext = &temp_buf.filled()[..n];
                     let plaintext_len = plaintext.len();
                     let crc = crc32fast::hash(plaintext);
                     let ciphertext = cipher
-                        .encrypt(nonce, plaintext)
-                        .map_err(|e| std::io::Error::other(format!("encrypt error: {e}")))?;
+                        .encrypt(&nonce, plaintext)
+                        .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
                     let int_len = put_uvarint_len(plaintext_len as u64);
                     let clen = int_len + ciphertext.len() + 4;
                     // Header: 8 bytes
@@ -352,7 +353,7 @@ where
 
             let Some(payload_len) = len.checked_sub(4) else {
                 tracing::error!("invalid encrypted block length: typ={} len={} header={:?}", typ, len, this.header_buf);
-                return Poll::Ready(Err(std::io::Error::other("Invalid encrypted block length")));
+                return Poll::Ready(Err(Error::other("Invalid encrypted block length")));
             };
 
             if this.ciphertext_buf.is_none() {
@@ -390,10 +391,10 @@ where
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
 
             let cipher = Aes256Gcm::new_from_slice(this.key).expect("key");
-            let nonce = Nonce::from_slice(this.current_nonce);
+            let nonce = Nonce::try_from(this.current_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
             let plaintext = cipher
-                .decrypt(nonce, ciphertext)
-                .map_err(|e| std::io::Error::other(format!("decrypt error: {e}")))?;
+                .decrypt(&nonce, ciphertext)
+                .map_err(|e| Error::other(format!("decrypt error: {e}")))?;
 
             debug!(
                 part = *this.current_part,
@@ -405,7 +406,7 @@ where
                 this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
-                return Poll::Ready(Err(std::io::Error::other("Plaintext length mismatch")));
+                return Poll::Ready(Err(Error::other("Plaintext length mismatch")));
             }
 
             let actual_crc = crc32fast::hash(&plaintext);
@@ -413,7 +414,7 @@ where
                 this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
-                return Poll::Ready(Err(std::io::Error::other("CRC32 mismatch")));
+                return Poll::Ready(Err(Error::other("CRC32 mismatch")));
             }
 
             *this.buffer = plaintext;

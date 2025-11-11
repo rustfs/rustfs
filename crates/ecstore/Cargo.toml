@@ -106,6 +106,7 @@ serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
+faster-hex = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

@@ -39,6 +39,7 @@ serde = { workspace = true }
 bytes.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true
+faster-hex.workspace = true
 futures.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
 serde_json.workspace = true

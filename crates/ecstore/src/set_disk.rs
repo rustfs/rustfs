@@ -1323,13 +1323,13 @@ impl SetDisks {
 
             if etag_only || mod_valid {
                 for part in meta.parts.iter() {
-                    let _ = hasher.write(format!("part.{}", part.number).as_bytes())?;
-                    let _ = hasher.write(format!("part.{}", part.size).as_bytes())?;
+                    hasher.update(format!("part.{}", part.number).as_bytes());
+                    hasher.update(format!("part.{}", part.size).as_bytes());
                 }
 
                 if !meta.deleted && meta.size != 0 {
-                    let _ = hasher.write(format!("{}+{}", meta.erasure.data_blocks, meta.erasure.parity_blocks).as_bytes())?;
-                    let _ = hasher.write(format!("{:?}", meta.erasure.distribution).as_bytes())?;
+                    hasher.update(format!("{}+{}", meta.erasure.data_blocks, meta.erasure.parity_blocks).as_bytes());
+                    hasher.update(format!("{:?}", meta.erasure.distribution).as_bytes());
                 }
 
                 if meta.is_remote() {
@@ -1339,8 +1339,6 @@ impl SetDisks {
                 // TODO: IsEncrypted
 
                 // TODO: IsCompressed
-
-                hasher.flush()?;
 
                 meta_hashes[i] = Some(hex(hasher.clone().finalize().as_slice()));
 
@@ -6553,9 +6551,11 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     }
 
     let mut hasher = Md5::new();
-    let _ = hasher.write(&buf);
+    hasher.update(&buf);
 
-    format!("{:x}-{}", hasher.finalize(), parts.len())
+    let digest = hasher.finalize();
+    let etag_hex = faster_hex::hex_string(digest.as_slice());
+    format!("{}-{}", etag_hex, parts.len())
 }
 
 pub fn canonicalize_etag(etag: &str) -> String {

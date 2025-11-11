@@ -15,7 +15,7 @@
 use crate::global::get_global_action_cred;
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
