@@ -130,7 +130,7 @@ impl ExpiryOp for Jentry {
         let mut hasher = Sha256::new();
         hasher.update(format!("{}", self.tier_name).as_bytes());
         hasher.update(format!("{}", self.obj_name).as_bytes());
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
