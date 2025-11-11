@@ -130,8 +130,11 @@ impl LocalKmsClient {
             if stored_key.nonce.len() != 12 {
                 return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
             }
-            let nonce = Nonce::try_from(stored_key.nonce.as_slice())
-                .map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
+
+            let mut nonce_array = [0u8; 12];
+            nonce_array.copy_from_slice(&stored_key.nonce);
+            let nonce = Nonce::from(nonce_array);
+
             cipher
                 .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
@@ -229,7 +232,9 @@ impl LocalKmsClient {
             if stored_key.nonce.len() != 12 {
                 return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
             }
-            let nonce = Nonce::from(stored_key.nonce.as_slice());
+            let mut nonce_array = [0u8; 12];
+            nonce_array.copy_from_slice(&stored_key.nonce);
+            let nonce = Nonce::from(nonce_array);
             cipher
                 .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
@@ -271,7 +276,9 @@ impl LocalKmsClient {
             .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
         let cipher = Aes256Gcm::new(&key);
 
-        let nonce_ref = Nonce::from(nonce);
+        let mut nonce_array = [0u8; 12];
+        nonce_array.copy_from_slice(nonce);
+        let nonce_ref = Nonce::from(nonce_array);
 
         let plaintext = cipher
             .decrypt(&nonce_ref, ciphertext)
@@ -801,7 +808,9 @@ impl KmsBackend for LocalKmsBackend {
             if stored_key.nonce.len() != 12 {
                 return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
             }
-            let nonce = Nonce::from(stored_key.nonce.as_slice());
+            let mut nonce_array = [0u8; 12];
+            nonce_array.copy_from_slice(&stored_key.nonce);
+            let nonce = Nonce::from(nonce_array);
             cipher
                 .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
