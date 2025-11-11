@@ -38,7 +38,7 @@ pub fn is_sha256_checksum(s: &str) -> bool {
 
 /// `hmac_sha1(key, data)`
 pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
 
     let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).unwrap();
@@ -48,7 +48,7 @@ pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
 
 /// `hmac_sha256(key, data)`
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).unwrap();

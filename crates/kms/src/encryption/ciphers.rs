@@ -19,9 +19,10 @@ use crate::types::EncryptionAlgorithm;
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
 };
 use chacha20poly1305::ChaCha20Poly1305;
+use rand::rngs::OsRng;
 
 /// Trait for object encryption ciphers
 #[cfg_attr(not(test), allow(dead_code))]

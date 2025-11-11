@@ -22,9 +22,10 @@ use crate::types::*;
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit},
 };
 use async_trait::async_trait;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -155,7 +156,7 @@ impl LocalKmsClient {
 
         // Encrypt key material if master cipher is available
         let (encrypted_key_material, nonce) = if let Some(ref cipher) = self.master_cipher {
-            let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+            let nonce = Aes256Gcm::generate_nonce()?;
             let encrypted = cipher
                 .encrypt(&nonce, key_material)
                 .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
@@ -236,7 +237,7 @@ impl LocalKmsClient {
         let key_material = self.get_key_material(key_id).await?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_material));
 
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Aes256Gcm::generate_nonce()?;
         let ciphertext = cipher
             .encrypt(&nonce, plaintext)
             .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;

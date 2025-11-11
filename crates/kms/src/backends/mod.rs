@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 pub mod local;
-
 pub mod vault;
 
 /// Abstract KMS client interface that all backends must implement

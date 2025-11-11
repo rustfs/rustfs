@@ -18,6 +18,7 @@ use crate::compress_index::{Index, TryGetIndex};
 use crate::{EtagResolvable, Reader};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use core::convert::TryFrom;
 use pin_project_lite::pin_project;
 use rustfs_utils::{put_uvarint, put_uvarint_len};
 use std::pin::Pin;

@@ -115,9 +115,8 @@ struct ExpiryTask {
 impl ExpiryOp for ExpiryTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.obj_info.bucket).as_bytes());
-        let _ = hasher.write(format!("{}", self.obj_info.name).as_bytes());
-        hasher.flush();
+        let _ = hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
+        let _ = hasher.update(format!("{}", self.obj_info.name).as_bytes());
         xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -171,9 +170,8 @@ struct FreeVersionTask(ObjectInfo);
 impl ExpiryOp for FreeVersionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.0.transitioned_object.tier).as_bytes());
-        let _ = hasher.write(format!("{}", self.0.transitioned_object.name).as_bytes());
-        hasher.flush();
+        let _ = hasher.update(format!("{}", self.0.transitioned_object.tier).as_bytes());
+        let _ = hasher.update(format!("{}", self.0.transitioned_object.name).as_bytes());
         xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -191,9 +189,8 @@ struct NewerNoncurrentTask {
 impl ExpiryOp for NewerNoncurrentTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.bucket).as_bytes());
-        let _ = hasher.write(format!("{}", self.versions[0].object_name).as_bytes());
-        hasher.flush();
+        let _ = hasher.update(format!("{}", self.bucket).as_bytes());
+        let _ = hasher.update(format!("{}", self.versions[0].object_name).as_bytes());
         xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -415,9 +412,8 @@ struct TransitionTask {
 impl ExpiryOp for TransitionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.obj_info.bucket).as_bytes());
+        let _ = hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
         //let _ = hasher.write(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
-        hasher.flush();
         xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -480,7 +476,7 @@ impl TransitionState {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
         let mut n = max_workers;
-        let tw = 8; //globalILMConfig.getTransitionWorkers(); 
+        let tw = 8; //globalILMConfig.getTransitionWorkers();
         if tw > 0 {
             n = tw;
         }
@@ -760,8 +756,7 @@ pub async fn expire_transitioned_object(
 pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let us = Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
-    let _ = hasher.write(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
-    hasher.flush();
+    let _ = hasher.update(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
     let hash = rustfs_utils::crypto::hex(hasher.clone().finalize().as_slice());
     let obj = format!("{}/{}/{}/{}", &hash[0..16], &us[0..2], &us[2..4], &us);
     Ok(obj)
