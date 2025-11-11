@@ -120,7 +120,8 @@ mod tests {
         let data = b"hello world";
         let mut hasher = Md5::new();
         hasher.update(data);
-        let expected = format!("{:x}", hasher.finalize());
+        let hex = faster_hex::hex_string(hasher.finalize().as_slice());
+        let expected = hex.to_string();
         let reader = BufReader::new(&data[..]);
         let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
@@ -139,7 +140,8 @@ mod tests {
         let data = b"";
         let mut hasher = Md5::new();
         hasher.update(data);
-        let expected = format!("{:x}", hasher.finalize());
+        let hex = faster_hex::hex_string(hasher.finalize().as_slice());
+        let expected = hex.to_string();
         let reader = BufReader::new(&data[..]);
         let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
@@ -158,7 +160,8 @@ mod tests {
         let data = b"abc123";
         let mut hasher = Md5::new();
         hasher.update(data);
-        let expected = format!("{:x}", hasher.finalize());
+        let hex = faster_hex::hex_string(hasher.finalize().as_slice());
+        let expected = hex.to_string();
         let reader = BufReader::new(&data[..]);
         let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
@@ -195,15 +198,12 @@ mod tests {
         rand::rng().fill(&mut data[..]);
         let mut hasher = Md5::new();
         hasher.update(&data);
-
         let cloned_data = data.clone();
-
-        let expected = format!("{:x}", hasher.finalize());
-
+        let hex = faster_hex::hex_string(hasher.finalize().as_slice());
+        let expected = hex.to_string();
         let reader = Cursor::new(data.clone());
         let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
-
         let mut buf = Vec::new();
         let n = etag_reader.read_to_end(&mut buf).await.unwrap();
         assert_eq!(n, size);

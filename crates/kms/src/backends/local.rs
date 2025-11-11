@@ -19,13 +19,12 @@ use crate::config::KmsConfig;
 use crate::config::LocalConfig;
 use crate::error::{KmsError, Result};
 use crate::types::*;
-use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, AeadCore, KeyInit},
+    aead::{Aead, KeyInit},
 };
 use async_trait::async_trait;
-use rand::rngs::OsRng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -106,8 +105,9 @@ impl LocalKmsClient {
         hasher.update(master_key.as_bytes());
         hasher.update(b"rustfs-kms-local"); // Salt to prevent rainbow tables
         let hash = hasher.finalize();
-
-        Ok(*Key::<Aes256Gcm>::from_slice(&hash))
+        let key = Key::<Aes256Gcm>::try_from(hash.as_slice())
+            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        Ok(key)
     }
 
     /// Get the file path for a master key
@@ -118,7 +118,6 @@ impl LocalKmsClient {
     /// Load a master key from disk
     async fn load_master_key(&self, key_id: &str) -> Result<MasterKey> {
         let key_path = self.master_key_path(key_id);
-
         if !key_path.exists() {
             return Err(KmsError::key_not_found(key_id));
         }
@@ -128,9 +127,13 @@ impl LocalKmsClient {
 
         // Decrypt key material if master cipher is available
         let _key_material = if let Some(ref cipher) = self.master_cipher {
-            let nonce = Nonce::from_slice(&stored_key.nonce);
+            if stored_key.nonce.len() != 12 {
+                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+            }
+            let nonce = Nonce::try_from(stored_key.nonce.as_slice())
+                .map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
             cipher
-                .decrypt(nonce, stored_key.encrypted_key_material.as_ref())
+                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
         } else {
             stored_key.encrypted_key_material
@@ -156,7 +159,10 @@ impl LocalKmsClient {
 
         // Encrypt key material if master cipher is available
         let (encrypted_key_material, nonce) = if let Some(ref cipher) = self.master_cipher {
-            let nonce = Aes256Gcm::generate_nonce()?;
+            let mut nonce_bytes = [0u8; 12];
+            rand::rng().fill(&mut nonce_bytes[..]);
+            let nonce = Nonce::from(nonce_bytes);
+
             let encrypted = cipher
                 .encrypt(&nonce, key_material)
                 .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
@@ -203,7 +209,7 @@ impl LocalKmsClient {
     /// Generate a random 256-bit key
     fn generate_key_material() -> Vec<u8> {
         let mut key_material = vec![0u8; 32]; // 256 bits
-        OsRng.fill_bytes(&mut key_material);
+        rand::rng().fill(&mut key_material[..]);
         key_material
     }
 
@@ -220,9 +226,12 @@ impl LocalKmsClient {
 
         // Decrypt key material if master cipher is available
         let key_material = if let Some(ref cipher) = self.master_cipher {
-            let nonce = Nonce::from_slice(&stored_key.nonce);
+            if stored_key.nonce.len() != 12 {
+                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+            }
+            let nonce = Nonce::from(stored_key.nonce.as_slice());
             cipher
-                .decrypt(nonce, stored_key.encrypted_key_material.as_ref())
+                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
         } else {
             stored_key.encrypted_key_material
@@ -235,25 +244,37 @@ impl LocalKmsClient {
     async fn encrypt_with_master_key(&self, key_id: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         // Load the actual master key material
         let key_material = self.get_key_material(key_id).await?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_material));
+        let key = Key::<Aes256Gcm>::try_from(key_material.as_slice())
+            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        let cipher = Aes256Gcm::new(&key);
 
-        let nonce = Aes256Gcm::generate_nonce()?;
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill(&mut nonce_bytes[..]);
+
+        let nonce = Nonce::from(nonce_bytes);
+
         let ciphertext = cipher
             .encrypt(&nonce, plaintext)
             .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
 
-        Ok((ciphertext, nonce.to_vec()))
+        Ok((ciphertext, nonce_bytes.to_vec()))
     }
 
     /// Decrypt data using a master key
     async fn decrypt_with_master_key(&self, key_id: &str, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+        if nonce.len() != 12 {
+            return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+        }
         // Load the actual master key material
         let key_material = self.get_key_material(key_id).await?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_material));
+        let key = Key::<Aes256Gcm>::try_from(key_material.as_slice())
+            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        let cipher = Aes256Gcm::new(&key);
 
-        let nonce = Nonce::from_slice(nonce);
+        let nonce_ref = Nonce::from(nonce);
+
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce_ref, ciphertext)
             .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?;
 
         Ok(plaintext)
@@ -276,7 +297,7 @@ impl KmsClient for LocalKmsClient {
         };
 
         let mut plaintext_key = vec![0u8; key_length];
-        OsRng.fill_bytes(&mut plaintext_key);
+        rand::rng().fill(&mut plaintext_key[..]);
 
         // Encrypt the data key with the master key
         let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
@@ -777,9 +798,12 @@ impl KmsBackend for LocalKmsBackend {
 
         // Decrypt the existing key material to preserve it
         let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
-            let nonce = Nonce::from_slice(&stored_key.nonce);
+            if stored_key.nonce.len() != 12 {
+                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+            }
+            let nonce = Nonce::from(stored_key.nonce.as_slice());
             cipher
-                .decrypt(nonce, stored_key.encrypted_key_material.as_ref())
+                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
         } else {
             stored_key.encrypted_key_material

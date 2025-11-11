@@ -184,6 +184,7 @@ crossbeam-queue = "0.3.12"
 datafusion = "50.3.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
+faster-hex = "0.10.0"
 flate2 = "1.1.5"
 flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
@@ -219,7 +220,6 @@ path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.0-rc.5", features = ["serde"] }
-rand_core = "0.10.0-rc-2"
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.2" }
