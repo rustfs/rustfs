@@ -115,9 +115,9 @@ struct ExpiryTask {
 impl ExpiryOp for ExpiryTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
-        let _ = hasher.update(format!("{}", self.obj_info.name).as_bytes());
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
+        hasher.update(format!("{}", self.obj_info.name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -170,9 +170,9 @@ struct FreeVersionTask(ObjectInfo);
 impl ExpiryOp for FreeVersionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.update(format!("{}", self.0.transitioned_object.tier).as_bytes());
-        let _ = hasher.update(format!("{}", self.0.transitioned_object.name).as_bytes());
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.0.transitioned_object.tier).as_bytes());
+        hasher.update(format!("{}", self.0.transitioned_object.name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -189,9 +189,9 @@ struct NewerNoncurrentTask {
 impl ExpiryOp for NewerNoncurrentTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.update(format!("{}", self.bucket).as_bytes());
-        let _ = hasher.update(format!("{}", self.versions[0].object_name).as_bytes());
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.bucket).as_bytes());
+        hasher.update(format!("{}", self.versions[0].object_name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -412,9 +412,9 @@ struct TransitionTask {
 impl ExpiryOp for TransitionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
-        //let _ = hasher.write(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
+        // hasher.update(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -756,8 +756,8 @@ pub async fn expire_transitioned_object(
 pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let us = Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
-    let _ = hasher.update(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
-    let hash = rustfs_utils::crypto::hex(hasher.clone().finalize().as_slice());
+    hasher.update(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
+    let hash = rustfs_utils::crypto::hex(hasher.finalize().as_slice());
     let obj = format!("{}/{}/{}/{}", &hash[0..16], &us[0..2], &us[2..4], &us);
     Ok(obj)
 }

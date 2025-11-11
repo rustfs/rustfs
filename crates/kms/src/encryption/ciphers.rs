@@ -57,7 +57,7 @@ impl AesCipher {
             return Err(KmsError::invalid_key_size(32, key.len()));
         }
 
-        let key = Key::<Aes256Gcm>::try_from(key).map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
+        let key = Key::<Aes256Gcm>::try_from(key).map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
         let cipher = Aes256Gcm::new(&key);
 
         Ok(Self { cipher })
