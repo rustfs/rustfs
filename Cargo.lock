@@ -3677,15 +3677,16 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "google-cloud-auth"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f084abe65c3bdde490bf4a4eebc7e103637fb3ac4b101d09508dd5bf12ce82b1"
+checksum = "5628e0c17140a50dd4d75d37465bf190d26a6c67909519c2e3cf87a9e45d5cf6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bon",
  "google-cloud-gax",
  "http 1.3.1",
+ "jsonwebtoken",
  "reqwest",
  "rustc_version",
  "rustls 0.23.35",
@@ -3699,9 +3700,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-gax"
-version = "1.2.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a36f8701dac18c2cbedf588d15ee4ce5c018da531c2e74e9ad043cbd32b0fccb"
+checksum = "3c5aa07295f49565ee1ae52e0799e42bd67284396e042734f078b8737a816047"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3719,9 +3720,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-gax-internal"
-version = "0.7.3"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "152076418386463ff650deabbef392672626d62e97639bb5194e11f8984b4835"
+checksum = "6dbd41e77921bbf75ed32acc8a648f087b3227ca88c62ddd9b37b43230c91554"
 dependencies = [
  "bytes",
  "google-cloud-auth",
@@ -3730,6 +3731,7 @@ dependencies = [
  "google-cloud-wkt",
  "http 1.3.1",
  "http-body-util",
+ "hyper 1.7.0",
  "opentelemetry-semantic-conventions",
  "percent-encoding",
  "prost 0.14.1",
@@ -3740,6 +3742,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tracing",
@@ -3814,9 +3817,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-storage"
-version = "1.2.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "166471b8f807470024f4533d7229bc98696161b5e1f254d1a485b60c6c42baf3"
+checksum = "12e6a4d24384f8ffae6d295d55095b25d21c9099855c5a96a0edf6777178b35b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6424,9 +6427,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.38.3"
+version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a232e7487fc2ef313d96dde7948e7a3c05101870d8985e4fd8d26aedd27b89"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
 dependencies = [
  "memchr",
  "serde",
@@ -7221,7 +7224,7 @@ dependencies = [
  "parking_lot",
  "path-absolutize",
  "pin-project-lite",
- "quick-xml 0.38.3",
+ "quick-xml 0.38.4",
  "rand 0.10.0-rc.5",
  "reed-solomon-simd",
  "regex",
@@ -7402,7 +7405,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hashbrown 0.16.0",
- "quick-xml 0.38.3",
+ "quick-xml 0.38.4",
  "rayon",
  "rumqttc",
  "rustc-hash",
