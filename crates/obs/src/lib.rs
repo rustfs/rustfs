@@ -66,4 +66,5 @@ pub use error::*;
 pub use global::*;
 pub use metrics::*;
 pub use recorder::*;
+pub use system::SystemObserver;
 pub use telemetry::OtelGuard;
