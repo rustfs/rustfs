@@ -14,7 +14,7 @@
 
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 /// Shuts down the event notifier system gracefully
 pub(crate) async fn shutdown_event_notifier() {
@@ -28,7 +28,7 @@ pub(crate) async fn shutdown_event_notifier() {
     let system = match rustfs_notify::notification_system() {
         Some(sys) => sys,
         None => {
-            error!("Event notifier system is not initialized.");
+            info!("Event notifier system is not initialized.");
             return;
         }
     };
@@ -49,7 +49,7 @@ pub(crate) async fn init_event_notifier() {
     let server_config = match GLOBAL_SERVER_CONFIG.get() {
         Some(config) => config.clone(), // Clone the config to pass ownership
         None => {
-            error!("Event notifier initialization failed: Global server config not loaded.");
+            warn!("Event notifier initialization failed: Global server config not loaded.");
             return;
         }
     };

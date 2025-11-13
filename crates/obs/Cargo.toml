@@ -38,7 +38,6 @@ rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
 flexi_logger = { workspace = true }
 metrics = { workspace = true }
-metrics-exporter-opentelemetry = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }

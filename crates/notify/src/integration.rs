@@ -140,7 +140,7 @@ impl NotificationSystem {
             info!("Initializing target: {}", target.id());
             // Initialize the target
             if let Err(e) = target.init().await {
-                error!("Target {} Initialization failed:{}", target.id(), e);
+                warn!("Target {} Initialization failed:{}", target.id(), e);
                 continue;
             }
             debug!("Target {} initialized successfully,enabled:{}", target_id, target.is_enabled());
@@ -422,7 +422,7 @@ impl NotificationSystem {
             if !e.to_string().contains("ARN not found") {
                 return Err(NotificationError::BucketNotification(e.to_string()));
             } else {
-                error!("{}", e);
+                error!("config validate failed, err: {}", e);
             }
         }
 
