@@ -52,8 +52,10 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           command: ["/usr/bin/rustfs"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.securityContext }}
           securityContext:
-            runAsUser: 1000
+          {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- end }}
           ports:
             - containerPort: {{ .Values.service.ep_port }}
               name: endpoint
