@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 pub(crate) async fn start_audit_system() -> AuditResult<()> {
     info!(
         target: "rustfs::main::start_audit_system",
-        "Step 1: Initializing the audit system..."
+        "Initializing the audit system..."
     );
 
     // 1. Get the global configuration loaded by ecstore
@@ -39,7 +39,7 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
             config.clone()
         }
         None => {
-            error!(
+            warn!(
                 target: "rustfs::main::start_audit_system",
                 "Audit system initialization failed: Global server configuration not loaded."
             );
