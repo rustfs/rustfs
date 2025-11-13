@@ -204,7 +204,6 @@ matchit = "0.9.0"
 md-5 = "0.11.0-rc.3"
 md5 = "0.8.0"
 metrics = "0.24.2"
-metrics-exporter-opentelemetry = "0.1.2"
 mime_guess = "2.0.5"
 moka = { version = "0.12.11", features = ["future"] }
 netif = "0.1.6"

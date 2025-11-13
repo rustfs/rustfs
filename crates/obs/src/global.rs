@@ -12,47 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, OtelGuard, SystemObserver, TelemetryError, telemetry::init_telemetry};
+use crate::{AppConfig, GlobalError, OtelGuard, SystemObserver, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{OnceCell, SetError};
+use tokio::sync::OnceCell;
 use tracing::{error, info};
 
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 
-/// Flag indicating if observability is enabled
-pub(crate) static IS_OBSERVABILITY_ENABLED: OnceCell<bool> = OnceCell::const_new();
+/// Flag indicating if observability metric is enabled
+pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
 
-/// Check whether Observability is enabled
-pub fn is_observability_enabled() -> bool {
-    IS_OBSERVABILITY_ENABLED.get().copied().unwrap_or(false)
-}
-
-/// Error type for global guard operations
-#[derive(Debug, thiserror::Error)]
-pub enum GlobalError {
-    #[error("Failed to set global guard: {0}")]
-    SetError(#[from] SetError<Arc<Mutex<OtelGuard>>>),
-    #[error("Global guard not initialized")]
-    NotInitialized,
-    #[error("Global system metrics err: {0}")]
-    MetricsError(String),
-    #[error("Failed to get current PID: {0}")]
-    PidError(String),
-    #[error("Process with PID {0} not found")]
-    ProcessNotFound(u32),
-    #[error("Failed to get physical core count")]
-    CoreCountError,
-    #[error("GPU initialization failed: {0}")]
-    GpuInitError(String),
-    #[error("GPU device not found: {0}")]
-    GpuDeviceError(String),
-    #[error("Failed to send log: {0}")]
-    SendFailed(&'static str),
-    #[error("Operation timed out: {0}")]
-    Timeout(&'static str),
-    #[error("Telemetry initialization failed: {0}")]
-    TelemetryError(#[from] TelemetryError),
+/// Check whether Observability metric is enabled
+pub fn observability_metric_enabled() -> bool {
+    OBSERVABILITY_METRIC_ENABLED.get().copied().unwrap_or(false)
 }
 
 /// Initialize the observability module
