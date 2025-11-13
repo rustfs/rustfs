@@ -446,7 +446,8 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
             })
             .build();
         global::set_meter_provider(provider.clone());
-        metrics::set_global_recorder(recorder).unwrap();
+        metrics::set_global_recorder(recorder)
+            .map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
         provider
     };
 
