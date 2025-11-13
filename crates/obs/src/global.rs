@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, GlobalError, OtelGuard, SystemObserver, telemetry::init_telemetry};
+use crate::system::SystemObserver;
+use crate::{AppConfig, GlobalError, OtelGuard, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::{error, info};

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Recorder;
 use crate::config::OtelConfig;
 use crate::global::OBSERVABILITY_METRIC_ENABLED;
+use crate::{Recorder, TelemetryError};
 use flexi_logger::{DeferredNow, Record, WriteMode, WriteMode::AsyncWith, style};
 use metrics::counter;
 use nu_ansi_term::Color;
@@ -114,28 +114,6 @@ impl Drop for OtelGuard {
         }
     }
 }
-
-#[derive(Debug)]
-pub enum TelemetryError {
-    BuildSpanExporter(String),
-    BuildMetricExporter(String),
-    BuildLogExporter(String),
-    InstallMetricsRecorder(String),
-    SubscriberInit(String),
-}
-
-impl std::fmt::Display for TelemetryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TelemetryError::BuildSpanExporter(e) => write!(f, "Span exporter build failed: {e}"),
-            TelemetryError::BuildMetricExporter(e) => write!(f, "Metric exporter build failed: {e}"),
-            TelemetryError::BuildLogExporter(e) => write!(f, "Log exporter build failed: {e}"),
-            TelemetryError::InstallMetricsRecorder(e) => write!(f, "Install metrics recorder failed: {e}"),
-            TelemetryError::SubscriberInit(e) => write!(f, "Tracing subscriber init failed: {e}"),
-        }
-    }
-}
-impl std::error::Error for TelemetryError {}
 
 /// create OpenTelemetry Resource
 fn resource(config: &OtelConfig) -> Resource {
@@ -271,7 +249,7 @@ fn init_stdout_logging(_config: &OtelConfig, logger_level: &str, is_production: 
 }
 
 /// File rolling log (size switching + number retained)
-fn init_file_logging(config: &OtelConfig, logger_level: &str, _is_production: bool) -> OtelGuard {
+fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
     use flexi_logger::{Age, Cleanup, Criterion, FileSpec, LogSpecification, Naming};
 
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
@@ -280,13 +258,40 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, _is_production: bo
     let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
     let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
     if let Err(e) = fs::create_dir_all(log_directory) {
-        eprintln!("ERROR: create log dir '{log_directory}': {e}");
+        return Err(TelemetryError::Io(e.to_string()));
     }
     #[cfg(unix)]
     {
         use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(log_directory, Permissions::from_mode(0o755));
+        let desired: u32 = 0o755;
+        match fs::metadata(log_directory) {
+            Ok(meta) => {
+                let current = meta.permissions().mode() & 0o777;
+                // Only tighten to 0755 if existing permissions are looser than target, avoid loosening
+                if (current & !desired) != 0 {
+                    if let Err(e) = fs::set_permissions(log_directory, Permissions::from_mode(desired)) {
+                        return Err(TelemetryError::SetPermissions(format!(
+                            "dir='{}', want={:#o}, have={:#o}, err={}",
+                            log_directory, desired, current, e
+                        )));
+                    }
+                    // Second verification
+                    if let Ok(meta2) = fs::metadata(log_directory) {
+                        let after = meta2.permissions().mode() & 0o777;
+                        if after != desired {
+                            return Err(TelemetryError::SetPermissions(format!(
+                                "dir='{}', want={:#o}, after={:#o}",
+                                log_directory, desired, after
+                            )));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(TelemetryError::Io(format!("stat '{}' failed: {}", log_directory, e)));
+            }
+        }
     }
 
     // parsing level
@@ -345,7 +350,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, _is_production: bo
         .use_utc();
 
     // Optional copy to stdout (for local observation)
-    if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
+    if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
         builder = builder.duplicate_to_stdout(flexi_logger::Duplicate::All);
     } else {
         builder = builder.duplicate_to_stdout(flexi_logger::Duplicate::None);
@@ -366,13 +371,13 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, _is_production: bo
         log_directory, config.log_rotation_size_mb, keep_files
     );
 
-    OtelGuard {
+    Ok(OtelGuard {
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
         flexi_logger_handles: handle,
         tracing_guard: None,
-    }
+    })
 }
 
 /// Observability (HTTP export, supports three sub-endpoints; if not, fallback to unified endpoint)
@@ -539,7 +544,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, Telemetry
     // Rule 2: The user has explicitly customized the log directory (determined by whether ENV_OBS_LOG_DIRECTORY is set)
     let user_set_log_dir = env::var(ENV_OBS_LOG_DIRECTORY).is_ok();
     if user_set_log_dir {
-        return Ok(init_file_logging(config, logger_level, is_production));
+        return init_file_logging(config, logger_level, is_production);
     }
 
     // Rule 1: Default stdout (error level)

@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{OtelGuard, TelemetryError};
+use crate::OtelGuard;
 use std::sync::{Arc, Mutex};
 use tokio::sync::SetError;
 
 /// Error type for global guard operations
 #[derive(Debug, thiserror::Error)]
 pub enum GlobalError {
-    /// *Called from [`Recorder::install_global`]*: Failed to set
-    /// a global recorder as one is already initialised.
+    /// Occurs when attempting to set a global recorder (e.g., via [`crate::Recorder::install_global`] or [`metrics::set_global_recorder`])
+    /// but a global recorder is already initialized.
     ///
-    /// [`Recorder::install_global`]: struct.Recorder.html#method.install_global
-    /// [`Recorder`]: struct.Recorder.html
+    /// [`crate::Recorder::install_global`]: crate::Recorder::install_global
+    /// [`metrics::set_global_recorder`]: https://docs.rs/metrics/latest/metrics/fn.set_global_recorder.html
     #[error("Failed to set a global recorder: {0}")]
     SetRecorder(#[from] metrics::SetRecorderError<crate::Recorder>),
     #[error("Failed to set global guard: {0}")]
@@ -48,4 +48,28 @@ pub enum GlobalError {
     Timeout(&'static str),
     #[error("Telemetry initialization failed: {0}")]
     TelemetryError(#[from] TelemetryError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryError {
+    #[error("Span exporter build failed: {0}")]
+    BuildSpanExporter(String),
+    #[error("Metric exporter build failed: {0}")]
+    BuildMetricExporter(String),
+    #[error("Log exporter build failed: {0}")]
+    BuildLogExporter(String),
+    #[error("Install metrics recorder failed: {0}")]
+    InstallMetricsRecorder(String),
+    #[error("Tracing subscriber init failed: {0}")]
+    SubscriberInit(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+    #[error("Set permissions failed: {0}")]
+    SetPermissions(String),
+}
+
+impl From<std::io::Error> for TelemetryError {
+    fn from(e: std::io::Error) -> Self {
+        TelemetryError::Io(e.to_string())
+    }
 }
