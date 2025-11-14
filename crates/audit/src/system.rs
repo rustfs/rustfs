@@ -59,7 +59,7 @@ impl AuditSystem {
 
     /// Starts the audit system with the given configuration
     pub async fn start(&self, config: Config) -> AuditResult<()> {
-        let mut state = self.state.write().await;
+        let state = self.state.write().await;
 
         match *state {
             AuditSystemState::Running => {
@@ -72,7 +72,6 @@ impl AuditSystem {
             _ => {}
         }
 
-        *state = AuditSystemState::Starting;
         drop(state);
 
         info!("Starting audit system");
@@ -90,6 +89,17 @@ impl AuditSystem {
         let mut registry = self.registry.lock().await;
         match registry.create_targets_from_config(&config).await {
             Ok(targets) => {
+                if targets.is_empty() {
+                    info!("No enabled audit targets found, keeping audit system stopped");
+                    drop(registry);
+                    return Ok(());
+                }
+
+                {
+                    let mut state = self.state.write().await;
+                    *state = AuditSystemState::Starting;
+                }
+
                 info!(target_count = targets.len(), "Created audit targets successfully");
 
                 // Initialize all targets

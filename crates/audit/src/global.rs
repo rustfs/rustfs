@@ -15,7 +15,7 @@
 use crate::{AuditEntry, AuditResult, AuditSystem};
 use rustfs_ecstore::config::Config;
 use std::sync::{Arc, OnceLock};
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Global audit system instance
 static AUDIT_SYSTEM: OnceLock<Arc<AuditSystem>> = OnceLock::new();
@@ -78,7 +78,7 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
     } else {
         // The system is not initialized at all. This is a more important state.
         // It might be better to return an error or log a warning.
-        warn!("Audit system not initialized, dropping audit entry.");
+        debug!("Audit system not initialized, dropping audit entry.");
         // If this should be a hard failure, you can return Err(AuditError::NotInitialized("..."))
         Ok(())
     }
