@@ -167,7 +167,6 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
     RUSTFS_OBS_LOG_DIRECTORY="/logs" \
-    RUSTFS_SINKS_FILE_PATH="/logs" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
     RUSTFS_UID="1000" \
