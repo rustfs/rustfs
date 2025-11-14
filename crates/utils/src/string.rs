@@ -17,6 +17,29 @@ use regex::Regex;
 use std::io::{Error, Result};
 use std::sync::LazyLock;
 
+/// Parses a boolean value from a string.
+///
+/// # Arguments
+/// `str` - A string slice representing the boolean value.
+///
+/// # Returns
+/// A `Result` containing the parsed boolean value or an error if parsing fails.
+///
+/// Examples
+/// ```no_run
+/// use utils::string::parse_bool;
+///
+/// let true_values = ["1", "t", "T", "true", "TRUE", "True", "on", "ON", "On", "enabled"];
+/// let false_values = ["0", "f", "F", "false", "FALSE", "False", "off", "OFF", "Off", "disabled"];
+///
+/// for val in true_values.iter() {
+///     assert_eq!(parse_bool(val).unwrap(), true);
+/// }
+/// for val in false_values.iter() {
+///     assert_eq!(parse_bool(val).unwrap(), false);
+/// }
+/// ```
+///
 pub fn parse_bool(str: &str) -> Result<bool> {
     match str {
         "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Ok(true),
@@ -25,6 +48,23 @@ pub fn parse_bool(str: &str) -> Result<bool> {
     }
 }
 
+/// Matches a simple pattern against a name using wildcards.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match, which may include wildcards '*' and '?'
+/// * `name` - The name to match against the pattern
+///
+/// # Returns
+/// * `true` if the name matches the pattern, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use utils::string::match_simple;
+/// assert!(match_simple("file*", "file123"));
+/// assert!(match_simple("file?", "file1"));
+/// assert!(!match_simple("file?", "file12"));
+/// ```
+///
 pub fn match_simple(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() {
         return name == pattern;
@@ -36,6 +76,24 @@ pub fn match_simple(pattern: &str, name: &str) -> bool {
     deep_match_rune(name.as_bytes(), pattern.as_bytes(), true)
 }
 
+/// Matches a pattern against a name using wildcards.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match, which may include wildcards '*' and '?'
+/// * `name` - The name to match against the pattern
+///
+/// # Returns
+/// * `true` if the name matches the pattern, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use utils::string::match_pattern;
+///
+/// assert!(match_pattern("file*", "file123"));
+/// assert!(match_pattern("file?", "file1"));
+/// assert!(!match_pattern("file?", "file12"));
+/// ```
+///
 pub fn match_pattern(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() {
         return name == pattern;
@@ -47,6 +105,25 @@ pub fn match_pattern(pattern: &str, name: &str) -> bool {
     deep_match_rune(name.as_bytes(), pattern.as_bytes(), false)
 }
 
+/// Checks if any pattern in the list matches the given string.
+///
+/// # Arguments
+/// * `patterns` - A slice of patterns to match against
+/// * `match_str` - The string to match against the patterns
+///
+/// # Returns
+/// * `true` if any pattern matches the string, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use utils::string::has_pattern;
+///
+/// let patterns = vec!["file*", "data?", "image*"];
+/// assert!(has_pattern(&patterns, "file123"));
+/// assert!(has_pattern(&patterns, "data1"));
+/// assert!(!has_pattern(&patterns, "video1"));
+/// ```
+///
 pub fn has_pattern(patterns: &[&str], match_str: &str) -> bool {
     for pattern in patterns {
         if match_simple(pattern, match_str) {
@@ -56,6 +133,23 @@ pub fn has_pattern(patterns: &[&str], match_str: &str) -> bool {
     false
 }
 
+/// Checks if the given string has any suffix from the provided list, ignoring case.
+///
+/// # Arguments
+/// * `str` - The string to check
+/// * `list` - A slice of suffixes to check against
+///
+/// # Returns
+/// * `true` if the string ends with any of the suffixes in the list, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use utils::string::has_string_suffix_in_slice;
+///
+/// let suffixes = vec![".txt", ".md", ".rs"];
+/// assert!(has_string_suffix_in_slice("document.TXT", &suffixes));
+/// assert!(!has_string_suffix_in_slice("image.png", &suffixes));
+/// ```
 pub fn has_string_suffix_in_slice(str: &str, list: &[&str]) -> bool {
     let str = str.to_lowercase();
     for v in list {

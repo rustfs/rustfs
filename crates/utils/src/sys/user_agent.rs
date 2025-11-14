@@ -39,7 +39,17 @@ impl ServiceType {
     }
 }
 
-// UserAgent structure
+/// UserAgent structure to hold User-Agent information
+/// including OS platform, architecture, version, and service type.
+/// It provides methods to generate a formatted User-Agent string.
+/// # Examples
+/// ```
+/// use rustfs_utils::{get_user_agent, ServiceType};
+///
+/// let ua = get_user_agent(ServiceType::Core);
+/// println!("User-Agent: {}", ua);
+/// ```
+#[derive(Debug)]
 struct UserAgent {
     os_platform: String,
     arch: String,
@@ -146,7 +156,14 @@ impl fmt::Display for UserAgent {
     }
 }
 
-// Get the User-Agent string and accept business type parameters
+/// Get the User-Agent string and accept business type parameters
+///
+/// # Arguments
+/// * `service` - The type of service for which the User-Agent is being created.
+///
+/// # Returns
+/// A formatted User-Agent string.
+///
 pub fn get_user_agent(service: ServiceType) -> String {
     UserAgent::new(service).to_string()
 }

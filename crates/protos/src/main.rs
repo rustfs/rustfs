@@ -16,8 +16,8 @@ use std::{cmp, env, fs, io::Write, path::Path, process::Command};
 
 type AnyError = Box<dyn std::error::Error>;
 
-const VERSION_PROTOBUF: Version = Version(27, 2, 0); // 27.2.0
-const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
+const VERSION_PROTOBUF: Version = Version(33, 1, 0); // 31.1.0
+const VERSION_FLATBUFFERS: Version = Version(25, 9, 23); // 25.9.23
 /// Build protos if the major version of `flatc` or `protoc` is greater
 /// or lesser than the expected version.
 const ENV_BUILD_PROTOS: &str = "BUILD_PROTOS";
