@@ -113,11 +113,11 @@ fn hex_bytes32<R>(src: impl AsRef<[u8]>, f: impl FnOnce(&str) -> R) -> R {
     f(ans)
 }
 
-fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> + use < > {
+fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> + use<> {
     <Sha256 as Digest>::digest(data)
 }
 
-fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use < > {
+fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
     let mut h = <Sha256 as Digest>::new();
     chunk.iter().for_each(|data| h.update(data));
     h.finalize()

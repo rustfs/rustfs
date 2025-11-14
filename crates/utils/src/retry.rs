@@ -20,7 +20,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::time::{interval, Interval, MissedTickBehavior};
+use tokio::time::{Interval, MissedTickBehavior, interval};
 
 pub const MAX_RETRY: i64 = 10;
 pub const MAX_JITTER: f64 = 1.0;
@@ -95,9 +95,7 @@ impl Stream for RetryTimer {
                 }
                 Poll::Ready(Some(()))
             }
-            Poll::Pending => {
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
