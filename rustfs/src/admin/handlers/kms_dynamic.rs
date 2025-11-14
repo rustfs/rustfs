@@ -22,8 +22,8 @@ use matchit::Params;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{
-    ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse,
-    StartKmsRequest, StartKmsResponse, StopKmsResponse, get_global_kms_service_manager,
+    ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
+    StartKmsResponse, StopKmsResponse, get_global_kms_service_manager,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -37,14 +37,13 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
     let Some(store) = new_object_layer_fn() else {
         return Err("Storage layer not initialized".to_string());
     };
-    
-    let data = serde_json::to_vec(config)
-        .map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
-    
+
+    let data = serde_json::to_vec(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
+
     save_config(store, KMS_CONFIG_PATH, data)
         .await
         .map_err(|e| format!("Failed to save KMS config to storage: {e}"))?;
-    
+
     info!("KMS configuration persisted to cluster storage at {}", KMS_CONFIG_PATH);
     Ok(())
 }
@@ -55,20 +54,18 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
         warn!("Storage layer not initialized, cannot load KMS config");
         return None;
     };
-    
+
     match read_config(store, KMS_CONFIG_PATH).await {
-        Ok(data) => {
-            match serde_json::from_slice::<KmsConfig>(&data) {
-                Ok(config) => {
-                    info!("Loaded KMS configuration from cluster storage");
-                    Some(config)
-                }
-                Err(e) => {
-                    error!("Failed to deserialize KMS config: {}", e);
-                    None
-                }
+        Ok(data) => match serde_json::from_slice::<KmsConfig>(&data) {
+            Ok(config) => {
+                info!("Loaded KMS configuration from cluster storage");
+                Some(config)
             }
-        }
+            Err(e) => {
+                error!("Failed to deserialize KMS config: {}", e);
+                None
+            }
+        },
         Err(e) => {
             // Config not found is normal on first run
             if e.to_string().contains("ConfigNotFound") || e.to_string().contains("not found") {

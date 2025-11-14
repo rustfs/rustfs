@@ -623,10 +623,10 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
     } else {
         // Try to load persisted KMS configuration from cluster storage
         info!("Attempting to load persisted KMS configuration from cluster storage...");
-        
+
         if let Some(persisted_config) = admin::handlers::kms_dynamic::load_kms_config().await {
             info!("Found persisted KMS configuration, attempting to configure and start service...");
-            
+
             // Configure the KMS service with persisted config
             match service_manager.configure(persisted_config).await {
                 Ok(()) => {
