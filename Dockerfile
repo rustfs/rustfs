@@ -82,9 +82,8 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
-    RUSTFS_OBS_LOG_DIRECTORY="/logs" \
-    RUSTFS_SINKS_FILE_PATH="/logs"
-
+    RUSTFS_OBS_LOG_DIRECTORY="/logs" 
+    
 EXPOSE 9000 9001
 
 VOLUME ["/data", "/logs"]

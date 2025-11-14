@@ -32,7 +32,6 @@ config:
     log_level: "debug"
     rust_log: "debug"
     console_enable: "true"
-    sinks_file_path: "/logs"
     obs_log_directory: "/logs"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
