@@ -143,8 +143,7 @@ impl ParsedURL {
     /// * `&self` - Reference to the ParsedURL instance.
     ///
     /// # Returns
-    /// * `bool` - True if the URL is empty or "about:blank",
-    /// false otherwise.
+    /// * `bool` - True if the URL is empty or "about:blank", false otherwise.
     ///
     pub fn is_empty(&self) -> bool {
         self.0.as_str() == "" || (self.0.scheme() == "about" && self.0.path() == "blank")
