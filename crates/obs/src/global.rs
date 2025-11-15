@@ -70,7 +70,7 @@ pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError
     Ok(otel_guard)
 }
 
-/// Set the global guard for OpenTelemetry
+/// Set the global guard for OtelGuard
 ///
 /// # Arguments
 /// * `guard` - The OtelGuard instance to set globally
@@ -93,11 +93,11 @@ pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError
 /// # }
 /// ```
 pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
-    info!("Initializing global OpenTelemetry guard");
+    info!("Initializing global guard");
     GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GlobalError::SetError)
 }
 
-/// Get the global guard for OpenTelemetry
+/// Get the global guard for OtelGuard
 ///
 /// # Returns
 /// * `Ok(Arc<Mutex<OtelGuard>>)` if guard exists
