@@ -18,6 +18,12 @@ use crate::encryption::ciphers::{create_cipher, generate_iv};
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
+use base64::Engine;
+use rand::random;
+use std::collections::HashMap;
+use std::io::Cursor;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tracing::{debug, info};
 use zeroize::Zeroize;
 
 /// Data key for object encryption
@@ -36,12 +42,6 @@ impl Drop for DataKey {
         self.plaintext_key.zeroize();
     }
 }
-use base64::Engine;
-use rand::random;
-use std::collections::HashMap;
-use std::io::Cursor;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, info};
 
 /// Service for encrypting and decrypting S3 objects with KMS integration
 pub struct ObjectEncryptionService {
@@ -59,51 +59,110 @@ pub struct EncryptionResult {
 
 impl ObjectEncryptionService {
     /// Create a new object encryption service
+    ///
+    /// # Arguments
+    /// * `kms_manager` - KMS manager to use for key operations
+    ///
+    /// # Returns
+    /// New ObjectEncryptionService instance
+    ///
     pub fn new(kms_manager: KmsManager) -> Self {
         Self { kms_manager }
     }
 
     /// Create a new master key (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - CreateKeyRequest with key parameters
+    ///
+    /// # Returns
+    /// CreateKeyResponse with created key details
+    ///
     pub async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         self.kms_manager.create_key(request).await
     }
 
     /// Describe a master key (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - DescribeKeyRequest with key ID
+    ///
+    /// # Returns
+    /// DescribeKeyResponse with key metadata
+    ///
     pub async fn describe_key(&self, request: DescribeKeyRequest) -> Result<DescribeKeyResponse> {
         self.kms_manager.describe_key(request).await
     }
 
     /// List master keys (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - ListKeysRequest with listing parameters
+    ///
+    /// # Returns
+    /// ListKeysResponse with list of keys
+    ///
     pub async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse> {
         self.kms_manager.list_keys(request).await
     }
 
     /// Generate a data encryption key (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - GenerateDataKeyRequest with key parameters
+    ///
+    /// # Returns
+    /// GenerateDataKeyResponse with generated key details
+    ///
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
         self.kms_manager.generate_data_key(request).await
     }
 
     /// Get the default key ID
+    ///
+    /// # Returns
+    /// Option with default key ID if configured
+    ///
     pub fn get_default_key_id(&self) -> Option<&String> {
         self.kms_manager.get_default_key_id()
     }
 
     /// Get cache statistics
+    ///
+    /// # Returns
+    /// Option with (hits, misses) if caching is enabled
+    ///
     pub async fn cache_stats(&self) -> Option<(u64, u64)> {
         self.kms_manager.cache_stats().await
     }
 
     /// Clear the cache
+    ///
+    /// # Returns
+    /// Result indicating success or failure
+    ///
     pub async fn clear_cache(&self) -> Result<()> {
         self.kms_manager.clear_cache().await
     }
 
     /// Get backend health status
+    ///
+    /// # Returns
+    /// Result indicating if backend is healthy
+    ///
     pub async fn health_check(&self) -> Result<bool> {
         self.kms_manager.health_check().await
     }
 
     /// Create a data encryption key for object encryption
+    ///
+    /// # Arguments
+    /// * `kms_key_id` - Optional KMS key ID to use (uses default if None)
+    /// * `context` - ObjectEncryptionContext with bucket and object key
+    ///
+    /// # Returns
+    /// Tuple with DataKey and encrypted key blob
+    ///
     pub async fn create_data_key(
         &self,
         kms_key_id: &Option<String>,
@@ -146,6 +205,14 @@ impl ObjectEncryptionService {
     }
 
     /// Decrypt a data encryption key
+    ///
+    /// # Arguments
+    /// * `encrypted_key` - Encrypted data key blob
+    /// * `context` - ObjectEncryptionContext with bucket and object key
+    ///
+    /// # Returns
+    /// DataKey with decrypted key
+    ///
     pub async fn decrypt_data_key(&self, encrypted_key: &[u8], _context: &ObjectEncryptionContext) -> Result<DataKey> {
         let decrypt_request = DecryptRequest {
             ciphertext: encrypted_key.to_vec(),
@@ -429,6 +496,17 @@ impl ObjectEncryptionService {
     }
 
     /// Decrypt object with customer-provided key (SSE-C)
+    ///
+    /// # Arguments
+    /// * `bucket` - S3 bucket name
+    /// * `object_key` - S3 object key
+    /// * `ciphertext` - Encrypted data
+    /// * `metadata` - Encryption metadata
+    /// * `customer_key` - Customer-provided 256-bit key
+    ///
+    /// # Returns
+    /// Decrypted data as a reader
+    ///
     pub async fn decrypt_object_with_customer_key(
         &self,
         bucket: &str,
@@ -481,6 +559,14 @@ impl ObjectEncryptionService {
     }
 
     /// Validate encryption context
+    ///
+    /// # Arguments
+    /// * `actual` - Actual encryption context from metadata
+    /// * `expected` - Expected encryption context to validate against
+    ///
+    /// # Returns
+    /// Result indicating success or context mismatch
+    ///
     fn validate_encryption_context(&self, actual: &HashMap<String, String>, expected: &HashMap<String, String>) -> Result<()> {
         for (key, expected_value) in expected {
             match actual.get(key) {
@@ -499,6 +585,13 @@ impl ObjectEncryptionService {
     }
 
     /// Convert encryption metadata to HTTP headers for S3 compatibility
+    ///
+    /// # Arguments
+    /// * `metadata` - EncryptionMetadata to convert
+    ///
+    /// # Returns
+    /// HashMap of HTTP headers
+    ///
     pub fn metadata_to_headers(&self, metadata: &EncryptionMetadata) -> HashMap<String, String> {
         let mut headers = HashMap::new();
 
@@ -542,6 +635,13 @@ impl ObjectEncryptionService {
     }
 
     /// Parse encryption metadata from HTTP headers
+    ///
+    /// # Arguments
+    /// * `headers` - HashMap of HTTP headers
+    ///
+    /// # Returns
+    /// EncryptionMetadata parsed from headers
+    ///
     pub fn headers_to_metadata(&self, headers: &HashMap<String, String>) -> Result<EncryptionMetadata> {
         let algorithm = headers
             .get("x-amz-server-side-encryption")

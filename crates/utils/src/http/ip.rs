@@ -38,6 +38,10 @@ static FOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:for=)([
 static PROTO_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(;|,| )+(?:proto=)(https|http)").unwrap());
 
 /// Used to disable all processing of the X-Forwarded-For header in source IP discovery.
+///
+/// # Returns
+/// A `bool` indicating whether the X-Forwarded-For header is enabled
+///
 fn is_xff_header_enabled() -> bool {
     env::var("_RUSTFS_API_XFF_HEADER")
         .unwrap_or_else(|_| "on".to_string())
@@ -47,6 +51,13 @@ fn is_xff_header_enabled() -> bool {
 
 /// GetSourceScheme retrieves the scheme from the X-Forwarded-Proto and RFC7239
 /// Forwarded headers (in that order).
+///
+/// # Arguments
+/// * `headers` - HTTP headers from the request
+///
+/// # Returns
+/// An `Option<String>` containing the source scheme if found
+///
 pub fn get_source_scheme(headers: &HeaderMap) -> Option<String> {
     // Retrieve the scheme from X-Forwarded-Proto.
     if let Some(proto) = headers.get(X_FORWARDED_PROTO) {
@@ -91,6 +102,13 @@ pub fn get_source_scheme(headers: &HeaderMap) -> Option<String> {
 
 /// GetSourceIPFromHeaders retrieves the IP from the X-Forwarded-For, X-Real-IP
 /// and RFC7239 Forwarded headers (in that order)
+///
+/// # Arguments
+/// * `headers` - HTTP headers from the request
+///
+/// # Returns
+/// An `Option<String>` containing the source IP address if found
+///
 pub fn get_source_ip_from_headers(headers: &HeaderMap) -> Option<String> {
     let mut addr = None;
 
@@ -143,6 +161,14 @@ pub fn get_source_ip_from_headers(headers: &HeaderMap) -> Option<String> {
 /// GetSourceIPRaw retrieves the IP from the request headers
 /// and falls back to remote_addr when necessary.
 /// however returns without bracketing.
+///
+/// # Arguments
+/// * `headers` - HTTP headers from the request
+/// * `remote_addr` - Remote address as a string
+///
+/// # Returns
+/// A `String` containing the source IP address
+///
 pub fn get_source_ip_raw(headers: &HeaderMap, remote_addr: &str) -> String {
     let addr = get_source_ip_from_headers(headers).unwrap_or_else(|| remote_addr.to_string());
 
@@ -156,6 +182,15 @@ pub fn get_source_ip_raw(headers: &HeaderMap, remote_addr: &str) -> String {
 
 /// GetSourceIP retrieves the IP from the request headers
 /// and falls back to remote_addr when necessary.
+/// It brackets IPv6 addresses.
+///
+/// # Arguments
+/// * `headers` - HTTP headers from the request
+/// * `remote_addr` - Remote address as a string
+///
+/// # Returns
+/// A `String` containing the source IP address, with IPv6 addresses bracketed
+///
 pub fn get_source_ip(headers: &HeaderMap, remote_addr: &str) -> String {
     let addr = get_source_ip_raw(headers, remote_addr);
     if addr.contains(':') { format!("[{addr}]") } else { addr }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 /// Check if MQTT Broker is available
+///
 /// # Arguments
 /// * `broker_url` - URL of MQTT Broker, for example `mqtt://localhost:1883`
 /// * `topic` - Topic for testing connections
@@ -40,6 +41,7 @@
 /// url = "2.5.7"
 /// tokio = { version = "1", features = ["full"] }
 /// ```
+///
 pub async fn check_mqtt_broker_available(broker_url: &str, topic: &str) -> Result<(), String> {
     use rumqttc::{AsyncClient, MqttOptions, QoS};
     let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed:{e}"))?;

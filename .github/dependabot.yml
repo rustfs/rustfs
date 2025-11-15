@@ -28,6 +28,9 @@ updates:
       time: "08:00"
     groups:
       s3s:
+        update-types:
+          - "minor"
+          - "patch"
         patterns:
           - "s3s"
           - "s3s-*"

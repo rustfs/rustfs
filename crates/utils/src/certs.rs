@@ -26,6 +26,13 @@ use tracing::{debug, warn};
 
 /// Load public certificate from file.
 /// This function loads a public certificate from the specified file.
+///
+/// # Arguments
+///  * `filename` - A string slice that holds the name of the file containing the public certificate.
+///
+/// # Returns
+/// * An io::Result containing a vector of CertificateDer if successful, or an io::Error if an error occurs during loading.
+///
 pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     // Open certificate file.
     let cert_file = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {filename}: {e}")))?;
@@ -43,6 +50,13 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
 
 /// Load private key from file.
 /// This function loads a private key from the specified file.
+///
+/// # Arguments
+///  * `filename` - A string slice that holds the name of the file containing the private key.
+///
+/// # Returns
+/// * An io::Result containing the PrivateKeyDer if successful, or an io::Error if an error occurs during loading.
+///
 pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
     // Open keyfile.
     let keyfile = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {filename}: {e}")))?;
@@ -53,6 +67,14 @@ pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
 }
 
 /// error function
+/// This function creates a new io::Error with the provided error message.
+///
+/// # Arguments
+///  * `err` - A string containing the error message.
+///
+/// # Returns
+///  * An io::Error instance with the specified error message.
+///
 pub fn certs_error(err: String) -> Error {
     Error::other(err)
 }
@@ -61,6 +83,13 @@ pub fn certs_error(err: String) -> Error {
 /// This function loads all certificate and private key pairs from the specified directory.
 /// It looks for files named `rustfs_cert.pem` and `rustfs_key.pem` in each subdirectory.
 /// The root directory can also contain a default certificate/private key pair.
+///
+/// # Arguments
+/// * `dir_path` - A string slice that holds the path to the directory containing the certificates and private keys.
+///
+/// # Returns
+/// * An io::Result containing a HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer). If no valid certificate/private key pairs are found, an io::Error is returned.
+///
 pub fn load_all_certs_from_directory(
     dir_path: &str,
 ) -> io::Result<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
@@ -137,6 +166,14 @@ pub fn load_all_certs_from_directory(
 /// loading a single certificate private key pair
 /// This function loads a certificate and private key from the specified paths.
 /// It returns a tuple containing the certificate and private key.
+///
+/// # Arguments
+/// * `cert_path` - A string slice that holds the path to the certificate file.
+/// * `key_path` - A string slice that holds the path to the private key file
+///
+/// # Returns
+/// * An io::Result containing a tuple of (Vec<CertificateDer>, PrivateKeyDer) if successful, or an io::Error if an error occurs during loading.
+///
 fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
@@ -147,6 +184,12 @@ fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<Certif
 /// This function loads all certificates and private keys from the specified directory.
 /// It uses the first certificate/private key pair found in the root directory as the default certificate.
 /// The rest of the certificates/private keys are used for SNI resolution.
+///
+/// # Arguments
+/// * `cert_key_pairs` - A HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer).
+///
+/// # Returns
+/// * An io::Result containing an implementation of ResolvesServerCert if successful, or an io::Error if an error occurs during loading.
 ///
 pub fn create_multi_cert_resolver(
     cert_key_pairs: HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
@@ -195,6 +238,10 @@ pub fn create_multi_cert_resolver(
 }
 
 /// Checks if TLS key logging is enabled.
+///
+/// # Returns
+/// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
+///
 pub fn tls_key_log() -> bool {
     env::var("RUSTFS_TLS_KEYLOG")
         .map(|v| {
@@ -203,6 +250,8 @@ pub fn tls_key_log() -> bool {
                 || v.eq_ignore_ascii_case("on")
                 || v.eq_ignore_ascii_case("true")
                 || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("enabled")
+                || v.eq_ignore_ascii_case("t")
         })
         .unwrap_or(false)
 }
