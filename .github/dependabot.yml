@@ -22,20 +22,6 @@ updates:
   - package-ecosystem: "cargo" # See documentation for possible values
     directory: "/" # Location of package manifests
     schedule:
-      interval: "monthly"
-    ignore:
-      - dependency-name: "s3s"
-      - dependency-name: "s3s-*"
-    groups:
-      dependencies:
-        patterns:
-          - "*"
-  - package-ecosystem: "cargo"
-    directory: "/"
-    allow:
-      - dependency-name: "s3s"
-      - dependency-name: "s3s-*"
-    schedule:
       interval: "weekly"
       day: "monday"
       timezone: "Asia/Shanghai"
@@ -45,3 +31,6 @@ updates:
         patterns:
           - "s3s"
           - "s3s-*"
+      dependencies:
+        patterns:
+          - "*"
