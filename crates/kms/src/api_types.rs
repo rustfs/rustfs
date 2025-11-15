@@ -14,7 +14,7 @@
 
 //! API types for KMS dynamic configuration
 
-use crate::config::{KmsBackend, KmsConfig, VaultAuthMethod};
+use crate::config::{BackendConfig, CacheConfig, KmsBackend, KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig};
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
 use serde::{Deserialize, Serialize};
@@ -212,12 +212,12 @@ impl From<&KmsConfig> for KmsConfigSummary {
         };
 
         let backend_summary = match &config.backend_config {
-            crate::config::BackendConfig::Local(local_config) => BackendSummary::Local {
+            BackendConfig::Local(local_config) => BackendSummary::Local {
                 key_dir: local_config.key_dir.clone(),
                 has_master_key: local_config.master_key.is_some(),
                 file_permissions: local_config.file_permissions,
             },
-            crate::config::BackendConfig::Vault(vault_config) => BackendSummary::Vault {
+            BackendConfig::Vault(vault_config) => BackendSummary::Vault {
                 address: vault_config.address.clone(),
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
@@ -248,7 +248,7 @@ impl ConfigureLocalKmsRequest {
         KmsConfig {
             backend: KmsBackend::Local,
             default_key_id: self.default_key_id.clone(),
-            backend_config: crate::config::BackendConfig::Local(crate::config::LocalConfig {
+            backend_config: BackendConfig::Local(LocalConfig {
                 key_dir: self.key_dir.clone(),
                 master_key: self.master_key.clone(),
                 file_permissions: self.file_permissions,
@@ -256,7 +256,7 @@ impl ConfigureLocalKmsRequest {
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
-            cache_config: crate::config::CacheConfig {
+            cache_config: CacheConfig {
                 max_keys: self.max_cached_keys.unwrap_or(1000),
                 ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
                 enable_metrics: true,
@@ -271,7 +271,7 @@ impl ConfigureVaultKmsRequest {
         KmsConfig {
             backend: KmsBackend::Vault,
             default_key_id: self.default_key_id.clone(),
-            backend_config: crate::config::BackendConfig::Vault(crate::config::VaultConfig {
+            backend_config: BackendConfig::Vault(VaultConfig {
                 address: self.address.clone(),
                 auth_method: self.auth_method.clone(),
                 namespace: self.namespace.clone(),
@@ -279,7 +279,7 @@ impl ConfigureVaultKmsRequest {
                 kv_mount: self.kv_mount.clone().unwrap_or_else(|| "secret".to_string()),
                 key_path_prefix: self.key_path_prefix.clone().unwrap_or_else(|| "rustfs/kms/keys".to_string()),
                 tls: if self.skip_tls_verify.unwrap_or(false) {
-                    Some(crate::config::TlsConfig {
+                    Some(TlsConfig {
                         ca_cert_path: None,
                         client_cert_path: None,
                         client_key_path: None,
@@ -292,7 +292,7 @@ impl ConfigureVaultKmsRequest {
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),
-            cache_config: crate::config::CacheConfig {
+            cache_config: CacheConfig {
                 max_keys: self.max_cached_keys.unwrap_or(1000),
                 ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
                 enable_metrics: true,

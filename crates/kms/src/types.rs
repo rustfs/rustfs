@@ -42,6 +42,17 @@ pub struct DataKey {
 
 impl DataKey {
     /// Create a new data key
+    ///
+    /// # Arguments
+    /// * `key_id` - Unique identifier for the key
+    /// * `version` - Key version number
+    /// * `plaintext` - Optional plaintext key material
+    /// * `ciphertext` - Encrypted key material
+    /// * `key_spec` - Key specification (e.g., "AES_256")
+    ///
+    /// # Returns
+    /// A new `DataKey` instance
+    ///
     pub fn new(key_id: String, version: u32, plaintext: Option<Vec<u8>>, ciphertext: Vec<u8>, key_spec: String) -> Self {
         Self {
             key_id,
@@ -55,6 +66,11 @@ impl DataKey {
     }
 
     /// Clear the plaintext key material from memory for security
+    ///
+    /// # Security
+    /// This method zeroes out the plaintext key material before dropping it
+    /// to prevent sensitive data from lingering in memory.
+    ///
     pub fn clear_plaintext(&mut self) {
         if let Some(ref mut plaintext) = self.plaintext {
             // Zero out the memory before dropping
@@ -64,6 +80,14 @@ impl DataKey {
     }
 
     /// Add metadata to the data key
+    ///
+    /// # Arguments
+    /// * `key` - Metadata key
+    /// * `value` - Metadata value
+    ///
+    /// # Returns
+    /// Updated `DataKey` instance with added metadata
+    ///
     pub fn with_metadata(mut self, key: String, value: String) -> Self {
         self.metadata.insert(key, value);
         self
@@ -97,6 +121,15 @@ pub struct MasterKey {
 
 impl MasterKey {
     /// Create a new master key
+    ///
+    /// # Arguments
+    /// * `key_id` - Unique identifier for the key
+    /// * `algorithm` - Key algorithm (e.g., "AES-256")
+    /// * `created_by` - Optional creator/owner of the key
+    ///
+    /// # Returns
+    /// A new `MasterKey` instance
+    ///
     pub fn new(key_id: String, algorithm: String, created_by: Option<String>) -> Self {
         Self {
             key_id,
@@ -113,6 +146,16 @@ impl MasterKey {
     }
 
     /// Create a new master key with description
+    ///
+    /// # Arguments
+    /// * `key_id` - Unique identifier for the key
+    /// * `algorithm` - Key algorithm (e.g., "AES-256")
+    /// * `created_by` - Optional creator/owner of the key
+    /// * `description` - Optional key description
+    ///
+    /// # Returns
+    /// A new `MasterKey` instance with description
+    ///
     pub fn new_with_description(
         key_id: String,
         algorithm: String,
@@ -218,6 +261,14 @@ pub struct GenerateKeyRequest {
 
 impl GenerateKeyRequest {
     /// Create a new generate key request
+    ///
+    /// # Arguments
+    /// * `master_key_id` - Master key ID to use for encryption
+    /// * `key_spec` - Key specification (e.g., "AES_256")
+    ///
+    /// # Returns
+    /// A new `GenerateKeyRequest` instance
+    ///
     pub fn new(master_key_id: String, key_spec: String) -> Self {
         Self {
             master_key_id,
@@ -229,12 +280,27 @@ impl GenerateKeyRequest {
     }
 
     /// Add encryption context
+    ///
+    /// # Arguments
+    /// * `key` - Context key
+    /// * `value` - Context value
+    ///
+    /// # Returns
+    /// Updated `GenerateKeyRequest` instance with added context
+    ///
     pub fn with_context(mut self, key: String, value: String) -> Self {
         self.encryption_context.insert(key, value);
         self
     }
 
     /// Set key length explicitly
+    ///
+    /// # Arguments
+    /// * `length` - Key length in bytes
+    ///
+    /// # Returns
+    /// Updated `GenerateKeyRequest` instance with specified key length
+    ///
     pub fn with_length(mut self, length: u32) -> Self {
         self.key_length = Some(length);
         self
@@ -256,6 +322,14 @@ pub struct EncryptRequest {
 
 impl EncryptRequest {
     /// Create a new encrypt request
+    ///
+    /// # Arguments
+    /// * `key_id` - Key ID to use for encryption
+    /// * `plaintext` - Plaintext data to encrypt
+    ///
+    /// # Returns
+    /// A new `EncryptRequest` instance
+    ///
     pub fn new(key_id: String, plaintext: Vec<u8>) -> Self {
         Self {
             key_id,
@@ -266,6 +340,14 @@ impl EncryptRequest {
     }
 
     /// Add encryption context
+    ///
+    /// # Arguments
+    /// * `key` - Context key
+    /// * `value` - Context value
+    ///
+    /// # Returns
+    /// Updated `EncryptRequest` instance with added context
+    ///
     pub fn with_context(mut self, key: String, value: String) -> Self {
         self.encryption_context.insert(key, value);
         self
@@ -298,6 +380,13 @@ pub struct DecryptRequest {
 
 impl DecryptRequest {
     /// Create a new decrypt request
+    ///
+    /// # Arguments
+    /// * `ciphertext` - Ciphertext to decrypt
+    ///
+    /// # Returns
+    /// A new `DecryptRequest` instance
+    ///
     pub fn new(ciphertext: Vec<u8>) -> Self {
         Self {
             ciphertext,
@@ -307,6 +396,14 @@ impl DecryptRequest {
     }
 
     /// Add encryption context
+    ///
+    /// # Arguments
+    /// * `key` - Context key
+    /// * `value` - Context value
+    ///
+    /// # Returns
+    /// Updated `DecryptRequest` instance with added context
+    ///
     pub fn with_context(mut self, key: String, value: String) -> Self {
         self.encryption_context.insert(key, value);
         self
@@ -365,6 +462,13 @@ pub struct OperationContext {
 
 impl OperationContext {
     /// Create a new operation context
+    ///
+    /// # Arguments
+    /// * `principal` - User or service performing the operation
+    ///
+    /// # Returns
+    /// A new `OperationContext` instance
+    ///
     pub fn new(principal: String) -> Self {
         Self {
             operation_id: Uuid::new_v4(),
@@ -376,18 +480,40 @@ impl OperationContext {
     }
 
     /// Add additional context
+    ///
+    /// # Arguments
+    /// * `key` - Context key
+    /// * `value` - Context value
+    ///
+    /// # Returns
+    /// Updated `OperationContext` instance with added context
+    ///
     pub fn with_context(mut self, key: String, value: String) -> Self {
         self.additional_context.insert(key, value);
         self
     }
 
     /// Set source IP
+    ///
+    /// # Arguments
+    /// * `ip` - Source IP address
+    ///
+    /// # Returns
+    /// Updated `OperationContext` instance with source IP
+    ///
     pub fn with_source_ip(mut self, ip: String) -> Self {
         self.source_ip = Some(ip);
         self
     }
 
     /// Set user agent
+    ///
+    /// # Arguments
+    /// * `agent` - User agent string
+    ///
+    /// # Returns
+    /// Updated `OperationContext` instance with user agent
+    ///
     pub fn with_user_agent(mut self, agent: String) -> Self {
         self.user_agent = Some(agent);
         self
@@ -411,6 +537,14 @@ pub struct ObjectEncryptionContext {
 
 impl ObjectEncryptionContext {
     /// Create a new object encryption context
+    ///
+    /// # Arguments
+    /// * `bucket` - Bucket name
+    /// * `object_key` - Object key
+    ///
+    /// # Returns
+    /// A new `ObjectEncryptionContext` instance
+    ///
     pub fn new(bucket: String, object_key: String) -> Self {
         Self {
             bucket,
@@ -422,18 +556,40 @@ impl ObjectEncryptionContext {
     }
 
     /// Set content type
+    ///
+    /// # Arguments
+    /// * `content_type` - Content type string
+    ///
+    /// # Returns
+    /// Updated `ObjectEncryptionContext` instance with content type
+    ///
     pub fn with_content_type(mut self, content_type: String) -> Self {
         self.content_type = Some(content_type);
         self
     }
 
     /// Set object size
+    ///
+    /// # Arguments
+    /// * `size` - Object size in bytes
+    ///
+    /// # Returns
+    /// Updated `ObjectEncryptionContext` instance with size
+    ///
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = Some(size);
         self
     }
 
     /// Add encryption context
+    ///
+    /// # Arguments
+    /// * `key` - Context key
+    /// * `value` - Context value
+    ///
+    /// # Returns
+    /// Updated `ObjectEncryptionContext` instance with added context
+    ///
     pub fn with_encryption_context(mut self, key: String, value: String) -> Self {
         self.encryption_context.insert(key, value);
         self
@@ -503,6 +659,10 @@ pub enum KeySpec {
 
 impl KeySpec {
     /// Get the key size in bytes
+    ///
+    /// # Returns
+    /// Key size in bytes
+    ///
     pub fn key_size(&self) -> usize {
         match self {
             Self::Aes256 => 32,
@@ -512,6 +672,10 @@ impl KeySpec {
     }
 
     /// Get the string representation for backends
+    ///
+    /// # Returns
+    /// Key specification as a string
+    ///
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Aes256 => "AES_256",
@@ -636,6 +800,14 @@ pub struct GenerateDataKeyRequest {
 
 impl GenerateDataKeyRequest {
     /// Create a new generate data key request
+    ///
+    /// # Arguments
+    /// * `key_id` - Key ID to use for encryption
+    /// * `key_spec` - Key specification
+    ///
+    /// # Returns
+    /// A new `GenerateDataKeyRequest` instance
+    ///
     pub fn new(key_id: String, key_spec: KeySpec) -> Self {
         Self {
             key_id,
@@ -658,6 +830,10 @@ pub struct GenerateDataKeyResponse {
 
 impl EncryptionAlgorithm {
     /// Get the algorithm name as a string
+    ///
+    /// # Returns
+    /// Algorithm name as a string
+    ///
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Aes256 => "AES256",
