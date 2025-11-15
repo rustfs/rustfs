@@ -42,7 +42,6 @@ pub struct RetryTimer {
 
 impl RetryTimer {
     pub fn new(max_retry: i64, base_sleep: Duration, max_sleep: Duration, jitter: f64, random: u64) -> Self {
-        //println!("time1: {:?}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
         Self {
             base_sleep,
             max_sleep,
@@ -70,9 +69,6 @@ impl Stream for RetryTimer {
             sleep = self.max_sleep;
         }
         if (jitter - NO_JITTER).abs() > 1e-9 {
-            //println!("\njitter: {:?}", jitter);
-            //println!("sleep: {sleep:?}");
-            //println!("0000: {:?}", self.random as f64 * jitter / 100_f64);
             let sleep_ms = sleep.as_millis();
             let reduction = ((sleep_ms as f64) * (self.random as f64 * jitter / 100_f64)).round() as u128;
             let jittered_ms = sleep_ms.saturating_sub(reduction);
@@ -85,29 +81,21 @@ impl Stream for RetryTimer {
             let mut timer = interval(sleep);
             timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
             self.timer = Some(timer);
-            //println!("time1: {:?}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
         }
 
         let mut timer = self.timer.as_mut().unwrap();
         match Pin::new(&mut timer).poll_tick(cx) {
             Poll::Ready(_) => {
-                //println!("ready");
-                //println!("time2: {:?}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
                 self.rem -= 1;
                 if self.rem > 0 {
                     let mut new_timer = interval(sleep);
                     new_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
                     new_timer.reset();
                     self.timer = Some(new_timer);
-                    //println!("time1: {:?}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
                 }
                 Poll::Ready(Some(()))
             }
-            Poll::Pending => {
-                //println!("pending");
-                //println!("time2: {:?}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -176,7 +164,7 @@ pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
-    use futures::{Future, StreamExt};
+    use futures::StreamExt;
     use rand::Rng;
     use std::time::UNIX_EPOCH;
 

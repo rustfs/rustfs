@@ -20,9 +20,9 @@ use std::net::{IpAddr, Ipv4Addr};
 /// If both fail to retrieve, None is returned.
 ///
 /// # Returns
-///
 /// * `Some(IpAddr)` - Native IP address (IPv4 or IPv6)
 /// * `None` - Unable to obtain any native IP address
+///
 pub fn get_local_ip() -> Option<IpAddr> {
     local_ip_address::local_ip()
         .ok()
@@ -34,8 +34,8 @@ pub fn get_local_ip() -> Option<IpAddr> {
 /// If the IP address cannot be obtained, returns "127.0.0.1" as the default value.
 ///
 /// # Returns
-///
 /// * `String` - Native IP address (IPv4 or IPv6) as a string, or the default value
+///
 pub fn get_local_ip_with_default() -> String {
     get_local_ip()
         .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))) // Provide a safe default value

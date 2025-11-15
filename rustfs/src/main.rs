@@ -550,7 +550,7 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
 
     // If KMS is enabled in configuration, configure and start the service
     if opt.kms_enable {
-        info!("KMS is enabled, configuring and starting service...");
+        info!("KMS is enabled via command line, configuring and starting service...");
 
         // Create KMS configuration from command line options
         let kms_config = match opt.kms_backend.as_str() {
@@ -619,9 +619,34 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
             .await
             .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
 
-        info!("KMS service configured and started successfully");
+        info!("KMS service configured and started successfully from command line options");
     } else {
-        info!("KMS service manager initialized. KMS is ready for dynamic configuration via API.");
+        // Try to load persisted KMS configuration from cluster storage
+        info!("Attempting to load persisted KMS configuration from cluster storage...");
+
+        if let Some(persisted_config) = admin::handlers::kms_dynamic::load_kms_config().await {
+            info!("Found persisted KMS configuration, attempting to configure and start service...");
+
+            // Configure the KMS service with persisted config
+            match service_manager.configure(persisted_config).await {
+                Ok(()) => {
+                    // Start the KMS service
+                    match service_manager.start().await {
+                        Ok(()) => {
+                            info!("KMS service configured and started successfully from persisted configuration");
+                        }
+                        Err(e) => {
+                            warn!("Failed to start KMS with persisted configuration: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to configure KMS with persisted configuration: {}", e);
+                }
+            }
+        } else {
+            info!("No persisted KMS configuration found. KMS is ready for dynamic configuration via API.");
+        }
     }
 
     Ok(())

@@ -116,7 +116,7 @@ impl KmsError {
         Self::BackendError { message: message.into() }
     }
 
-    /// Create an access denied error
+    /// Create access denied error
     pub fn access_denied<S: Into<String>>(message: S) -> Self {
         Self::AccessDenied { message: message.into() }
     }
@@ -184,7 +184,7 @@ impl KmsError {
     }
 }
 
-// Convert from standard library errors
+/// Convert from standard library errors
 impl From<std::io::Error> for KmsError {
     fn from(error: std::io::Error) -> Self {
         Self::IoError {
@@ -206,6 +206,13 @@ impl From<serde_json::Error> for KmsError {
 
 impl KmsError {
     /// Create a KMS error from AES-GCM error
+    ///
+    /// #Arguments
+    /// * `error` - The AES-GCM error to convert
+    ///
+    /// #Returns
+    /// * `KmsError` - The corresponding KMS error
+    ///
     pub fn from_aes_gcm_error(error: aes_gcm::Error) -> Self {
         Self::CryptographicError {
             operation: "AES-GCM".to_string(),
@@ -214,6 +221,13 @@ impl KmsError {
     }
 
     /// Create a KMS error from ChaCha20-Poly1305 error
+    ///
+    /// #Arguments
+    /// * `error` - The ChaCha20-Poly1305 error to convert
+    ///
+    /// #Returns
+    /// * `KmsError` - The corresponding KMS error
+    ///
     pub fn from_chacha20_error(error: chacha20poly1305::Error) -> Self {
         Self::CryptographicError {
             operation: "ChaCha20-Poly1305".to_string(),

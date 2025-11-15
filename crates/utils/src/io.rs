@@ -83,7 +83,7 @@ pub fn put_uvarint_len(x: u64) -> usize {
     i + 1
 }
 
-/// Decodes a u64 from buf and returns (value, number of bytes read).
+/// Decodes an u64 from buf and returns (value, number of bytes read).
 /// If buf is too small, returns (0, 0).
 /// If overflow, returns (0, -(n as isize)), where n is the number of bytes read.
 pub fn uvarint(buf: &[u8]) -> (u64, isize) {

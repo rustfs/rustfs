@@ -19,13 +19,64 @@ use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
 use hyper::StatusCode;
 use matchit::Params;
+use rustfs_ecstore::config::com::{read_config, save_config};
+use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{
-    ConfigureKmsRequest, ConfigureKmsResponse, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
+    ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
     StartKmsResponse, StopKmsResponse, get_global_kms_service_manager,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::{error, info, warn};
+
+/// Path to store KMS configuration in the cluster metadata
+const KMS_CONFIG_PATH: &str = "config/kms_config.json";
+
+/// Save KMS configuration to cluster storage
+async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
+    let Some(store) = new_object_layer_fn() else {
+        return Err("Storage layer not initialized".to_string());
+    };
+
+    let data = serde_json::to_vec(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
+
+    save_config(store, KMS_CONFIG_PATH, data)
+        .await
+        .map_err(|e| format!("Failed to save KMS config to storage: {e}"))?;
+
+    info!("KMS configuration persisted to cluster storage at {}", KMS_CONFIG_PATH);
+    Ok(())
+}
+
+/// Load KMS configuration from cluster storage
+pub async fn load_kms_config() -> Option<KmsConfig> {
+    let Some(store) = new_object_layer_fn() else {
+        warn!("Storage layer not initialized, cannot load KMS config");
+        return None;
+    };
+
+    match read_config(store, KMS_CONFIG_PATH).await {
+        Ok(data) => match serde_json::from_slice::<KmsConfig>(&data) {
+            Ok(config) => {
+                info!("Loaded KMS configuration from cluster storage");
+                Some(config)
+            }
+            Err(e) => {
+                error!("Failed to deserialize KMS config: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            // Config not found is normal on first run
+            if e.to_string().contains("ConfigNotFound") || e.to_string().contains("not found") {
+                info!("No persisted KMS configuration found (first run or not configured yet)");
+            } else {
+                warn!("Failed to load KMS config from storage: {}", e);
+            }
+            None
+        }
+    }
+}
 
 /// Configure KMS service handler
 pub struct ConfigureKmsHandler;
@@ -82,11 +133,19 @@ impl Operation for ConfigureKmsHandler {
         let kms_config = configure_request.to_kms_config();
 
         // Configure the service
-        let (success, message, status) = match service_manager.configure(kms_config).await {
+        let (success, message, status) = match service_manager.configure(kms_config.clone()).await {
             Ok(()) => {
-                let status = service_manager.get_status().await;
-                info!("KMS configured successfully with status: {:?}", status);
-                (true, "KMS configured successfully".to_string(), status)
+                // Persist the configuration to cluster storage
+                if let Err(e) = save_kms_config(&kms_config).await {
+                    let error_msg = format!("KMS configured in memory but failed to persist: {e}");
+                    error!("{}", error_msg);
+                    let status = service_manager.get_status().await;
+                    (false, error_msg, status)
+                } else {
+                    let status = service_manager.get_status().await;
+                    info!("KMS configured successfully and persisted with status: {:?}", status);
+                    (true, "KMS configured successfully".to_string(), status)
+                }
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
@@ -441,11 +500,19 @@ impl Operation for ReconfigureKmsHandler {
         let kms_config = configure_request.to_kms_config();
 
         // Reconfigure the service (stops, reconfigures, and starts)
-        let (success, message, status) = match service_manager.reconfigure(kms_config).await {
+        let (success, message, status) = match service_manager.reconfigure(kms_config.clone()).await {
             Ok(()) => {
-                let status = service_manager.get_status().await;
-                info!("KMS reconfigured successfully with status: {:?}", status);
-                (true, "KMS reconfigured and restarted successfully".to_string(), status)
+                // Persist the configuration to cluster storage
+                if let Err(e) = save_kms_config(&kms_config).await {
+                    let error_msg = format!("KMS reconfigured in memory but failed to persist: {e}");
+                    error!("{}", error_msg);
+                    let status = service_manager.get_status().await;
+                    (false, error_msg, status)
+                } else {
+                    let status = service_manager.get_status().await;
+                    info!("KMS reconfigured successfully and persisted with status: {:?}", status);
+                    (true, "KMS reconfigured and restarted successfully".to_string(), status)
+                }
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");
