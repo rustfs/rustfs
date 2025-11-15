@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use http::HeaderMap;
+#[cfg(feature = "string")]
 use regex::Regex;
 use std::env;
 use std::net::SocketAddr;
 use std::str::FromStr;
+#[cfg(feature = "string")]
 use std::sync::LazyLock;
 
 /// De-facto standard header keys.
@@ -30,7 +32,9 @@ const X_REAL_IP: &str = "x-real-ip";
 /// e.g. Forwarded: for=192.0.2.60;proto=https;by=203.0.113.43
 const FORWARDED: &str = "forwarded";
 
+#[cfg(feature = "string")]
 static FOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:for=)([^(;|,| )]+)(.*)").unwrap());
+#[cfg(feature = "string")]
 static PROTO_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(;|,| )+(?:proto=)(https|http)").unwrap());
 
 /// Used to disable all processing of the X-Forwarded-For header in source IP discovery.
@@ -57,21 +61,24 @@ pub fn get_source_scheme(headers: &HeaderMap) -> Option<String> {
         }
     }
 
-    if let Some(forwarded) = headers.get(FORWARDED) {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            // match should contain at least two elements if the protocol was
-            // specified in the Forwarded header. The first element will always be
-            // the 'for=', which we ignore, subsequently we proceed to look for
-            // 'proto=' which should precede right after `for=` if not
-            // we simply ignore the values and return empty. This is in line
-            // with the approach we took for returning first ip from multiple
-            // params.
-            if let Some(for_match) = FOR_REGEX.captures(forwarded_str) {
-                if for_match.len() > 1 {
-                    let remaining = &for_match[2];
-                    if let Some(proto_match) = PROTO_REGEX.captures(remaining) {
-                        if proto_match.len() > 1 {
-                            return Some(proto_match[2].to_lowercase());
+    #[cfg(feature = "string")]
+    {
+        if let Some(forwarded) = headers.get(FORWARDED) {
+            if let Ok(forwarded_str) = forwarded.to_str() {
+                // match should contain at least two elements if the protocol was
+                // specified in the Forwarded header. The first element will always be
+                // the 'for=', which we ignore, subsequently we proceed to look for
+                // 'proto=' which should precede right after `for=` if not
+                // we simply ignore the values and return empty. This is in line
+                // with the approach we took for returning first ip from multiple
+                // params.
+                if let Some(for_match) = FOR_REGEX.captures(forwarded_str) {
+                    if for_match.len() > 1 {
+                        let remaining = &for_match[2];
+                        if let Some(proto_match) = PROTO_REGEX.captures(remaining) {
+                            if proto_match.len() > 1 {
+                                return Some(proto_match[2].to_lowercase());
+                            }
                         }
                     }
                 }
@@ -107,19 +114,23 @@ pub fn get_source_ip_from_headers(headers: &HeaderMap) -> Option<String> {
                 // request).
                 addr = Some(real_ip_str.to_string());
             }
-        } else if let Some(forwarded) = headers.get(FORWARDED) {
-            if let Ok(forwarded_str) = forwarded.to_str() {
-                // match should contain at least two elements if the protocol was
-                // specified in the Forwarded header. The first element will always be
-                // the 'for=' capture, which we ignore. In the case of multiple IP
-                // addresses (for=8.8.8.8, 8.8.4.4, 172.16.1.20 is valid) we only
-                // extract the first, which should be the client IP.
-                if let Some(for_match) = FOR_REGEX.captures(forwarded_str) {
-                    if for_match.len() > 1 {
-                        // IPv6 addresses in Forwarded headers are quoted-strings. We strip
-                        // these quotes.
-                        let ip = for_match[1].trim_matches('"');
-                        addr = Some(ip.to_string());
+        }
+        #[cfg(feature = "string")]
+        if addr.is_none() {
+            if let Some(forwarded) = headers.get(FORWARDED) {
+                if let Ok(forwarded_str) = forwarded.to_str() {
+                    // match should contain at least two elements if the protocol was
+                    // specified in the Forwarded header. The first element will always be
+                    // the 'for=' capture, which we ignore. In the case of multiple IP
+                    // addresses (for=8.8.8.8, 8.8.4.4, 172.16.1.20 is valid) we only
+                    // extract the first, which should be the client IP.
+                    if let Some(for_match) = FOR_REGEX.captures(forwarded_str) {
+                        if for_match.len() > 1 {
+                            // IPv6 addresses in Forwarded headers are quoted-strings. We strip
+                            // these quotes.
+                            let ip = for_match[1].trim_matches('"');
+                            addr = Some(ip.to_string());
+                        }
                     }
                 }
             }

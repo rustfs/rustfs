@@ -544,7 +544,9 @@ impl FileMeta {
         for (idx, exist) in self.versions.iter().enumerate() {
             if let Some(ref ex_mt) = exist.header.mod_time {
                 if let Some(ref in_md) = mod_time {
-                    if ex_mt <= in_md {
+                    // Insert before the first version with mod_time less than or equal to the new version
+                    // This maintains descending order by mod_time (newest first)
+                    if ex_mt < in_md {
                         self.versions.insert(idx, FileMetaShallowVersion::try_from(version)?);
                         return Ok(());
                     }
@@ -552,7 +554,9 @@ impl FileMeta {
             }
         }
 
-        Err(Error::other("add_version failed"))
+        // If we reach here, append at the end (oldest)
+        self.versions.push(FileMetaShallowVersion::try_from(version)?);
+        Ok(())
 
         // if !ver.valid() {
         //     return Err(Error::other("attempted to add invalid version"));
@@ -2857,6 +2861,52 @@ mod test {
 
         // Test version ordering checks
         assert!(fm.is_sorted_by_mod_time(), "Versions should be time-ordered");
+    }
+
+    #[test]
+    fn test_version_insertion_ordering() {
+        // Test that versions are inserted in descending mod_time order (newest first)
+        use crate::fileinfo::FileInfo;
+        use time::OffsetDateTime;
+
+        let mut fm = FileMeta::new();
+
+        // Create versions with different timestamps
+        let base_time = OffsetDateTime::now_utc();
+
+        // Add oldest first (should go to end)
+        let mut fi1 = FileInfo::new("test", 2, 1);
+        fi1.version_id = Some(Uuid::new_v4());
+        fi1.mod_time = Some(base_time - time::Duration::seconds(20));
+        fm.add_version(fi1.clone()).expect("Failed to add version 1");
+
+        // Add newest (should go to front)
+        let mut fi2 = FileInfo::new("test", 2, 1);
+        fi2.version_id = Some(Uuid::new_v4());
+        fi2.mod_time = Some(base_time);
+        fm.add_version(fi2.clone()).expect("Failed to add version 2");
+
+        // Add middle (should go between)
+        let mut fi3 = FileInfo::new("test", 2, 1);
+        fi3.version_id = Some(Uuid::new_v4());
+        fi3.mod_time = Some(base_time - time::Duration::seconds(10));
+        fm.add_version(fi3.clone()).expect("Failed to add version 3");
+
+        // Verify ordering: newest first
+        assert_eq!(fm.versions.len(), 3, "Should have 3 versions");
+        assert_eq!(fm.versions[0].header.version_id, fi2.version_id, "Newest should be first");
+        assert_eq!(fm.versions[1].header.version_id, fi3.version_id, "Middle should be second");
+        assert_eq!(fm.versions[2].header.version_id, fi1.version_id, "Oldest should be last");
+
+        // Verify mod_time ordering
+        for i in 1..fm.versions.len() {
+            let prev_time = fm.versions[i - 1].header.mod_time;
+            let curr_time = fm.versions[i].header.mod_time;
+            assert!(
+                prev_time >= curr_time,
+                "Versions should be in descending order by mod_time (newest first)"
+            );
+        }
     }
 
     #[test]
