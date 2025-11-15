@@ -34,3 +34,6 @@ updates:
         patterns:
           - "s3s"
           - "s3s-*"
+      dependencies:
+        patterns:
+          - "*"
