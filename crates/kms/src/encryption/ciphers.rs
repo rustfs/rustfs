@@ -52,6 +52,16 @@ pub struct AesCipher {
 
 impl AesCipher {
     /// Create a new AES cipher with the given key
+    ///
+    /// #Arguments
+    /// * `key` - A byte slice representing the AES-256 key (32 bytes)
+    ///
+    /// #Errors
+    /// Returns `KmsError` if the key size is invalid
+    ///
+    /// #Returns
+    /// A Result containing the AesCipher instance
+    ///
     pub fn new(key: &[u8]) -> Result<Self> {
         if key.len() != 32 {
             return Err(KmsError::invalid_key_size(32, key.len()));
@@ -142,6 +152,16 @@ pub struct ChaCha20Cipher {
 
 impl ChaCha20Cipher {
     /// Create a new ChaCha20 cipher with the given key
+    ///
+    /// #Arguments
+    /// * `key` - A byte slice representing the ChaCha20-Poly1305 key (32 bytes)
+    ///
+    /// #Errors
+    /// Returns `KmsError` if the key size is invalid
+    ///
+    /// #Returns
+    /// A Result containing the ChaCha20Cipher instance
+    ///
     pub fn new(key: &[u8]) -> Result<Self> {
         if key.len() != 32 {
             return Err(KmsError::invalid_key_size(32, key.len()));
@@ -228,6 +248,14 @@ impl ObjectCipher for ChaCha20Cipher {
 }
 
 /// Create a cipher instance for the given algorithm and key
+///
+/// #Arguments
+/// * `algorithm` - The encryption algorithm to use
+/// * `key` - A byte slice representing the encryption key
+///
+/// #Returns
+/// A Result containing a boxed ObjectCipher instance
+///
 pub fn create_cipher(algorithm: &EncryptionAlgorithm, key: &[u8]) -> Result<Box<dyn ObjectCipher>> {
     match algorithm {
         EncryptionAlgorithm::Aes256 | EncryptionAlgorithm::AwsKms => Ok(Box::new(AesCipher::new(key)?)),
@@ -236,6 +264,13 @@ pub fn create_cipher(algorithm: &EncryptionAlgorithm, key: &[u8]) -> Result<Box<
 }
 
 /// Generate a random IV for the given algorithm
+///
+/// #Arguments
+/// * `algorithm` - The encryption algorithm for which to generate the IV
+///
+/// #Returns
+/// A vector containing the generated IV bytes
+///
 pub fn generate_iv(algorithm: &EncryptionAlgorithm) -> Vec<u8> {
     let iv_size = match algorithm {
         EncryptionAlgorithm::Aes256 | EncryptionAlgorithm::AwsKms => 12,

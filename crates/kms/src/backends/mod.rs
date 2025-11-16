@@ -200,6 +200,16 @@ pub struct BackendInfo {
 
 impl BackendInfo {
     /// Create a new backend info
+    ///
+    /// # Arguments
+    /// * `backend_type` - The type of the backend
+    /// * `version` - The version of the backend
+    /// * `endpoint` - The endpoint or location of the backend
+    /// * `healthy` - Whether the backend is healthy
+    ///
+    /// # Returns
+    /// A new BackendInfo instance
+    ///
     pub fn new(backend_type: String, version: String, endpoint: String, healthy: bool) -> Self {
         Self {
             backend_type,
@@ -211,6 +221,14 @@ impl BackendInfo {
     }
 
     /// Add metadata to the backend info
+    ///
+    /// # Arguments
+    /// * `key` - Metadata key
+    /// * `value` - Metadata value
+    ///
+    /// # Returns
+    /// Updated BackendInfo instance
+    ///
     pub fn with_metadata(mut self, key: String, value: String) -> Self {
         self.metadata.insert(key, value);
         self

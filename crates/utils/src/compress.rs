@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::io::Write;
+use std::{fmt, str};
 use tokio::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -41,13 +42,13 @@ impl CompressionAlgorithm {
     }
 }
 
-impl std::fmt::Display for CompressionAlgorithm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CompressionAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
-impl std::str::FromStr for CompressionAlgorithm {
-    type Err = std::io::Error;
+impl str::FromStr for CompressionAlgorithm {
+    type Err = io::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
@@ -63,6 +64,16 @@ impl std::str::FromStr for CompressionAlgorithm {
     }
 }
 
+/// Compress a block of data using the specified compression algorithm.
+/// Returns the compressed data as a Vec<u8>.
+///
+/// # Arguments
+/// * `input` - The input data to be compressed.
+/// * `algorithm` - The compression algorithm to use.
+///
+/// # Returns
+/// * A Vec<u8> containing the compressed data.
+///
 pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> {
     match algorithm {
         CompressionAlgorithm::Gzip => {
@@ -105,6 +116,16 @@ pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> 
     }
 }
 
+/// Decompress a block of data using the specified compression algorithm.
+/// Returns the decompressed data as a Vec<u8>.
+///
+/// # Arguments
+/// * `compressed` - The compressed data to be decompressed.
+/// * `algorithm` - The compression algorithm used for compression.
+///
+/// # Returns
+/// * A Result containing a Vec<u8> with the decompressed data, or an io::Error.
+///
 pub fn decompress_block(compressed: &[u8], algorithm: CompressionAlgorithm) -> io::Result<Vec<u8>> {
     match algorithm {
         CompressionAlgorithm::Gzip => {

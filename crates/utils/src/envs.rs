@@ -366,8 +366,8 @@ pub fn get_env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
         .and_then(|v| match v.to_lowercase().as_str() {
-            "1" | "true" | "yes" => Some(true),
-            "0" | "false" | "no" => Some(false),
+            "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Some(true),
+            "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" | "disabled" => Some(false),
             _ => None,
         })
         .unwrap_or(default)
@@ -383,8 +383,8 @@ pub fn get_env_bool(key: &str, default: bool) -> bool {
 ///
 pub fn get_env_opt_bool(key: &str) -> Option<bool> {
     env::var(key).ok().and_then(|v| match v.to_lowercase().as_str() {
-        "1" | "true" | "yes" => Some(true),
-        "0" | "false" | "no" => Some(false),
+        "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" | "disabled" => Some(false),
         _ => None,
     })
 }

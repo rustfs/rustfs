@@ -37,7 +37,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-once_cell = { workspace = true }
 
 # Cryptography
 aes-gcm = { workspace = true }

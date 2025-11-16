@@ -17,6 +17,29 @@ use regex::Regex;
 use std::io::{Error, Result};
 use std::sync::LazyLock;
 
+/// Parses a boolean value from a string.
+///
+/// # Arguments
+/// `str` - A string slice representing the boolean value.
+///
+/// # Returns
+/// A `Result` containing the parsed boolean value or an error if parsing fails.
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::parse_bool;
+///
+/// let true_values = ["1", "t", "T", "true", "TRUE", "True", "on", "ON", "On", "enabled"];
+/// let false_values = ["0", "f", "F", "false", "FALSE", "False", "off", "OFF", "Off", "disabled"];
+///
+/// for val in true_values.iter() {
+///     assert_eq!(parse_bool(val).unwrap(), true);
+/// }
+/// for val in false_values.iter() {
+///     assert_eq!(parse_bool(val).unwrap(), false);
+/// }
+/// ```
+///
 pub fn parse_bool(str: &str) -> Result<bool> {
     match str {
         "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Ok(true),
@@ -25,6 +48,23 @@ pub fn parse_bool(str: &str) -> Result<bool> {
     }
 }
 
+/// Matches a simple pattern against a name using wildcards.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match, which may include wildcards '*' and '?'
+/// * `name` - The name to match against the pattern
+///
+/// # Returns
+/// * `true` if the name matches the pattern, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::match_simple;
+/// assert!(match_simple("file*", "file123"));
+/// assert!(match_simple("file?", "file1"));
+/// assert!(!match_simple("file?", "file12"));
+/// ```
+///
 pub fn match_simple(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() {
         return name == pattern;
@@ -36,6 +76,24 @@ pub fn match_simple(pattern: &str, name: &str) -> bool {
     deep_match_rune(name.as_bytes(), pattern.as_bytes(), true)
 }
 
+/// Matches a pattern against a name using wildcards.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match, which may include wildcards '*' and '?'
+/// * `name` - The name to match against the pattern
+///
+/// # Returns
+/// * `true` if the name matches the pattern, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::match_pattern;
+///
+/// assert!(match_pattern("file*", "file123"));
+/// assert!(match_pattern("file?", "file1"));
+/// assert!(!match_pattern("file?", "file12"));
+/// ```
+///
 pub fn match_pattern(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() {
         return name == pattern;
@@ -47,6 +105,25 @@ pub fn match_pattern(pattern: &str, name: &str) -> bool {
     deep_match_rune(name.as_bytes(), pattern.as_bytes(), false)
 }
 
+/// Checks if any pattern in the list matches the given string.
+///
+/// # Arguments
+/// * `patterns` - A slice of patterns to match against
+/// * `match_str` - The string to match against the patterns
+///
+/// # Returns
+/// * `true` if any pattern matches the string, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::has_pattern;
+///
+/// let patterns = vec!["file*", "data?", "image*"];
+/// assert!(has_pattern(&patterns, "file123"));
+/// assert!(has_pattern(&patterns, "data1"));
+/// assert!(!has_pattern(&patterns, "video1"));
+/// ```
+///
 pub fn has_pattern(patterns: &[&str], match_str: &str) -> bool {
     for pattern in patterns {
         if match_simple(pattern, match_str) {
@@ -56,6 +133,23 @@ pub fn has_pattern(patterns: &[&str], match_str: &str) -> bool {
     false
 }
 
+/// Checks if the given string has any suffix from the provided list, ignoring case.
+///
+/// # Arguments
+/// * `str` - The string to check
+/// * `list` - A slice of suffixes to check against
+///
+/// # Returns
+/// * `true` if the string ends with any of the suffixes in the list, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::has_string_suffix_in_slice;
+///
+/// let suffixes = vec![".txt", ".md", ".rs"];
+/// assert!(has_string_suffix_in_slice("document.TXT", &suffixes));
+/// assert!(!has_string_suffix_in_slice("image.png", &suffixes));
+/// ```
 pub fn has_string_suffix_in_slice(str: &str, list: &[&str]) -> bool {
     let str = str.to_lowercase();
     for v in list {
@@ -99,6 +193,24 @@ fn deep_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
     str_.is_empty() && pattern.is_empty()
 }
 
+/// Matches a pattern as a prefix against the given text.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match, which may include wildcards '*' and '?'
+/// * `text` - The text to match against the pattern
+///
+/// # Returns
+/// * `true` if the text matches the pattern as a prefix, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::match_as_pattern_prefix;
+///
+/// assert!(match_as_pattern_prefix("file*", "file123"));
+/// assert!(match_as_pattern_prefix("file?", "file1"));
+/// assert!(!match_as_pattern_prefix("file?", "file12"));
+/// ```
+///
 pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     let mut i = 0;
     while i < text.len() && i < pattern.len() {
@@ -215,6 +327,24 @@ impl ArgPattern {
 }
 
 /// finds all ellipses patterns, recursively and parses the ranges numerically.
+///
+/// # Arguments
+/// * `arg` - The argument string to search for ellipses patterns
+///
+/// # Returns
+/// * `Result<ArgPattern>` - A result containing the parsed ArgPattern or an error if parsing fails
+///
+/// # Errors
+/// This function will return an error if the ellipses pattern format is invalid.
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::find_ellipses_patterns;
+///
+/// let pattern = "http://rustfs{2...3}/export/set{1...64}";
+/// let arg_pattern = find_ellipses_patterns(pattern).unwrap();
+/// assert_eq!(arg_pattern.total_sizes(), 128);
+/// ```
 pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
     let mut parts = match ELLIPSES_RE.captures(arg) {
         Some(caps) => caps,
@@ -268,6 +398,21 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
 }
 
 /// returns true if input arg has ellipses type pattern.
+///
+/// # Arguments
+/// * `s` - A slice of strings to check for ellipses patterns
+///
+/// # Returns
+/// * `true` if any string contains ellipses patterns, `false` otherwise
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::has_ellipses;
+///
+/// let args = vec!["http://rustfs{2...3}/export/set{1...64}", "mydisk-{a...z}{1...20}"];
+/// assert!(has_ellipses(&args));
+/// ```
+///
 pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
     let pattern = [ELLIPSES, OPEN_BRACES, CLOSE_BRACES];
 
@@ -279,6 +424,24 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// example:
 /// {1...64}
 /// {33...64}
+///
+/// # Arguments
+/// * `pattern` - A string slice representing the ellipses range pattern
+///
+/// # Returns
+/// * `Result<Vec<String>>` - A result containing a vector of strings representing the expanded range or an error if parsing fails
+///
+/// # Errors
+/// This function will return an error if the ellipses range format is invalid.
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::parse_ellipses_range;
+///
+/// let range = parse_ellipses_range("{1...5}").unwrap();
+/// assert_eq!(range, vec!["1", "2", "3", "4", "5"]);
+/// ```
+///
 pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     if !pattern.contains(OPEN_BRACES) {
         return Err(Error::other("Invalid argument"));
@@ -317,6 +480,25 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     Ok(ret)
 }
 
+/// Generates a random access key of the specified length.
+///
+/// # Arguments
+/// * `length` - The length of the access key to generate
+///
+/// # Returns
+/// * `Result<String>` - A result containing the generated access key or an error if the length is too short
+///
+/// # Errors
+/// This function will return an error if the specified length is less than 3.
+///
+/// Examples
+/// ```no_run
+/// use rustfs_utils::string::gen_access_key;
+///
+/// let access_key = gen_access_key(16).unwrap();
+/// println!("Generated access key: {}", access_key);
+/// ```
+///
 pub fn gen_access_key(length: usize) -> Result<String> {
     const ALPHA_NUMERIC_TABLE: [char; 36] = [
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
@@ -337,6 +519,25 @@ pub fn gen_access_key(length: usize) -> Result<String> {
     Ok(result)
 }
 
+/// Generates a random secret key of the specified length.
+///
+/// # Arguments
+/// * `length` - The length of the secret key to generate
+///
+/// # Returns
+/// * `Result<String>` - A result containing the generated secret key or an error if the length is too short
+///
+/// # Errors
+/// This function will return an error if the specified length is less than 8.
+///
+/// # Examples
+/// ```no_run
+/// use rustfs_utils::string::gen_secret_key;
+///
+/// let secret_key = gen_secret_key(32).unwrap();
+/// println!("Generated secret key: {}", secret_key);
+/// ```
+///
 pub fn gen_secret_key(length: usize) -> Result<String> {
     use base64_simd::URL_SAFE_NO_PAD;
 
@@ -355,6 +556,22 @@ pub fn gen_secret_key(length: usize) -> Result<String> {
 }
 
 /// Tests whether the string s begins with prefix ignoring case
+///
+/// # Arguments
+/// * `s` - The string to test
+/// * `prefix` - The prefix to look for
+///
+/// # Returns
+/// * `true` if s starts with prefix (case-insensitive), `false` otherwise
+///
+/// # Examples
+/// ```no_run
+/// use rustfs_utils::string::strings_has_prefix_fold;
+///
+/// assert!(strings_has_prefix_fold("HelloWorld", "hello"));
+/// assert!(!strings_has_prefix_fold("HelloWorld", "world"));
+/// ```
+///
 pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
     if s.len() < prefix.len() {
         return false;
