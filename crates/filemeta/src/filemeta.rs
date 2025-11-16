@@ -2910,6 +2910,63 @@ mod test {
     }
 
     #[test]
+    fn test_add_version_older_than_all_existing() {
+        // Test that adding a version older than all existing versions appends it to the end
+        // This directly tests the bug fix on line 558 where we changed from returning an error
+        // to appending at the end when no insertion point is found
+        use crate::fileinfo::FileInfo;
+        use time::OffsetDateTime;
+
+        let mut fm = FileMeta::new();
+        let base_time = OffsetDateTime::now_utc();
+
+        // Add three versions with descending mod_times: [100, 90, 80]
+        let mut fi1 = FileInfo::new("test", 2, 1);
+        fi1.version_id = Some(Uuid::new_v4());
+        fi1.mod_time = Some(base_time);
+        fm.add_version(fi1.clone()).expect("Failed to add version 1");
+
+        let mut fi2 = FileInfo::new("test", 2, 1);
+        fi2.version_id = Some(Uuid::new_v4());
+        fi2.mod_time = Some(base_time - time::Duration::seconds(10));
+        fm.add_version(fi2.clone()).expect("Failed to add version 2");
+
+        let mut fi3 = FileInfo::new("test", 2, 1);
+        fi3.version_id = Some(Uuid::new_v4());
+        fi3.mod_time = Some(base_time - time::Duration::seconds(20));
+        fm.add_version(fi3.clone()).expect("Failed to add version 3");
+
+        // Verify initial state: [100, 90, 80]
+        assert_eq!(fm.versions.len(), 3);
+
+        // Now add a version older than all existing ones (mod_time = 70)
+        let mut fi4 = FileInfo::new("test", 2, 1);
+        fi4.version_id = Some(Uuid::new_v4());
+        fi4.mod_time = Some(base_time - time::Duration::seconds(30));
+        fm.add_version(fi4.clone()).expect("Failed to add oldest version");
+
+        // Verify it was appended to the end: [100, 90, 80, 70]
+        assert_eq!(fm.versions.len(), 4, "Should have 4 versions after adding oldest");
+        assert_eq!(
+            fm.versions[3].header.version_id, fi4.version_id,
+            "Oldest version should be appended at the end"
+        );
+
+        // Verify complete ordering is maintained
+        assert_eq!(fm.versions[0].header.version_id, fi1.version_id);
+        assert_eq!(fm.versions[1].header.version_id, fi2.version_id);
+        assert_eq!(fm.versions[2].header.version_id, fi3.version_id);
+        assert_eq!(fm.versions[3].header.version_id, fi4.version_id);
+
+        // Verify all versions are still in descending mod_time order
+        for i in 1..fm.versions.len() {
+            let prev_time = fm.versions[i - 1].header.mod_time;
+            let curr_time = fm.versions[i].header.mod_time;
+            assert!(prev_time >= curr_time, "Versions should remain in descending order by mod_time");
+        }
+    }
+
+    #[test]
     fn test_round_trip_serialization() {
         // Test round-trip serialization consistency
         let original_data = create_real_xlmeta().expect("Failed to create original test data");
