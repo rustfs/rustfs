@@ -111,6 +111,9 @@ impl Sets {
 
         let mut disk_set = Vec::with_capacity(set_count);
 
+        // Create fast lock manager for high performance
+        let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
+
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
@@ -164,11 +167,9 @@ impl Sets {
 
             // Note: write_quorum was used for the old lock system, no longer needed with FastLock
             let _write_quorum = set_drive_count - parity_count;
-            // Create fast lock manager for high performance
-            let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
 
             let set_disks = SetDisks::new(
-                fast_lock_manager,
+                fast_lock_manager.clone(),
                 GLOBAL_Local_Node_Name.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,

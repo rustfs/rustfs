@@ -3545,7 +3545,7 @@ impl ObjectIO for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         // Acquire a shared read-lock early to protect read consistency
-        let _read_lock_guard = if !opts.no_lock {
+        let read_lock_guard = if !opts.no_lock {
             Some(
                 self.fast_lock_manager
                     .acquire_read_lock(bucket, object, self.locker_owner.as_str())
@@ -3607,7 +3607,7 @@ impl ObjectIO for SetDisks {
         // Move the read-lock guard into the task so it lives for the duration of the read
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
-            // let _guard = _guard_to_hold; // keep guard alive until task ends
+            let _guard = read_lock_guard; // keep guard alive until task ends
             let mut writer = wd;
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
@@ -5534,6 +5534,17 @@ impl StorageAPI for SetDisks {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        let _object_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+            )
+        } else {
+            None
+        };
+
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
