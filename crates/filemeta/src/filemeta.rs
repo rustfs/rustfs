@@ -544,7 +544,7 @@ impl FileMeta {
         for (idx, exist) in self.versions.iter().enumerate() {
             if let Some(ref ex_mt) = exist.header.mod_time {
                 if let Some(ref in_md) = mod_time {
-                    // Insert before the first version with mod_time less than or equal to the new version
+                    // Insert before the first version with mod_time less than the new version
                     // This maintains descending order by mod_time (newest first)
                     if ex_mt < in_md {
                         self.versions.insert(idx, FileMetaShallowVersion::try_from(version)?);
