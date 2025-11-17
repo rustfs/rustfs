@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::auth::get_condition_values;
-use crate::config::workload_profiles::{RustFSBufferConfig, WorkloadProfile};
+use crate::config::workload_profiles::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
@@ -221,6 +221,36 @@ fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<Workloa
     config.get_buffer_size(file_size)
 }
 
+/// Get adaptive buffer size using global configuration if enabled.
+///
+/// This function is the recommended entry point for buffer sizing in Phase 2 (Opt-In Usage).
+/// It respects the global buffer profile configuration when enabled, otherwise falls back
+/// to the legacy behavior for backward compatibility.
+///
+/// # Arguments
+/// * `file_size` - The size of the file in bytes, or -1 if unknown
+///
+/// # Returns
+/// Optimal buffer size in bytes
+///
+/// # Examples
+/// ```ignore
+/// // When RUSTFS_BUFFER_PROFILE_ENABLE=true, uses the configured profile
+/// let buffer_size = get_buffer_size_opt_in(file_size);
+///
+/// // When RUSTFS_BUFFER_PROFILE_ENABLE=false, uses legacy behavior
+/// let buffer_size = get_buffer_size_opt_in(file_size);
+/// ```
+fn get_buffer_size_opt_in(file_size: i64) -> usize {
+    if is_buffer_profile_enabled() {
+        // Use global buffer configuration
+        let config = get_global_buffer_config();
+        config.get_buffer_size(file_size)
+    } else {
+        // Fall back to legacy behavior
+        get_adaptive_buffer_size(file_size)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -457,11 +487,10 @@ impl FS {
             }
         };
 
-        // Use adaptive buffer sizing based on file size for optimal performance:
-        // - Small files (< 1MB): 64KB buffer to minimize memory overhead
-        // - Medium files (1MB-100MB): 256KB buffer for balanced performance
-        // - Large files (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
-        let buffer_size = get_adaptive_buffer_size(size);
+        // Use adaptive buffer sizing based on file size for optimal performance.
+        // Phase 2 (Opt-In): Uses workload profiles if RUSTFS_BUFFER_PROFILE_ENABLE=true,
+        // otherwise falls back to legacy behavior for backward compatibility.
+        let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -2407,11 +2436,10 @@ impl S3 for FS {
             return Err(s3_error!(UnexpectedContent));
         }
 
-        // Use adaptive buffer sizing based on file size for optimal performance:
-        // - Small files (< 1MB): 64KB buffer to minimize memory overhead
-        // - Medium files (1MB-100MB): 256KB buffer for balanced performance
-        // - Large files (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
-        let buffer_size = get_adaptive_buffer_size(size);
+        // Use adaptive buffer sizing based on file size for optimal performance.
+        // Phase 2 (Opt-In): Uses workload profiles if RUSTFS_BUFFER_PROFILE_ENABLE=true,
+        // otherwise falls back to legacy behavior for backward compatibility.
+        let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -2935,11 +2963,10 @@ impl S3 for FS {
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
-        // Use adaptive buffer sizing based on part size for optimal performance:
-        // - Small parts (< 1MB): 64KB buffer to minimize memory overhead
-        // - Medium parts (1MB-100MB): 256KB buffer for balanced performance
-        // - Large parts (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
-        let buffer_size = get_adaptive_buffer_size(size);
+        // Use adaptive buffer sizing based on part size for optimal performance.
+        // Phase 2 (Opt-In): Uses workload profiles if RUSTFS_BUFFER_PROFILE_ENABLE=true,
+        // otherwise falls back to legacy behavior for backward compatibility.
+        let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -5176,6 +5203,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_buffer_size_opt_in() {
+        use crate::config::workload_profiles::{set_buffer_profile_enabled, init_global_buffer_config, RustFSBufferConfig, WorkloadProfile};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test with profile disabled (should use legacy behavior)
+        set_buffer_profile_enabled(false);
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), DEFAULT_READ_BUFFER_SIZE);
+
+        // Test with profile enabled and AiTraining profile
+        set_buffer_profile_enabled(true);
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
+        
+        assert_eq!(get_buffer_size_opt_in(5 * MB), 512 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(100 * MB), 2 * MB as usize);
+        assert_eq!(get_buffer_size_opt_in(600 * MB), 4 * MB as usize);
+
+        // Test with WebWorkload profile
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::WebWorkload));
+        
+        assert_eq!(get_buffer_size_opt_in(100 * KB), 32 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(5 * MB), 128 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+
+        // Reset to disabled for other tests
+        set_buffer_profile_enabled(false);
+    }
 
     // Note: S3Request structure is complex and requires many fields.
     // For real testing, we would need proper integration test setup.
@@ -5191,3 +5249,4 @@ mod tests {
     // These are better suited for integration tests rather than unit tests.
     // The current tests focus on the testable parts without external dependencies.
 }
+

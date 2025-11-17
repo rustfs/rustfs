@@ -18,6 +18,56 @@
 //! to achieve optimal balance between performance, memory usage, and security.
 
 use rustfs_config::{KI_B, MI_B};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global buffer configuration that can be set at application startup
+static GLOBAL_BUFFER_CONFIG: OnceLock<RustFSBufferConfig> = OnceLock::new();
+
+/// Global flag indicating whether buffer profiles are enabled
+static BUFFER_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable buffer profiling globally
+///
+/// This controls whether the opt-in buffer profiling feature is active.
+///
+/// # Arguments
+/// * `enabled` - Whether to enable buffer profiling
+pub fn set_buffer_profile_enabled(enabled: bool) {
+    BUFFER_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Check if buffer profiling is enabled globally
+pub fn is_buffer_profile_enabled() -> bool {
+    BUFFER_PROFILE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Initialize the global buffer configuration
+///
+/// This should be called once at application startup with the desired profile.
+/// If not called, the default GeneralPurpose profile will be used.
+///
+/// # Arguments
+/// * `config` - The buffer configuration to use globally
+///
+/// # Examples
+/// ```ignore
+/// use rustfs::config::workload_profiles::{RustFSBufferConfig, WorkloadProfile};
+///
+/// // Initialize with AiTraining profile
+/// init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
+/// ```
+pub fn init_global_buffer_config(config: RustFSBufferConfig) {
+    let _ = GLOBAL_BUFFER_CONFIG.set(config);
+}
+
+/// Get the global buffer configuration
+///
+/// Returns the configured profile, or GeneralPurpose if not initialized.
+pub fn get_global_buffer_config() -> &'static RustFSBufferConfig {
+    GLOBAL_BUFFER_CONFIG.get_or_init(|| RustFSBufferConfig::default())
+}
+
 
 /// Workload profile types that define buffer sizing strategies
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +112,37 @@ pub struct RustFSBufferConfig {
 }
 
 impl WorkloadProfile {
+    /// Parse a workload profile from a string name
+    ///
+    /// # Arguments
+    /// * `name` - The name of the profile (case-insensitive)
+    ///
+    /// # Returns
+    /// The corresponding WorkloadProfile, or GeneralPurpose if name is not recognized
+    ///
+    /// # Examples
+    /// ```
+    /// use rustfs::config::workload_profiles::WorkloadProfile;
+    ///
+    /// let profile = WorkloadProfile::from_name("AiTraining");
+    /// let profile2 = WorkloadProfile::from_name("aitraining"); // case-insensitive
+    /// let profile3 = WorkloadProfile::from_name("unknown"); // defaults to GeneralPurpose
+    /// ```
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "generalpurpose" | "general" => WorkloadProfile::GeneralPurpose,
+            "aitraining" | "ai" => WorkloadProfile::AiTraining,
+            "dataanalytics" | "analytics" => WorkloadProfile::DataAnalytics,
+            "webworkload" | "web" => WorkloadProfile::WebWorkload,
+            "industrialiot" | "iot" => WorkloadProfile::IndustrialIoT,
+            "securestorage" | "secure" => WorkloadProfile::SecureStorage,
+            _ => {
+                // Default to GeneralPurpose for unknown profiles
+                WorkloadProfile::GeneralPurpose
+            }
+        }
+    }
+
     /// Get the buffer configuration for this workload profile
     pub fn config(&self) -> BufferConfig {
         match self {
@@ -498,4 +579,54 @@ mod tests {
 
         assert_eq!(WorkloadProfile::Custom(custom1.clone()), WorkloadProfile::Custom(custom2));
     }
+
+    #[test]
+    fn test_workload_profile_from_name() {
+        // Test exact matches (case-insensitive)
+        assert_eq!(WorkloadProfile::from_name("GeneralPurpose"), WorkloadProfile::GeneralPurpose);
+        assert_eq!(WorkloadProfile::from_name("generalpurpose"), WorkloadProfile::GeneralPurpose);
+        assert_eq!(WorkloadProfile::from_name("GENERALPURPOSE"), WorkloadProfile::GeneralPurpose);
+        assert_eq!(WorkloadProfile::from_name("general"), WorkloadProfile::GeneralPurpose);
+        
+        assert_eq!(WorkloadProfile::from_name("AiTraining"), WorkloadProfile::AiTraining);
+        assert_eq!(WorkloadProfile::from_name("aitraining"), WorkloadProfile::AiTraining);
+        assert_eq!(WorkloadProfile::from_name("ai"), WorkloadProfile::AiTraining);
+        
+        assert_eq!(WorkloadProfile::from_name("DataAnalytics"), WorkloadProfile::DataAnalytics);
+        assert_eq!(WorkloadProfile::from_name("dataanalytics"), WorkloadProfile::DataAnalytics);
+        assert_eq!(WorkloadProfile::from_name("analytics"), WorkloadProfile::DataAnalytics);
+        
+        assert_eq!(WorkloadProfile::from_name("WebWorkload"), WorkloadProfile::WebWorkload);
+        assert_eq!(WorkloadProfile::from_name("webworkload"), WorkloadProfile::WebWorkload);
+        assert_eq!(WorkloadProfile::from_name("web"), WorkloadProfile::WebWorkload);
+        
+        assert_eq!(WorkloadProfile::from_name("IndustrialIoT"), WorkloadProfile::IndustrialIoT);
+        assert_eq!(WorkloadProfile::from_name("industrialiot"), WorkloadProfile::IndustrialIoT);
+        assert_eq!(WorkloadProfile::from_name("iot"), WorkloadProfile::IndustrialIoT);
+        
+        assert_eq!(WorkloadProfile::from_name("SecureStorage"), WorkloadProfile::SecureStorage);
+        assert_eq!(WorkloadProfile::from_name("securestorage"), WorkloadProfile::SecureStorage);
+        assert_eq!(WorkloadProfile::from_name("secure"), WorkloadProfile::SecureStorage);
+        
+        // Test unknown name defaults to GeneralPurpose
+        assert_eq!(WorkloadProfile::from_name("unknown"), WorkloadProfile::GeneralPurpose);
+        assert_eq!(WorkloadProfile::from_name("invalid"), WorkloadProfile::GeneralPurpose);
+        assert_eq!(WorkloadProfile::from_name(""), WorkloadProfile::GeneralPurpose);
+    }
+
+    #[test]
+    fn test_global_buffer_config() {
+        use super::{set_buffer_profile_enabled, is_buffer_profile_enabled};
+
+        // Test enable/disable
+        set_buffer_profile_enabled(true);
+        assert!(is_buffer_profile_enabled());
+        
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+        
+        // Reset for other tests
+        set_buffer_profile_enabled(false);
+    }
 }
+

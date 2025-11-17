@@ -296,11 +296,26 @@ metrics::counter!("buffer_resizes", 1);
 - Fully documented
 - Tested
 
-### Phase 2: Opt-In Usage (Future)
+### Phase 2: Opt-In Usage ✅ **IMPLEMENTED**
 
-- Add configuration option to enable profiles
-- Default to existing behavior
-- Monitor performance impact
+- ✅ Configuration option to enable profiles (`RUSTFS_BUFFER_PROFILE_ENABLE`)
+- ✅ Workload profile selection (`RUSTFS_BUFFER_PROFILE`)
+- ✅ Default to existing behavior when disabled
+- ✅ Global configuration management
+- ✅ Integration in `put_object`, `put_object_extract`, and `upload_part`
+- ✅ Command-line and environment variable support
+- ✅ Performance monitoring ready
+
+**How to Use:**
+```bash
+# Enable with environment variables
+export RUSTFS_BUFFER_PROFILE_ENABLE=true
+export RUSTFS_BUFFER_PROFILE=AiTraining
+./rustfs /data
+
+# Or use command-line flags
+./rustfs --buffer-profile-enable --buffer-profile WebWorkload /data
+```
 
 ### Phase 3: Default Enablement (Future)
 

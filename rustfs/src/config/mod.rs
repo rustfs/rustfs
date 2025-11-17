@@ -114,6 +114,15 @@ pub struct Opt {
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
+
+    /// Enable adaptive buffer sizing with workload profiles (opt-in)
+    #[arg(long, default_value_t = false, env = "RUSTFS_BUFFER_PROFILE_ENABLE")]
+    pub buffer_profile_enable: bool,
+
+    /// Workload profile for adaptive buffer sizing
+    /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
+    #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
+    pub buffer_profile: String,
 }
 
 // lazy_static::lazy_static! {
