@@ -370,7 +370,13 @@ impl FS {
         let event_version_id = version_id;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
+        // when uploading large files (10GB+). The default 8KB buffer is too small and causes
+        // excessive syscalls and potential connection timeouts.
+        let body = StreamReader::with_capacity(
+            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+            DEFAULT_READ_BUFFER_SIZE,
+        );
 
         let size = match content_length {
             Some(c) => c,
@@ -2326,7 +2332,13 @@ impl S3 for FS {
             return Err(s3_error!(UnexpectedContent));
         }
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
+        // when uploading large files (10GB+). The default 8KB buffer is too small and causes
+        // excessive syscalls and potential connection timeouts.
+        let body = StreamReader::with_capacity(
+            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+            DEFAULT_READ_BUFFER_SIZE,
+        );
 
         // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
@@ -2846,7 +2858,13 @@ impl S3 for FS {
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
-        let body = StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
+        // during multipart uploads of large files (10GB+). The default 8KB buffer is too small
+        // and causes excessive syscalls and potential connection timeouts.
+        let body = StreamReader::with_capacity(
+            body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+            DEFAULT_READ_BUFFER_SIZE,
+        );
 
         // mc cp step 4
 
