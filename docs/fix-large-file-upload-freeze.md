@@ -129,16 +129,48 @@ This value is used consistently across the codebase for stream reading operation
 
 The solution uses `tokio::io::BufReader` to wrap the `StreamReader`, as `tokio-util 0.7.17` does not provide a `StreamReader::with_capacity()` method. The `BufReader` provides the same buffering benefits while being compatible with the current tokio-util version.
 
+### Adaptive Buffer Sizing (Implemented)
+
+The fix now includes **dynamic adaptive buffer sizing** based on file size for optimal performance and memory usage:
+
+```rust
+/// Calculate adaptive buffer size based on file size for optimal streaming performance.
+fn get_adaptive_buffer_size(file_size: i64) -> usize {
+    match file_size {
+        // Unknown size or negative (chunked/streaming): use 1MB buffer for safety
+        size if size < 0 => 1024 * 1024,
+        // Small files (< 1MB): use 64KB to minimize memory overhead
+        size if size < 1_048_576 => 65_536,
+        // Medium files (1MB - 100MB): use 256KB for balanced performance
+        size if size < 104_857_600 => 262_144,
+        // Large files (>= 100MB): use 1MB buffer for maximum throughput
+        _ => 1024 * 1024,
+    }
+}
+```
+
+**Benefits**:
+- **Memory Efficiency**: Small files use smaller buffers (64KB), reducing memory overhead
+- **Balanced Performance**: Medium files use 256KB buffers for optimal balance
+- **Maximum Throughput**: Large files (100MB+) use 1MB buffers to minimize syscalls
+- **Automatic Selection**: Buffer size is chosen automatically based on content-length
+
+**Performance Impact by File Size**:
+
+| File Size | Buffer Size | Memory Saved vs Fixed 1MB | Syscalls (approx) |
+|-----------|-------------|--------------------------|-------------------|
+| 100 KB    | 64 KB       | 960 KB (94% reduction)   | ~2                |
+| 10 MB     | 256 KB      | 768 KB (75% reduction)   | ~40               |
+| 100 MB    | 1 MB        | 0 KB (same)              | ~100              |
+| 10 GB     | 1 MB        | 0 KB (same)              | ~10,240           |
+
 ### Future Improvements
 
-1. **Adaptive Buffer Sizing**: Consider adjusting buffer size based on file size
-   - Small files (< 1MB): 8KB-64KB buffer
-   - Medium files (1MB-100MB): 256KB buffer
-   - Large files (> 100MB): 1MB+ buffer
+1. **Connection Keep-Alive**: Ensure HTTP keep-alive is properly configured for consecutive uploads
 
-2. **Connection Keep-Alive**: Ensure HTTP keep-alive is properly configured for consecutive uploads
+2. **Rate Limiting**: Consider implementing upload rate limiting to prevent resource exhaustion
 
-3. **Rate Limiting**: Consider implementing upload rate limiting to prevent resource exhaustion
+3. **Configurable Thresholds**: Make buffer size thresholds configurable via environment variables or config file
 
 ### Alternative Approaches Considered
 
