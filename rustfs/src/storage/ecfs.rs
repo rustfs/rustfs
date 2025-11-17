@@ -2219,7 +2219,7 @@ impl S3 for FS {
         let objects: Vec<ObjectVersion> = object_infos
             .objects
             .iter()
-            .filter(|v| !v.name.is_empty() && !v.delete_marker)
+            .filter(|v| !v.name.is_empty())
             .map(|v| {
                 ObjectVersion {
                     key: Some(v.name.to_owned()),
