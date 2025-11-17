@@ -115,7 +115,6 @@ impl HashAlgorithm {
     }
 }
 
-use crc32fast::Hasher;
 use siphasher::sip::SipHasher;
 
 pub const EMPTY_STRING_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -151,11 +150,9 @@ pub fn sip_hash(key: &str, cardinality: usize, id: &[u8; 16]) -> usize {
 /// A usize representing the bucket index
 ///
 pub fn crc_hash(key: &str, cardinality: usize) -> usize {
-    let mut hasher = Hasher::new(); // Create a new hasher
-
-    hasher.update(key.as_bytes()); // Update hash state, add data
-
-    let checksum = hasher.finalize();
+    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    hasher.update(key.as_bytes());
+    let checksum = hasher.finalize() as u32;
 
     checksum as usize % cardinality
 }
