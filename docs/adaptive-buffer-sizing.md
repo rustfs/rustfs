@@ -291,9 +291,147 @@ export RUSTFS_BUFFER_PROFILE_DISABLE=true
 ./rustfs /data
 ```
 
+## Phase 4: Full Integration (Current Implementation)
+
+**🚀 NEW: Profile-only implementation with performance metrics!**
+
+Phase 4 represents the final stage of the adaptive buffer sizing system, providing a unified, profile-based approach with optional performance monitoring.
+
+### Key Features
+
+1. **Deprecated Legacy Function**
+   - `get_adaptive_buffer_size()` is now deprecated
+   - Maintained for backward compatibility only
+   - All new code uses the workload profile system
+
+2. **Profile-Only Implementation**
+   - Single entry point: `get_buffer_size_opt_in()`
+   - All buffer sizes come from workload profiles
+   - Even "disabled" mode uses GeneralPurpose profile (no hardcoded values)
+
+3. **Performance Metrics** (Optional)
+   - Built-in metrics collection with `metrics` feature flag
+   - Tracks buffer size selections
+   - Monitors buffer-to-file size ratios
+   - Helps optimize profile configurations
+
+### Unified Buffer Sizing
+
+```rust
+// Phase 4: Single, unified implementation
+fn get_buffer_size_opt_in(file_size: i64) -> usize {
+    // Enabled by default (Phase 3)
+    // Uses workload profiles exclusively
+    // Optional metrics collection
+}
+```
+
+### Performance Monitoring
+
+When compiled with the `metrics` feature flag:
+
+```bash
+# Build with metrics support
+cargo build --features metrics
+
+# Run and collect metrics
+./rustfs /data
+
+# Metrics collected:
+# - buffer_size_bytes: Histogram of selected buffer sizes
+# - buffer_size_selections: Counter of buffer size calculations
+# - buffer_to_file_ratio: Ratio of buffer size to file size
+```
+
+### Migration from Phase 3
+
+No action required! Phase 4 is fully backward compatible with Phase 3:
+
+```bash
+# Phase 3 usage continues to work
+./rustfs /data
+export RUSTFS_BUFFER_PROFILE=AiTraining
+./rustfs /data
+
+# Phase 4 adds deprecation warnings for direct legacy function calls
+# (if you have custom code calling get_adaptive_buffer_size)
+```
+
+### What Changed
+
+| Aspect | Phase 3 | Phase 4 |
+|--------|---------|---------|
+| Legacy Function | Active | Deprecated (still works) |
+| Implementation | Hybrid (legacy fallback) | Profile-only |
+| Metrics | None | Optional via feature flag |
+| Buffer Source | Profiles or hardcoded | Profiles only |
+
+### Benefits
+
+1. **Simplified Codebase**
+   - Single implementation path
+   - Easier to maintain and optimize
+   - Consistent behavior across all scenarios
+
+2. **Better Observability**
+   - Optional metrics for performance monitoring
+   - Data-driven profile optimization
+   - Production usage insights
+
+3. **Future-Proof**
+   - No legacy code dependencies
+   - Easy to add new profiles
+   - Extensible for future enhancements
+
+### Code Example
+
+**Phase 3 (Still Works):**
+```rust
+// Enabled by default
+let buffer_size = get_buffer_size_opt_in(file_size);
+```
+
+**Phase 4 (Recommended):**
+```rust
+// Same call, but now with optional metrics and profile-only implementation
+let buffer_size = get_buffer_size_opt_in(file_size);
+// Metrics automatically collected if feature enabled
+```
+
+**Deprecated (Backward Compatible):**
+```rust
+// This still works but generates deprecation warnings
+#[allow(deprecated)]
+let buffer_size = get_adaptive_buffer_size(file_size);
+```
+
+### Enabling Metrics
+
+Add to `Cargo.toml`:
+```toml
+[dependencies]
+rustfs = { version = "*", features = ["metrics"] }
+```
+
+Or build with feature flag:
+```bash
+cargo build --features metrics --release
+```
+
+### Metrics Dashboard
+
+When metrics are enabled, you can visualize:
+
+- **Buffer Size Distribution**: Most common buffer sizes used
+- **Profile Effectiveness**: How well profiles match actual workloads
+- **Memory Efficiency**: Buffer-to-file size ratios
+- **Usage Patterns**: File size distribution and buffer selection trends
+
+Use your preferred metrics backend (Prometheus, InfluxDB, etc.) to collect and visualize these metrics.
+
 ## Phase 2: Opt-In Usage (Previous Implementation)
 
-**Note:** Phase 2 documentation is kept for historical reference. The current version uses Phase 3 (Default Enablement).
+**Note:** Phase 2 documentation is kept for historical reference. The current version uses Phase 4 (Full Integration).
 
 <details>
 <summary>Click to expand Phase 2 documentation</summary>

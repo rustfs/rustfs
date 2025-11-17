@@ -343,11 +343,29 @@ export RUSTFS_BUFFER_PROFILE=AiTraining
 - Maintains full backward compatibility
 - No breaking changes for existing deployments
 
-### Phase 4: Full Integration (Future)
+### Phase 4: Full Integration ✅ **IMPLEMENTED**
 
-- Remove legacy function
-- Profile-only implementation
-- Optimize based on collected metrics
+- ✅ Deprecated legacy `get_adaptive_buffer_size()` function
+- ✅ Profile-only implementation via `get_buffer_size_opt_in()`
+- ✅ Performance metrics collection capability (with `metrics` feature)
+- ✅ Consolidated buffer sizing logic
+- ✅ All buffer sizes come from workload profiles
+
+**Implementation Details:**
+```rust
+// Phase 4: Single entry point for buffer sizing
+fn get_buffer_size_opt_in(file_size: i64) -> usize {
+    // Uses workload profiles exclusively
+    // Legacy function deprecated but maintained for compatibility
+    // Metrics collection integrated for performance monitoring
+}
+```
+
+**Key Changes from Phase 3:**
+- Legacy function marked as `#[deprecated]` but still functional
+- Single, unified buffer sizing implementation
+- Performance metrics tracking (optional, via feature flag)
+- Even disabled mode uses GeneralPurpose profile (profile-only)
 
 ## Maintenance Guidelines
 
