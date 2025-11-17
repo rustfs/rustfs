@@ -669,7 +669,9 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
 /// # Arguments
 /// * `opt` - The application configuration options
 fn init_buffer_profile_system(opt: &config::Opt) {
-    use crate::config::workload_profiles::{WorkloadProfile, RustFSBufferConfig, init_global_buffer_config, set_buffer_profile_enabled};
+    use crate::config::workload_profiles::{
+        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+    };
 
     if opt.buffer_profile_disable {
         // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
@@ -678,20 +680,19 @@ fn init_buffer_profile_system(opt: &config::Opt) {
     } else {
         // Enabled by default: use configured workload profile
         info!("Buffer profiling enabled with profile: {}", opt.buffer_profile);
-        
+
         // Parse the workload profile from configuration string
         let profile = WorkloadProfile::from_name(&opt.buffer_profile);
-        
+
         // Log the selected profile for operational visibility
         info!("Active buffer profile: {:?}", profile);
-        
+
         // Initialize the global buffer configuration
         init_global_buffer_config(RustFSBufferConfig::new(profile));
-        
+
         // Enable buffer profiling globally
         set_buffer_profile_enabled(true);
-        
+
         info!("Buffer profiling system initialized successfully");
     }
 }
-

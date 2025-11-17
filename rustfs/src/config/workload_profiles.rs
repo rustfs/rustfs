@@ -68,7 +68,6 @@ pub fn get_global_buffer_config() -> &'static RustFSBufferConfig {
     GLOBAL_BUFFER_CONFIG.get_or_init(|| RustFSBufferConfig::default())
 }
 
-
 /// Workload profile types that define buffer sizing strategies
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkloadProfile {
@@ -166,9 +165,9 @@ impl WorkloadProfile {
             max_size: MI_B,
             default_unknown: MI_B,
             thresholds: vec![
-                (MI_B as i64, 64 * KI_B),           // < 1MB: 64KB
-                (100 * MI_B as i64, 256 * KI_B),    // 1MB-100MB: 256KB
-                (i64::MAX, MI_B),                   // >= 100MB: 1MB
+                (MI_B as i64, 64 * KI_B),        // < 1MB: 64KB
+                (100 * MI_B as i64, 256 * KI_B), // 1MB-100MB: 256KB
+                (i64::MAX, MI_B),                // >= 100MB: 1MB
             ],
         }
     }
@@ -183,9 +182,9 @@ impl WorkloadProfile {
             max_size: 4 * MI_B,
             default_unknown: 2 * MI_B,
             thresholds: vec![
-                (10 * MI_B as i64, 512 * KI_B),     // < 10MB: 512KB
-                (500 * MI_B as i64, 2 * MI_B),      // 10MB-500MB: 2MB
-                (i64::MAX, 4 * MI_B),               // >= 500MB: 4MB
+                (10 * MI_B as i64, 512 * KI_B), // < 10MB: 512KB
+                (500 * MI_B as i64, 2 * MI_B),  // 10MB-500MB: 2MB
+                (i64::MAX, 4 * MI_B),           // >= 500MB: 4MB
             ],
         }
     }
@@ -200,9 +199,9 @@ impl WorkloadProfile {
             max_size: 2 * MI_B,
             default_unknown: 512 * KI_B,
             thresholds: vec![
-                (5 * MI_B as i64, 128 * KI_B),      // < 5MB: 128KB
-                (200 * MI_B as i64, 512 * KI_B),    // 5MB-200MB: 512KB
-                (i64::MAX, 2 * MI_B),               // >= 200MB: 2MB
+                (5 * MI_B as i64, 128 * KI_B),   // < 5MB: 128KB
+                (200 * MI_B as i64, 512 * KI_B), // 5MB-200MB: 512KB
+                (i64::MAX, 2 * MI_B),            // >= 200MB: 2MB
             ],
         }
     }
@@ -217,9 +216,9 @@ impl WorkloadProfile {
             max_size: 256 * KI_B,
             default_unknown: 128 * KI_B,
             thresholds: vec![
-                (512 * KI_B as i64, 32 * KI_B),     // < 512KB: 32KB
-                (10 * MI_B as i64, 128 * KI_B),     // 512KB-10MB: 128KB
-                (i64::MAX, 256 * KI_B),             // >= 10MB: 256KB
+                (512 * KI_B as i64, 32 * KI_B), // < 512KB: 32KB
+                (10 * MI_B as i64, 128 * KI_B), // 512KB-10MB: 128KB
+                (i64::MAX, 256 * KI_B),         // >= 10MB: 256KB
             ],
         }
     }
@@ -234,9 +233,9 @@ impl WorkloadProfile {
             max_size: 512 * KI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![
-                (MI_B as i64, 64 * KI_B),           // < 1MB: 64KB
-                (50 * MI_B as i64, 256 * KI_B),     // 1MB-50MB: 256KB
-                (i64::MAX, 512 * KI_B),             // >= 50MB: 512KB
+                (MI_B as i64, 64 * KI_B),       // < 1MB: 64KB
+                (50 * MI_B as i64, 256 * KI_B), // 1MB-50MB: 256KB
+                (i64::MAX, 512 * KI_B),         // >= 50MB: 512KB
             ],
         }
     }
@@ -251,9 +250,9 @@ impl WorkloadProfile {
             max_size: 256 * KI_B,
             default_unknown: 128 * KI_B,
             thresholds: vec![
-                (MI_B as i64, 32 * KI_B),           // < 1MB: 32KB
-                (50 * MI_B as i64, 128 * KI_B),     // 1MB-50MB: 128KB
-                (i64::MAX, 256 * KI_B),             // >= 50MB: 256KB
+                (MI_B as i64, 32 * KI_B),       // < 1MB: 32KB
+                (50 * MI_B as i64, 128 * KI_B), // 1MB-50MB: 128KB
+                (i64::MAX, 256 * KI_B),         // >= 50MB: 256KB
             ],
         }
     }
@@ -587,27 +586,27 @@ mod tests {
         assert_eq!(WorkloadProfile::from_name("generalpurpose"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name("GENERALPURPOSE"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name("general"), WorkloadProfile::GeneralPurpose);
-        
+
         assert_eq!(WorkloadProfile::from_name("AiTraining"), WorkloadProfile::AiTraining);
         assert_eq!(WorkloadProfile::from_name("aitraining"), WorkloadProfile::AiTraining);
         assert_eq!(WorkloadProfile::from_name("ai"), WorkloadProfile::AiTraining);
-        
+
         assert_eq!(WorkloadProfile::from_name("DataAnalytics"), WorkloadProfile::DataAnalytics);
         assert_eq!(WorkloadProfile::from_name("dataanalytics"), WorkloadProfile::DataAnalytics);
         assert_eq!(WorkloadProfile::from_name("analytics"), WorkloadProfile::DataAnalytics);
-        
+
         assert_eq!(WorkloadProfile::from_name("WebWorkload"), WorkloadProfile::WebWorkload);
         assert_eq!(WorkloadProfile::from_name("webworkload"), WorkloadProfile::WebWorkload);
         assert_eq!(WorkloadProfile::from_name("web"), WorkloadProfile::WebWorkload);
-        
+
         assert_eq!(WorkloadProfile::from_name("IndustrialIoT"), WorkloadProfile::IndustrialIoT);
         assert_eq!(WorkloadProfile::from_name("industrialiot"), WorkloadProfile::IndustrialIoT);
         assert_eq!(WorkloadProfile::from_name("iot"), WorkloadProfile::IndustrialIoT);
-        
+
         assert_eq!(WorkloadProfile::from_name("SecureStorage"), WorkloadProfile::SecureStorage);
         assert_eq!(WorkloadProfile::from_name("securestorage"), WorkloadProfile::SecureStorage);
         assert_eq!(WorkloadProfile::from_name("secure"), WorkloadProfile::SecureStorage);
-        
+
         // Test unknown name defaults to GeneralPurpose
         assert_eq!(WorkloadProfile::from_name("unknown"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name("invalid"), WorkloadProfile::GeneralPurpose);
@@ -616,17 +615,16 @@ mod tests {
 
     #[test]
     fn test_global_buffer_config() {
-        use super::{set_buffer_profile_enabled, is_buffer_profile_enabled};
+        use super::{is_buffer_profile_enabled, set_buffer_profile_enabled};
 
         // Test enable/disable
         set_buffer_profile_enabled(true);
         assert!(is_buffer_profile_enabled());
-        
+
         set_buffer_profile_enabled(false);
         assert!(!is_buffer_profile_enabled());
-        
+
         // Reset for other tests
         set_buffer_profile_enabled(false);
     }
 }
-

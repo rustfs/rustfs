@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::auth::get_condition_values;
-use crate::config::workload_profiles::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
+use crate::config::workload_profiles::{
+    RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
+};
 use crate::error::ApiError;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
@@ -180,34 +182,7 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 ///     Some(WorkloadProfile::SecureStorage)
 /// );
 /// ```
-fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
-/// This enhanced version supports different workload profiles for optimal performance
-/// across various use cases (AI/ML, web workloads, secure storage, etc.).
 ///
-/// # Arguments
-/// * `file_size` - The size of the file in bytes, or -1 if unknown
-/// * `profile` - Optional workload profile. If None, uses auto-detection or GeneralPurpose
-///
-/// # Returns
-/// Optimal buffer size in bytes based on the workload profile and file size
-///
-/// # Examples
-/// ```ignore
-/// // Use general purpose profile (default)
-/// let buffer_size = get_adaptive_buffer_size_with_profile(1024 * 1024, None);
-///
-/// // Use AI training profile for large model files
-/// let buffer_size = get_adaptive_buffer_size_with_profile(
-///     500 * 1024 * 1024,
-///     Some(WorkloadProfile::AiTraining)
-/// );
-///
-/// // Use secure storage profile for compliance scenarios
-/// let buffer_size = get_adaptive_buffer_size_with_profile(
-///     10 * 1024 * 1024,
-///     Some(WorkloadProfile::SecureStorage)
-/// );
-/// ```
 fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
     let config = match profile {
         Some(p) => RustFSBufferConfig::new(p),
@@ -216,7 +191,7 @@ fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<Workloa
             RustFSBufferConfig::with_auto_detect()
         }
     };
-    
+
     config.get_buffer_size(file_size)
 }
 
@@ -263,7 +238,7 @@ fn get_buffer_size_opt_in(file_size: i64) -> usize {
     {
         metrics::histogram!("buffer_size_bytes", buffer_size as f64);
         metrics::counter!("buffer_size_selections", 1);
-        
+
         if file_size >= 0 {
             let ratio = buffer_size as f64 / file_size as f64;
             metrics::histogram!("buffer_to_file_ratio", ratio);
@@ -5200,7 +5175,9 @@ mod tests {
 
     #[test]
     fn test_buffer_size_opt_in() {
-        use crate::config::workload_profiles::{set_buffer_profile_enabled, init_global_buffer_config, RustFSBufferConfig, WorkloadProfile};
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -5214,14 +5191,14 @@ mod tests {
         // Test with profile enabled and AiTraining profile
         set_buffer_profile_enabled(true);
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
-        
+
         assert_eq!(get_buffer_size_opt_in(5 * MB), 512 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(100 * MB), 2 * MB as usize);
         assert_eq!(get_buffer_size_opt_in(600 * MB), 4 * MB as usize);
 
         // Test with WebWorkload profile
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::WebWorkload));
-        
+
         assert_eq!(get_buffer_size_opt_in(100 * KB), 32 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(5 * MB), 128 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
@@ -5232,7 +5209,9 @@ mod tests {
 
     #[test]
     fn test_phase3_default_behavior() {
-        use crate::config::workload_profiles::{set_buffer_profile_enabled, init_global_buffer_config, RustFSBufferConfig, WorkloadProfile};
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -5253,7 +5232,9 @@ mod tests {
 
     #[test]
     fn test_phase4_full_integration() {
-        use crate::config::workload_profiles::{set_buffer_profile_enabled, init_global_buffer_config, RustFSBufferConfig, WorkloadProfile};
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -5261,7 +5242,7 @@ mod tests {
         // Phase 4: Profile-only implementation
         // Test that disabled mode still uses GeneralPurpose (not the old hardcoded algorithm)
         set_buffer_profile_enabled(false);
-        
+
         // Even when disabled, we use GeneralPurpose profile for consistency
         assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
@@ -5269,14 +5250,14 @@ mod tests {
 
         // Test with different profiles enabled
         set_buffer_profile_enabled(true);
-        
+
         // Test profile switching
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
         assert_eq!(get_buffer_size_opt_in(600 * MB), 4 * MB as usize);
-        
+
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::SecureStorage));
         assert_eq!(get_buffer_size_opt_in(100 * MB), 256 * KB as usize);
-        
+
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::WebWorkload));
         assert_eq!(get_buffer_size_opt_in(100 * KB), 32 * KB as usize);
 
@@ -5285,7 +5266,7 @@ mod tests {
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
         let general_buffer = get_buffer_size_opt_in(50 * MB);
         assert_eq!(general_buffer, 256 * KB as usize);
-        
+
         // Reset for other tests
         set_buffer_profile_enabled(false);
     }
@@ -5304,4 +5285,3 @@ mod tests {
     // These are better suited for integration tests rather than unit tests.
     // The current tests focus on the testable parts without external dependencies.
 }
-
