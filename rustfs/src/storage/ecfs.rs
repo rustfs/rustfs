@@ -1042,7 +1042,7 @@ impl S3 for FS {
                 warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string());
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
-                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err),
+                    format!("unable to restore transitioned bucket/object {bucket}/{object}: {err}"),
                 ));
             }
 
