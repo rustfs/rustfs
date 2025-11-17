@@ -256,7 +256,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
 
-    // Initialize buffer profiling system (Phase 2: Opt-In Usage)
+    // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
 
     // Initialize event notifier
