@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::auth::get_condition_values;
+use crate::config::workload_profiles::{RustFSBufferConfig, WorkloadProfile};
 use crate::error::ApiError;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
@@ -163,6 +164,9 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 /// # Returns
 /// Optimal buffer size in bytes
 ///
+/// # Note
+/// This is the legacy function for backward compatibility. For new code, consider using
+/// `get_adaptive_buffer_size_with_profile` which supports workload profiles.
 fn get_adaptive_buffer_size(file_size: i64) -> usize {
     match file_size {
         // Unknown size or negative (chunked/streaming): use default large buffer for safety
@@ -175,6 +179,48 @@ fn get_adaptive_buffer_size(file_size: i64) -> usize {
         _ => DEFAULT_READ_BUFFER_SIZE,
     }
 }
+
+/// Calculate adaptive buffer size with workload profile support.
+///
+/// This enhanced version supports different workload profiles for optimal performance
+/// across various use cases (AI/ML, web workloads, secure storage, etc.).
+///
+/// # Arguments
+/// * `file_size` - The size of the file in bytes, or -1 if unknown
+/// * `profile` - Optional workload profile. If None, uses auto-detection or GeneralPurpose
+///
+/// # Returns
+/// Optimal buffer size in bytes based on the workload profile and file size
+///
+/// # Examples
+/// ```ignore
+/// // Use general purpose profile (default)
+/// let buffer_size = get_adaptive_buffer_size_with_profile(1024 * 1024, None);
+///
+/// // Use AI training profile for large model files
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     500 * 1024 * 1024,
+///     Some(WorkloadProfile::AiTraining)
+/// );
+///
+/// // Use secure storage profile for compliance scenarios
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     10 * 1024 * 1024,
+///     Some(WorkloadProfile::SecureStorage)
+/// );
+/// ```
+fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
+    let config = match profile {
+        Some(p) => RustFSBufferConfig::new(p),
+        None => {
+            // Auto-detect OS environment or use general purpose
+            RustFSBufferConfig::with_auto_detect()
+        }
+    };
+    
+    config.get_buffer_size(file_size)
+}
+
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -5020,6 +5066,116 @@ mod tests {
         assert_eq!(get_adaptive_buffer_size(10 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 10GB
         assert_eq!(get_adaptive_buffer_size(20 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 20GB
     }
+
+    #[test]
+    fn test_adaptive_buffer_size_with_profile() {
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test GeneralPurpose profile (default behavior, should match get_adaptive_buffer_size)
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::GeneralPurpose)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(200 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            DEFAULT_READ_BUFFER_SIZE
+        );
+
+        // Test AiTraining profile - larger buffers for large files
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::AiTraining)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(600 * MB, Some(WorkloadProfile::AiTraining)),
+            4 * MB as usize
+        );
+
+        // Test WebWorkload profile - smaller buffers for web assets
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * KB, Some(WorkloadProfile::WebWorkload)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::WebWorkload)),
+            256 * KB as usize
+        );
+
+        // Test SecureStorage profile - memory-constrained buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::SecureStorage)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::SecureStorage)),
+            256 * KB as usize
+        );
+
+        // Test IndustrialIoT profile - low latency, moderate buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(512 * KB, Some(WorkloadProfile::IndustrialIoT)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            512 * KB as usize
+        );
+
+        // Test DataAnalytics profile
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(2 * MB, Some(WorkloadProfile::DataAnalytics)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::DataAnalytics)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * MB, Some(WorkloadProfile::DataAnalytics)),
+            2 * MB as usize
+        );
+
+        // Test with None (should auto-detect or use GeneralPurpose)
+        let result = get_adaptive_buffer_size_with_profile(50 * MB, None);
+        // Should be either SecureStorage (if on special OS) or GeneralPurpose
+        assert!(result == 128 * KB as usize || result == 256 * KB as usize);
+
+        // Test unknown file size with different profiles
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+    }
+
 
     // Note: S3Request structure is complex and requires many fields.
     // For real testing, we would need proper integration test setup.

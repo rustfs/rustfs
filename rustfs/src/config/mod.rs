@@ -17,6 +17,8 @@ use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
+pub mod workload_profiles;
+
 #[cfg(test)]
 mod config_test;
 
