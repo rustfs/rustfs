@@ -373,9 +373,9 @@ impl FS {
         // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
         // when uploading large files (10GB+). The default 8KB buffer is too small and causes
         // excessive syscalls and potential connection timeouts.
-        let body = StreamReader::with_capacity(
-            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+        let body = tokio::io::BufReader::with_capacity(
             DEFAULT_READ_BUFFER_SIZE,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
 
         let size = match content_length {
@@ -2335,9 +2335,9 @@ impl S3 for FS {
         // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
         // when uploading large files (10GB+). The default 8KB buffer is too small and causes
         // excessive syscalls and potential connection timeouts.
-        let body = StreamReader::with_capacity(
-            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+        let body = tokio::io::BufReader::with_capacity(
             DEFAULT_READ_BUFFER_SIZE,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
 
         // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
@@ -2861,9 +2861,9 @@ impl S3 for FS {
         // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
         // during multipart uploads of large files (10GB+). The default 8KB buffer is too small
         // and causes excessive syscalls and potential connection timeouts.
-        let body = StreamReader::with_capacity(
-            body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+        let body = tokio::io::BufReader::with_capacity(
             DEFAULT_READ_BUFFER_SIZE,
+            StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
 
         // mc cp step 4
