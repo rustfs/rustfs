@@ -151,38 +151,36 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });
 
-/// Calculate adaptive buffer size based on file size for optimal streaming performance.
+/// Calculate adaptive buffer size with workload profile support.
 ///
-/// # Deprecated
-/// This function is deprecated in Phase 4 and maintained only for backward compatibility.
-/// Use the workload profile system via configuration instead, which provides better
-/// performance optimization for different use cases.
-///
-/// # Migration
-/// Instead of calling this function directly, the system now automatically uses
-/// workload profiles configured at startup. The buffer sizing happens transparently
-/// in `get_buffer_size_opt_in()`.
+/// This enhanced version supports different workload profiles for optimal performance
+/// across various use cases (AI/ML, web workloads, secure storage, etc.).
 ///
 /// # Arguments
 /// * `file_size` - The size of the file in bytes, or -1 if unknown
+/// * `profile` - Optional workload profile. If None, uses auto-detection or GeneralPurpose
 ///
 /// # Returns
-/// Optimal buffer size in bytes
+/// Optimal buffer size in bytes based on the workload profile and file size
 ///
-#[deprecated(
-    since = "Phase 4",
-    note = "Use workload profile configuration instead. The buffer sizing is now handled automatically via get_buffer_size_opt_in()."
-)]
-#[allow(dead_code)]
-fn get_adaptive_buffer_size(file_size: i64) -> usize {
-    // Phase 4: This function is now deprecated. It delegates to the GeneralPurpose profile
-    // to maintain exact backward compatibility while encouraging migration to the profile system.
-    let config = RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose);
-    config.get_buffer_size(file_size)
-}
-
-/// Calculate adaptive buffer size with workload profile support.
+/// # Examples
+/// ```ignore
+/// // Use general purpose profile (default)
+/// let buffer_size = get_adaptive_buffer_size_with_profile(1024 * 1024, None);
 ///
+/// // Use AI training profile for large model files
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     500 * 1024 * 1024,
+///     Some(WorkloadProfile::AiTraining)
+/// );
+///
+/// // Use secure storage profile for compliance scenarios
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     10 * 1024 * 1024,
+///     Some(WorkloadProfile::SecureStorage)
+/// );
+/// ```
+fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
 /// This enhanced version supports different workload profiles for optimal performance
 /// across various use cases (AI/ML, web workloads, secure storage, etc.).
 ///
@@ -222,16 +220,15 @@ fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<Workloa
     config.get_buffer_size(file_size)
 }
 
-/// Get adaptive buffer size using global configuration (Phase 4: Primary Implementation).
+/// Get adaptive buffer size using global workload profile configuration.
 ///
-/// This is the primary buffer sizing function in Phase 4. It uses the workload profile
+/// This is the primary buffer sizing function that uses the workload profile
 /// system configured at startup to provide optimal buffer sizes for different scenarios.
 ///
-/// **Phase 4 Changes:**
-/// - This is now the single entry point for all buffer sizing
-/// - Profiles are enabled by default (Phase 3)
-/// - Legacy behavior available via `--buffer-profile-disable`
-/// - Performance metrics collection integrated
+/// The function automatically selects buffer sizes based on:
+/// - Configured workload profile (default: GeneralPurpose)
+/// - File size characteristics
+/// - Optional performance metrics collection
 ///
 /// # Arguments
 /// * `file_size` - The size of the file in bytes, or -1 if unknown
@@ -240,27 +237,28 @@ fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<Workloa
 /// Optimal buffer size in bytes based on the configured workload profile
 ///
 /// # Performance Metrics
-/// This function tracks buffer size selections for performance monitoring and
-/// optimization. Metrics can be used to analyze workload patterns and tune profiles.
+/// When compiled with the `metrics` feature flag, this function tracks:
+/// - Buffer size distribution
+/// - Selection frequency
+/// - Buffer-to-file size ratios
 ///
 /// # Examples
 /// ```ignore
-/// // Phase 4: Uses configured profile (default: GeneralPurpose)
+/// // Uses configured profile (default: GeneralPurpose)
 /// let buffer_size = get_buffer_size_opt_in(file_size);
 /// ```
 fn get_buffer_size_opt_in(file_size: i64) -> usize {
     let buffer_size = if is_buffer_profile_enabled() {
-        // Use global buffer configuration (Phase 3+: enabled by default)
+        // Use globally configured workload profile (enabled by default in Phase 3)
         let config = get_global_buffer_config();
         config.get_buffer_size(file_size)
     } else {
-        // Opt-out mode: Use GeneralPurpose profile (same as PR #869)
+        // Opt-out mode: Use GeneralPurpose profile for consistent behavior
         let config = RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose);
         config.get_buffer_size(file_size)
     };
 
-    // Phase 4: Performance metrics collection
-    // Track buffer size selections for monitoring and optimization
+    // Optional performance metrics collection for monitoring and optimization
     #[cfg(feature = "metrics")]
     {
         metrics::histogram!("buffer_size_bytes", buffer_size as f64);
@@ -510,9 +508,9 @@ impl FS {
             }
         };
 
-        // Use adaptive buffer sizing based on file size for optimal performance.
-        // Phase 2 (Opt-In): Uses workload profiles if RUSTFS_BUFFER_PROFILE_ENABLE=true,
-        // otherwise falls back to legacy behavior for backward compatibility.
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
@@ -2459,9 +2457,9 @@ impl S3 for FS {
             return Err(s3_error!(UnexpectedContent));
         }
 
-        // Use adaptive buffer sizing based on file size for optimal performance.
-        // Phase 2 (Opt-In): Uses workload profiles if RUSTFS_BUFFER_PROFILE_ENABLE=true,
-        // otherwise falls back to legacy behavior for backward compatibility.
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
@@ -2986,9 +2984,9 @@ impl S3 for FS {
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
-        // Use adaptive buffer sizing based on part size for optimal performance.
-        // Phase 2 (Opt-In): Uses workload profiles if RUSTFS_BUFFER_PROFILE_ENABLE=true,
-        // otherwise falls back to legacy behavior for backward compatibility.
+        // Apply adaptive buffer sizing based on part size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on part size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
@@ -5092,37 +5090,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn test_adaptive_buffer_size() {
-        // Phase 4: This tests the deprecated legacy function for backward compatibility
-        const KB: i64 = 1024;
-        const MB: i64 = 1024 * 1024;
-
-        // The deprecated function now delegates to GeneralPurpose profile
-        // so it should still return the same values for compatibility
-
-        // Test unknown/negative size (chunked/streaming)
-        assert_eq!(get_adaptive_buffer_size(-1), DEFAULT_READ_BUFFER_SIZE);
-        assert_eq!(get_adaptive_buffer_size(-100), DEFAULT_READ_BUFFER_SIZE);
-
-        // Test small files (< 1MB) - should use 64KB
-        assert_eq!(get_adaptive_buffer_size(0), 64 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(512 * KB), 64 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(MB - 1), 64 * KB as usize);
-
-        // Test medium files (1MB - 100MB) - should use 256KB
-        assert_eq!(get_adaptive_buffer_size(MB), 256 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(50 * MB), 256 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(100 * MB - 1), 256 * KB as usize);
-
-        // Test large files (>= 100MB) - should use 1MB (DEFAULT_READ_BUFFER_SIZE)
-        assert_eq!(get_adaptive_buffer_size(100 * MB), DEFAULT_READ_BUFFER_SIZE);
-        assert_eq!(get_adaptive_buffer_size(500 * MB), DEFAULT_READ_BUFFER_SIZE);
-        assert_eq!(get_adaptive_buffer_size(10 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 10GB
-        assert_eq!(get_adaptive_buffer_size(20 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 20GB
-    }
-
-    #[test]
     fn test_adaptive_buffer_size_with_profile() {
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -5264,27 +5231,21 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_phase3_default_behavior() {
         use crate::config::workload_profiles::{set_buffer_profile_enabled, init_global_buffer_config, RustFSBufferConfig, WorkloadProfile};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
 
-        // Phase 3: Enabled by default with GeneralPurpose profile
+        // Test Phase 3: Enabled by default with GeneralPurpose profile
         set_buffer_profile_enabled(true);
         init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
 
-        // Should use GeneralPurpose profile (same as PR #869 for most cases)
+        // Verify GeneralPurpose profile provides consistent buffer sizes
         assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
         assert_eq!(get_buffer_size_opt_in(-1), MI_B); // Unknown size
-
-        // Verify it matches the legacy function for the same inputs (GeneralPurpose alignment)
-        assert_eq!(get_buffer_size_opt_in(500 * KB), get_adaptive_buffer_size(500 * KB));
-        assert_eq!(get_buffer_size_opt_in(50 * MB), get_adaptive_buffer_size(50 * MB));
-        assert_eq!(get_buffer_size_opt_in(200 * MB), get_adaptive_buffer_size(200 * MB));
 
         // Reset for other tests
         set_buffer_profile_enabled(false);
