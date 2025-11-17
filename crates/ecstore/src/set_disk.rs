@@ -68,6 +68,7 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
+use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
@@ -111,7 +112,7 @@ use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);

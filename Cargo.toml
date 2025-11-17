@@ -225,7 +225,7 @@ regex = { version = "1.12.2" }
 rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/s3s-project/s3s.git", rev = "1ab064b", version = "0.12.0-rc.3", features = ["minio"] }
+s3s = { git = "https://github.com/s3s-project/s3s.git", rev = "ba9f902", version = "0.12.0-rc.3", features = ["minio"] }
 serial_test = "3.2.0"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
