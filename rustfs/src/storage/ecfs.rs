@@ -168,9 +168,9 @@ fn get_adaptive_buffer_size(file_size: i64) -> usize {
         // Unknown size or negative (chunked/streaming): use default large buffer for safety
         size if size < 0 => DEFAULT_READ_BUFFER_SIZE,
         // Small files (< 1MB): use 64KB to minimize memory overhead
-        size if size < MI_B as i64 => 64 * KI_B as usize,
+        size if size < MI_B as i64 => 64 * KI_B,
         // Medium files (1MB - 100MB): use 256KB for balanced performance
-        size if size < (100 * MI_B) as i64 => 256 * KI_B as usize,
+        size if size < (100 * MI_B) as i64 => 256 * KI_B,
         // Large files (>= 100MB): use 1MB buffer for maximum throughput
         _ => DEFAULT_READ_BUFFER_SIZE,
     }
