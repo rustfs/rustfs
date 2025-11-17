@@ -33,6 +33,7 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
+use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -150,7 +151,7 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 });
 
 /// Calculate adaptive buffer size based on file size for optimal streaming performance.
-/// 
+///
 /// This function implements adaptive buffering to balance memory usage and performance:
 /// - Small files (< 1MB): 64KB buffer - minimize memory overhead
 /// - Medium files (1MB-100MB): 256KB buffer - balanced approach
@@ -161,17 +162,15 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 ///
 /// # Returns
 /// Optimal buffer size in bytes
+///
 fn get_adaptive_buffer_size(file_size: i64) -> usize {
-    const KB: i64 = 1024;
-    const MB: i64 = 1024 * 1024;
-    
     match file_size {
         // Unknown size or negative (chunked/streaming): use default large buffer for safety
         size if size < 0 => DEFAULT_READ_BUFFER_SIZE,
         // Small files (< 1MB): use 64KB to minimize memory overhead
-        size if size < MB => 64 * KB as usize,
+        size if size < MI_B as i64 => 64 * KI_B as usize,
         // Medium files (1MB - 100MB): use 256KB for balanced performance
-        size if size < 100 * MB => 256 * KB as usize,
+        size if size < (100 * MI_B) as i64 => 256 * KI_B as usize,
         // Large files (>= 100MB): use 1MB buffer for maximum throughput
         _ => DEFAULT_READ_BUFFER_SIZE,
     }
