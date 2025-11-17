@@ -2347,7 +2347,7 @@ impl SetDisks {
                         bucket.to_string(),
                         Some(object.to_string()),
                         false,
-                        Some(HealChannelPriority::Low), // Use low priority for proactive healing
+                        Some(HealChannelPriority::Normal), // Use low priority for proactive healing
                         Some(pool_index),
                         Some(set_index),
                     ),
