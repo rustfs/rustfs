@@ -33,15 +33,15 @@ When multiple large files are uploaded consecutively:
 
 ## Solution
 
-Replace `StreamReader::new()` with `StreamReader::with_capacity()` using a 1MB buffer size (`DEFAULT_READ_BUFFER_SIZE = 1024 * 1024`).
+Wrap `StreamReader::new()` with `tokio::io::BufReader::with_capacity()` using a 1MB buffer size (`DEFAULT_READ_BUFFER_SIZE = 1024 * 1024`).
 
 ### Changes Made
 
 Modified three critical locations in `rustfs/src/storage/ecfs.rs`:
 
-1. **put_object** (line ~2335): Standard object upload
-2. **put_object_extract** (line ~373): Archive file extraction and upload
-3. **upload_part** (line ~2861): Multipart upload
+1. **put_object** (line ~2338): Standard object upload
+2. **put_object_extract** (line ~376): Archive file extraction and upload
+3. **upload_part** (line ~2864): Multipart upload
 
 ### Before
 ```rust
@@ -55,9 +55,9 @@ let body = StreamReader::new(
 // Use a larger buffer size (1MB) for StreamReader to prevent chunked stream read timeouts
 // when uploading large files (10GB+). The default 8KB buffer is too small and causes
 // excessive syscalls and potential connection timeouts.
-let body = StreamReader::with_capacity(
-    body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
+let body = tokio::io::BufReader::with_capacity(
     DEFAULT_READ_BUFFER_SIZE,
+    StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
 );
 ```
 
@@ -125,6 +125,10 @@ This value is used consistently across the codebase for stream reading operation
 
 ## Additional Considerations
 
+### Implementation Details
+
+The solution uses `tokio::io::BufReader` to wrap the `StreamReader`, as `tokio-util 0.7.17` does not provide a `StreamReader::with_capacity()` method. The `BufReader` provides the same buffering benefits while being compatible with the current tokio-util version.
+
 ### Future Improvements
 
 1. **Adaptive Buffer Sizing**: Consider adjusting buffer size based on file size
@@ -141,6 +145,7 @@ This value is used consistently across the codebase for stream reading operation
 1. **Increase s3s timeout**: Would only mask the problem, not fix the root cause
 2. **Retry logic**: Would increase complexity and potentially make things worse
 3. **Connection pooling**: Already handled by underlying HTTP stack
+4. **Upgrade tokio-util**: Would provide `StreamReader::with_capacity()` but requires testing entire dependency tree
 
 ## References
 
