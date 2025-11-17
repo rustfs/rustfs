@@ -65,14 +65,11 @@ pub async fn del_opts(
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
     if let Some(ref id) = vid {
-        if let Err(err) = Uuid::parse_str(id.as_str()) {
+        if *id != Uuid::nil().to_string()
+            && let Err(err) = Uuid::parse_str(id.as_str())
+        {
             error!("del_opts: invalid version id: {} error: {}", id, err);
             return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
-
-        if !versioned {
-            error!("del_opts: object not versioned: {}", object);
-            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 
@@ -83,7 +80,7 @@ pub async fn del_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::max().to_string())
+            Some(Uuid::nil().to_string())
         } else {
             vid
         }
@@ -113,12 +110,10 @@ pub async fn get_opts(
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
     if let Some(ref id) = vid {
-        if let Err(_err) = Uuid::parse_str(id.as_str()) {
+        if *id != Uuid::nil().to_string()
+            && let Err(_err) = Uuid::parse_str(id.as_str())
+        {
             return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
-
-        if !versioned {
-            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 
@@ -127,7 +122,7 @@ pub async fn get_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::max().to_string())
+            Some(Uuid::nil().to_string())
         } else {
             vid
         }
@@ -203,7 +198,7 @@ pub async fn put_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::max().to_string())
+            Some(Uuid::nil().to_string())
         } else {
             vid
         }

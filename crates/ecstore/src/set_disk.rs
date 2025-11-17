@@ -4631,7 +4631,7 @@ impl StorageAPI for SetDisks {
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
-                return Err(Error::other(format!("remote tier error: {}", err)));
+                return Err(Error::other(format!("remote tier error: {err}")));
             }
         };
 

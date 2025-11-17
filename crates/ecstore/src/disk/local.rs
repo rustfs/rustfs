@@ -2300,7 +2300,6 @@ impl DiskAPI for LocalDisk {
         let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
             Ok(res) => res,
             Err(err) => {
-                //
                 if err != DiskError::FileNotFound {
                     return Err(err);
                 }
