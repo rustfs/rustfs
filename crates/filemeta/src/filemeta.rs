@@ -592,6 +592,7 @@ impl FileMeta {
     }
 
     // delete_version deletes version, returns data_dir
+    #[tracing::instrument(skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let vid = if fi.version_id.is_none() {
             Some(Uuid::nil())
@@ -703,6 +704,8 @@ impl FileMeta {
                 }
             }
         }
+
+        let mut found_index = None;
 
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != vid {
@@ -818,15 +821,8 @@ impl FileMeta {
 
                         return Ok(old_dir);
                     }
+                    found_index = Some(i);
                 }
-            }
-        }
-
-        let mut found_index = None;
-        for (i, version) in self.versions.iter().enumerate() {
-            if version.header.version_type == VersionType::Object && version.header.version_id == vid {
-                found_index = Some(i);
-                break;
             }
         }
 
