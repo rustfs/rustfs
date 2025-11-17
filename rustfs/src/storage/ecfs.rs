@@ -5235,6 +5235,32 @@ mod tests {
         set_buffer_profile_enabled(false);
     }
 
+    #[test]
+    fn test_phase3_default_behavior() {
+        use crate::config::workload_profiles::{set_buffer_profile_enabled, init_global_buffer_config, RustFSBufferConfig, WorkloadProfile};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Phase 3: Enabled by default with GeneralPurpose profile
+        set_buffer_profile_enabled(true);
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Should use GeneralPurpose profile (same as PR #869 for most cases)
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B); // Unknown size
+
+        // Verify it matches the legacy function for the same inputs (GeneralPurpose alignment)
+        assert_eq!(get_buffer_size_opt_in(500 * KB), get_adaptive_buffer_size(500 * KB));
+        assert_eq!(get_buffer_size_opt_in(50 * MB), get_adaptive_buffer_size(50 * MB));
+        assert_eq!(get_buffer_size_opt_in(200 * MB), get_adaptive_buffer_size(200 * MB));
+
+        // Reset for other tests
+        set_buffer_profile_enabled(false);
+    }
+
     // Note: S3Request structure is complex and requires many fields.
     // For real testing, we would need proper integration test setup.
     // Removing this test as it requires too much S3 infrastructure setup.

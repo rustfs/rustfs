@@ -657,16 +657,22 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
 
 /// Initialize the buffer profiling system based on configuration.
 ///
-/// This implements Phase 2 (Opt-In Usage) of the migration path, allowing users
-/// to enable workload-aware buffer sizing via configuration.
+/// This implements Phase 3 (Default Enablement) of the migration path.
+/// Workload-aware buffer sizing is now enabled by default with the GeneralPurpose profile.
+/// Users can opt-out using the --buffer-profile-disable flag for legacy behavior.
 ///
 /// # Arguments
 /// * `opt` - The application configuration options
 fn init_buffer_profile_system(opt: &config::Opt) {
     use crate::config::workload_profiles::{WorkloadProfile, RustFSBufferConfig, init_global_buffer_config, set_buffer_profile_enabled};
 
-    if opt.buffer_profile_enable {
-        info!("Buffer profiling is enabled, profile: {}", opt.buffer_profile);
+    if opt.buffer_profile_disable {
+        // User explicitly disabled buffer profiling - use legacy behavior
+        info!("Buffer profiling is disabled (--buffer-profile-disable), using legacy adaptive buffer sizing");
+        set_buffer_profile_enabled(false);
+    } else {
+        // Phase 3: Enabled by default
+        info!("Buffer profiling is enabled by default (Phase 3), profile: {}", opt.buffer_profile);
         
         // Parse the profile from configuration
         let profile = WorkloadProfile::from_name(&opt.buffer_profile);
@@ -681,9 +687,6 @@ fn init_buffer_profile_system(opt: &config::Opt) {
         set_buffer_profile_enabled(true);
         
         info!("Buffer profiling system initialized successfully");
-    } else {
-        info!("Buffer profiling is disabled, using legacy adaptive buffer sizing");
-        set_buffer_profile_enabled(false);
     }
 }
 

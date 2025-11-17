@@ -179,7 +179,124 @@ let profile = WorkloadProfile::Custom(custom_config);
 let buffer_size = get_adaptive_buffer_size_with_profile(file_size, Some(profile));
 ```
 
-## Phase 2: Opt-In Usage (Current Implementation)
+## Phase 3: Default Enablement (Current Implementation)
+
+**⚡ NEW: Workload profiles are now enabled by default!**
+
+Starting from Phase 3, adaptive buffer sizing with workload profiles is **enabled by default** using the `GeneralPurpose` profile. This provides improved performance out-of-the-box while maintaining full backward compatibility.
+
+### Default Behavior
+
+```bash
+# Phase 3: Profile-aware buffer sizing enabled by default with GeneralPurpose profile
+./rustfs /data
+```
+
+This now automatically uses intelligent buffer sizing based on file size and workload characteristics.
+
+### Changing the Workload Profile
+
+```bash
+# Use a different profile (AI/ML workloads)
+export RUSTFS_BUFFER_PROFILE=AiTraining
+./rustfs /data
+
+# Or via command-line
+./rustfs --buffer-profile AiTraining /data
+
+# Use web workload profile
+./rustfs --buffer-profile WebWorkload /data
+```
+
+### Opt-Out (Legacy Behavior)
+
+If you need the exact behavior from PR #869 (fixed algorithm), you can disable profiling:
+
+```bash
+# Disable buffer profiling (revert to PR #869 behavior)
+export RUSTFS_BUFFER_PROFILE_DISABLE=true
+./rustfs /data
+
+# Or via command-line
+./rustfs --buffer-profile-disable /data
+```
+
+### Available Profile Names
+
+The following profile names are supported (case-insensitive):
+
+| Profile Name | Aliases | Description |
+|-------------|---------|-------------|
+| `GeneralPurpose` | `general` | Default balanced configuration (same as PR #869 for most files) |
+| `AiTraining` | `ai` | Optimized for AI/ML workloads |
+| `DataAnalytics` | `analytics` | Mixed read-write patterns |
+| `WebWorkload` | `web` | Small file intensive operations |
+| `IndustrialIoT` | `iot` | Real-time streaming |
+| `SecureStorage` | `secure` | Security-first, memory constrained |
+
+### Behavior Summary
+
+**Phase 3 Default (Enabled):**
+- Uses workload-aware buffer sizing with `GeneralPurpose` profile
+- Provides same buffer sizes as PR #869 for most scenarios
+- Allows easy switching to specialized profiles
+- Buffer sizes: 64KB, 256KB, 1MB based on file size (GeneralPurpose)
+
+**With `RUSTFS_BUFFER_PROFILE_DISABLE=true`:**
+- Uses the exact original adaptive buffer sizing from PR #869
+- For users who want guaranteed legacy behavior
+- Buffer sizes: 64KB, 256KB, 1MB based on file size
+
+**With Different Profiles:**
+- `AiTraining`: 512KB, 2MB, 4MB - maximize throughput
+- `WebWorkload`: 32KB, 128KB, 256KB - optimize concurrency
+- `SecureStorage`: 32KB, 128KB, 256KB - compliance-focused
+- And more...
+
+### Migration Examples
+
+**Phase 2 → Phase 3 Migration:**
+
+```bash
+# Phase 2 (Opt-In): Had to explicitly enable
+export RUSTFS_BUFFER_PROFILE_ENABLE=true
+export RUSTFS_BUFFER_PROFILE=GeneralPurpose
+./rustfs /data
+
+# Phase 3 (Default): Enabled automatically
+./rustfs /data  # ← Same behavior, no configuration needed!
+```
+
+**Using Different Profiles:**
+
+```bash
+# AI/ML workloads - larger buffers for maximum throughput
+export RUSTFS_BUFFER_PROFILE=AiTraining
+./rustfs /data
+
+# Web workloads - smaller buffers for high concurrency
+export RUSTFS_BUFFER_PROFILE=WebWorkload
+./rustfs /data
+
+# Secure environments - compliance-focused
+export RUSTFS_BUFFER_PROFILE=SecureStorage
+./rustfs /data
+```
+
+**Reverting to Legacy Behavior:**
+
+```bash
+# If you encounter issues or need exact PR #869 behavior
+export RUSTFS_BUFFER_PROFILE_DISABLE=true
+./rustfs /data
+```
+
+## Phase 2: Opt-In Usage (Previous Implementation)
+
+**Note:** Phase 2 documentation is kept for historical reference. The current version uses Phase 3 (Default Enablement).
+
+<details>
+<summary>Click to expand Phase 2 documentation</summary>
 
 Starting from Phase 2 of the migration path, workload profiles can be enabled via environment variables or command-line arguments.
 
@@ -213,22 +330,9 @@ Alternatively, use command-line flags:
 ./rustfs /data
 ```
 
-### Available Profile Names
-
-The following profile names are supported (case-insensitive):
-
-| Profile Name | Aliases | Description |
-|-------------|---------|-------------|
-| `GeneralPurpose` | `general` | Default balanced configuration |
-| `AiTraining` | `ai` | Optimized for AI/ML workloads |
-| `DataAnalytics` | `analytics` | Mixed read-write patterns |
-| `WebWorkload` | `web` | Small file intensive operations |
-| `IndustrialIoT` | `iot` | Real-time streaming |
-| `SecureStorage` | `secure` | Security-first, memory constrained |
-
 ### Behavior
 
-When `RUSTFS_BUFFER_PROFILE_ENABLE=false` (default):
+When `RUSTFS_BUFFER_PROFILE_ENABLE=false` (default in Phase 2):
 - Uses the original adaptive buffer sizing from PR #869
 - No breaking changes to existing deployments
 - Buffer sizes: 64KB, 256KB, 1MB based on file size
@@ -238,26 +342,8 @@ When `RUSTFS_BUFFER_PROFILE_ENABLE=true`:
 - Allows for workload-specific optimizations
 - Buffer sizes vary based on the selected profile
 
-### Migration Example
+</details>
 
-**Before (Legacy Behavior):**
-```bash
-# No configuration needed, uses fixed algorithm
-./rustfs /data
-```
-
-**After (Opt-In to Profiles):**
-```bash
-# For AI/ML workloads - larger buffers
-export RUSTFS_BUFFER_PROFILE_ENABLE=true
-export RUSTFS_BUFFER_PROFILE=AiTraining
-./rustfs /data
-
-# For web workloads - smaller buffers, high concurrency
-export RUSTFS_BUFFER_PROFILE_ENABLE=true
-export RUSTFS_BUFFER_PROFILE=WebWorkload
-./rustfs /data
-```
 
 
 ## Configuration Validation

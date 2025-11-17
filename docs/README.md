@@ -11,6 +11,7 @@ RustFS provides intelligent performance optimization features for different work
 | Document | Description | Audience |
 |------|------|----------|
 | [Adaptive Buffer Sizing](./adaptive-buffer-sizing.md) | Intelligent buffer sizing optimization for optimal performance across workload types | Developers and system administrators |
+| [Phase 3 Migration Guide](./MIGRATION_PHASE3.md) | Migration guide from Phase 2 to Phase 3 (Default Enablement) | Operations and DevOps teams |
 | [Performance Testing Guide](./PERFORMANCE_TESTING.md) | Performance benchmarking and optimization guide | Performance engineers |
 
 ### 🔐 KMS (Key Management Service)

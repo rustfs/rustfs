@@ -317,11 +317,31 @@ export RUSTFS_BUFFER_PROFILE=AiTraining
 ./rustfs --buffer-profile-enable --buffer-profile WebWorkload /data
 ```
 
-### Phase 3: Default Enablement (Future)
+### Phase 3: Default Enablement ✅ **IMPLEMENTED**
 
-- Make profile-aware buffer sizing default
-- Maintain backward compatibility flag
-- Update documentation
+- ✅ Profile-aware buffer sizing enabled by default
+- ✅ Default profile: `GeneralPurpose` (same behavior as PR #869 for most files)
+- ✅ Backward compatibility via `--buffer-profile-disable` flag
+- ✅ Easy profile switching via `--buffer-profile` or `RUSTFS_BUFFER_PROFILE`
+- ✅ Updated documentation with Phase 3 examples
+
+**Default Behavior:**
+```bash
+# Phase 3: Enabled by default with GeneralPurpose profile
+./rustfs /data
+
+# Change to a different profile
+./rustfs --buffer-profile AiTraining /data
+
+# Opt-out to legacy behavior if needed
+./rustfs --buffer-profile-disable /data
+```
+
+**Key Changes from Phase 2:**
+- Phase 2: Required `--buffer-profile-enable` to opt-in
+- Phase 3: Enabled by default, use `--buffer-profile-disable` to opt-out
+- Maintains full backward compatibility
+- No breaking changes for existing deployments
 
 ### Phase 4: Full Integration (Future)
 

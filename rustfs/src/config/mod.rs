@@ -115,9 +115,10 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
 
-    /// Enable adaptive buffer sizing with workload profiles (opt-in)
-    #[arg(long, default_value_t = false, env = "RUSTFS_BUFFER_PROFILE_ENABLE")]
-    pub buffer_profile_enable: bool,
+    /// Disable adaptive buffer sizing with workload profiles (Phase 3: enabled by default)
+    /// Set this flag to use legacy fixed-size buffer behavior from PR #869
+    #[arg(long, default_value_t = false, env = "RUSTFS_BUFFER_PROFILE_DISABLE")]
+    pub buffer_profile_disable: bool,
 
     /// Workload profile for adaptive buffer sizing
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
