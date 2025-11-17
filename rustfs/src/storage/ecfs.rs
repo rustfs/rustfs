@@ -1294,7 +1294,7 @@ impl S3 for FS {
             }
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                object.version_id = Some(Uuid::max());
+                object.version_id = Some(Uuid::nil());
             }
 
             if replicate_deletes {

@@ -184,12 +184,10 @@ pub async fn put_opts(
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
     if let Some(ref id) = vid {
-        if let Err(_err) = Uuid::parse_str(id.as_str()) {
+        if *id != Uuid::nil().to_string()
+            && let Err(_err) = Uuid::parse_str(id.as_str())
+        {
             return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
-
-        if !versioned {
-            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 

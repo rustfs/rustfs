@@ -4225,11 +4225,10 @@ impl StorageAPI for SetDisks {
         let mut vers = Vec::with_capacity(vers_map.len());
 
         for (_, mut fi_vers) in vers_map {
-            fi_vers.versions.sort_by(|a, b| a.deleted.cmp(&b.deleted));
-            fi_vers.versions.reverse();
+            fi_vers.versions.sort_by(|a, b| b.deleted.cmp(&a.deleted));
 
             if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
-                fi_vers.versions.truncate(index + 1);
+                fi_vers.versions.drain(..=index);
             }
 
             vers.push(fi_vers);

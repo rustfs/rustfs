@@ -593,11 +593,17 @@ impl FileMeta {
 
     // delete_version deletes version, returns data_dir
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
+        let vid = if fi.version_id.is_none() {
+            Some(Uuid::nil())
+        } else {
+            Some(fi.version_id.unwrap())
+        };
+
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
             ventry.version_type = VersionType::Delete;
             ventry.delete_marker = Some(MetaDeleteMarker {
-                version_id: fi.version_id,
+                version_id: vid,
                 mod_time: fi.mod_time,
                 ..Default::default()
             });
@@ -699,7 +705,7 @@ impl FileMeta {
         }
 
         for (i, ver) in self.versions.iter().enumerate() {
-            if ver.header.version_id != fi.version_id {
+            if ver.header.version_id != vid {
                 continue;
             }
 
@@ -710,7 +716,7 @@ impl FileMeta {
                         let mut v = self.get_idx(i)?;
                         if v.delete_marker.is_none() {
                             v.delete_marker = Some(MetaDeleteMarker {
-                                version_id: fi.version_id,
+                                version_id: vid,
                                 mod_time: fi.mod_time,
                                 meta_sys: HashMap::new(),
                             });
@@ -776,7 +782,7 @@ impl FileMeta {
                     self.versions.remove(i);
 
                     if (fi.mark_deleted && fi.version_purge_status() != VersionPurgeStatusType::Complete)
-                        || (fi.deleted && fi.version_id.is_none())
+                        || (fi.deleted && vid == Some(Uuid::nil()))
                     {
                         self.add_version_filemata(ventry)?;
                     }
@@ -818,7 +824,7 @@ impl FileMeta {
 
         let mut found_index = None;
         for (i, version) in self.versions.iter().enumerate() {
-            if version.header.version_type == VersionType::Object && version.header.version_id == fi.version_id {
+            if version.header.version_type == VersionType::Object && version.header.version_id == vid {
                 found_index = Some(i);
                 break;
             }
