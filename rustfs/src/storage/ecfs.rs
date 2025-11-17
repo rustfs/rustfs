@@ -3247,6 +3247,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    #[instrument(level = "debug", skip(self, req))]
     async fn list_multipart_uploads(
         &self,
         req: S3Request<ListMultipartUploadsInput>,
@@ -3274,6 +3275,11 @@ impl S3 for FS {
                 return Err(s3_error!(NotImplemented, "Invalid key marker"));
             }
         }
+
+        warn!(
+            "List multipart uploads with bucket={}, prefix={}, delimiter={:?}, key_marker={:?}, upload_id_marker={:?}, max_uploads={}",
+            bucket, prefix, delimiter, key_marker, upload_id_marker, max_uploads
+        );
 
         let result = store
             .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)

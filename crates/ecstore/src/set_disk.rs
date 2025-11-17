@@ -5272,6 +5272,7 @@ impl StorageAPI for SetDisks {
                     if err == DiskError::DiskNotFound {
                         None
                     } else if err == DiskError::FileNotFound {
+                        warn!("list_multipart_uploads: FileNotFound");
                         return Ok(ListMultipartsInfo {
                             key_marker: key_marker.to_owned(),
                             max_uploads,

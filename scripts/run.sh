@@ -28,8 +28,8 @@ fi
 current_dir=$(pwd)
 echo "Current directory: $current_dir"
 
-# mkdir -p ./target/volume/test
-mkdir -p ./target/volume/test{1..4}
+mkdir -p ./target/volume/test
+# mkdir -p ./target/volume/test{1..4}
 
 
 if [ -z "$RUST_LOG" ]; then
@@ -41,8 +41,8 @@ fi
 
 # export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
-export RUSTFS_VOLUMES="./target/volume/test{1...4}"
-# export RUSTFS_VOLUMES="./target/volume/test"
+# export RUSTFS_VOLUMES="./target/volume/test{1...4}"
+export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"
@@ -77,7 +77,7 @@ export RUSTFS_OBS_LOG_FLUSH_MS=300
 #tokio runtime
 export RUSTFS_RUNTIME_WORKER_THREADS=16
 export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
-export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=true
+export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
 # shellcheck disable=SC2125
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
