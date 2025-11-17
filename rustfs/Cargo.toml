@@ -73,7 +73,7 @@ http.workspace = true
 http-body.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
 tokio-rustls = { workspace = true }
 tokio-stream.workspace = true
 tokio-util.workspace = true

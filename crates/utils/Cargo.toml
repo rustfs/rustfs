@@ -29,7 +29,7 @@ base64-simd = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
-crc32fast = { workspace = true, optional = true }
+crc-fast = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
@@ -88,7 +88,7 @@ notify = ["dep:hyper", "dep:s3s", "dep:hashbrown", "dep:thiserror", "dep:serde",
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex", "dep:rand"]
 crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
-hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:base64-simd", "dep:crc32fast"]
+hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:base64-simd", "dep:crc-fast"]
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features

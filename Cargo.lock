@@ -1872,15 +1872,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc64fast-nvme"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38fe9239af6a04e140c7424d36d1615f37f1804700c17d5339af162add9022e0"
-dependencies = [
- "crc",
-]
-
-[[package]]
 name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7216,7 +7207,7 @@ version = "0.0.5"
 dependencies = [
  "byteorder",
  "bytes",
- "crc32fast",
+ "crc-fast",
  "criterion",
  "lazy_static",
  "regex",
@@ -7436,9 +7427,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "bytes",
- "crc32c",
- "crc32fast",
- "crc64fast-nvme",
+ "crc-fast",
  "faster-hex",
  "futures",
  "hex-simd",
@@ -7545,7 +7534,7 @@ dependencies = [
  "brotli 8.0.2",
  "bytes",
  "convert_case",
- "crc32fast",
+ "crc-fast",
  "flate2",
  "futures",
  "hashbrown 0.16.0",
@@ -7789,7 +7778,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "s3s"
 version = "0.12.0-rc.3"
-source = "git+https://github.com/s3s-project/s3s.git?rev=1ab064b#1ab064b6e8cfe0c36a2f763e9f6aa14b56592220"
+source = "git+https://github.com/s3s-project/s3s.git?rev=ba9f902#ba9f902df5a0b68dc9b0eeed4f06625fc0633d20"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -7800,9 +7789,7 @@ dependencies = [
  "cfg-if",
  "chrono",
  "const-str",
- "crc32c",
- "crc32fast",
- "crc64fast-nvme",
+ "crc-fast",
  "futures",
  "hex-simd",
  "hmac 0.13.0-rc.3",

@@ -356,7 +356,11 @@ where
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Decompressed length mismatch")));
         }
-        let actual_crc = crc32fast::hash(&decompressed);
+        let actual_crc = {
+            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+            hasher.update(&decompressed);
+            hasher.finalize() as u32
+        };
         if actual_crc != crc {
             // error!("DecompressReader CRC32 mismatch: actual {actual_crc} != expected {crc}");
             this.compressed_buf.take();
@@ -404,7 +408,11 @@ where
 
 /// Build compressed block with header + uvarint + compressed data
 fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: CompressionAlgorithm) -> Vec<u8> {
-    let crc = crc32fast::hash(uncompressed_data);
+    let crc = {
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(uncompressed_data);
+        hasher.finalize() as u32
+    };
     let compressed_data = compress_block(uncompressed_data, compression_algorithm);
     let uncompressed_len = uncompressed_data.len();
     let mut uncompressed_len_buf = [0u8; 10];
