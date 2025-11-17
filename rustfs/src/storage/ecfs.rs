@@ -33,6 +33,7 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
+use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -148,6 +149,32 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     display_name: Some("rustfs".to_owned()),
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });
+
+/// Calculate adaptive buffer size based on file size for optimal streaming performance.
+///
+/// This function implements adaptive buffering to balance memory usage and performance:
+/// - Small files (< 1MB): 64KB buffer - minimize memory overhead
+/// - Medium files (1MB-100MB): 256KB buffer - balanced approach
+/// - Large files (>= 100MB): 1MB buffer - maximize throughput, minimize syscalls
+///
+/// # Arguments
+/// * `file_size` - The size of the file in bytes, or -1 if unknown
+///
+/// # Returns
+/// Optimal buffer size in bytes
+///
+fn get_adaptive_buffer_size(file_size: i64) -> usize {
+    match file_size {
+        // Unknown size or negative (chunked/streaming): use default large buffer for safety
+        size if size < 0 => DEFAULT_READ_BUFFER_SIZE,
+        // Small files (< 1MB): use 64KB to minimize memory overhead
+        size if size < MI_B as i64 => 64 * KI_B,
+        // Medium files (1MB - 100MB): use 256KB for balanced performance
+        size if size < (100 * MI_B) as i64 => 256 * KI_B,
+        // Large files (>= 100MB): use 1MB buffer for maximum throughput
+        _ => DEFAULT_READ_BUFFER_SIZE,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -370,8 +397,6 @@ impl FS {
         let event_version_id = version_id;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
-
         let size = match content_length {
             Some(c) => c,
             None => {
@@ -385,6 +410,16 @@ impl FS {
                 }
             }
         };
+
+        // Use adaptive buffer sizing based on file size for optimal performance:
+        // - Small files (< 1MB): 64KB buffer to minimize memory overhead
+        // - Medium files (1MB-100MB): 256KB buffer for balanced performance
+        // - Large files (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
+        let buffer_size = get_adaptive_buffer_size(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
 
         let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
             return Err(s3_error!(InvalidArgument, "key extension not found"));
@@ -2326,7 +2361,15 @@ impl S3 for FS {
             return Err(s3_error!(UnexpectedContent));
         }
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Use adaptive buffer sizing based on file size for optimal performance:
+        // - Small files (< 1MB): 64KB buffer to minimize memory overhead
+        // - Medium files (1MB-100MB): 256KB buffer for balanced performance
+        // - Large files (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
+        let buffer_size = get_adaptive_buffer_size(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
 
         // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
@@ -2846,7 +2889,15 @@ impl S3 for FS {
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
-        let body = StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Use adaptive buffer sizing based on part size for optimal performance:
+        // - Small parts (< 1MB): 64KB buffer to minimize memory overhead
+        // - Medium parts (1MB-100MB): 256KB buffer for balanced performance
+        // - Large parts (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
+        let buffer_size = get_adaptive_buffer_size(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
 
         // mc cp step 4
 
@@ -4942,6 +4993,32 @@ mod tests {
 
         let gz_format = CompressionFormat::from_extension("gz");
         assert_eq!(gz_format.extension(), "gz");
+    }
+
+    #[test]
+    fn test_adaptive_buffer_size() {
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test unknown/negative size (chunked/streaming)
+        assert_eq!(get_adaptive_buffer_size(-1), DEFAULT_READ_BUFFER_SIZE);
+        assert_eq!(get_adaptive_buffer_size(-100), DEFAULT_READ_BUFFER_SIZE);
+
+        // Test small files (< 1MB) - should use 64KB
+        assert_eq!(get_adaptive_buffer_size(0), 64 * KB as usize);
+        assert_eq!(get_adaptive_buffer_size(512 * KB), 64 * KB as usize);
+        assert_eq!(get_adaptive_buffer_size(MB - 1), 64 * KB as usize);
+
+        // Test medium files (1MB - 100MB) - should use 256KB
+        assert_eq!(get_adaptive_buffer_size(MB), 256 * KB as usize);
+        assert_eq!(get_adaptive_buffer_size(50 * MB), 256 * KB as usize);
+        assert_eq!(get_adaptive_buffer_size(100 * MB - 1), 256 * KB as usize);
+
+        // Test large files (>= 100MB) - should use 1MB (DEFAULT_READ_BUFFER_SIZE)
+        assert_eq!(get_adaptive_buffer_size(100 * MB), DEFAULT_READ_BUFFER_SIZE);
+        assert_eq!(get_adaptive_buffer_size(500 * MB), DEFAULT_READ_BUFFER_SIZE);
+        assert_eq!(get_adaptive_buffer_size(10 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 10GB
+        assert_eq!(get_adaptive_buffer_size(20 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 20GB
     }
 
     // Note: S3Request structure is complex and requires many fields.
