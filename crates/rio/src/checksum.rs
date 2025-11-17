@@ -15,7 +15,6 @@
 use crate::errors::ChecksumMismatch;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
-use crc32fast::Hasher as Crc32Hasher;
 use http::HeaderMap;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -612,7 +611,7 @@ pub trait ChecksumHasher: Write + Send + Sync {
 
 /// CRC32 IEEE hasher
 pub struct Crc32IeeeHasher {
-    hasher: Crc32Hasher,
+    hasher: crc_fast::Digest,
 }
 
 impl Default for Crc32IeeeHasher {
@@ -624,7 +623,7 @@ impl Default for Crc32IeeeHasher {
 impl Crc32IeeeHasher {
     pub fn new() -> Self {
         Self {
-            hasher: Crc32Hasher::new(),
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
         }
     }
 }
@@ -642,27 +641,36 @@ impl Write for Crc32IeeeHasher {
 
 impl ChecksumHasher for Crc32IeeeHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.hasher.clone().finalize().to_be_bytes().to_vec()
+        (self.hasher.clone().finalize() as u32).to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.hasher = Crc32Hasher::new();
+        self.hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
     }
 }
 
 /// CRC32 Castagnoli hasher
-#[derive(Default)]
-pub struct Crc32CastagnoliHasher(u32);
+pub struct Crc32CastagnoliHasher {
+    hasher: crc_fast::Digest,
+}
+
+impl Default for Crc32CastagnoliHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Crc32CastagnoliHasher {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
+        }
     }
 }
 
 impl Write for Crc32CastagnoliHasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 = crc32c::crc32c_append(self.0, buf);
+        self.hasher.update(buf);
         Ok(buf.len())
     }
 
@@ -673,11 +681,11 @@ impl Write for Crc32CastagnoliHasher {
 
 impl ChecksumHasher for Crc32CastagnoliHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.0.to_be_bytes().to_vec()
+        (self.hasher.clone().finalize() as u32).to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.0 = 0;
+        self.hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     }
 }
 
@@ -758,22 +766,27 @@ impl ChecksumHasher for Sha256Hasher {
 }
 
 /// CRC64 NVME hasher
-#[derive(Default)]
 pub struct Crc64NvmeHasher {
-    hasher: crc64fast_nvme::Digest,
+    hasher: crc_fast::Digest,
+}
+
+impl Default for Crc64NvmeHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Crc64NvmeHasher {
     pub fn new() -> Self {
         Self {
-            hasher: Default::default(),
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme),
         }
     }
 }
 
 impl Write for Crc64NvmeHasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.write(buf);
+        self.hasher.update(buf);
         Ok(buf.len())
     }
 
@@ -784,11 +797,11 @@ impl Write for Crc64NvmeHasher {
 
 impl ChecksumHasher for Crc64NvmeHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.hasher.sum64().to_be_bytes().to_vec()
+        self.hasher.clone().finalize().to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.hasher = Default::default();
+        self.hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
     }
 }
 

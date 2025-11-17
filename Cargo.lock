@@ -1872,15 +1872,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc64fast-nvme"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38fe9239af6a04e140c7424d36d1615f37f1804700c17d5339af162add9022e0"
-dependencies = [
- "crc",
-]
-
-[[package]]
 name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7216,7 +7207,7 @@ version = "0.0.5"
 dependencies = [
  "byteorder",
  "bytes",
- "crc32fast",
+ "crc-fast",
  "criterion",
  "lazy_static",
  "regex",
@@ -7436,9 +7427,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "bytes",
- "crc32c",
- "crc32fast",
- "crc64fast-nvme",
+ "crc-fast",
  "faster-hex",
  "futures",
  "hex-simd",
@@ -7545,7 +7534,7 @@ dependencies = [
  "brotli 8.0.2",
  "bytes",
  "convert_case",
- "crc32fast",
+ "crc-fast",
  "flate2",
  "futures",
  "hashbrown 0.16.0",

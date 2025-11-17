@@ -26,7 +26,7 @@ categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-filemeta/latest/rustfs_filemeta/"
 
 [dependencies]
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
