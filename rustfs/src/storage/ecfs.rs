@@ -236,12 +236,13 @@ fn get_buffer_size_opt_in(file_size: i64) -> usize {
     // Optional performance metrics collection for monitoring and optimization
     #[cfg(feature = "metrics")]
     {
-        metrics::histogram!("buffer_size_bytes", buffer_size as f64);
-        metrics::counter!("buffer_size_selections", 1);
+        use metrics::histogram;
+        histogram!("rustfs_buffer_size_bytes").record(buffer_size as f64);
+        counter!("rustfs_buffer_size_selections").increment(1);
 
         if file_size >= 0 {
             let ratio = buffer_size as f64 / file_size as f64;
-            metrics::histogram!("buffer_to_file_ratio", ratio);
+            histogram!("rustfs_buffer_to_file_ratio").record(ratio);
         }
     }
 

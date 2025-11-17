@@ -115,7 +115,7 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
 
-    /// Disable adaptive buffer sizing with workload profiles (Phase 3: enabled by default)
+    /// Disable adaptive buffer sizing with workload profiles
     /// Set this flag to use legacy fixed-size buffer behavior from PR #869
     #[arg(long, default_value_t = false, env = "RUSTFS_BUFFER_PROFILE_DISABLE")]
     pub buffer_profile_disable: bool,
