@@ -1872,15 +1872,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc64fast-nvme"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38fe9239af6a04e140c7424d36d1615f37f1804700c17d5339af162add9022e0"
-dependencies = [
- "crc",
-]
-
-[[package]]
 name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
