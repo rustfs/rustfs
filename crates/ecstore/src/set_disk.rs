@@ -2335,6 +2335,33 @@ impl SetDisks {
                 return Err(Error::other(format!("not enough disks to read: {errors:?}")));
             }
 
+            // Check if we have missing shards even though we can read successfully
+            // This happens when a node was offline during write and comes back online
+            let total_shards = erasure.data_shards + erasure.parity_shards;
+            let missing_shards = total_shards - nil_count;
+            if missing_shards > 0 && nil_count >= erasure.data_shards {
+                // We have missing shards but enough to read - trigger background heal
+                tracing::info!(
+                    bucket,
+                    object,
+                    part_number,
+                    missing_shards,
+                    available_shards = nil_count,
+                    "Detected missing shards during read, triggering background heal"
+                );
+                let _ = rustfs_common::heal_channel::send_heal_request(
+                    rustfs_common::heal_channel::create_heal_request_with_options(
+                        bucket.to_string(),
+                        Some(object.to_string()),
+                        false,
+                        Some(HealChannelPriority::Low), // Use low priority for proactive healing
+                        Some(pool_index),
+                        Some(set_index),
+                    ),
+                )
+                .await;
+            }
+
             // debug!(
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
