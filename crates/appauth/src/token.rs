@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rsa::Pkcs1v15Encrypt;
 use rsa::{
-    RsaPrivateKey, RsaPublicKey,
+    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
     pkcs8::{DecodePrivateKey, DecodePublicKey},
-    rand_core::OsRng,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Error, Result};
@@ -33,8 +31,9 @@ pub struct Token {
 /// Returns the encrypted string processed by base64
 pub fn gencode(token: &Token, key: &str) -> Result<String> {
     let data = serde_json::to_vec(token)?;
+    let mut rng = rand::rng();
     let public_key = RsaPublicKey::from_public_key_pem(key).map_err(Error::other)?;
-    let encrypted_data = public_key.encrypt(&mut OsRng, Pkcs1v15Encrypt, &data).map_err(Error::other)?;
+    let encrypted_data = public_key.encrypt(&mut rng, Pkcs1v15Encrypt, &data).map_err(Error::other)?;
     Ok(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encrypted_data))
 }
 
@@ -76,9 +75,10 @@ mod tests {
         pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
     #[test]
     fn test_gencode_and_parse() {
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let bits = 2048;
         let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
         let public_key = RsaPublicKey::from(&private_key);
@@ -101,7 +101,8 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_token() {
-        let private_key_pem = RsaPrivateKey::new(&mut OsRng, 2048)
+        let mut rng = rand::rng();
+        let private_key_pem = RsaPrivateKey::new(&mut rng, 2048)
             .expect("Failed to generate private key")
             .to_pkcs8_pem(LineEnding::LF)
             .unwrap();

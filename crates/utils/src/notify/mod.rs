@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod net;
+
+use hashbrown::HashMap;
 use hyper::HeaderMap;
 use s3s::{S3Request, S3Response};
-use std::collections::HashMap;
+
+pub use net::*;
 
 /// Extract request parameters from S3Request, mainly header information.
 #[allow(dead_code)]

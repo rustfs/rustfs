@@ -17,11 +17,8 @@
 //! provides tools for system and service monitoring
 //!
 //! ## feature mark
-//!
-//! - `file`: enable file logging enabled by default
+//! - `default`: default monitoring function
 //! - `gpu`: gpu monitoring function
-//! - `kafka`: enable kafka metric output
-//! - `webhook`: enable webhook notifications
 //! - `full`: includes all functions
 //!
 //! to enable gpu monitoring add in cargo toml
@@ -41,27 +38,33 @@
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// let (logger, guard) = init_obs(None).await;
+/// #   let _guard = match init_obs(None).await {
+/// #         Ok(g) => g,
+/// #         Err(e) => {
+/// #             panic!("Failed to initialize observability: {:?}", e);
+/// #         }
+/// #     };
+/// #   // Application logic here
+/// #   {
+/// #       // Simulate some work
+/// #       tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+/// #       println!("Application is running...");
+/// #   }
+/// #   // Guard will be dropped here, flushing telemetry data
 /// # }
 /// ```
 mod config;
-mod entry;
+mod error;
 mod global;
-mod logger;
 mod metrics;
-mod sinks;
+mod recorder;
 mod system;
 mod telemetry;
-mod worker;
 
-pub use config::{AppConfig, LoggerConfig, OtelConfig, SinkConfig};
-pub use entry::args::Args;
-pub use entry::audit::{ApiDetails, AuditLogEntry};
-pub use entry::base::BaseLogEntry;
-pub use entry::unified::{ConsoleLogEntry, ServerLogEntry, UnifiedLogEntry};
-pub use entry::{LogKind, LogRecord, ObjectVersion, SerializableLevel};
+pub use config::*;
+pub use error::*;
 pub use global::*;
-pub use logger::Logger;
-pub use logger::{get_global_logger, init_global_logger, start_logger};
-pub use logger::{log_debug, log_error, log_info, log_trace, log_warn, log_with_context};
+pub use metrics::*;
+pub use recorder::*;
 pub use system::SystemObserver;
+pub use telemetry::OtelGuard;

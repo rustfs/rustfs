@@ -34,7 +34,7 @@ workspace = true
 default = []
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
@@ -50,7 +50,7 @@ serde.workspace = true
 time.workspace = true
 bytesize.workspace = true
 serde_json.workspace = true
-serde-xml-rs.workspace = true
+quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 s3s.workspace = true
 http.workspace = true
 url.workspace = true
@@ -66,16 +66,15 @@ rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }
-path-clean = { workspace = true }
 tempfile.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
-tokio-stream = { workspace = true }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true
@@ -89,8 +88,6 @@ rustfs-madmin.workspace = true
 rustfs-workers.workspace = true
 reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true }
-once_cell = { workspace = true }
-rustfs-rsc = { workspace = true }
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
@@ -98,7 +95,18 @@ rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-signer.workspace = true
-futures-util.workspace = true
+rustfs-checksums.workspace = true
+async-recursion.workspace = true
+aws-credential-types = { workspace = true }
+aws-smithy-types = { workspace = true }
+parking_lot = { workspace = true }
+moka = { workspace = true }
+base64-simd.workspace = true
+serde_urlencoded.workspace = true
+google-cloud-storage = { workspace = true }
+google-cloud-auth = { workspace = true }
+aws-config = { workspace = true }
+faster-hex = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

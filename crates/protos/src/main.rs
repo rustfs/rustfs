@@ -16,8 +16,8 @@ use std::{cmp, env, fs, io::Write, path::Path, process::Command};
 
 type AnyError = Box<dyn std::error::Error>;
 
-const VERSION_PROTOBUF: Version = Version(30, 2, 0); // 30.2.0
-const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
+const VERSION_PROTOBUF: Version = Version(33, 1, 0); // 31.1.0
+const VERSION_FLATBUFFERS: Version = Version(25, 9, 23); // 25.9.23
 /// Build protos if the major version of `flatc` or `protoc` is greater
 /// or lesser than the expected version.
 const ENV_BUILD_PROTOS: &str = "BUILD_PROTOS";
@@ -27,10 +27,11 @@ const ENV_FLATC_PATH: &str = "FLATC_PATH";
 fn main() -> Result<(), AnyError> {
     let version = protobuf_compiler_version()?;
     let need_compile = match version.compare_ext(&VERSION_PROTOBUF) {
-        Ok(cmp::Ordering::Equal) => true,
+        Ok(cmp::Ordering::Greater) => true,
         Ok(_) => {
-            let version_err = Version::build_error_message(&version, &VERSION_PROTOBUF).unwrap();
-            println!("cargo:warning=Tool `protoc` {version_err}, skip compiling.");
+            if let Some(version_err) = Version::build_error_message(&version, &VERSION_PROTOBUF) {
+                println!("cargo:warning=Tool `protoc` {version_err}, skip compiling.");
+            }
             false
         }
         Err(version_err) => {
@@ -47,32 +48,67 @@ fn main() -> Result<(), AnyError> {
     // path of proto file
     let project_root_dir = env::current_dir()?.join("crates/protos/src");
     let proto_dir = project_root_dir.clone();
+    println!("proto_dir: {proto_dir:?}");
     let proto_files = &["node.proto"];
     let proto_out_dir = project_root_dir.join("generated").join("proto_gen");
     let flatbuffer_out_dir = project_root_dir.join("generated").join("flatbuffers_generated");
     // let descriptor_set_path = PathBuf::from(env::var(ENV_OUT_DIR).unwrap()).join("proto-descriptor.bin");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .out_dir(proto_out_dir)
         // .file_descriptor_set_path(descriptor_set_path)
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_well_known_types(true)
-        .bytes(["."])
+        .bytes(".")
         .emit_rerun_if_changed(false)
-        .compile_protos(proto_files, &[proto_dir.clone()])
+        .compile_protos(proto_files, &[proto_dir.to_string_lossy().as_ref()])
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;
 
     // protos/gen/mod.rs
     let generated_mod_rs_path = project_root_dir.join("generated").join("proto_gen").join("mod.rs");
-
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
+    writeln!(
+        &mut generated_mod_rs,
+        r#"// Copyright 2024 RustFS Team
+    //
+    // Licensed under the Apache License, Version 2.0 (the "License");
+    // you may not use this file except in compliance with the License.
+    // You may obtain a copy of the License at
+    //
+    //     http://www.apache.org/licenses/LICENSE-2.0
+    //
+    // Unless required by applicable law or agreed to in writing, software
+    // distributed under the License is distributed on an "AS IS" BASIS,
+    // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    // See the License for the specific language governing permissions and
+    // limitations under the License."#
+    )?;
+    writeln!(&mut generated_mod_rs, "\n")?;
     writeln!(&mut generated_mod_rs, "pub mod node_service;")?;
     generated_mod_rs.flush()?;
 
     let generated_mod_rs_path = project_root_dir.join("generated").join("mod.rs");
-
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
+
+    writeln!(
+        &mut generated_mod_rs,
+        r#"// Copyright 2024 RustFS Team
+    //
+    // Licensed under the Apache License, Version 2.0 (the "License");
+    // you may not use this file except in compliance with the License.
+    // You may obtain a copy of the License at
+    //
+    //     http://www.apache.org/licenses/LICENSE-2.0
+    //
+    // Unless required by applicable law or agreed to in writing, software
+    // distributed under the License is distributed on an "AS IS" BASIS,
+    // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    // See the License for the specific language governing permissions and
+    // limitations under the License."#
+    )?;
+    writeln!(&mut generated_mod_rs, "\n")?;
     writeln!(&mut generated_mod_rs, "#![allow(unused_imports)]")?;
+    writeln!(&mut generated_mod_rs, "\n")?;
     writeln!(&mut generated_mod_rs, "#![allow(clippy::all)]")?;
     writeln!(&mut generated_mod_rs, "pub mod proto_gen;")?;
     generated_mod_rs.flush()?;
@@ -107,10 +143,11 @@ fn compile_flatbuffers_models<P: AsRef<Path>, S: AsRef<str>>(
 ) -> Result<(), AnyError> {
     let version = flatbuffers_compiler_version(flatc_path)?;
     let need_compile = match version.compare_ext(&VERSION_FLATBUFFERS) {
-        Ok(cmp::Ordering::Equal) => true,
+        Ok(cmp::Ordering::Greater) => true,
         Ok(_) => {
-            let version_err = Version::build_error_message(&version, &VERSION_FLATBUFFERS).unwrap();
-            println!("cargo:warning=Tool `{flatc_path}` {version_err}, skip compiling.");
+            if let Some(version_err) = Version::build_error_message(&version, &VERSION_FLATBUFFERS) {
+                println!("cargo:warning=Tool `{flatc_path}` {version_err}, skip compiling.");
+            }
             false
         }
         Err(version_err) => {
@@ -217,8 +254,14 @@ impl Version {
                     Ok(self.compare_major_version(expected_version))
                 } else {
                     match self.compare_major_version(expected_version) {
-                        cmp::Ordering::Equal => Ok(cmp::Ordering::Equal),
-                        _ => Err(Self::build_error_message(self, expected_version).unwrap()),
+                        cmp::Ordering::Greater => Ok(cmp::Ordering::Greater),
+                        _ => {
+                            if let Some(error_msg) = Self::build_error_message(self, expected_version) {
+                                Err(error_msg)
+                            } else {
+                                Err("Unknown version comparison error".to_string())
+                            }
+                        }
                     }
                 }
             }

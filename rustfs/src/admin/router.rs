@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::routing::get;
+use crate::admin::ADMIN_PREFIX;
+use crate::admin::console::is_console_path;
+use crate::admin::console::make_console_server;
+use crate::admin::rpc::RPC_PREFIX;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -31,12 +34,6 @@ use s3s::s3_error;
 use tower::Service;
 use tracing::error;
 
-use crate::admin::ADMIN_PREFIX;
-use crate::admin::console;
-use crate::admin::rpc::RPC_PREFIX;
-
-const CONSOLE_PREFIX: &str = "/rustfs/console";
-
 pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
@@ -48,12 +45,7 @@ impl<T: Operation> S3Router<T> {
         let router = Router::new();
 
         let console_router = if console_enabled {
-            Some(
-                axum::Router::new()
-                    .nest(CONSOLE_PREFIX, axum::Router::new().fallback_service(get(console::static_handler)))
-                    .fallback_service(get(console::static_handler))
-                    .into_service::<Body>(),
-            )
+            Some(make_console_server().into_service::<Body>())
         } else {
             None
         };
@@ -92,8 +84,13 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
+        let path = uri.path();
+        if method == Method::GET && (path == "/health" || path == "/profile/cpu" || path == "/profile/memory") {
+            return true;
+        }
+
         // AssumeRole
-        if method == Method::POST && uri.path() == "/" {
+        if method == Method::POST && path == "/" {
             if let Some(val) = headers.get(header::CONTENT_TYPE) {
                 if val.as_bytes() == b"application/x-www-form-urlencoded" {
                     return true;
@@ -101,40 +98,18 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(CONSOLE_PREFIX)
-    }
-
-    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
-            if let Some(console_router) = &self.console_router {
-                let mut console_router = console_router.clone();
-                let req = convert_request(req);
-                let result = console_router.call(req).await;
-                return match result {
-                    Ok(resp) => Ok(convert_response(resp)),
-                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
-                };
-            }
-            return Err(s3_error!(InternalError, "console is not enabled"));
-        }
-
-        let uri = format!("{}|{}", &req.method, req.uri.path());
-
-        // warn!("get uri {}", &uri);
-
-        if let Ok(mat) = self.router.at(&uri) {
-            let op: &T = mat.value;
-            let mut resp = op.call(req, mat.params).await?;
-            resp.status = Some(resp.output.0);
-            return Ok(resp.map_output(|x| x.1));
-        }
-
-        return Err(s3_error!(NotImplemented));
+        path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
     }
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
-        if self.console_enabled && req.uri.path().starts_with(CONSOLE_PREFIX) {
+        // Allow unauthenticated access to health check
+        let path = req.uri.path();
+        if req.method == Method::GET && (path == "/health" || path == "/profile/cpu" || path == "/profile/memory") {
+            return Ok(());
+        }
+        // Allow unauthenticated access to console static files if console is enabled
+        if self.console_enabled && is_console_path(path) {
             return Ok(());
         }
 
@@ -155,6 +130,31 @@ where
             Some(_) => Ok(()),
             None => Err(s3_error!(AccessDenied, "Signature is required")),
         }
+    }
+
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if self.console_enabled && is_console_path(req.uri.path()) {
+            if let Some(console_router) = &self.console_router {
+                let mut console_router = console_router.clone();
+                let req = convert_request(req);
+                let result = console_router.call(req).await;
+                return match result {
+                    Ok(resp) => Ok(convert_response(resp)),
+                    Err(e) => Err(s3_error!(InternalError, "{}", e)),
+                };
+            }
+            return Err(s3_error!(InternalError, "console is not enabled"));
+        }
+
+        let uri = format!("{}|{}", &req.method, req.uri.path());
+        if let Ok(mat) = self.router.at(&uri) {
+            let op: &T = mat.value;
+            let mut resp = op.call(req, mat.params).await?;
+            resp.status = Some(resp.output.0);
+            return Ok(resp.map_output(|x| x.1));
+        }
+
+        Err(s3_error!(NotImplemented))
     }
 }
 

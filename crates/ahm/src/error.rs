@@ -14,6 +14,10 @@
 
 use thiserror::Error;
 
+/// Custom error type for AHM operations
+/// This enum defines various error variants that can occur during
+/// the execution of AHM-related tasks, such as I/O errors, storage errors,
+/// configuration errors, and specific errors related to healing operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -22,22 +26,84 @@ pub enum Error {
     #[error("Storage error: {0}")]
     Storage(#[from] rustfs_ecstore::error::Error),
 
+    #[error("Disk error: {0}")]
+    Disk(#[from] rustfs_ecstore::disk::error::DiskError),
+
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Heal configuration error: {message}")]
+    ConfigurationError { message: String },
+
+    #[error("Other error: {0}")]
+    Other(String),
+
+    #[error(transparent)]
+    Anyhow(#[from] anyhow::Error),
+
+    // Scanner
     #[error("Scanner error: {0}")]
     Scanner(String),
 
     #[error("Metrics error: {0}")]
     Metrics(String),
 
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("IO error: {0}")]
+    IO(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("Invalid checkpoint: {0}")]
+    InvalidCheckpoint(String),
+
+    // Heal
+    #[error("Heal task not found: {task_id}")]
+    TaskNotFound { task_id: String },
+
+    #[error("Heal task already exists: {task_id}")]
+    TaskAlreadyExists { task_id: String },
+
+    #[error("Heal manager is not running")]
+    ManagerNotRunning,
+
+    #[error("Heal task execution failed: {message}")]
+    TaskExecutionFailed { message: String },
+
+    #[error("Invalid heal type: {heal_type}")]
+    InvalidHealType { heal_type: String },
+
+    #[error("Heal task cancelled")]
+    TaskCancelled,
+
+    #[error("Heal task timeout")]
+    TaskTimeout,
+
+    #[error("Heal event processing failed: {message}")]
+    EventProcessingFailed { message: String },
+
+    #[error("Heal progress tracking failed: {message}")]
+    ProgressTrackingFailed { message: String },
 }
 
+/// A specialized Result type for AHM operations
+///This type is a convenient alias for results returned by functions in the AHM crate,
+/// using the custom Error type defined above.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// Implement conversion from ahm::Error to std::io::Error for use in main.rs
+impl Error {
+    /// Create an Other error from any error type
+    pub fn other<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Error::Other(error.into().to_string())
+    }
+}
+
 impl From<Error> for std::io::Error {
     fn from(err: Error) -> Self {
         std::io::Error::other(err)

@@ -15,9 +15,13 @@
 name: "issue-translator"
 on:
   issue_comment:
-    types: [created]
+    types: [ created ]
   issues:
-    types: [opened]
+    types: [ opened ]
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   build:

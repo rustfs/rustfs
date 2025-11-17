@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
-use crate::{FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, VersionType, merge_file_meta_versions};
+use crate::{Error, FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, merge_file_meta_versions};
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -112,8 +111,8 @@ impl MetaCacheEntry {
             return false;
         }
 
-        match FileMeta::check_xl2_v1(&self.metadata) {
-            Ok((meta, _, _)) => {
+        match FileMeta::is_indexed_meta(&self.metadata) {
+            Ok((meta, _inline_data)) => {
                 if !meta.is_empty() {
                     return FileMeta::is_latest_delete_marker(meta);
                 }
@@ -221,7 +220,7 @@ impl MetaCacheEntry {
         };
 
         if self_vers.versions.len() != other_vers.versions.len() {
-            match self_vers.lastest_mod_time().cmp(&other_vers.lastest_mod_time()) {
+            match self_vers.latest_mod_time().cmp(&other_vers.latest_mod_time()) {
                 Ordering::Greater => return (Some(self.clone()), false),
                 Ordering::Less => return (Some(other.clone()), false),
                 _ => {}
@@ -795,24 +794,26 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             }
         }
 
-        if self.opts.no_wait && v.is_some() && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
-            if self.updating.try_lock().is_ok() {
-                let this = Arc::clone(&self);
-                spawn(async move {
-                    let _ = this.update().await;
-                });
+        if self.opts.no_wait && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
+            if let Some(value) = v {
+                if self.updating.try_lock().is_ok() {
+                    let this = Arc::clone(&self);
+                    spawn(async move {
+                        let _ = this.update().await;
+                    });
+                }
+                return Ok(value);
             }
-
-            return Ok(v.unwrap());
         }
 
         let _ = self.updating.lock().await;
 
-        if let Ok(duration) =
-            SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst)))
-        {
+        if let (Ok(duration), Some(value)) = (
+            SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst))),
+            v,
+        ) {
             if duration < self.ttl {
-                return Ok(v.unwrap());
+                return Ok(value);
             }
         }
 

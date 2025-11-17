@@ -90,3 +90,11 @@ pub fn is_rustfs_header(header_key: &str) -> bool {
 pub fn is_minio_header(header_key: &str) -> bool {
     header_key.to_lowercase().starts_with("x-minio-")
 }
+
+pub fn base64_encode(input: &[u8]) -> String {
+    base64_simd::URL_SAFE_NO_PAD.encode_to_string(input)
+}
+
+pub fn base64_decode(input: &[u8]) -> Result<Vec<u8>, base64_simd::Error> {
+    base64_simd::URL_SAFE_NO_PAD.decode_to_vec(input)
+}

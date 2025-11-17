@@ -17,6 +17,7 @@ use matchit::Params;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::GroupAddRemove;
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -26,7 +27,10 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
 
-use crate::admin::{router::Operation, utils::has_space_be};
+use crate::{
+    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    auth::{check_key_valid, get_session_token},
+};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct GroupQuery {
@@ -37,12 +41,28 @@ pub struct GroupQuery {
 pub struct ListGroups {}
 #[async_trait::async_trait]
 impl Operation for ListGroups {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListGroups");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)],
+        )
+        .await?;
 
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        let groups = iam_store.list_groups().await.map_err(|e| {
+        let groups = iam_store.list_groups_load().await.map_err(|e| {
             warn!("list groups failed, e: {:?}", e);
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
@@ -61,6 +81,22 @@ pub struct GetGroup {}
 impl Operation for GetGroup {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle GetGroup");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::GetGroupAdminAction)],
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -92,6 +128,22 @@ pub struct SetGroupStatus {}
 impl Operation for SetGroupStatus {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle SetGroupStatus");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)],
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -143,6 +195,22 @@ pub struct UpdateGroupMembers {}
 impl Operation for UpdateGroupMembers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle UpdateGroupMembers");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)],
+        )
+        .await?;
 
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {

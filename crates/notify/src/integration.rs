@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::arn::TargetID;
-use crate::store::{Key, Store};
 use crate::{
-    Event, EventName, StoreError, Target, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry,
-    rules::BucketNotificationConfig, stream,
+    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
+use hashbrown::HashMap;
 use rustfs_ecstore::config::{Config, KVS};
-use std::collections::HashMap;
+use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
+use rustfs_targets::store::{Key, Store};
+use rustfs_targets::target::EntityTarget;
+use rustfs_targets::{StoreError, Target};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -127,7 +129,7 @@ impl NotificationSystem {
 
         let config = self.config.read().await;
         debug!("Initializing notification system with config: {:?}", *config);
-        let targets: Vec<Box<dyn Target + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
+        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
 
@@ -138,7 +140,7 @@ impl NotificationSystem {
             info!("Initializing target: {}", target.id());
             // Initialize the target
             if let Err(e) = target.init().await {
-                error!("Target {} Initialization failed:{}", target.id(), e);
+                warn!("Target {} Initialization failed:{}", target.id(), e);
                 continue;
             }
             debug!("Target {} initialized successfully,enabled:{}", target_id, target.is_enabled());
@@ -197,7 +199,9 @@ impl NotificationSystem {
         F: FnMut(&mut Config) -> bool, // The closure returns a boolean value indicating whether the configuration has been changed
     {
         let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::ServerNotInitialized);
+            return Err(NotificationError::StorageNotAvailable(
+                "Failed to save target configuration: server storage not initialized".to_string(),
+            ));
         };
 
         let mut new_config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
@@ -208,11 +212,6 @@ impl NotificationSystem {
             // If the closure indication has not changed, return in advance
             info!("Configuration not changed, skipping save and reload.");
             return Ok(());
-        }
-
-        if let Err(e) = rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
-            error!("Failed to save config: {}", e);
-            return Err(NotificationError::SaveConfig(e.to_string()));
         }
 
         info!("Configuration updated. Reloading system...");
@@ -299,8 +298,8 @@ impl NotificationSystem {
         info!("Removing config for target {} of type {}", target_name, target_type);
         self.update_config_and_reload(|config| {
             let mut changed = false;
-            if let Some(targets) = config.0.get_mut(target_type) {
-                if targets.remove(target_name).is_some() {
+            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
+                if targets.remove(&target_name.to_lowercase()).is_some() {
                     changed = true;
                 }
                 if targets.is_empty() {
@@ -310,6 +309,7 @@ impl NotificationSystem {
             if !changed {
                 info!("Target {} of type {} not found, no changes made.", target_name, target_type);
             }
+            debug!("Config after remove: {:?}", config);
             changed
         })
         .await
@@ -318,12 +318,11 @@ impl NotificationSystem {
     /// Enhanced event stream startup function, including monitoring and concurrency control
     fn enhanced_start_event_stream(
         &self,
-        store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
-        target: Arc<dyn Target + Send + Sync>,
+        store: Box<dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send>,
+        target: Arc<dyn Target<Event> + Send + Sync>,
         metrics: Arc<NotificationMetrics>,
         semaphore: Arc<Semaphore>,
     ) -> mpsc::Sender<()> {
-        // Event Stream Processing Using Batch Version
         stream::start_event_stream_with_batching(store, target, metrics, semaphore)
     }
 
@@ -348,7 +347,8 @@ impl NotificationSystem {
         self.update_config(new_config.clone()).await;
 
         // Create a new target from configuration
-        let targets: Vec<Box<dyn Target + Send + Sync>> = self
+        // This function will now be responsible for merging env, creating and persisting the final configuration.
+        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self
             .registry
             .create_targets_from_config(&new_config)
             .await
@@ -422,7 +422,7 @@ impl NotificationSystem {
             if !e.to_string().contains("ARN not found") {
                 return Err(NotificationError::BucketNotification(e.to_string()));
             } else {
-                error!("{}", e);
+                error!("config validate failed, err: {}", e);
             }
         }
 

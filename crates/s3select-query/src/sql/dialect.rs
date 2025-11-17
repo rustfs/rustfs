@@ -64,7 +64,7 @@ mod tests {
 
         // Test Unicode alphabetic characters
         assert!(dialect.is_identifier_start('α'), "Greek letter should be valid identifier start");
-        assert!(dialect.is_identifier_start('中'), "Chinese character should be valid identifier start");
+        assert!(dialect.is_identifier_start('ü'), "Unicode character should be valid identifier start");
         assert!(dialect.is_identifier_start('ñ'), "Accented letter should be valid identifier start");
     }
 
@@ -129,7 +129,7 @@ mod tests {
 
         // Test Unicode alphabetic characters
         assert!(dialect.is_identifier_part('α'), "Greek letter should be valid identifier part");
-        assert!(dialect.is_identifier_part('中'), "Chinese character should be valid identifier part");
+        assert!(dialect.is_identifier_part('ü'), "Unicode character should be valid identifier part");
         assert!(dialect.is_identifier_part('ñ'), "Accented letter should be valid identifier part");
     }
 
@@ -203,8 +203,8 @@ mod tests {
         let dialect = RustFsDialect;
 
         // Test valid identifier patterns
-        let valid_starts = ['a', 'A', 'z', 'Z', '_', '#', '@', 'α', '中'];
-        let valid_parts = ['a', 'A', '0', '9', '_', '#', '@', '$', 'α', '中'];
+        let valid_starts = ['a', 'A', 'z', 'Z', '_', '#', '@', 'α', 'ü'];
+        let valid_parts = ['a', 'A', '0', '9', '_', '#', '@', '$', 'α', 'ü'];
 
         for start_char in valid_starts {
             assert!(
@@ -247,7 +247,7 @@ mod tests {
         let dialect = RustFsDialect;
 
         // Test various Unicode categories
-        let unicode_letters = ['α', 'β', 'γ', 'Α', 'Β', 'Γ', '中', '文', '日', '本', 'ñ', 'ü', 'ç'];
+        let unicode_letters = ['α', 'β', 'γ', 'Α', 'Β', 'Γ', 'ñ', 'ü', 'ç', 'ø', 'æ', 'ß'];
 
         for ch in unicode_letters {
             assert!(dialect.is_identifier_start(ch), "Unicode letter '{ch}' should be valid identifier start");
@@ -275,7 +275,7 @@ mod tests {
 
         // Test that all valid identifier starts are also valid identifier parts
         let test_chars = [
-            'a', 'A', 'z', 'Z', '_', '#', '@', 'α', '中', 'ñ', '0', '9', '$', ' ', '.', ',', ';', '(', ')', '=', '+', '-',
+            'a', 'A', 'z', 'Z', '_', '#', '@', 'α', 'ü', 'ñ', '0', '9', '$', ' ', '.', ',', ';', '(', ')', '=', '+', '-',
         ];
 
         for ch in test_chars {

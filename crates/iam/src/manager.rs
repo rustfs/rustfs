@@ -33,7 +33,6 @@ use rustfs_policy::{
         EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
     },
 };
-use rustfs_utils::crypto::base64_encode;
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,7 +89,7 @@ where
     T: Store,
 {
     pub(crate) async fn new(api: T) -> Arc<Self> {
-        let (sender, reciver) = mpsc::channel::<i64>(100);
+        let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
             api,
@@ -101,15 +100,15 @@ where
             last_timestamp: AtomicI64::new(0),
         });
 
-        sys.clone().init(reciver).await.unwrap();
+        sys.clone().init(receiver).await.unwrap();
         sys
     }
 
-    async fn init(self: Arc<Self>, reciver: Receiver<i64>) -> Result<()> {
+    async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // 检查环境变量是否设置
+        // Check if environment variable is set
         let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 
         if !skip_background_task {
@@ -118,7 +117,7 @@ where
                 let s = Arc::clone(&self);
                 async move {
                     let ticker = tokio::time::interval(Duration::from_secs(120));
-                    tokio::pin!(ticker, reciver);
+                    tokio::pin!(ticker, receiver);
                     loop {
                         select! {
                             _ = ticker.tick() => {
@@ -127,13 +126,13 @@ where
                                     error!("iam load err {:?}", err);
                                 }
                             },
-                            i = reciver.recv() => {
-                                info!("iam load reciver");
+                            i = receiver.recv() => {
+                                info!("iam load receiver");
                                 match i {
                                     Some(t) => {
                                         let last = s.last_timestamp.load(Ordering::Relaxed);
                                         if last <= t {
-                                            info!("iam load reciver load");
+                                            info!("iam load receiver load");
                                             if let Err(err) =s.clone().load().await{
                                                 error!("iam load err {:?}", err);
                                             }
@@ -161,6 +160,83 @@ where
         self.api.load_all(&self.cache).await?;
         self.last_timestamp
             .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub async fn load_user(&self, access_key: &str) -> Result<()> {
+        let mut users_map: HashMap<String, UserIdentity> = HashMap::new();
+        let mut user_policy_map = HashMap::new();
+        let mut sts_users_map = HashMap::new();
+        let mut sts_policy_map = HashMap::new();
+        let mut policy_docs_map = HashMap::new();
+
+        let _ = self.api.load_user(access_key, UserType::Svc, &mut users_map).await;
+
+        let parent_user = users_map.get(access_key).map(|svc| svc.credentials.parent_user.clone());
+
+        if let Some(parent_user) = parent_user {
+            let _ = self.api.load_user(&parent_user, UserType::Reg, &mut users_map).await;
+            let _ = self
+                .api
+                .load_mapped_policy(&parent_user, UserType::Reg, false, &mut user_policy_map)
+                .await;
+        } else {
+            let _ = self.api.load_user(access_key, UserType::Reg, &mut users_map).await;
+            if users_map.contains_key(access_key) {
+                let _ = self
+                    .api
+                    .load_mapped_policy(access_key, UserType::Reg, false, &mut user_policy_map)
+                    .await;
+            }
+
+            let _ = self.api.load_user(access_key, UserType::Sts, &mut sts_users_map).await;
+
+            let has_sts_user = sts_users_map.get(access_key);
+
+            let sts_parent = has_sts_user.map(|sts| sts.credentials.parent_user.clone());
+            if let Some(parent) = sts_parent {
+                let _ = self
+                    .api
+                    .load_mapped_policy(&parent, UserType::Sts, false, &mut sts_policy_map)
+                    .await;
+            }
+
+            let sts_user = has_sts_user.map(|sts| sts.credentials.access_key.clone());
+            if let Some(ref sts) = sts_user {
+                if let Some(plc) = sts_policy_map.get(sts) {
+                    for p in plc.to_slice().iter() {
+                        if !policy_docs_map.contains_key(p) {
+                            let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(plc) = user_policy_map.get(access_key) {
+            for p in plc.to_slice().iter() {
+                if !policy_docs_map.contains_key(p) {
+                    let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
+                }
+            }
+        }
+
+        if let Some(user) = users_map.get(access_key) {
+            Cache::add_or_update(&self.cache.users, access_key, user, OffsetDateTime::now_utc());
+        }
+        if let Some(user_policy) = user_policy_map.get(access_key) {
+            Cache::add_or_update(&self.cache.user_policies, access_key, user_policy, OffsetDateTime::now_utc());
+        }
+        if let Some(sts_user) = sts_users_map.get(access_key) {
+            Cache::add_or_update(&self.cache.sts_accounts, access_key, sts_user, OffsetDateTime::now_utc());
+        }
+        if let Some(sts_policy) = sts_policy_map.get(access_key) {
+            Cache::add_or_update(&self.cache.sts_policies, access_key, sts_policy, OffsetDateTime::now_utc());
+        }
+        if let Some(policy_doc) = policy_docs_map.get(access_key) {
+            Cache::add_or_update(&self.cache.policy_docs, access_key, policy_doc, OffsetDateTime::now_utc());
+        }
+
         Ok(())
     }
 
@@ -555,7 +631,10 @@ where
                     return Err(Error::PolicyTooLarge);
                 }
 
-                m.insert(SESSION_POLICY_NAME.to_owned(), Value::String(base64_encode(&policy_buf)));
+                m.insert(
+                    SESSION_POLICY_NAME.to_owned(),
+                    Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+                );
                 m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
             }
         }
@@ -651,7 +730,11 @@ where
             Some(p) => p.clone(),
             None => {
                 let mut m = HashMap::new();
-                self.api.load_mapped_policy(name, UserType::Reg, false, &mut m).await?;
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, false, &mut m).await {
+                    if !is_err_no_such_policy(&err) {
+                        return Err(err);
+                    }
+                }
                 if let Some(p) = m.get(name) {
                     Cache::add_or_update(&self.cache.user_policies, name, p, OffsetDateTime::now_utc());
                     p.clone()
@@ -660,7 +743,11 @@ where
                         Some(p) => p.clone(),
                         None => {
                             let mut m = HashMap::new();
-                            self.api.load_mapped_policy(name, UserType::Sts, false, &mut m).await?;
+                            if let Err(err) = self.api.load_mapped_policy(name, UserType::Sts, false, &mut m).await {
+                                if !is_err_no_such_policy(&err) {
+                                    return Err(err);
+                                }
+                            }
                             if let Some(p) = m.get(name) {
                                 Cache::add_or_update(&self.cache.sts_policies, name, p, OffsetDateTime::now_utc());
                                 p.clone()
@@ -692,7 +779,11 @@ where
                     Some(p) => p.clone(),
                     None => {
                         let mut m = HashMap::new();
-                        self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await?;
+                        if let Err(err) = self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await {
+                            if !is_err_no_such_policy(&err) {
+                                return Err(err);
+                            }
+                        }
                         if let Some(p) = m.get(group) {
                             Cache::add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
                             p.clone()
@@ -734,7 +825,11 @@ where
                 Some(p) => p.clone(),
                 None => {
                     let mut m = HashMap::new();
-                    self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await?;
+                    if let Err(err) = self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await {
+                        if !is_err_no_such_policy(&err) {
+                            return Err(err);
+                        }
+                    }
                     if let Some(p) = m.get(group) {
                         Cache::add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
                         p.clone()
@@ -814,7 +909,7 @@ where
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::other(format!("need poliy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::other(format!("Required policy not found: {}", IamError::NoSuchPolicy)));
             }
 
             self.api
@@ -987,7 +1082,7 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entiry = UserIdentity::from(Credentials {
+        let user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
@@ -995,10 +1090,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entiry)?;
+        self.update_user_with_claims(access_key, user_entry)?;
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1036,7 +1131,7 @@ where
             }
         }
 
-        self.api.delete_mapped_policy(access_key, utype, false).await?;
+        let _ = self.api.delete_mapped_policy(access_key, utype, false).await;
 
         Cache::delete(&self.cache.user_policies, access_key, OffsetDateTime::now_utc());
 
@@ -1104,7 +1199,7 @@ where
             }
         };
 
-        let user_entiry = UserIdentity::from(Credentials {
+        let user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
@@ -1112,10 +1207,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entiry)?;
+        self.update_user_with_claims(access_key, user_entry)?;
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1244,6 +1339,26 @@ where
         Ok(self.cache.groups.load().keys().cloned().collect())
     }
 
+    pub async fn update_groups(&self) -> Result<Vec<String>> {
+        let mut groups_set = HashSet::new();
+        let mut m = HashMap::new();
+        self.api.load_groups(&mut m).await?;
+        for (group, gi) in m.iter() {
+            Cache::add_or_update(&self.cache.groups, group, gi, OffsetDateTime::now_utc());
+            groups_set.insert(group.to_string());
+        }
+
+        let mut m = HashMap::new();
+
+        self.api.load_mapped_policies(UserType::Reg, true, &mut m).await?;
+        for (group, gi) in m.iter() {
+            Cache::add_or_update(&self.cache.group_policies, group, gi, OffsetDateTime::now_utc());
+            groups_set.insert(group.to_string());
+        }
+
+        Ok(groups_set.into_iter().collect())
+    }
+
     pub async fn remove_members_from_group(
         &self,
         name: &str,
@@ -1310,9 +1425,17 @@ where
         }
 
         if members.is_empty() {
-            self.api.delete_mapped_policy(group, UserType::Reg, true).await?;
+            if let Err(err) = self.api.delete_mapped_policy(group, UserType::Reg, true).await {
+                if !is_err_no_such_policy(&err) {
+                    return Err(err);
+                }
+            }
 
-            self.api.delete_group_info(group).await?;
+            if let Err(err) = self.api.delete_group_info(group).await {
+                if !is_err_no_such_group(&err) {
+                    return Err(err);
+                }
+            }
 
             Cache::delete(&self.cache.groups, group, OffsetDateTime::now_utc());
             Cache::delete(&self.cache.group_policies, group, OffsetDateTime::now_utc());

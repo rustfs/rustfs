@@ -17,7 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::store_api::ListPartsInfo;
+use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -28,9 +28,6 @@ use crate::{
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
-    heal::heal_commands::{
-        DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA, HealOpts,
-    },
     set_disk::SetDisks,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
@@ -41,15 +38,19 @@ use crate::{
 };
 use futures::future::join_all;
 use http::HeaderMap;
-use rustfs_common::globals::GLOBAL_Local_Node_Name;
+use rustfs_common::heal_channel::HealOpts;
+use rustfs_common::{
+    globals::GLOBAL_Local_Node_Name,
+    heal_channel::{DriveState, HealItemType},
+};
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
+
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::heal::heal_ops::HealSequence;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
 use tracing::warn;
@@ -60,12 +61,11 @@ pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
-    pub lockers: Vec<Vec<LockApi>>,
     pub disk_set: Vec<Arc<SetDisks>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
     pub format: FormatV3,
-    pub partiy_count: usize,
+    pub parity_count: usize,
     pub set_count: usize,
     pub set_drive_count: usize,
     pub default_parity_count: usize,
@@ -82,38 +82,39 @@ impl Drop for Sets {
 }
 
 impl Sets {
-    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, partiy_count))]
+    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
     pub async fn new(
         disks: Vec<Option<DiskStore>>,
         endpoints: &PoolEndpoints,
         fm: &FormatV3,
         pool_idx: usize,
-        partiy_count: usize,
+        parity_count: usize,
     ) -> Result<Arc<Self>> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = vec![vec![]; set_count];
-        let mut lockers: Vec<Vec<LockApi>> = vec![vec![]; set_count];
-        endpoints.endpoints.as_ref().iter().enumerate().for_each(|(idx, endpoint)| {
+        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
+
+        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
             let set_idx = idx / set_drive_count;
             if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
                 unique[set_idx].push("local".to_string());
-                lockers[set_idx].push(new_lock_api(true, None));
             }
 
             if !endpoint.is_local {
                 let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
                 if !unique[set_idx].contains(&host_port) {
                     unique[set_idx].push(host_port);
-                    lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));
                 }
             }
-        });
+        }
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        for (i, locker) in lockers.iter().enumerate().take(set_count) {
+        // Create fast lock manager for high performance
+        let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
+
+        for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
@@ -121,7 +122,6 @@ impl Sets {
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
-                // let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -165,15 +165,15 @@ impl Sets {
                 }
             }
 
-            // warn!("sets new set_drive {:?}", &set_drive);
+            // Note: write_quorum was used for the old lock system, no longer needed with FastLock
+            let _write_quorum = set_drive_count - parity_count;
 
             let set_disks = SetDisks::new(
-                locker.clone(),
+                fast_lock_manager.clone(),
                 GLOBAL_Local_Node_Name.read().await.to_string(),
-                Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
-                partiy_count,
+                parity_count,
                 i,
                 pool_idx,
                 set_endpoints,
@@ -190,14 +190,13 @@ impl Sets {
             id: fm.id,
             // sets: todo!(),
             disk_set,
-            lockers,
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),
-            partiy_count,
+            parity_count,
             set_count,
             set_drive_count,
-            default_parity_count: partiy_count,
+            default_parity_count: parity_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
             exit_signal: Some(tx),
         });
@@ -458,6 +457,17 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
@@ -542,8 +552,8 @@ impl StorageAPI for Sets {
         bucket: &str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
-        // 默认返回值
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
@@ -575,38 +585,11 @@ impl StorageAPI for Sets {
             }
         }
 
-        // let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
-        // let mut jhs = Vec::with_capacity(semaphore.available_permits());
-
-        // for (k, v) in set_obj_map {
-        //     let disks = self.get_disks(k);
-        //     let semaphore = semaphore.clone();
-        //     let opts = opts.clone();
-        //     let bucket = bucket.to_string();
-
-        //     let jh = tokio::spawn(async move {
-        //         let _permit = semaphore.acquire().await.unwrap();
-        //         let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-        //         disks.delete_objects(&bucket, objs, opts).await
-        //     });
-        //     jhs.push(jh);
-        // }
-
-        // let mut results = Vec::with_capacity(jhs.len());
-        // for jh in jhs {
-        //     results.push(jh.await?.unwrap());
-        // }
-
-        // for (dobjects, errs) in results {
-        //     del_objects.extend(dobjects);
-        //     del_errs.extend(errs);
-        // }
-
-        // TODO: 并发
+        // TODO: concurrency
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await?;
+            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await;
 
             for (i, err) in errs.into_iter().enumerate() {
                 let obj = v.get(i).unwrap();
@@ -617,7 +600,7 @@ impl StorageAPI for Sets {
             }
         }
 
-        Ok((del_objects, del_errs))
+        (del_objects, del_errs)
     }
 
     async fn list_object_parts(
@@ -664,7 +647,7 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         self.get_disks_by_key(object)
             .restore_transitioned_object(bucket, object, opts)
             .await
@@ -789,7 +772,7 @@ impl StorageAPI for Sets {
             Err(err) => return Ok((HealResultItem::default(), Some(err))),
         };
         let mut res = HealResultItem {
-            heal_item_type: HEAL_ITEM_METADATA.to_string(),
+            heal_item_type: HealItemType::Metadata.to_string(),
             detail: "disk-format".to_string(),
             disk_count: self.set_count * self.set_drive_count,
             set_count: self.set_count,
@@ -813,7 +796,6 @@ impl StorageAPI for Sets {
         //     return Ok((res, Some(Error::new(DiskError::CorruptedFormat))));
         // }
 
-        let format_op_id = Uuid::new_v4().to_string();
         let (new_format_sets, _) = new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
         if !dry_run {
             let mut tmp_new_formats = vec![None; self.set_count * self.set_drive_count];
@@ -821,14 +803,14 @@ impl StorageAPI for Sets {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
                         res.after.drives[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
-                        res.after.drives[i * self.set_drive_count + j].state = DRIVE_STATE_OK.to_string();
+                        res.after.drives[i * self.set_drive_count + j].state = DriveState::Ok.to_string();
                         tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
             }
             // Save new formats `format.json` on unformatted disks.
             for (fm, disk) in tmp_new_formats.iter_mut().zip(disks.iter()) {
-                if fm.is_some() && disk.is_some() && save_format_file(disk, fm, &format_op_id).await.is_err() {
+                if fm.is_some() && disk.is_some() && save_format_file(disk, fm).await.is_err() {
                     let _ = disk.as_ref().unwrap().close().await;
                     *fm = None;
                 }
@@ -871,23 +853,23 @@ impl StorageAPI for Sets {
             .await
     }
     #[tracing::instrument(skip(self))]
-    async fn heal_objects(
-        &self,
-        _bucket: &str,
-        _prefix: &str,
-        _opts: &HealOpts,
-        _hs: Arc<HealSequence>,
-        _is_meta: bool,
-    ) -> Result<()> {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
     async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
         unimplemented!()
     }
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
+        let mut reader = gor.stream;
+
+        // Stream data to sink instead of reading all into memory to prevent OOM
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+
+        Ok(())
     }
 }
 
@@ -959,17 +941,17 @@ fn formats_to_drives_info(endpoints: &Endpoints, formats: &[Option<FormatV3>], e
     for (index, format) in formats.iter().enumerate() {
         let drive = endpoints.get_string(index);
         let state = if format.is_some() {
-            DRIVE_STATE_OK
+            DriveState::Ok.to_string()
         } else if let Some(Some(err)) = errs.get(index) {
             if *err == DiskError::UnformattedDisk {
-                DRIVE_STATE_MISSING
+                DriveState::Missing.to_string()
             } else if *err == DiskError::DiskNotFound {
-                DRIVE_STATE_OFFLINE
+                DriveState::Offline.to_string()
             } else {
-                DRIVE_STATE_CORRUPT
+                DriveState::Corrupt.to_string()
             }
         } else {
-            DRIVE_STATE_CORRUPT
+            DriveState::Corrupt.to_string()
         };
 
         let uuid = if let Some(format) = format {

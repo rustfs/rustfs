@@ -72,6 +72,13 @@ fn u8x32_from_u64x4(input: [u64; 4]) -> [u8; 32] {
 
 impl HashAlgorithm {
     /// Hash the input data and return the hash result as Vec<u8>.
+    ///
+    /// # Arguments
+    /// * `data` - A byte slice representing the data to be hashed
+    ///
+    /// # Returns
+    /// A byte slice containing the hash of the input data
+    ///
     pub fn hash_encode(&self, data: &[u8]) -> impl AsRef<[u8]> {
         match self {
             HashAlgorithm::Md5 => HashEncoded::Md5(Md5::digest(data).into()),
@@ -92,6 +99,10 @@ impl HashAlgorithm {
     }
 
     /// Return the output size in bytes for the hash algorithm.
+    ///
+    /// # Returns
+    /// The size in bytes of the hash output
+    ///
     pub fn size(&self) -> usize {
         match self {
             HashAlgorithm::SHA256 => 32,
@@ -109,19 +120,40 @@ use siphasher::sip::SipHasher;
 
 pub const EMPTY_STRING_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-pub fn sip_hash(key: &str, cardinality: usize, id: &[u8; 16]) -> usize {
-    //  你的密钥，必须是 16 字节
+pub const DEFAULT_SIP_HASH_KEY: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-    // 计算字符串的 SipHash 值
+/// SipHash function to hash a string key into a bucket index.
+///
+/// # Arguments
+/// * `key` - The input string to be hashed
+/// * `cardinality` - The number of buckets
+/// * `id` - A 16-byte array used as the SipHash key
+///
+/// # Returns
+/// A usize representing the bucket index
+///
+pub fn sip_hash(key: &str, cardinality: usize, id: &[u8; 16]) -> usize {
+    // Your key, must be 16 bytes
+
+    // Calculate SipHash value of the string
     let result = SipHasher::new_with_key(id).hash(key.as_bytes());
 
-    result as usize % cardinality
+    (result as usize) % cardinality
 }
 
+/// CRC32 hash function to hash a string key into a bucket index.
+///
+/// # Arguments
+/// * `key` - The input string to be hashed
+/// * `cardinality` - The number of buckets
+///
+/// # Returns
+/// A usize representing the bucket index
+///
 pub fn crc_hash(key: &str, cardinality: usize) -> usize {
-    let mut hasher = Hasher::new(); // 创建一个新的哈希器
+    let mut hasher = Hasher::new(); // Create a new hasher
 
-    hasher.update(key.as_bytes()); // 更新哈希状态，添加数据
+    hasher.update(key.as_bytes()); // Update hash state, add data
 
     let checksum = hasher.finalize();
 

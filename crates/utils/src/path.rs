@@ -277,11 +277,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_trim_etag() {
+        // Test with quoted ETag
+        assert_eq!(trim_etag("\"abc123\""), "abc123");
+
+        // Test with unquoted ETag
+        assert_eq!(trim_etag("abc123"), "abc123");
+
+        // Test with empty string
+        assert_eq!(trim_etag(""), "");
+
+        // Test with only quotes
+        assert_eq!(trim_etag("\"\""), "");
+
+        // Test with MD5 hash
+        assert_eq!(trim_etag("\"2c7ab85a893283e98c931e9511add182\""), "2c7ab85a893283e98c931e9511add182");
+
+        // Test with multipart ETag format
+        assert_eq!(trim_etag("\"098f6bcd4621d373cade4e832627b4f6-2\""), "098f6bcd4621d373cade4e832627b4f6-2");
+    }
+
+    #[test]
     fn test_base_dir_from_prefix() {
         let a = "da/";
-        println!("---- in {a}");
-        let a = base_dir_from_prefix(a);
-        println!("---- out {a}");
+        // Test base_dir_from_prefix function
+        let result = base_dir_from_prefix(a);
+        assert!(!result.is_empty());
     }
 
     #[test]

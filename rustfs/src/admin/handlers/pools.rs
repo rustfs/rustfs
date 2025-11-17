@@ -15,13 +15,18 @@
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::{GLOBAL_Endpoints, new_object_layer_fn};
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
-use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::{admin::router::Operation, error::ApiError};
+use crate::{
+    admin::{auth::validate_admin_request, router::Operation},
+    auth::{check_key_valid, get_session_token},
+    error::ApiError,
+};
 
 pub struct ListPools {}
 
@@ -29,8 +34,27 @@ pub struct ListPools {}
 impl Operation for ListPools {
     // GET <endpoint>/<admin-API>/pools/list
     #[tracing::instrument(skip_all)]
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListPools");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![
+                Action::AdminAction(AdminAction::ServerInfoAdminAction),
+                Action::AdminAction(AdminAction::DecommissionAdminAction),
+            ],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -78,6 +102,25 @@ impl Operation for StatusPool {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StatusPool");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![
+                Action::AdminAction(AdminAction::ServerInfoAdminAction),
+                Action::AdminAction(AdminAction::DecommissionAdminAction),
+            ],
+        )
+        .await?;
 
         let Some(endpoints) = GLOBAL_Endpoints.get() else {
             return Err(s3_error!(NotImplemented));
@@ -138,6 +181,22 @@ impl Operation for StartDecommission {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StartDecommission");
 
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+        )
+        .await?;
+
         let Some(endpoints) = GLOBAL_Endpoints.get() else {
             return Err(s3_error!(NotImplemented));
         };
@@ -173,8 +232,7 @@ impl Operation for StartDecommission {
         let pools: Vec<&str> = query.pool.split(",").collect();
         let mut pools_indices = Vec::with_capacity(pools.len());
 
-        // TODO: ctx
-        let (_ctx_tx, ctx_rx) = broadcast::channel::<bool>(1);
+        let ctx = CancellationToken::new();
 
         for pool in pools.iter() {
             let idx = {
@@ -205,7 +263,7 @@ impl Operation for StartDecommission {
         }
 
         if !pools_indices.is_empty() {
-            store.decommission(ctx_rx, pools_indices).await.map_err(ApiError::from)?;
+            store.decommission(ctx.clone(), pools_indices).await.map_err(ApiError::from)?;
         }
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
@@ -220,6 +278,22 @@ impl Operation for CancelDecommission {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle CancelDecommission");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+        )
+        .await?;
 
         let Some(endpoints) = GLOBAL_Endpoints.get() else {
             return Err(s3_error!(NotImplemented));

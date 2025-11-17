@@ -17,10 +17,6 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
-use crate::heal::heal_commands::{
-    DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET, HealOpts,
-};
-use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -30,6 +26,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::future::join_all;
+use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_protos::node_service_time_out_client;
 use rustfs_protos::proto_gen::node_service::{
@@ -97,11 +94,11 @@ impl S3PeerSys {
 
         let mut pool_errs = Vec::new();
         for pool_idx in 0..self.pools_count {
-            let mut per_pool_errs = Vec::new();
+            let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].clone());
+                        per_pool_errs[i] = errs[i].clone();
                     }
                 }
             }
@@ -132,18 +129,26 @@ impl S3PeerSys {
         let errs = join_all(futures).await;
 
         for pool_idx in 0..self.pools_count {
-            let mut per_pool_errs = Vec::new();
+            let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].clone());
+                        per_pool_errs[i] = errs[i].clone();
                     }
                 }
             }
             let qu = per_pool_errs.len() / 2;
             if let Some(pool_err) = reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, qu) {
+                tracing::error!("heal_bucket per_pool_errs: {per_pool_errs:?}");
+                tracing::error!("heal_bucket reduce_write_quorum_errs: {pool_err}");
                 return Err(pool_err);
             }
+        }
+
+        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, (errs.len() / 2) + 1) {
+            tracing::error!("heal_bucket errs: {errs:?}");
+            tracing::error!("heal_bucket reduce_write_quorum_errs: {err}");
+            return Err(err);
         }
 
         for (i, err) in errs.iter().enumerate() {
@@ -160,34 +165,38 @@ impl S3PeerSys {
             futures.push(cli.make_bucket(bucket, opts));
         }
 
-        let mut errors = Vec::with_capacity(self.clients.len());
+        let mut errors = vec![None; self.clients.len()];
 
         let results = join_all(futures).await;
-        for result in results {
+        for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(_) => {
-                    errors.push(None);
+                    errors[i] = None;
                 }
                 Err(e) => {
-                    errors.push(Some(e));
+                    errors[i] = Some(e);
                 }
             }
         }
 
         for i in 0..self.pools_count {
-            let mut per_pool_errs = Vec::with_capacity(self.clients.len());
+            let mut per_pool_errs = vec![None; self.clients.len()];
             for (j, cli) in self.clients.iter().enumerate() {
                 let pools = cli.get_pools();
                 let idx = i;
                 if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs.push(errors[j].as_ref());
+                    per_pool_errs[j] = errors[j].clone();
                 }
+            }
 
-                // TODO: reduceWriteQuorumErrs
+            if let Some(pool_err) =
+                reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
+            {
+                tracing::error!("make_bucket per_pool_errs: {per_pool_errs:?}");
+                tracing::error!("make_bucket reduce_write_quorum_errs: {pool_err}");
+                return Err(pool_err);
             }
         }
-
-        // TODO:
 
         Ok(())
     }
@@ -197,42 +206,74 @@ impl S3PeerSys {
             futures.push(cli.list_bucket(opts));
         }
 
-        let mut errors = Vec::with_capacity(self.clients.len());
-        let mut ress = Vec::with_capacity(self.clients.len());
+        let mut errors = vec![None; self.clients.len()];
+        let mut node_buckets = vec![None; self.clients.len()];
 
         let results = join_all(futures).await;
-        for result in results {
+        for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(res) => {
-                    ress.push(Some(res));
-                    errors.push(None);
+                    node_buckets[i] = Some(res);
+                    errors[i] = None;
                 }
                 Err(e) => {
-                    ress.push(None);
-                    errors.push(Some(e));
-                }
-            }
-        }
-        // TODO: reduceWriteQuorumErrs
-        // for i in 0..self.pools_count {}
-
-        let mut uniq_map: HashMap<&String, &BucketInfo> = HashMap::new();
-
-        for res in ress.iter() {
-            if res.is_none() {
-                continue;
-            }
-
-            let buckets = res.as_ref().unwrap();
-
-            for bucket in buckets.iter() {
-                if !uniq_map.contains_key(&bucket.name) {
-                    uniq_map.insert(&bucket.name, bucket);
+                    node_buckets[i] = None;
+                    errors[i] = Some(e);
                 }
             }
         }
 
-        let buckets: Vec<BucketInfo> = uniq_map.values().map(|&v| v.clone()).collect();
+        let mut result_map: HashMap<&String, BucketInfo> = HashMap::new();
+        for i in 0..self.pools_count {
+            let mut per_pool_errs = vec![None; self.clients.len()];
+            for (j, cli) in self.clients.iter().enumerate() {
+                let pools = cli.get_pools();
+                let idx = i;
+                if pools.unwrap_or_default().contains(&idx) {
+                    per_pool_errs[j] = errors[j].clone();
+                }
+            }
+
+            let quorum = per_pool_errs.len() / 2;
+
+            if let Some(pool_err) = reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, quorum) {
+                tracing::error!("list_bucket per_pool_errs: {per_pool_errs:?}");
+                tracing::error!("list_bucket reduce_write_quorum_errs: {pool_err}");
+                return Err(pool_err);
+            }
+
+            let mut bucket_map: HashMap<&String, usize> = HashMap::new();
+            for (j, node_bucket) in node_buckets.iter().enumerate() {
+                if let Some(buckets) = node_bucket.as_ref() {
+                    if buckets.is_empty() {
+                        continue;
+                    }
+
+                    if !self.clients[j].get_pools().unwrap_or_default().contains(&i) {
+                        continue;
+                    }
+
+                    for bucket in buckets.iter() {
+                        if result_map.contains_key(&bucket.name) {
+                            continue;
+                        }
+
+                        // incr bucket_map count create if not exists
+                        let count = bucket_map.entry(&bucket.name).or_insert(0usize);
+                        *count += 1;
+
+                        if *count >= quorum {
+                            result_map.insert(&bucket.name, bucket.clone());
+                        }
+                    }
+                }
+            }
+            // TODO: MRF
+        }
+
+        let mut buckets: Vec<BucketInfo> = result_map.into_values().collect();
+
+        buckets.sort_by_key(|b| b.name.clone());
 
         Ok(buckets)
     }
@@ -242,22 +283,27 @@ impl S3PeerSys {
             futures.push(cli.delete_bucket(bucket, opts));
         }
 
-        let mut errors = Vec::with_capacity(self.clients.len());
+        let mut errors = vec![None; self.clients.len()];
 
         let results = join_all(futures).await;
 
-        for result in results {
+        for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(_) => {
-                    errors.push(None);
+                    errors[i] = None;
                 }
                 Err(e) => {
-                    errors.push(Some(e));
+                    errors[i] = Some(e);
                 }
             }
         }
 
-        // TODO: reduceWriteQuorumErrs
+        if let Some(err) = reduce_write_quorum_errs(&errors, BUCKET_OP_IGNORED_ERRS, (errors.len() / 2) + 1) {
+            if !Error::is_err_object_not_found(&err) && !opts.no_recreate {
+                let _ = self.make_bucket(bucket, &MakeBucketOptions::default()).await;
+            }
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -267,37 +313,44 @@ impl S3PeerSys {
             futures.push(cli.get_bucket_info(bucket, opts));
         }
 
-        let mut ress = Vec::with_capacity(self.clients.len());
-        let mut errors = Vec::with_capacity(self.clients.len());
+        let mut ress = vec![None; self.clients.len()];
+        let mut errors = vec![None; self.clients.len()];
 
         let results = join_all(futures).await;
-        for result in results {
+        for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(res) => {
-                    ress.push(Some(res));
-                    errors.push(None);
+                    ress[i] = Some(res);
+                    errors[i] = None;
                 }
                 Err(e) => {
-                    ress.push(None);
-                    errors.push(Some(e));
+                    ress[i] = None;
+                    errors[i] = Some(e);
                 }
             }
         }
 
         for i in 0..self.pools_count {
-            let mut per_pool_errs = Vec::with_capacity(self.clients.len());
+            let mut per_pool_errs = vec![None; self.clients.len()];
             for (j, cli) in self.clients.iter().enumerate() {
                 let pools = cli.get_pools();
                 let idx = i;
                 if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs.push(errors[j].as_ref());
+                    per_pool_errs[j] = errors[j].clone();
                 }
+            }
 
-                // TODO: reduceWriteQuorumErrs
+            if let Some(pool_err) =
+                reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
+            {
+                return Err(pool_err);
             }
         }
 
-        ress.iter().find_map(|op| op.clone()).ok_or(Error::VolumeNotFound)
+        ress.into_iter()
+            .filter(|op| op.is_some())
+            .find_map(|op| op.clone())
+            .ok_or(Error::VolumeNotFound)
     }
 
     pub fn get_pools(&self) -> Option<Vec<usize>> {
@@ -390,7 +443,6 @@ impl PeerS3Client for LocalPeerS3Client {
                         if opts.force_create && matches!(e, Error::VolumeExists) {
                             return Ok(());
                         }
-
                         Err(e)
                     }
                 }
@@ -408,7 +460,9 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
-        // TODO: reduceWriteQuorumErrs
+        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, (local_disks.len() / 2) + 1) {
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -449,7 +503,7 @@ impl PeerS3Client for LocalPeerS3Client {
                 op.as_ref().map(|v| BucketInfo {
                     name: v.name.clone(),
                     created: v.created,
-                    versionning: versioned,
+                    versioning: versioned,
                     ..Default::default()
                 })
             })
@@ -482,7 +536,7 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
-        // errVolumeNotEmpty 不删除，把已经删除的重新创建
+        // For errVolumeNotEmpty, do not delete; recreate only the entries already removed
 
         for (idx, err) in errs.into_iter().enumerate() {
             if err.is_none() && recreate {
@@ -542,7 +596,7 @@ impl PeerS3Client for RemotePeerS3Client {
         }
 
         Ok(HealResultItem {
-            heal_item_type: HEAL_ITEM_BUCKET.to_string(),
+            heal_item_type: HealItemType::Bucket.to_string(),
             bucket: bucket.to_string(),
             set_count: 0,
             ..Default::default()
@@ -651,13 +705,13 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let disk = match disk {
                 Some(disk) => disk,
                 None => {
-                    bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
-                    as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                    bs_clone.write().await[index] = DriveState::Offline.to_string();
+                    as_clone.write().await[index] = DriveState::Offline.to_string();
                     return Some(Error::DiskNotFound);
                 }
             };
-            bs_clone.write().await[index] = DRIVE_STATE_OK.to_string();
-            as_clone.write().await[index] = DRIVE_STATE_OK.to_string();
+            bs_clone.write().await[index] = DriveState::Ok.to_string();
+            as_clone.write().await[index] = DriveState::Ok.to_string();
 
             if bucket == RUSTFS_RESERVED_BUCKET {
                 return None;
@@ -667,18 +721,18 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                 Ok(_) => None,
                 Err(err) => match err {
                     Error::DiskNotFound => {
-                        bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
-                        as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                        bs_clone.write().await[index] = DriveState::Offline.to_string();
+                        as_clone.write().await[index] = DriveState::Offline.to_string();
                         Some(err)
                     }
                     Error::VolumeNotFound => {
-                        bs_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
-                        as_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
+                        bs_clone.write().await[index] = DriveState::Missing.to_string();
+                        as_clone.write().await[index] = DriveState::Missing.to_string();
                         Some(err)
                     }
                     _ => {
-                        bs_clone.write().await[index] = DRIVE_STATE_CORRUPT.to_string();
-                        as_clone.write().await[index] = DRIVE_STATE_CORRUPT.to_string();
+                        bs_clone.write().await[index] = DriveState::Corrupt.to_string();
+                        as_clone.write().await[index] = DriveState::Corrupt.to_string();
                         Some(err)
                     }
                 },
@@ -687,7 +741,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     }
     let errs = join_all(futures).await;
     let mut res = HealResultItem {
-        heal_item_type: HEAL_ITEM_BUCKET.to_string(),
+        heal_item_type: HealItemType::Bucket.to_string(),
         bucket: bucket.to_string(),
         disk_count: disks.len(),
         set_count: 0,
@@ -736,11 +790,11 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let as_clone = after_state.clone();
             let errs_clone = errs.to_vec();
             futures.push(async move {
-                if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
+                if bs_clone.read().await[idx] == DriveState::Missing.to_string() {
                     info!("bucket not find, will recreate");
                     match disk.as_ref().unwrap().make_volume(&bucket).await {
                         Ok(_) => {
-                            as_clone.write().await[idx] = DRIVE_STATE_OK.to_string();
+                            as_clone.write().await[idx] = DriveState::Ok.to_string();
                             return None;
                         }
                         Err(err) => {

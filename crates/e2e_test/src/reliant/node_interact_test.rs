@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::workspace_root;
 use futures::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_ecstore::disk::{VolumeInfo, WalkDirOptions};
@@ -28,6 +29,7 @@ use rustfs_protos::{
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io::Cursor;
+use std::path::PathBuf;
 use tokio::spawn;
 use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
@@ -125,8 +127,15 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
     let mut buf = Vec::new();
     opts.serialize(&mut Serializer::new(&mut buf))?;
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let disk_path = std::env::var_os("RUSTFS_DISK_PATH").map(PathBuf::from).unwrap_or_else(|| {
+        let mut path = workspace_root();
+        path.push("target");
+        path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+        path.push("data");
+        path
+    });
     let request = Request::new(WalkDirRequest {
-        disk: "/home/dandan/code/rust/s3-rustfs/target/debug/data".to_string(),
+        disk: disk_path.to_string_lossy().into_owned(),
         walk_dir_options: buf.into(),
     });
     let mut response = client.walk_dir(request).await?.into_inner();

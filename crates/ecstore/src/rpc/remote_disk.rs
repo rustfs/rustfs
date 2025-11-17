@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use futures::lock::Mutex;
@@ -21,9 +21,9 @@ use rustfs_protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
-        ReadAllRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
-        RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+        ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
+        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
 
@@ -32,26 +32,15 @@ use crate::disk::{
     ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     endpoint::Endpoint,
 };
+use crate::disk::{FileReader, FileWriter};
 use crate::{
     disk::error::{Error, Result},
     rpc::build_auth_headers,
 };
-use crate::{
-    disk::{FileReader, FileWriter},
-    heal::{
-        data_scanner::ShouldSleepFn,
-        data_usage_cache::{DataUsageCache, DataUsageEntry},
-        heal_commands::{HealScanMode, HealingTracker},
-    },
-};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
-use tokio::{
-    io::AsyncWrite,
-    sync::mpsc::{self, Sender},
-};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
 use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
@@ -64,6 +53,8 @@ pub struct RemoteDisk {
     pub root: PathBuf,
     endpoint: Endpoint,
 }
+
+const REMOTE_DISK_ONLINE_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
@@ -94,11 +85,19 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
-        // TODO: 连接状态
-        if node_service_time_out_client(&self.addr).await.is_ok() {
-            return true;
+        let Some(host) = self.endpoint.url.host_str().map(|host| host.to_string()) else {
+            return false;
+        };
+
+        let port = self.endpoint.url.port_or_known_default().unwrap_or(80);
+
+        match timeout(REMOTE_DISK_ONLINE_PROBE_TIMEOUT, TcpStream::connect((host, port))).await {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                true
+            }
+            _ => false,
         }
-        false
     }
 
     #[tracing::instrument(skip(self))]
@@ -356,21 +355,43 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         info!("delete_versions");
-        let opts = serde_json::to_string(&opts)?;
+
+        let opts = match serde_json::to_string(&opts) {
+            Ok(opts) => opts,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
         let mut versions_str = Vec::with_capacity(versions.len());
         for file_info_versions in versions.iter() {
-            versions_str.push(serde_json::to_string(file_info_versions)?);
+            versions_str.push(match serde_json::to_string(file_info_versions) {
+                Ok(versions_str) => versions_str,
+                Err(err) => {
+                    let mut errors = Vec::with_capacity(versions.len());
+                    for _ in 0..versions.len() {
+                        errors.push(Some(Error::other(err.to_string())));
+                    }
+                    return errors;
+                }
+            });
         }
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        let mut client = match node_service_time_out_client(&self.addr).await {
+            Ok(client) => client,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
+
         let request = Request::new(DeleteVersionsRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
@@ -379,11 +400,27 @@ impl DiskAPI for RemoteDisk {
         });
 
         // TODO: use Error not string
-        let response = client.delete_versions(request).await?.into_inner();
+
+        let response = match client.delete_versions(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
+
+        let response = response.into_inner();
         if !response.success {
-            return Err(response.error.unwrap_or_default().into());
+            let mut errors = Vec::with_capacity(versions.len());
+            for _ in 0..versions.len() {
+                errors.push(Some(Error::other(response.error.clone().map(|e| e.error_info).unwrap_or_default())));
+            }
+            return errors;
         }
-        let errors = response
+        response
             .errors
             .iter()
             .map(|error| {
@@ -393,9 +430,7 @@ impl DiskAPI for RemoteDisk {
                     Some(Error::other(error.to_string()))
                 }
             })
-            .collect();
-
-        Ok(errors)
+            .collect()
     }
 
     #[tracing::instrument(skip(self))]
@@ -927,60 +962,12 @@ impl DiskAPI for RemoteDisk {
 
         Ok(disk_info)
     }
-
-    #[tracing::instrument(skip(self, cache, scan_mode, _we_sleep))]
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        _we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache> {
-        info!("ns_scanner");
-        let cache = serde_json::to_string(cache)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-
-        let (tx, rx) = mpsc::channel(10);
-        let in_stream = ReceiverStream::new(rx);
-        let mut response = client.ns_scanner(in_stream).await?.into_inner();
-        let request = NsScannerRequest {
-            disk: self.endpoint.to_string(),
-            cache,
-            scan_mode: scan_mode as u64,
-        };
-        tx.send(request)
-            .await
-            .map_err(|err| Error::other(format!("can not send request, err: {err}")))?;
-
-        loop {
-            match response.next().await {
-                Some(Ok(resp)) => {
-                    if !resp.update.is_empty() {
-                        let data_usage_cache = serde_json::from_str::<DataUsageEntry>(&resp.update)?;
-                        let _ = updates.send(data_usage_cache).await;
-                    } else if !resp.data_usage_cache.is_empty() {
-                        let data_usage_cache = serde_json::from_str::<DataUsageCache>(&resp.data_usage_cache)?;
-                        return Ok(data_usage_cache);
-                    } else {
-                        return Err(Error::other("scan was interrupted"));
-                    }
-                }
-                _ => return Err(Error::other("scan was interrupted")),
-            }
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn healing(&self) -> Option<HealingTracker> {
-        None
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -1062,6 +1049,58 @@ mod tests {
 
         // Remote disk path should be based on the URL path
         assert!(path.to_string_lossy().contains("storage"));
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_is_online_detects_active_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        assert!(remote_disk.is_online().await);
+
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_is_online_detects_missing_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ip = addr.ip();
+        let port = addr.port();
+
+        drop(listener);
+
+        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", ip, port)).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        assert!(!remote_disk.is_online().await);
     }
 
     #[tokio::test]

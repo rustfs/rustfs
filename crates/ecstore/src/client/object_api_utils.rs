@@ -20,13 +20,13 @@
 #![allow(clippy::all)]
 
 use http::HeaderMap;
-use std::io::Cursor;
-use std::{collections::HashMap, sync::Arc};
+use s3s::dto::ETag;
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions};
-use rustfs_filemeta::fileinfo::ObjectPartInfo;
+use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
 use s3s::S3ErrorCode;
 
@@ -54,7 +54,7 @@ impl PutObjReader {
     }
 }
 
-pub type ObjReaderFn = Arc<dyn Fn(BufReader<Cursor<Vec<u8>>>, HeaderMap) -> GetObjectReader + 'static>;
+pub type ObjReaderFn<'a> = Arc<dyn Fn(BufReader<Cursor<Vec<u8>>>, HeaderMap) -> GetObjectReader + Send + Sync + 'a>;
 
 fn part_number_to_rangespec(oi: ObjectInfo, part_number: usize) -> Option<HTTPRangeSpec> {
     if oi.size == 0 || oi.parts.len() == 0 {
@@ -108,19 +108,24 @@ fn get_compressed_offsets(oi: ObjectInfo, offset: i64) -> (i64, i64, i64, i64, u
     (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
 }
 
-pub fn new_getobjectreader(
-    rs: HTTPRangeSpec,
-    oi: &ObjectInfo,
+pub fn new_getobjectreader<'a>(
+    rs: &Option<HTTPRangeSpec>,
+    oi: &'a ObjectInfo,
     opts: &ObjectOptions,
-    h: &HeaderMap,
-) -> Result<(ObjReaderFn, i64, i64), ErrorResponse> {
+    _h: &HeaderMap,
+) -> Result<(ObjReaderFn<'a>, i64, i64), ErrorResponse> {
     //let (_, mut is_encrypted) = crypto.is_encrypted(oi.user_defined)?;
     let mut is_encrypted = false;
     let is_compressed = false; //oi.is_compressed_ok();
 
+    let mut rs_ = None;
+    if rs.is_none() && opts.part_number.is_some() && opts.part_number.unwrap() > 0 {
+        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.unwrap());
+    }
+
     let mut get_fn: ObjReaderFn;
 
-    let (off, length) = match rs.get_offset_length(oi.size) {
+    let (off, length) = match rs_.unwrap().get_offset_length(oi.size) {
         Ok(x) => x,
         Err(err) => {
             return Err(ErrorResponse {
@@ -136,22 +141,89 @@ pub fn new_getobjectreader(
     };
     get_fn = Arc::new(move |input_reader: BufReader<Cursor<Vec<u8>>>, _: HeaderMap| {
         //Box::pin({
-        /*let r = GetObjectReader {
+        let r = GetObjectReader {
             object_info: oi.clone(),
-            stream: StreamingBlob::new(HashReader::new(input_reader, 10, None, None, 10)),
+            stream: Box::new(input_reader),
         };
-        r*/
-        todo!();
+        r
         //})
     });
 
     Ok((get_fn, off as i64, length as i64))
 }
 
-pub fn extract_etag(metadata: &HashMap<String, String>) -> String {
-    if let Some(etag) = metadata.get("etag") {
-        etag.clone()
-    } else {
-        metadata["md5Sum"].clone()
+/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
+///
+/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
+pub fn to_s3s_etag(etag: &str) -> ETag {
+    if let Some(rest) = etag.strip_prefix("W/\"") {
+        if let Some(body) = rest.strip_suffix('"') {
+            return ETag::Weak(body.to_string());
+        }
+        return ETag::Weak(rest.to_string());
+    }
+
+    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        return ETag::Strong(body.to_string());
+    }
+
+    ETag::Strong(etag.to_string())
+}
+
+pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
+    metadata
+        .get("etag")
+        .cloned()
+        .or_else(|| metadata.get("md5Sum").cloned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_s3s_etag() {
+        // Test unquoted ETag - should become strong etag
+        assert_eq!(
+            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
+            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
+
+        assert_eq!(
+            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
+            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
+
+        assert_eq!(
+            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
+            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
+        );
+
+        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
+
+        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
+
+        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
+    }
+
+    #[test]
+    fn test_extract_etag() {
+        let mut metadata = HashMap::new();
+
+        // Test with etag field
+        metadata.insert("etag".to_string(), "abc123".to_string());
+        assert_eq!(get_raw_etag(&metadata), "abc123");
+
+        metadata.insert("etag".to_string(), "\"def456\"".to_string());
+        assert_eq!(get_raw_etag(&metadata), "\"def456\"");
+
+        // Test fallback to md5Sum
+        metadata.remove("etag");
+        metadata.insert("md5Sum".to_string(), "xyz789".to_string());
+        assert_eq!(get_raw_etag(&metadata), "xyz789");
+
+        metadata.clear();
+        assert_eq!(get_raw_etag(&metadata), "");
     }
 }

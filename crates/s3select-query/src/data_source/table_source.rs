@@ -103,7 +103,7 @@ impl TableSource for TableSourceAdapter {
     }
 
     /// Called by [`InlineTableScan`]
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         Some(Cow::Owned(self.plan.clone()))
     }
 }

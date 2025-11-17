@@ -47,42 +47,41 @@ export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
-# HTTPS 证书目录
+# HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
-# 可观测性 相关配置信息
-export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
-#export RUSTFS_OBS_USE_STDOUT=false # 是否使用标准输出
-#export RUSTFS_OBS_SAMPLE_RATIO=2.0 # 采样率，0.0-1.0之间，0.0表示不采样，1.0表示全部采样
-#export RUSTFS_OBS_METER_INTERVAL=1 # 采样间隔，单位为秒
-#export RUSTFS_OBS_SERVICE_NAME=rustfs # 服务名称
-#export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # 服务版本
-export RUSTFS_OBS_ENVIRONMENT=develop # 环境名称
-export RUSTFS_OBS_LOGGER_LEVEL=debug # 日志级别，支持 trace, debug, info, warn, error
-export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # 是否启用本地日志记录
+# Observability related configuration
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+# RustFS OR OTEL exporter configuration
+#export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
+#export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+#export RUSTFS_OBS_METRIC_ENDPOINT=http://localhost:9090/api/v1/otlp # OpenTelemetry Collector metric address
+#export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://localhost:9090/api/v1/otlp/v1/metrics
+#export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
+#export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
+#export RUSTFS_OBS_USE_STDOUT=false # Whether to use standard output
+#export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
+#export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
+#export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
+#export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
+export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
+export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
-export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
-export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
+export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
+export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
+export RUSTFS_OBS_LOG_POOL_CAPA=10240
+export RUSTFS_OBS_LOG_MESSAGE_CAPA=32768
+export RUSTFS_OBS_LOG_FLUSH_MS=300
 
-#
-export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs/rustfs.log"
-export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
-export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
-export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
-#
-# Kafka sink 配置
-#export RUSTFS_SINKS_KAFKA_BROKERS=localhost:9092
-#export RUSTFS_SINKS_KAFKA_TOPIC=logs
-#export RUSTFS_SINKS_KAFKA_BATCH_SIZE=100
-#export RUSTFS_SINKS_KAFKA_BATCH_TIMEOUT_MS=1000
-#
-# Webhook sink 配置
-#export RUSTFS_SINKS_WEBHOOK_ENDPOINT=http://localhost:8080/webhook
-#export RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN=you-auth-token
-#export RUSTFS_SINKS_WEBHOOK_BATCH_SIZE=100
-#export RUSTFS_SINKS_WEBHOOK_BATCH_TIMEOUT_MS=1000
-#
-#export RUSTFS_LOGGER_QUEUE_CAPACITY=10
+#tokio runtime
+export RUSTFS_RUNTIME_WORKER_THREADS=16
+export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
+export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=true
+# shellcheck disable=SC2125
+export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
+export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
+export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
@@ -90,26 +89,63 @@ export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
 # notify
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE="true" # 是否启用 webhook 通知
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # webhook 通知地址
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook notification address
 export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
 
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook notification address
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
 
-export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook notification address
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
+
+# export RUSTFS_POLICY_PLUGIN_URL="http://localhost:8181/v1/data/rustfs/authz/allow"  # The URL of the OPA system
+# export RUSTFS_POLICY_PLUGIN_AUTH_TOKEN="your-opa-token"  # The authentication token for the OPA system is optional
+
+
+export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
 
-export RUSTFS_COMPRESSION_ENABLED=true # 是否启用压缩
+# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
 
 #export RUSTFS_REGION="us-east-1"
 
-# 事件消息配置
+export RUSTFS_ENABLE_SCANNER=false
+
+export RUSTFS_ENABLE_HEAL=false
+
+# Event message configuration
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
-# 启动 webhook 服务器
+# Enable jemalloc for memory profiling
+# MALLOC_CONF parameters:
+#   prof:true                - Enable heap profiling
+#   prof_active:true         - Start profiling immediately
+#   lg_prof_sample:16        - Average number of bytes between samples (2^16 = 65536 bytes)
+#   log:true                 - Enable logging
+#   narenas:2                - Number of arenas (controls concurrency and memory fragmentation)
+#   lg_chunk:21              - Chunk size (2^21 = 2MB)
+#   background_thread:true   - Enable background threads for purging
+#   dirty_decay_ms:1000      - Time (ms) before dirty pages are purged
+#   muzzy_decay_ms:1000      - Time (ms) before muzzy pages are purged
+# You can override these defaults by setting the MALLOC_CONF environment variable before running this script.
+if [ -z "$MALLOC_CONF" ]; then
+    export MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+fi
+
+# Start webhook server
 #cargo run --example webhook -p rustfs-notify &
-# 启动主服务
+# Start main service
+# To run with profiling enabled, uncomment the following line and comment the next line
+#cargo run --profile profiling --bin rustfs
+# To run in release mode, use the following line
+#cargo run --profile release --bin rustfs
+# To run in debug mode, use the following line
 cargo run --bin rustfs
+

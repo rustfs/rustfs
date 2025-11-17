@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::version;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info};
-
-use crate::version;
 
 /// Update check related errors
 #[derive(Error, Debug)]
@@ -190,7 +189,7 @@ mod tests {
     async fn test_get_current_version() {
         let version = get_current_version();
         assert!(!version.is_empty());
-        println!("Current version: {version}");
+        debug!("Current version: {version}");
     }
 
     #[test]
@@ -213,7 +212,7 @@ mod tests {
             check_time,
         };
 
-        println!("result: {:?}", serde_json::to_string(&result).unwrap());
+        debug!("Update check result: {:?}", serde_json::to_string(&result).unwrap());
 
         // Test fields
         assert!(result.update_available);
@@ -271,7 +270,7 @@ mod tests {
         assert!(!error_result.update_available);
         assert!(error_result.latest_version.is_none());
 
-        println!("✅ UpdateCheckResult tests passed");
+        debug!("UpdateCheckResult tests passed successfully");
     }
 
     #[test]
@@ -320,7 +319,7 @@ mod tests {
 
         // Test JSON serialization/deserialization
         let json_string = serde_json::to_string(&version_info).unwrap();
-        println!("json_string: {json_string}");
+        debug!("Serialized version info: {json_string}");
         assert!(json_string.contains("2.0.0"));
         assert!(json_string.contains("Major release"));
 
@@ -328,7 +327,7 @@ mod tests {
         assert_eq!(deserialized.version, version_info.version);
         assert_eq!(deserialized.release_notes, version_info.release_notes);
 
-        println!("✅ VersionInfo tests passed");
+        debug!("VersionInfo tests passed successfully");
     }
 
     #[test]
@@ -345,6 +344,6 @@ mod tests {
         assert_eq!(version::parse_version("1.0.0").unwrap(), (1, 0, 0, None));
         assert_eq!(version::parse_version("2.1.3-alpha.1").unwrap(), (2, 1, 3, Some("alpha.1".to_string())));
 
-        println!("✅ Version functions integration tests passed");
+        debug!("Version functions integration tests passed successfully");
     }
 }

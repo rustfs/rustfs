@@ -52,24 +52,19 @@ runs:
         sudo apt-get install -y \
           musl-tools \
           build-essential \
-          lld \
-          libdbus-1-dev \
-          libwayland-dev \
-          libwebkit2gtk-4.1-dev \
-          libxdo-dev \
           pkg-config \
           libssl-dev
 
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
-        version: "31.1"
+        version: "33.1"
         repo-token: ${{ inputs.github-token }}
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
       with:
-        version: "25.2.10"
+        version: "25.9.23"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable

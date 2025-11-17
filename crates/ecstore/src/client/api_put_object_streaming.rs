@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
+use crate::client::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
 use crate::client::{
     api_error_response::{err_invalid_argument, err_unexpected_eof, http_resp_to_error_response},
     api_put_object::PutObjectOptions,
@@ -40,7 +40,8 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 
-use rustfs_utils::{crypto::base64_encode, path::trim_etag};
+use crate::client::utils::base64_encode;
+use rustfs_utils::path::trim_etag;
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 
 pub struct UploadedPartRes {
@@ -156,7 +157,8 @@ impl TransitionClient {
                 md5_base64 = base64_encode(hash.as_ref());
             } else {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
@@ -303,7 +305,8 @@ impl TransitionClient {
             let mut custom_header = HeaderMap::new();
             if !opts.send_content_md5 {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
@@ -477,7 +480,12 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
 
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                &resp,
+                vec![],
+                bucket_name,
+                object_name,
+            )));
         }
 
         let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {

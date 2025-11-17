@@ -12,29 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth;
 pub mod console;
 pub mod handlers;
 pub mod router;
 mod rpc;
 pub mod utils;
 
-// use ecstore::global::{is_dist_erasure, is_erasure};
+#[cfg(test)]
+mod console_test;
+
 use handlers::{
-    bucket_meta, group, policys, pools, rebalance,
+    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
+    bucket_meta,
+    event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
+    group, kms, kms_dynamic, kms_keys, policies, pools,
+    profile::{TriggerProfileCPU, TriggerProfileMemory},
+    rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
-
-use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
+// const ADMIN_PREFIX: &str = "/minio/admin";
 
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
+
+    // Health check endpoint for monitoring and orchestration
+    r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::GET, "/profile/cpu", AdminOperation(&TriggerProfileCPU {}))?;
+    r.insert(Method::GET, "/profile/memory", AdminOperation(&TriggerProfileMemory {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
@@ -209,6 +221,126 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
+    // Performance profiling endpoints (available on all platforms, with platform-specific responses)
+    #[cfg(not(target_os = "windows"))]
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
+        AdminOperation(&handlers::ProfileHandler {}),
+    )?;
+
+    #[cfg(not(target_os = "windows"))]
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
+        AdminOperation(&handlers::ProfileStatusHandler {}),
+    )?;
+
+    // KMS management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/create-key").as_str(),
+        AdminOperation(&kms::CreateKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/describe-key").as_str(),
+        AdminOperation(&kms::DescribeKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/list-keys").as_str(),
+        AdminOperation(&kms::ListKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/generate-data-key").as_str(),
+        AdminOperation(&kms::GenerateDataKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
+        AdminOperation(&kms::KmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/config").as_str(),
+        AdminOperation(&kms::KmsConfigHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/clear-cache").as_str(),
+        AdminOperation(&kms::KmsClearCacheHandler {}),
+    )?;
+
+    // KMS Dynamic Configuration APIs
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
+        AdminOperation(&kms_dynamic::ConfigureKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/start").as_str(),
+        AdminOperation(&kms_dynamic::StartKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/stop").as_str(),
+        AdminOperation(&kms_dynamic::StopKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/service-status").as_str(),
+        AdminOperation(&kms_dynamic::GetKmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/reconfigure").as_str(),
+        AdminOperation(&kms_dynamic::ReconfigureKmsHandler {}),
+    )?;
+
+    // KMS key management endpoints
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::CreateKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
+        AdminOperation(&kms_keys::DeleteKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
+        AdminOperation(&kms_keys::CancelKmsKeyDeletionHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::ListKmsKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
+        AdminOperation(&kms_keys::DescribeKmsKeyHandler {}),
+    )?;
+
     Ok(r)
 }
 
@@ -333,35 +465,65 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-canned-policies").as_str(),
-        AdminOperation(&policys::ListCannedPolicies {}),
+        AdminOperation(&policies::ListCannedPolicies {}),
     )?;
 
     // info-canned-policy?name=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-canned-policy").as_str(),
-        AdminOperation(&policys::InfoCannedPolicy {}),
+        AdminOperation(&policies::InfoCannedPolicy {}),
     )?;
 
     // add-canned-policy?name=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-canned-policy").as_str(),
-        AdminOperation(&policys::AddCannedPolicy {}),
+        AdminOperation(&policies::AddCannedPolicy {}),
     )?;
 
     // remove-canned-policy?name=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-canned-policy").as_str(),
-        AdminOperation(&policys::RemoveCannedPolicy {}),
+        AdminOperation(&policies::RemoveCannedPolicy {}),
     )?;
 
     // set-user-or-group-policy?policyName=xxx&userOrGroup=xxx&isGroup=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
-        AdminOperation(&policys::SetPolicyForUserOrGroup {}),
+        AdminOperation(&policies::SetPolicyForUserOrGroup {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/list").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}").as_str(),
+        AdminOperation(&NotificationTarget {}),
+    )?;
+
+    // Remove notification target
+    // This endpoint removes a notification target based on its type and name.
+    // target-remove?target_type=xxx&target_name=xxx
+    // * `target_type` - Target type, such as "notify_webhook" or "notify_mqtt".
+    // * `target_name` - A unique name for a Target, such as "1".
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/reset").as_str(),
+        AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+
+    // arns list
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
+        AdminOperation(&ListTargetsArns {}),
     )?;
 
     Ok(())

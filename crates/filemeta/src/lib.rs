@@ -13,11 +13,12 @@
 // limitations under the License.
 
 mod error;
-pub mod fileinfo;
+mod fileinfo;
 mod filemeta;
 mod filemeta_inline;
-pub mod headers;
+// pub mod headers;
 mod metacache;
+mod replication;
 
 pub mod test_data;
 
@@ -26,3 +27,4 @@ pub use fileinfo::*;
 pub use filemeta::*;
 pub use filemeta_inline::*;
 pub use metacache::*;
+pub use replication::*;

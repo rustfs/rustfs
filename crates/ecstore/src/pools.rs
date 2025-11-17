@@ -15,6 +15,7 @@
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, save_config};
+use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
@@ -22,8 +23,6 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
     is_err_version_not_found,
 };
-use crate::heal::data_usage::DATA_USAGE_CACHE_NAME;
-use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::set_disk::SetDisks;
@@ -36,6 +35,7 @@ use futures::future::BoxFuture;
 use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_common::defer;
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
@@ -48,7 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::broadcast::Receiver as B_Receiver;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 pub const POOL_META_NAME: &str = "pool.bin";
@@ -384,7 +384,7 @@ impl PoolMeta {
 
         let mut update = false;
 
-        // 检查指定的池是否需要从已退役的池中移除。
+        // Determine whether the selected pool should be removed from the retired list.
         for k in specified_pools.keys() {
             if let Some(pi) = remembered_pools.get(k) {
                 if pi.completed {
@@ -400,7 +400,7 @@ impl PoolMeta {
                     // )));
                 }
             } else {
-                // 如果之前记住的池不再存在，允许更新，因为可能是添加了一个新池。
+                // If the previous pool no longer exists, allow updates because a new pool may have been added.
                 update = true;
             }
         }
@@ -409,7 +409,7 @@ impl PoolMeta {
             for (k, pi) in remembered_pools.iter() {
                 if let Some(pos) = specified_pools.get(k) {
                     if *pos != pi.position {
-                        update = true; // 池的顺序发生了变化，允许更新。
+                        update = true; // Pool order changed, allow the update.
                     }
                 }
             }
@@ -427,12 +427,12 @@ impl PoolMeta {
         for pool in &self.pools {
             if let Some(decommission) = &pool.decommission {
                 if decommission.complete || decommission.canceled {
-                    // 不需要恢复的情况：
-                    // - 退役已完成
-                    // - 退役已取消
+                    // Recovery is not required when:
+                    // - Decommissioning completed
+                    // - Decommissioning was cancelled
                     continue;
                 }
-                // 其他情况需要恢复
+                // All other scenarios require recovery
                 new_pools.push(pool.clone());
             }
         }
@@ -651,7 +651,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    pub async fn decommission(&self, rx: B_Receiver<bool>, indices: Vec<usize>) -> Result<()> {
+    pub async fn decommission(&self, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
         warn!("decommission: {:?}", indices);
         if indices.is_empty() {
             return Err(Error::other("InvalidArgument"));
@@ -663,13 +663,14 @@ impl ECStore {
 
         self.start_decommission(indices.clone()).await?;
 
+        let rx_clone = rx.clone();
         tokio::spawn(async move {
             let Some(store) = new_object_layer_fn() else {
                 error!("store not init");
                 return;
             };
             for idx in indices.iter() {
-                store.do_decommission_in_routine(rx.resubscribe(), *idx).await;
+                store.do_decommission_in_routine(rx_clone.clone(), *idx).await;
             }
         });
 
@@ -891,7 +892,7 @@ impl ECStore {
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_pool(
         self: &Arc<Self>,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         idx: usize,
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
@@ -936,20 +937,20 @@ impl ECStore {
             });
 
             let set = set.clone();
-            let mut rx = rx.resubscribe();
+            let rx_clone = rx.clone();
             let bi = bi.clone();
             let set_id = set_idx;
             let wk_clone = wk.clone();
             tokio::spawn(async move {
                 loop {
-                    if rx.try_recv().is_ok() {
+                    if rx_clone.is_cancelled() {
                         warn!("decommission_pool: cancel {}", set_id);
                         break;
                     }
                     warn!("decommission_pool: list_objects_to_decommission {} {}", set_id, &bi.name);
 
                     match set
-                        .list_objects_to_decommission(rx.resubscribe(), bi.clone(), decommission_entry.clone())
+                        .list_objects_to_decommission(rx_clone.clone(), bi.clone(), decommission_entry.clone())
                         .await
                     {
                         Ok(_) => {
@@ -982,7 +983,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: B_Receiver<bool>, idx: usize) {
+    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
         if let Err(err) = self.decommission_in_background(rx, idx).await {
             error!("decom err {:?}", &err);
             if let Err(er) = self.decommission_failed(idx).await {
@@ -1060,7 +1061,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    async fn decommission_in_background(self: &Arc<Self>, rx: B_Receiver<bool>, idx: usize) -> Result<()> {
+    async fn decommission_in_background(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
         let pool = self.pools[idx].clone();
 
         let pending = {
@@ -1090,10 +1091,7 @@ impl ECStore {
 
             warn!("decommission: currently on bucket {}", &bucket.name);
 
-            if let Err(err) = self
-                .decommission_pool(rx.resubscribe(), idx, pool.clone(), bucket.clone())
-                .await
-            {
+            if let Err(err) = self.decommission_pool(rx.clone(), idx, pool.clone(), bucket.clone()).await {
                 error!("decommission: decommission_pool err {:?}", &err);
                 return Err(err);
             } else {
@@ -1142,6 +1140,7 @@ impl ECStore {
                 .await
             {
                 if !is_err_bucket_exists(&err) {
+                    error!("decommission: make bucket failed: {err}");
                     return Err(err);
                 }
             }
@@ -1264,6 +1263,8 @@ impl ECStore {
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
                     etag: pi.etag,
+
+                    ..Default::default()
                 };
             }
 
@@ -1291,7 +1292,7 @@ impl ECStore {
         }
 
         let reader = BufReader::new(rd.stream);
-        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, None, false)?;
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
@@ -1329,7 +1330,7 @@ impl SetDisks {
     #[tracing::instrument(skip(self, rx, cb_func))]
     async fn list_objects_to_decommission(
         self: &Arc<Self>,
-        rx: B_Receiver<bool>,
+        rx: CancellationToken,
         bucket_info: DecomBucketInfo,
         cb_func: ListCallback,
     ) -> Result<()> {
@@ -1355,7 +1356,7 @@ impl SetDisks {
                 disks: disks.iter().cloned().map(Some).collect(),
                 bucket: bucket_info.name.clone(),
                 path: bucket_info.prefix.clone(),
-                recursice: true,
+                recursive: true,
                 min_disks: listing_quorum,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {

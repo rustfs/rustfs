@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Using Global Accessories
-use rustfs_config::notify::{
-    DEFAULT_LIMIT, DEFAULT_TARGET, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC,
-    MQTT_USERNAME, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
-    WEBHOOK_QUEUE_LIMIT,
+mod base;
+
+use base::{LogLevel, init_logger};
+use rustfs_config::EnableState::On;
+use rustfs_config::notify::{DEFAULT_TARGET, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::{
+    DEFAULT_LIMIT, ENABLE_KEY, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KV, KVS};
-use rustfs_notify::arn::TargetID;
-use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
+use rustfs_ecstore::config::{Config, KV, KVS};
+use rustfs_notify::{BucketNotificationConfig, Event, NotificationError};
 use rustfs_notify::{initialize, notification_system};
+use rustfs_targets::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::sleep;
 use tracing::info;
 
 #[tokio::main]
@@ -47,7 +52,7 @@ async fn main() -> Result<(), NotificationError> {
     let webhook_kvs_vec = vec![
         KV {
             key: ENABLE_KEY.to_string(),
-            value: ENABLE_ON.to_string(),
+            value: On.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -64,7 +69,7 @@ async fn main() -> Result<(), NotificationError> {
             key: WEBHOOK_QUEUE_DIR.to_string(),
             value: current_root
                 .clone()
-                .join("../../deploy/logs/notify/webhook")
+                .join("../../deploy/logs/notify")
                 .to_str()
                 .unwrap()
                 .to_string(),
@@ -87,7 +92,7 @@ async fn main() -> Result<(), NotificationError> {
     system.init().await?;
     info!("✅ System initialized with Webhook target.");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
 
     // --- Dynamically update system configuration: Add an MQTT Target ---
     info!("\n---> Dynamically adding MQTT target...");
@@ -95,7 +100,7 @@ async fn main() -> Result<(), NotificationError> {
     let mqtt_kvs_vec = vec![
         KV {
             key: ENABLE_KEY.to_string(),
-            value: ENABLE_ON.to_string(),
+            value: On.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -125,11 +130,7 @@ async fn main() -> Result<(), NotificationError> {
         },
         KV {
             key: MQTT_QUEUE_DIR.to_string(),
-            value: current_root
-                .join("../../deploy/logs/notify/mqtt")
-                .to_str()
-                .unwrap()
-                .to_string(),
+            value: current_root.join("../../deploy/logs/notify").to_str().unwrap().to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -148,7 +149,7 @@ async fn main() -> Result<(), NotificationError> {
         .await?;
     info!("✅ MQTT target added and system reloaded.");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
 
     // --- Loading and managing Bucket configurations ---
     info!("\n---> Loading bucket notification config...");
@@ -172,7 +173,7 @@ async fn main() -> Result<(), NotificationError> {
     system.send_event(event).await;
     info!("✅ Event sent. Both Webhook and MQTT targets should receive it.");
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
 
     // --- Dynamically remove configuration ---
     info!("\n---> Dynamically removing Webhook target...");
@@ -184,5 +185,6 @@ async fn main() -> Result<(), NotificationError> {
     info!("✅ Bucket 'my-bucket' config removed.");
 
     info!("\nDemo completed successfully");
+    sleep(Duration::from_secs(1)).await;
     Ok(())
 }

@@ -17,6 +17,9 @@ use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
+#[cfg(test)]
+mod config_test;
+
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
     if !build::TAG.is_empty() {
@@ -65,14 +68,18 @@ pub struct Opt {
     pub secret_key: String,
 
     /// Enable console server
-    #[arg(long, default_value_t = true, env = "RUSTFS_CONSOLE_ENABLE")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ENABLE, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
+
+    /// Console server bind address
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string(), env = "RUSTFS_CONSOLE_ADDRESS")]
+    pub console_address: String,
 
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,
 
-    /// tls path for rustfs api and console.
+    /// tls path for rustfs API and console.
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
 
@@ -81,6 +88,30 @@ pub struct Opt {
 
     #[arg(long, env = "RUSTFS_REGION")]
     pub region: Option<String>,
+
+    /// Enable KMS encryption for server-side encryption
+    #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ENABLE")]
+    pub kms_enable: bool,
+
+    /// KMS backend type (local or vault)
+    #[arg(long, default_value_t = String::from("local"), env = "RUSTFS_KMS_BACKEND")]
+    pub kms_backend: String,
+
+    /// KMS key directory for local backend
+    #[arg(long, env = "RUSTFS_KMS_KEY_DIR")]
+    pub kms_key_dir: Option<String>,
+
+    /// Vault address for vault backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_ADDRESS")]
+    pub kms_vault_address: Option<String>,
+
+    /// Vault token for vault backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_TOKEN")]
+    pub kms_vault_token: Option<String>,
+
+    /// Default KMS key ID for encryption
+    #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
+    pub kms_default_key_id: Option<String>,
 }
 
 // lazy_static::lazy_static! {

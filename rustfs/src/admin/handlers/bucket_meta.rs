@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::{
-    admin::router::Operation,
+    admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
 };
 
@@ -44,7 +44,10 @@ use rustfs_ecstore::{
     bucket::utils::{deserialize, serialize},
     store_api::MakeBucketOptions,
 };
-use rustfs_policy::policy::BucketPolicy;
+use rustfs_policy::policy::{
+    BucketPolicy,
+    action::{Action, AdminAction},
+};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
@@ -85,8 +88,17 @@ impl Operation for ExportBucketMetadata {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
+        )
+        .await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InvalidRequest, "object store not init"));
@@ -125,16 +137,15 @@ impl Operation for ExportBucketMetadata {
                 let conf_path = path_join_buf(&[bucket.name.as_str(), conf]);
                 match conf {
                     BUCKET_POLICY_CONFIG => {
-                        let config: rustfs_policy::policy::BucketPolicy =
-                            match metadata_sys::get_bucket_policy(&bucket.name).await {
-                                Ok((res, _)) => res,
-                                Err(e) => {
-                                    if e == StorageError::ConfigNotFound {
-                                        continue;
-                                    }
-                                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                        let config: BucketPolicy = match metadata_sys::get_bucket_policy(&bucket.name).await {
+                            Ok((res, _)) => res,
+                            Err(e) => {
+                                if e == StorageError::ConfigNotFound {
+                                    continue;
                                 }
-                            };
+                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                            }
+                        };
                         let config_json =
                             serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
                         zip_writer
@@ -369,8 +380,17 @@ impl Operation for ImportBucketMetadata {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
+        )
+        .await?;
 
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {

@@ -20,18 +20,21 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug"
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=debug",
+                "RUSTFS_SKIP_BACKGROUND_TASK": "on",
+                // "RUSTFS_POLICY_PLUGIN_URL":"http://localhost:8181/v1/data/rustfs/authz/allow",
+                // "RUSTFS_POLICY_PLUGIN_AUTH_TOKEN":"your-opa-token" 
             },
             "args": [
                 "--access-key",
-                "AKEXAMPLERUSTFS",
+                "rustfsadmin",
                 "--secret-key",
-                "SKEXAMPLERUSTFS",
+                "rustfsadmin",
                 "--address",
                 "0.0.0.0:9010",
-                "--domain-name",
+                "--server-domains",
                 "127.0.0.1:9010",
-                "./target/volume/test{0...4}"
+                "./target/volume/test{1...4}"
             ],
             "cwd": "${workspaceFolder}"
         },
@@ -79,6 +82,26 @@
             "request": "launch",
             "program": "${workspaceFolder}/target/debug/rustfs",
             "args": [],
+            "cwd": "${workspaceFolder}",
+            //"stopAtEntry": false,
+            //"preLaunchTask": "cargo build",
+            "sourceLanguages": [
+                "rust"
+            ],
+        },
+        {
+            "name": "Debug executable target/debug/test",
+            "type":  "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/deps/lifecycle_integration_test-5915cbfcab491b3b",
+            "args": [
+              "--skip",
+              "test_lifecycle_expiry_basic",
+              "--skip",
+              "test_lifecycle_expiry_deletemarker",
+              //"--skip",
+              //"test_lifecycle_transition_basic",
+            ],
             "cwd": "${workspaceFolder}",
             //"stopAtEntry": false,
             //"preLaunchTask": "cargo build",

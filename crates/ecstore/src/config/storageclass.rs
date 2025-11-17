@@ -15,9 +15,9 @@
 use super::KVS;
 use crate::config::KV;
 use crate::error::{Error, Result};
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::sync::LazyLock;
 use tracing::warn;
 
 /// Default parity count for a given drive count
@@ -35,6 +35,17 @@ pub fn default_parity_count(drive: usize) -> usize {
 // Standard constants for all storage class
 pub const RRS: &str = "REDUCED_REDUNDANCY";
 pub const STANDARD: &str = "STANDARD";
+
+// AWS S3 Storage Classes
+pub const DEEP_ARCHIVE: &str = "DEEP_ARCHIVE";
+pub const EXPRESS_ONEZONE: &str = "EXPRESS_ONEZONE";
+pub const GLACIER: &str = "GLACIER";
+pub const GLACIER_IR: &str = "GLACIER_IR";
+pub const INTELLIGENT_TIERING: &str = "INTELLIGENT_TIERING";
+pub const ONEZONE_IA: &str = "ONEZONE_IA";
+pub const OUTPOSTS: &str = "OUTPOSTS";
+pub const SNOW: &str = "SNOW";
+pub const STANDARD_IA: &str = "STANDARD_IA";
 
 // Standard constants for config info storage class
 pub const CLASS_STANDARD: &str = "standard";
@@ -62,34 +73,32 @@ pub const DEFAULT_RRS_PARITY: usize = 1;
 
 pub static DEFAULT_INLINE_BLOCK: usize = 128 * 1024;
 
-lazy_static! {
-    pub static ref DefaultKVS: KVS = {
-        let kvs = vec![
-            KV {
-                key: CLASS_STANDARD.to_owned(),
-                value: "".to_owned(),
-                hidden_if_empty: false,
-            },
-            KV {
-                key: CLASS_RRS.to_owned(),
-                value: "EC:1".to_owned(),
-                hidden_if_empty: false,
-            },
-            KV {
-                key: OPTIMIZE.to_owned(),
-                value: "availability".to_owned(),
-                hidden_if_empty: false,
-            },
-            KV {
-                key: INLINE_BLOCK.to_owned(),
-                value: "".to_owned(),
-                hidden_if_empty: true,
-            },
-        ];
+pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
+    let kvs = vec![
+        KV {
+            key: CLASS_STANDARD.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: CLASS_RRS.to_owned(),
+            value: "EC:1".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: OPTIMIZE.to_owned(),
+            value: "availability".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: INLINE_BLOCK.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+    ];
 
-        KVS(kvs)
-    };
-}
+    KVS(kvs)
+});
 
 // StorageClass - holds storage class information
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -113,6 +122,15 @@ impl Config {
             RRS => {
                 if self.initialized {
                     Some(self.rrs.parity)
+                } else {
+                    None
+                }
+            }
+            // All these storage classes use standard parity configuration
+            STANDARD | DEEP_ARCHIVE | EXPRESS_ONEZONE | GLACIER | GLACIER_IR | INTELLIGENT_TIERING | ONEZONE_IA | OUTPOSTS
+            | SNOW | STANDARD_IA => {
+                if self.initialized {
+                    Some(self.standard.parity)
                 } else {
                     None
                 }

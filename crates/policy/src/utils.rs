@@ -59,7 +59,7 @@ pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Resu
     jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
 }
 
-pub fn extract_claims<T: DeserializeOwned>(
+pub fn extract_claims<T: DeserializeOwned + Clone>(
     token: &str,
     secret: &str,
 ) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {

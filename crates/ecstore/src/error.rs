@@ -148,6 +148,9 @@ pub enum StorageError {
     #[error("Specified part could not be found. PartNumber {0}, Expected {1}, got {2}")]
     InvalidPart(usize, String, String),
 
+    #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
+    EntityTooSmall(usize, i64, i64),
+
     #[error("Invalid version id: {0}/{1}-{2}")]
     InvalidVersionID(String, String, String),
     #[error("invalid data movement operation, source and destination pool are the same for : {0}/{1}-{2}")]
@@ -156,11 +159,12 @@ pub enum StorageError {
     #[error("Object exists on :{0} as directory {1}")]
     ObjectExistsAsDirectory(String, String),
 
-    // #[error("Storage resources are insufficient for the read operation")]
-    // InsufficientReadQuorum,
+    #[error("Storage resources are insufficient for the read operation: {0}/{1}")]
+    InsufficientReadQuorum(String, String),
 
-    // #[error("Storage resources are insufficient for the write operation")]
-    // InsufficientWriteQuorum,
+    #[error("Storage resources are insufficient for the write operation: {0}/{1}")]
+    InsufficientWriteQuorum(String, String),
+
     #[error("Decommission not started")]
     DecommissionNotStarted,
     #[error("Decommission already running")]
@@ -183,6 +187,15 @@ pub enum StorageError {
 
     #[error("Io error: {0}")]
     Io(std::io::Error),
+
+    #[error("Lock error: {0}")]
+    Lock(#[from] rustfs_lock::LockError),
+
+    #[error("Precondition failed")]
+    PreconditionFailed,
+
+    #[error("Invalid range specified: {0}")]
+    InvalidRangeSpec(String),
 }
 
 impl StorageError {
@@ -401,6 +414,7 @@ impl Clone for StorageError {
             // StorageError::InsufficientWriteQuorum => StorageError::InsufficientWriteQuorum,
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
+            StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
@@ -409,6 +423,11 @@ impl Clone for StorageError {
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
+            StorageError::Lock(e) => StorageError::Lock(e.clone()),
+            StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
+            StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
+            StorageError::PreconditionFailed => StorageError::PreconditionFailed,
+            StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
         }
     }
 }
@@ -471,6 +490,12 @@ impl StorageError {
             StorageError::ConfigNotFound => 0x35,
             StorageError::TooManyOpenFiles => 0x36,
             StorageError::NoHealRequired => 0x37,
+            StorageError::Lock(_) => 0x38,
+            StorageError::InsufficientReadQuorum(_, _) => 0x39,
+            StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
+            StorageError::PreconditionFailed => 0x3B,
+            StorageError::EntityTooSmall(_, _, _) => 0x3C,
+            StorageError::InvalidRangeSpec(_) => 0x3D,
         }
     }
 
@@ -535,6 +560,12 @@ impl StorageError {
             0x35 => Some(StorageError::ConfigNotFound),
             0x36 => Some(StorageError::TooManyOpenFiles),
             0x37 => Some(StorageError::NoHealRequired),
+            0x38 => Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string()))),
+            0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
+            0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
+            0x3B => Some(StorageError::PreconditionFailed),
+            0x3C => Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default())),
+            0x3D => Some(StorageError::InvalidRangeSpec(Default::default())),
             _ => None,
         }
     }
@@ -745,6 +776,17 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
             let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
             StorageError::PrefixAccessDenied(bucket, object)
+        }
+
+        StorageError::ErasureReadQuorum => {
+            let bucket = params.first().cloned().unwrap_or_default().to_owned();
+            let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
+            StorageError::InsufficientReadQuorum(bucket, object)
+        }
+        StorageError::ErasureWriteQuorum => {
+            let bucket = params.first().cloned().unwrap_or_default().to_owned();
+            let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
+            StorageError::InsufficientWriteQuorum(bucket, object)
         }
 
         _ => err,

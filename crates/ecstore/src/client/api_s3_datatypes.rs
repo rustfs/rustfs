@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
-use crate::checksum::ChecksumMode;
+use crate::client::checksum::ChecksumMode;
 use crate::client::transition_api::ObjectMultipartInfo;
-use rustfs_utils::crypto::base64_decode;
+use crate::client::utils::base64_decode;
 
 use super::transition_api;
 
@@ -279,7 +279,7 @@ pub struct CompleteMultipartUpload {
 impl CompleteMultipartUpload {
     pub fn marshal_msg(&self) -> Result<String, std::io::Error> {
         //let buf = serde_json::to_string(self)?;
-        let buf = match serde_xml_rs::to_string(self) {
+        let buf = match quick_xml::se::to_string(self) {
             Ok(buf) => buf,
             Err(e) => {
                 return Err(std::io::Error::other(e));
@@ -329,7 +329,7 @@ pub struct DeleteMultiObjects {
 impl DeleteMultiObjects {
     pub fn marshal_msg(&self) -> Result<String, std::io::Error> {
         //let buf = serde_json::to_string(self)?;
-        let buf = match serde_xml_rs::to_string(self) {
+        let buf = match quick_xml::se::to_string(self) {
             Ok(buf) => buf,
             Err(e) => {
                 return Err(std::io::Error::other(e));

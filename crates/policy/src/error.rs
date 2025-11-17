@@ -228,7 +228,7 @@ mod tests {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
         use serde::{Deserialize, Serialize};
 
-        #[derive(Debug, Serialize, Deserialize)]
+        #[derive(Debug, Serialize, Deserialize, Clone)]
         struct Claims {
             sub: String,
             exp: usize,

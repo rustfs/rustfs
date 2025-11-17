@@ -28,5 +28,14 @@ categories = ["web-programming", "development-tools", "data-structures"]
 workspace = true
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true }
 tonic = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rustfs-madmin = { workspace = true }
+rustfs-filemeta = { workspace = true }
+serde = { workspace = true }
+path-clean = { workspace = true }
+rmp-serde = { workspace = true }
+async-trait = { workspace = true }
+s3s = { workspace = true }

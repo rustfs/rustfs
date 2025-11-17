@@ -22,28 +22,3 @@ service_version = "0.1.0"
 environments = "develop"
 logger_level = "debug"
 local_logging_enabled = true # Default is false if not specified
-
-
-#[[sinks]]
-#type = "Kafka"
-#bootstrap_servers = "localhost:9092"
-#topic = "logs"
-#batch_size = 100 # Default is 100 if not specified
-#batch_timeout_ms = 100 # Default is 1000ms if not specified
-#
-#[[sinks]]
-#type = "Webhook"
-#endpoint = "http://localhost:8080/webhook"
-#auth_token = ""
-#batch_size = 100 # Default is 3 if not specified
-#batch_timeout_ms = 100 # Default is 100ms if not specified
-
-[[sinks]]
-type = "File"
-path = "deploy/logs/rustfs.log"
-buffer_size = 102 # Default is 8192 bytes if not specified
-flush_interval_ms = 1000
-flush_threshold = 100
-
-[logger]
-queue_capacity = 10000

@@ -22,8 +22,18 @@ updates:
   - package-ecosystem: "cargo" # See documentation for possible values
     directory: "/" # Location of package manifests
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
+      timezone: "Asia/Shanghai"
+      time: "08:00"
     groups:
+      s3s:
+        update-types:
+          - "minor"
+          - "patch"
+        patterns:
+          - "s3s"
+          - "s3s-*"
       dependencies:
         patterns:
           - "*"

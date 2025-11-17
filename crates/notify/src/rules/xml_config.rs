@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use super::pattern;
-use crate::arn::{ARN, ArnError, TargetIDError};
-use crate::event::EventName;
+use hashbrown::HashSet;
+use rustfs_targets::EventName;
+use rustfs_targets::arn::{ARN, ArnError, TargetIDError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::Read;
 use thiserror::Error;
 
@@ -168,7 +168,7 @@ impl QueueConfig {
         // Validate ARN (similar to Go's Queue.Validate)
         // The Go code checks targetList.Exists(q.ARN.TargetID)
         // Here we check against a provided arn_list
-        let _config_arn_str = self.arn.to_arn_string();
+        let _config_arn_str = self.arn.to_string();
         if !self.arn.region.is_empty() && self.arn.region != region {
             return Err(ParseConfigError::UnknownRegion(self.arn.region.clone()));
         }
@@ -187,8 +187,8 @@ impl QueueConfig {
             partition: self.arn.partition.clone(), // or default "rustfs"
         };
 
-        if !arn_list.contains(&effective_arn.to_arn_string()) {
-            return Err(ParseConfigError::ArnNotFound(effective_arn.to_arn_string()));
+        if !arn_list.contains(&effective_arn.to_string()) {
+            return Err(ParseConfigError::ArnNotFound(effective_arn.to_string()));
         }
         Ok(())
     }
@@ -266,7 +266,7 @@ impl NotificationConfiguration {
             queue_config.validate(current_region, arn_list)?;
             let queue_key = (
                 queue_config.id.clone(),
-                queue_config.arn.to_arn_string(), // Assuming that the ARN structure implements Display or ToString
+                queue_config.arn.to_string(), // Assuming that the ARN structure implements Display or ToString
             );
             if !unique_queues.insert(queue_key.clone()) {
                 return Err(ParseConfigError::DuplicateQueueConfiguration(queue_key.0, queue_key.1));

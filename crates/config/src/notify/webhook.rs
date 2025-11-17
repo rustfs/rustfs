@@ -12,19 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Webhook Keys
-pub const WEBHOOK_ENDPOINT: &str = "endpoint";
-pub const WEBHOOK_AUTH_TOKEN: &str = "auth_token";
-pub const WEBHOOK_QUEUE_LIMIT: &str = "queue_limit";
-pub const WEBHOOK_QUEUE_DIR: &str = "queue_dir";
-pub const WEBHOOK_CLIENT_CERT: &str = "client_cert";
-pub const WEBHOOK_CLIENT_KEY: &str = "client_key";
+/// A list of all valid configuration keys for a webhook target.
+pub const NOTIFY_WEBHOOK_KEYS: &[&str] = &[
+    crate::ENABLE_KEY,
+    crate::WEBHOOK_ENDPOINT,
+    crate::WEBHOOK_AUTH_TOKEN,
+    crate::WEBHOOK_QUEUE_LIMIT,
+    crate::WEBHOOK_QUEUE_DIR,
+    crate::WEBHOOK_CLIENT_CERT,
+    crate::WEBHOOK_CLIENT_KEY,
+    crate::COMMENT_KEY,
+];
 
 // Webhook Environment Variables
-pub const ENV_WEBHOOK_ENABLE: &str = "RUSTFS_NOTIFY_WEBHOOK_ENABLE";
-pub const ENV_WEBHOOK_ENDPOINT: &str = "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT";
-pub const ENV_WEBHOOK_AUTH_TOKEN: &str = "RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN";
-pub const ENV_WEBHOOK_QUEUE_LIMIT: &str = "RUSTFS_NOTIFY_WEBHOOK_QUEUE_LIMIT";
-pub const ENV_WEBHOOK_QUEUE_DIR: &str = "RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR";
-pub const ENV_WEBHOOK_CLIENT_CERT: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_CERT";
-pub const ENV_WEBHOOK_CLIENT_KEY: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_KEY";
+pub const ENV_NOTIFY_WEBHOOK_ENABLE: &str = "RUSTFS_NOTIFY_WEBHOOK_ENABLE";
+pub const ENV_NOTIFY_WEBHOOK_ENDPOINT: &str = "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT";
+pub const ENV_NOTIFY_WEBHOOK_AUTH_TOKEN: &str = "RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN";
+pub const ENV_NOTIFY_WEBHOOK_QUEUE_LIMIT: &str = "RUSTFS_NOTIFY_WEBHOOK_QUEUE_LIMIT";
+pub const ENV_NOTIFY_WEBHOOK_QUEUE_DIR: &str = "RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR";
+pub const ENV_NOTIFY_WEBHOOK_CLIENT_CERT: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_CERT";
+pub const ENV_NOTIFY_WEBHOOK_CLIENT_KEY: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_KEY";
+
+pub const ENV_NOTIFY_WEBHOOK_KEYS: &[&str; 7] = &[
+    ENV_NOTIFY_WEBHOOK_ENABLE,
+    ENV_NOTIFY_WEBHOOK_ENDPOINT,
+    ENV_NOTIFY_WEBHOOK_AUTH_TOKEN,
+    ENV_NOTIFY_WEBHOOK_QUEUE_LIMIT,
+    ENV_NOTIFY_WEBHOOK_QUEUE_DIR,
+    ENV_NOTIFY_WEBHOOK_CLIENT_CERT,
+    ENV_NOTIFY_WEBHOOK_CLIENT_KEY,
+];

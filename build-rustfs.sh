@@ -21,13 +21,17 @@ detect_platform() {
         "linux")
             case "$arch" in
                 "x86_64")
-                    echo "x86_64-unknown-linux-musl"
+                    # Default to GNU for better compatibility
+                    echo "x86_64-unknown-linux-gnu"
                     ;;
                 "aarch64"|"arm64")
-                    echo "aarch64-unknown-linux-musl"
+                    echo "aarch64-unknown-linux-gnu"
                     ;;
                 "armv7l")
-                    echo "armv7-unknown-linux-musleabihf"
+                    echo "armv7-unknown-linux-gnueabihf"
+                    ;;
+                "loongarch64")
+                    echo "loongarch64-unknown-linux-musl"
                     ;;
                 "loongarch64")
                     echo "loongarch64-unknown-linux-musl"
@@ -122,6 +126,17 @@ usage() {
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
     echo "  -p, --platform TARGET      Target platform (default: auto-detect)"
+    echo "                              Supported platforms:"
+    echo "                                x86_64-unknown-linux-gnu"
+    echo "                                aarch64-unknown-linux-gnu"
+    echo "                                armv7-unknown-linux-gnueabihf"
+    echo "                                x86_64-unknown-linux-musl"
+    echo "                                aarch64-unknown-linux-musl"
+    echo "                                armv7-unknown-linux-musleabihf"
+    echo "                                x86_64-apple-darwin"
+    echo "                                aarch64-apple-darwin"
+    echo "                                x86_64-pc-windows-msvc"
+    echo "                                aarch64-pc-windows-msvc"
     echo "  --dev                      Build in dev mode"
     echo "  --sign                     Sign binaries after build"
     echo "  --with-console             Download console static assets (default)"
@@ -149,6 +164,35 @@ print_message() {
     local color=$1
     local message=$2
     echo -e "${color}${message}${NC}"
+}
+
+# Prevent zig/ld from hitting macOS file descriptor defaults during linking
+ensure_file_descriptor_limit() {
+    local required_limit=4096
+    local current_limit
+    current_limit=$(ulimit -Sn 2>/dev/null || echo "")
+
+    if [ -z "$current_limit" ] || [ "$current_limit" = "unlimited" ]; then
+        return
+    fi
+
+    if (( current_limit >= required_limit )); then
+        return
+    fi
+
+    local hard_limit target_limit
+    hard_limit=$(ulimit -Hn 2>/dev/null || echo "")
+    target_limit=$required_limit
+
+    if [ -n "$hard_limit" ] && [ "$hard_limit" != "unlimited" ] && (( hard_limit < required_limit )); then
+        target_limit=$hard_limit
+    fi
+
+    if ulimit -Sn "$target_limit" 2>/dev/null; then
+        print_message $YELLOW "🔧 Increased open file limit from $current_limit to $target_limit to avoid ProcessFdQuotaExceeded"
+    else
+        print_message $YELLOW "⚠️ Unable to raise ulimit -n automatically (current: $current_limit, needed: $required_limit). Please run 'ulimit -n $required_limit' manually before building."
+    fi
 }
 
 # Get version from git
@@ -558,10 +602,11 @@ main() {
         fi
     fi
 
+    ensure_file_descriptor_limit
+
     # Start build process
     build_rustfs
 }
 
 # Run main function
 main
-

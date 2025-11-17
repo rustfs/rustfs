@@ -14,46 +14,99 @@
 
 // Ensure the correct path for parse_license is imported
 use crate::admin;
-// use crate::admin::console::{CONSOLE_CONFIG, init_console_cfg};
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::hybrid::hybrid;
-use crate::server::layer::RedirectLayer;
-use crate::server::{ServiceState, ServiceStateManager};
+use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
+use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Request as HttpRequest, Response};
-use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
+    server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
-use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_ecstore::rpc::make_server;
-use rustfs_obs::SystemObserver;
+use metrics::{counter, histogram};
+use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
-use s3s::service::S3Service;
-use s3s::{host::MultiDomain, service::S3ServiceBuilder};
+use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
 use socket2::SockRef;
 use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::compression::CompressionLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 
-const MI_B: usize = 1024 * 1024;
+/// Parse CORS allowed origins from configuration
+fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
+    use http::Method;
+
+    let cors_layer = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+        ])
+        .allow_headers(Any);
+
+    match origins {
+        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
+        Some(origins_str) => {
+            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
+            if origins.is_empty() {
+                warn!("Empty CORS origins provided, using permissive CORS");
+                cors_layer.allow_origin(Any).expose_headers(Any)
+            } else {
+                // Parse origins with proper error handling
+                let mut valid_origins = Vec::new();
+                for origin in origins {
+                    match origin.parse::<http::HeaderValue>() {
+                        Ok(header_value) => {
+                            valid_origins.push(header_value);
+                        }
+                        Err(e) => {
+                            warn!("Invalid CORS origin '{}': {}", origin, e);
+                        }
+                    }
+                }
+
+                if valid_origins.is_empty() {
+                    warn!("No valid CORS origins found, using permissive CORS");
+                    cors_layer.allow_origin(Any).expose_headers(Any)
+                } else {
+                    info!("Endpoint CORS origins configured: {:?}", valid_origins);
+                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
+                }
+            }
+        }
+        None => {
+            debug!("No CORS origins configured for endpoint, using permissive CORS");
+            cors_layer.allow_origin(Any).expose_headers(Any)
+        }
+    }
+}
+
+fn get_cors_allowed_origins() -> String {
+    std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
+        .parse::<String>()
+        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
+}
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -61,10 +114,6 @@ pub async fn start_http_server(
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
-    let server_address = server_addr.to_string();
-
-    // The listening address and port are obtained from the parameters
-    // let listener = TcpListener::bind(server_address.clone()).await?;
 
     // The listening address and port are obtained from the parameters
     let listener = {
@@ -97,35 +146,46 @@ pub async fn start_http_server(
 
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
-    debug!("Listening on: {}", local_addr);
     let local_ip = match rustfs_utils::get_local_ip() {
-        Some(ip) => {
-            debug!("Obtained local IP address: {}", ip);
-            ip
-        }
+        Some(ip) => ip,
         None => {
             warn!("Unable to obtain local IP address, using fallback IP: {}", local_addr.ip());
             local_addr.ip()
         }
     };
-
+    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_enabled = tls_acceptor.is_some();
+    let protocol = if tls_enabled { "https" } else { "http" };
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("http://{local_ip}:{server_port}");
-    let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
-    info!("   API: {}  {}", api_endpoints, localhost_endpoint);
+    let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
+    let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
+
     if opt.console_enable {
+        admin::console::init_console_cfg(local_ip, server_port);
+
         info!(
-            "   WebUI: http://{}:{}/rustfs/console/index.html http://127.0.0.1:{}/rustfs/console/index.html http://{}/rustfs/console/index.html",
-            local_ip, server_port, server_port, server_address
+            target: "rustfs::console::startup",
+            "Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html"
         );
-    }
-    info!("   RootUser: {}", opt.access_key.clone());
-    info!("   RootPass: {}", opt.secret_key.clone());
-    if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
-        warn!(
-            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-            DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+        info!(
+            target: "rustfs::console::startup",
+            "Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",
+
         );
+
+        println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
+        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
+    } else {
+        info!("   API: {}  {}", api_endpoints, localhost_endpoint);
+        println!("   API: {api_endpoints}  {localhost_endpoint}");
+        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+            warn!(
+                "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
+                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+            );
+        }
+        info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
+        info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
     }
 
     // Setup S3 service
@@ -136,42 +196,52 @@ pub async fn start_http_server(
 
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
-        debug!("authentication is enabled {}, {}", &access_key, &secret_key);
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
         b.set_route(admin::make_admin_route(opt.console_enable)?);
 
         if !opt.server_domains.is_empty() {
-            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
-            b.set_host(MultiDomain::new(&opt.server_domains).map_err(Error::other)?);
+            MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
+
+            // add the default port number to the given server domains
+            let mut domain_sets = std::collections::HashSet::new();
+            for domain in &opt.server_domains {
+                domain_sets.insert(domain.to_string());
+                if let Some((host, _)) = domain.split_once(':') {
+                    domain_sets.insert(format!("{host}:{server_port}"));
+                } else {
+                    domain_sets.insert(format!("{domain}:{server_port}"));
+                }
+            }
+
+            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &domain_sets);
+            b.set_host(MultiDomain::new(domain_sets).map_err(Error::other)?);
         }
 
         b.build()
     };
 
-    tokio::spawn(async move {
-        // Record the PID-related metrics of the current process
-        let meter = opentelemetry::global::meter("system");
-        let obs_result = SystemObserver::init_process_observer(meter).await;
-        match obs_result {
-            Ok(_) => {
-                info!("Process observer initialized successfully");
-            }
-            Err(e) => {
-                error!("Failed to initialize process observer: {}", e);
-            }
-        }
-    });
-
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
+    // Capture CORS configuration for the server loop
+    let cors_allowed_origins = get_cors_allowed_origins();
+    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
+        None
+    } else {
+        Some(cors_allowed_origins)
+    };
+
+    let is_console = opt.console_enable;
     tokio::spawn(async move {
+        // Create CORS layer inside the server loop closure
+        let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
+
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
+            use tokio::signal::unix::{SignalKind, signal};
             // Unix platform specific code
             let sigterm_inner = signal(SignalKind::terminate()).expect("Failed to create SIGTERM signal handler");
             let sigint_inner = signal(SignalKind::interrupt()).expect("Failed to create SIGINT signal handler");
@@ -255,7 +325,15 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(socket, tls_acceptor.clone(), http_server.clone(), s3_service.clone(), graceful.clone());
+            process_connection(
+                socket,
+                tls_acceptor.clone(),
+                http_server.clone(),
+                s3_service.clone(),
+                graceful.clone(),
+                cors_layer.clone(),
+                is_console,
+            );
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -292,32 +370,55 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 
     debug!("Found TLS directory, checking for certificates");
 
-    // 1. Try to load all certificates from the directory (multi-cert support)
+    // Make sure to use a modern encryption suite
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
         if !cert_key_pairs.is_empty() {
-            debug!("Found {} certificates, creating multi-cert resolver", cert_key_pairs.len());
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
+
+            // Create an SNI-enabled certificate resolver
+            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+
+            // Configure the server to enable SNI support
             let mut server_config = ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(Arc::new(rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?));
+                .with_cert_resolver(Arc::new(resolver));
+
+            // Configure ALPN protocol priority
             server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+
+            // Log SNI requests
+            if rustfs_utils::tls_key_log() {
+                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            }
+
             return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
         }
     }
 
-    // 2. Fallback to legacy single certificate mode
+    // 2. Revert to the traditional single-certificate mode
     let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
     let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
     if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
         debug!("Found legacy single TLS certificate, starting with HTTPS");
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
         let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+
         let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+
+        // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
+
         return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
     }
 
@@ -339,6 +440,8 @@ fn process_connection(
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
     graceful: Arc<GracefulShutdown>,
+    cors_layer: CorsLayer,
+    is_console: bool,
 ) {
     tokio::spawn(async move {
         // Build services inside each connected task to avoid passing complex service types across tasks,
@@ -347,11 +450,18 @@ fn process_connection(
         let service = hybrid(s3_service, rpc_service);
 
         let hybrid_service = ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
+                        let trace_id = request
+                            .headers()
+                            .get(http::header::HeaderName::from_static("x-request-id"))
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("unknown");
                         let span = tracing::info_span!("http-request",
+                            trace_id = %trace_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
                             uri = %request.uri(),
@@ -365,39 +475,52 @@ fn process_connection(
 
                         span
                     })
-                    .on_request(|request: &HttpRequest<_>, _span: &Span| {
-                        info!(
-                            counter.rustfs_api_requests_total = 1_u64,
-                            key_request_method = %request.method().to_string(),
-                            key_request_uri_path = %request.uri().path().to_owned(),
-                            "handle request api total",
-                        );
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
+                    .on_request(|request: &HttpRequest<_>, span: &Span| {
+                        let _enter = span.enter();
+                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
+                        let labels = [
+                            ("key_request_method", format!("{}", request.method())),
+                            ("key_request_uri_path", request.uri().path().to_owned().to_string()),
+                        ];
+                        counter!("rustfs_api_requests_total", &labels).increment(1);
                     })
-                    .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
-                        _span.record("http response status_code", tracing::field::display(response.status()));
+                    .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
+                        span.record("status_code", tracing::field::display(response.status()));
+                        let _enter = span.enter();
+                        histogram!("request.latency.ms").record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
                     })
-                    .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                        info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
-                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
+                    .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                        let _enter = span.enter();
+                        histogram!("request.body.len").record(chunk.len() as f64);
+                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
-                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                        let _enter = span.enter();
                         debug!("http stream closed after {:?}", stream_duration)
                     })
-                    .on_failure(|_error, latency: Duration, _span: &Span| {
-                        info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
+                    .on_failure(|_error, latency: Duration, span: &Span| {
+                        let _enter = span.enter();
+                        counter!("rustfs_api_requests_failure_total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
-            .layer(CorsLayer::permissive())
-            .layer(RedirectLayer)
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(cors_layer)
+            // Compress responses
+            .layer(CompressionLayer::new())
+            .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
+
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
         if let Some(acceptor) = tls_acceptor {
             debug!("TLS handshake start");
+            let peer_addr = socket
+                .peer_addr()
+                .ok()
+                .map_or_else(|| "unknown".to_string(), |addr| addr.to_string());
             match acceptor.accept(socket).await {
                 Ok(tls_socket) => {
                     debug!("TLS handshake successful");
@@ -408,8 +531,40 @@ fn process_connection(
                     }
                 }
                 Err(err) => {
-                    error!(?err, "TLS handshake failed");
-                    return; // Failed to end the task directly
+                    // Detailed analysis of the reasons why the TLS handshake fails
+                    let err_str = err.to_string();
+                    let mut key_failure_type_str: &str = "UNKNOWN";
+                    if err_str.contains("unexpected EOF") || err_str.contains("handshake eof") {
+                        warn!(peer_addr = %peer_addr, "TLS handshake failed. If this client needs HTTP, it should connect to the HTTP port instead");
+                        key_failure_type_str = "UNEXPECTED_EOF";
+                    } else if err_str.contains("protocol version") {
+                        error!(
+                            peer_addr = %peer_addr,
+                            "TLS handshake failed due to protocol version mismatch: {}", err
+                        );
+                        key_failure_type_str = "PROTOCOL_VERSION";
+                    } else if err_str.contains("certificate") {
+                        error!(
+                            peer_addr = %peer_addr,
+                            "TLS handshake failed due to certificate issues: {}", err
+                        );
+                        key_failure_type_str = "CERTIFICATE";
+                    } else {
+                        error!(
+                            peer_addr = %peer_addr,
+                            "TLS handshake failed: {}", err
+                        );
+                    }
+                    counter!("rustfs_tls_handshake_failures", &[("key_failure_type", key_failure_type_str)]).increment(1);
+                    // Record detailed diagnostic information
+                    debug!(
+                        peer_addr = %peer_addr,
+                        error_type = %std::any::type_name_of_val(&err),
+                        error_details = %err,
+                        "TLS handshake failure details"
+                    );
+
+                    return;
                 }
             }
             debug!("TLS handshake success");

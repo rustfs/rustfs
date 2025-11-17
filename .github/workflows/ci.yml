@@ -16,7 +16,7 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -36,7 +36,7 @@ on:
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
   pull_request:
-    branches: [main]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -58,6 +58,9 @@ on:
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -83,6 +86,16 @@ jobs:
           # Never skip release events and tag pushes
           do_not_skip: '["workflow_dispatch", "schedule", "merge_group", "release", "push"]'
 
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Typos check with custom config file
+        uses: crate-ci/typos@master
+
   test-and-lint:
     name: Test and Lint
     needs: skip-check
@@ -90,8 +103,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -120,7 +135,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup

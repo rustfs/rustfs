@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_config::{DEFAULT_LOG_DIR, DEFAULT_LOG_FILENAME};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 /// Get the absolute path to the current project
 ///
@@ -27,11 +30,12 @@ use std::path::{Path, PathBuf};
 /// # Returns
 /// - `Ok(PathBuf)`: The absolute path of the project that was successfully obtained.
 /// - `Err(String)`: Error message for the failed path.
+///
 pub fn get_project_root() -> Result<PathBuf, String> {
     // Try to get the project root directory through the CARGO_MANIFEST_DIR environment variable
     if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
         let project_root = Path::new(&manifest_dir).to_path_buf();
-        println!("Get the project root directory with CARGO_MANIFEST_DIR:{}", project_root.display());
+        debug!("Get the project root directory with CARGO_MANIFEST_DIR:{}", project_root.display());
         return Ok(project_root);
     }
 
@@ -41,7 +45,7 @@ pub fn get_project_root() -> Result<PathBuf, String> {
         // Assume that the project root directory is in the parent directory of the parent directory of the executable path (usually target/debug or target/release)
         project_root.pop(); // Remove the executable file name
         project_root.pop(); // Remove target/debug or target/release
-        println!("Deduce the project root directory through current_exe:{}", project_root.display());
+        debug!("Deduce the project root directory through current_exe:{}", project_root.display());
         return Ok(project_root);
     }
 
@@ -49,12 +53,104 @@ pub fn get_project_root() -> Result<PathBuf, String> {
     if let Ok(mut current_dir) = env::current_dir() {
         // Assume that the project root directory is in the parent directory of the current working directory
         current_dir.pop();
-        println!("Deduce the project root directory through current_dir:{}", current_dir.display());
+        debug!("Deduce the project root directory through current_dir:{}", current_dir.display());
         return Ok(current_dir);
     }
 
     // If all methods fail, return an error
     Err("The project root directory cannot be obtained. Please check the running environment and project structure.".to_string())
+}
+
+/// Get the log directory as a string
+/// This function will try to find a writable log directory in the following order:
+///
+/// 1. Environment variables are specified
+/// 2. System temporary directory
+/// 3. User home directory
+/// 4. Current working directory
+/// 5. Relative path
+///
+/// # Arguments
+/// * `key` - The environment variable key to check for log directory
+///
+/// # Returns
+/// * `String` - The log directory path as a string
+///
+pub fn get_log_directory_to_string(key: &str) -> String {
+    get_log_directory(key).to_string_lossy().to_string()
+}
+
+/// Get the log directory
+/// This function will try to find a writable log directory in the following order:
+///
+/// 1. Environment variables are specified
+/// 2. System temporary directory
+/// 3. User home directory
+/// 4. Current working directory
+/// 5. Relative path
+///
+/// # Arguments
+/// * `key` - The environment variable key to check for log directory
+///
+/// # Returns
+/// * `PathBuf` - The log directory path
+///
+pub fn get_log_directory(key: &str) -> PathBuf {
+    // Environment variables are specified
+    if let Ok(log_dir) = env::var(key) {
+        let path = PathBuf::from(log_dir);
+        if ensure_directory_writable(&path) {
+            return path;
+        }
+    }
+
+    // System temporary directory
+    if let Ok(mut temp_dir) = env::temp_dir().canonicalize() {
+        temp_dir.push(DEFAULT_LOG_FILENAME);
+        temp_dir.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&temp_dir) {
+            return temp_dir;
+        }
+    }
+
+    // User home directory
+    if let Ok(home_dir) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
+        let mut path = PathBuf::from(home_dir);
+        path.push(format!(".{DEFAULT_LOG_FILENAME}"));
+        path.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&path) {
+            return path;
+        }
+    }
+
+    // Current working directory
+    if let Ok(current_dir) = env::current_dir() {
+        let mut path = current_dir;
+        path.push(DEFAULT_LOG_DIR);
+        if ensure_directory_writable(&path) {
+            return path;
+        }
+    }
+
+    // Relative path
+    PathBuf::from(DEFAULT_LOG_DIR)
+}
+
+fn ensure_directory_writable(path: &PathBuf) -> bool {
+    // Try creating a catalog
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+
+    // Check write permissions
+    let test_file = path.join(".write_test");
+    match fs::write(&test_file, "test") {
+        Ok(_) => {
+            let _ = fs::remove_file(&test_file);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

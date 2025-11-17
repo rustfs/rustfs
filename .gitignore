@@ -20,3 +20,7 @@ profile.json
 .docker/openobserve-otel/data
 *.zst
 .secrets
+*.go
+*.pb
+*.svg
+deploy/logs/*.log.*

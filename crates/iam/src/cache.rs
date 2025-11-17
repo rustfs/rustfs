@@ -127,8 +127,8 @@ impl CacheInner {
     //     todo!()
     // }
 
-    // /// 如果是临时用户，返回 Ok(Some(partent_name)))
-    // /// 如果不是临时用户，返回 Ok(None)
+    // /// Return Ok(Some(parent_name)) when the user is temporary.
+    // /// Return Ok(None) for non-temporary users.
     // fn is_temp_user(&self, user_name: &str) -> crate::Result<Option<&str>> {
     //     let user = self
     //         .get_user(user_name)
@@ -141,8 +141,8 @@ impl CacheInner {
     //     }
     // }
 
-    // /// 如果是临时用户，返回 Ok(Some(partent_name)))
-    // /// 如果不是临时用户，返回 Ok(None)
+    // /// Return Ok(Some(parent_name)) when the user is a temporary identity.
+    // /// Return Ok(None) when the user is not temporary.
     // fn is_service_account(&self, user_name: &str) -> crate::Result<Option<&str>> {
     //     let user = self
     //         .get_user(user_name)

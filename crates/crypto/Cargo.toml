@@ -29,7 +29,7 @@ documentation = "https://docs.rs/rustfs-crypto/latest/rustfs_crypto/"
 workspace = true
 
 [dependencies]
-aes-gcm = { workspace = true, features = ["std"], optional = true }
+aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, features = ["std"], optional = true }
 cfg-if = { workspace = true }
 chacha20poly1305 = { workspace = true, optional = true }

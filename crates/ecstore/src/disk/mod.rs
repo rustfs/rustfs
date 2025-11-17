@@ -30,11 +30,6 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
-use crate::heal::{
-    data_scanner::ShouldSleepFn,
-    data_usage_cache::{DataUsageCache, DataUsageEntry},
-    heal_commands::{HealScanMode, HealingTracker},
-};
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
@@ -46,10 +41,7 @@ use rustfs_madmin::info_commands::DiskMetrics;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::mpsc::Sender,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Disk>;
@@ -209,12 +201,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         match self {
             Disk::Local(local_disk) => local_disk.delete_versions(volume, versions, opts).await,
             Disk::Remote(remote_disk) => remote_disk.delete_versions(volume, versions, opts).await,
@@ -406,28 +393,6 @@ impl DiskAPI for Disk {
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
         }
     }
-
-    #[tracing::instrument(skip(self, cache, we_sleep, scan_mode))]
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache> {
-        match self {
-            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
-            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn healing(&self) -> Option<HealingTracker> {
-        match self {
-            Disk::Local(local_disk) => local_disk.healing().await,
-            Disk::Remote(remote_disk) => remote_disk.healing().await,
-        }
-    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
@@ -466,7 +431,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
     async fn delete_volume(&self, volume: &str) -> Result<()>;
 
-    // 并发边读边写 w <- MetaCacheEntry
+    // Concurrent read/write pipeline w <- MetaCacheEntry
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;
 
     // Metadata operations
@@ -478,12 +443,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()>;
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>>;
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()>;
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
@@ -506,7 +466,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<RenameDataResp>;
 
     // File operations.
-    // 读目录下的所有文件、目录
+    // Read every file and directory within the folder
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
@@ -527,14 +487,6 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
-    async fn ns_scanner(
-        &self,
-        cache: &DataUsageCache,
-        updates: Sender<DataUsageEntry>,
-        scan_mode: HealScanMode,
-        we_sleep: ShouldSleepFn,
-    ) -> Result<DataUsageCache>;
-    async fn healing(&self) -> Option<HealingTracker>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -706,7 +658,7 @@ pub struct VolumeInfo {
     pub created: Option<OffsetDateTime>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
 pub struct ReadOptions {
     pub incl_free_versions: bool,
     pub read_data: bool,
@@ -1048,7 +1000,7 @@ mod tests {
         // Note: is_online() might return false for local disks without proper initialization
         // This is expected behavior for test environments
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -1079,7 +1031,7 @@ mod tests {
         let location = disk.get_disk_location();
         assert!(location.valid() || (!location.valid() && endpoint.pool_idx < 0));
 
-        // 清理测试目录
+        // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 }

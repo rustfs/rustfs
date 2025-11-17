@@ -30,6 +30,7 @@ pub mod api_restore;
 pub mod api_s3_datatypes;
 pub mod api_stat;
 pub mod bucket_cache;
+pub mod checksum;
 pub mod constants;
 pub mod credentials;
 pub mod object_api_utils;

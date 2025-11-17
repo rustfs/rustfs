@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
-use crate::filemeta::*;
+use crate::{ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, MetaDeleteMarker, MetaObject, Result, VersionType};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// 创建一个真实的 xl.meta 文件数据用于测试
+/// Create real xl.meta file data for testing
 pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     let mut fm = FileMeta::new();
 
-    // 创建一个真实的对象版本
+    // Create a real object version
     let version_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef")?;
     let data_dir = Uuid::parse_str("fedcba98-7654-3210-fedc-ba9876543210")?;
 
@@ -62,12 +61,12 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     let shallow_version = FileMetaShallowVersion::try_from(file_version)?;
     fm.versions.push(shallow_version);
 
-    // 添加一个删除标记版本
+    // Add a delete marker version
     let delete_version_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555")?;
     let delete_marker = MetaDeleteMarker {
         version_id: Some(delete_version_id),
-        mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312260)?), // 1分钟后
-        meta_sys: None,
+        mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312260)?), // 1 minute later
+        meta_sys: HashMap::new(),
     };
 
     let delete_file_version = FileMetaVersion {
@@ -80,7 +79,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     let delete_shallow_version = FileMetaShallowVersion::try_from(delete_file_version)?;
     fm.versions.push(delete_shallow_version);
 
-    // 添加一个 Legacy 版本用于测试
+    // Add a Legacy version for testing
     let legacy_version_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")?;
     let legacy_version = FileMetaVersion {
         version_type: VersionType::Legacy,
@@ -91,20 +90,20 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
 
     let mut legacy_shallow = FileMetaShallowVersion::try_from(legacy_version)?;
     legacy_shallow.header.version_id = Some(legacy_version_id);
-    legacy_shallow.header.mod_time = Some(OffsetDateTime::from_unix_timestamp(1705312140)?); // 更早的时间
+    legacy_shallow.header.mod_time = Some(OffsetDateTime::from_unix_timestamp(1705312140)?); // earlier time
     fm.versions.push(legacy_shallow);
 
-    // 按修改时间排序（最新的在前）
+    // Sort by modification time (newest first)
     fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
 
     fm.marshal_msg()
 }
 
-/// 创建一个包含多个版本的复杂 xl.meta 文件
+/// Create a complex xl.meta file with multiple versions
 pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     let mut fm = FileMeta::new();
 
-    // 创建10个版本的对象
+    // Create 10 object versions
     for i in 0i64..10i64 {
         let version_id = Uuid::new_v4();
         let data_dir = if i % 3 == 0 { Some(Uuid::new_v4()) } else { None };
@@ -145,13 +144,13 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
         let shallow_version = FileMetaShallowVersion::try_from(file_version)?;
         fm.versions.push(shallow_version);
 
-        // 每隔3个版本添加一个删除标记
+        // Add a delete marker every 3 versions
         if i % 3 == 2 {
             let delete_version_id = Uuid::new_v4();
             let delete_marker = MetaDeleteMarker {
                 version_id: Some(delete_version_id),
                 mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312200 + i * 60 + 30)?),
-                meta_sys: None,
+                meta_sys: HashMap::new(),
             };
 
             let delete_file_version = FileMetaVersion {
@@ -166,56 +165,56 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
         }
     }
 
-    // 按修改时间排序（最新的在前）
+    // Sort by modification time (newest first)
     fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
 
     fm.marshal_msg()
 }
 
-/// 创建一个损坏的 xl.meta 文件用于错误处理测试
+/// Create a corrupted xl.meta file for error handling tests
 pub fn create_corrupted_xlmeta() -> Vec<u8> {
     let mut data = vec![
-        // 正确的文件头
-        b'X', b'L', b'2', b' ', // 版本号
-        1, 0, 3, 0, // 版本号
-        0xc6, 0x00, 0x00, 0x00, 0x10, // 正确的 bin32 长度标记，但数据长度不匹配
+        // Correct file header
+        b'X', b'L', b'2', b' ', // version
+        1, 0, 3, 0, // version
+        0xc6, 0x00, 0x00, 0x00, 0x10, // correct bin32 length marker, but data length mismatch
     ];
 
-    // 添加不足的数据（少于声明的长度）
-    data.extend_from_slice(&[0x42; 8]); // 只有8字节，但声明了16字节
+    // Add insufficient data (less than declared length)
+    data.extend_from_slice(&[0x42; 8]); // only 8 bytes, but declared 16 bytes
 
     data
 }
 
-/// 创建一个空的 xl.meta 文件
+/// Create an empty xl.meta file
 pub fn create_empty_xlmeta() -> Result<Vec<u8>> {
     let fm = FileMeta::new();
     fm.marshal_msg()
 }
 
-/// 验证解析结果的辅助函数
+/// Helper function to verify parsing results
 pub fn verify_parsed_metadata(fm: &FileMeta, expected_versions: usize) -> Result<()> {
-    assert_eq!(fm.versions.len(), expected_versions, "版本数量不匹配");
-    assert_eq!(fm.meta_ver, crate::filemeta::XL_META_VERSION, "元数据版本不匹配");
+    assert_eq!(fm.versions.len(), expected_versions, "Version count mismatch");
+    assert_eq!(fm.meta_ver, crate::filemeta::XL_META_VERSION, "Metadata version mismatch");
 
-    // 验证版本是否按修改时间排序
+    // Verify versions are sorted by modification time
     for i in 1..fm.versions.len() {
         let prev_time = fm.versions[i - 1].header.mod_time;
         let curr_time = fm.versions[i].header.mod_time;
 
         if let (Some(prev), Some(curr)) = (prev_time, curr_time) {
-            assert!(prev >= curr, "版本未按修改时间正确排序");
+            assert!(prev >= curr, "Versions not sorted correctly by modification time");
         }
     }
 
     Ok(())
 }
 
-/// 创建一个包含内联数据的 xl.meta 文件
+/// Create an xl.meta file with inline data
 pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
     let mut fm = FileMeta::new();
 
-    // 添加内联数据
+    // Add inline data
     let inline_data = b"This is inline data for testing purposes";
     let version_id = Uuid::new_v4();
     fm.data.replace(&version_id.to_string(), inline_data.to_vec())?;
@@ -257,50 +256,51 @@ pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileMeta;
 
     #[test]
     fn test_create_real_xlmeta() {
-        let data = create_real_xlmeta().expect("创建测试数据失败");
-        assert!(!data.is_empty(), "生成的数据不应为空");
+        let data = create_real_xlmeta().expect("Failed to create test data");
+        assert!(!data.is_empty(), "Generated data should not be empty");
 
-        // 验证文件头
-        assert_eq!(&data[0..4], b"XL2 ", "文件头不正确");
+        // Verify file header
+        assert_eq!(&data[0..4], b"XL2 ", "Incorrect file header");
 
-        // 尝试解析
-        let fm = FileMeta::load(&data).expect("解析失败");
-        verify_parsed_metadata(&fm, 3).expect("验证失败");
+        // Try to parse
+        let fm = FileMeta::load(&data).expect("Failed to parse");
+        verify_parsed_metadata(&fm, 3).expect("Verification failed");
     }
 
     #[test]
     fn test_create_complex_xlmeta() {
-        let data = create_complex_xlmeta().expect("创建复杂测试数据失败");
-        assert!(!data.is_empty(), "生成的数据不应为空");
+        let data = create_complex_xlmeta().expect("Failed to create complex test data");
+        assert!(!data.is_empty(), "Generated data should not be empty");
 
-        let fm = FileMeta::load(&data).expect("解析失败");
-        assert!(fm.versions.len() >= 10, "应该有至少10个版本");
+        let fm = FileMeta::load(&data).expect("Failed to parse");
+        assert!(fm.versions.len() >= 10, "Should have at least 10 versions");
     }
 
     #[test]
     fn test_create_xlmeta_with_inline_data() {
-        let data = create_xlmeta_with_inline_data().expect("创建内联数据测试失败");
-        assert!(!data.is_empty(), "生成的数据不应为空");
+        let data = create_xlmeta_with_inline_data().expect("Failed to create inline data test");
+        assert!(!data.is_empty(), "Generated data should not be empty");
 
-        let fm = FileMeta::load(&data).expect("解析失败");
-        assert_eq!(fm.versions.len(), 1, "应该有1个版本");
-        assert!(!fm.data.as_slice().is_empty(), "应该包含内联数据");
+        let fm = FileMeta::load(&data).expect("Failed to parse");
+        assert_eq!(fm.versions.len(), 1, "Should have 1 version");
+        assert!(!fm.data.as_slice().is_empty(), "Should contain inline data");
     }
 
     #[test]
     fn test_corrupted_xlmeta_handling() {
         let data = create_corrupted_xlmeta();
         let result = FileMeta::load(&data);
-        assert!(result.is_err(), "损坏的数据应该解析失败");
+        assert!(result.is_err(), "Corrupted data should fail to parse");
     }
 
     #[test]
     fn test_empty_xlmeta() {
-        let data = create_empty_xlmeta().expect("创建空测试数据失败");
-        let fm = FileMeta::load(&data).expect("解析空数据失败");
-        assert_eq!(fm.versions.len(), 0, "空文件应该没有版本");
+        let data = create_empty_xlmeta().expect("Failed to create empty test data");
+        let fm = FileMeta::load(&data).expect("Failed to parse empty data");
+        assert_eq!(fm.versions.len(), 0, "Empty file should have no versions");
     }
 }

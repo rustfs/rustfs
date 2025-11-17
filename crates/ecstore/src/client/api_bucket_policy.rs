@@ -63,7 +63,7 @@ impl TransitionClient {
         //defer closeResponse(resp)
         //if resp != nil {
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, vec![], bucket_name, "")));
         }
         //}
         Ok(())
@@ -98,7 +98,7 @@ impl TransitionClient {
         //defer closeResponse(resp)
 
         if resp.status() != StatusCode::NO_CONTENT {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(&resp, vec![], bucket_name, "")));
         }
 
         Ok(())

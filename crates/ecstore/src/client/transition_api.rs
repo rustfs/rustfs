@@ -19,7 +19,7 @@
 #![allow(clippy::all)]
 
 use bytes::Bytes;
-use futures::Future;
+use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
 use http::{
     HeaderValue, Response, StatusCode,
@@ -44,7 +44,7 @@ use std::{
 use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -61,11 +61,13 @@ use crate::client::{
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
 };
-use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
+use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use rustfs_rio::HashReader;
 use rustfs_utils::{
     net::get_endpoint_url,
-    retry::{MAX_RETRY, new_retry_timer},
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
 };
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
@@ -87,6 +89,7 @@ pub enum ReaderImpl {
 
 pub type ReadCloser = BufReader<Cursor<Vec<u8>>>;
 
+#[derive(Debug)]
 pub struct TransitionClient {
     pub endpoint_url: Url,
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
@@ -106,6 +109,7 @@ pub struct TransitionClient {
     pub health_status: AtomicI32,
     pub trailing_header_support: bool,
     pub max_retries: i64,
+    pub tier_type: String,
 }
 
 #[derive(Debug, Default)]
@@ -129,19 +133,19 @@ pub enum BucketLookupType {
 }
 
 impl TransitionClient {
-    pub async fn new(endpoint: &str, opts: Options) -> Result<TransitionClient, std::io::Error> {
-        let clnt = Self::private_new(endpoint, opts).await?;
+    pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+        let clnt = Self::private_new(endpoint, opts, tier_type).await?;
 
         Ok(clnt)
     }
 
-    async fn private_new(endpoint: &str, opts: Options) -> Result<TransitionClient, std::io::Error> {
+    async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
         //#[cfg(feature = "ring")]
-        //let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         //#[cfg(feature = "aws-lc-rs")]
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let scheme = endpoint_url.scheme();
         let client;
@@ -172,6 +176,7 @@ impl TransitionClient {
             health_status: AtomicI32::new(C_UNKNOWN),
             trailing_header_support: opts.trailing_headers,
             max_retries: opts.max_retries,
+            tier_type: tier_type.to_string(),
         };
 
         {
@@ -186,6 +191,7 @@ impl TransitionClient {
 
         clnt.trailing_header_support = opts.trailing_headers && clnt.override_signer_type == SignatureType::SignatureV4;
 
+        clnt.max_retries = MAX_RETRY;
         if opts.max_retries > 0 {
             clnt.max_retries = opts.max_retries;
         }
@@ -279,11 +285,14 @@ impl TransitionClient {
         let mut resp = resp.unwrap();
         debug!("http_resp: {:?}", resp);
 
+        //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
+
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
             //self.dump_http(&cloned_req, &resp)?;
             let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-            debug!("err_body: {}", String::from_utf8(b).unwrap());
+            warn!("err_body: {}", String::from_utf8(b).unwrap());
         }
 
         Ok(resp)
@@ -313,12 +322,9 @@ impl TransitionClient {
         }
         //}
 
-        //let mut retry_timer = RetryTimer::new();
-        //while let Some(v) = retry_timer.next().await {
-        for _ in [1; 1]
-        /*new_retry_timer(req_retry, default_retry_unit, default_retry_cap, max_jitter)*/
-        {
-            let req = self.new_request(method, metadata).await?;
+        let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, self.random);
+        while retry_timer.next().await.is_some() {
+            let req = self.new_request(&method, metadata).await?;
 
             resp = self.doit(req).await?;
 
@@ -329,7 +335,8 @@ impl TransitionClient {
             }
 
             let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-            let err_response = http_resp_to_error_response(resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
+            let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
+            err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
                 match err_response.code {
@@ -360,6 +367,14 @@ impl TransitionClient {
                 }
             }
 
+            if is_s3code_retryable(err_response.code.as_str()) {
+                continue;
+            }
+
+            if is_http_status_retryable(&resp.status()) {
+                continue;
+            }
+
             break;
         }
 
@@ -368,12 +383,12 @@ impl TransitionClient {
 
     async fn new_request(
         &self,
-        method: http::Method,
+        method: &http::Method,
         metadata: &mut RequestMetadata,
     ) -> Result<http::Request<Body>, std::io::Error> {
-        let location = metadata.bucket_location.clone();
+        let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
-            let location = self.get_bucket_location(&metadata.bucket_name).await?;
+            location = self.get_bucket_location(&metadata.bucket_name).await?;
         }
 
         let is_makebucket = metadata.object_name == "" && method == http::Method::PUT && metadata.query_values.len() == 0;
@@ -561,7 +576,16 @@ impl TransitionClient {
     }
 
     pub fn is_virtual_host_style_request(&self, url: &Url, bucket_name: &str) -> bool {
-        if bucket_name == "" {
+        // Contract:
+        // - return true if we should use virtual-hosted-style addressing (bucket as subdomain)
+        // Heuristics (aligned with AWS S3/MinIO clients):
+        // - explicit DNS mode => true
+        // - explicit PATH mode => false
+        // - AUTO:
+        //   - bucket must be non-empty and DNS compatible
+        //   - endpoint host must be a DNS name (not an IPv4/IPv6 literal)
+        //   - when using TLS (https), buckets with dots are avoided due to wildcard/cert issues
+        if bucket_name.is_empty() {
             return false;
         }
 
@@ -606,7 +630,7 @@ pub struct TransitionCore(pub Arc<TransitionClient>);
 
 impl TransitionCore {
     pub async fn new(endpoint: &str, opts: Options) -> Result<Self, std::io::Error> {
-        let client = TransitionClient::new(endpoint, opts).await?;
+        let client = TransitionClient::new(endpoint, opts, "").await?;
         Ok(Self(Arc::new(client)))
     }
 
@@ -792,6 +816,7 @@ impl TransitionCore {
     }
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct PutObjectPartOptions {
     pub md5_base64: String,
     pub sha256_hex: String,
@@ -803,23 +828,23 @@ pub struct PutObjectPartOptions {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ObjectInfo {
-    pub etag: String,
+    pub etag: Option<String>,
     pub name: String,
-    pub mod_time: OffsetDateTime,
-    pub size: usize,
+    pub mod_time: Option<OffsetDateTime>,
+    pub size: i64,
     pub content_type: Option<String>,
     #[serde(skip)]
     pub metadata: HeaderMap,
     pub user_metadata: HashMap<String, String>,
     pub user_tags: String,
-    pub user_tag_count: i64,
+    pub user_tag_count: usize,
     #[serde(skip)]
     pub owner: Owner,
     //pub grant: Vec<Grant>,
     pub storage_class: String,
     pub is_latest: bool,
     pub is_delete_marker: bool,
-    pub version_id: Uuid,
+    pub version_id: Option<Uuid>,
 
     #[serde(skip, default = "replication_status_default")]
     pub replication_status: ReplicationStatus,
@@ -845,9 +870,9 @@ fn replication_status_default() -> ReplicationStatus {
 impl Default for ObjectInfo {
     fn default() -> Self {
         Self {
-            etag: "".to_string(),
+            etag: None,
             name: "".to_string(),
-            mod_time: OffsetDateTime::now_utc(),
+            mod_time: None,
             size: 0,
             content_type: None,
             metadata: HeaderMap::new(),
@@ -858,7 +883,7 @@ impl Default for ObjectInfo {
             storage_class: "".to_string(),
             is_latest: false,
             is_delete_marker: false,
-            version_id: Uuid::nil(),
+            version_id: None,
             replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
             replication_ready: false,
             expiration: OffsetDateTime::now_utc(),
@@ -978,4 +1003,13 @@ impl tower::Service<Request<Body>> for SendRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Document(pub String);
+pub struct LocationConstraint {
+    #[serde(rename = "$value")]
+    pub field: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateBucketConfiguration {
+    #[serde(rename = "LocationConstraint")]
+    pub location_constraint: String,
+}

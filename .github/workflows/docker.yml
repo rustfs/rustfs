@@ -36,8 +36,8 @@ permissions:
 on:
   # Automatically triggered when build workflow completes
   workflow_run:
-    workflows: ["Build and Release"]
-    types: [completed]
+    workflows: [ "Build and Release" ]
+    types: [ completed ]
   # Manual trigger with same parameters for consistency
   workflow_dispatch:
     inputs:
@@ -58,6 +58,10 @@ on:
         type: boolean
 
 env:
+  CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  TRIGGERING_EVENT: ${{ github.event.workflow_run.event }}
   DOCKERHUB_USERNAME: rustfs
   CARGO_TERM_COLOR: always
   REGISTRY_DOCKERHUB: rustfs/rustfs
@@ -79,7 +83,7 @@ jobs:
       create_latest: ${{ steps.check.outputs.create_latest }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           # For workflow_run events, checkout the specific commit that triggered the workflow
@@ -102,27 +106,27 @@ jobs:
 
             # Check if the triggering workflow was successful
             # If the workflow succeeded, it means ALL builds (including Linux x86_64 and aarch64) succeeded
-            if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            if [[ "$CONCLUSION" == "success" ]]; then
               echo "✅ Build workflow succeeded, all builds including Linux are successful"
               should_build=true
               should_push=true
             else
-              echo "❌ Build workflow failed (conclusion: ${{ github.event.workflow_run.conclusion }}), skipping Docker build"
+              echo "❌ Build workflow failed (conclusion: $CONCLUSION), skipping Docker build"
               should_build=false
             fi
 
             # Extract version info from commit message or use commit SHA
             # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
-            short_sha=$(git rev-parse --short "${{ github.event.workflow_run.head_sha }}")
+            short_sha=$(git rev-parse --short "$HEAD_SHA")
 
             # Determine build type based on triggering workflow event and ref
-            triggering_event="${{ github.event.workflow_run.event }}"
-            head_branch="${{ github.event.workflow_run.head_branch }}"
+            triggering_event="$TRIGGERING_EVENT"
+            head_branch="$HEAD_BRANCH"
 
             echo "🔍 Analyzing triggering workflow:"
             echo "   📋 Event: $triggering_event"
             echo "   🌿 Head branch: $head_branch"
-            echo "   📎 Head SHA: ${{ github.event.workflow_run.head_sha }}"
+            echo "   📎 Head SHA: $HEAD_SHA"
 
             # Check if this was triggered by a tag push
             if [[ "$triggering_event" == "push" ]]; then
@@ -158,7 +162,14 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  echo "🧪 Building Docker image for prerelease: $version"
+                  # TODO: 临时修改 - 当前允许 alpha 版本也创建 latest 标签
+                  # 等版本稳定后，需要移除下面这行，恢复原有逻辑（只有稳定版本才创建 latest）
+                  if [[ "$version" == *"alpha"* ]]; then
+                    create_latest=true
+                    echo "🧪 Building Docker image for prerelease: $version (临时允许创建 latest 标签)"
+                  else
+                    echo "🧪 Building Docker image for prerelease: $version"
+                  fi
                 else
                   build_type="release"
                   create_latest=true
@@ -174,10 +185,10 @@ jobs:
             fi
 
             echo "🔄 Build triggered by workflow_run:"
-            echo "   📋 Conclusion: ${{ github.event.workflow_run.conclusion }}"
-            echo "   🌿 Branch: ${{ github.event.workflow_run.head_branch }}"
-            echo "   📎 SHA: ${{ github.event.workflow_run.head_sha }}"
-            echo "   🎯 Event: ${{ github.event.workflow_run.event }}"
+            echo "   📋 Conclusion: $CONCLUSION"
+            echo "   🌿 Branch: $HEAD_BRANCH"
+            echo "   📎 SHA: $HEAD_SHA"
+            echo "   🎯 Event: $TRIGGERING_EVENT"
 
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Manual trigger
@@ -204,7 +215,14 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                echo "🧪 Building with prerelease version: $input_version"
+                # TODO: 临时修改 - 当前允许 alpha 版本也创建 latest 标签
+                # 等版本稳定后，需要移除下面的 if 块，恢复原有逻辑
+                if [[ "$input_version" == *"alpha"* ]]; then
+                  create_latest=true
+                  echo "🧪 Building with prerelease version: $input_version (临时允许创建 latest 标签)"
+                else
+                  echo "🧪 Building with prerelease version: $input_version"
+                fi
                 ;;
               # Release versions (match after prereleases, more general)
               v[0-9]*|[0-9]*.*.*)
@@ -250,7 +268,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -312,7 +330,9 @@ jobs:
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
-            # Stable release
+            # TODO: 临时修改 - 当前 alpha 版本也会创建 latest 标签
+            # 等版本稳定后，这里的逻辑保持不变，但上游的 CREATE_LATEST 设置需要恢复
+            # Stable release (以及临时的 alpha 版本)
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
@@ -382,7 +402,7 @@ jobs:
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
-    needs: [build-check, build-docker]
+    needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -409,7 +429,13 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              echo "🚫 Latest tag NOT created for prerelease"
+              # TODO: 临时修改 - alpha 版本当前会创建 latest 标签
+              # 等版本稳定后，需要恢复下面的提示信息
+              if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tag has been created for alpha version (临时措施)"
+              else
+                echo "🚫 Latest tag NOT created for prerelease"
+              fi
               ;;
             *)
               echo "❌ Unexpected build type: $BUILD_TYPE"

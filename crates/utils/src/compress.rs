@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::io::Write;
+use std::{fmt, str};
 use tokio::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -41,13 +42,13 @@ impl CompressionAlgorithm {
     }
 }
 
-impl std::fmt::Display for CompressionAlgorithm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CompressionAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
-impl std::str::FromStr for CompressionAlgorithm {
-    type Err = std::io::Error;
+impl str::FromStr for CompressionAlgorithm {
+    type Err = io::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
@@ -63,6 +64,16 @@ impl std::str::FromStr for CompressionAlgorithm {
     }
 }
 
+/// Compress a block of data using the specified compression algorithm.
+/// Returns the compressed data as a Vec<u8>.
+///
+/// # Arguments
+/// * `input` - The input data to be compressed.
+/// * `algorithm` - The compression algorithm to use.
+///
+/// # Returns
+/// * A Vec<u8> containing the compressed data.
+///
 pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> {
     match algorithm {
         CompressionAlgorithm::Gzip => {
@@ -105,6 +116,16 @@ pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> 
     }
 }
 
+/// Decompress a block of data using the specified compression algorithm.
+/// Returns the decompressed data as a Vec<u8>.
+///
+/// # Arguments
+/// * `compressed` - The compressed data to be decompressed.
+/// * `algorithm` - The compression algorithm used for compression.
+///
+/// # Returns
+/// * A Result containing a Vec<u8> with the decompressed data, or an io::Error.
+///
 pub fn decompress_block(compressed: &[u8], algorithm: CompressionAlgorithm) -> io::Result<Vec<u8>> {
     match algorithm {
         CompressionAlgorithm::Gzip => {
@@ -289,44 +310,44 @@ mod tests {
             CompressionAlgorithm::Snappy,
         ];
 
-        println!("\n压缩算法基准测试结果:");
+        println!("\nCompression algorithm benchmark results:");
         println!(
             "{:<10} {:<10} {:<15} {:<15} {:<15}",
-            "数据大小", "算法", "压缩时间(ms)", "压缩后大小", "压缩率"
+            "Data Size", "Algorithm", "Compress Time(ms)", "Compressed Size", "Compression Ratio"
         );
 
         for size in sizes {
-            // 生成可压缩的数据（重复的文本模式）
+            // Generate compressible data (repeated text pattern)
             let pattern = b"Hello, this is a test pattern that will be repeated multiple times to create compressible data. ";
             let data: Vec<u8> = pattern.iter().cycle().take(size).copied().collect();
 
             for algo in algorithms {
-                // 压缩测试
+                // Compression test
                 let start = Instant::now();
                 let compressed = compress_block(&data, algo);
-                let compress_time = start.elapsed();
+                let compression_time = start.elapsed();
 
-                // 解压测试
+                // Decompression test
                 let start = Instant::now();
                 let _decompressed = decompress_block(&compressed, algo).unwrap();
-                let _decompress_time = start.elapsed();
+                let _decompression_time = start.elapsed();
 
-                // 计算压缩率
+                // Calculate compression ratio
                 let compression_ratio = (size as f64 / compressed.len() as f64) as f32;
 
                 println!(
                     "{:<10} {:<10} {:<15.2} {:<15} {:<15.2}x",
                     format!("{}KB", size / 1024),
                     algo.as_str(),
-                    compress_time.as_secs_f64() * 1000.0,
+                    compression_time.as_secs_f64() * 1000.0,
                     compressed.len(),
                     compression_ratio
                 );
 
-                // 验证解压结果
+                // Verify decompression result
                 assert_eq!(_decompressed, data);
             }
-            println!(); // 添加空行分隔不同大小的结果
+            println!(); // Add blank line to separate results of different sizes
         }
     }
 }

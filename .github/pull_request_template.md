@@ -19,9 +19,7 @@ Pull Request Template for RustFS
 
 ## Checklist
 - [ ] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
-- [ ] Code is formatted with `cargo fmt --all`
-- [ ] Passed `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] Passed `cargo check --all-targets`
+- [ ] Passed `make pre-commit`
 - [ ] Added/updated necessary tests
 - [ ] Documentation updated (if needed)
 - [ ] CI/CD passed (if applicable)

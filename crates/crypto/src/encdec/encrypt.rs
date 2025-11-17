@@ -43,7 +43,7 @@ pub fn encrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
         if native_aes() {
             encrypt(Aes256Gcm::new_from_slice(&key)?, &salt, id, data)
         } else {
-            encrypt(ChaCha20Poly1305::new_from_slice(&key)?, &salt, id, data)
+            encrypt(chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key)?, &salt, id, data)
         }
     }
 }
@@ -56,16 +56,19 @@ fn encrypt<T: aes_gcm::aead::Aead>(
     data: &[u8],
 ) -> Result<Vec<u8>, crate::Error> {
     use crate::error::Error;
-    use aes_gcm::aead::rand_core::OsRng;
+    use aes_gcm::AeadCore;
+    use aes_gcm::aead::array::Array;
+    use rand::RngCore;
 
-    let nonce = T::generate_nonce(&mut OsRng);
+    let mut nonce: Array<u8, <T as AeadCore>::NonceSize> = Array::default();
+    rand::rng().fill_bytes(&mut nonce);
 
     let encryptor = stream.encrypt(&nonce, data).map_err(Error::ErrEncryptFailed)?;
 
     let mut ciphertext = Vec::with_capacity(salt.len() + 1 + nonce.len() + encryptor.len());
     ciphertext.extend_from_slice(salt);
     ciphertext.push(id as u8);
-    ciphertext.extend_from_slice(nonce.as_slice());
+    ciphertext.extend_from_slice(&nonce);
     ciphertext.extend_from_slice(&encryptor);
 
     Ok(ciphertext)

@@ -20,7 +20,7 @@
 
 use sha2::{Digest, Sha256};
 use std::any::Any;
-use std::io::{Cursor, Write};
+use std::io::Write;
 use xxhash_rust::xxh64;
 
 use super::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
@@ -128,10 +128,9 @@ pub struct Jentry {
 impl ExpiryOp for Jentry {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.tier_name).as_bytes());
-        let _ = hasher.write(format!("{}", self.obj_name).as_bytes());
-        hasher.flush();
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.tier_name).as_bytes());
+        hasher.update(format!("{}", self.obj_name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {

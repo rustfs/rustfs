@@ -28,8 +28,8 @@ name: Build and Release
 
 on:
   push:
-    tags: ["*.*.*"]
-    branches: [main]
+    tags: [ "*.*.*" ]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -45,7 +45,7 @@ on:
       - ".gitignore"
       - ".dockerignore"
   pull_request:
-    branches: [main]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "**.txt"
@@ -70,6 +70,9 @@ on:
         default: true
         type: boolean
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -89,7 +92,7 @@ jobs:
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -153,7 +156,7 @@ jobs:
   # Build RustFS binaries
   build-rustfs:
     name: Build RustFS
-    needs: [build-check]
+    needs: [ build-check ]
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -172,6 +175,14 @@ jobs:
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            platform: linux
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            platform: linux
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -181,18 +192,18 @@ jobs:
             target: x86_64-apple-darwin
             cross: false
             platform: macos
-          # # Windows builds (temporarily disabled)
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   cross: false
-          #   platform: windows
-          # - os: windows-latest
-          #   target: aarch64-pc-windows-msvc
-          #   cross: true
-          #   platform: windows
+          # Windows builds (temporarily disabled)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            platform: windows
+          #- os: windows-latest
+          #  target: aarch64-pc-windows-msvc
+          #  cross: true
+          #  platform: windows
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -207,6 +218,7 @@ jobs:
           install-cross-tools: ${{ matrix.cross }}
 
       - name: Download static console assets
+        shell: bash
         run: |
           mkdir -p ./rustfs/static
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
@@ -232,6 +244,7 @@ jobs:
           fi
 
       - name: Build RustFS
+        shell: bash
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
@@ -260,30 +273,55 @@ jobs:
           # Extract platform and arch from target
           TARGET="${{ matrix.target }}"
           PLATFORM="${{ matrix.platform }}"
-
-          # Map target to architecture
+          # Map target to architecture and variant
           case "$TARGET" in
+            *x86_64*musl*)
+              ARCH="x86_64"
+              VARIANT="musl"
+              ;;
+            *x86_64*gnu*)
+              ARCH="x86_64"
+              VARIANT="gnu"
+              ;;
             *x86_64*)
               ARCH="x86_64"
+              VARIANT=""
+              ;;
+            *aarch64*musl*|*arm64*musl*)
+              ARCH="aarch64"
+              VARIANT="musl"
+              ;;
+            *aarch64*gnu*|*arm64*gnu*)
+              ARCH="aarch64"
+              VARIANT="gnu"
               ;;
             *aarch64*|*arm64*)
               ARCH="aarch64"
+              VARIANT=""
               ;;
             *armv7*)
               ARCH="armv7"
+              VARIANT=""
               ;;
             *)
               ARCH="unknown"
+              VARIANT=""
               ;;
           esac
 
           # Generate package name based on build type
-          if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development build: rustfs-${platform}-${arch}-dev-${short_sha}.zip
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-dev-${SHORT_SHA}"
+          if [[ -n "$VARIANT" ]]; then
+            ARCH_WITH_VARIANT="${ARCH}-${VARIANT}"
           else
-            # Release/Prerelease build: rustfs-${platform}-${arch}-v${version}.zip
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH}-v${VERSION}"
+            ARCH_WITH_VARIANT="${ARCH}"
+          fi
+
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development build: rustfs-${platform}-${arch}-${variant}-dev-${short_sha}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-dev-${SHORT_SHA}"
+          else
+            # Release/Prerelease build: rustfs-${platform}-${arch}-${variant}-v${version}.zip
+            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-v${VERSION}"
           fi
 
           # Create zip packages for all platforms
@@ -295,23 +333,119 @@ jobs:
           fi
 
           cd target/${{ matrix.target }}/release
-          zip "../../../${PACKAGE_NAME}.zip" rustfs
+          # Determine the binary name based on platform
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            BINARY_NAME="rustfs.exe"
+          else
+            BINARY_NAME="rustfs"
+          fi
+
+          # Verify the binary exists before packaging
+          if [[ ! -f "$BINARY_NAME" ]]; then
+            echo "❌ Binary $BINARY_NAME not found in $(pwd)"
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              dir
+            else
+              ls -la
+            fi
+            exit 1
+          fi
+
+          # Universal packaging function
+          package_zip() {
+            local src=$1
+            local dst=$2
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              # Windows uses PowerShell Compress-Archive
+              powershell -Command "Compress-Archive -Path '$src' -DestinationPath '$dst' -Force"
+            elif command -v zip &> /dev/null; then
+              # Unix systems use zip command
+              zip "$dst" "$src"
+            else
+              echo "❌ No zip utility available"
+              exit 1
+            fi
+          }
+
+          # Create the zip package
+          echo "Start packaging: $BINARY_NAME -> ../../../${PACKAGE_NAME}.zip"
+          package_zip "$BINARY_NAME" "../../../${PACKAGE_NAME}.zip"
+
           cd ../../..
+
+          # Verify the package was created
+          if [[ -f "${PACKAGE_NAME}.zip" ]]; then
+            echo "✅ Package created successfully: ${PACKAGE_NAME}.zip"
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              dir
+            else
+              ls -lh ${PACKAGE_NAME}.zip
+            fi
+          else
+            echo "❌ Failed to create package: ${PACKAGE_NAME}.zip"
+            exit 1
+          fi
+
+          # Create latest version files right after the main package
+          LATEST_FILES=""
+          if [[ "$BUILD_TYPE" == "release" ]] || [[ "$BUILD_TYPE" == "prerelease" ]]; then
+            # Create latest version filename
+            # Convert from rustfs-linux-x86_64-musl-v1.0.0 to rustfs-linux-x86_64-musl-latest
+            LATEST_FILE="${PACKAGE_NAME%-v*}-latest.zip"
+
+            echo "🔄 Creating latest version: ${PACKAGE_NAME}.zip -> $LATEST_FILE"
+            cp "${PACKAGE_NAME}.zip" "$LATEST_FILE"
+
+            if [[ -f "$LATEST_FILE" ]]; then
+              echo "✅ Latest version created: $LATEST_FILE"
+              LATEST_FILES="$LATEST_FILE"
+            fi
+          elif [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development builds (only main branch triggers development builds)
+            # Create main-latest version filename
+            # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
+            MAIN_LATEST_FILE="${PACKAGE_NAME%-dev-*}-main-latest.zip"
+
+            echo "🔄 Creating main-latest version: ${PACKAGE_NAME}.zip -> $MAIN_LATEST_FILE"
+            cp "${PACKAGE_NAME}.zip" "$MAIN_LATEST_FILE"
+
+            if [[ -f "$MAIN_LATEST_FILE" ]]; then
+              echo "✅ Main-latest version created: $MAIN_LATEST_FILE"
+              LATEST_FILES="$MAIN_LATEST_FILE"
+
+              # Also create a generic main-latest for Docker builds (Linux only)
+              if [[ "${{ matrix.platform }}" == "linux" ]]; then
+                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${ARCH_WITH_VARIANT}-main-latest.zip"
+
+                echo "🔄 Creating Docker main-latest version: ${PACKAGE_NAME}.zip -> $DOCKER_MAIN_LATEST_FILE"
+                cp "${PACKAGE_NAME}.zip" "$DOCKER_MAIN_LATEST_FILE"
+
+                if [[ -f "$DOCKER_MAIN_LATEST_FILE" ]]; then
+                  echo "✅ Docker main-latest version created: $DOCKER_MAIN_LATEST_FILE"
+                  LATEST_FILES="$LATEST_FILES $DOCKER_MAIN_LATEST_FILE"
+                fi
+              fi
+            fi
+          fi
 
           echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
           echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
+          echo "latest_files=${LATEST_FILES}" >> $GITHUB_OUTPUT
           echo "build_type=${BUILD_TYPE}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
           echo "📦 Package created: ${PACKAGE_NAME}.zip"
+          if [[ -n "$LATEST_FILES" ]]; then
+            echo "📦 Latest files created: $LATEST_FILES"
+          fi
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
 
-      - name: Upload artifacts
+      - name: Upload to GitHub artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.package_name }}
-          path: ${{ steps.package.outputs.package_file }}
+          path: "rustfs-*.zip"
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
       - name: Upload to Aliyun OSS
@@ -321,6 +455,7 @@ jobs:
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
           OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
 
@@ -359,6 +494,16 @@ jobs:
               chmod +x /usr/local/bin/ossutil
               OSSUTIL_BIN=ossutil
               ;;
+            windows)
+              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
+              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
+
+              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+              unzip "$OSSUTIL_ZIP"
+              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
+              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+              OSSUTIL_BIN=./ossutil.exe
+              ;;
           esac
 
           # Determine upload path based on build type
@@ -370,83 +515,27 @@ jobs:
             echo "📤 Uploading release build to OSS release directory"
           fi
 
-          # Upload the package file to OSS
-          echo "Uploading ${{ steps.package.outputs.package_file }} to $OSS_PATH..."
-          $OSSUTIL_BIN cp "${{ steps.package.outputs.package_file }}" "$OSS_PATH" --force
-
-          # For release and prerelease builds, also create a latest version
-          if [[ "$BUILD_TYPE" == "release" ]] || [[ "$BUILD_TYPE" == "prerelease" ]]; then
-            # Extract platform and arch from package name
-            PACKAGE_NAME="${{ steps.package.outputs.package_name }}"
-
-            # Create latest version filename
-            # Convert from rustfs-linux-x86_64-v1.0.0 to rustfs-linux-x86_64-latest
-            LATEST_FILE="${PACKAGE_NAME%-v*}-latest.zip"
-
-            # Copy the original file to latest version
-            cp "${{ steps.package.outputs.package_file }}" "$LATEST_FILE"
-
-            # Upload the latest version
-            echo "Uploading latest version: $LATEST_FILE to $OSS_PATH..."
-            $OSSUTIL_BIN cp "$LATEST_FILE" "$OSS_PATH" --force
-
-            echo "✅ Latest version uploaded: $LATEST_FILE"
-          fi
-
-          # For development builds, create dev-latest version
-          if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Extract platform and arch from package name
-            PACKAGE_NAME="${{ steps.package.outputs.package_name }}"
-
-            # Create dev-latest version filename
-            # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-dev-latest
-            DEV_LATEST_FILE="${PACKAGE_NAME%-*}-latest.zip"
-
-            # Copy the original file to dev-latest version
-            cp "${{ steps.package.outputs.package_file }}" "$DEV_LATEST_FILE"
-
-            # Upload the dev-latest version
-            echo "Uploading dev-latest version: $DEV_LATEST_FILE to $OSS_PATH..."
-            $OSSUTIL_BIN cp "$DEV_LATEST_FILE" "$OSS_PATH" --force
-
-            echo "✅ Dev-latest version uploaded: $DEV_LATEST_FILE"
-
-            # For main branch builds, also create a main-latest version
-            if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-              # Create main-latest version filename
-              # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
-              MAIN_LATEST_FILE="${PACKAGE_NAME%-dev-*}-main-latest.zip"
-
-              # Copy the original file to main-latest version
-              cp "${{ steps.package.outputs.package_file }}" "$MAIN_LATEST_FILE"
-
-              # Upload the main-latest version
-              echo "Uploading main-latest version: $MAIN_LATEST_FILE to $OSS_PATH..."
-              $OSSUTIL_BIN cp "$MAIN_LATEST_FILE" "$OSS_PATH" --force
-
-              echo "✅ Main-latest version uploaded: $MAIN_LATEST_FILE"
-
-              # Also create a generic main-latest for Docker builds
-              if [[ "${{ matrix.platform }}" == "linux" ]]; then
-                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64' || 'aarch64' }}-main-latest.zip"
-
-                cp "${{ steps.package.outputs.package_file }}" "$DOCKER_MAIN_LATEST_FILE"
-                $OSSUTIL_BIN cp "$DOCKER_MAIN_LATEST_FILE" "$OSS_PATH" --force
-                echo "✅ Docker main-latest version uploaded: $DOCKER_MAIN_LATEST_FILE"
-              fi
+          # Upload all rustfs zip files to OSS using glob pattern
+          echo "📤 Uploading all rustfs-*.zip files to $OSS_PATH..."
+          for zip_file in rustfs-*.zip; do
+            if [[ -f "$zip_file" ]]; then
+              echo "Uploading: $zip_file to $OSS_PATH..."
+              $OSSUTIL_BIN cp "$zip_file" "$OSS_PATH" --force
+              echo "✅ Uploaded: $zip_file"
             fi
-          fi
+          done
 
           echo "✅ Upload completed successfully"
 
   # Build summary
   build-summary:
     name: Build Summary
-    needs: [build-check, build-rustfs]
+    needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Build completion summary
+        shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
           VERSION="${{ needs.build-check.outputs.version }}"
@@ -493,7 +582,7 @@ jobs:
   # Create GitHub Release (only for tag pushes)
   create-release:
     name: Create GitHub Release
-    needs: [build-check, build-rustfs]
+    needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
@@ -503,7 +592,7 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -511,6 +600,7 @@ jobs:
         id: create
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
           VERSION="${{ needs.build-check.outputs.version }}"
@@ -578,7 +668,7 @@ jobs:
   # Prepare and upload release assets
   upload-release-assets:
     name: Upload Release Assets
-    needs: [build-check, build-rustfs, create-release]
+    needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
@@ -586,10 +676,10 @@ jobs:
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: ./artifacts
           pattern: rustfs-*
@@ -597,13 +687,14 @@ jobs:
 
       - name: Prepare release assets
         id: prepare
+        shell: bash
         run: |
           VERSION="${{ needs.build-check.outputs.version }}"
           TAG="${{ needs.build-check.outputs.version }}"
 
           mkdir -p ./release-assets
 
-          # Copy and verify artifacts
+          # Copy and verify artifacts (including latest files created during build)
           ASSETS_COUNT=0
           for file in ./artifacts/*.zip; do
             if [[ -f "$file" ]]; then
@@ -619,7 +710,7 @@ jobs:
 
           cd ./release-assets
 
-          # Generate checksums
+          # Generate checksums for all files (including latest versions)
           if ls *.zip >/dev/null 2>&1; then
             sha256sum *.zip > SHA256SUMS
             sha512sum *.zip > SHA512SUMS
@@ -634,11 +725,12 @@ jobs:
           echo "📦 Prepared assets:"
           ls -la
 
-          echo "🔢 Asset count: $ASSETS_COUNT"
+          echo "🔢 Total asset count: $ASSETS_COUNT"
 
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
 
@@ -657,14 +749,17 @@ jobs:
   # Update latest.json for stable releases only
   update-latest-version:
     name: Update Latest Version
-    needs: [build-check, upload-release-assets]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.is_prerelease == 'false'
+    needs: [ build-check, upload-release-assets ]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        shell: bash
         run: |
           if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
             echo "⚠️ OSS credentials not available, skipping latest.json update"
@@ -681,7 +776,9 @@ jobs:
 
           curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
           unzip "$OSSUTIL_ZIP"
-          chmod +x "${OSSUTIL_DIR}/ossutil"
+          mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+          rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+          chmod +x /usr/local/bin/ossutil
 
           # Create latest.json
           cat > latest.json << EOF
@@ -695,25 +792,26 @@ jobs:
           EOF
 
           # Upload to OSS
-          ./${OSSUTIL_DIR}/ossutil cp latest.json oss://rustfs-version/latest.json --force
+          ossutil cp latest.json oss://rustfs-version/latest.json --force
 
           echo "✅ Updated latest.json for stable release $VERSION"
 
   # Publish release (remove draft status)
   publish-release:
     name: Publish Release
-    needs: [build-check, create-release, upload-release-assets]
+    needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Update release notes and publish
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ needs.build-check.outputs.version }}"
           VERSION="${{ needs.build-check.outputs.version }}"

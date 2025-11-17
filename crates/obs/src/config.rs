@@ -12,38 +12,68 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_FILENAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB,
-    DEFAULT_LOG_ROTATION_TIME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+use rustfs_config::observability::{
+    DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_ENDPOINT,
+    ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME,
+    ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_SAMPLE_RATIO,
+    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_USE_STDOUT,
 };
+use rustfs_config::{
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
+    DEFAULT_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION,
+    USE_STDOUT,
+};
+use rustfs_utils::dirs::get_log_directory_to_string;
+use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
 use serde::{Deserialize, Serialize};
 use std::env;
 
-/// OpenTelemetry Configuration
-/// Add service name, service version, environment
-/// Add interval time for metric collection
-/// Add sample ratio for trace sampling
-/// Add endpoint for metric collection
-/// Add use_stdout for output to stdout
-/// Add logger level for log level
-/// Add local_logging_enabled for local logging enabled
+/// Observability: OpenTelemetry configuration
+/// # Fields
+/// * `endpoint`: Endpoint for metric collection
+/// * `use_stdout`: Output to stdout
+/// * `sample_ratio`: Trace sampling ratio
+/// * `meter_interval`: Metric collection interval
+/// * `service_name`: Service name
+/// * `service_version`: Service version
+/// * `environment`: Environment
+/// * `logger_level`: Logger level
+/// * `local_logging_enabled`: Local logging enabled
+/// # Added flexi_logger related configurations
+/// * `log_directory`: Log file directory
+/// * `log_filename`: The name of the log file
+/// * `log_rotation_size_mb`: Log file size cut threshold (MB)
+/// * `log_rotation_time`: Logs are cut by time (Hour,Day,Minute,Second)
+/// * `log_keep_files`: Number of log files to be retained
+/// # Returns
+/// A new instance of OtelConfig
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::OtelConfig;
+///
+/// let config = OtelConfig::new();
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
-    pub endpoint: String,                    // Endpoint for metric collection
-    pub use_stdout: Option<bool>,            // Output to stdout
-    pub sample_ratio: Option<f64>,           // Trace sampling ratio
-    pub meter_interval: Option<u64>,         // Metric collection interval
-    pub service_name: Option<String>,        // Service name
-    pub service_version: Option<String>,     // Service version
-    pub environment: Option<String>,         // Environment
-    pub logger_level: Option<String>,        // Logger level
-    pub local_logging_enabled: Option<bool>, // Local logging enabled
+    pub endpoint: String,                 // Endpoint for metric collection
+    pub trace_endpoint: Option<String>,   // Endpoint for trace collection
+    pub metric_endpoint: Option<String>,  // Endpoint for metric collection
+    pub log_endpoint: Option<String>,     // Endpoint for log collection
+    pub use_stdout: Option<bool>,         // Output to stdout
+    pub sample_ratio: Option<f64>,        // Trace sampling ratio
+    pub meter_interval: Option<u64>,      // Metric collection interval
+    pub service_name: Option<String>,     // Service name
+    pub service_version: Option<String>,  // Service version
+    pub environment: Option<String>,      // Environment
+    pub logger_level: Option<String>,     // Logger level
+    pub log_stdout_enabled: Option<bool>, // Stdout logging enabled
     // Added flexi_logger related configurations
     pub log_directory: Option<String>,     // LOG FILE DIRECTORY
     pub log_filename: Option<String>,      // The name of the log file
     pub log_rotation_size_mb: Option<u64>, // Log file size cut threshold (MB)
     pub log_rotation_time: Option<String>, // Logs are cut by time (Hour， Day，Minute， Second)
-    pub log_keep_files: Option<u16>,       // Number of log files to be retained
+    pub log_keep_files: Option<usize>,     // Number of log files to be retained
 }
 
 impl OtelConfig {
@@ -51,72 +81,36 @@ impl OtelConfig {
     pub fn extract_otel_config_from_env(endpoint: Option<String>) -> OtelConfig {
         let endpoint = if let Some(endpoint) = endpoint {
             if endpoint.is_empty() {
-                env::var("RUSTFS_OBS_ENDPOINT").unwrap_or_else(|_| "".to_string())
+                env::var(ENV_OBS_ENDPOINT).unwrap_or_else(|_| "".to_string())
             } else {
                 endpoint
             }
         } else {
-            env::var("RUSTFS_OBS_ENDPOINT").unwrap_or_else(|_| "".to_string())
+            env::var(ENV_OBS_ENDPOINT).unwrap_or_else(|_| "".to_string())
         };
-        let mut use_stdout = env::var("RUSTFS_OBS_USE_STDOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(USE_STDOUT));
+        let mut use_stdout = get_env_bool(ENV_OBS_USE_STDOUT, USE_STDOUT);
         if endpoint.is_empty() {
-            use_stdout = Some(true);
+            use_stdout = true;
         }
 
         OtelConfig {
             endpoint,
-            use_stdout,
-            sample_ratio: env::var("RUSTFS_OBS_SAMPLE_RATIO")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(SAMPLE_RATIO)),
-            meter_interval: env::var("RUSTFS_OBS_METER_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(METER_INTERVAL)),
-            service_name: env::var("RUSTFS_OBS_SERVICE_NAME")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(APP_NAME.to_string())),
-            service_version: env::var("RUSTFS_OBS_SERVICE_VERSION")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(SERVICE_VERSION.to_string())),
-            environment: env::var("RUSTFS_OBS_ENVIRONMENT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(ENVIRONMENT.to_string())),
-            logger_level: env::var("RUSTFS_OBS_LOGGER_LEVEL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_LEVEL.to_string())),
-            local_logging_enabled: env::var("RUSTFS_OBS_LOCAL_LOGGING_ENABLED")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(false)),
-            log_directory: env::var("RUSTFS_OBS_LOG_DIRECTORY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_DIR.to_string())),
-            log_filename: env::var("RUSTFS_OBS_LOG_FILENAME")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_FILENAME.to_string())),
-            log_rotation_size_mb: env::var("RUSTFS_OBS_LOG_ROTATION_SIZE_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
-            log_rotation_time: env::var("RUSTFS_OBS_LOG_ROTATION_TIME")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_ROTATION_TIME.to_string())), // Default to "Day"
-            log_keep_files: env::var("RUSTFS_OBS_LOG_KEEP_FILES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
+            trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
+            metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
+            log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
+            use_stdout: Some(use_stdout),
+            sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
+            meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
+            service_name: Some(get_env_str(ENV_OBS_SERVICE_NAME, APP_NAME)),
+            service_version: Some(get_env_str(ENV_OBS_SERVICE_VERSION, SERVICE_VERSION)),
+            environment: Some(get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT)),
+            logger_level: Some(get_env_str(ENV_OBS_LOGGER_LEVEL, DEFAULT_LOG_LEVEL)),
+            log_stdout_enabled: Some(get_env_bool(ENV_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOG_STDOUT_ENABLED)),
+            log_directory: Some(get_log_directory_to_string(ENV_OBS_LOG_DIRECTORY)),
+            log_filename: Some(get_env_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
+            log_rotation_size_mb: Some(get_env_u64(ENV_OBS_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
+            log_rotation_time: Some(get_env_str(ENV_OBS_LOG_ROTATION_TIME, DEFAULT_LOG_ROTATION_TIME)), // Default to "Hour"
+            log_keep_files: Some(get_env_usize(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
         }
     }
 
@@ -124,179 +118,38 @@ impl OtelConfig {
     ///
     /// # Returns
     /// A new instance of OtelConfig
+    ///
+    /// # Example
+    /// ```no_run
+    /// use rustfs_obs::OtelConfig;
+    ///
+    /// let config = OtelConfig::new();
+    /// ```
     pub fn new() -> Self {
         Self::extract_otel_config_from_env(None)
     }
 }
 
+/// Implement Default trait for OtelConfig
+/// This allows creating a default instance of OtelConfig using OtelConfig::default()
+/// which internally calls OtelConfig::new()
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::OtelConfig;
+///
+/// let config = OtelConfig::default();
+/// ```
 impl Default for OtelConfig {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Kafka Sink Configuration - Add batch parameters
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct KafkaSinkConfig {
-    pub brokers: String,
-    pub topic: String,
-    pub batch_size: Option<usize>,     // Batch size, default 100
-    pub batch_timeout_ms: Option<u64>, // Batch timeout time, default 1000ms
-}
-
-impl KafkaSinkConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for KafkaSinkConfig {
-    fn default() -> Self {
-        Self {
-            brokers: env::var("RUSTFS_SINKS_KAFKA_BROKERS")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "localhost:9092".to_string()),
-            topic: env::var("RUSTFS_SINKS_KAFKA_TOPIC")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "rustfs_sink".to_string()),
-            batch_size: Some(100),
-            batch_timeout_ms: Some(1000),
-        }
-    }
-}
-
-/// Webhook Sink Configuration - Add Retry Parameters
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct WebhookSinkConfig {
-    pub endpoint: String,
-    pub auth_token: String,
-    pub max_retries: Option<usize>,  // Maximum number of retry times, default 3
-    pub retry_delay_ms: Option<u64>, // Retry the delay cardinality, default 100ms
-}
-
-impl WebhookSinkConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for WebhookSinkConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: env::var("RUSTFS_SINKS_WEBHOOK_ENDPOINT")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "http://localhost:8080".to_string()),
-            auth_token: env::var("RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "rustfs_webhook_token".to_string()),
-            max_retries: Some(3),
-            retry_delay_ms: Some(100),
-        }
-    }
-}
-
-/// File Sink Configuration - Add buffering parameters
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct FileSinkConfig {
-    pub path: String,
-    pub buffer_size: Option<usize>,     // Write buffer size, default 8192
-    pub flush_interval_ms: Option<u64>, // Refresh interval time, default 1000ms
-    pub flush_threshold: Option<usize>, // Refresh threshold, default 100 logs
-}
-
-impl FileSinkConfig {
-    pub fn get_default_log_path() -> String {
-        let temp_dir = env::temp_dir().join("rustfs");
-
-        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-            eprintln!("Failed to create log directory: {e}");
-            return "rustfs/rustfs.log".to_string();
-        }
-        temp_dir
-            .join("rustfs.log")
-            .to_str()
-            .unwrap_or("rustfs/rustfs.log")
-            .to_string()
-    }
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for FileSinkConfig {
-    fn default() -> Self {
-        Self {
-            path: env::var("RUSTFS_SINKS_FILE_PATH")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(Self::get_default_log_path),
-            buffer_size: env::var("RUSTFS_SINKS_FILE_BUFFER_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(8192)),
-            flush_interval_ms: env::var("RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(1000)),
-            flush_threshold: env::var("RUSTFS_SINKS_FILE_FLUSH_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(Some(100)),
-        }
-    }
-}
-
-/// Sink configuration collection
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SinkConfig {
-    File(FileSinkConfig),
-    Kafka(KafkaSinkConfig),
-    Webhook(WebhookSinkConfig),
-}
-
-impl SinkConfig {
-    pub fn new() -> Self {
-        Self::File(FileSinkConfig::new())
-    }
-}
-
-impl Default for SinkConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-///Logger Configuration
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct LoggerConfig {
-    pub queue_capacity: Option<usize>,
-}
-
-impl LoggerConfig {
-    pub fn new() -> Self {
-        Self {
-            queue_capacity: Some(10000),
-        }
-    }
-}
-
-impl Default for LoggerConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Overall application configuration
-/// Add observability, sinks, and logger configuration
+/// Add observability configuration
 ///
 /// Observability: OpenTelemetry configuration
-/// Sinks: Kafka, Webhook, File sink configuration
-/// Logger: Logger configuration
 ///
 /// # Example
 /// ```
@@ -307,8 +160,6 @@ impl Default for LoggerConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub observability: OtelConfig,
-    pub sinks: Vec<SinkConfig>,
-    pub logger: Option<LoggerConfig>,
 }
 
 impl AppConfig {
@@ -319,23 +170,51 @@ impl AppConfig {
     pub fn new() -> Self {
         Self {
             observability: OtelConfig::default(),
-            sinks: vec![SinkConfig::default()],
-            logger: Some(LoggerConfig::default()),
         }
     }
 
+    /// Create a new instance of AppConfig with specified endpoint
+    ///
+    /// # Arguments
+    /// * `endpoint` - An optional string representing the endpoint for metric collection
+    ///
+    /// # Returns
+    /// A new instance of AppConfig
+    ///
+    /// # Example
+    /// ```no_run
+    /// use rustfs_obs::AppConfig;
+    ///
+    /// let config = AppConfig::new_with_endpoint(Some("http://localhost:4317".to_string()));
+    /// ```
     pub fn new_with_endpoint(endpoint: Option<String>) -> Self {
         Self {
             observability: OtelConfig::extract_otel_config_from_env(endpoint),
-            sinks: vec![SinkConfig::new()],
-            logger: Some(LoggerConfig::new()),
         }
     }
 }
 
-// implement default for AppConfig
+/// Implement Default trait for AppConfig
+/// This allows creating a default instance of AppConfig using AppConfig::default()
+/// which internally calls AppConfig::new()
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::AppConfig;
+///
+/// let config = AppConfig::default();
+/// ```
 impl Default for AppConfig {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check if the current environment is production
+///
+/// # Returns
+/// true if production, false otherwise
+///
+pub fn is_production_environment() -> bool {
+    get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
 }

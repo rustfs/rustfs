@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
-
-use chrono::Utc;
-use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr};
-use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
-use rustfs_utils::os::get_drive_stats;
-use serde::{Deserialize, Serialize};
-use tracing::info;
-
 use crate::{
     admin_server_info::get_local_server_property,
-    heal::{
-        data_scanner_metric::globalScannerMetrics,
-        heal_commands::{DRIVE_STATE_OK, DRIVE_STATE_UNFORMATTED},
-    },
     new_object_layer_fn,
     store_api::StorageAPI,
     // utils::os::get_drive_stats,
 };
+use chrono::Utc;
+use rustfs_common::{
+    globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr},
+    heal_channel::DriveState,
+    metrics::global_metrics,
+};
+use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
+use rustfs_utils::os::get_drive_stats;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, info};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CollectMetricsOpts {
@@ -44,7 +42,7 @@ pub struct CollectMetricsOpts {
 pub struct MetricType(u32);
 
 impl MetricType {
-    // 定义一些常量
+    // Define some constants
     pub const NONE: MetricType = MetricType(0);
     pub const SCANNER: MetricType = MetricType(1 << 0);
     pub const DISK: MetricType = MetricType(1 << 1);
@@ -70,8 +68,18 @@ impl MetricType {
     }
 }
 
+/// Collect local metrics based on the specified types and options.
+///
+/// # Arguments
+///
+/// * `types` - A `MetricType` specifying which types of metrics to collect.
+/// * `opts` - A reference to `CollectMetricsOpts` containing additional options for metric collection.
+///
+/// # Returns
+/// * A `RealtimeMetrics` struct containing the collected metrics.
+///
 pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts) -> RealtimeMetrics {
-    info!("collect_local_metrics");
+    debug!("collect_local_metrics");
     let mut real_time_metrics = RealtimeMetrics::default();
     if types.0 == MetricType::NONE.0 {
         info!("types is None, return");
@@ -93,13 +101,13 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     }
 
     if types.contains(&MetricType::DISK) {
-        info!("start get disk metrics");
+        debug!("start get disk metrics");
         let mut aggr = DiskMetric {
             collected_at: Utc::now(),
             ..Default::default()
         };
         for (name, disk) in collect_local_disks_metrics(&opts.disks).await.into_iter() {
-            info!("got disk metric, name: {name}, metric: {disk:?}");
+            debug!("got disk metric, name: {name}, metric: {disk:?}");
             real_time_metrics.by_disk.insert(name, disk.clone());
             aggr.merge(&disk);
         }
@@ -107,8 +115,8 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     }
 
     if types.contains(&MetricType::SCANNER) {
-        info!("start get scanner metrics");
-        let metrics = globalScannerMetrics.report().await;
+        debug!("start get scanner metrics");
+        let metrics = global_metrics().report().await;
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
 
@@ -147,7 +155,7 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
             continue;
         }
 
-        if d.state != *DRIVE_STATE_OK && d.state != *DRIVE_STATE_UNFORMATTED {
+        if d.state != DriveState::Ok.to_string() && d.state != DriveState::Unformatted.to_string() {
             metrics.insert(
                 d.endpoint.clone(),
                 DiskMetric {

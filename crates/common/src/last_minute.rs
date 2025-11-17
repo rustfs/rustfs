@@ -27,11 +27,11 @@ struct TimedAction {
 #[allow(dead_code)]
 impl TimedAction {
     // Avg returns the average time spent on the action.
-    pub fn avg(&self) -> Option<std::time::Duration> {
+    pub fn avg(&self) -> Option<Duration> {
         if self.count == 0 {
             return None;
         }
-        Some(std::time::Duration::from_nanos(self.acc_time / self.count))
+        Some(Duration::from_nanos(self.acc_time / self.count))
     }
 
     // AvgBytes returns the average bytes processed.
@@ -844,7 +844,7 @@ mod tests {
     }
 }
 
-const SIZE_LAST_ELEM_MARKER: usize = 10; // 这里假设你的 marker 是 10，请根据实际情况修改
+const SIZE_LAST_ELEM_MARKER: usize = 10; // Assumed marker size is 10, modify according to actual situation
 
 #[allow(dead_code)]
 #[derive(Debug, Default)]
@@ -860,7 +860,7 @@ impl LastMinuteHistogram {
         }
     }
 
-    pub fn add(&mut self, size: i64, t: std::time::Duration) {
+    pub fn add(&mut self, size: i64, t: Duration) {
         let index = size_to_tag(size);
         self.histogram[index].add(&t);
     }

@@ -83,7 +83,7 @@ pub fn put_uvarint_len(x: u64) -> usize {
     i + 1
 }
 
-/// Decodes a u64 from buf and returns (value, number of bytes read).
+/// Decodes an u64 from buf and returns (value, number of bytes read).
 /// If buf is too small, returns (0, 0).
 /// If overflow, returns (0, -(n as isize)), where n is the number of bytes read.
 pub fn uvarint(buf: &[u8]) -> (u64, isize) {
@@ -110,6 +110,7 @@ pub fn uvarint(buf: &[u8]) -> (u64, isize) {
 mod tests {
     use super::*;
     use tokio::io::BufReader;
+    use tracing::debug;
 
     #[tokio::test]
     async fn test_read_full_exact() {
@@ -130,7 +131,7 @@ mod tests {
             rev[total - n..total].copy_from_slice(&buf[..n]);
 
             count += 1;
-            println!("count: {count}, total: {total}, n: {n}");
+            debug!("Read progress - count: {}, total: {}, bytes read: {}", count, total, n);
         }
         assert_eq!(total, size);
 

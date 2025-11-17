@@ -30,7 +30,8 @@ use s3s::header::{
     X_AMZ_STORAGE_CLASS, X_AMZ_WEBSITE_REDIRECT_LOCATION,
 };
 //use crate::disk::{BufferReader, Reader};
-use crate::checksum::ChecksumMode;
+use crate::client::checksum::ChecksumMode;
+use crate::client::utils::base64_encode;
 use crate::client::{
     api_error_response::{err_entity_too_large, err_invalid_argument},
     api_put_object_common::optimal_part_info,
@@ -41,7 +42,6 @@ use crate::client::{
     transition_api::{ReaderImpl, TransitionClient, UploadInfo},
     utils::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},
 };
-use rustfs_utils::crypto::base64_encode;
 
 #[derive(Debug, Clone)]
 pub struct AdvancedPutOptions {
@@ -85,7 +85,7 @@ pub struct PutObjectOptions {
     pub expires: OffsetDateTime,
     pub mode: ObjectLockRetentionMode,
     pub retain_until_date: OffsetDateTime,
-    //pub server_side_encryption: encrypt.ServerSide,
+    //pub server_side_encryption: encrypt::ServerSide,
     pub num_threads: u64,
     pub storage_class: String,
     pub website_redirect_location: String,
@@ -135,7 +135,7 @@ impl Default for PutObjectOptions {
 
 #[allow(dead_code)]
 impl PutObjectOptions {
-    fn set_matche_tag(&mut self, etag: &str) {
+    fn set_match_etag(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
                 .insert("If-Match", HeaderValue::from_str("*").expect("err"));
@@ -145,7 +145,7 @@ impl PutObjectOptions {
         }
     }
 
-    fn set_matche_tag_except(&mut self, etag: &str) {
+    fn set_match_etag_except(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
                 .insert("If-None-Match", HeaderValue::from_str("*").expect("err"));
@@ -181,7 +181,7 @@ impl PutObjectOptions {
             header.insert(
                 "Expires",
                 HeaderValue::from_str(&self.expires.format(ISO8601_DATEFORMAT).unwrap()).expect("err"),
-            ); //rustfs invalid heade
+            ); //rustfs invalid header
         }
 
         if self.mode.as_str() != "" {
@@ -366,7 +366,8 @@ impl TransitionClient {
                 md5_base64 = base64_encode(hash.as_ref());
             } else {
                 let mut crc = opts.auto_checksum.hasher()?;
-                let csum = crc.hash_encode(&buf[..length]);
+                crc.update(&buf[..length]);
+                let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
                     custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));

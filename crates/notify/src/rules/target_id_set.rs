@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::arn::TargetID;
-use std::collections::HashSet;
+use hashbrown::HashSet;
+use rustfs_targets::arn::TargetID;
 
 /// TargetIDSet - A collection representation of TargetID.
 pub type TargetIdSet = HashSet<TargetID>;

@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 
 #[async_trait::async_trait]
 pub trait Store: Clone + Send + Sync + 'static {
+    fn has_watcher(&self) -> bool;
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()>;
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item>;
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
@@ -62,8 +63,12 @@ pub trait Store: Clone + Send + Sync + 'static {
         is_group: bool,
         m: &mut HashMap<String, MappedPolicy>,
     ) -> Result<()>;
-    async fn load_mapped_policys(&self, user_type: UserType, is_group: bool, m: &mut HashMap<String, MappedPolicy>)
-    -> Result<()>;
+    async fn load_mapped_policies(
+        &self,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+    ) -> Result<()>;
 
     async fn load_all(&self, cache: &Cache) -> Result<()>;
 }
@@ -83,6 +88,24 @@ impl UserType {
             UserType::Sts => "sts/",
             UserType::Reg => "users/",
             UserType::None => "",
+        }
+    }
+    pub fn to_u64(&self) -> u64 {
+        match self {
+            UserType::Svc => 1,
+            UserType::Sts => 2,
+            UserType::Reg => 3,
+            UserType::None => 0,
+        }
+    }
+
+    pub fn from_u64(u64: u64) -> Option<Self> {
+        match u64 {
+            1 => Some(UserType::Svc),
+            2 => Some(UserType::Sts),
+            3 => Some(UserType::Reg),
+            0 => Some(UserType::None),
+            _ => None,
         }
     }
 }

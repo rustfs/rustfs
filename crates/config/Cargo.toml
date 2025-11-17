@@ -26,16 +26,14 @@ categories = ["web-programming", "development-tools", "config"]
 
 [dependencies]
 const-str = { workspace = true, optional = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-
 
 [lints]
 workspace = true
 
 [features]
-default = []
+default = ["constants"]
+audit = ["dep:const-str", "constants"]
 constants = ["dep:const-str"]
-notify = ["dep:const-str"]
-observability = []
-
+notify = ["dep:const-str", "constants"]
+observability = ["constants"]
+opa = ["constants"]

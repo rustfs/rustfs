@@ -12,7 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod user_agent;
-
-pub use user_agent::ServiceType;
-pub use user_agent::get_user_agent;
+pub(crate) mod user_agent;

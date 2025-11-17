@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{error::BucketMetadataError, metadata_sys::get_bucket_metadata_sys};
-use crate::error::Result;
+use super::metadata_sys::get_bucket_metadata_sys;
+use crate::error::{Result, StorageError};
 use rustfs_policy::policy::{BucketPolicy, BucketPolicyArgs};
-use tracing::warn;
+use tracing::info;
 
 pub struct PolicySys {}
 
@@ -24,9 +24,8 @@ impl PolicySys {
         match Self::get(args.bucket).await {
             Ok(cfg) => return cfg.is_allowed(args),
             Err(err) => {
-                let berr: BucketMetadataError = err.into();
-                if berr != BucketMetadataError::BucketPolicyNotFound {
-                    warn!("config get err {:?}", berr);
+                if err != StorageError::ConfigNotFound {
+                    info!("config get err {:?}", err);
                 }
             }
         }

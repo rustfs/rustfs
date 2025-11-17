@@ -15,18 +15,18 @@
 use const_str::concat;
 
 /// Application name
-/// Default value: RustFs
+/// Default value: RustFS
 /// Environment variable: RUSTFS_APP_NAME
-pub const APP_NAME: &str = "RustFs";
+pub const APP_NAME: &str = "RustFS";
 /// Application version
 /// Default value: 1.0.0
 /// Environment variable: RUSTFS_VERSION
-pub const VERSION: &str = "0.0.1";
+pub const VERSION: &str = "1.0.0";
 
 /// Default configuration logger level
-/// Default value: info
+/// Default value: error
 /// Environment variable: RUSTFS_LOG_LEVEL
-pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_LOG_LEVEL: &str = "error";
 
 /// Default configuration use stdout
 /// Default value: false
@@ -40,21 +40,14 @@ pub const SAMPLE_RATIO: f64 = 1.0;
 pub const METER_INTERVAL: u64 = 30;
 
 /// Default configuration service version
-/// Default value: 0.0.1
-pub const SERVICE_VERSION: &str = "0.0.1";
+/// Default value: 1.0.0
+/// Environment variable: RUSTFS_OBS_SERVICE_VERSION
+/// Uses the same value as VERSION constant
+pub const SERVICE_VERSION: &str = "1.0.0";
 
 /// Default configuration environment
 /// Default value: production
 pub const ENVIRONMENT: &str = "production";
-
-/// maximum number of connections
-/// This is the maximum number of connections that the server will accept.
-/// This is used to limit the number of connections to the server.
-pub const MAX_CONNECTIONS: usize = 100;
-/// timeout for connections
-/// This is the timeout for connections to the server.
-/// This is used to limit the time that a connection can be open.
-pub const DEFAULT_TIMEOUT_MS: u64 = 3000;
 
 /// Default Access Key
 /// Default value: rustfsadmin
@@ -70,6 +63,16 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: RUSTFS_SECRET_KEY=rustfsadmin
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+
+/// Default console enable
+/// This is the default value for the console server.
+/// It is used to enable or disable the console server.
+/// Default value: true
+/// Environment variable: RUSTFS_CONSOLE_ENABLE
+/// Command line argument: --console-enable
+/// Example: RUSTFS_CONSOLE_ENABLE=true
+/// Example: --console-enable true
+pub const DEFAULT_CONSOLE_ENABLE: bool = true;
 
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
@@ -108,35 +111,55 @@ pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
 /// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
-pub const DEFAULT_LOG_FILENAME: &str = "rustfs.log";
+pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
+
+/// Default OBS log filename for rustfs
+/// This is the default log filename for OBS.
+/// It is used to store the logs of the application.
+/// Default value: rustfs.log
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, "");
 
 /// Default log directory for rustfs
 /// This is the default log directory for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: logs
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
-pub const DEFAULT_LOG_DIR: &str = "deploy/logs";
+/// Environment variable: RUSTFS_LOG_DIRECTORY
+pub const DEFAULT_LOG_DIR: &str = "logs";
 
 /// Default log rotation size mb for rustfs
 /// This is the default log rotation size for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: 100 MB
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_SIZE_MB
 pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
 /// Default value: hour, eg: day,hour,minute,second
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME
-pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
+/// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
+pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
 /// It is used to keep the logs of the application.
 /// Default value: 30
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_KEEP_FILES
-pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
+/// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
+pub const DEFAULT_LOG_KEEP_FILES: usize = 30;
+
+/// Default log local logging enabled for rustfs
+/// This is the default log local logging enabled for rustfs.
+/// It is used to enable or disable local logging of the application.
+/// Default value: false
+/// Environment variable: RUSTFS_OBS_LOGL_STDOUT_ENABLED
+pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
+
+/// Constant representing 1 Kibibyte (1024 bytes)
+/// Default value: 1024
+pub const KI_B: usize = 1024;
+/// Constant representing 1 Mebibyte (1024 * 1024 bytes)
+/// Default value: 1048576
+pub const MI_B: usize = 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -145,19 +168,19 @@ mod tests {
     #[test]
     fn test_app_basic_constants() {
         // Test application basic constants
-        assert_eq!(APP_NAME, "RustFs");
+        assert_eq!(APP_NAME, "RustFS");
         assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
 
-        assert_eq!(VERSION, "0.0.1");
+        assert_eq!(VERSION, "1.0.0");
 
-        assert_eq!(SERVICE_VERSION, "0.0.1");
+        assert_eq!(SERVICE_VERSION, "1.0.0");
         assert_eq!(VERSION, SERVICE_VERSION, "Version and service version should be consistent");
     }
 
     #[test]
     fn test_logging_constants() {
         // Test logging related constants
-        assert_eq!(DEFAULT_LOG_LEVEL, "info");
+        assert_eq!(DEFAULT_LOG_LEVEL, "error");
         assert!(
             ["trace", "debug", "info", "warn", "error"].contains(&DEFAULT_LOG_LEVEL),
             "Log level should be a valid tracing level"
@@ -176,14 +199,6 @@ mod tests {
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"
         );
-    }
-
-    #[test]
-    fn test_connection_constants() {
-        // Test connection related constants
-        assert_eq!(MAX_CONNECTIONS, 100);
-
-        assert_eq!(DEFAULT_TIMEOUT_MS, 3000);
     }
 
     #[test]
@@ -288,8 +303,8 @@ mod tests {
         // assert!(DEFAULT_TIMEOUT_MS < u64::MAX, "Timeout should be reasonable");
 
         // These are const non-zero values, so zero checks are redundant
-        // assert!(DEFAULT_PORT != 0, "Default port should not be zero");
-        // assert!(DEFAULT_CONSOLE_PORT != 0, "Console port should not be zero");
+        assert_ne!(DEFAULT_PORT, 0, "Default port should not be zero");
+        assert_ne!(DEFAULT_CONSOLE_PORT, 0, "Console port should not be zero");
     }
 
     #[test]

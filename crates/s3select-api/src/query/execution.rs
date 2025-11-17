@@ -53,9 +53,9 @@ pub trait QueryExecution: Send + Sync {
     fn query_type(&self) -> QueryType {
         QueryType::Batch
     }
-    // 开始
+    // Start
     async fn start(&self) -> QueryResult<Output>;
-    // 停止
+    // Stop
     fn cancel(&self) -> QueryResult<()>;
 }
 
@@ -157,7 +157,7 @@ impl QueryStateMachine {
 
     pub fn begin_optimize(&self) {
         // TODO record time
-        self.translate_to(Box::new(QueryState::RUNNING(RUNNING::OPTMIZING)));
+        self.translate_to(Box::new(QueryState::RUNNING(RUNNING::OPTIMIZING)));
     }
 
     pub fn end_optimize(&self) {
@@ -222,7 +222,7 @@ impl AsRef<str> for QueryState {
 pub enum RUNNING {
     DISPATCHING,
     ANALYZING,
-    OPTMIZING,
+    OPTIMIZING,
     SCHEDULING,
 }
 
@@ -231,7 +231,7 @@ impl AsRef<str> for RUNNING {
         match self {
             Self::DISPATCHING => "DISPATCHING",
             Self::ANALYZING => "ANALYZING",
-            Self::OPTMIZING => "OPTMIZING",
+            Self::OPTIMIZING => "OPTIMIZING",
             Self::SCHEDULING => "SCHEDULING",
         }
     }

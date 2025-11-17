@@ -12,23 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
 use crate::{
     disk::endpoint::Endpoint,
     global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
-    heal::{
-        data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend},
-        data_usage_cache::DataUsageCache,
-        heal_commands::{DRIVE_STATE_OK, DRIVE_STATE_UNFORMATTED},
-    },
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     store_api::StorageAPI,
 };
-use rustfs_common::{
-    // error::{Error, Result},
-    globals::GLOBAL_Local_Node_Name,
-};
+
+use crate::data_usage::load_data_usage_cache;
+use rustfs_common::{globals::GLOBAL_Local_Node_Name, heal_channel::DriveState};
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
 };
@@ -39,15 +34,18 @@ use rustfs_protos::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use time::OffsetDateTime;
+use tokio::time::timeout;
 use tonic::Request;
 use tracing::warn;
 
 use shadow_rs::shadow;
 
 shadow!(build);
+
+const SERVER_PING_TIMEOUT: Duration = Duration::from_secs(1);
 
 // pub const ITEM_OFFLINE: &str = "offline";
 // pub const ITEM_INITIALIZING: &str = "initializing";
@@ -88,42 +86,45 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
         endpoint.url.host_str().unwrap(),
         endpoint.url.port().unwrap()
     );
-    let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let payload = fbb.create_vector(b"hello world");
 
-    let mut builder = PingBodyBuilder::new(&mut fbb);
-    builder.add_payload(payload);
-    let root = builder.finish();
-    fbb.finish(root, None);
+    let ping_task = async {
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let payload = fbb.create_vector(b"hello world");
 
-    let finished_data = fbb.finished_data();
+        let mut builder = PingBodyBuilder::new(&mut fbb);
+        builder.add_payload(payload);
+        let root = builder.finish();
+        fbb.finish(root, None);
 
-    let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
-    assert!(decoded_payload.is_ok());
+        let finished_data = fbb.finished_data();
 
-    // 创建客户端
-    let mut client = node_service_time_out_client(&addr)
+        let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
+        assert!(decoded_payload.is_ok());
+
+        let mut client = node_service_time_out_client(&addr)
+            .await
+            .map_err(|err| Error::other(err.to_string()))?;
+
+        let request = Request::new(PingRequest {
+            version: 1,
+            body: bytes::Bytes::copy_from_slice(finished_data),
+        });
+
+        let response: PingResponse = client.ping(request).await?.into_inner();
+
+        let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
+        if let Err(e) = ping_response_body {
+            eprintln!("{e}");
+        } else {
+            println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
+        }
+
+        Ok(())
+    };
+
+    timeout(SERVER_PING_TIMEOUT, ping_task)
         .await
-        .map_err(|err| Error::other(err.to_string()))?;
-
-    // 构造 PingRequest
-    let request = Request::new(PingRequest {
-        version: 1,
-        body: bytes::Bytes::copy_from_slice(finished_data),
-    });
-
-    // 发送请求并获取响应
-    let response: PingResponse = client.ping(request).await?.into_inner();
-
-    // 打印响应
-    let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
-    if let Err(e) = ping_response_body {
-        eprintln!("{e}");
-    } else {
-        println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
-    }
-
-    Ok(())
+        .map_err(|_| Error::other("server ping timeout"))?
 }
 
 pub async fn get_local_server_property() -> ServerProperties {
@@ -253,7 +254,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
 
         warn!("load_data_usage_from_backend end {:?}", after3 - after2);
 
-        let backen_info = store.clone().backend_info().await;
+        let backend_info = store.clone().backend_info().await;
 
         let after4 = OffsetDateTime::now_utc();
 
@@ -272,10 +273,10 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
             backend_type: rustfs_madmin::BackendType::ErasureType,
             online_disks: online_disks.sum(),
             offline_disks: offline_disks.sum(),
-            standard_sc_parity: backen_info.standard_sc_parity,
-            rr_sc_parity: backen_info.rr_sc_parity,
-            total_sets: backen_info.total_sets,
-            drives_per_set: backen_info.drives_per_set,
+            standard_sc_parity: backend_info.standard_sc_parity,
+            rr_sc_parity: backend_info.rr_sc_parity,
+            total_sets: backend_info.total_sets,
+            drives_per_set: backend_info.drives_per_set,
         };
         if get_pools {
             pools = get_pools_info(&all_disks).await.unwrap_or_default();
@@ -318,7 +319,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
     for disk in disks_info {
         let ep = &disk.endpoint;
         let state = &disk.state;
-        if *state != DRIVE_STATE_OK && *state != DRIVE_STATE_UNFORMATTED {
+        if *state != DriveState::Ok.to_string() && *state != DriveState::Unformatted.to_string() {
             *offline_disks.get_mut(ep).unwrap() += 1;
             continue;
         }
@@ -359,13 +360,13 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
 
         if erasure_set.id == 0 {
             erasure_set.id = d.set_index;
-            if let Ok(cache) = DataUsageCache::load(
+            if let Ok(cache) = load_data_usage_cache(
                 &store.pools[d.pool_index as usize].disk_set[d.set_index as usize].clone(),
                 DATA_USAGE_CACHE_NAME,
             )
             .await
             {
-                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &[]);
+                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &Vec::<String>::new());
                 erasure_set.objects_count = data_usage_info.objects_total_count;
                 erasure_set.versions_count = data_usage_info.versions_total_count;
                 erasure_set.delete_markers_count = data_usage_info.delete_markers_total_count;
