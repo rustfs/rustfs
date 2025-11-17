@@ -272,8 +272,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
                 if (current & !desired) != 0 {
                     if let Err(e) = fs::set_permissions(log_directory, Permissions::from_mode(desired)) {
                         return Err(TelemetryError::SetPermissions(format!(
-                            "dir='{}', want={:#o}, have={:#o}, err={}",
-                            log_directory, desired, current, e
+                            "dir='{log_directory}', want={desired:#o}, have={current:#o}, err={e}"
                         )));
                     }
                     // Second verification
@@ -281,15 +280,14 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
                         let after = meta2.permissions().mode() & 0o777;
                         if after != desired {
                             return Err(TelemetryError::SetPermissions(format!(
-                                "dir='{}', want={:#o}, after={:#o}",
-                                log_directory, desired, after
+                                "dir='{log_directory}', want={desired:#o}, after={after:#o}"
                             )));
                         }
                     }
                 }
             }
             Err(e) => {
-                return Err(TelemetryError::Io(format!("stat '{}' failed: {}", log_directory, e)));
+                return Err(TelemetryError::Io(format!("stat '{log_directory}' failed: {e}")));
             }
         }
     }

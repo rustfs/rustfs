@@ -1085,7 +1085,7 @@ mod tests {
 
         drop(listener);
 
-        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", ip, port)).unwrap();
+        let url = url::Url::parse(&format!("http://{ip}:{port}/data/rustfs0")).unwrap();
         let endpoint = Endpoint {
             url,
             is_local: false,
