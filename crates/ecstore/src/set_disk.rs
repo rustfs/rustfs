@@ -68,6 +68,7 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
+use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
@@ -111,7 +112,7 @@ use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
@@ -2212,7 +2213,7 @@ impl SetDisks {
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
-        tracing::debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
+        debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
         let total_size = fi.size as usize;
@@ -2237,27 +2238,20 @@ impl SetDisks {
 
         let (last_part_index, last_part_relative_offset) = fi.to_part_offset(end_offset)?;
 
-        tracing::debug!(
+        debug!(
             bucket,
-            object,
-            offset,
-            length,
-            end_offset,
-            part_index,
-            last_part_index,
-            last_part_relative_offset,
-            "Multipart read bounds"
+            object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
-        tracing::debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
+        debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
 
         let mut total_read = 0;
         for current_part in part_indices {
             if total_read == length {
-                tracing::debug!(
+                debug!(
                     bucket,
                     object,
                     total_read,
@@ -2279,7 +2273,7 @@ impl SetDisks {
 
             let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
 
-            tracing::debug!(
+            debug!(
                 bucket,
                 object,
                 part_index = current_part,
@@ -2334,12 +2328,39 @@ impl SetDisks {
                 return Err(Error::other(format!("not enough disks to read: {errors:?}")));
             }
 
+            // Check if we have missing shards even though we can read successfully
+            // This happens when a node was offline during write and comes back online
+            let total_shards = erasure.data_shards + erasure.parity_shards;
+            let missing_shards = total_shards - nil_count;
+            if missing_shards > 0 && nil_count >= erasure.data_shards {
+                // We have missing shards but enough to read - trigger background heal
+                info!(
+                    bucket,
+                    object,
+                    part_number,
+                    missing_shards,
+                    available_shards = nil_count,
+                    "Detected missing shards during read, triggering background heal"
+                );
+                let _ = rustfs_common::heal_channel::send_heal_request(
+                    rustfs_common::heal_channel::create_heal_request_with_options(
+                        bucket.to_string(),
+                        Some(object.to_string()),
+                        false,
+                        Some(HealChannelPriority::Normal), // Use low priority for proactive healing
+                        Some(pool_index),
+                        Some(set_index),
+                    ),
+                )
+                .await;
+            }
+
             // debug!(
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
             let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
-            tracing::debug!(
+            debug!(
                 bucket,
                 object,
                 part_index = current_part,
@@ -2386,7 +2407,7 @@ impl SetDisks {
 
         // debug!("read end");
 
-        tracing::debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
+        debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
 
         Ok(())
     }
@@ -5663,7 +5684,7 @@ impl StorageAPI for SetDisks {
             }
 
             let ext_part = &curr_fi.parts[i];
-            tracing::info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
+            info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
 
             // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
             let client_etag = p.etag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));

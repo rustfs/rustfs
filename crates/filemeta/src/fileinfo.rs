@@ -220,7 +220,11 @@ impl FileInfo {
         let indices = {
             let cardinality = data_blocks + parity_blocks;
             let mut nums = vec![0; cardinality];
-            let key_crc = crc32fast::hash(object.as_bytes());
+            let key_crc = {
+                let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                hasher.update(object.as_bytes());
+                hasher.finalize() as u32
+            };
 
             let start = key_crc as usize % cardinality;
             for i in 1..=cardinality {
