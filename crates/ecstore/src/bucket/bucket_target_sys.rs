@@ -1105,10 +1105,20 @@ impl TargetClient {
             Err(e) => match e {
                 SdkError::ServiceError(oe) => match oe.into_err() {
                     HeadBucketError::NotFound(_) => Ok(false),
-                    other => Err(other.into()),
+                    other => Err(S3ClientError::new(format!(
+                        "failed to check bucket exists for bucket:{} please check the bucket name and credentials, error:{:?}",
+                        bucket, other
+                    ))),
                 },
+                SdkError::DispatchFailure(e) => Err(S3ClientError::new(format!(
+                    "failed to dispatch bucket exists for bucket:{} error:{:?}",
+                    bucket, e
+                ))),
 
-                _ => Err(e.into()),
+                _ => Err(S3ClientError::new(format!(
+                    "failed to check bucket exists for bucket:{} error:{:?}",
+                    bucket, e
+                ))),
             },
         }
     }
