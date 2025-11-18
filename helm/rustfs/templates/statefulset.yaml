@@ -1,3 +1,4 @@
+{{- if .Values.mode.distributed.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -14,6 +15,10 @@ spec:
       labels:
         app: {{ include "rustfs.name" . }}
     spec:
+      {{- if .Values.podSecurityContext }}
+      securityContext:
+      {{- toYaml .Values.podSecurityContext | nindent 12 }}
+      {{- end }}
       initContainers:
         - name: init-step
           image: busybox
@@ -33,8 +38,8 @@ spec:
                 mkdir -p /data
               fi
 
-              chown -R 1000:1000 /data
-              chown -R 1000:1000 /logs
+              chown -R 10001:10001 /data
+              chown -R 10001:10001 /logs
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
@@ -52,9 +57,9 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           command: ["/usr/bin/rustfs"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.securityContext }}
+          {{- if .Values.containerSecurityContext }}
           securityContext:
-          {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           {{- end }}
           ports:
             - containerPort: {{ .Values.service.ep_port }}
@@ -89,7 +94,6 @@ spec:
             httpGet:
               path: /health
               port: 9000
-            exec:
             initialDelaySeconds: 30
             periodSeconds: 5
             timeoutSeconds: 3
@@ -107,12 +111,17 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
-      volumes:
-        - name: logs
-          emptyDir: {}
   volumeClaimTemplates:
-  {{- if eq (int .Values.replicaCount) 4 }}
-  {{- range $i := until (int .Values.replicaCount) }}
+    - metadata:
+        name: logs
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.storageclass.name }}
+        resources:
+          requests:
+            storage: {{ $.Values.storageclass.size}}
+    {{- if eq (int .Values.replicaCount) 4 }}
+    {{- range $i := until (int .Values.replicaCount) }}
     - metadata:
         name: data-rustfs-{{ $i }}
       spec:
@@ -121,8 +130,8 @@ spec:
         resources:
           requests:
             storage: {{ $.Values.storageclass.size}}
-  {{- end }}
-  {{- else if eq (int .Values.replicaCount) 16 }}
+    {{- end }}
+    {{- else if eq (int .Values.replicaCount) 16 }}
     - metadata:
         name: data
       spec:
@@ -131,4 +140,5 @@ spec:
         resources:
           requests:
             storage: {{ $.Values.storageclass.size}}
-  {{- end }}
+    {{- end }}
+{{- end }}
