@@ -23,7 +23,7 @@ spec:
       name: console
   selector:
     app: {{ include "rustfs.name" . }}
-{{- end}}
+{{- end }}
 
 ---
 apiVersion: v1
