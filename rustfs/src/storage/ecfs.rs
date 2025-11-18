@@ -5176,40 +5176,6 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_size_opt_in() {
-        use crate::config::workload_profiles::{
-            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-        };
-
-        const KB: i64 = 1024;
-        const MB: i64 = 1024 * 1024;
-
-        // Test with profile disabled (should use legacy behavior)
-        set_buffer_profile_enabled(false);
-        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
-        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
-        assert_eq!(get_buffer_size_opt_in(200 * MB), DEFAULT_READ_BUFFER_SIZE);
-
-        // Test with profile enabled and AiTraining profile
-        set_buffer_profile_enabled(true);
-        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
-
-        assert_eq!(get_buffer_size_opt_in(5 * MB), 512 * KB as usize);
-        assert_eq!(get_buffer_size_opt_in(100 * MB), 2 * MB as usize);
-        assert_eq!(get_buffer_size_opt_in(600 * MB), 4 * MB as usize);
-
-        // Test with WebWorkload profile
-        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::WebWorkload));
-
-        assert_eq!(get_buffer_size_opt_in(100 * KB), 32 * KB as usize);
-        assert_eq!(get_buffer_size_opt_in(5 * MB), 128 * KB as usize);
-        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
-
-        // Reset to disabled for other tests
-        set_buffer_profile_enabled(false);
-    }
-
-    #[test]
     fn test_phase3_default_behavior() {
         use crate::config::workload_profiles::{
             RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
@@ -5233,6 +5199,38 @@ mod tests {
     }
 
     #[test]
+    fn test_buffer_size_opt_in() {
+        use crate::config::workload_profiles::{is_buffer_profile_enabled, set_buffer_profile_enabled};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] Default state: profile is not enabled, global configuration is not explicitly initialized
+        // get_buffer_size_opt_in should be equivalent to the GeneralPurpose configuration
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+
+        // GeneralPurpose rules:
+        // \< 1MB -> 64KB，1MB-100MB -> 256KB，\>=100MB -> 1MB
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[2\] Enable the profile switch, but the global configuration is still the default GeneralPurpose
+        set_buffer_profile_enabled(true);
+        assert!(is_buffer_profile_enabled());
+
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] Close again to ensure unchanged behavior
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+    }
+
+    #[test]
     fn test_phase4_full_integration() {
         use crate::config::workload_profiles::{
             RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
@@ -5241,35 +5239,28 @@ mod tests {
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
 
-        // Phase 4: Profile-only implementation
-        // Test that disabled mode still uses GeneralPurpose (not the old hardcoded algorithm)
+        // \[1\] During the entire test process, the global configuration is initialized only once.
+        // In order not to interfere with other tests, use GeneralPurpose (consistent with the default).
+        // If it has been initialized elsewhere, this call will be ignored by OnceLock and the behavior will still be GeneralPurpose.
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Make sure to turn off profile initially
         set_buffer_profile_enabled(false);
 
-        // Even when disabled, we use GeneralPurpose profile for consistency
+        // \[2\] Verify behavior of get_buffer_size_opt_in in disabled profile (GeneralPurpose)
         assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
         assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
 
-        // Test with different profiles enabled
+        // \[3\] When profile is enabled, the behavior remains consistent with the global GeneralPurpose configuration
         set_buffer_profile_enabled(true);
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
 
-        // Test profile switching
-        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
-        assert_eq!(get_buffer_size_opt_in(600 * MB), 4 * MB as usize);
+        // \[4\] Complex scenes, boundary values: such as unknown size
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B);
 
-        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::SecureStorage));
-        assert_eq!(get_buffer_size_opt_in(100 * MB), 256 * KB as usize);
-
-        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::WebWorkload));
-        assert_eq!(get_buffer_size_opt_in(100 * KB), 32 * KB as usize);
-
-        // Phase 4: Verify the system is profile-only (no hardcoded sizes)
-        // All buffer sizes come from workload profiles, not hardcoded values
-        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
-        let general_buffer = get_buffer_size_opt_in(50 * MB);
-        assert_eq!(general_buffer, 256 * KB as usize);
-
-        // Reset for other tests
         set_buffer_profile_enabled(false);
     }
 
