@@ -1,0 +1,29 @@
+[ req ]
+# 默认配置
+default_bits        = 2048
+default_keyfile     = tls.key
+default_md          = sha256
+prompt              = no
+encrypt_key         = no
+distinguished_name  = req_distinguished_name
+req_extensions      = req_ext
+
+[ req_distinguished_name ]
+# 证书信息 (可自定义)
+C  = CN                       # 国家 (Country Name)
+ST = Beijing                  # 省/市 (State or Province Name)
+L  = Beijing                  # 地点 (Locality Name)
+O  = RustFS Lab               # 组织 (Organization Name)
+OU = DevOps                   # 组织单位 (Organizational Unit Name)
+CN = xmg.rustfs.com           # 通用名称 (Common Name) - 必须是你的域名
+
+[ req_ext ]
+# 关键：定义 Subject Alternative Name (SAN)
+# 现代浏览器和 Kubernetes 要求使用 SAN
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = xmg.rustfs.com        # 你的主域名
+# 如果需要，可以添加其他子域名或 IP
+# DNS.2 = another.xmg.rustfs.com
+# IP.1 = 192.168.1.100
