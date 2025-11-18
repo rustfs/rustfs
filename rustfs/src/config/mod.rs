@@ -17,6 +17,8 @@ use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
+pub mod workload_profiles;
+
 #[cfg(test)]
 mod config_test;
 
@@ -112,6 +114,16 @@ pub struct Opt {
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
+
+    /// Disable adaptive buffer sizing with workload profiles
+    /// Set this flag to use legacy fixed-size buffer behavior from PR #869
+    #[arg(long, default_value_t = false, env = "RUSTFS_BUFFER_PROFILE_DISABLE")]
+    pub buffer_profile_disable: bool,
+
+    /// Workload profile for adaptive buffer sizing
+    /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
+    #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
+    pub buffer_profile: String,
 }
 
 // lazy_static::lazy_static! {
