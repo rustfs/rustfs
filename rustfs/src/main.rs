@@ -114,7 +114,7 @@ async fn async_main() -> Result<()> {
     let guard = match init_obs(Some(opt.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            println!("Failed to initialize observability: {}", e);
+            println!("Failed to initialize observability: {e}");
             return Err(Error::other(e));
         }
     };
