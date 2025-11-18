@@ -1,6 +1,6 @@
 # rustfs-helm
 
-You can use this helm chart to deploy rustfs on k8s cluster. The chart supports standalone and distributed mode. For standalone mode, there is only one pod and one pvc; for distributed mode, there are two styles, 4 pods and 16 pvcs(echo pod has 4 pvcs), 16 pods and 16 pvcs(echo pod has 1 pvc). You should decide which mode and style suits for your situation. You can specify the parameters `mode` and `replicaCount` to install different mode and style.
+You can use this helm chart to deploy rustfs on k8s cluster. The chart supports standalone and distributed mode. For standalone mode, there is only one pod and one pvc; for distributed mode, there are two styles, 4 pods and 16 pvcs(each pod has 4 pvcs), 16 pods and 16 pvcs(each pod has 1 pvc). You should decide which mode and style suits for your situation. You can specify the parameters `mode` and `replicaCount` to install different mode and style.
 
 ## Parameters Overview
 
