@@ -95,12 +95,12 @@ impl PriorityHealQueue {
 
     fn push(&mut self, request: HealRequest) -> bool {
         let key = Self::make_dedup_key(&request);
-        
+
         // Check for duplicates
         if self.dedup_keys.contains(&key) {
             return false; // Duplicate request, don't add
         }
-        
+
         self.dedup_keys.insert(key);
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
@@ -122,7 +122,11 @@ impl PriorityHealQueue {
     /// Create a deduplication key from a heal request
     fn make_dedup_key(request: &HealRequest) -> String {
         match &request.heal_type {
-            HealType::Object { bucket, object, version_id } => {
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            } => {
                 format!("object:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
             HealType::Bucket { bucket } => {
@@ -137,7 +141,11 @@ impl PriorityHealQueue {
             HealType::MRF { meta_path } => {
                 format!("mrf:{}", meta_path)
             }
-            HealType::ECDecode { bucket, object, version_id } => {
+            HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => {
                 format!("ecdecode:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
         }
@@ -293,7 +301,7 @@ impl HealManager {
 
         let request_id = request.id.clone();
         let priority = request.priority;
-        
+
         // Try to push the request; if it's a duplicate, still return the request_id
         let is_new = queue.push(request);
         drop(queue);
@@ -303,7 +311,7 @@ impl HealManager {
         } else {
             info!("Heal request already queued (duplicate): {}", request_id);
         }
-        
+
         Ok(request_id)
     }
 
@@ -820,9 +828,7 @@ mod tests {
         assert_eq!(queue.len(), 4);
 
         // Check they come out in priority order
-        let priorities: Vec<HealPriority> = (0..4)
-            .filter_map(|_| queue.pop().map(|r| r.priority))
-            .collect();
+        let priorities: Vec<HealPriority> = (0..4).filter_map(|_| queue.pop().map(|r| r.priority)).collect();
 
         assert_eq!(
             priorities,
