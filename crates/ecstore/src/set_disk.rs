@@ -4247,7 +4247,6 @@ impl StorageAPI for SetDisks {
 
         for (_, mut fi_vers) in vers_map {
             fi_vers.versions.sort_by(|a, b| a.deleted.cmp(&b.deleted));
-            fi_vers.versions.reverse();
 
             if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
                 fi_vers.versions.truncate(index + 1);
@@ -4652,7 +4651,7 @@ impl StorageAPI for SetDisks {
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
-                return Err(Error::other(format!("remote tier error: {}", err)));
+                return Err(Error::other(format!("remote tier error: {err}")));
             }
         };
 

@@ -1077,7 +1077,7 @@ impl S3 for FS {
                 warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string());
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
-                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err),
+                    format!("unable to restore transitioned bucket/object {bucket}/{object}: {err}"),
                 ));
             }
 
@@ -1329,7 +1329,7 @@ impl S3 for FS {
             }
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                object.version_id = Some(Uuid::max());
+                object.version_id = Some(Uuid::nil());
             }
 
             if replicate_deletes {

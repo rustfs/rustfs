@@ -144,7 +144,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let mut wtxn = lmdb_env.write_txn().unwrap();
     let db = match lmdb_env
         .database_options()
-        .name(&format!("bucket_{}", bucket_name))
+        .name(&format!("bucket_{bucket_name}"))
         .types::<I64<BigEndian>, LifecycleContentCodec>()
         .flags(DatabaseFlags::DUP_SORT)
         //.dup_sort_comparator::<>()
@@ -152,7 +152,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     {
         Ok(db) => db,
         Err(err) => {
-            panic!("lmdb error: {}", err);
+            panic!("lmdb error: {err}");
         }
     };
     let _ = wtxn.commit();
@@ -199,7 +199,7 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
         .await
         .expect("Failed to upload test object");
 
-    println!("object_info1: {:?}", object_info);
+    println!("object_info1: {object_info:?}");
 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
@@ -456,7 +456,7 @@ mod serial_tests {
                     }
 
                     let object_info = convert_record_to_object_info(record);
-                    println!("object_info2: {:?}", object_info);
+                    println!("object_info2: {object_info:?}");
                     let mod_time = object_info.mod_time.unwrap_or(OffsetDateTime::now_utc());
                     let expiry_time = rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, 1);
 
@@ -494,9 +494,9 @@ mod serial_tests {
                             type_,
                             object_name,
                         } = &elm.1;
-                        println!("cache row:{} {} {} {:?} {}", ver_no, ver_id, mod_time, type_, object_name);
+                        println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
                     }
-                    println!("row:{:?}", row);
+                    println!("row:{row:?}");
                 }
                 //drop(iter);
                 wtxn.commit().unwrap();
