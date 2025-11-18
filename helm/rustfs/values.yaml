@@ -69,7 +69,7 @@ containerSecurityContext:
   capabilities:
     drop:
       - ALL
-  readOnlyRootFilesystem: false
+  readOnlyRootFilesystem: true
   runAsNonRoot: true
 
 service:
