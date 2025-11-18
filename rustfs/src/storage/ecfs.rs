@@ -36,7 +36,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
-use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -183,6 +182,7 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
 /// );
 /// ```
 ///
+#[allow(dead_code)]
 fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
     let config = match profile {
         Some(p) => RustFSBufferConfig::new(p),
@@ -4993,6 +4993,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::MI_B;
 
     #[test]
     fn test_fs_creation() {

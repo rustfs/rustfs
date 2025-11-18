@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
+
 //! Adaptive buffer sizing optimization for different workload types.
 //!
 //! This module provides intelligent buffer size selection based on file size and workload profile
@@ -65,7 +67,7 @@ pub fn init_global_buffer_config(config: RustFSBufferConfig) {
 ///
 /// Returns the configured profile, or GeneralPurpose if not initialized.
 pub fn get_global_buffer_config() -> &'static RustFSBufferConfig {
-    GLOBAL_BUFFER_CONFIG.get_or_init(|| RustFSBufferConfig::default())
+    GLOBAL_BUFFER_CONFIG.get_or_init(RustFSBufferConfig::default)
 }
 
 /// Workload profile types that define buffer sizing strategies
@@ -500,7 +502,7 @@ mod tests {
         // Valid configuration
         let valid_config = BufferConfig {
             min_size: 32 * KI_B,
-            max_size: 1 * MI_B,
+            max_size: MI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![(MI_B as i64, 128 * KI_B), (i64::MAX, 512 * KI_B)],
         };
@@ -509,7 +511,7 @@ mod tests {
         // Invalid: min_size is 0
         let invalid_config = BufferConfig {
             min_size: 0,
-            max_size: 1 * MI_B,
+            max_size: MI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![(MI_B as i64, 128 * KI_B)],
         };
@@ -517,7 +519,7 @@ mod tests {
 
         // Invalid: max_size < min_size
         let invalid_config = BufferConfig {
-            min_size: 1 * MI_B,
+            min_size: MI_B,
             max_size: 32 * KI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![(MI_B as i64, 128 * KI_B)],
@@ -528,7 +530,7 @@ mod tests {
         let invalid_config = BufferConfig {
             min_size: 32 * KI_B,
             max_size: 256 * KI_B,
-            default_unknown: 1 * MI_B,
+            default_unknown: MI_B,
             thresholds: vec![(MI_B as i64, 128 * KI_B)],
         };
         assert!(invalid_config.validate().is_err());
@@ -536,7 +538,7 @@ mod tests {
         // Invalid: empty thresholds
         let invalid_config = BufferConfig {
             min_size: 32 * KI_B,
-            max_size: 1 * MI_B,
+            max_size: MI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![],
         };
@@ -545,7 +547,7 @@ mod tests {
         // Invalid: thresholds not in ascending order
         let invalid_config = BufferConfig {
             min_size: 32 * KI_B,
-            max_size: 1 * MI_B,
+            max_size: MI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![(100 * MI_B as i64, 512 * KI_B), (MI_B as i64, 128 * KI_B)],
         };
@@ -570,7 +572,7 @@ mod tests {
 
         let custom1 = BufferConfig {
             min_size: 32 * KI_B,
-            max_size: 1 * MI_B,
+            max_size: MI_B,
             default_unknown: 256 * KI_B,
             thresholds: vec![(MI_B as i64, 128 * KI_B)],
         };
