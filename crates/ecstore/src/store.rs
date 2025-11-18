@@ -1338,9 +1338,19 @@ impl StorageAPI for ECStore {
         max_keys: i32,
         fetch_owner: bool,
         start_after: Option<String>,
+        incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
-        self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
-            .await
+        self.inner_list_objects_v2(
+            bucket,
+            prefix,
+            continuation_token,
+            delimiter,
+            max_keys,
+            fetch_owner,
+            start_after,
+            incl_deleted,
+        )
+        .await
     }
 
     #[instrument(skip(self))]
