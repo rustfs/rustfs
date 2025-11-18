@@ -23,6 +23,9 @@ spec:
         - name: init-step
           image: busybox
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
           env:
             - name: REPLICA_COUNT
               value: "{{ .Values.replicaCount }}"
