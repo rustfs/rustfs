@@ -225,6 +225,7 @@ impl ECStore {
         max_keys: i32,
         _fetch_owner: bool,
         start_after: Option<String>,
+        incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
         let marker = {
             if continuation_token.is_none() {
@@ -234,7 +235,9 @@ impl ECStore {
             }
         };
 
-        let loi = self.list_objects_generic(bucket, prefix, marker, delimiter, max_keys).await?;
+        let loi = self
+            .list_objects_generic(bucket, prefix, marker, delimiter, max_keys, incl_deleted)
+            .await?;
         Ok(ListObjectsV2Info {
             is_truncated: loi.is_truncated,
             continuation_token,
@@ -251,6 +254,7 @@ impl ECStore {
         marker: Option<String>,
         delimiter: Option<String>,
         max_keys: i32,
+        incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
@@ -258,7 +262,7 @@ impl ECStore {
             separator: delimiter.clone(),
             limit: max_keys_plus_one(max_keys, marker.is_some()),
             marker,
-            incl_deleted: false,
+            incl_deleted,
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
         };
