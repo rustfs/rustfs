@@ -806,7 +806,7 @@ impl LocalDisk {
         Ok((bytes, modtime))
     }
 
-    async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &Vec<FileInfo>) -> Result<()> {
+    async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo]) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         let xlpath = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
@@ -820,7 +820,7 @@ impl LocalDisk {
 
         fm.unmarshal_msg(&data)?;
 
-        for fi in fis {
+        for fi in fis.iter() {
             let data_dir = match fm.delete_version(fi) {
                 Ok(res) => res,
                 Err(err) => {
@@ -2300,7 +2300,6 @@ impl DiskAPI for LocalDisk {
         let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
             Ok(res) => res,
             Err(err) => {
-                //
                 if err != DiskError::FileNotFound {
                     return Err(err);
                 }

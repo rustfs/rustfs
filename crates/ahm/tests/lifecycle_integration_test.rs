@@ -277,11 +277,11 @@ async fn create_test_tier(server: u32) {
     };
     let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
     if let Err(err) = tier_config_mgr.add(args, false).await {
-        println!("tier_config_mgr add failed, e: {:?}", err);
+        println!("tier_config_mgr add failed, e: {err:?}");
         panic!("tier add failed. {err}");
     }
     if let Err(e) = tier_config_mgr.save().await {
-        println!("tier_config_mgr save failed, e: {:?}", e);
+        println!("tier_config_mgr save failed, e: {e:?}");
         panic!("tier save failed");
     }
     println!("Created test tier: COLDTIER44");
@@ -299,7 +299,7 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 #[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        println!("oi: {:?}", oi);
+        println!("oi: {oi:?}");
         oi.delete_marker
     } else {
         println!("object_is_delete_marker is error");
@@ -311,7 +311,7 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
 #[allow(dead_code)]
 async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        println!("oi: {:?}", oi);
+        println!("oi: {oi:?}");
         !oi.transitioned_object.status.is_empty()
     } else {
         println!("object_is_transitioned is error");
