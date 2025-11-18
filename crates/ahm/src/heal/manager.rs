@@ -22,7 +22,7 @@ use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -32,6 +32,130 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// Priority queue wrapper for heal requests
+/// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
+#[derive(Debug)]
+struct PriorityHealQueue {
+    /// Heap of (priority, sequence, request) tuples
+    heap: BinaryHeap<PriorityQueueItem>,
+    /// Sequence counter for FIFO ordering within same priority
+    sequence: u64,
+    /// Set of request keys to prevent duplicates
+    dedup_keys: HashSet<String>,
+}
+
+/// Wrapper for heap items to implement proper ordering
+#[derive(Debug)]
+struct PriorityQueueItem {
+    priority: HealPriority,
+    sequence: u64,
+    request: HealRequest,
+}
+
+impl Eq for PriorityQueueItem {}
+
+impl PartialEq for PriorityQueueItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.sequence == other.sequence
+    }
+}
+
+impl Ord for PriorityQueueItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // First compare by priority (higher priority first)
+        match self.priority.cmp(&other.priority) {
+            std::cmp::Ordering::Equal => {
+                // If priorities are equal, use sequence for FIFO (lower sequence first)
+                other.sequence.cmp(&self.sequence)
+            }
+            ordering => ordering,
+        }
+    }
+}
+
+impl PartialOrd for PriorityQueueItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PriorityHealQueue {
+    fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            sequence: 0,
+            dedup_keys: HashSet::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    fn push(&mut self, request: HealRequest) -> bool {
+        let key = Self::make_dedup_key(&request);
+        
+        // Check for duplicates
+        if self.dedup_keys.contains(&key) {
+            return false; // Duplicate request, don't add
+        }
+        
+        self.dedup_keys.insert(key);
+        self.sequence += 1;
+        self.heap.push(PriorityQueueItem {
+            priority: request.priority,
+            sequence: self.sequence,
+            request,
+        });
+        true
+    }
+
+    fn pop(&mut self) -> Option<HealRequest> {
+        self.heap.pop().map(|item| {
+            let key = Self::make_dedup_key(&item.request);
+            self.dedup_keys.remove(&key);
+            item.request
+        })
+    }
+
+    /// Create a deduplication key from a heal request
+    fn make_dedup_key(request: &HealRequest) -> String {
+        match &request.heal_type {
+            HealType::Object { bucket, object, version_id } => {
+                format!("object:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
+            }
+            HealType::Bucket { bucket } => {
+                format!("bucket:{}", bucket)
+            }
+            HealType::ErasureSet { set_disk_id, .. } => {
+                format!("erasure_set:{}", set_disk_id)
+            }
+            HealType::Metadata { bucket, object } => {
+                format!("metadata:{}:{}", bucket, object)
+            }
+            HealType::MRF { meta_path } => {
+                format!("mrf:{}", meta_path)
+            }
+            HealType::ECDecode { bucket, object, version_id } => {
+                format!("ecdecode:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
+            }
+        }
+    }
+
+    /// Check if a request with the same key already exists in the queue
+    #[allow(dead_code)]
+    fn contains_key(&self, request: &HealRequest) -> bool {
+        let key = Self::make_dedup_key(request);
+        self.dedup_keys.contains(&key)
+    }
+
+    /// Check if an erasure set heal request for a specific set_disk_id exists
+    fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
+        let key = format!("erasure_set:{}", set_disk_id);
+        self.dedup_keys.contains(&key)
+    }
+}
 
 /// Heal config
 #[derive(Debug, Clone)]
@@ -85,8 +209,8 @@ pub struct HealManager {
     state: Arc<RwLock<HealState>>,
     /// Active heal tasks
     active_heals: Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
-    /// Heal queue
-    heal_queue: Arc<Mutex<VecDeque<HealRequest>>>,
+    /// Heal queue (priority-based)
+    heal_queue: Arc<Mutex<PriorityHealQueue>>,
     /// Storage layer interface
     storage: Arc<dyn HealStorageAPI>,
     /// Cancel token
@@ -103,7 +227,7 @@ impl HealManager {
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(HealState::default())),
             active_heals: Arc::new(Mutex::new(HashMap::new())),
-            heal_queue: Arc::new(Mutex::new(VecDeque::new())),
+            heal_queue: Arc::new(Mutex::new(PriorityHealQueue::new())),
             storage,
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
@@ -168,10 +292,18 @@ impl HealManager {
         }
 
         let request_id = request.id.clone();
-        queue.push_back(request);
+        let priority = request.priority;
+        
+        // Try to push the request; if it's a duplicate, still return the request_id
+        let is_new = queue.push(request);
         drop(queue);
 
-        info!("Submitted heal request: {}", request_id);
+        if is_new {
+            info!("Submitted heal request: {} with priority: {:?}", request_id, priority);
+        } else {
+            info!("Heal request already queued (duplicate): {}", request_id);
+        }
+        
         Ok(request_id)
     }
 
@@ -321,13 +453,7 @@ impl HealManager {
                             let mut skip = false;
                             {
                                 let queue = heal_queue.lock().await;
-                                if queue.iter().any(|req| {
-                                    matches!(
-                                        &req.heal_type,
-                                        crate::heal::task::HealType::ErasureSet { set_disk_id: queued_id, .. }
-                                        if queued_id == &set_disk_id
-                                    )
-                                }) {
+                                if queue.contains_erasure_set(&set_disk_id) {
                                     skip = true;
                                 }
                             }
@@ -358,7 +484,7 @@ impl HealManager {
                                 HealPriority::Normal,
                             );
                             let mut queue = heal_queue.lock().await;
-                            queue.push_back(req);
+                            queue.push(req);
                             info!("Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
                         }
                     }
@@ -370,7 +496,7 @@ impl HealManager {
 
     /// Process heal queue
     async fn process_heal_queue(
-        heal_queue: &Arc<Mutex<VecDeque<HealRequest>>>,
+        heal_queue: &Arc<Mutex<PriorityHealQueue>>,
         active_heals: &Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
         config: &Arc<RwLock<HealConfig>>,
         statistics: &Arc<RwLock<HealStatistics>>,
@@ -385,7 +511,8 @@ impl HealManager {
         }
 
         let mut queue = heal_queue.lock().await;
-        if let Some(request) = queue.pop_front() {
+        if let Some(request) = queue.pop() {
+            let task_priority = request.priority;
             let task = Arc::new(HealTask::from_request(request, storage.clone()));
             let task_id = task.id.clone();
             active_heals_guard.insert(task_id.clone(), task.clone());
@@ -395,7 +522,7 @@ impl HealManager {
 
             // start heal task
             tokio::spawn(async move {
-                info!("Starting heal task: {}", task_id);
+                info!("Starting heal task: {} with priority: {:?}", task_id, task_priority);
                 let result = task.execute().await;
                 match result {
                     Ok(_) => {
@@ -436,5 +563,275 @@ impl std::fmt::Debug for HealManager {
             .field("active_heals_count", &"<active_heals>")
             .field("queue_length", &"<queue>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
+
+    #[test]
+    fn test_priority_queue_ordering() {
+        let mut queue = PriorityHealQueue::new();
+
+        // Add requests with different priorities
+        let low_req = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        let normal_req = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket2".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let high_req = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket3".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        );
+
+        let urgent_req = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket4".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Urgent,
+        );
+
+        // Add in random order: low, high, normal, urgent
+        assert!(queue.push(low_req));
+        assert!(queue.push(high_req));
+        assert!(queue.push(normal_req));
+        assert!(queue.push(urgent_req));
+
+        assert_eq!(queue.len(), 4);
+
+        // Should pop in priority order: urgent, high, normal, low
+        let popped1 = queue.pop().unwrap();
+        assert_eq!(popped1.priority, HealPriority::Urgent);
+
+        let popped2 = queue.pop().unwrap();
+        assert_eq!(popped2.priority, HealPriority::High);
+
+        let popped3 = queue.pop().unwrap();
+        assert_eq!(popped3.priority, HealPriority::Normal);
+
+        let popped4 = queue.pop().unwrap();
+        assert_eq!(popped4.priority, HealPriority::Low);
+
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn test_priority_queue_fifo_same_priority() {
+        let mut queue = PriorityHealQueue::new();
+
+        // Add multiple requests with same priority
+        let req1 = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let req2 = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket2".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let req3 = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket3".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let id1 = req1.id.clone();
+        let id2 = req2.id.clone();
+        let id3 = req3.id.clone();
+
+        assert!(queue.push(req1));
+        assert!(queue.push(req2));
+        assert!(queue.push(req3));
+
+        // Should maintain FIFO order for same priority
+        let popped1 = queue.pop().unwrap();
+        assert_eq!(popped1.id, id1);
+
+        let popped2 = queue.pop().unwrap();
+        assert_eq!(popped2.id, id2);
+
+        let popped3 = queue.pop().unwrap();
+        assert_eq!(popped3.id, id3);
+    }
+
+    #[test]
+    fn test_priority_queue_deduplication() {
+        let mut queue = PriorityHealQueue::new();
+
+        let req1 = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket1".to_string(),
+                object: "object1".to_string(),
+                version_id: None,
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let req2 = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket1".to_string(),
+                object: "object1".to_string(),
+                version_id: None,
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        );
+
+        // First request should be added
+        assert!(queue.push(req1));
+        assert_eq!(queue.len(), 1);
+
+        // Second request with same object should be rejected (duplicate)
+        assert!(!queue.push(req2));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_priority_queue_contains_erasure_set() {
+        let mut queue = PriorityHealQueue::new();
+
+        let req = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket1".to_string()],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        assert!(queue.push(req));
+        assert!(queue.contains_erasure_set("pool_0_set_1"));
+        assert!(!queue.contains_erasure_set("pool_0_set_2"));
+    }
+
+    #[test]
+    fn test_priority_queue_dedup_key_generation() {
+        // Test different heal types generate different keys
+        let obj_req = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket1".to_string(),
+                object: "object1".to_string(),
+                version_id: None,
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let bucket_req = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let erasure_req = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket1".to_string()],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let obj_key = PriorityHealQueue::make_dedup_key(&obj_req);
+        let bucket_key = PriorityHealQueue::make_dedup_key(&bucket_req);
+        let erasure_key = PriorityHealQueue::make_dedup_key(&erasure_req);
+
+        // All keys should be different
+        assert_ne!(obj_key, bucket_key);
+        assert_ne!(obj_key, erasure_key);
+        assert_ne!(bucket_key, erasure_key);
+
+        assert!(obj_key.starts_with("object:"));
+        assert!(bucket_key.starts_with("bucket:"));
+        assert!(erasure_key.starts_with("erasure_set:"));
+    }
+
+    #[test]
+    fn test_priority_queue_mixed_priorities_and_types() {
+        let mut queue = PriorityHealQueue::new();
+
+        // Add various requests
+        let requests = vec![
+            (
+                HealType::Object {
+                    bucket: "b1".to_string(),
+                    object: "o1".to_string(),
+                    version_id: None,
+                },
+                HealPriority::Low,
+            ),
+            (
+                HealType::Bucket {
+                    bucket: "b2".to_string(),
+                },
+                HealPriority::Urgent,
+            ),
+            (
+                HealType::ErasureSet {
+                    buckets: vec!["b3".to_string()],
+                    set_disk_id: "pool_0_set_1".to_string(),
+                },
+                HealPriority::Normal,
+            ),
+            (
+                HealType::Object {
+                    bucket: "b4".to_string(),
+                    object: "o4".to_string(),
+                    version_id: None,
+                },
+                HealPriority::High,
+            ),
+        ];
+
+        for (heal_type, priority) in requests {
+            let req = HealRequest::new(heal_type, HealOptions::default(), priority);
+            queue.push(req);
+        }
+
+        assert_eq!(queue.len(), 4);
+
+        // Check they come out in priority order
+        let priorities: Vec<HealPriority> = (0..4)
+            .filter_map(|_| queue.pop().map(|r| r.priority))
+            .collect();
+
+        assert_eq!(
+            priorities,
+            vec![
+                HealPriority::Urgent,
+                HealPriority::High,
+                HealPriority::Normal,
+                HealPriority::Low,
+            ]
+        );
     }
 }
