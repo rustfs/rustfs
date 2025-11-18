@@ -93,6 +93,10 @@ impl PriorityHealQueue {
         self.heap.len()
     }
 
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
     fn push(&mut self, request: HealRequest) -> bool {
         let key = Self::make_dedup_key(&request);
 
@@ -109,6 +113,15 @@ impl PriorityHealQueue {
             request,
         });
         true
+    }
+
+    /// Get statistics about queue contents by priority
+    fn get_priority_stats(&self) -> HashMap<HealPriority, usize> {
+        let mut stats = HashMap::new();
+        for item in &self.heap {
+            *stats.entry(item.priority).or_insert(0) += 1;
+        }
+        stats
     }
 
     fn pop(&mut self) -> Option<HealRequest> {
@@ -293,10 +306,24 @@ impl HealManager {
         let config = self.config.read().await;
         let mut queue = self.heal_queue.lock().await;
 
-        if queue.len() >= config.queue_size {
+        let queue_len = queue.len();
+        let queue_capacity = config.queue_size;
+
+        if queue_len >= queue_capacity {
             return Err(Error::ConfigurationError {
-                message: "Heal queue is full".to_string(),
+                message: format!("Heal queue is full ({}/{})", queue_len, queue_capacity),
             });
+        }
+
+        // Warn when queue is getting full (>80% capacity)
+        let capacity_threshold = (queue_capacity as f64 * 0.8) as usize;
+        if queue_len >= capacity_threshold {
+            warn!(
+                "Heal queue is {}% full ({}/{}). Consider increasing queue size or processing capacity.",
+                (queue_len * 100) / queue_capacity,
+                queue_len,
+                queue_capacity
+            );
         }
 
         let request_id = request.id.clone();
@@ -304,6 +331,21 @@ impl HealManager {
 
         // Try to push the request; if it's a duplicate, still return the request_id
         let is_new = queue.push(request);
+
+        // Log queue statistics periodically (when adding high/urgent priority items)
+        if matches!(priority, HealPriority::High | HealPriority::Urgent) {
+            let stats = queue.get_priority_stats();
+            info!(
+                "Heal queue stats after adding {:?} priority request: total={}, urgent={}, high={}, normal={}, low={}",
+                priority,
+                queue_len + 1,
+                stats.get(&HealPriority::Urgent).unwrap_or(&0),
+                stats.get(&HealPriority::High).unwrap_or(&0),
+                stats.get(&HealPriority::Normal).unwrap_or(&0),
+                stats.get(&HealPriority::Low).unwrap_or(&0)
+            );
+        }
+
         drop(queue);
 
         if is_new {
@@ -503,6 +545,7 @@ impl HealManager {
     }
 
     /// Process heal queue
+    /// Processes multiple tasks per cycle when capacity allows and queue has high-priority items
     async fn process_heal_queue(
         heal_queue: &Arc<Mutex<PriorityHealQueue>>,
         active_heals: &Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
@@ -513,52 +556,83 @@ impl HealManager {
         let config = config.read().await;
         let mut active_heals_guard = active_heals.lock().await;
 
-        // check if new heal tasks can be started
-        if active_heals_guard.len() >= config.max_concurrent_heals {
+        // Check if new heal tasks can be started
+        let active_count = active_heals_guard.len();
+        if active_count >= config.max_concurrent_heals {
             return;
         }
 
+        // Calculate how many tasks we can start this cycle
+        let available_slots = config.max_concurrent_heals - active_count;
+
         let mut queue = heal_queue.lock().await;
-        if let Some(request) = queue.pop() {
-            let task_priority = request.priority;
-            let task = Arc::new(HealTask::from_request(request, storage.clone()));
-            let task_id = task.id.clone();
-            active_heals_guard.insert(task_id.clone(), task.clone());
-            drop(active_heals_guard);
-            let active_heals_clone = active_heals.clone();
-            let statistics_clone = statistics.clone();
+        let queue_len = queue.len();
 
-            // start heal task
-            tokio::spawn(async move {
-                info!("Starting heal task: {} with priority: {:?}", task_id, task_priority);
-                let result = task.execute().await;
-                match result {
-                    Ok(_) => {
-                        info!("Heal task completed successfully: {}", task_id);
-                    }
-                    Err(e) => {
-                        error!("Heal task failed: {} - {}", task_id, e);
-                    }
-                }
-                let mut active_heals_guard = active_heals_clone.lock().await;
-                if let Some(completed_task) = active_heals_guard.remove(&task_id) {
-                    // update statistics
-                    let mut stats = statistics_clone.write().await;
-                    match completed_task.get_status().await {
-                        HealTaskStatus::Completed => {
-                            stats.update_task_completion(true);
-                        }
-                        _ => {
-                            stats.update_task_completion(false);
-                        }
-                    }
-                    stats.update_running_tasks(active_heals_guard.len() as u64);
-                }
-            });
+        if queue_len == 0 {
+            return;
+        }
 
-            // update statistics
-            let mut stats = statistics.write().await;
-            stats.total_tasks += 1;
+        // Process multiple tasks if:
+        // 1. We have available slots
+        // 2. Queue is not empty
+        // Prioritize urgent/high priority tasks by processing up to 2 tasks per cycle if available
+        let tasks_to_process = if queue_len > 0 {
+            std::cmp::min(available_slots, std::cmp::min(2, queue_len))
+        } else {
+            0
+        };
+
+        for _ in 0..tasks_to_process {
+            if let Some(request) = queue.pop() {
+                let task_priority = request.priority;
+                let task = Arc::new(HealTask::from_request(request, storage.clone()));
+                let task_id = task.id.clone();
+                active_heals_guard.insert(task_id.clone(), task.clone());
+                let active_heals_clone = active_heals.clone();
+                let statistics_clone = statistics.clone();
+
+                // start heal task
+                tokio::spawn(async move {
+                    info!("Starting heal task: {} with priority: {:?}", task_id, task_priority);
+                    let result = task.execute().await;
+                    match result {
+                        Ok(_) => {
+                            info!("Heal task completed successfully: {}", task_id);
+                        }
+                        Err(e) => {
+                            error!("Heal task failed: {} - {}", task_id, e);
+                        }
+                    }
+                    let mut active_heals_guard = active_heals_clone.lock().await;
+                    if let Some(completed_task) = active_heals_guard.remove(&task_id) {
+                        // update statistics
+                        let mut stats = statistics_clone.write().await;
+                        match completed_task.get_status().await {
+                            HealTaskStatus::Completed => {
+                                stats.update_task_completion(true);
+                            }
+                            _ => {
+                                stats.update_task_completion(false);
+                            }
+                        }
+                        stats.update_running_tasks(active_heals_guard.len() as u64);
+                    }
+                });
+            } else {
+                break;
+            }
+        }
+
+        // Update statistics for all started tasks
+        let mut stats = statistics.write().await;
+        stats.total_tasks += tasks_to_process as u64;
+
+        // Log queue status if items remain
+        if !queue.is_empty() {
+            let remaining = queue.len();
+            if remaining > 10 {
+                info!("Heal queue has {} pending requests, {} tasks active", remaining, active_heals_guard.len());
+            }
         }
     }
 }
@@ -839,5 +913,67 @@ mod tests {
                 HealPriority::Low,
             ]
         );
+    }
+
+    #[test]
+    fn test_priority_queue_stats() {
+        let mut queue = PriorityHealQueue::new();
+
+        // Add requests with different priorities
+        for _ in 0..3 {
+            queue.push(HealRequest::new(
+                HealType::Bucket {
+                    bucket: format!("bucket-low-{}", queue.len()),
+                },
+                HealOptions::default(),
+                HealPriority::Low,
+            ));
+        }
+
+        for _ in 0..2 {
+            queue.push(HealRequest::new(
+                HealType::Bucket {
+                    bucket: format!("bucket-normal-{}", queue.len()),
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            ));
+        }
+
+        queue.push(HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-high".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        ));
+
+        let stats = queue.get_priority_stats();
+
+        assert_eq!(*stats.get(&HealPriority::Low).unwrap_or(&0), 3);
+        assert_eq!(*stats.get(&HealPriority::Normal).unwrap_or(&0), 2);
+        assert_eq!(*stats.get(&HealPriority::High).unwrap_or(&0), 1);
+        assert_eq!(*stats.get(&HealPriority::Urgent).unwrap_or(&0), 0);
+    }
+
+    #[test]
+    fn test_priority_queue_is_empty() {
+        let mut queue = PriorityHealQueue::new();
+
+        assert!(queue.is_empty());
+
+        queue.push(HealRequest::new(
+            HealType::Bucket {
+                bucket: "test".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        ));
+
+        assert!(!queue.is_empty());
+
+        queue.pop();
+
+        assert!(queue.is_empty());
     }
 }

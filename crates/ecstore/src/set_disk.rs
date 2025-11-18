@@ -2342,17 +2342,25 @@ impl SetDisks {
                     available_shards = nil_count,
                     "Detected missing shards during read, triggering background heal"
                 );
-                let _ = rustfs_common::heal_channel::send_heal_request(
-                    rustfs_common::heal_channel::create_heal_request_with_options(
+                if let Err(e) =
+                    rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
                         bucket.to_string(),
                         Some(object.to_string()),
                         false,
-                        Some(HealChannelPriority::Normal), // Use low priority for proactive healing
+                        Some(HealChannelPriority::Normal),
                         Some(pool_index),
                         Some(set_index),
-                    ),
-                )
-                .await;
+                    ))
+                    .await
+                {
+                    warn!(
+                        bucket,
+                        object,
+                        part_number,
+                        error = %e,
+                        "Failed to enqueue heal request for missing shards"
+                    );
+                }
             }
 
             // debug!(
@@ -2376,7 +2384,7 @@ impl SetDisks {
                     match de_err {
                         DiskError::FileNotFound | DiskError::FileCorrupt => {
                             error!("erasure.decode err 111 {:?}", &de_err);
-                            let _ = rustfs_common::heal_channel::send_heal_request(
+                            if let Err(e) = rustfs_common::heal_channel::send_heal_request(
                                 rustfs_common::heal_channel::create_heal_request_with_options(
                                     bucket.to_string(),
                                     Some(object.to_string()),
@@ -2386,7 +2394,16 @@ impl SetDisks {
                                     Some(set_index),
                                 ),
                             )
-                            .await;
+                            .await
+                            {
+                                warn!(
+                                    bucket,
+                                    object,
+                                    part_number,
+                                    error = %e,
+                                    "Failed to enqueue heal request after decode error"
+                                );
+                            }
                             has_err = false;
                         }
                         _ => {}
@@ -4537,15 +4554,25 @@ impl StorageAPI for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        let _ = rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-            bucket.to_string(),
-            Some(object.to_string()),
-            false,
-            Some(HealChannelPriority::Normal),
-            Some(self.pool_index),
-            Some(self.set_index),
-        ))
-        .await;
+        if let Err(e) =
+            rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
+                bucket.to_string(),
+                Some(object.to_string()),
+                false,
+                Some(HealChannelPriority::Normal),
+                Some(self.pool_index),
+                Some(self.set_index),
+            ))
+            .await
+        {
+            warn!(
+                bucket,
+                object,
+                version_id,
+                error = %e,
+                "Failed to enqueue heal request for partial object"
+            );
+        }
         Ok(())
     }
 

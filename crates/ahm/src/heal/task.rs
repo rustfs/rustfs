@@ -51,7 +51,7 @@ pub enum HealType {
 }
 
 /// Heal priority
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HealPriority {
     /// Low priority
     Low = 0,
