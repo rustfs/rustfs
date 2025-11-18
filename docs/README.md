@@ -4,6 +4,17 @@ Welcome to the RustFS distributed file system documentation center!
 
 ## 📚 Documentation Navigation
 
+### ⚡ Performance Optimization
+
+RustFS provides intelligent performance optimization features for different workloads.
+
+| Document | Description | Audience |
+|------|------|----------|
+| [Adaptive Buffer Sizing](./adaptive-buffer-sizing.md) | Intelligent buffer sizing optimization for optimal performance across workload types | Developers and system administrators |
+| [Phase 3 Migration Guide](./MIGRATION_PHASE3.md) | Migration guide from Phase 2 to Phase 3 (Default Enablement) | Operations and DevOps teams |
+| [Phase 4 Full Integration Guide](./PHASE4_GUIDE.md) | Complete guide to Phase 4 features: deprecated legacy functions, performance metrics | Advanced users and performance engineers |
+| [Performance Testing Guide](./PERFORMANCE_TESTING.md) | Performance benchmarking and optimization guide | Performance engineers |
+
 ### 🔐 KMS (Key Management Service)
 
 RustFS KMS delivers enterprise-grade key management and data encryption.

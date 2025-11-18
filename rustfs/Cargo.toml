@@ -31,7 +31,8 @@ name = "rustfs"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["metrics"]
+metrics = []
 
 [lints]
 workspace = true

@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::auth::get_condition_values;
+use crate::config::workload_profiles::{
+    RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
+};
 use crate::error::ApiError;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
@@ -33,7 +36,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
-use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -150,30 +152,101 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });
 
-/// Calculate adaptive buffer size based on file size for optimal streaming performance.
+/// Calculate adaptive buffer size with workload profile support.
 ///
-/// This function implements adaptive buffering to balance memory usage and performance:
-/// - Small files (< 1MB): 64KB buffer - minimize memory overhead
-/// - Medium files (1MB-100MB): 256KB buffer - balanced approach
-/// - Large files (>= 100MB): 1MB buffer - maximize throughput, minimize syscalls
+/// This enhanced version supports different workload profiles for optimal performance
+/// across various use cases (AI/ML, web workloads, secure storage, etc.).
+///
+/// # Arguments
+/// * `file_size` - The size of the file in bytes, or -1 if unknown
+/// * `profile` - Optional workload profile. If None, uses auto-detection or GeneralPurpose
+///
+/// # Returns
+/// Optimal buffer size in bytes based on the workload profile and file size
+///
+/// # Examples
+/// ```ignore
+/// // Use general purpose profile (default)
+/// let buffer_size = get_adaptive_buffer_size_with_profile(1024 * 1024, None);
+///
+/// // Use AI training profile for large model files
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     500 * 1024 * 1024,
+///     Some(WorkloadProfile::AiTraining)
+/// );
+///
+/// // Use secure storage profile for compliance scenarios
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     10 * 1024 * 1024,
+///     Some(WorkloadProfile::SecureStorage)
+/// );
+/// ```
+///
+#[allow(dead_code)]
+fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
+    let config = match profile {
+        Some(p) => RustFSBufferConfig::new(p),
+        None => {
+            // Auto-detect OS environment or use general purpose
+            RustFSBufferConfig::with_auto_detect()
+        }
+    };
+
+    config.get_buffer_size(file_size)
+}
+
+/// Get adaptive buffer size using global workload profile configuration.
+///
+/// This is the primary buffer sizing function that uses the workload profile
+/// system configured at startup to provide optimal buffer sizes for different scenarios.
+///
+/// The function automatically selects buffer sizes based on:
+/// - Configured workload profile (default: GeneralPurpose)
+/// - File size characteristics
+/// - Optional performance metrics collection
 ///
 /// # Arguments
 /// * `file_size` - The size of the file in bytes, or -1 if unknown
 ///
 /// # Returns
-/// Optimal buffer size in bytes
+/// Optimal buffer size in bytes based on the configured workload profile
 ///
-fn get_adaptive_buffer_size(file_size: i64) -> usize {
-    match file_size {
-        // Unknown size or negative (chunked/streaming): use default large buffer for safety
-        size if size < 0 => DEFAULT_READ_BUFFER_SIZE,
-        // Small files (< 1MB): use 64KB to minimize memory overhead
-        size if size < MI_B as i64 => 64 * KI_B,
-        // Medium files (1MB - 100MB): use 256KB for balanced performance
-        size if size < (100 * MI_B) as i64 => 256 * KI_B,
-        // Large files (>= 100MB): use 1MB buffer for maximum throughput
-        _ => DEFAULT_READ_BUFFER_SIZE,
+/// # Performance Metrics
+/// When compiled with the `metrics` feature flag, this function tracks:
+/// - Buffer size distribution
+/// - Selection frequency
+/// - Buffer-to-file size ratios
+///
+/// # Examples
+/// ```ignore
+/// // Uses configured profile (default: GeneralPurpose)
+/// let buffer_size = get_buffer_size_opt_in(file_size);
+/// ```
+fn get_buffer_size_opt_in(file_size: i64) -> usize {
+    let buffer_size = if is_buffer_profile_enabled() {
+        // Use globally configured workload profile (enabled by default in Phase 3)
+        let config = get_global_buffer_config();
+        config.get_buffer_size(file_size)
+    } else {
+        // Opt-out mode: Use GeneralPurpose profile for consistent behavior
+        let config = RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose);
+        config.get_buffer_size(file_size)
+    };
+
+    // Optional performance metrics collection for monitoring and optimization
+    #[cfg(feature = "metrics")]
+    {
+        use metrics::histogram;
+        histogram!("rustfs_buffer_size_bytes").record(buffer_size as f64);
+        counter!("rustfs_buffer_size_selections").increment(1);
+
+        if file_size >= 0 {
+            let ratio = buffer_size as f64 / file_size as f64;
+            histogram!("rustfs_buffer_to_file_ratio").record(ratio);
+        }
     }
+
+    buffer_size
 }
 
 #[derive(Debug, Clone)]
@@ -411,11 +484,10 @@ impl FS {
             }
         };
 
-        // Use adaptive buffer sizing based on file size for optimal performance:
-        // - Small files (< 1MB): 64KB buffer to minimize memory overhead
-        // - Medium files (1MB-100MB): 256KB buffer for balanced performance
-        // - Large files (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
-        let buffer_size = get_adaptive_buffer_size(size);
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
+        let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -2367,11 +2439,10 @@ impl S3 for FS {
             return Err(s3_error!(UnexpectedContent));
         }
 
-        // Use adaptive buffer sizing based on file size for optimal performance:
-        // - Small files (< 1MB): 64KB buffer to minimize memory overhead
-        // - Medium files (1MB-100MB): 256KB buffer for balanced performance
-        // - Large files (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
-        let buffer_size = get_adaptive_buffer_size(size);
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
+        let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -2895,11 +2966,10 @@ impl S3 for FS {
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
-        // Use adaptive buffer sizing based on part size for optimal performance:
-        // - Small parts (< 1MB): 64KB buffer to minimize memory overhead
-        // - Medium parts (1MB-100MB): 256KB buffer for balanced performance
-        // - Large parts (>= 100MB): 1MB buffer to prevent chunked stream read timeouts
-        let buffer_size = get_adaptive_buffer_size(size);
+        // Apply adaptive buffer sizing based on part size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on part size and configured workload profile.
+        let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -4929,6 +4999,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::MI_B;
 
     #[test]
     fn test_fs_creation() {
@@ -5002,29 +5073,201 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_buffer_size() {
+    fn test_adaptive_buffer_size_with_profile() {
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
 
-        // Test unknown/negative size (chunked/streaming)
-        assert_eq!(get_adaptive_buffer_size(-1), DEFAULT_READ_BUFFER_SIZE);
-        assert_eq!(get_adaptive_buffer_size(-100), DEFAULT_READ_BUFFER_SIZE);
+        // Test GeneralPurpose profile (default behavior, should match get_adaptive_buffer_size)
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::GeneralPurpose)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(200 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            DEFAULT_READ_BUFFER_SIZE
+        );
 
-        // Test small files (< 1MB) - should use 64KB
-        assert_eq!(get_adaptive_buffer_size(0), 64 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(512 * KB), 64 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(MB - 1), 64 * KB as usize);
+        // Test AiTraining profile - larger buffers for large files
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::AiTraining)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(600 * MB, Some(WorkloadProfile::AiTraining)),
+            4 * MB as usize
+        );
 
-        // Test medium files (1MB - 100MB) - should use 256KB
-        assert_eq!(get_adaptive_buffer_size(MB), 256 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(50 * MB), 256 * KB as usize);
-        assert_eq!(get_adaptive_buffer_size(100 * MB - 1), 256 * KB as usize);
+        // Test WebWorkload profile - smaller buffers for web assets
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * KB, Some(WorkloadProfile::WebWorkload)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::WebWorkload)),
+            256 * KB as usize
+        );
 
-        // Test large files (>= 100MB) - should use 1MB (DEFAULT_READ_BUFFER_SIZE)
-        assert_eq!(get_adaptive_buffer_size(100 * MB), DEFAULT_READ_BUFFER_SIZE);
-        assert_eq!(get_adaptive_buffer_size(500 * MB), DEFAULT_READ_BUFFER_SIZE);
-        assert_eq!(get_adaptive_buffer_size(10 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 10GB
-        assert_eq!(get_adaptive_buffer_size(20 * 1024 * MB), DEFAULT_READ_BUFFER_SIZE); // 20GB
+        // Test SecureStorage profile - memory-constrained buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::SecureStorage)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::SecureStorage)),
+            256 * KB as usize
+        );
+
+        // Test IndustrialIoT profile - low latency, moderate buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(512 * KB, Some(WorkloadProfile::IndustrialIoT)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            512 * KB as usize
+        );
+
+        // Test DataAnalytics profile
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(2 * MB, Some(WorkloadProfile::DataAnalytics)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::DataAnalytics)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * MB, Some(WorkloadProfile::DataAnalytics)),
+            2 * MB as usize
+        );
+
+        // Test with None (should auto-detect or use GeneralPurpose)
+        let result = get_adaptive_buffer_size_with_profile(50 * MB, None);
+        // Should be either SecureStorage (if on special OS) or GeneralPurpose
+        assert!(result == 128 * KB as usize || result == 256 * KB as usize);
+
+        // Test unknown file size with different profiles
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+    }
+
+    #[test]
+    fn test_phase3_default_behavior() {
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test Phase 3: Enabled by default with GeneralPurpose profile
+        set_buffer_profile_enabled(true);
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Verify GeneralPurpose profile provides consistent buffer sizes
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B); // Unknown size
+
+        // Reset for other tests
+        set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_buffer_size_opt_in() {
+        use crate::config::workload_profiles::{is_buffer_profile_enabled, set_buffer_profile_enabled};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] Default state: profile is not enabled, global configuration is not explicitly initialized
+        // get_buffer_size_opt_in should be equivalent to the GeneralPurpose configuration
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+
+        // GeneralPurpose rules:
+        // \< 1MB -> 64KB，1MB-100MB -> 256KB，\>=100MB -> 1MB
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[2\] Enable the profile switch, but the global configuration is still the default GeneralPurpose
+        set_buffer_profile_enabled(true);
+        assert!(is_buffer_profile_enabled());
+
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] Close again to ensure unchanged behavior
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+    }
+
+    #[test]
+    fn test_phase4_full_integration() {
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] During the entire test process, the global configuration is initialized only once.
+        // In order not to interfere with other tests, use GeneralPurpose (consistent with the default).
+        // If it has been initialized elsewhere, this call will be ignored by OnceLock and the behavior will still be GeneralPurpose.
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Make sure to turn off profile initially
+        set_buffer_profile_enabled(false);
+
+        // \[2\] Verify behavior of get_buffer_size_opt_in in disabled profile (GeneralPurpose)
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] When profile is enabled, the behavior remains consistent with the global GeneralPurpose configuration
+        set_buffer_profile_enabled(true);
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[4\] Complex scenes, boundary values: such as unknown size
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B);
+
+        set_buffer_profile_enabled(false);
     }
 
     // Note: S3Request structure is complex and requires many fields.
