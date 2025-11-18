@@ -2331,15 +2331,31 @@ impl SetDisks {
             // Check if we have missing shards even though we can read successfully
             // This happens when a node was offline during write and comes back online
             let total_shards = erasure.data_shards + erasure.parity_shards;
-            let missing_shards = total_shards - nil_count;
-            if missing_shards > 0 && nil_count >= erasure.data_shards {
+            let available_shards = nil_count;
+            let missing_shards = total_shards - available_shards;
+
+            info!(
+                bucket,
+                object,
+                part_number,
+                total_shards,
+                available_shards,
+                missing_shards,
+                data_shards = erasure.data_shards,
+                parity_shards = erasure.parity_shards,
+                "Shard availability check"
+            );
+
+            if missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
                 info!(
                     bucket,
                     object,
                     part_number,
                     missing_shards,
-                    available_shards = nil_count,
+                    available_shards,
+                    pool_index,
+                    set_index,
                     "Detected missing shards during read, triggering background heal"
                 );
                 if let Err(e) =
@@ -2360,6 +2376,8 @@ impl SetDisks {
                         error = %e,
                         "Failed to enqueue heal request for missing shards"
                     );
+                } else {
+                    info!(bucket, object, part_number, "Successfully enqueued heal request for missing shards");
                 }
             }
 
@@ -2660,10 +2678,12 @@ impl SetDisks {
                         )
                         .await?;
 
-                        // info!(
-                        //     "disks_with_all_parts: got available_disks: {:?}, data_errs_by_disk: {:?}, data_errs_by_part: {:?}, latest_meta: {:?}",
-                        //     available_disks, data_errs_by_disk, data_errs_by_part, latest_meta
-                        // );
+                        info!(
+                            "disks_with_all_parts results: available_disks count={}, total_disks={}",
+                            available_disks.iter().filter(|d| d.is_some()).count(),
+                            available_disks.len()
+                        );
+
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
                             // Initialize erasure coding
                             erasure_coding::Erasure::new(
@@ -2683,10 +2703,7 @@ impl SetDisks {
                         let mut outdate_disks = vec![None; disk_len];
                         let mut disks_to_heal_count = 0;
 
-                        // info!(
-                        //     "errs: {:?}, data_errs_by_disk: {:?}, latest_meta: {:?}",
-                        //     errs, data_errs_by_disk, latest_meta
-                        // );
+                        info!("Checking {} disks for healing needs (bucket={}, object={})", disk_len, bucket, object);
                         for index in 0..available_disks.len() {
                             let (yes, reason) = should_heal_object_on_disk(
                                 &errs[index],
@@ -2694,9 +2711,16 @@ impl SetDisks {
                                 &parts_metadata[index],
                                 &latest_meta,
                             );
+
+                            info!(
+                                "Disk {} heal check: should_heal={}, reason={:?}, err={:?}, endpoint={}",
+                                index, yes, reason, errs[index], self.set_endpoints[index]
+                            );
+
                             if yes {
                                 outdate_disks[index] = disks[index].clone();
                                 disks_to_heal_count += 1;
+                                info!("Disk {} marked for healing (endpoint={})", index, self.set_endpoints[index]);
                             }
 
                             let drive_state = match reason {
@@ -2723,6 +2747,11 @@ impl SetDisks {
                                 state: drive_state.to_string(),
                             });
                         }
+
+                        info!(
+                            "Heal check complete: {} disks need healing out of {} total (bucket={}, object={})",
+                            disks_to_heal_count, disk_len, bucket, object
+                        );
 
                         if DiskError::is_all_not_found(&errs) {
                             warn!(
@@ -3066,6 +3095,12 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
+                        info!(
+                            "Starting rename phase: {} disks to process (bucket={}, object={})",
+                            out_dated_disks.iter().filter(|d| d.is_some()).count(),
+                            bucket,
+                            object
+                        );
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
                                 // record the index of the updated disks
@@ -3074,16 +3109,18 @@ impl SetDisks {
                                 parts_metadata[index].set_healing();
 
                                 info!(
-                                    "rename temp data, src_volume: {}, src_path: {}, dst_volume: {}, dst_path: {}",
-                                    RUSTFS_META_TMP_BUCKET, tmp_id, bucket, object
+                                    "Renaming healed data for disk {} (endpoint={}): src_volume={}, src_path={}, dst_volume={}, dst_path={}",
+                                    index, self.set_endpoints[index], RUSTFS_META_TMP_BUCKET, tmp_id, bucket, object
                                 );
                                 let rename_result = disk
                                     .rename_data(RUSTFS_META_TMP_BUCKET, &tmp_id, parts_metadata[index].clone(), bucket, object)
                                     .await;
 
                                 if let Err(err) = &rename_result {
-                                    info!(
-                                        "rename temp data err: {}. Try fallback to direct xl.meta overwrite...",
+                                    warn!(
+                                        "Rename failed for disk {} (endpoint={}): {}. Trying fallback to direct xl.meta overwrite...",
+                                        index,
+                                        self.set_endpoints[index],
                                         err.to_string()
                                     );
 
@@ -3124,7 +3161,10 @@ impl SetDisks {
                                         ));
                                     }
                                 } else {
-                                    info!("remove temp object, volume: {}, path: {}", RUSTFS_META_TMP_BUCKET, tmp_id);
+                                    info!(
+                                        "Successfully renamed healed data for disk {} (endpoint={}), removing temp files from volume={}, path={}",
+                                        index, self.set_endpoints[index], RUSTFS_META_TMP_BUCKET, tmp_id
+                                    );
 
                                     self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
                                         .await
