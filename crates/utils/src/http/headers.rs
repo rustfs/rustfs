@@ -163,6 +163,7 @@ pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
 pub const RUSTFS_FORCE_DELETE: &str = "X-Rustfs-Force-Delete";
+pub const RUSTFS_INCLUDE_DELETED: &str = "X-Rustfs-Include-Deleted";
 
 pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
 pub const RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";

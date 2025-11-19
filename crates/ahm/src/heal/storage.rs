@@ -498,7 +498,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         match self
             .ecstore
             .clone()
-            .list_objects_v2(bucket, prefix, None, None, 1000, false, None)
+            .list_objects_v2(bucket, prefix, None, None, 1000, false, None, false)
             .await
         {
             Ok(list_info) => {

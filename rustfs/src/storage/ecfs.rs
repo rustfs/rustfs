@@ -2225,6 +2225,11 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
+        let incl_deleted = req
+            .headers
+            .get(rustfs_utils::http::headers::RUSTFS_INCLUDE_DELETED)
+            .is_some_and(|v| v.to_str().unwrap_or_default() == "true");
+
         let object_infos = store
             .list_objects_v2(
                 &bucket,
@@ -2234,6 +2239,7 @@ impl S3 for FS {
                 max_keys,
                 fetch_owner.unwrap_or_default(),
                 start_after,
+                incl_deleted,
             )
             .await
             .map_err(ApiError::from)?;

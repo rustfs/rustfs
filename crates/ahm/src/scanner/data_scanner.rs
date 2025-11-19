@@ -1005,6 +1005,7 @@ impl Scanner {
                             100,   // max_keys - small limit for performance
                             false, // fetch_owner
                             None,  // start_after
+                            false, // incl_deleted
                         )
                         .await
                     {

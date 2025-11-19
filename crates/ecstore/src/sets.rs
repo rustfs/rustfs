@@ -440,6 +440,7 @@ impl StorageAPI for Sets {
         _max_keys: i32,
         _fetch_owner: bool,
         _start_after: Option<String>,
+        _incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
