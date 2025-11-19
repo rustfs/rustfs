@@ -1492,7 +1492,7 @@ impl SetDisks {
         object: &str,
         version_id: &str,
         opts: &ReadOptions,
-    ) -> Result<Vec<rustfs_filemeta::FileInfo>> {
+    ) -> Result<Vec<FileInfo>> {
         // Use existing disk selection logic
         let disks = self.disks.read().await;
         let required_reads = self.format.erasure.sets.len();
@@ -2181,11 +2181,11 @@ impl SetDisks {
         // TODO: replicatio
 
         if fi.deleted {
-            if opts.version_id.is_none() || opts.delete_marker {
-                return Err(to_object_err(StorageError::FileNotFound, vec![bucket, object]));
+            return if opts.version_id.is_none() || opts.delete_marker {
+                Err(to_object_err(StorageError::FileNotFound, vec![bucket, object]))
             } else {
-                return Err(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object]));
-            }
+                Err(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object]))
+            };
         }
 
         Ok((oi, write_quorum))
@@ -2619,7 +2619,7 @@ impl SetDisks {
                             let elapsed = start_time.elapsed();
                             warn!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
                             if i < 2 {
-                                tokio::time::sleep(std::time::Duration::from_millis(50 * (i as u64 + 1))).await;
+                                tokio::time::sleep(Duration::from_millis(50 * (i as u64 + 1))).await;
                             } else {
                                 let message = self.format_lock_error(bucket, object, "write", &e);
                                 error!("Failed to acquire write lock after retries: {}", message);
@@ -2645,7 +2645,36 @@ impl SetDisks {
 
         let disks = { self.disks.read().await.clone() };
 
-        let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+        let (mut parts_metadata, errs) = {
+            let mut retry_count = 0;
+            loop {
+                let (parts, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+
+                // Check if we have enough valid metadata to proceed
+                // If we have too many errors, and we haven't exhausted retries, try again
+                let valid_count = errs.iter().filter(|e| e.is_none()).count();
+                // Simple heuristic: if valid_count is less than expected quorum (e.g. half disks), retry
+                // But we don't know the exact quorum yet. Let's just retry on high error rate if possible.
+                // Actually, read_all_fileinfo shouldn't fail easily.
+                // Let's just retry if we see ANY non-NotFound errors that might be transient (like timeouts)
+
+                let has_transient_error = errs
+                    .iter()
+                    .any(|e| matches!(e, Some(DiskError::SourceStalled) | Some(DiskError::Timeout)));
+
+                if !has_transient_error || retry_count >= 3 {
+                    break (parts, errs);
+                }
+
+                warn!(
+                    "read_all_fileinfo encountered transient errors, retrying (attempt {}/3). Errs: {:?}",
+                    retry_count + 1,
+                    errs
+                );
+                tokio::time::sleep(Duration::from_millis(50 * (retry_count as u64 + 1))).await;
+                retry_count += 1;
+            }
+        };
         warn!(parts_count = parts_metadata.len(), ?errs, "File info read complete");
         if DiskError::is_all_not_found(&errs) {
             warn!(
@@ -2799,9 +2828,18 @@ impl SetDisks {
                         );
 
                         if !latest_meta.deleted && disks_to_heal_count > latest_meta.erasure.parity_blocks {
+                            let total_disks = parts_metadata.len();
+                            let healthy_count = total_disks.saturating_sub(disks_to_heal_count);
+                            let required_data = total_disks.saturating_sub(latest_meta.erasure.parity_blocks);
+
                             error!(
-                                "file({} : {}) part corrupt too much, can not to fix, disks_to_heal_count: {}, parity_blocks: {}",
-                                bucket, object, disks_to_heal_count, latest_meta.erasure.parity_blocks
+                                "Data corruption detected for {}/{}: Insufficient healthy shards. Need at least {} data shards, but found only {} healthy disks. (Missing/Corrupt: {}, Parity: {})",
+                                bucket,
+                                object,
+                                required_data,
+                                healthy_count,
+                                disks_to_heal_count,
+                                latest_meta.erasure.parity_blocks
                             );
 
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
@@ -3513,7 +3551,10 @@ impl SetDisks {
             }
             Ok(m)
         } else {
-            error!("delete_if_dang_ling: is_object_dang_ling errs={:?}", errs);
+            warn!(
+                "Object {}/{} is corrupted but not dangling (some parts exist). Preserving data for potential manual recovery. Errors: {:?}",
+                bucket, object, errs
+            );
             Err(DiskError::ErasureReadQuorum)
         }
     }
@@ -4216,7 +4257,7 @@ impl StorageAPI for SetDisks {
 
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
-        let mut unique_objects: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unique_objects: HashSet<String> = HashSet::new();
         for dobj in &objects {
             if unique_objects.insert(dobj.object_name.clone()) {
                 batch = batch.add_write_lock(bucket, dobj.object_name.clone());
@@ -4231,7 +4272,7 @@ impl StorageAPI for SetDisks {
             .collect();
         let _lock_guards = batch_result.guards;
 
-        let failed_map: HashMap<(String, String), rustfs_lock::fast_lock::LockResult> = batch_result
+        let failed_map: HashMap<(String, String), LockResult> = batch_result
             .failed_locks
             .into_iter()
             .map(|(key, err)| ((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), err))
@@ -4578,7 +4619,7 @@ impl StorageAPI for SetDisks {
         _rx: CancellationToken,
         _bucket: &str,
         _prefix: &str,
-        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _result: Sender<ObjectInfoOrErr>,
         _opts: WalkOptions,
     ) -> Result<()> {
         unimplemented!()
@@ -4914,11 +4955,11 @@ impl StorageAPI for SetDisks {
                 false,
             )?;
             let mut p_reader = PutObjReader::new(hash_reader);
-            if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
-                return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
+            return if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
+                set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await
             } else {
-                return Ok(());
-            }
+                Ok(())
+            };
         }
 
         let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
@@ -6022,7 +6063,7 @@ impl StorageAPI for SetDisks {
                     bucket.to_string(),
                     Some(object.to_string()),
                     false,
-                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+                    Some(HealChannelPriority::Normal),
                     Some(self.pool_index),
                     Some(self.set_index),
                 ))
