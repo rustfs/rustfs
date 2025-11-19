@@ -1224,6 +1224,7 @@ pub trait StorageAPI: ObjectIO + Debug {
         max_keys: i32,
         fetch_owner: bool,
         start_after: Option<String>,
+        incl_deleted: bool,
     ) -> Result<ListObjectsV2Info>;
     // ListObjectVersions TODO: FIXME:
     async fn list_object_versions(
