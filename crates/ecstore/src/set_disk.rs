@@ -2372,7 +2372,7 @@ impl SetDisks {
 
             if missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
-                warn!(
+                info!(
                     bucket,
                     object,
                     part_number,
@@ -2616,7 +2616,7 @@ impl SetDisks {
                     reuse_existing_lock = true;
                     debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
                 } else {
-                    info!("Lock already exists for object {}: {:?}", object, lock_info);
+                    warn!("Lock already exists for object {}: {:?}", object, lock_info);
                 }
             } else {
                 info!("No existing lock found for object {}", object);
@@ -4686,7 +4686,7 @@ impl StorageAPI for SetDisks {
             ))
             .await
         {
-            info!(
+            warn!(
                 bucket,
                 object,
                 version_id,
