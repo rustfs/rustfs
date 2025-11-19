@@ -400,13 +400,13 @@ impl HealStorageAPI for ECStoreHealStorage {
         match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
             Ok(_) => Ok(true), // Object exists
             Err(e) => {
-                // Map ObjectNotFound to false, other errors to false as well for safety
+                // Map ObjectNotFound to false, other errors must be propagated!
                 if matches!(e, rustfs_ecstore::error::StorageError::ObjectNotFound(_, _)) {
                     debug!("Object not found: {}/{}", bucket, object);
                     Ok(false)
                 } else {
-                    debug!("Error checking object existence {}/{}: {}", bucket, object, e);
-                    Ok(false) // Treat errors as non-existence to be safe
+                    error!("Error checking object existence {}/{}: {}", bucket, object, e);
+                    Err(Error::other(e))
                 }
             }
         }

@@ -2561,6 +2561,7 @@ impl SetDisks {
         Ok((new_disks, new_infos, healing))
     }
 
+    #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     async fn heal_object(
         &self,
         bucket: &str,
@@ -2568,10 +2569,7 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        info!(
-            "SetDisks heal_object: bucket={}, object={}, version_id={}, opts={:?}",
-            bucket, object, version_id, opts
-        );
+        warn!(?opts, "Starting heal_object");
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
             bucket: bucket.to_string(),
@@ -2603,20 +2601,34 @@ impl SetDisks {
             if reuse_existing_lock {
                 None
             } else {
-                let start_time = std::time::Instant::now();
-                let lock_result = self
-                    .fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|e| {
-                        let elapsed = start_time.elapsed();
-                        let message = self.format_lock_error(bucket, object, "write", &e);
-                        error!("Failed to acquire write lock for heal operation after {:?}: {}", elapsed, message);
-                        DiskError::other(message)
-                    })?;
-                let elapsed = start_time.elapsed();
-                info!("Successfully acquired write lock for object: {} in {:?}", object, elapsed);
-                Some(lock_result)
+                let mut lock_result = None;
+                for i in 0..3 {
+                    let start_time = Instant::now();
+                    match self
+                        .fast_lock_manager
+                        .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                        .await
+                    {
+                        Ok(res) => {
+                            let elapsed = start_time.elapsed();
+                            warn!(duration = ?elapsed, attempt = i + 1, "Write lock acquired");
+                            lock_result = Some(res);
+                            break;
+                        }
+                        Err(e) => {
+                            let elapsed = start_time.elapsed();
+                            warn!(error = %e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
+                            if i < 2 {
+                                tokio::time::sleep(std::time::Duration::from_millis(50 * (i as u64 + 1))).await;
+                            } else {
+                                let message = self.format_lock_error(bucket, object, "write", &e);
+                                error!("Failed to acquire write lock after retries: {}", message);
+                                return Err(DiskError::other(message));
+                            }
+                        }
+                    }
+                }
+                lock_result
             }
         } else {
             info!("Skipping lock acquisition (no_lock=true)");
@@ -2634,7 +2646,7 @@ impl SetDisks {
         let disks = { self.disks.read().await.clone() };
 
         let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
-        info!("Read file info: parts_metadata.len()={}, errs={:?}", parts_metadata.len(), errs);
+        warn!(parts_count = parts_metadata.len(), ?errs, "File info read complete");
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -2653,7 +2665,7 @@ impl SetDisks {
             ));
         }
 
-        info!("About to call object_quorum_from_meta with parts_metadata.len()={}", parts_metadata.len());
+        warn!(parts_count = parts_metadata.len(), "Initiating quorum check");
         match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count) {
             Ok((read_quorum, _)) => {
                 result.parity_blocks = result.disk_count - read_quorum as usize;
@@ -2976,7 +2988,7 @@ impl SetDisks {
                                 );
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     if let Some(outdated_disk) = &out_dated_disks[index] {
-                                        info!("Creating writer for index {} (outdated disk)", index);
+                                        warn!(disk_index = index, "Creating writer for outdated disk");
                                         let writer = create_bitrot_writer(
                                             is_inline_buffer,
                                             Some(outdated_disk),
@@ -2989,7 +3001,7 @@ impl SetDisks {
                                         .await?;
                                         writers.push(Some(writer));
                                     } else {
-                                        info!("Skipping writer for index {} (not outdated)", index);
+                                        warn!(disk_index = index, "Skipping writer (disk not outdated)");
                                         writers.push(None);
                                     }
 
@@ -3118,11 +3130,14 @@ impl SetDisks {
 
                                 if let Err(err) = &rename_result {
                                     warn!(
-                                        "Rename failed for disk {} (endpoint={}): {}. Trying fallback to direct xl.meta overwrite...",
-                                        index,
-                                        self.set_endpoints[index],
-                                        err.to_string()
+                                        error = %err,
+                                        disk_index = index,
+                                        endpoint = %self.set_endpoints[index],
+                                        "Rename failed, attempting fallback"
                                     );
+
+                                    // Preserve temp files for safety
+                                    warn!(temp_uuid = %tmp_id, "Rename failed, preserving temporary files for safety");
 
                                     let healthy_index = latest_disks.iter().position(|d| d.is_some()).unwrap_or(0);
 
