@@ -1,3 +1,4 @@
+{{- if .Values.mode.distributed.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -22,16 +23,19 @@ spec:
       name: console
   selector:
     app: {{ include "rustfs.name" . }}
+{{- end }}
 
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-svc
+  {{- if .Values.mode.distributed.enabled }}
   {{- if eq .Values.ingress.className "traefik" }}
   {{- with .Values.ingress.traefikAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   {{- end }}
   labels:

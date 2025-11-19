@@ -9,15 +9,22 @@ replicaCount: 4
 image:
   repository: rustfs/rustfs
   # This sets the pull policy for images.
-  pullPolicy: Always
+  pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "1.0.0-alpha.66"
+  tag: "latest"
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
 # This is to override the chart name.
 nameOverride: ""
 fullnameOverride: ""
+
+
+mode:
+  standalone:
+    enabled: false
+  distributed:
+    enabled: true
 
 secret:
   rustfs:
@@ -54,16 +61,16 @@ podAnnotations: {}
 podLabels: {}
 
 podSecurityContext:
-  {}
-  # fsGroup: 2000
+  fsGroup: 10001
+  runAsUser: 10001 
+  runAsGroup: 10001
 
-securityContext:
+containerSecurityContext:
   capabilities:
     drop:
-    - ALL
+      - ALL
   readOnlyRootFilesystem: true
   runAsNonRoot: true
-  runAsUser: 1000
 
 service:
   type: NodePort
@@ -87,7 +94,7 @@ ingress:
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
   hosts:
-    - host: xmg.rustfs.com
+    - host: your.rustfs.com
       paths:
         - path: /
           pathType: ImplementationSpecific

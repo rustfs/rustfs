@@ -1,12 +1,12 @@
-{{- if .Values.mode.distributed.enabled }}
+{{- if .Values.mode.standalone.enabled }}
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: {{ include "rustfs.fullname" . }}
+  labels:
+    app: {{ include "rustfs.name" . }}
 spec:
-  serviceName: {{ include "rustfs.fullname" . }}-headless
-  replicas: {{ .Values.replicaCount }}
-  podManagementPolicy: Parallel
+  replicas: 1
   selector:
     matchLabels:
       app: {{ include "rustfs.name" . }}
@@ -26,33 +26,15 @@ spec:
           securityContext:
             runAsUser: 0
             runAsGroup: 0
-          env:
-            - name: REPLICA_COUNT
-              value: "{{ .Values.replicaCount }}"
           command:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
-                  mkdir -p /data/rustfs$i
-                done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
-                mkdir -p /data
-              fi
-
-              chown -R 10001:10001 /data
-              chown -R 10001:10001 /logs
+              mkdir -p /data /logs
+              chown -R 10001:10001 /data /logs
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
-            - name: data-rustfs-{{ $i }}
-              mountPath: /data/rustfs{{ $i }}
-            {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
             - name: data
               mountPath: /data
-            {{- end }}
             - name: logs
               mountPath: /logs
       containers:
@@ -69,9 +51,6 @@ spec:
               name: endpoint
             - containerPort: {{ .Values.service.console_port }}
               name: console
-          env:
-            - name: REPLICA_COUNT
-              value: "{{ .Values.replicaCount }}"
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
@@ -105,43 +84,13 @@ spec:
           volumeMounts:
             - name: logs
               mountPath: /logs
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
-            - name: data-rustfs-{{ $i }}
-              mountPath: /data/rustfs{{ $i }}
-            {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
             - name: data
               mountPath: /data
-            {{- end }}
-  volumeClaimTemplates:
-    - metadata:
-        name: logs
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
-        resources:
-          requests:
-            storage: {{ $.Values.storageclass.size}}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
-    - metadata:
-        name: data-rustfs-{{ $i }}
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
-        resources:
-          requests:
-            storage: {{ $.Values.storageclass.size}}
-    {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
-        resources:
-          requests:
-            storage: {{ $.Values.storageclass.size}}
-    {{- end }}
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: {{ include "rustfs.fullname" . }}-logs
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "rustfs.fullname" . }}-data
 {{- end }}
