@@ -6123,6 +6123,55 @@ impl StorageAPI for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        let mut effective_object = object.to_string();
+
+        // Optimization: Only attempt correction if the name looks suspicious (quotes or URL encoded)
+        // and the original object does NOT exist.
+        let has_quotes = (effective_object.starts_with('\'') && effective_object.ends_with('\''))
+            || (effective_object.starts_with('"') && effective_object.ends_with('"'));
+        let has_percent = effective_object.contains('%');
+
+        if has_quotes || has_percent {
+            let disks = self.disks.read().await;
+            // 1. Check if the original object exists (lightweight check)
+            let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, &effective_object, version_id, false, false).await?;
+
+            if DiskError::is_all_not_found(&errs) {
+                // Original not found. Try candidates.
+                let mut candidates = Vec::new();
+
+                // Candidate 1: URL Decoded (Priority for web access issues)
+                if has_percent {
+                    if let Ok(decoded) = urlencoding::decode(&effective_object) {
+                        if decoded != effective_object {
+                            candidates.push(decoded.to_string());
+                        }
+                    }
+                }
+
+                // Candidate 2: Quote Stripped (For shell copy-paste issues)
+                if has_quotes && effective_object.len() >= 2 {
+                    candidates.push(effective_object[1..effective_object.len() - 1].to_string());
+                }
+
+                // Check candidates
+                for candidate in candidates {
+                    let (_, errs_cand) =
+                        Self::read_all_fileinfo(&disks, "", bucket, &candidate, version_id, false, false).await?;
+
+                    if !DiskError::is_all_not_found(&errs_cand) {
+                        warn!(
+                            "Heal request for object '{}' failed (not found). Auto-corrected to '{}'.",
+                            effective_object, candidate
+                        );
+                        effective_object = candidate;
+                        break; // Found a match, stop searching
+                    }
+                }
+            }
+        }
+        let object = effective_object.as_str();
+
         let _write_lock_guard = if !opts.no_lock {
             let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
             let mut skip_lock = false;
