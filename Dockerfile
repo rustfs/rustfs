@@ -66,8 +66,8 @@ COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /usr/bin/rustfs /entrypoint.sh
 
-RUN addgroup -g 1000 -S rustfs && \
-    adduser -u 1000 -G rustfs -S rustfs -D && \
+RUN addgroup -g 10001 -S rustfs && \
+    adduser -u 10001 -G rustfs -S rustfs -D && \
     mkdir -p /data /logs && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs

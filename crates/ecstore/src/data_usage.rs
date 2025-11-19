@@ -277,6 +277,7 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
                 1000,  // max_keys
                 false, // fetch_owner
                 None,  // start_after
+                false, // incl_deleted
             )
             .await?;
 
