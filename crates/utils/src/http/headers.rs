@@ -166,7 +166,7 @@ pub const RUSTFS_FORCE_DELETE: &str = "X-Rustfs-Force-Delete";
 pub const RUSTFS_INCLUDE_DELETED: &str = "X-Rustfs-Include-Deleted";
 
 pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
-pub const RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";
+pub const RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";
 
 pub const RUSTFS_BUCKET_SOURCE_VERSION_ID: &str = "X-Rustfs-Source-Version-Id";
 pub const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-Rustfs-Source-Mtime";
