@@ -2617,7 +2617,7 @@ impl SetDisks {
                         }
                         Err(e) => {
                             let elapsed = start_time.elapsed();
-                            warn!(error = %e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
+                            warn!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
                             if i < 2 {
                                 tokio::time::sleep(std::time::Duration::from_millis(50 * (i as u64 + 1))).await;
                             } else {
