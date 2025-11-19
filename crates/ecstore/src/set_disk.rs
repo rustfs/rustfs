@@ -2358,7 +2358,7 @@ impl SetDisks {
             let available_shards = nil_count;
             let missing_shards = total_shards - available_shards;
 
-            warn!(
+            info!(
                 bucket,
                 object,
                 part_number,
@@ -2593,7 +2593,7 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        warn!(?opts, "Starting heal_object");
+        info!(?opts, "Starting heal_object");
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
             bucket: bucket.to_string(),
@@ -2616,7 +2616,7 @@ impl SetDisks {
                     reuse_existing_lock = true;
                     debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
                 } else {
-                    warn!("Lock already exists for object {}: {:?}", object, lock_info);
+                    info!("Lock already exists for object {}: {:?}", object, lock_info);
                 }
             } else {
                 info!("No existing lock found for object {}", object);
@@ -2635,13 +2635,13 @@ impl SetDisks {
                     {
                         Ok(res) => {
                             let elapsed = start_time.elapsed();
-                            warn!(duration = ?elapsed, attempt = i + 1, "Write lock acquired");
+                            info!(duration = ?elapsed, attempt = i + 1, "Write lock acquired");
                             lock_result = Some(res);
                             break;
                         }
                         Err(e) => {
                             let elapsed = start_time.elapsed();
-                            warn!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
+                            info!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
                             if i < 2 {
                                 tokio::time::sleep(Duration::from_millis(50 * (i as u64 + 1))).await;
                             } else {
@@ -2701,7 +2701,7 @@ impl SetDisks {
         };
         info!(parts_count = parts_metadata.len(), ?errs, "File info read complete");
         if DiskError::is_all_not_found(&errs) {
-            info!(
+            warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
                 bucket, object, version_id
             );
@@ -2819,7 +2819,7 @@ impl SetDisks {
                         );
 
                         if DiskError::is_all_not_found(&errs) {
-                            info!(
+                            warn!(
                                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
                                 bucket, object, version_id
                             );
@@ -2915,7 +2915,7 @@ impl SetDisks {
                                 "unexpected file distribution ({:?}) from available disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
                                 latest_meta.erasure.distribution, available_disks, bucket, object, version_id
                             );
-                            info!(err_str);
+                            warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
                                 self.default_heal_result(latest_meta, &errs, bucket, object, version_id).await,
@@ -2929,7 +2929,7 @@ impl SetDisks {
                                 "unexpected file distribution ({:?}) from outdated disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
                                 latest_meta.erasure.distribution, outdate_disks, bucket, object, version_id
                             );
-                            info!(err_str);
+                            warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
                                 self.default_heal_result(latest_meta, &errs, bucket, object, version_id).await,
@@ -2946,7 +2946,7 @@ impl SetDisks {
                                 object,
                                 version_id
                             );
-                            info!(err_str);
+                            warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
                                 self.default_heal_result(latest_meta, &errs, bucket, object, version_id).await,
@@ -3278,7 +3278,7 @@ impl SetDisks {
                         Ok((result, None))
                     }
                     Err(err) => {
-                        info!("heal_object can not pick valid file info");
+                        warn!("heal_object can not pick valid file info");
                         Ok((result, Some(err)))
                     }
                 }
@@ -3575,7 +3575,7 @@ impl SetDisks {
             }
             Ok(m)
         } else {
-            info!(
+            error!(
                 "Object {}/{} is corrupted but not dangling (some parts exist). Preserving data for potential manual recovery. Errors: {:?}",
                 bucket, object, errs
             );
@@ -3835,7 +3835,7 @@ impl ObjectIO for SetDisks {
         }
 
         if filtered_online < write_quorum {
-            info!(
+            warn!(
                 "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
                 filtered_online, write_quorum, bucket, object
             );
@@ -3950,7 +3950,7 @@ impl ObjectIO for SetDisks {
         // }
 
         if (w_size as i64) < data.size() {
-            info!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
             return Err(Error::other(format!(
                 "put_object write size < data.size(), w_size={}, data.size={}",
                 w_size,
@@ -5135,7 +5135,7 @@ impl StorageAPI for SetDisks {
         let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
 
         if filtered_online < write_quorum {
-            info!(
+            warn!(
                 "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
                 filtered_online, write_quorum, bucket, object
             );
@@ -5208,7 +5208,7 @@ impl StorageAPI for SetDisks {
         let _ = mem::replace(&mut data.stream, reader);
 
         if (w_size as i64) < data.size() {
-            info!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
+            warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
             return Err(Error::other(format!(
                 "put_object_part write size < data.size(), w_size={}, data.size={}",
                 w_size,
@@ -5372,7 +5372,7 @@ impl StorageAPI for SetDisks {
 
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
-                info!("list_object_parts part error: {:?}", &err);
+                warn!("list_object_parts part error: {:?}", &err);
             }
 
             parts.push(PartInfo {
@@ -5596,11 +5596,11 @@ impl StorageAPI for SetDisks {
 
         fi.data_dir = Some(Uuid::new_v4());
 
-        if let Some(cssum) = user_defined.get(rustfs_rio::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM)
+        if let Some(cssum) = user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM)
             && !cssum.is_empty()
         {
             fi.checksum = base64_simd::STANDARD.decode_to_vec(cssum).ok().map(Bytes::from);
-            user_defined.remove(rustfs_rio::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM);
+            user_defined.remove(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM);
         }
 
         let parts_metadata = vec![fi.clone(); disks.len()];
@@ -6199,8 +6199,14 @@ impl StorageAPI for SetDisks {
         let _write_lock_guard = if !opts.no_lock {
             let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
             let mut skip_lock = false;
-            if opts.scan_mode == HealScanMode::Scan {
-                if let Ok(true) = self.fast_lock_manager.check_is_write_locked(&key).await {
+            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
+                if lock_info.owner.as_ref() == self.locker_owner.as_str()
+                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
+                {
+                    debug!(
+                        "Reusing existing exclusive lock for heal operation on {}/{} held by {}",
+                        bucket, object, self.locker_owner
+                    );
                     skip_lock = true;
                 }
             }

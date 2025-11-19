@@ -286,7 +286,7 @@ impl HealTask {
             *task_start_instant = Some(start_instant);
         }
 
-        warn!("Task started");
+        info!("Task started");
 
         let result = match &self.heal_type {
             HealType::Object {
@@ -316,7 +316,7 @@ impl HealTask {
             Ok(_) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
-                warn!("Task completed successfully");
+                info!("Task completed successfully");
             }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
@@ -357,7 +357,7 @@ impl HealTask {
     // specific heal implementation method
     #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
     async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        warn!("Starting object heal workflow");
+        info!("Starting object heal workflow");
 
         // update progress
         {
@@ -388,7 +388,7 @@ impl HealTask {
         }
 
         // Step 2: directly call ecstore to perform heal
-        warn!("Step 2: Performing heal using ecstore");
+        info!("Step 2: Performing heal using ecstore");
         let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
@@ -426,7 +426,7 @@ impl HealTask {
 
                     // If heal failed and remove_corrupted is enabled, delete the corrupted object
                     if self.options.remove_corrupted {
-                        warn!("Removing corrupted object: {}/{}", bucket, object);
+                        info!("Removing corrupted object: {}/{}", bucket, object);
                         if !self.options.dry_run {
                             self.await_with_control(self.storage.delete_object(bucket, object)).await?;
                             info!("Successfully deleted corrupted object: {}/{}", bucket, object);
@@ -446,9 +446,9 @@ impl HealTask {
                 }
 
                 // Step 3: Verify heal result
-                warn!("Step 3: Verifying heal result");
+                info!("Step 3: Verifying heal result");
                 let object_size = result.object_size as u64;
-                warn!(
+                info!(
                     object_size = object_size,
                     drives_healed = result.after.drives.len(),
                     "Heal completed successfully"
@@ -481,7 +481,7 @@ impl HealTask {
 
                 // If heal failed and remove_corrupted is enabled, delete the corrupted object
                 if self.options.remove_corrupted {
-                    warn!("Removing corrupted object: {}/{}", bucket, object);
+                    info!("Removing corrupted object: {}/{}", bucket, object);
                     if !self.options.dry_run {
                         self.await_with_control(self.storage.delete_object(bucket, object)).await?;
                         info!("Successfully deleted corrupted object: {}/{}", bucket, object);
