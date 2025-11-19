@@ -531,12 +531,13 @@ impl FileMeta {
             return Err(Error::other("file meta version invalid"));
         }
 
-        // 1000 is the limit of versions TODO: make it configurable
-        if self.versions.len() + 1 > 1000 {
-            return Err(Error::other(
-                "You've exceeded the limit on the number of versions you can create on this object",
-            ));
-        }
+        // TODO: make it configurable
+        // 1000 is the limit of versions
+        // if self.versions.len() + 1 > 1000 {
+        //     return Err(Error::other(
+        //         "You've exceeded the limit on the number of versions you can create on this object",
+        //     ));
+        // }
 
         if self.versions.is_empty() {
             self.versions.push(FileMetaShallowVersion::try_from(version)?);
