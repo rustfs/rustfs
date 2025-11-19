@@ -2120,15 +2120,20 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-
         let mut req = req;
 
-        if authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction))
-            .await
-            .is_err()
-        {
-            bucket_infos = futures::stream::iter(bucket_infos)
+        if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+        }
+
+        let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
+            if e.code() != &S3ErrorCode::AccessDenied {
+                return Err(e);
+            }
+
+            let mut list_bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+
+            list_bucket_infos = futures::stream::iter(list_bucket_infos)
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
                     let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
@@ -2148,7 +2153,14 @@ impl S3 for FS {
                 })
                 .collect()
                 .await;
-        }
+
+            if list_bucket_infos.is_empty() {
+                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+            }
+            list_bucket_infos
+        } else {
+            store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
+        };
 
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
