@@ -129,7 +129,7 @@ flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
 prost = "0.14.1"
 quick-xml = "0.38.4"
-rmcp = { version = "0.8.5" }
+rmcp = { version = "0.9.0" }
 rmp = { version = "0.8.14" }
 rmp-serde = { version = "1.3.0" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -167,18 +167,18 @@ atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.10" }
 aws-credential-types = { version = "1.2.9" }
-aws-sdk-s3 = { version = "1.112.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.113.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
 aws-smithy-types = { version = "1.3.4" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.51", features = ["derive", "env"] }
+clap = { version = "4.5.53", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
 convert_case = "0.9.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
-datafusion = "50.3.0"
+datafusion = "51.0.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
@@ -222,7 +222,7 @@ regex = { version = "1.12.2" }
 rumqttc = { version = "0.25.0" }
 rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/s3s-project/s3s.git", rev = "ba9f902", version = "0.12.0-rc.3", features = ["minio"] }
+s3s = { git = "https://github.com/s3s-project/s3s.git", rev = "85144c53cf358bfb5e00fce9ce080f52e94e1b71", version = "0.12.0-rc.3", features = ["minio"] }
 serial_test = "3.2.0"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
