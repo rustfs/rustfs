@@ -3,9 +3,9 @@
 RustFS helm chart supports **standalone and distributed mode**. For standalone mode, there is only one pod and one pvc; for distributed mode, there are two styles, 4 pods and 16 pvcs(each pod has 4 pvcs), 16 pods and 16 pvcs(each pod has 1 pvc). You should decide which mode and style suits for your situation. You can specify the parameters `mode` and `replicaCount` to install different mode and style.
 
 - **For standalone mode**: Only one pod and one pvc acts as single node single disk; Specify parameters `mode.standalone.enabled="true",mode.distributed.enabled="false"` to install.
-- **For distrubuted mode**(**default**): Multiple pods and multiple pvcs, acts as multiple nodes multiple disks, there are two styles:
+- **For distributed mode**(**default**): Multiple pods and multiple pvcs, acts as multiple nodes multiple disks, there are two styles:
     - 4 pods and each pods has 4 pvcs(**default**)
-    - 16 pods and each pods has 1 pvc: Specify paremeters `replicaCount` with `--set replicaCount="16"` to install.
+    - 16 pods and each pods has 1 pvc: Specify parameters `replicaCount` with `--set replicaCount="16"` to install.
 
 **NOTE**: Please make sure which mode suits for you situation and specify the right parameter to install rustfs on kubernetes.
 
@@ -90,7 +90,7 @@ You can request cert and key from CA or use the self-signed cert(**not recommend
 
 * Step 2: Certification specifying
 
-You should use `--set-file` paramter when running `helm install` command, for example, running the below command can enable ingress tls and generate tls secret:
+You should use `--set-file` parameter when running `helm install` command, for example, running the below command can enable ingress tls and generate tls secret:
 
 ```
 helm install rustfs rustfs/rustfs -n rustfs --set tls.enabled=true,--set-file tls.crt=./tls.crt,--set-file tls.key=./tls.key
