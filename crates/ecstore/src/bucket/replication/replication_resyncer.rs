@@ -34,7 +34,7 @@ use rustfs_filemeta::{
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE,
+    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE,
     RUSTFS_REPLICATION_RESET_STATUS, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, headers,
 };
 use rustfs_utils::path::path_join_buf;
@@ -2324,7 +2324,7 @@ async fn replicate_object_with_multipart(
     let mut user_metadata = HashMap::new();
 
     user_metadata.insert(
-        RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE.to_string(),
+        RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE.to_string(),
         object_info
             .user_defined
             .get(&format!("{RESERVED_METADATA_PREFIX}actual-size"))

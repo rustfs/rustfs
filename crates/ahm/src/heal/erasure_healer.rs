@@ -49,8 +49,9 @@ impl ErasureSetHealer {
     }
 
     /// execute erasure set heal with resume
+    #[tracing::instrument(skip(self, buckets), fields(set_disk_id = %set_disk_id, bucket_count = buckets.len()))]
     pub async fn heal_erasure_set(&self, buckets: &[String], set_disk_id: &str) -> Result<()> {
-        info!("Starting erasure set heal for {} buckets on set disk {}", buckets.len(), set_disk_id);
+        info!("Starting erasure set heal");
 
         // 1. generate or get task id
         let task_id = self.get_or_create_task_id(set_disk_id).await?;
@@ -231,6 +232,7 @@ impl ErasureSetHealer {
 
     /// heal single bucket with resume
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, _skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
     async fn heal_bucket_with_resume(
         &self,
         bucket: &str,
@@ -243,7 +245,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        info!(target: "rustfs:ahm:heal_bucket_with_resume" ,"Starting heal for bucket: {} from object index {}", bucket, current_object_index);
+        info!(target: "rustfs:ahm:heal_bucket_with_resume" ,"Starting heal for bucket from object index {}", current_object_index);
 
         // 1. get bucket info
         let _bucket_info = match self.storage.get_bucket_info(bucket).await? {
@@ -273,7 +275,9 @@ impl ErasureSetHealer {
             let object_exists = match self.storage.object_exists(bucket, object).await {
                 Ok(exists) => exists,
                 Err(e) => {
-                    warn!("Failed to check existence of {}/{}: {}, skipping", bucket, object, e);
+                    warn!("Failed to check existence of {}/{}: {}, marking as failed", bucket, object, e);
+                    *failed_objects += 1;
+                    checkpoint_manager.add_failed_object(object.clone()).await?;
                     *current_object_index = obj_idx + 1;
                     continue;
                 }
