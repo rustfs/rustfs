@@ -15,6 +15,7 @@
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::LogicalPlan as DFPlan;
+use std::sync::Arc;
 
 use crate::QueryResult;
 
@@ -31,7 +32,7 @@ pub enum Plan {
 impl Plan {
     pub fn schema(&self) -> SchemaRef {
         match self {
-            Self::Query(p) => SchemaRef::from(p.df_plan.schema().as_ref().to_owned()),
+            Self::Query(p) => Arc::new(p.df_plan.schema().as_arrow().clone()),
         }
     }
 }
