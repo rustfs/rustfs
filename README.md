@@ -65,7 +65,7 @@ Stress test server parameters
 |---------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
 | Powerful Console                                                                | Simple and useless Console                                                                                              |
 | Developed based on Rust language, memory is safer                               | Developed in Go or C, with potential issues like memory GC/leaks                                                        |
-| Guaranteed Data Sovereignty: No telemetry or unauthorized data egress       | Reporting logs to other third countries may violate national security laws                                              |
+|  No telemetry. Guards against unauthorized cross-border data egress, ensuring full compliance with global regulations including GDPR (EU/UK), CCPA (US), APPI (Japan) |Potential legal exposure and data telemetry risks     |
 | Permissive Apache 2.0 License     | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
 | 100% S3 compatible—works with any cloud provider, anywhere  | Full support for S3, but no local cloud vendor support                                                                  |
 | Rust-based development, strong support for secure and innovative devices        | Poor support for edge gateways and secure innovative devices                                                            |
