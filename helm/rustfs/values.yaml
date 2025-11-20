@@ -80,7 +80,7 @@ service:
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ingress:
   enabled: true
-  className: "" # Specify the classname, traefik or nginx. Different classname has different annotations for session sticky.
+  className: "traefik" # Specify the classname, traefik or nginx. Different classname has different annotations for session sticky.
   traefikAnnotations:
     traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
     traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
@@ -101,7 +101,12 @@ ingress:
   tls:
     - secretName: rustfs-tls
       hosts:
-        - xmg.rustfs.com
+        - your.rustfs.com
+
+tls:
+  enabled: false
+  crt: tls.crt
+  key: tls.key
 
 resources:
   # We usually recommend not to specify default resources and to leave this as a conscious
