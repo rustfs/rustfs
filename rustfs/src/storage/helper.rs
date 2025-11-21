@@ -157,7 +157,7 @@ impl OperationHelper {
                 .clone()
                 .status(status)
                 .status_code(status_code)
-                .time_to_response(format!("{:.2?}", ttr))
+                .time_to_response(format!("{ttr:.2?}"))
                 .time_to_response_in_ns(ttr.as_nanos().to_string())
                 .build();
 

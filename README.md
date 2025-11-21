@@ -1,6 +1,6 @@
 [![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-<p align="center">RustFS is a high-performance distributed object storage software built using Rust</p>
+<p align="center">RustFS is a high-performance, distributed object storage system built in Rust.</p>
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
@@ -29,13 +29,13 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简�
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
-RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages
-worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature,
+RustFS is a high-performance, distributed object storage system built in Rust., one of the most popular languages
+worldwide. RustFS combines the simplicity of MinIO with the memory safety and performance of Rust., S3 compatibility, open-source nature,
 support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in
 comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation,
 RustFS provides faster speed and safer distributed features for high-performance object storage.
 
-> ⚠️ **RustFS is under rapid development. Do NOT use in production environments!**
+> ⚠️ **Current Status: Beta / Technical Preview. Not yet recommended for critical production workloads.**
 
 ## Features
 
@@ -65,9 +65,9 @@ Stress test server parameters
 |---------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
 | Powerful Console                                                                | Simple and useless Console                                                                                              |
 | Developed based on Rust language, memory is safer                               | Developed in Go or C, with potential issues like memory GC/leaks                                                        |
-| Does not report logs to third-party countries                                   | Reporting logs to other third countries may violate national security laws                                              |
-| Licensed under Apache, more business-friendly                                   | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
-| Comprehensive S3 support, works with domestic and international cloud providers | Full support for S3, but no local cloud vendor support                                                                  |
+|  No telemetry. Guards against unauthorized cross-border data egress, ensuring full compliance with global regulations including GDPR (EU/UK), CCPA (US), APPI (Japan) |Potential legal exposure and data telemetry risks     |
+| Permissive Apache 2.0 License     | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
+| 100% S3 compatible—works with any cloud provider, anywhere  | Full support for S3, but no local cloud vendor support                                                                  |
 | Rust-based development, strong support for secure and innovative devices        | Poor support for edge gateways and secure innovative devices                                                            |
 | Stable commercial prices, free community support                                | High pricing, with costs up to $250,000 for 1PiB                                                                        |
 | No risk                                                                         | Intellectual property risks and risks of prohibited uses                                                                |
@@ -91,7 +91,7 @@ RustFS container run as non-root user `rustfs` with id `1000`, if you run docker
    mkdir -p data logs
 
    # change the owner of those two ditectories
-   chown -R 1000:1000 data logs
+   chown -R 10001:10001 data logs
 
    # using latest version
    docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest

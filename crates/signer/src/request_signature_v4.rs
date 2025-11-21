@@ -543,7 +543,7 @@ mod tests {
         *req.uri_mut() = Uri::from_parts(parts).unwrap();
 
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
-        println!("canonical_request: \n{}\n", canonical_request);
+        println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
             concat!(
@@ -562,7 +562,7 @@ mod tests {
         );
 
         let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
-        println!("string_to_sign: \n{}\n", string_to_sign);
+        println!("string_to_sign: \n{string_to_sign}\n");
         assert_eq!(
             string_to_sign,
             concat!(
@@ -576,7 +576,7 @@ mod tests {
 
         let signing_key = get_signing_key(secret_access_key, region, t, service);
         let signature = get_signature(signing_key, &string_to_sign);
-        println!("signature: \n{}\n", signature);
+        println!("signature: \n{signature}\n");
         assert_eq!(signature, "73fad2dfea0727e10a7179bf49150360a56f2e6b519c53999fd6e011152187d0");
     }
 
@@ -608,7 +608,7 @@ mod tests {
 
         println!("{:?}", req.uri().query());
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
-        println!("canonical_request: \n{}\n", canonical_request);
+        println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
             concat!(
@@ -627,7 +627,7 @@ mod tests {
         );
 
         let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
-        println!("string_to_sign: \n{}\n", string_to_sign);
+        println!("string_to_sign: \n{string_to_sign}\n");
         assert_eq!(
             string_to_sign,
             concat!(
@@ -641,7 +641,7 @@ mod tests {
 
         let signing_key = get_signing_key(secret_access_key, region, t, service);
         let signature = get_signature(signing_key, &string_to_sign);
-        println!("signature: \n{}\n", signature);
+        println!("signature: \n{signature}\n");
         assert_eq!(signature, "dfbed913d1982428f6224ee506431fc133dbcad184194c0cbf01bc517435788a");
     }
 
@@ -673,7 +673,7 @@ mod tests {
 
         println!("{:?}", req.uri().query());
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
-        println!("canonical_request: \n{}\n", canonical_request);
+        println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
             concat!(
@@ -692,7 +692,7 @@ mod tests {
         );
 
         let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
-        println!("string_to_sign: \n{}\n", string_to_sign);
+        println!("string_to_sign: \n{string_to_sign}\n");
         assert_eq!(
             string_to_sign,
             concat!(
@@ -706,7 +706,7 @@ mod tests {
 
         let signing_key = get_signing_key(secret_access_key, region, t, service);
         let signature = get_signature(signing_key, &string_to_sign);
-        println!("signature: \n{}\n", signature);
+        println!("signature: \n{signature}\n");
         assert_eq!(signature, "c7c7c6e12e5709c0c2ffc4707600a86c3cd261dd1de7409126a17f5b08c58dfa");
     }
 

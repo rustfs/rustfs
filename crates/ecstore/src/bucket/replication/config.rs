@@ -103,6 +103,8 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 if filter.test_tags(&object_tags) {
                     rules.push(rule.clone());
                 }
+            } else {
+                rules.push(rule.clone());
             }
         }
 

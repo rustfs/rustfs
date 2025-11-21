@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::auth::get_condition_values;
+use crate::config::workload_profiles::{
+    RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
+};
 use crate::error::ApiError;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
@@ -118,6 +121,7 @@ use rustfs_utils::{
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::ops::Add;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -148,6 +152,103 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     display_name: Some("rustfs".to_owned()),
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });
+
+/// Calculate adaptive buffer size with workload profile support.
+///
+/// This enhanced version supports different workload profiles for optimal performance
+/// across various use cases (AI/ML, web workloads, secure storage, etc.).
+///
+/// # Arguments
+/// * `file_size` - The size of the file in bytes, or -1 if unknown
+/// * `profile` - Optional workload profile. If None, uses auto-detection or GeneralPurpose
+///
+/// # Returns
+/// Optimal buffer size in bytes based on the workload profile and file size
+///
+/// # Examples
+/// ```ignore
+/// // Use general purpose profile (default)
+/// let buffer_size = get_adaptive_buffer_size_with_profile(1024 * 1024, None);
+///
+/// // Use AI training profile for large model files
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     500 * 1024 * 1024,
+///     Some(WorkloadProfile::AiTraining)
+/// );
+///
+/// // Use secure storage profile for compliance scenarios
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     10 * 1024 * 1024,
+///     Some(WorkloadProfile::SecureStorage)
+/// );
+/// ```
+///
+#[allow(dead_code)]
+fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
+    let config = match profile {
+        Some(p) => RustFSBufferConfig::new(p),
+        None => {
+            // Auto-detect OS environment or use general purpose
+            RustFSBufferConfig::with_auto_detect()
+        }
+    };
+
+    config.get_buffer_size(file_size)
+}
+
+/// Get adaptive buffer size using global workload profile configuration.
+///
+/// This is the primary buffer sizing function that uses the workload profile
+/// system configured at startup to provide optimal buffer sizes for different scenarios.
+///
+/// The function automatically selects buffer sizes based on:
+/// - Configured workload profile (default: GeneralPurpose)
+/// - File size characteristics
+/// - Optional performance metrics collection
+///
+/// # Arguments
+/// * `file_size` - The size of the file in bytes, or -1 if unknown
+///
+/// # Returns
+/// Optimal buffer size in bytes based on the configured workload profile
+///
+/// # Performance Metrics
+/// When compiled with the `metrics` feature flag, this function tracks:
+/// - Buffer size distribution
+/// - Selection frequency
+/// - Buffer-to-file size ratios
+///
+/// # Examples
+/// ```ignore
+/// // Uses configured profile (default: GeneralPurpose)
+/// let buffer_size = get_buffer_size_opt_in(file_size);
+/// ```
+fn get_buffer_size_opt_in(file_size: i64) -> usize {
+    let buffer_size = if is_buffer_profile_enabled() {
+        // Use globally configured workload profile (enabled by default in Phase 3)
+        let config = get_global_buffer_config();
+        config.get_buffer_size(file_size)
+    } else {
+        // Opt-out mode: Use GeneralPurpose profile for consistent behavior
+        let config = RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose);
+        config.get_buffer_size(file_size)
+    };
+
+    // Optional performance metrics collection for monitoring and optimization
+    #[cfg(feature = "metrics")]
+    {
+        use metrics::histogram;
+        histogram!("rustfs_buffer_size_bytes").record(buffer_size as f64);
+        counter!("rustfs_buffer_size_selections").increment(1);
+
+        if file_size >= 0 {
+            let ratio = buffer_size as f64 / file_size as f64;
+            histogram!("rustfs_buffer_to_file_ratio").record(ratio);
+        }
+    }
+
+    buffer_size
+}
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -370,8 +471,6 @@ impl FS {
         let event_version_id = version_id;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
-
         let size = match content_length {
             Some(c) => c,
             None => {
@@ -385,6 +484,15 @@ impl FS {
                 }
             }
         };
+
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
+        let buffer_size = get_buffer_size_opt_in(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
 
         let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
             return Err(s3_error!(InvalidArgument, "key extension not found"));
@@ -1042,7 +1150,7 @@ impl S3 for FS {
                 warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string());
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
-                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err),
+                    format!("unable to restore transitioned bucket/object {bucket}/{object}: {err}"),
                 ));
             }
 
@@ -1294,7 +1402,7 @@ impl S3 for FS {
             }
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                object.version_id = Some(Uuid::max());
+                object.version_id = Some(Uuid::nil());
             }
 
             if replicate_deletes {
@@ -1511,6 +1619,10 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
+            if_none_match,
+            if_match,
+            if_modified_since,
+            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -1557,6 +1669,36 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+
+        if let Some(match_etag) = if_none_match {
+            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(modified_since) = if_modified_since {
+            // obj_time < givenTime + 1s
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = modified_since.into();
+                mod_time < give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(match_etag) = if_match {
+            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        } else if let Some(unmodified_since) = if_unmodified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = unmodified_since.into();
+                mod_time > give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
+
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
             debug!(
@@ -1869,6 +2011,10 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
+            if_none_match,
+            if_match,
+            if_modified_since,
+            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -1906,6 +2052,35 @@ impl S3 for FS {
         };
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+
+        if let Some(match_etag) = if_none_match {
+            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(modified_since) = if_modified_since {
+            // obj_time < givenTime + 1s
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = modified_since.into();
+                mod_time < give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(match_etag) = if_match {
+            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        } else if let Some(unmodified_since) = if_unmodified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = unmodified_since.into();
+                mod_time > give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
 
         let event_info = info.clone();
         let content_type = {
@@ -2013,15 +2188,20 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-
         let mut req = req;
 
-        if authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction))
-            .await
-            .is_err()
-        {
-            bucket_infos = futures::stream::iter(bucket_infos)
+        if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+        }
+
+        let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
+            if e.code() != &S3ErrorCode::AccessDenied {
+                return Err(e);
+            }
+
+            let mut list_bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+
+            list_bucket_infos = futures::stream::iter(list_bucket_infos)
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
                     let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
@@ -2041,7 +2221,14 @@ impl S3 for FS {
                 })
                 .collect()
                 .await;
-        }
+
+            if list_bucket_infos.is_empty() {
+                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+            }
+            list_bucket_infos
+        } else {
+            store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
+        };
 
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
@@ -2118,6 +2305,11 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
+        let incl_deleted = req
+            .headers
+            .get(rustfs_utils::http::headers::RUSTFS_INCLUDE_DELETED)
+            .is_some_and(|v| v.to_str().unwrap_or_default() == "true");
+
         let object_infos = store
             .list_objects_v2(
                 &bucket,
@@ -2127,6 +2319,7 @@ impl S3 for FS {
                 max_keys,
                 fetch_owner.unwrap_or_default(),
                 start_after,
+                incl_deleted,
             )
             .await
             .map_err(ApiError::from)?;
@@ -2303,8 +2496,42 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
+            if_match,
+            if_none_match,
             ..
         } = input;
+
+        if if_match.is_some() || if_none_match.is_some() {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            };
+
+            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+                Ok(info) => {
+                    if !info.delete_marker {
+                        if let Some(ifmatch) = if_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                        if let Some(ifnonematch) = if_none_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+
+                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
+                        return Err(ApiError::from(err).into());
+                    }
+                }
+            }
+        }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -2326,7 +2553,14 @@ impl S3 for FS {
             return Err(s3_error!(UnexpectedContent));
         }
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
+        let buffer_size = get_buffer_size_opt_in(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
 
         // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
@@ -2846,7 +3080,14 @@ impl S3 for FS {
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
-        let body = StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        // Apply adaptive buffer sizing based on part size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on part size and configured workload profile.
+        let buffer_size = get_buffer_size_opt_in(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
 
         // mc cp step 4
 
@@ -3326,8 +3567,42 @@ impl S3 for FS {
             bucket,
             key,
             upload_id,
+            if_match,
+            if_none_match,
             ..
         } = input;
+
+        if if_match.is_some() || if_none_match.is_some() {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            };
+
+            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+                Ok(info) => {
+                    if !info.delete_marker {
+                        if let Some(ifmatch) = if_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                        if let Some(ifnonematch) = if_none_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+
+                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
+                        return Err(ApiError::from(err).into());
+                    }
+                }
+            }
+        }
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
@@ -4872,6 +5147,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::MI_B;
 
     #[test]
     fn test_fs_creation() {
@@ -4942,6 +5218,204 @@ mod tests {
 
         let gz_format = CompressionFormat::from_extension("gz");
         assert_eq!(gz_format.extension(), "gz");
+    }
+
+    #[test]
+    fn test_adaptive_buffer_size_with_profile() {
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test GeneralPurpose profile (default behavior, should match get_adaptive_buffer_size)
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::GeneralPurpose)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(200 * MB, Some(WorkloadProfile::GeneralPurpose)),
+            DEFAULT_READ_BUFFER_SIZE
+        );
+
+        // Test AiTraining profile - larger buffers for large files
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::AiTraining)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(600 * MB, Some(WorkloadProfile::AiTraining)),
+            4 * MB as usize
+        );
+
+        // Test WebWorkload profile - smaller buffers for web assets
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * KB, Some(WorkloadProfile::WebWorkload)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(5 * MB, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(50 * MB, Some(WorkloadProfile::WebWorkload)),
+            256 * KB as usize
+        );
+
+        // Test SecureStorage profile - memory-constrained buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * KB, Some(WorkloadProfile::SecureStorage)),
+            32 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::SecureStorage)),
+            256 * KB as usize
+        );
+
+        // Test IndustrialIoT profile - low latency, moderate buffers
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(512 * KB, Some(WorkloadProfile::IndustrialIoT)),
+            64 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(25 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            256 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::IndustrialIoT)),
+            512 * KB as usize
+        );
+
+        // Test DataAnalytics profile
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(2 * MB, Some(WorkloadProfile::DataAnalytics)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(100 * MB, Some(WorkloadProfile::DataAnalytics)),
+            512 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(500 * MB, Some(WorkloadProfile::DataAnalytics)),
+            2 * MB as usize
+        );
+
+        // Test with None (should auto-detect or use GeneralPurpose)
+        let result = get_adaptive_buffer_size_with_profile(50 * MB, None);
+        // Should be either SecureStorage (if on special OS) or GeneralPurpose
+        assert!(result == 128 * KB as usize || result == 256 * KB as usize);
+
+        // Test unknown file size with different profiles
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::AiTraining)),
+            2 * MB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::WebWorkload)),
+            128 * KB as usize
+        );
+        assert_eq!(
+            get_adaptive_buffer_size_with_profile(-1, Some(WorkloadProfile::SecureStorage)),
+            128 * KB as usize
+        );
+    }
+
+    #[test]
+    fn test_phase3_default_behavior() {
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // Test Phase 3: Enabled by default with GeneralPurpose profile
+        set_buffer_profile_enabled(true);
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Verify GeneralPurpose profile provides consistent buffer sizes
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B); // Unknown size
+
+        // Reset for other tests
+        set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_buffer_size_opt_in() {
+        use crate::config::workload_profiles::{is_buffer_profile_enabled, set_buffer_profile_enabled};
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] Default state: profile is not enabled, global configuration is not explicitly initialized
+        // get_buffer_size_opt_in should be equivalent to the GeneralPurpose configuration
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+
+        // GeneralPurpose rules:
+        // \< 1MB -> 64KB，1MB-100MB -> 256KB，\>=100MB -> 1MB
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[2\] Enable the profile switch, but the global configuration is still the default GeneralPurpose
+        set_buffer_profile_enabled(true);
+        assert!(is_buffer_profile_enabled());
+
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] Close again to ensure unchanged behavior
+        set_buffer_profile_enabled(false);
+        assert!(!is_buffer_profile_enabled());
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+    }
+
+    #[test]
+    fn test_phase4_full_integration() {
+        use crate::config::workload_profiles::{
+            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        };
+
+        const KB: i64 = 1024;
+        const MB: i64 = 1024 * 1024;
+
+        // \[1\] During the entire test process, the global configuration is initialized only once.
+        // In order not to interfere with other tests, use GeneralPurpose (consistent with the default).
+        // If it has been initialized elsewhere, this call will be ignored by OnceLock and the behavior will still be GeneralPurpose.
+        init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose));
+
+        // Make sure to turn off profile initially
+        set_buffer_profile_enabled(false);
+
+        // \[2\] Verify behavior of get_buffer_size_opt_in in disabled profile (GeneralPurpose)
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[3\] When profile is enabled, the behavior remains consistent with the global GeneralPurpose configuration
+        set_buffer_profile_enabled(true);
+        assert_eq!(get_buffer_size_opt_in(500 * KB), 64 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(50 * MB), 256 * KB as usize);
+        assert_eq!(get_buffer_size_opt_in(200 * MB), MI_B);
+
+        // \[4\] Complex scenes, boundary values: such as unknown size
+        assert_eq!(get_buffer_size_opt_in(-1), MI_B);
+
+        set_buffer_profile_enabled(false);
     }
 
     // Note: S3Request structure is complex and requires many fields.

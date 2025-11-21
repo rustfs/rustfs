@@ -114,7 +114,7 @@ async fn async_main() -> Result<()> {
     let guard = match init_obs(Some(opt.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            println!("Failed to initialize observability: {}", e);
+            println!("Failed to initialize observability: {e}");
             return Err(Error::other(e));
         }
     };
@@ -255,6 +255,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
+
+    // Initialize buffer profiling system
+    init_buffer_profile_system(&opt);
 
     // Initialize event notifier
     init_event_notifier().await;
@@ -650,4 +653,46 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Initialize the adaptive buffer sizing system with workload profile configuration.
+///
+/// This system provides intelligent buffer size selection based on file size and workload type.
+/// Workload-aware buffer sizing is enabled by default with the GeneralPurpose profile,
+/// which provides the same buffer sizes as the original implementation for compatibility.
+///
+/// # Configuration
+/// - Default: Enabled with GeneralPurpose profile
+/// - Opt-out: Use `--buffer-profile-disable` flag
+/// - Custom profile: Set via `--buffer-profile` or `RUSTFS_BUFFER_PROFILE` environment variable
+///
+/// # Arguments
+/// * `opt` - The application configuration options
+fn init_buffer_profile_system(opt: &config::Opt) {
+    use crate::config::workload_profiles::{
+        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+    };
+
+    if opt.buffer_profile_disable {
+        // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
+        info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
+        set_buffer_profile_enabled(false);
+    } else {
+        // Enabled by default: use configured workload profile
+        info!("Buffer profiling enabled with profile: {}", opt.buffer_profile);
+
+        // Parse the workload profile from configuration string
+        let profile = WorkloadProfile::from_name(&opt.buffer_profile);
+
+        // Log the selected profile for operational visibility
+        info!("Active buffer profile: {:?}", profile);
+
+        // Initialize the global buffer configuration
+        init_global_buffer_config(RustFSBufferConfig::new(profile));
+
+        // Enable buffer profiling globally
+        set_buffer_profile_enabled(true);
+
+        info!("Buffer profiling system initialized successfully");
+    }
 }

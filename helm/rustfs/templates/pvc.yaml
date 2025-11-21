@@ -1,0 +1,24 @@
+{{- if .Values.mode.standalone.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rustfs.fullname" . }}-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.storageclass.name }}
+  resources:
+    requests:
+      storage: {{ .Values.storageclass.size }}
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rustfs.fullname" . }}-logs
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.storageclass.name }}
+  resources:
+    requests:
+      storage: {{ .Values.storageclass.size }}
+{{- end }}

@@ -102,7 +102,11 @@ where
                     let nonce = Nonce::try_from(this.nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
                     let plaintext = &temp_buf.filled()[..n];
                     let plaintext_len = plaintext.len();
-                    let crc = crc32fast::hash(plaintext);
+                    let crc = {
+                        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                        hasher.update(plaintext);
+                        hasher.finalize() as u32
+                    };
                     let ciphertext = cipher
                         .encrypt(&nonce, plaintext)
                         .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
@@ -409,7 +413,11 @@ where
                 return Poll::Ready(Err(Error::other("Plaintext length mismatch")));
             }
 
-            let actual_crc = crc32fast::hash(&plaintext);
+            let actual_crc = {
+                let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                hasher.update(&plaintext);
+                hasher.finalize() as u32
+            };
             if actual_crc != crc {
                 this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;

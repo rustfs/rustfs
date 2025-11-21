@@ -30,7 +30,7 @@ const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 /// Helper function to convert Path to &str, returning an error if conversion fails
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
-        .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {:?}", path)))
+        .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {path:?}")))
 }
 
 /// resume state
