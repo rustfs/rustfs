@@ -2,12 +2,12 @@
 %global _empty_manifest_terminate_build 0
 Name:           rustfs
 Version:        1.0.0
-Release:        alpha.36%{?dist}
+Release:        alpha.69
 Summary:       High-performance distributed object storage for MinIO alternative
 
 License:        Apache-2.0
 URL:            https://github.com/rustfs/rustfs
-Source0:        https://github.com/rustfs/rustfs/archive/refs/tags/%{version}.tar.gz
+Source0:        https://github.com/rustfs/rustfs/archive/refs/tags/%{version}-%{release}.tar.gz
 
 BuildRequires: cargo
 BuildRequires: rust
@@ -33,7 +33,7 @@ RustFS is a high-performance distributed object storage software built using Rus
 export CMAKE=$(which cmake3)
 %ifarch x86_64 || aarch64 || loongarch64
     TARGET_DIR="target/%_arch"
-    PLATFORM=%_arch-unknown-linux-musl
+    PLATFORM=%_arch-unknown-linux-gnu
 %else
     TARGET_DIR="target/unknown"
     PLATFORM=unknown-platform
@@ -41,11 +41,15 @@ export CMAKE=$(which cmake3)
 
 # Set CARGO_TARGET_DIR and build the project
 #CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release --package rustfs
-CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release --target $PLATFORM -p rustfs --bins
+%ifarch loongarch64
+CFLAGS="-mcmodel=medium" CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-lm" cargo build --release --target $PLATFORM -p rustfs --bins
+%else
+CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-lm" cargo build --release --target $PLATFORM -p rustfs --bins
+%endif
 
 %install
 mkdir -p %buildroot/usr/bin/
-install %_builddir/%{name}-%{version}-%{release}/target/%_arch/$PLATFORM/release/rustfs %buildroot/usr/bin/
+install %_builddir/%{name}-%{version}-%{release}/target/%_arch/%_arch-unknown-linux-gnu/release/rustfs %buildroot/usr/bin/
 
 %files
 %license LICENSE
@@ -53,5 +57,8 @@ install %_builddir/%{name}-%{version}-%{release}/target/%_arch/$PLATFORM/release
 %_bindir/rustfs
 
 %changelog
+* Thu Nov 20 2025 Wenlong Zhang <zhangwenlong@loongson.cn>
+- Initial RPM package for RustFS 1.0.0-alpha.69
+
 * Tue Jul 08 2025 Wenlong Zhang <zhangwenlong@loongson.cn>
 - Initial RPM package for RustFS 1.0.0-alpha.36
