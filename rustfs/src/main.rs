@@ -540,14 +540,6 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
 /// Initialize KMS system and configure if enabled
 #[instrument(skip(opt))]
 async fn init_kms_system(opt: &config::Opt) -> Result<()> {
-    println!("CLAUDE DEBUG: init_kms_system called!");
-    info!("CLAUDE DEBUG: init_kms_system called!");
-    info!("Initializing KMS service manager...");
-    info!(
-        "CLAUDE DEBUG: KMS configuration - kms_enable: {}, kms_backend: {}, kms_key_dir: {:?}, kms_default_key_id: {:?}",
-        opt.kms_enable, opt.kms_backend, opt.kms_key_dir, opt.kms_default_key_id
-    );
-
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = rustfs_kms::init_global_kms_service_manager();
 
