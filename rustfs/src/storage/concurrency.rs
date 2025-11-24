@@ -355,6 +355,7 @@ impl HotObjectCache {
     }
 
     /// Clear all cached objects
+    #[allow(dead_code)]
     async fn clear(&self) {
         self.cache.invalidate_all();
         // Sync to ensure all entries are removed
@@ -362,6 +363,7 @@ impl HotObjectCache {
     }
 
     /// Get cache statistics for monitoring
+    #[allow(dead_code)]
     async fn stats(&self) -> CacheStats {
         // Ensure pending tasks are processed for accurate stats
         self.cache.run_pending_tasks().await;
@@ -377,6 +379,7 @@ impl HotObjectCache {
     }
 
     /// Check if a key exists in cache (lock-free)
+    #[allow(dead_code)]
     async fn contains(&self, key: &str) -> bool {
         self.cache.contains_key(key)
     }
@@ -384,6 +387,7 @@ impl HotObjectCache {
     /// Get multiple objects from cache in parallel
     ///
     /// Leverages Moka's lock-free design for true parallel access.
+    #[allow(dead_code)]
     async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -393,6 +397,7 @@ impl HotObjectCache {
     }
 
     /// Remove a specific key from cache
+    #[allow(dead_code)]
     async fn remove(&self, key: &str) -> bool {
         let had_key = self.cache.contains_key(key);
         self.cache.invalidate(key).await;
@@ -402,6 +407,7 @@ impl HotObjectCache {
     /// Get the most frequently accessed keys
     ///
     /// Returns up to `limit` keys sorted by access count in descending order.
+    #[allow(dead_code)]
     async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         // Run pending tasks to ensure accurate entry count
         self.cache.run_pending_tasks().await;
@@ -419,6 +425,7 @@ impl HotObjectCache {
     }
 
     /// Warm up cache with a batch of objects
+    #[allow(dead_code)]
     async fn warm(&self, objects: Vec<(String, Vec<u8>)>) {
         for (key, data) in objects {
             self.put(key, data).await;
@@ -426,6 +433,7 @@ impl HotObjectCache {
     }
 
     /// Get hit rate percentage
+    #[allow(dead_code)]
     fn hit_rate(&self) -> f64 {
         let hits = self.hit_count.load(Ordering::Relaxed);
         let misses = self.miss_count.load(Ordering::Relaxed);
