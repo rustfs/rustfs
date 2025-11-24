@@ -20,8 +20,8 @@ can:
 
 ```rust
 // Always check status code first
-if status.is_client_error() | | status.is_server_error() {
-return false; // Don't compress
+if status.is_client_error() || status.is_server_error() {
+    return false; // Don't compress
 }
 ```
 
@@ -44,11 +44,11 @@ return false; // Don't compress
 
 ```rust
 if let Some(content_length) = response.headers().get(CONTENT_LENGTH) {
-if let Ok(length) = content_length.to_str() ?.parse::< u64 > () ? {
-if length < 256 {
-return false; // Don't compress small responses
-}
-}
+    if let Ok(length) = content_length.to_str()?.parse::<u64>()? {
+        if length < 256 {
+            return false; // Don't compress small responses
+        }
+    }
 }
 ```
 

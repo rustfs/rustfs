@@ -75,7 +75,7 @@ pub struct OptimizedObjectKey {
     hash_cache: OnceLock<u64>,
 }
 
-// Manual implementations to handle OnceCell properly
+// Manual implementations to handle OnceLock properly
 impl PartialEq for OptimizedObjectKey {
     fn eq(&self, other: &Self) -> bool {
         self.bucket == other.bucket && self.object == other.object && self.version == other.version
