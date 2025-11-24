@@ -23,11 +23,10 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use serial_test::serial;
 use std::error::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 const ENDPOINT: &str = "http://localhost:9000";
 const ACCESS_KEY: &str = "rustfsadmin";
