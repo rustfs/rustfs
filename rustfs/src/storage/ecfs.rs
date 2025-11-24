@@ -132,6 +132,7 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
+use std::convert::Infallible;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{io::AsyncRead, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -1645,7 +1646,7 @@ impl S3 for FS {
                 debug!("Serving object from cache: {}", cache_key);
 
                 // Build response from cached data
-                let body = Some(StreamingBlob::wrap(futures::stream::once(async move {
+                let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move {
                     Ok(bytes::Bytes::from((*cached_data).clone()))
                 })));
 
