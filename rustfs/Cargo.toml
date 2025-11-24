@@ -107,7 +107,6 @@ clap = { workspace = true }
 const-str = { workspace = true }
 datafusion = { workspace = true }
 hex-simd.workspace = true
-lru = { workspace = true }
 matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
