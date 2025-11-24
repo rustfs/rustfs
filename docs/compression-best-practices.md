@@ -2,32 +2,38 @@
 
 ## Overview
 
-This document outlines best practices for HTTP response compression in RustFS, based on lessons learned from fixing the NoSuchKey error response regression (Issue #901).
+This document outlines best practices for HTTP response compression in RustFS, based on lessons learned from fixing the
+NoSuchKey error response regression (Issue #901).
 
 ## Key Principles
 
 ### 1. Never Compress Error Responses
 
-**Rationale**: Error responses are typically small (100-500 bytes) and need to be transmitted accurately. Compression can:
+**Rationale**: Error responses are typically small (100-500 bytes) and need to be transmitted accurately. Compression
+can:
+
 - Introduce Content-Length header mismatches
 - Add unnecessary overhead for small payloads
 - Potentially corrupt error details during buffering
 
 **Implementation**:
+
 ```rust
 // Always check status code first
-if status.is_client_error() || status.is_server_error() {
-    return false; // Don't compress
+if status.is_client_error() | | status.is_server_error() {
+return false; // Don't compress
 }
 ```
 
 **Affected Status Codes**:
+
 - 4xx Client Errors (400, 403, 404, etc.)
 - 5xx Server Errors (500, 502, 503, etc.)
 
 ### 2. Size-Based Compression Threshold
 
 **Rationale**: Compression has overhead in terms of CPU and potentially network roundtrips. For very small responses:
+
 - Compression overhead > space savings
 - May actually increase payload size
 - Adds latency without benefit
@@ -35,13 +41,14 @@ if status.is_client_error() || status.is_server_error() {
 **Recommended Threshold**: 256 bytes minimum
 
 **Implementation**:
+
 ```rust
 if let Some(content_length) = response.headers().get(CONTENT_LENGTH) {
-    if let Ok(length) = content_length.to_str()?.parse::<u64>()? {
-        if length < 256 {
-            return false; // Don't compress small responses
-        }
-    }
+if let Ok(length) = content_length.to_str() ?.parse::< u64 > () ? {
+if length < 256 {
+return false; // Don't compress small responses
+}
+}
 }
 ```
 
@@ -50,6 +57,7 @@ if let Some(content_length) = response.headers().get(CONTENT_LENGTH) {
 **Rationale**: Compression decisions can affect debugging and troubleshooting. Always log when compression is skipped.
 
 **Implementation**:
+
 ```rust
 debug!(
     "Skipping compression for error response: status={}",
@@ -58,6 +66,7 @@ debug!(
 ```
 
 **Log Analysis**:
+
 ```bash
 # Monitor compression decisions
 RUST_LOG=rustfs::server::http=debug ./target/release/rustfs
@@ -102,10 +111,10 @@ fn should_compress(&self, response: &Response<B>) -> bool {
 fn should_compress(&self, response: &Response<B>) -> bool {
     // Check status
     if response.status().is_error() { return false; }
-    
+
     // Check size
     if get_content_length(response) < 256 { return false; }
-    
+
     true
 }
 ```
@@ -144,7 +153,7 @@ fn test_should_not_compress_errors() {
         .status(404)
         .body(())
         .unwrap();
-    
+
     assert!(!predicate.should_compress(&response));
 }
 
@@ -156,7 +165,7 @@ fn test_should_not_compress_small_responses() {
         .header(CONTENT_LENGTH, "100")
         .body(())
         .unwrap();
-    
+
     assert!(!predicate.should_compress(&response));
 }
 ```
@@ -174,7 +183,7 @@ async fn test_error_response_not_truncated() {
         .key("nonexistent")
         .send()
         .await;
-    
+
     // Should get proper error, not truncation error
     match response.unwrap_err() {
         SdkError::ServiceError(err) => {
@@ -227,16 +236,16 @@ If you're adding compression to an existing service:
 ### Rollout Strategy
 
 1. **Stage 1**: Deploy to canary (5% traffic)
-   - Monitor for 24 hours
-   - Check error rates and latency
-   
+    - Monitor for 24 hours
+    - Check error rates and latency
+
 2. **Stage 2**: Expand to 25% traffic
-   - Monitor for 48 hours
-   - Validate compression ratios
-   
+    - Monitor for 48 hours
+    - Validate compression ratios
+
 3. **Stage 3**: Full rollout (100% traffic)
-   - Continue monitoring for 1 week
-   - Document any issues
+    - Continue monitoring for 1 week
+    - Document any issues
 
 ## Related Documentation
 
@@ -252,5 +261,5 @@ If you're adding compression to an existing service:
 
 ---
 
-**Last Updated**: 2024-11-24  
+**Last Updated**: 2025-11-24  
 **Maintainer**: RustFS Team
