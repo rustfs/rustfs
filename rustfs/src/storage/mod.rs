@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod access;
+pub mod concurrency;
 pub mod ecfs;
 pub(crate) mod entity;
 pub(crate) mod helper;

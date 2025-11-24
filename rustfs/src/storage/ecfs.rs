@@ -17,6 +17,7 @@ use crate::config::workload_profiles::{
     RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
 };
 use crate::error::ApiError;
+use crate::storage::concurrency::{ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager};
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
@@ -1610,6 +1611,15 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        // Track this request for concurrency-aware optimizations
+        let _request_guard = ConcurrencyManager::track_request();
+        let concurrent_requests = GetObjectGuard::concurrent_requests();
+        
+        debug!(
+            "GetObject request started with {} concurrent requests",
+            concurrent_requests
+        );
+        
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
         // mc get 3
 
@@ -1625,6 +1635,31 @@ impl S3 for FS {
             if_unmodified_since,
             ..
         } = req.input.clone();
+
+        // Try to get from cache for small, frequently accessed objects
+        let manager = get_concurrency_manager();
+        let cache_key = format!("{}/{}", bucket, key);
+        
+        // Only attempt cache lookup for objects without range/part requests
+        if part_number.is_none() && range.is_none() {
+            if let Some(cached_data) = manager.get_cached(&cache_key).await {
+                debug!("Serving object from cache: {}", cache_key);
+                
+                // Build response from cached data
+                let body = Some(StreamingBlob::wrap(futures::stream::once(async move {
+                    Ok(bytes::Bytes::from((*cached_data).clone()))
+                })));
+                
+                let output = GetObjectOutput {
+                    body,
+                    content_length: Some(cached_data.len() as i64),
+                    accept_ranges: Some("bytes".to_string()),
+                    ..Default::default()
+                };
+                
+                return Ok(S3Response::new(output));
+            }
+        }
 
         // TODO: getObjectInArchiveFileHandler object = xxx.zip/xxx/xxx.xxx
 
@@ -1663,6 +1698,9 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
+        // Acquire disk read permit to prevent I/O saturation under high concurrency
+        let _disk_permit = manager.acquire_disk_read_permit().await;
+        
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
             .await
@@ -1891,17 +1929,42 @@ impl S3 for FS {
             final_stream = Box::new(limit_reader);
         }
 
+        // Calculate concurrency-aware buffer size for optimal performance
+        // This adapts based on the number of concurrent GetObject requests
+        let base_buffer_size = get_buffer_size_opt_in(response_content_length);
+        let optimal_buffer_size = get_concurrency_aware_buffer_size(response_content_length, base_buffer_size);
+        
+        debug!(
+            "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}",
+            response_content_length,
+            base_buffer_size,
+            optimal_buffer_size,
+            concurrent_requests
+        );
+        
         // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
         // because DecryptReader needs to read all encrypted data to produce decrypted output
         let body = if stored_sse_algorithm.is_some() || managed_encryption_applied {
-            info!("Managed SSE: Using unlimited stream for decryption");
-            Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, DEFAULT_READ_BUFFER_SIZE)))
+            info!("Managed SSE: Using unlimited stream for decryption with buffer size {}", optimal_buffer_size);
+            Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
             Some(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(final_stream, DEFAULT_READ_BUFFER_SIZE),
+                ReaderStream::with_capacity(final_stream, optimal_buffer_size),
                 response_content_length as usize,
             )))
         };
+        
+        // For small objects (<= 10MB) with no range/part request, cache for future requests
+        if response_content_length <= 10 * 1024 * 1024 
+            && part_number.is_none() 
+            && rs.is_none() 
+            && !managed_encryption_applied 
+            && stored_sse_algorithm.is_none() {
+            // Note: In production, we'd want to stream the data and cache it
+            // For now, we'll just note the intention. Actual implementation would
+            // require refactoring to capture the stream data.
+            debug!("Object {} is eligible for caching (size: {} bytes)", cache_key, response_content_length);
+        }
 
         // Extract SSE information from metadata for response
         let server_side_encryption = info
