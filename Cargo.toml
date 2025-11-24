@@ -106,7 +106,7 @@ futures-util = "0.3.31"
 hyper = { version = "1.8.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
 hyper-util = { version = "0.1.18", features = ["tokio", "server-auto", "server-graceful"] }
-http = "1.3.1"
+http = "1.4.0"
 http-body = "1.0.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
 socket2 = "0.6.1"
@@ -119,7 +119,7 @@ tonic = { version = "0.14.2", features = ["gzip"] }
 tonic-prost = { version = "0.14.2" }
 tonic-prost-build = { version = "0.14.2" }
 tower = { version = "0.5.2", features = ["timeout"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.6.7", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.0", features = ["serde"] }
@@ -129,7 +129,7 @@ flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
 prost = "0.14.1"
 quick-xml = "0.38.4"
-rmcp = { version = "0.9.0" }
+rmcp = { version = "0.9.1" }
 rmp = { version = "0.8.14" }
 rmp-serde = { version = "1.3.0" }
 serde = { version = "1.0.228", features = ["derive"] }
