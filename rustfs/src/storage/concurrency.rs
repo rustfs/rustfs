@@ -194,6 +194,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
 ///     true               // sequential read
 /// );
 /// ```
+#[allow(dead_code)]
 pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequential: bool) -> usize {
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
@@ -326,6 +327,7 @@ impl HotObjectCache {
     /// Put an object into cache with automatic size-based eviction
     ///
     /// Moka handles eviction automatically based on the weigher function.
+    #[allow(dead_code)]
     async fn put(&self, key: String, data: Vec<u8>) {
         let size = data.len();
 
@@ -439,6 +441,7 @@ impl HotObjectCache {
 
 /// Cache statistics for monitoring and debugging
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CacheStats {
     /// Current total size of cached objects in bytes
     pub size: usize,
@@ -455,6 +458,7 @@ pub struct CacheStats {
 }
 
 /// Concurrency manager for coordinating concurrent GetObject requests
+#[allow(dead_code)]
 pub struct ConcurrencyManager {
     /// Hot object cache for frequently accessed objects
     cache: Arc<HotObjectCache>,
@@ -492,6 +496,7 @@ impl ConcurrencyManager {
     }
 
     /// Cache an object for future retrievals
+    #[allow(dead_code)]
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
         self.cache.put(key, data).await;
     }
@@ -508,36 +513,43 @@ impl ConcurrencyManager {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)]
     pub async fn cache_stats(&self) -> CacheStats {
         self.cache.stats().await
     }
 
     /// Clear all cached objects
+    #[allow(dead_code)]
     pub async fn clear_cache(&self) {
         self.cache.clear().await;
     }
 
     /// Check if a key is cached
+    #[allow(dead_code)]
     pub async fn is_cached(&self, key: &str) -> bool {
         self.cache.contains(key).await
     }
 
     /// Get multiple cached objects in a single operation
+    #[allow(dead_code)]
     pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         self.cache.get_batch(keys).await
     }
 
     /// Remove a specific object from cache
+    #[allow(dead_code)]
     pub async fn remove_cached(&self, key: &str) -> bool {
         self.cache.remove(key).await
     }
 
     /// Get the most frequently accessed keys
+    #[allow(dead_code)]
     pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         self.cache.get_hot_keys(limit).await
     }
 
     /// Get cache hit rate percentage
+    #[allow(dead_code)]
     pub fn cache_hit_rate(&self) -> f64 {
         self.cache.hit_rate()
     }
@@ -546,6 +558,7 @@ impl ConcurrencyManager {
     ///
     /// This can be called during server startup or maintenance windows
     /// to pre-populate the cache with known hot objects.
+    #[allow(dead_code)]
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
         self.cache.warm(objects).await;
     }
@@ -554,6 +567,7 @@ impl ConcurrencyManager {
     ///
     /// This wraps the advanced buffer sizing logic and makes it accessible
     /// through the concurrency manager interface.
+    #[allow(dead_code)]
     pub fn buffer_size(&self, file_size: i64, base: usize, sequential: bool) -> usize {
         get_advanced_buffer_size(file_size, base, sequential)
     }
