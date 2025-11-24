@@ -181,7 +181,7 @@ async fn test_head_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std:
         SdkError::ServiceError(service_err) => {
             let s3_err = service_err.into_err();
             assert!(
-                s3_err.is_no_such_key() || s3_err.meta().code() == Some("NotFound"),
+                s3_err.meta().code() == Some("NoSuchKey") || s3_err.meta().code() == Some("NotFound"),
                 "Error should be NoSuchKey or NotFound, got: {:?}",
                 s3_err
             );
