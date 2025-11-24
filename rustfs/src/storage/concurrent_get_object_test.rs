@@ -31,7 +31,7 @@ mod tests {
     use rustfs_config::{KI_B, MI_B};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::time::{sleep, Instant};
+    use tokio::time::{Instant, sleep};
 
     /// Test that concurrent requests are tracked correctly with RAII guards
     #[tokio::test]
@@ -90,8 +90,7 @@ mod tests {
             // Allow some tolerance for rounding
             let tolerance = base_buffer / 10;
             assert!(
-                buffer_size >= expected_size.saturating_sub(tolerance)
-                    && buffer_size <= expected_size + tolerance,
+                buffer_size >= expected_size.saturating_sub(tolerance) && buffer_size <= expected_size + tolerance,
                 "{}: expected ~{} bytes, got {} bytes",
                 description,
                 expected_size,
@@ -106,28 +105,17 @@ mod tests {
         // Test minimum buffer size
         let small_file = 1024i64; // 1KB file
         let min_buffer = get_concurrency_aware_buffer_size(small_file, 64 * KI_B);
-        assert!(
-            min_buffer >= 64 * KI_B,
-            "Buffer should have minimum size of 64KB, got {}",
-            min_buffer
-        );
+        assert!(min_buffer >= 64 * KI_B, "Buffer should have minimum size of 64KB, got {}", min_buffer);
 
         // Test maximum buffer size
         let huge_file = 10 * 1024 * MI_B as i64; // 10GB file
         let max_buffer = get_concurrency_aware_buffer_size(huge_file, 10 * MI_B);
-        assert!(
-            max_buffer <= 10 * MI_B,
-            "Buffer should not exceed 10MB, got {}",
-            max_buffer
-        );
+        assert!(max_buffer <= 10 * MI_B, "Buffer should not exceed 10MB, got {}", max_buffer);
 
         // Test that file size smaller than buffer uses file size
         let tiny_file = 32 * KI_B as i64;
         let buffer = get_concurrency_aware_buffer_size(tiny_file, 256 * KI_B);
-        assert!(
-            buffer <= tiny_file as usize,
-            "Buffer should not exceed file size for tiny files"
-        );
+        assert!(buffer <= tiny_file as usize, "Buffer should not exceed file size for tiny files");
     }
 
     /// Test disk I/O permit acquisition for rate limiting
@@ -153,11 +141,7 @@ mod tests {
 
         let elapsed = start.elapsed();
         // With 64 permits, 10 concurrent tasks should complete quickly
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "Should complete within 1 second, took {:?}",
-            elapsed
-        );
+        assert!(elapsed < Duration::from_secs(1), "Should complete within 1 second, took {:?}", elapsed);
     }
 
     /// Test Moka cache operations: insert, retrieve, and stats
@@ -279,11 +263,7 @@ mod tests {
 
         // Verify all objects were retrieved
         let hits = results.iter().filter(|r| r.is_some()).count();
-        assert!(
-            hits >= 8,
-            "Most objects should be cached (got {}/10 hits)",
-            hits
-        );
+        assert!(hits >= 8, "Most objects should be cached (got {}/10 hits)", hits);
 
         // Mix of existing and non-existing keys
         let mixed_keys = vec![
@@ -314,12 +294,7 @@ mod tests {
         for (key, data) in objects {
             let cached = manager.get_cached(&key).await;
             assert!(cached.is_some(), "Warmed object {} should be cached", key);
-            assert_eq!(
-                *cached.unwrap(),
-                data,
-                "Cached data for {} should match",
-                key
-            );
+            assert_eq!(*cached.unwrap(), data, "Cached data for {} should match", key);
         }
 
         let stats = manager.cache_stats().await;
@@ -354,31 +329,17 @@ mod tests {
         // Get hot keys
         let hot_keys = manager.get_hot_keys(3).await;
 
-        assert!(
-            hot_keys.len() >= 3,
-            "Should return at least 3 keys, got {}",
-            hot_keys.len()
-        );
+        assert!(hot_keys.len() >= 3, "Should return at least 3 keys, got {}", hot_keys.len());
 
         // Verify hot keys are sorted by access count
         if hot_keys.len() >= 3 {
-            assert!(
-                hot_keys[0].1 >= hot_keys[1].1,
-                "Hot keys should be sorted by access count"
-            );
-            assert!(
-                hot_keys[1].1 >= hot_keys[2].1,
-                "Hot keys should be sorted by access count"
-            );
+            assert!(hot_keys[0].1 >= hot_keys[1].1, "Hot keys should be sorted by access count");
+            assert!(hot_keys[1].1 >= hot_keys[2].1, "Hot keys should be sorted by access count");
         }
 
         // Most accessed should have highest count
         let top_key = &hot_keys[0];
-        assert!(
-            top_key.1 >= 10,
-            "Most accessed object should have at least 10 hits, got {}",
-            top_key.1
-        );
+        assert!(top_key.1 >= 10, "Most accessed object should have at least 10 hits, got {}", top_key.1);
     }
 
     /// Test cache removal functionality
@@ -393,10 +354,7 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
 
         // Verify it's cached
-        assert!(
-            manager.is_cached(&key).await,
-            "Object should be cached initially"
-        );
+        assert!(manager.is_cached(&key).await, "Object should be cached initially");
 
         // Remove it
         let removed = manager.remove_cached(&key).await;
@@ -405,10 +363,7 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
 
         // Verify it's gone
-        assert!(
-            !manager.is_cached(&key).await,
-            "Object should no longer be cached"
-        );
+        assert!(!manager.is_cached(&key).await, "Object should no longer be cached");
 
         // Try to remove non-existent key
         let not_removed = manager.remove_cached("nonexistent").await;
@@ -428,11 +383,7 @@ mod tests {
             small_size,
             base_buffer
         );
-        assert!(
-            small_size >= 16 * KI_B,
-            "Should not go below minimum: {}",
-            small_size
-        );
+        assert!(small_size >= 16 * KI_B, "Should not go below minimum: {}", small_size);
 
         // Test sequential read optimization
         let seq_size = get_advanced_buffer_size(32 * MI_B as i64, base_buffer, true);
@@ -444,9 +395,7 @@ mod tests {
         );
 
         // Test large file with high concurrency
-        let _guards: Vec<_> = (0..10)
-            .map(|_| ConcurrencyManager::track_request())
-            .collect();
+        let _guards: Vec<_> = (0..10).map(|_| ConcurrencyManager::track_request()).collect();
         let large_concurrent = get_advanced_buffer_size(100 * MI_B as i64, base_buffer, false);
         assert!(
             large_concurrent <= base_buffer,
@@ -516,11 +465,7 @@ mod tests {
         let hot_keys = manager.get_hot_keys(10).await;
         if let Some(entry) = hot_keys.iter().find(|(k, _)| k == &key) {
             // is_cached should not increment access_count significantly
-            assert!(
-                entry.1 <= 2,
-                "is_cached should not inflate access count, got {}",
-                entry.1
-            );
+            assert!(entry.1 <= 2, "is_cached should not inflate access count, got {}", entry.1);
         }
     }
 
@@ -550,11 +495,7 @@ mod tests {
 
         // Hit rate should be around 50%
         let hit_rate = manager.cache_hit_rate();
-        assert!(
-            hit_rate >= 40.0 && hit_rate <= 60.0,
-            "Hit rate should be ~50%, got {:.1}%",
-            hit_rate
-        );
+        assert!((40.0..=60.0).contains(&hit_rate), "Hit rate should be ~50%, got {:.1}%", hit_rate);
     }
 
     /// Test TTL expiration (Moka automatic cleanup)
@@ -576,10 +517,7 @@ mod tests {
         // Moka would automatically remove the entry
         // For testing, we just verify the mechanism is in place
         let stats = manager.cache_stats().await;
-        assert!(
-            stats.max_size > 0,
-            "Cache should be configured with limits"
-        );
+        assert!(stats.max_size > 0, "Cache should be configured with limits");
     }
 
     /// Benchmark: Compare performance of single vs concurrent cache access
@@ -630,9 +568,6 @@ mod tests {
 
         // Concurrent should be faster or similar (lock-free advantage)
         // Allow some margin for test variance
-        assert!(
-            conc_duration <= seq_duration * 2,
-            "Concurrent access should not be significantly slower"
-        );
+        assert!(conc_duration <= seq_duration * 2, "Concurrent access should not be significantly slower");
     }
 }

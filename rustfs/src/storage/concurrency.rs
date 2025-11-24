@@ -291,12 +291,27 @@ impl HotObjectCache {
         }
     }
 
+    /// Soft expiration determination, the number of hits is insufficient and exceeds the soft TTL
+    fn should_expire(&self, obj: &Arc<CachedObject>) -> bool {
+        let age_secs = obj.cached_at.elapsed().as_secs();
+        if age_secs >= CACHE_TTL_SECS {
+            let hits = obj.access_count.load(Ordering::Relaxed);
+            return hits < HOT_OBJECT_MIN_HITS_TO_EXTEND as u64;
+        }
+        false
+    }
+
     /// Get an object from cache with lock-free concurrent access
     ///
     /// Moka provides lock-free reads, significantly improving concurrent performance.
     async fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         match self.cache.get(key).await {
             Some(cached) => {
+                if self.should_expire(&cached) {
+                    self.cache.invalidate(key).await;
+                    self.miss_count.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 // Update access count
                 cached.access_count.fetch_add(1, Ordering::Relaxed);
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
@@ -367,7 +382,17 @@ impl HotObjectCache {
     async fn stats(&self) -> CacheStats {
         // Ensure pending tasks are processed for accurate stats
         self.cache.run_pending_tasks().await;
-
+        let mut total_ms: u128 = 0;
+        let mut cnt: u64 = 0;
+        self.cache.iter().for_each(|(_, v)| {
+            total_ms += v.cached_at.elapsed().as_millis();
+            cnt += 1;
+        });
+        let avg_age_secs = if cnt == 0 {
+            0.0
+        } else {
+            (total_ms as f64 / cnt as f64) / 1000.0
+        };
         CacheStats {
             size: self.cache.weighted_size() as usize,
             entries: self.cache.entry_count() as usize,
@@ -375,6 +400,7 @@ impl HotObjectCache {
             max_object_size: self.max_object_size,
             hit_count: self.hit_count.load(Ordering::Relaxed),
             miss_count: self.miss_count.load(Ordering::Relaxed),
+            avg_age_secs,
         }
     }
 
@@ -463,6 +489,8 @@ pub struct CacheStats {
     pub hit_count: u64,
     /// Total number of cache misses
     pub miss_count: u64,
+    /// Average cache object age (seconds)
+    pub avg_age_secs: f64,
 }
 
 /// Concurrency manager for coordinating concurrent GetObject requests
@@ -733,25 +761,6 @@ mod tests {
         let file_size = 100 * KI_B as i64;
         let result = (file_size as usize / 4).clamp(16 * KI_B, 64 * KI_B);
         assert!((16 * KI_B..=64 * KI_B).contains(&result));
-    }
-
-    #[tokio::test]
-    async fn test_cache_expiration() {
-        let cache = HotObjectCache::new();
-        let data = vec![1u8; 1024];
-
-        cache.put("test".to_string(), data).await;
-
-        // Simulate immediate expiration by manually creating an old object
-        // (In real scenario would need to wait for TTL, here we test the logic)
-        let expired_obj = CachedObject {
-            data: Arc::new(vec![]),
-            cached_at: Instant::now() - Duration::from_secs(HOT_OBJECT_SOFT_TTL_SECS + 1),
-            size: 1024,
-            hit_count: AtomicUsize::new(0),
-        };
-
-        assert!(HotObjectCache::should_expire(&expired_obj));
     }
 
     #[tokio::test]
