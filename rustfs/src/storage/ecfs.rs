@@ -1615,7 +1615,7 @@ impl S3 for FS {
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let request_start = std::time::Instant::now();
-        
+
         // Track this request for concurrency-aware optimizations
         let _request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
@@ -1653,17 +1653,15 @@ impl S3 for FS {
         if part_number.is_none() && range.is_none() {
             if let Some(cached_data) = manager.get_cached(&cache_key).await {
                 let cache_serve_duration = request_start.elapsed();
-                
+
                 debug!("Serving object from cache: {} (latency: {:?})", cache_key, cache_serve_duration);
 
                 #[cfg(feature = "metrics")]
                 {
                     use metrics::{counter, histogram};
                     counter!("rustfs_get_object_cache_served_total").increment(1);
-                    histogram!("rustfs_get_object_cache_serve_duration_seconds")
-                        .record(cache_serve_duration.as_secs_f64());
-                    histogram!("rustfs_get_object_cache_size_bytes")
-                        .record(cached_data.len() as f64);
+                    histogram!("rustfs_get_object_cache_serve_duration_seconds").record(cache_serve_duration.as_secs_f64());
+                    histogram!("rustfs_get_object_cache_size_bytes").record(cached_data.len() as f64);
                 }
 
                 let value = cached_data.clone();
@@ -1724,12 +1722,11 @@ impl S3 for FS {
         let permit_wait_start = std::time::Instant::now();
         let _disk_permit = manager.acquire_disk_read_permit().await;
         let permit_wait_duration = permit_wait_start.elapsed();
-        
+
         #[cfg(feature = "metrics")]
         {
             use metrics::histogram;
-            histogram!("rustfs_disk_permit_wait_duration_seconds")
-                .record(permit_wait_duration.as_secs_f64());
+            histogram!("rustfs_disk_permit_wait_duration_seconds").record(permit_wait_duration.as_secs_f64());
         }
 
         let reader = store
@@ -2085,23 +2082,20 @@ impl S3 for FS {
         helper = helper.object(event_info).version_id(version_id);
 
         let total_duration = request_start.elapsed();
-        
+
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, histogram};
             counter!("rustfs_get_object_requests_completed").increment(1);
-            histogram!("rustfs_get_object_total_duration_seconds")
-                .record(total_duration.as_secs_f64());
-            histogram!("rustfs_get_object_response_size_bytes")
-                .record(response_content_length as f64);
-            
+            histogram!("rustfs_get_object_total_duration_seconds").record(total_duration.as_secs_f64());
+            histogram!("rustfs_get_object_response_size_bytes").record(response_content_length as f64);
+
             // Record buffer size that was used
-            histogram!("rustfs_get_object_buffer_size_bytes")
-                .record(optimal_buffer_size as f64);
+            histogram!("rustfs_get_object_buffer_size_bytes").record(optimal_buffer_size as f64);
         }
 
         debug!(
-            "GetObject completed: key={} size={} duration={:?} buffer={}", 
+            "GetObject completed: key={} size={} duration={:?} buffer={}",
             cache_key, response_content_length, total_duration, optimal_buffer_size
         );
 

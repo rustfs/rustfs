@@ -30,8 +30,8 @@
 //! - Medium concurrency (3-8 requests): Balances throughput and fairness
 //! - High concurrency (>8 requests): Optimizes for fairness and predictable latency
 
-use rustfs_config::{KI_B, MI_B};
 use moka::future::Cache;
+use rustfs_config::{KI_B, MI_B};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -239,6 +239,17 @@ struct HotObjectCache {
     miss_count: Arc<AtomicU64>,
 }
 
+impl std::fmt::Debug for HotObjectCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::sync::atomic::Ordering;
+        f.debug_struct("HotObjectCache")
+            .field("max_object_size", &self.max_object_size)
+            .field("hit_count", &self.hit_count.load(Ordering::Relaxed))
+            .field("miss_count", &self.miss_count.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// A cached object with metadata and metrics
 #[derive(Clone)]
 struct CachedObject {
@@ -293,8 +304,7 @@ impl HotObjectCache {
                 {
                     use metrics::counter;
                     counter!("rustfs_object_cache_hits").increment(1);
-                    counter!("rustfs_object_cache_access_count", "key" => key.to_string())
-                        .increment(1);
+                    counter!("rustfs_object_cache_access_count", "key" => key.to_string()).increment(1);
                 }
 
                 Some(Arc::clone(&cached.data))
@@ -395,10 +405,10 @@ impl HotObjectCache {
         self.cache.run_pending_tasks().await;
 
         let mut entries: Vec<(String, u64)> = Vec::new();
-        
+
         // Iterate through cache entries
         self.cache.iter().for_each(|(key, value)| {
-            entries.push((key.clone(), value.access_count.load(Ordering::Relaxed)));
+            entries.push((key.to_string(), value.access_count.load(Ordering::Relaxed)));
         });
 
         entries.sort_by(|a, b| b.1.cmp(&a.1));
@@ -418,7 +428,7 @@ impl HotObjectCache {
         let hits = self.hit_count.load(Ordering::Relaxed);
         let misses = self.miss_count.load(Ordering::Relaxed);
         let total = hits + misses;
-        
+
         if total == 0 {
             0.0
         } else {
@@ -445,12 +455,21 @@ pub struct CacheStats {
 }
 
 /// Concurrency manager for coordinating concurrent GetObject requests
-#[derive(Debug)]
 pub struct ConcurrencyManager {
     /// Hot object cache for frequently accessed objects
     cache: Arc<HotObjectCache>,
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for ConcurrencyManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::sync::atomic::Ordering;
+        f.debug_struct("ConcurrencyManager")
+            .field("active_requests", &ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
+            .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
+            .finish()
+    }
 }
 
 impl ConcurrencyManager {
@@ -517,7 +536,7 @@ impl ConcurrencyManager {
     pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         self.cache.get_hot_keys(limit).await
     }
-    
+
     /// Get cache hit rate percentage
     pub fn cache_hit_rate(&self) -> f64 {
         self.cache.hit_rate()
