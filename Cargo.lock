@@ -6964,6 +6964,7 @@ dependencies = [
  "metrics",
  "mimalloc",
  "mime_guess",
+ "moka",
  "pin-project-lite",
  "pprof",
  "reqwest",
