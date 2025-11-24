@@ -124,6 +124,7 @@ use rustfs_utils::{
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::convert::Infallible;
 use std::ops::Add;
 use std::{
     collections::HashMap,
@@ -132,7 +133,6 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use std::convert::Infallible;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{io::AsyncRead, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -1645,9 +1645,10 @@ impl S3 for FS {
             if let Some(cached_data) = manager.get_cached(&cache_key).await {
                 debug!("Serving object from cache: {}", cache_key);
 
+                let value = cached_data.clone();
                 // Build response from cached data
                 let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move {
-                    Ok(bytes::Bytes::from((*cached_data).clone()))
+                    Ok(bytes::Bytes::from((*value).clone()))
                 })));
 
                 let output = GetObjectOutput {
