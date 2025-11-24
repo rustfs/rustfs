@@ -1954,16 +1954,26 @@ impl S3 for FS {
             )))
         };
         
-        // For small objects (<= 10MB) with no range/part request, cache for future requests
+        // TODO: Implement proper streaming cache for small objects
+        // For small objects (<= 10MB) with no range/part request, we could cache for future requests.
+        // However, this requires refactoring to capture the stream data while serving the response.
+        // Current implementation only provides cache lookup (lines 1644-1662), not cache insertion.
+        // 
+        // Potential approaches:
+        // 1. Use a TeeReader to duplicate the stream - one copy to response, one to cache
+        // 2. Pre-load small objects into memory before streaming (impacts first request latency)
+        // 3. Background task to cache after response completes (requires stream copy)
+        //
+        // For now, cache can be manually populated via admin API or future background processes.
         if response_content_length <= 10 * 1024 * 1024 
             && part_number.is_none() 
             && rs.is_none() 
             && !managed_encryption_applied 
             && stored_sse_algorithm.is_none() {
-            // Note: In production, we'd want to stream the data and cache it
-            // For now, we'll just note the intention. Actual implementation would
-            // require refactoring to capture the stream data.
-            debug!("Object {} is eligible for caching (size: {} bytes)", cache_key, response_content_length);
+            debug!(
+                "Object {} is eligible for caching (size: {} bytes) but streaming cache not yet implemented",
+                cache_key, response_content_length
+            );
         }
 
         // Extract SSE information from metadata for response

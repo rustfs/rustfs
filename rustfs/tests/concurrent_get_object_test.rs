@@ -57,7 +57,8 @@ async fn test_adaptive_buffer_sizing() {
     
     // Simulate different concurrency levels
     let test_cases = vec![
-        (1, 1.0, "Low concurrency: should use full buffer"),
+        (1, 1.0, "Very low concurrency: should use full buffer"),
+        (2, 1.0, "Low concurrency: should use full buffer"),
         (3, 0.75, "Medium concurrency: should reduce to 75%"),
         (6, 0.5, "High concurrency: should reduce to 50%"),
         (10, 0.4, "Very high concurrency: should reduce to 40%"),

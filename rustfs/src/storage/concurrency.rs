@@ -127,14 +127,17 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     }
     
     // Calculate adaptive multiplier based on concurrency level
-    let adaptive_multiplier = if concurrent_requests <= MEDIUM_CONCURRENCY_THRESHOLD {
-        // Medium concurrency: slightly reduce buffer size (75% of base)
+    let adaptive_multiplier = if concurrent_requests <= 2 {
+        // Low concurrency (1-2): use full buffer for maximum throughput
+        1.0
+    } else if concurrent_requests <= MEDIUM_CONCURRENCY_THRESHOLD {
+        // Medium concurrency (3-4): slightly reduce buffer size (75% of base)
         0.75
     } else if concurrent_requests <= HIGH_CONCURRENCY_THRESHOLD {
-        // Higher concurrency: more aggressive reduction (50% of base)
+        // Higher concurrency (5-8): more aggressive reduction (50% of base)
         0.5
     } else {
-        // Very high concurrency: minimize memory per request (40% of base)
+        // Very high concurrency (>8): minimize memory per request (40% of base)
         0.4
     };
     
@@ -241,16 +244,20 @@ impl HotObjectCache {
         let mut cache = self.cache.write().await;
         
         // Evict items if cache is too large
-        while self.current_size.load(Ordering::Relaxed) + size > self.max_cache_size {
+        // Note: We load the current_size inside the write lock to avoid race conditions
+        let mut current = self.current_size.load(Ordering::Relaxed);
+        while current + size > self.max_cache_size {
             if let Some((_, evicted)) = cache.pop_lru() {
-                self.current_size.fetch_sub(evicted.size, Ordering::Relaxed);
+                current -= evicted.size;
+                self.current_size.store(current, Ordering::Relaxed);
             } else {
                 break;
             }
         }
         
         cache.put(key, cached_obj);
-        self.current_size.fetch_add(size, Ordering::Relaxed);
+        current += size;
+        self.current_size.store(current, Ordering::Relaxed);
         
         #[cfg(feature = "metrics")]
         {
@@ -333,8 +340,17 @@ impl ConcurrencyManager {
     /// Acquire a disk read permit
     ///
     /// This ensures we don't overwhelm the disk with too many concurrent reads
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the semaphore has been closed, which should never
+    /// happen in normal operation since the semaphore is owned by the ConcurrencyManager
+    /// which lives for the entire application lifetime.
     pub async fn acquire_disk_read_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.disk_read_semaphore.acquire().await.expect("Semaphore closed")
+        self.disk_read_semaphore
+            .acquire()
+            .await
+            .expect("Failed to acquire disk read permit: semaphore is closed. This indicates a serious internal error.")
     }
     
     /// Get cache statistics
