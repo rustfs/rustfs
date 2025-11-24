@@ -6949,6 +6949,7 @@ dependencies = [
  "hyper-util",
  "jemalloc_pprof",
  "libsystemd",
+ "lru",
  "matchit 0.9.0",
  "md5",
  "metrics",
