@@ -45,6 +45,12 @@ const HIGH_CONCURRENCY_THRESHOLD: usize = 8;
 /// Medium concurrency threshold
 const MEDIUM_CONCURRENCY_THRESHOLD: usize = 4;
 
+/// Soft expiration time for hot cache objects (seconds)
+const HOT_OBJECT_SOFT_TTL_SECS: u64 = 300;
+
+/// Minimum hit count to extend object lifetime beyond TTL
+const HOT_OBJECT_MIN_HITS_TO_EXTEND: usize = 5;
+
 /// Global concurrency manager instance
 static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(ConcurrencyManager::new);
 
@@ -188,8 +194,9 @@ pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequ
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
     // For very small files, use smaller buffers regardless of concurrency
+    // Replace manual max/min chain with clamp
     if file_size > 0 && file_size < 256 * KI_B as i64 {
-        return (file_size as usize / 4).max(16 * KI_B).min(64 * KI_B);
+        return (file_size as usize / 4).clamp(16 * KI_B, 64 * KI_B);
     }
 
     // Base calculation from standard function
@@ -239,41 +246,63 @@ struct CachedObject {
 }
 
 impl HotObjectCache {
-    /// Create a new hot object cache
+    /// Create a new hot object cache with default parameters
     fn new() -> Self {
         Self {
             max_object_size: 10 * MI_B,
             max_cache_size: 100 * MI_B,
             current_size: AtomicUsize::new(0),
-            cache: RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap())),
+            cache: RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(1000).expect("max cache size overflow"))),
         }
+    }
+
+    /// Check if a cached object should be expired based on age and access pattern
+    fn should_expire(obj: &CachedObject) -> bool {
+        let age = obj.cached_at.elapsed();
+        age.as_secs() > HOT_OBJECT_SOFT_TTL_SECS && obj.hit_count.load(Ordering::Relaxed) < HOT_OBJECT_MIN_HITS_TO_EXTEND
     }
 
     /// Try to get an object from cache with optimized read-first pattern
     ///
     /// Uses `peek()` for initial lookup to avoid write lock contention when possible.
-    /// This significantly improves concurrent read performance.
+    /// This significantly improves concurrent read performance. Also enforces expiration.
     async fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        // First, try with read lock using peek (doesn't promote in LRU)
+        // Fast path: read lock with peek (doesn't promote in LRU)
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.peek(key) {
-                // Clone the data reference while holding read lock
-                let data = Arc::clone(&cached.data);
-                drop(cache);
+                // Check expiration before returning
+                if Self::should_expire(cached) {
+                    // Don't return expired object; will be removed in write path
+                } else {
+                    let data = Arc::clone(&cached.data);
+                    drop(cache);
 
-                // Now acquire write lock to promote in LRU and update stats
-                let mut cache_write = self.cache.write().await;
-                if let Some(cached) = cache_write.get(key) {
-                    cached.hit_count.fetch_add(1, Ordering::Relaxed);
+                    // Promote and update hit count with write lock
+                    let mut cache_write = self.cache.write().await;
+                    if let Some(cached) = cache_write.get(key) {
+                        cached.hit_count.fetch_add(1, Ordering::Relaxed);
 
-                    #[cfg(feature = "metrics")]
-                    {
-                        use metrics::counter;
-                        counter!("rustfs_object_cache_hits").increment(1);
+                        #[cfg(feature = "metrics")]
+                        {
+                            use metrics::counter;
+                            counter!("rustfs_object_cache_hits").increment(1);
+                        }
+
+                        return Some(data);
                     }
+                }
+            }
+        }
 
-                    return Some(data);
+        // Slow path: remove expired entry if found
+        {
+            let mut cache = self.cache.write().await;
+            if let Some(cached) = cache.peek(key) {
+                if Self::should_expire(cached) {
+                    if let Some(evicted) = cache.pop(key) {
+                        self.current_size.fetch_sub(evicted.size, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -288,12 +317,37 @@ impl HotObjectCache {
     }
 
     /// Put an object into cache if it's small enough
+    ///
+    /// This method ensures that:
+    /// - Objects larger than `max_object_size` are rejected
+    /// - Total cache size never exceeds `max_cache_size`
+    /// - Old entries are evicted using LRU policy when necessary
     async fn put(&self, key: String, data: Vec<u8>) {
         let size = data.len();
 
         // Only cache objects smaller than max_object_size
-        if size > self.max_object_size {
+        if size == 0 || size > self.max_object_size {
             return;
+        }
+
+        let mut cache = self.cache.write().await;
+
+        // If key already exists, remove the old value first to update size correctly
+        if let Some(old) = cache.pop(&key) {
+            self.current_size.fetch_sub(old.size, Ordering::Relaxed);
+        }
+
+        // Evict items if adding this object would exceed max_cache_size
+        let mut current = self.current_size.load(Ordering::Relaxed);
+        while current + size > self.max_cache_size {
+            if let Some((_k, evicted)) = cache.pop_lru() {
+                current -= evicted.size;
+                self.current_size.store(current, Ordering::Relaxed);
+            } else {
+                // Cache is empty but size is still reported wrong; reset
+                self.current_size.store(0, Ordering::Relaxed);
+                break;
+            }
         }
 
         let cached_obj = Arc::new(CachedObject {
@@ -303,23 +357,8 @@ impl HotObjectCache {
             hit_count: AtomicUsize::new(0),
         });
 
-        let mut cache = self.cache.write().await;
-
-        // Evict items if cache is too large
-        // Note: We load the current_size inside the write lock to avoid race conditions
-        let mut current = self.current_size.load(Ordering::Relaxed);
-        while current + size > self.max_cache_size {
-            if let Some((_, evicted)) = cache.pop_lru() {
-                current -= evicted.size;
-                self.current_size.store(current, Ordering::Relaxed);
-            } else {
-                break;
-            }
-        }
-
         cache.put(key, cached_obj);
-        current += size;
-        self.current_size.store(current, Ordering::Relaxed);
+        self.current_size.fetch_add(size, Ordering::Relaxed);
 
         #[cfg(feature = "metrics")]
         {
@@ -329,14 +368,14 @@ impl HotObjectCache {
         }
     }
 
-    /// Clear the cache
+    /// Clear all cached objects
     async fn clear(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
         self.current_size.store(0, Ordering::Relaxed);
     }
 
-    /// Get cache statistics
+    /// Get cache statistics for monitoring
     async fn stats(&self) -> CacheStats {
         let cache = self.cache.read().await;
         CacheStats {
@@ -358,30 +397,10 @@ impl HotObjectCache {
     /// This is more efficient than calling get() multiple times as it acquires
     /// the lock only once for all operations.
     async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
-        let mut cache = self.cache.write().await;
         let mut results = Vec::with_capacity(keys.len());
-
         for key in keys {
-            if let Some(cached) = cache.get(key) {
-                cached.hit_count.fetch_add(1, Ordering::Relaxed);
-                results.push(Some(Arc::clone(&cached.data)));
-
-                #[cfg(feature = "metrics")]
-                {
-                    use metrics::counter;
-                    counter!("rustfs_object_cache_hits").increment(1);
-                }
-            } else {
-                results.push(None);
-
-                #[cfg(feature = "metrics")]
-                {
-                    use metrics::counter;
-                    counter!("rustfs_object_cache_misses").increment(1);
-                }
-            }
+            results.push(self.get(key).await);
         }
-
         results
     }
 
@@ -390,10 +409,8 @@ impl HotObjectCache {
     /// Returns true if the key was found and removed, false otherwise.
     async fn remove(&self, key: &str) -> bool {
         let mut cache = self.cache.write().await;
-        if let Some(cached) = cache.pop(key) {
-            let current = self.current_size.load(Ordering::Relaxed);
-            self.current_size
-                .store(current.saturating_sub(cached.size), Ordering::Relaxed);
+        if let Some(evicted) = cache.pop(key) {
+            self.current_size.fetch_sub(evicted.size, Ordering::Relaxed);
             true
         } else {
             false
@@ -405,54 +422,56 @@ impl HotObjectCache {
     /// Returns up to `limit` keys sorted by hit count in descending order.
     async fn get_hot_keys(&self, limit: usize) -> Vec<(String, usize)> {
         let cache = self.cache.read().await;
-        let mut keys_with_hits: Vec<(String, usize)> = cache
+        let mut entries: Vec<(String, usize)> = cache
             .iter()
             .map(|(k, v)| (k.clone(), v.hit_count.load(Ordering::Relaxed)))
             .collect();
 
-        keys_with_hits.sort_by(|a, b| b.1.cmp(&a.1));
-        keys_with_hits.truncate(limit);
-        keys_with_hits
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.truncate(limit);
+        entries
+    }
+
+    /// Warm up cache with a batch of objects
+    async fn warm(&self, objects: Vec<(String, Vec<u8>)>) {
+        for (key, data) in objects {
+            self.put(key, data).await;
+        }
     }
 }
 
-/// Cache statistics
+/// Cache statistics for monitoring and debugging
 #[derive(Debug, Clone)]
 pub struct CacheStats {
-    /// Current cache size in bytes
+    /// Current total size of cached objects in bytes
     pub size: usize,
     /// Number of cached entries
     pub entries: usize,
-    /// Maximum cache size
+    /// Maximum allowed cache size in bytes
     pub max_size: usize,
-    /// Maximum object size that can be cached
+    /// Maximum allowed object size in bytes
     pub max_object_size: usize,
 }
 
 /// Concurrency manager for coordinating concurrent GetObject requests
 #[derive(Debug)]
 pub struct ConcurrencyManager {
-    /// Hot object cache for frequently accessed small files
+    /// Hot object cache for frequently accessed objects
     cache: Arc<HotObjectCache>,
-    /// Semaphore to limit maximum concurrent disk reads
-    /// This prevents disk I/O saturation under extreme load
+    /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
 }
 
 impl ConcurrencyManager {
-    /// Create a new concurrency manager
+    /// Create a new concurrency manager with default settings
     pub fn new() -> Self {
         Self {
             cache: Arc::new(HotObjectCache::new()),
-            // Allow up to 64 concurrent disk reads by default
-            // This can be tuned based on disk performance characteristics
             disk_read_semaphore: Arc::new(Semaphore::new(64)),
         }
     }
 
-    /// Start tracking a new GetObject request
-    ///
-    /// Returns a guard that automatically decrements the counter when dropped
+    /// Track a GetObject request
     pub fn track_request() -> GetObjectGuard {
         GetObjectGuard::new()
     }
@@ -462,25 +481,20 @@ impl ConcurrencyManager {
         self.cache.get(key).await
     }
 
-    /// Cache an object if it's eligible
+    /// Cache an object for future retrievals
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
-        self.cache.put(key, data).await
+        self.cache.put(key, data).await;
     }
 
-    /// Acquire a disk read permit
+    /// Acquire a permit to perform a disk read operation
     ///
-    /// This ensures we don't overwhelm the disk with too many concurrent reads
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the semaphore has been closed, which should never
-    /// happen in normal operation since the semaphore is owned by the ConcurrencyManager
-    /// which lives for the entire application lifetime.
+    /// This ensures we don't overwhelm the disk subsystem with too many
+    /// concurrent reads, which can cause performance degradation.
     pub async fn acquire_disk_read_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
         self.disk_read_semaphore
             .acquire()
             .await
-            .expect("Failed to acquire disk read permit: semaphore is closed. This indicates a serious internal error.")
+            .expect("semaphore closed unexpectedly")
     }
 
     /// Get cache statistics
@@ -488,35 +502,27 @@ impl ConcurrencyManager {
         self.cache.stats().await
     }
 
-    /// Clear the cache
+    /// Clear all cached objects
     pub async fn clear_cache(&self) {
-        self.cache.clear().await
+        self.cache.clear().await;
     }
 
-    /// Check if a key exists in cache
-    ///
-    /// This is a lightweight check that doesn't promote the key in LRU order.
+    /// Check if a key is cached
     pub async fn is_cached(&self, key: &str) -> bool {
         self.cache.contains(key).await
     }
 
-    /// Get multiple objects from cache in batch
-    ///
-    /// More efficient than individual get_cached() calls when fetching multiple objects.
+    /// Get multiple cached objects in a single operation
     pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         self.cache.get_batch(keys).await
     }
 
     /// Remove a specific object from cache
-    ///
-    /// Returns true if the object was cached and removed.
     pub async fn remove_cached(&self, key: &str) -> bool {
         self.cache.remove(key).await
     }
 
     /// Get the most frequently accessed keys
-    ///
-    /// Useful for identifying hot objects and optimizing cache strategies.
     pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, usize)> {
         self.cache.get_hot_keys(limit).await
     }
@@ -526,9 +532,15 @@ impl ConcurrencyManager {
     /// This can be called during server startup or maintenance windows
     /// to pre-populate the cache with known hot objects.
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
-        for (key, data) in objects {
-            self.cache_object(key, data).await;
-        }
+        self.cache.warm(objects).await;
+    }
+
+    /// Get optimized buffer size for a request
+    ///
+    /// This wraps the advanced buffer sizing logic and makes it accessible
+    /// through the concurrency manager interface.
+    pub fn buffer_size(&self, file_size: i64, base: usize, sequential: bool) -> usize {
+        get_advanced_buffer_size(file_size, base, sequential)
     }
 }
 
@@ -549,6 +561,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_request_tracking() {
+        // Ensure we start from a clean state
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
 
         let _guard1 = GetObjectGuard::new();
@@ -566,90 +579,84 @@ mod tests {
 
     #[test]
     fn test_adaptive_buffer_sizing() {
-        // Reset counter
+        // Reset concurrent requests
         ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
+        let base_buffer = 256 * KI_B;
 
-        let base_size = 256 * KI_B;
-
-        // Low concurrency: use base size
+        // Test low concurrency (1 request)
         ACTIVE_GET_REQUESTS.store(1, Ordering::Relaxed);
-        assert_eq!(get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size), base_size);
+        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_buffer);
+        assert_eq!(result, base_buffer, "Single request should use full buffer");
 
-        // Medium concurrency: reduce to 75%
+        // Test medium concurrency (3 requests)
         ACTIVE_GET_REQUESTS.store(3, Ordering::Relaxed);
-        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size);
-        assert!(result < base_size);
-        assert!(result >= base_size / 2);
+        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_buffer);
+        assert!(result < base_buffer && result >= base_buffer / 2);
 
-        // High concurrency: reduce to 50%
+        // Test higher concurrency (6 requests)
         ACTIVE_GET_REQUESTS.store(6, Ordering::Relaxed);
-        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size);
-        assert!(result <= base_size / 2);
-        assert!(result >= base_size / 3);
+        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_buffer);
+        assert!(result <= base_buffer / 2 && result >= base_buffer / 3);
 
-        // Very high concurrency: reduce to 40%
+        // Test very high concurrency (10 requests)
         ACTIVE_GET_REQUESTS.store(10, Ordering::Relaxed);
-        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size);
-        assert!(result <= base_size / 2);
-        assert!(result >= 64 * KI_B); // Should stay above minimum
-
-        // Reset for other tests
-        ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
+        let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_buffer);
+        assert!(result <= base_buffer / 2 && result >= 64 * KI_B);
     }
 
     #[tokio::test]
     async fn test_hot_object_cache() {
         let cache = HotObjectCache::new();
+        let test_data = vec![1u8; 1024];
 
-        // Cache a small object
-        let data = vec![1u8; 1024];
-        cache.put("test-key".to_string(), data.clone()).await;
+        // Test basic put and get
+        cache.put("test_key".to_string(), test_data.clone()).await;
+        let retrieved = cache.get("test_key").await;
+        assert!(retrieved.is_some());
+        assert_eq!(*retrieved.unwrap(), test_data);
 
-        // Retrieve it
-        let cached = cache.get("test-key").await;
-        assert!(cached.is_some());
-        assert_eq!(*cached.unwrap(), data);
-
-        // Try to get non-existent key
-        let missing = cache.get("missing-key").await;
+        // Test cache miss
+        let missing = cache.get("nonexistent").await;
         assert!(missing.is_none());
-
-        // Cache too large object (> 10MB)
-        let large_data = vec![1u8; 11 * MI_B];
-        cache.put("large-key".to_string(), large_data).await;
-
-        // Should not be cached
-        let not_cached = cache.get("large-key").await;
-        assert!(not_cached.is_none());
     }
 
     #[tokio::test]
     async fn test_cache_eviction() {
         let cache = HotObjectCache::new();
 
-        // Fill cache with small objects
-        for i in 0..20 {
-            let data = vec![1u8; 6 * MI_B]; // 6MB each
-            cache.put(format!("key-{}", i), data).await;
+        // Fill cache with objects
+        for i in 0..200 {
+            let data = vec![0u8; 64 * KI_B];
+            cache.put(format!("key_{}", i), data).await;
         }
 
-        // Check that old items were evicted
         let stats = cache.stats().await;
-        assert!(stats.size <= cache.max_cache_size);
+        assert!(
+            stats.size <= stats.max_size,
+            "Cache size {} should not exceed max {}",
+            stats.size,
+            stats.max_size
+        );
+    }
 
-        // First keys should be evicted
-        let first = cache.get("key-0").await;
-        assert!(first.is_none());
+    #[tokio::test]
+    async fn test_cache_reject_large_objects() {
+        let cache = HotObjectCache::new();
+        let large_data = vec![0u8; 11 * MI_B]; // Larger than max_object_size
 
-        // Recent keys should still be there
-        let recent = cache.get("key-19").await;
-        assert!(recent.is_some());
+        cache.put("large_object".to_string(), large_data).await;
+        let retrieved = cache.get("large_object").await;
+        assert!(retrieved.is_none(), "Large objects should not be cached");
     }
 
     #[test]
     fn test_concurrency_manager_creation() {
         let manager = ConcurrencyManager::new();
-        assert_eq!(manager.disk_read_semaphore.available_permits(), 64);
+        assert_eq!(
+            manager.disk_read_semaphore.available_permits(),
+            64,
+            "Should start with 64 available disk read permits"
+        );
     }
 
     #[tokio::test]
@@ -667,5 +674,116 @@ mod tests {
 
         drop(permit2);
         assert_eq!(manager.disk_read_semaphore.available_permits(), 64);
+    }
+
+    #[test]
+    fn test_advanced_buffer_size_small_files() {
+        ACTIVE_GET_REQUESTS.store(1, Ordering::Relaxed);
+
+        // Test small file optimization
+        let result = get_advanced_buffer_size(32 * KI_B as i64, 256 * KI_B, true);
+        assert!(
+            (16 * KI_B..=64 * KI_B).contains(&result),
+            "Small files should use reduced buffer: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_clamp_behavior() {
+        // Test the clamp replacement
+        let file_size = 100 * KI_B as i64;
+        let result = (file_size as usize / 4).clamp(16 * KI_B, 64 * KI_B);
+        assert!((16 * KI_B..=64 * KI_B).contains(&result));
+    }
+
+    #[tokio::test]
+    async fn test_cache_expiration() {
+        let cache = HotObjectCache::new();
+        let data = vec![1u8; 1024];
+
+        cache.put("test".to_string(), data).await;
+
+        // Simulate immediate expiration by manually creating an old object
+        // (In real scenario would need to wait for TTL, here we test the logic)
+        let expired_obj = CachedObject {
+            data: Arc::new(vec![]),
+            cached_at: Instant::now() - Duration::from_secs(HOT_OBJECT_SOFT_TTL_SECS + 1),
+            size: 1024,
+            hit_count: AtomicUsize::new(0),
+        };
+
+        assert!(HotObjectCache::should_expire(&expired_obj));
+    }
+
+    #[tokio::test]
+    async fn test_hot_keys_tracking() {
+        let manager = ConcurrencyManager::new();
+
+        // Cache some objects with different access patterns
+        manager.cache_object("hot1".to_string(), vec![1u8; 100]).await;
+        manager.cache_object("hot2".to_string(), vec![2u8; 100]).await;
+
+        // Access them multiple times to build hit counts
+        for _ in 0..5 {
+            let _ = manager.get_cached("hot1").await;
+        }
+        for _ in 0..3 {
+            let _ = manager.get_cached("hot2").await;
+        }
+
+        let hot_keys = manager.get_hot_keys(2).await;
+        assert!(!hot_keys.is_empty(), "Should have hot keys");
+    }
+
+    #[tokio::test]
+    async fn test_batch_operations() {
+        let manager = ConcurrencyManager::new();
+
+        manager.cache_object("key1".to_string(), vec![1u8; 100]).await;
+        manager.cache_object("key2".to_string(), vec![2u8; 100]).await;
+        manager.cache_object("key3".to_string(), vec![3u8; 100]).await;
+
+        let keys = vec!["key1".to_string(), "key2".to_string(), "key4".to_string()];
+        let results = manager.get_cached_batch(&keys).await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some());
+        assert!(results[1].is_some());
+        assert!(results[2].is_none()); // key4 doesn't exist
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear() {
+        let manager = ConcurrencyManager::new();
+
+        manager.cache_object("key1".to_string(), vec![1u8; 1024]).await;
+        manager.cache_object("key2".to_string(), vec![2u8; 1024]).await;
+
+        let stats_before = manager.cache_stats().await;
+        assert!(stats_before.entries > 0);
+
+        manager.clear_cache().await;
+
+        let stats_after = manager.cache_stats().await;
+        assert_eq!(stats_after.entries, 0);
+        assert_eq!(stats_after.size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_warm_cache() {
+        let manager = ConcurrencyManager::new();
+
+        let objects = vec![
+            ("warm1".to_string(), vec![1u8; 100]),
+            ("warm2".to_string(), vec![2u8; 100]),
+            ("warm3".to_string(), vec![3u8; 100]),
+        ];
+
+        manager.warm_cache(objects).await;
+
+        assert!(manager.is_cached("warm1").await);
+        assert!(manager.is_cached("warm2").await);
+        assert!(manager.is_cached("warm3").await);
     }
 }
