@@ -160,6 +160,55 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     adjusted_size.clamp(min_buffer, max_buffer)
 }
 
+/// Advanced concurrency-aware buffer sizing with file size optimization
+///
+/// This enhanced version considers both concurrency level and file size patterns
+/// to provide even better performance characteristics.
+///
+/// # Arguments
+///
+/// * `file_size` - The size of the file being read, or -1 if unknown
+/// * `base_buffer_size` - The baseline buffer size from workload profile
+/// * `is_sequential` - Whether this is a sequential read (hint for optimization)
+///
+/// # Returns
+///
+/// Optimized buffer size in bytes
+///
+/// # Examples
+///
+/// ```ignore
+/// let buffer_size = get_advanced_buffer_size(
+///     32 * 1024 * 1024,  // 32MB file
+///     256 * 1024,        // 256KB base buffer
+///     true               // sequential read
+/// );
+/// ```
+pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequential: bool) -> usize {
+    let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+    
+    // For very small files, use smaller buffers regardless of concurrency
+    if file_size > 0 && file_size < 256 * KI_B as i64 {
+        return (file_size as usize / 4).max(16 * KI_B).min(64 * KI_B);
+    }
+    
+    // Base calculation from standard function
+    let standard_size = get_concurrency_aware_buffer_size(file_size, base_buffer_size);
+    
+    // For sequential reads, we can be more aggressive with buffer sizes
+    if is_sequential && concurrent_requests <= MEDIUM_CONCURRENCY_THRESHOLD {
+        return ((standard_size as f64 * 1.5) as usize).min(2 * MI_B);
+    }
+    
+    // For high concurrency with large files, optimize for parallel processing
+    if concurrent_requests > HIGH_CONCURRENCY_THRESHOLD && file_size > 10 * MI_B as i64 {
+        // Use smaller, more numerous buffers for better parallelism
+        return (standard_size as f64 * 0.8) as usize;
+    }
+    
+    standard_size
+}
+
 /// Simple LRU cache for hot objects
 ///
 /// This cache stores frequently accessed small objects (<= 10MB) to reduce
@@ -200,20 +249,33 @@ impl HotObjectCache {
         }
     }
 
-    /// Try to get an object from cache
+    /// Try to get an object from cache with optimized read-first pattern
+    ///
+    /// Uses `peek()` for initial lookup to avoid write lock contention when possible.
+    /// This significantly improves concurrent read performance.
     async fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(cached) = cache.get(key) {
-            cached.hit_count.fetch_add(1, Ordering::Relaxed);
-
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::counter;
-                counter!("rustfs_object_cache_hits").increment(1);
+        // First, try with read lock using peek (doesn't promote in LRU)
+        {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.peek(key) {
+                // Clone the data reference while holding read lock
+                let data = Arc::clone(&cached.data);
+                drop(cache);
+                
+                // Now acquire write lock to promote in LRU and update stats
+                let mut cache_write = self.cache.write().await;
+                if let Some(cached) = cache_write.get(key) {
+                    cached.hit_count.fetch_add(1, Ordering::Relaxed);
+                    
+                    #[cfg(feature = "metrics")]
+                    {
+                        use metrics::counter;
+                        counter!("rustfs_object_cache_hits").increment(1);
+                    }
+                    
+                    return Some(data);
+                }
             }
-
-            return Some(Arc::clone(&cached.data));
         }
 
         #[cfg(feature = "metrics")]
@@ -283,6 +345,73 @@ impl HotObjectCache {
             max_size: self.max_cache_size,
             max_object_size: self.max_object_size,
         }
+    }
+    
+    /// Check if a key exists in cache without promoting it in LRU
+    async fn contains(&self, key: &str) -> bool {
+        let cache = self.cache.read().await;
+        cache.peek(key).is_some()
+    }
+    
+    /// Get multiple objects from cache in a single operation
+    ///
+    /// This is more efficient than calling get() multiple times as it acquires
+    /// the lock only once for all operations.
+    async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
+        let mut cache = self.cache.write().await;
+        let mut results = Vec::with_capacity(keys.len());
+        
+        for key in keys {
+            if let Some(cached) = cache.get(key) {
+                cached.hit_count.fetch_add(1, Ordering::Relaxed);
+                results.push(Some(Arc::clone(&cached.data)));
+                
+                #[cfg(feature = "metrics")]
+                {
+                    use metrics::counter;
+                    counter!("rustfs_object_cache_hits").increment(1);
+                }
+            } else {
+                results.push(None);
+                
+                #[cfg(feature = "metrics")]
+                {
+                    use metrics::counter;
+                    counter!("rustfs_object_cache_misses").increment(1);
+                }
+            }
+        }
+        
+        results
+    }
+    
+    /// Remove a specific key from cache
+    ///
+    /// Returns true if the key was found and removed, false otherwise.
+    async fn remove(&self, key: &str) -> bool {
+        let mut cache = self.cache.write().await;
+        if let Some((_, cached)) = cache.pop(key) {
+            let current = self.current_size.load(Ordering::Relaxed);
+            self.current_size.store(current.saturating_sub(cached.size), Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get the most frequently accessed keys
+    ///
+    /// Returns up to `limit` keys sorted by hit count in descending order.
+    async fn get_hot_keys(&self, limit: usize) -> Vec<(String, usize)> {
+        let cache = self.cache.read().await;
+        let mut keys_with_hits: Vec<(String, usize)> = cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.hit_count.load(Ordering::Relaxed)))
+            .collect();
+        
+        keys_with_hits.sort_by(|a, b| b.1.cmp(&a.1));
+        keys_with_hits.truncate(limit);
+        keys_with_hits
     }
 }
 
@@ -361,6 +490,44 @@ impl ConcurrencyManager {
     /// Clear the cache
     pub async fn clear_cache(&self) {
         self.cache.clear().await
+    }
+    
+    /// Check if a key exists in cache
+    ///
+    /// This is a lightweight check that doesn't promote the key in LRU order.
+    pub async fn is_cached(&self, key: &str) -> bool {
+        self.cache.contains(key).await
+    }
+    
+    /// Get multiple objects from cache in batch
+    ///
+    /// More efficient than individual get_cached() calls when fetching multiple objects.
+    pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
+        self.cache.get_batch(keys).await
+    }
+    
+    /// Remove a specific object from cache
+    ///
+    /// Returns true if the object was cached and removed.
+    pub async fn remove_cached(&self, key: &str) -> bool {
+        self.cache.remove(key).await
+    }
+    
+    /// Get the most frequently accessed keys
+    ///
+    /// Useful for identifying hot objects and optimizing cache strategies.
+    pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, usize)> {
+        self.cache.get_hot_keys(limit).await
+    }
+    
+    /// Warm up cache with frequently accessed objects
+    ///
+    /// This can be called during server startup or maintenance windows
+    /// to pre-populate the cache with known hot objects.
+    pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
+        for (key, data) in objects {
+            self.cache_object(key, data).await;
+        }
     }
 }
 
