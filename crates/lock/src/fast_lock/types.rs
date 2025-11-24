@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::unsync::OnceCell;
 use serde::{Deserialize, Serialize};
 use smartstring::SmartString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::fast_lock::guard::FastLockGuard;
@@ -72,10 +72,10 @@ pub struct OptimizedObjectKey {
     /// Version - optional for latest version semantics
     pub version: Option<SmartString<smartstring::LazyCompact>>,
     /// Cached hash to avoid recomputation
-    hash_cache: OnceCell<u64>,
+    hash_cache: OnceLock<u64>,
 }
 
-// Manual implementations to handle OnceCell properly
+// Manual implementations to handle OnceLock properly
 impl PartialEq for OptimizedObjectKey {
     fn eq(&self, other: &Self) -> bool {
         self.bucket == other.bucket && self.object == other.object && self.version == other.version
@@ -116,7 +116,7 @@ impl OptimizedObjectKey {
             bucket: bucket.into(),
             object: object.into(),
             version: None,
-            hash_cache: OnceCell::new(),
+            hash_cache: OnceLock::new(),
         }
     }
 
@@ -129,7 +129,7 @@ impl OptimizedObjectKey {
             bucket: bucket.into(),
             object: object.into(),
             version: Some(version.into()),
-            hash_cache: OnceCell::new(),
+            hash_cache: OnceLock::new(),
         }
     }
 
@@ -145,7 +145,7 @@ impl OptimizedObjectKey {
 
     /// Reset hash cache if key is modified
     pub fn invalidate_cache(&mut self) {
-        self.hash_cache = OnceCell::new();
+        self.hash_cache = OnceLock::new();
     }
 
     /// Convert from regular ObjectKey
@@ -154,7 +154,7 @@ impl OptimizedObjectKey {
             bucket: SmartString::from(key.bucket.as_ref()),
             object: SmartString::from(key.object.as_ref()),
             version: key.version.as_ref().map(|v| SmartString::from(v.as_ref())),
-            hash_cache: OnceCell::new(),
+            hash_cache: OnceLock::new(),
         }
     }
 
