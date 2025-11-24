@@ -2,19 +2,23 @@
 
 ## Overview
 
-This document provides a comprehensive analysis of the complete solution for Issue #901 (NoSuchKey regression), including related improvements from PR #917 that were merged into this branch.
+This document provides a comprehensive analysis of the complete solution for Issue #901 (NoSuchKey regression),
+including related improvements from PR #917 that were merged into this branch.
 
 ## Problem Statement
 
-**Issue #901**: In RustFS 1.0.69, attempting to download a non-existent or deleted object returns a networking error instead of the expected `NoSuchKey` S3 error.
+**Issue #901**: In RustFS 1.0.69, attempting to download a non-existent or deleted object returns a networking error
+instead of the expected `NoSuchKey` S3 error.
 
 **Error Observed**:
+
 ```
 Class: Seahorse::Client::NetworkingError
 Message: "http response body truncated, expected 119 bytes, received 0 bytes"
 ```
 
 **Expected Behavior**:
+
 ```ruby
 assert_raises(Aws::S3::Errors::NoSuchKey) do
   s3.get_object(bucket: 'some-bucket', key: 'some-key-that-was-deleted')
@@ -27,13 +31,16 @@ end
 
 **File**: `rustfs/src/server/http.rs`
 
-**Root Cause**: The `CompressionLayer` was being applied to all responses, including error responses. When s3s generates a NoSuchKey error response (~119 bytes XML), the compression layer interferes, causing Content-Length mismatch.
+**Root Cause**: The `CompressionLayer` was being applied to all responses, including error responses. When s3s generates
+a NoSuchKey error response (~119 bytes XML), the compression layer interferes, causing Content-Length mismatch.
 
 **Solution**: Implemented `ShouldCompress` predicate that intelligently excludes:
+
 - Error responses (4xx/5xx status codes)
 - Small responses (< 256 bytes)
 
 **Code Changes**:
+
 ```rust
 impl Predicate for ShouldCompress {
     fn should_compress<B>(&self, response: &Response<B>) -> bool
@@ -41,13 +48,13 @@ impl Predicate for ShouldCompress {
         B: http_body::Body,
     {
         let status = response.status();
-        
+
         // Never compress error responses
         if status.is_client_error() || status.is_server_error() {
             debug!("Skipping compression for error response: status={}", status.as_u16());
             return false;
         }
-        
+
         // Skip compression for small responses
         if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
             if let Ok(length_str) = content_length.to_str() {
@@ -59,13 +66,14 @@ impl Predicate for ShouldCompress {
                 }
             }
         }
-        
+
         true
     }
 }
 ```
 
-**Impact**: Ensures error responses are transmitted with accurate Content-Length headers, preventing AWS SDK truncation errors.
+**Impact**: Ensures error responses are transmitted with accurate Content-Length headers, preventing AWS SDK truncation
+errors.
 
 ### 2. Content-Length Calculation Fix (Related Issue from PR #917)
 
@@ -74,23 +82,25 @@ impl Predicate for ShouldCompress {
 **Problem**: The content-length was being calculated incorrectly for certain object types (compressed, encrypted).
 
 **Changes**:
+
 ```rust
 // Before:
 let mut content_length = info.size;
-let content_range = if let Some(rs) = &rs {
-    let total_size = info.get_actual_size().map_err(ApiError::from)?;
-    // ...
+let content_range = if let Some(rs) = & rs {
+let total_size = info.get_actual_size().map_err(ApiError::from) ?;
+// ...
 }
 
 // After:
-let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
-let content_range = if let Some(rs) = &rs {
-    let total_size = content_length;
-    // ...
+let mut content_length = info.get_actual_size().map_err(ApiError::from) ?;
+let content_range = if let Some(rs) = & rs {
+let total_size = content_length;
+// ...
 }
 ```
 
-**Rationale**: 
+**Rationale**:
+
 - `get_actual_size()` properly handles compressed and encrypted objects
 - Returns the actual decompressed size when needed
 - Avoids duplicate calls and potential inconsistencies
@@ -114,12 +124,14 @@ let mut update_version = false;
 ```
 
 **Rationale**:
+
 - The previous logic would always update version when `mark_deleted` was true
 - This could cause incorrect version state transitions
 - The new logic only updates version in specific replication scenarios
 - Prevents spurious version updates during delete marker operations
 
-**Impact**: Ensures correct version management when objects are deleted, which is critical for subsequent GetObject operations to correctly determine that an object doesn't exist.
+**Impact**: Ensures correct version management when objects are deleted, which is critical for subsequent GetObject
+operations to correctly determine that an object doesn't exist.
 
 #### Change 2: Version ID Filtering (Lines 1711, 1815)
 
@@ -148,11 +160,13 @@ pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileIn
 ```
 
 **Rationale**:
+
 - Nil UUIDs (all zeros) are not valid version IDs
 - Filtering them ensures cleaner semantics
 - Aligns with S3 API expectations where no version ID means None, not a nil UUID
 
-**Impact**: 
+**Impact**:
+
 - Improves correctness of version tracking
 - Prevents confusion with nil UUIDs in debugging and logging
 - Ensures proper behavior in versioned bucket scenarios
@@ -163,29 +177,29 @@ pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileIn
 
 1. **Client Request**: `GET /bucket/deleted-object`
 
-2. **Object Lookup**: 
-   - RustFS queries metadata using `FileMeta`
-   - Version ID filtering ensures nil UUIDs don't interfere (filemeta.rs change)
-   - Delete state is correctly maintained (filemeta.rs change)
+2. **Object Lookup**:
+    - RustFS queries metadata using `FileMeta`
+    - Version ID filtering ensures nil UUIDs don't interfere (filemeta.rs change)
+    - Delete state is correctly maintained (filemeta.rs change)
 
 3. **Error Generation**:
-   - Object not found or marked as deleted
-   - Returns `ObjectNotFound` error
-   - Converted to S3 `NoSuchKey` error by s3s library
+    - Object not found or marked as deleted
+    - Returns `ObjectNotFound` error
+    - Converted to S3 `NoSuchKey` error by s3s library
 
 4. **Response Serialization**:
-   - s3s serializes error to XML (~119 bytes)
-   - Sets `Content-Length: 119`
+    - s3s serializes error to XML (~119 bytes)
+    - Sets `Content-Length: 119`
 
 5. **Compression Decision** (NEW):
-   - `ShouldCompress` predicate evaluates response
-   - Detects 4xx status code → Skip compression
-   - Detects small size (119 < 256) → Skip compression
+    - `ShouldCompress` predicate evaluates response
+    - Detects 4xx status code → Skip compression
+    - Detects small size (119 < 256) → Skip compression
 
 6. **Response Transmission**:
-   - Full 119-byte XML error body is sent
-   - Content-Length matches actual body size
-   - AWS SDK successfully parses NoSuchKey error
+    - Full 119-byte XML error body is sent
+    - Content-Length matches actual body size
+    - AWS SDK successfully parses NoSuchKey error
 
 ### Without the Fix
 
@@ -193,14 +207,14 @@ The problematic flow:
 
 1. Steps 1-4 same as above
 2. **Compression Decision** (OLD):
-   - No filtering, all responses compressed
-   - Attempts to compress 119-byte error response
+    - No filtering, all responses compressed
+    - Attempts to compress 119-byte error response
 3. **Response Transmission**:
-   - Compression layer buffers/processes response
-   - Body becomes corrupted or empty (0 bytes)
-   - Headers already sent with Content-Length: 119
-   - AWS SDK receives 0 bytes, expects 119 bytes
-   - Throws "truncated body" networking error
+    - Compression layer buffers/processes response
+    - Body becomes corrupted or empty (0 bytes)
+    - Headers already sent with Content-Length: 119
+    - AWS SDK receives 0 bytes, expects 119 bytes
+    - Throws "truncated body" networking error
 
 ## Testing Strategy
 
@@ -211,20 +225,20 @@ The problematic flow:
 Four test cases covering different scenarios:
 
 1. **`test_get_deleted_object_returns_nosuchkey`**
-   - Upload object → Delete → GetObject
-   - Verifies NoSuchKey error, not networking error
+    - Upload object → Delete → GetObject
+    - Verifies NoSuchKey error, not networking error
 
 2. **`test_head_deleted_object_returns_nosuchkey`**
-   - Tests HeadObject on deleted objects
-   - Ensures consistency across API methods
+    - Tests HeadObject on deleted objects
+    - Ensures consistency across API methods
 
 3. **`test_get_nonexistent_object_returns_nosuchkey`**
-   - Tests objects that never existed
-   - Validates error handling for truly non-existent keys
+    - Tests objects that never existed
+    - Validates error handling for truly non-existent keys
 
 4. **`test_multiple_gets_deleted_object`**
-   - 5 consecutive GetObject calls on deleted object
-   - Ensures stability and no race conditions
+    - 5 consecutive GetObject calls on deleted object
+    - Ensures stability and no race conditions
 
 ### Running Tests
 
@@ -247,11 +261,13 @@ cargo test --test get_deleted_object_test -- --ignored
 **After Fix**: ~5-10% (error responses + small responses)
 
 **Calculation**:
+
 - Error responses: ~3-5% of total traffic (typical)
 - Small responses: ~2-5% of successful responses
 - Total skip rate: ~5-10%
 
-**CPU Impact**: 
+**CPU Impact**:
+
 - Reduced CPU usage from skipped compression
 - Estimated savings: 1-2% overall CPU reduction
 - No negative impact on latency
@@ -265,14 +281,17 @@ cargo test --test get_deleted_object_test -- --ignored
 ### Network Impact
 
 **Before Fix (Errors)**:
+
 - Attempted compression of 119-byte error responses
 - Often resulted in 0-byte transmissions (bug)
 
 **After Fix (Errors)**:
+
 - Direct transmission of 119-byte responses
 - No bandwidth savings, but correct behavior
 
 **After Fix (Small Responses)**:
+
 - Skip compression for responses < 256 bytes
 - Minimal bandwidth impact (~1-2% increase)
 - Better latency for small responses
@@ -299,11 +318,13 @@ cargo test --test get_deleted_object_test -- --ignored
 ### Debug Logging
 
 Enable detailed logging:
+
 ```bash
 RUST_LOG=rustfs::server::http=debug ./target/release/rustfs
 ```
 
 Look for:
+
 - `Skipping compression for error response: status=404`
 - `Skipping compression for small response: size=119 bytes`
 
@@ -327,6 +348,7 @@ Look for:
 ### Rollback Plan
 
 If issues detected:
+
 1. Revert compression predicate changes
 2. Keep metadata fixes (they're beneficial regardless)
 3. Investigate and reapply compression fix
@@ -360,6 +382,7 @@ This comprehensive fix addresses the NoSuchKey regression through a multi-layere
 3. **Metadata Layer**: Proper version management and UUID filtering for deleted objects
 
 The solution is:
+
 - ✅ **Correct**: Fixes the regression completely
 - ✅ **Performant**: No negative performance impact, potential improvements
 - ✅ **Robust**: Comprehensive test coverage
@@ -369,5 +392,5 @@ The solution is:
 ---
 
 **Author**: RustFS Team  
-**Date**: 2024-11-24  
+**Date**: 2025-11-24  
 **Version**: 1.0
