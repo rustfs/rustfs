@@ -43,7 +43,7 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::CompressionLayer;
+use tower_http::compression::{CompressionLayer, predicate::SizeAbove, Predicate};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -106,6 +106,20 @@ fn get_cors_allowed_origins() -> String {
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
         .parse::<String>()
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
+}
+
+/// Predicate to determine if a response should be compressed.
+/// This excludes error responses (4xx and 5xx status codes) to avoid
+/// potential issues with Content-Length mismatch in error responses.
+#[derive(Clone, Copy)]
+struct ShouldCompress;
+
+impl<B> Predicate<Response<B>> for ShouldCompress {
+    fn should_compress(&self, response: &Response<B>) -> bool {
+        // Don't compress error responses (4xx and 5xx status codes)
+        // This prevents potential Content-Length mismatch issues with error responses
+        !response.status().is_client_error() && !response.status().is_server_error()
+    }
 }
 
 pub async fn start_http_server(
@@ -507,8 +521,8 @@ fn process_connection(
             )
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(cors_layer)
-            // Compress responses
-            .layer(CompressionLayer::new())
+            // Compress responses, but exclude error responses to avoid Content-Length mismatch issues
+            .layer(CompressionLayer::new().compress_when(ShouldCompress))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 
