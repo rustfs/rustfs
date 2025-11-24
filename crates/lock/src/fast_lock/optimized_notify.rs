@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 /// Optimized notification pool to reduce memory overhead and thundering herd effects
 /// Increased pool size for better performance under high concurrency
-static NOTIFY_POOL: Lazy<Vec<Arc<Notify>>> = Lazy::new(|| (0..128).map(|_| Arc::new(Notify::new())).collect());
+static NOTIFY_POOL: LazyLock<Vec<Arc<Notify>>> = LazyLock::new(|| (0..128).map(|_| Arc::new(Notify::new())).collect());
 
 /// Optimized notification system for object locks
 #[derive(Debug)]
