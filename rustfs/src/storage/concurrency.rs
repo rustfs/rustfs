@@ -459,6 +459,7 @@ pub struct CacheStats {
 
 /// Concurrency manager for coordinating concurrent GetObject requests
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct ConcurrencyManager {
     /// Hot object cache for frequently accessed objects
     cache: Arc<HotObjectCache>,
