@@ -43,7 +43,7 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::{CompressionLayer, predicate::SizeAbove, Predicate};
+use tower_http::compression::{CompressionLayer, predicate::Predicate};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -109,16 +109,56 @@ fn get_cors_allowed_origins() -> String {
 }
 
 /// Predicate to determine if a response should be compressed.
-/// This excludes error responses (4xx and 5xx status codes) to avoid
-/// potential issues with Content-Length mismatch in error responses.
-#[derive(Clone, Copy)]
+///
+/// This predicate implements intelligent compression selection to avoid issues
+/// with error responses and small payloads. It excludes:
+/// - Client error responses (4xx status codes) - typically small XML/JSON error messages
+/// - Server error responses (5xx status codes) - ensures error details are preserved
+/// - Very small responses (< 256 bytes) - compression overhead outweighs benefits
+///
+/// # Rationale
+/// The CompressionLayer can cause Content-Length header mismatches with error responses,
+/// particularly when the s3s library generates XML error responses (~119 bytes for NoSuchKey).
+/// By excluding these responses from compression, we ensure:
+/// 1. Error responses are sent with accurate Content-Length headers
+/// 2. Clients receive complete error bodies without truncation
+/// 3. Small responses avoid compression overhead
+///
+/// # Performance
+/// This predicate is evaluated per-response and has O(1) complexity.
+#[derive(Clone, Copy, Debug)]
 struct ShouldCompress;
 
-impl<B> Predicate<Response<B>> for ShouldCompress {
-    fn should_compress(&self, response: &Response<B>) -> bool {
-        // Don't compress error responses (4xx and 5xx status codes)
-        // This prevents potential Content-Length mismatch issues with error responses
-        !response.status().is_client_error() && !response.status().is_server_error()
+impl Predicate for ShouldCompress {
+    fn should_compress<B>(&self, response: &Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        let status = response.status();
+
+        // Never compress error responses (4xx and 5xx status codes)
+        // This prevents Content-Length mismatch issues with error responses
+        if status.is_client_error() || status.is_server_error() {
+            debug!("Skipping compression for error response: status={}", status.as_u16());
+            return false;
+        }
+
+        // Check Content-Length header to avoid compressing very small responses
+        // Responses smaller than 256 bytes typically don't benefit from compression
+        // and may actually increase in size due to compression overhead
+        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
+            if let Ok(length_str) = content_length.to_str() {
+                if let Ok(length) = length_str.parse::<u64>() {
+                    if length < 256 {
+                        debug!("Skipping compression for small response: size={} bytes", length);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Compress successful responses with sufficient size
+        true
     }
 }
 
