@@ -19,3 +19,5 @@ pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod options;
 pub mod tonic_service;
+
+mod concurrent_get_object_test;

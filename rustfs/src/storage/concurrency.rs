@@ -34,7 +34,7 @@ use rustfs_config::{KI_B, MI_B};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, RwLock};
+use tokio::sync::{RwLock, Semaphore};
 
 /// Global concurrent request counter for adaptive buffer sizing
 static ACTIVE_GET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
@@ -81,7 +81,7 @@ impl GetObjectGuard {
 impl Drop for GetObjectGuard {
     fn drop(&mut self) {
         ACTIVE_GET_REQUESTS.fetch_sub(1, Ordering::Relaxed);
-        
+
         // Record metrics for monitoring
         #[cfg(feature = "metrics")]
         {
@@ -113,19 +113,19 @@ impl Drop for GetObjectGuard {
 /// Optimized buffer size in bytes for the current concurrency level
 pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
-    
+
     // Record concurrent request metrics
     #[cfg(feature = "metrics")]
     {
         use metrics::gauge;
         gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
     }
-    
+
     // For low concurrency, use the base buffer size for maximum throughput
     if concurrent_requests <= 1 {
         return base_buffer_size;
     }
-    
+
     // Calculate adaptive multiplier based on concurrency level
     let adaptive_multiplier = if concurrent_requests <= 2 {
         // Low concurrency (1-2): use full buffer for maximum throughput
@@ -140,23 +140,23 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
         // Very high concurrency (>8): minimize memory per request (40% of base)
         0.4
     };
-    
+
     // Calculate the adjusted buffer size
     let adjusted_size = (base_buffer_size as f64 * adaptive_multiplier) as usize;
-    
+
     // Ensure we stay within reasonable bounds
     let min_buffer = if file_size > 0 && file_size < 100 * KI_B as i64 {
         32 * KI_B // For very small files, use minimum buffer
     } else {
         64 * KI_B // Standard minimum buffer size
     };
-    
+
     let max_buffer = if concurrent_requests > HIGH_CONCURRENCY_THRESHOLD {
         256 * KI_B // Cap at 256KB for high concurrency
     } else {
         MI_B // Cap at 1MB for lower concurrency
     };
-    
+
     adjusted_size.clamp(min_buffer, max_buffer)
 }
 
@@ -177,7 +177,7 @@ struct HotObjectCache {
 }
 
 /// A cached object with metadata
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CachedObject {
     /// The object data
     data: Arc<Vec<u8>>,
@@ -199,50 +199,50 @@ impl HotObjectCache {
             cache: RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap())),
         }
     }
-    
+
     /// Try to get an object from cache
     async fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         let mut cache = self.cache.write().await;
-        
+
         if let Some(cached) = cache.get(key) {
             cached.hit_count.fetch_add(1, Ordering::Relaxed);
-            
+
             #[cfg(feature = "metrics")]
             {
                 use metrics::counter;
                 counter!("rustfs_object_cache_hits").increment(1);
             }
-            
+
             return Some(Arc::clone(&cached.data));
         }
-        
+
         #[cfg(feature = "metrics")]
         {
             use metrics::counter;
             counter!("rustfs_object_cache_misses").increment(1);
         }
-        
+
         None
     }
-    
+
     /// Put an object into cache if it's small enough
     async fn put(&self, key: String, data: Vec<u8>) {
         let size = data.len();
-        
+
         // Only cache objects smaller than max_object_size
         if size > self.max_object_size {
             return;
         }
-        
+
         let cached_obj = Arc::new(CachedObject {
             data: Arc::new(data),
             cached_at: Instant::now(),
             size,
             hit_count: AtomicUsize::new(0),
         });
-        
+
         let mut cache = self.cache.write().await;
-        
+
         // Evict items if cache is too large
         // Note: We load the current_size inside the write lock to avoid race conditions
         let mut current = self.current_size.load(Ordering::Relaxed);
@@ -254,11 +254,11 @@ impl HotObjectCache {
                 break;
             }
         }
-        
+
         cache.put(key, cached_obj);
         current += size;
         self.current_size.store(current, Ordering::Relaxed);
-        
+
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, gauge};
@@ -266,14 +266,14 @@ impl HotObjectCache {
             gauge!("rustfs_object_cache_size_bytes").set(self.current_size.load(Ordering::Relaxed) as f64);
         }
     }
-    
+
     /// Clear the cache
     async fn clear(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
         self.current_size.store(0, Ordering::Relaxed);
     }
-    
+
     /// Get cache statistics
     async fn stats(&self) -> CacheStats {
         let cache = self.cache.read().await;
@@ -319,24 +319,24 @@ impl ConcurrencyManager {
             disk_read_semaphore: Arc::new(Semaphore::new(64)),
         }
     }
-    
+
     /// Start tracking a new GetObject request
     ///
     /// Returns a guard that automatically decrements the counter when dropped
     pub fn track_request() -> GetObjectGuard {
         GetObjectGuard::new()
     }
-    
+
     /// Try to get an object from cache
     pub async fn get_cached(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.cache.get(key).await
     }
-    
+
     /// Cache an object if it's eligible
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
         self.cache.put(key, data).await
     }
-    
+
     /// Acquire a disk read permit
     ///
     /// This ensures we don't overwhelm the disk with too many concurrent reads
@@ -352,12 +352,12 @@ impl ConcurrencyManager {
             .await
             .expect("Failed to acquire disk read permit: semaphore is closed. This indicates a serious internal error.")
     }
-    
+
     /// Get cache statistics
     pub async fn cache_stats(&self) -> CacheStats {
         self.cache.stats().await
     }
-    
+
     /// Clear the cache
     pub async fn clear_cache(&self) {
         self.cache.clear().await
@@ -378,125 +378,125 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_concurrent_request_tracking() {
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
-        
+
         let _guard1 = GetObjectGuard::new();
         assert_eq!(GetObjectGuard::concurrent_requests(), 1);
-        
+
         let _guard2 = GetObjectGuard::new();
         assert_eq!(GetObjectGuard::concurrent_requests(), 2);
-        
+
         drop(_guard1);
         assert_eq!(GetObjectGuard::concurrent_requests(), 1);
-        
+
         drop(_guard2);
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
     }
-    
+
     #[test]
     fn test_adaptive_buffer_sizing() {
         // Reset counter
         ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
-        
+
         let base_size = 256 * KI_B;
-        
+
         // Low concurrency: use base size
         ACTIVE_GET_REQUESTS.store(1, Ordering::Relaxed);
         assert_eq!(get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size), base_size);
-        
+
         // Medium concurrency: reduce to 75%
         ACTIVE_GET_REQUESTS.store(3, Ordering::Relaxed);
         let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size);
         assert!(result < base_size);
         assert!(result >= base_size / 2);
-        
+
         // High concurrency: reduce to 50%
         ACTIVE_GET_REQUESTS.store(6, Ordering::Relaxed);
         let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size);
         assert!(result <= base_size / 2);
         assert!(result >= base_size / 3);
-        
+
         // Very high concurrency: reduce to 40%
         ACTIVE_GET_REQUESTS.store(10, Ordering::Relaxed);
         let result = get_concurrency_aware_buffer_size(10 * MI_B as i64, base_size);
         assert!(result <= base_size / 2);
         assert!(result >= 64 * KI_B); // Should stay above minimum
-        
+
         // Reset for other tests
         ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
     }
-    
+
     #[tokio::test]
     async fn test_hot_object_cache() {
         let cache = HotObjectCache::new();
-        
+
         // Cache a small object
         let data = vec![1u8; 1024];
         cache.put("test-key".to_string(), data.clone()).await;
-        
+
         // Retrieve it
         let cached = cache.get("test-key").await;
         assert!(cached.is_some());
         assert_eq!(*cached.unwrap(), data);
-        
+
         // Try to get non-existent key
         let missing = cache.get("missing-key").await;
         assert!(missing.is_none());
-        
+
         // Cache too large object (> 10MB)
         let large_data = vec![1u8; 11 * MI_B];
         cache.put("large-key".to_string(), large_data).await;
-        
+
         // Should not be cached
         let not_cached = cache.get("large-key").await;
         assert!(not_cached.is_none());
     }
-    
+
     #[tokio::test]
     async fn test_cache_eviction() {
         let cache = HotObjectCache::new();
-        
+
         // Fill cache with small objects
         for i in 0..20 {
             let data = vec![1u8; 6 * MI_B]; // 6MB each
             cache.put(format!("key-{}", i), data).await;
         }
-        
+
         // Check that old items were evicted
         let stats = cache.stats().await;
         assert!(stats.size <= cache.max_cache_size);
-        
+
         // First keys should be evicted
         let first = cache.get("key-0").await;
         assert!(first.is_none());
-        
+
         // Recent keys should still be there
         let recent = cache.get("key-19").await;
         assert!(recent.is_some());
     }
-    
+
     #[test]
     fn test_concurrency_manager_creation() {
         let manager = ConcurrencyManager::new();
         assert_eq!(manager.disk_read_semaphore.available_permits(), 64);
     }
-    
+
     #[tokio::test]
     async fn test_disk_read_permits() {
         let manager = ConcurrencyManager::new();
-        
+
         let permit1 = manager.acquire_disk_read_permit().await;
         assert_eq!(manager.disk_read_semaphore.available_permits(), 63);
-        
+
         let permit2 = manager.acquire_disk_read_permit().await;
         assert_eq!(manager.disk_read_semaphore.available_permits(), 62);
-        
+
         drop(permit1);
         assert_eq!(manager.disk_read_semaphore.available_permits(), 63);
-        
+
         drop(permit2);
         assert_eq!(manager.disk_read_semaphore.available_permits(), 64);
     }

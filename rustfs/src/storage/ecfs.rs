@@ -17,7 +17,9 @@ use crate::config::workload_profiles::{
     RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
 };
 use crate::error::ApiError;
-use crate::storage::concurrency::{ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager};
+use crate::storage::concurrency::{
+    ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+};
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
@@ -65,7 +67,7 @@ use rustfs_ecstore::{
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::{DEFAULT_READ_BUFFER_SIZE, MAX_PARTS_COUNT, is_valid_storage_class},
+    set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
     store_api::{
         BucketOptions,
         CompletePart,
@@ -1614,12 +1616,9 @@ impl S3 for FS {
         // Track this request for concurrency-aware optimizations
         let _request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
-        
-        debug!(
-            "GetObject request started with {} concurrent requests",
-            concurrent_requests
-        );
-        
+
+        debug!("GetObject request started with {} concurrent requests", concurrent_requests);
+
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
         // mc get 3
 
@@ -1639,24 +1638,24 @@ impl S3 for FS {
         // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
         let cache_key = format!("{}/{}", bucket, key);
-        
+
         // Only attempt cache lookup for objects without range/part requests
         if part_number.is_none() && range.is_none() {
             if let Some(cached_data) = manager.get_cached(&cache_key).await {
                 debug!("Serving object from cache: {}", cache_key);
-                
+
                 // Build response from cached data
                 let body = Some(StreamingBlob::wrap(futures::stream::once(async move {
                     Ok(bytes::Bytes::from((*cached_data).clone()))
                 })));
-                
+
                 let output = GetObjectOutput {
                     body,
                     content_length: Some(cached_data.len() as i64),
                     accept_ranges: Some("bytes".to_string()),
                     ..Default::default()
                 };
-                
+
                 return Ok(S3Response::new(output));
             }
         }
@@ -1700,7 +1699,7 @@ impl S3 for FS {
 
         // Acquire disk read permit to prevent I/O saturation under high concurrency
         let _disk_permit = manager.acquire_disk_read_permit().await;
-        
+
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
             .await
@@ -1933,19 +1932,19 @@ impl S3 for FS {
         // This adapts based on the number of concurrent GetObject requests
         let base_buffer_size = get_buffer_size_opt_in(response_content_length);
         let optimal_buffer_size = get_concurrency_aware_buffer_size(response_content_length, base_buffer_size);
-        
+
         debug!(
             "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}",
-            response_content_length,
-            base_buffer_size,
-            optimal_buffer_size,
-            concurrent_requests
+            response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests
         );
-        
+
         // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
         // because DecryptReader needs to read all encrypted data to produce decrypted output
         let body = if stored_sse_algorithm.is_some() || managed_encryption_applied {
-            info!("Managed SSE: Using unlimited stream for decryption with buffer size {}", optimal_buffer_size);
+            info!(
+                "Managed SSE: Using unlimited stream for decryption with buffer size {}",
+                optimal_buffer_size
+            );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
             Some(StreamingBlob::wrap(bytes_stream(
@@ -1953,23 +1952,24 @@ impl S3 for FS {
                 response_content_length as usize,
             )))
         };
-        
+
         // TODO: Implement proper streaming cache for small objects
         // For small objects (<= 10MB) with no range/part request, we could cache for future requests.
         // However, this requires refactoring to capture the stream data while serving the response.
         // Current implementation only provides cache lookup (lines 1644-1662), not cache insertion.
-        // 
+        //
         // Potential approaches:
         // 1. Use a TeeReader to duplicate the stream - one copy to response, one to cache
         // 2. Pre-load small objects into memory before streaming (impacts first request latency)
         // 3. Background task to cache after response completes (requires stream copy)
         //
         // For now, cache can be manually populated via admin API or future background processes.
-        if response_content_length <= 10 * 1024 * 1024 
-            && part_number.is_none() 
-            && rs.is_none() 
-            && !managed_encryption_applied 
-            && stored_sse_algorithm.is_none() {
+        if response_content_length <= 10 * 1024 * 1024
+            && part_number.is_none()
+            && rs.is_none()
+            && !managed_encryption_applied
+            && stored_sse_algorithm.is_none()
+        {
             debug!(
                 "Object {} is eligible for caching (size: {} bytes) but streaming cache not yet implemented",
                 cache_key, response_content_length
@@ -5221,6 +5221,7 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 mod tests {
     use super::*;
     use rustfs_config::MI_B;
+    use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 
     #[test]
     fn test_fs_creation() {
