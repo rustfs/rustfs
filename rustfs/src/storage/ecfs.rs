@@ -1733,10 +1733,10 @@ impl S3 for FS {
             }
         }
 
-        let mut content_length = info.size;
+        let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
 
         let content_range = if let Some(rs) = &rs {
-            let total_size = info.get_actual_size().map_err(ApiError::from)?;
+            let total_size = content_length;
             let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
             content_length = length;
             Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
