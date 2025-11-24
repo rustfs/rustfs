@@ -7291,7 +7291,6 @@ dependencies = [
  "bytes",
  "crossbeam-queue",
  "futures",
- "once_cell",
  "parking_lot",
  "rustfs-protos",
  "serde",

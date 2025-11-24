@@ -73,13 +73,13 @@ pub const MAX_DELETE_LIST: usize = 1000;
 // ============================================================================
 
 // Global singleton FastLock manager shared across all lock implementations
-use once_cell::sync::OnceCell;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// Enum wrapper for different lock manager implementations
 pub enum GlobalLockManager {
-    Enabled(Arc<fast_lock::FastObjectLockManager>),
-    Disabled(fast_lock::DisabledLockManager),
+    Enabled(Arc<FastObjectLockManager>),
+    Disabled(DisabledLockManager),
 }
 
 impl Default for GlobalLockManager {
@@ -99,11 +99,11 @@ impl GlobalLockManager {
         match locks_enabled.as_str() {
             "false" | "0" | "no" | "off" | "disabled" => {
                 tracing::info!("Lock system disabled via RUSTFS_ENABLE_LOCKS environment variable");
-                Self::Disabled(fast_lock::DisabledLockManager::new())
+                Self::Disabled(DisabledLockManager::new())
             }
             _ => {
                 tracing::info!("Lock system enabled");
-                Self::Enabled(Arc::new(fast_lock::FastObjectLockManager::new()))
+                Self::Enabled(Arc::new(FastObjectLockManager::new()))
             }
         }
     }
@@ -114,7 +114,7 @@ impl GlobalLockManager {
     }
 
     /// Get the FastObjectLockManager if enabled, otherwise returns None
-    pub fn as_fast_lock_manager(&self) -> Option<Arc<fast_lock::FastObjectLockManager>> {
+    pub fn as_fast_lock_manager(&self) -> Option<Arc<FastObjectLockManager>> {
         match self {
             Self::Enabled(manager) => Some(manager.clone()),
             Self::Disabled(_) => None,
@@ -123,11 +123,8 @@ impl GlobalLockManager {
 }
 
 #[async_trait::async_trait]
-impl fast_lock::LockManager for GlobalLockManager {
-    async fn acquire_lock(
-        &self,
-        request: fast_lock::ObjectLockRequest,
-    ) -> std::result::Result<fast_lock::FastLockGuard, fast_lock::LockResult> {
+impl LockManager for GlobalLockManager {
+    async fn acquire_lock(&self, request: ObjectLockRequest) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
             Self::Enabled(manager) => manager.acquire_lock(request).await,
             Self::Disabled(manager) => manager.acquire_lock(request).await,
@@ -139,7 +136,7 @@ impl fast_lock::LockManager for GlobalLockManager {
         bucket: impl Into<Arc<str>> + Send,
         object: impl Into<Arc<str>> + Send,
         owner: impl Into<Arc<str>> + Send,
-    ) -> std::result::Result<fast_lock::FastLockGuard, fast_lock::LockResult> {
+    ) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
             Self::Enabled(manager) => manager.acquire_read_lock(bucket, object, owner).await,
             Self::Disabled(manager) => manager.acquire_read_lock(bucket, object, owner).await,
@@ -152,7 +149,7 @@ impl fast_lock::LockManager for GlobalLockManager {
         object: impl Into<Arc<str>> + Send,
         version: impl Into<Arc<str>> + Send,
         owner: impl Into<Arc<str>> + Send,
-    ) -> std::result::Result<fast_lock::FastLockGuard, fast_lock::LockResult> {
+    ) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
             Self::Enabled(manager) => manager.acquire_read_lock_versioned(bucket, object, version, owner).await,
             Self::Disabled(manager) => manager.acquire_read_lock_versioned(bucket, object, version, owner).await,
@@ -164,7 +161,7 @@ impl fast_lock::LockManager for GlobalLockManager {
         bucket: impl Into<Arc<str>> + Send,
         object: impl Into<Arc<str>> + Send,
         owner: impl Into<Arc<str>> + Send,
-    ) -> std::result::Result<fast_lock::FastLockGuard, fast_lock::LockResult> {
+    ) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
             Self::Enabled(manager) => manager.acquire_write_lock(bucket, object, owner).await,
             Self::Disabled(manager) => manager.acquire_write_lock(bucket, object, owner).await,
@@ -177,21 +174,21 @@ impl fast_lock::LockManager for GlobalLockManager {
         object: impl Into<Arc<str>> + Send,
         version: impl Into<Arc<str>> + Send,
         owner: impl Into<Arc<str>> + Send,
-    ) -> std::result::Result<fast_lock::FastLockGuard, fast_lock::LockResult> {
+    ) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
             Self::Enabled(manager) => manager.acquire_write_lock_versioned(bucket, object, version, owner).await,
             Self::Disabled(manager) => manager.acquire_write_lock_versioned(bucket, object, version, owner).await,
         }
     }
 
-    async fn acquire_locks_batch(&self, batch_request: fast_lock::BatchLockRequest) -> fast_lock::BatchLockResult {
+    async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
         match self {
             Self::Enabled(manager) => manager.acquire_locks_batch(batch_request).await,
             Self::Disabled(manager) => manager.acquire_locks_batch(batch_request).await,
         }
     }
 
-    fn get_lock_info(&self, key: &fast_lock::ObjectKey) -> Option<fast_lock::ObjectLockInfo> {
+    fn get_lock_info(&self, key: &ObjectKey) -> Option<ObjectLockInfo> {
         match self {
             Self::Enabled(manager) => manager.get_lock_info(key),
             Self::Disabled(manager) => manager.get_lock_info(key),
@@ -248,7 +245,7 @@ impl fast_lock::LockManager for GlobalLockManager {
     }
 }
 
-static GLOBAL_LOCK_MANAGER: OnceCell<Arc<GlobalLockManager>> = OnceCell::new();
+static GLOBAL_LOCK_MANAGER: OnceLock<Arc<GlobalLockManager>> = OnceLock::new();
 
 /// Get the global shared lock manager instance
 ///
@@ -263,7 +260,7 @@ pub fn get_global_lock_manager() -> Arc<GlobalLockManager> {
 /// This function is deprecated. Use get_global_lock_manager() instead.
 /// Returns FastObjectLockManager when locks are enabled, or panics when disabled.
 #[deprecated(note = "Use get_global_lock_manager() instead")]
-pub fn get_global_fast_lock_manager() -> Arc<fast_lock::FastObjectLockManager> {
+pub fn get_global_fast_lock_manager() -> Arc<FastObjectLockManager> {
     let manager = get_global_lock_manager();
     manager.as_fast_lock_manager().unwrap_or_else(|| {
         panic!("Cannot get FastObjectLockManager when locks are disabled. Use get_global_lock_manager() instead.");
@@ -301,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disabled_manager_direct() {
-        let manager = fast_lock::DisabledLockManager::new();
+        let manager = DisabledLockManager::new();
 
         // All operations should succeed immediately
         let guard = manager.acquire_read_lock("bucket", "object", "owner").await;
@@ -316,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enabled_manager_direct() {
-        let manager = fast_lock::FastObjectLockManager::new();
+        let manager = FastObjectLockManager::new();
 
         // Operations should work normally
         let guard = manager.acquire_read_lock("bucket", "object", "owner").await;
@@ -331,8 +328,8 @@ mod tests {
     #[tokio::test]
     async fn test_global_manager_enum_wrapper() {
         // Test the GlobalLockManager enum directly
-        let enabled_manager = GlobalLockManager::Enabled(Arc::new(fast_lock::FastObjectLockManager::new()));
-        let disabled_manager = GlobalLockManager::Disabled(fast_lock::DisabledLockManager::new());
+        let enabled_manager = GlobalLockManager::Enabled(Arc::new(FastObjectLockManager::new()));
+        let disabled_manager = GlobalLockManager::Disabled(DisabledLockManager::new());
 
         assert!(!enabled_manager.is_disabled());
         assert!(disabled_manager.is_disabled());
@@ -352,7 +349,7 @@ mod tests {
     async fn test_batch_operations_work() {
         let manager = get_global_lock_manager();
 
-        let batch = fast_lock::BatchLockRequest::new("owner")
+        let batch = BatchLockRequest::new("owner")
             .add_read_lock("bucket", "obj1")
             .add_write_lock("bucket", "obj2");
 
