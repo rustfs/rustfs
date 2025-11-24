@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
-use once_cell::sync::Lazy;
-use tokio::sync::mpsc;
-
 use crate::{client::LockClient, types::LockId};
+use std::sync::{Arc, LazyLock};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 struct UnlockJob {
@@ -31,7 +28,7 @@ struct UnlockRuntime {
 }
 
 // Global unlock runtime with background worker
-static UNLOCK_RUNTIME: Lazy<UnlockRuntime> = Lazy::new(|| {
+static UNLOCK_RUNTIME: LazyLock<UnlockRuntime> = LazyLock::new(|| {
     // Larger buffer to reduce contention during bursts
     let (tx, mut rx) = mpsc::channel::<UnlockJob>(8192);
 
