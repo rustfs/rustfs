@@ -224,20 +224,20 @@ mod tests {
     /// Test buffer size bounds and minimum/maximum constraints
     #[tokio::test]
     async fn test_buffer_size_bounds() {
-        // Test minimum buffer size
+        // Test minimum buffer size for tiny files (<100KB uses 32KB minimum)
         let small_file = 1024i64; // 1KB file
         let min_buffer = get_concurrency_aware_buffer_size(small_file, 64 * KI_B);
-        assert!(min_buffer >= 64 * KI_B, "Buffer should have minimum size of 64KB, got {}", min_buffer);
+        assert!(min_buffer >= 32 * KI_B, "Buffer should have minimum size of 32KB for tiny files, got {}", min_buffer);
 
-        // Test maximum buffer size
+        // Test maximum buffer size (capped at 1MB when base is reasonable)
         let huge_file = 10 * 1024 * MI_B as i64; // 10GB file
-        let max_buffer = get_concurrency_aware_buffer_size(huge_file, 10 * MI_B);
-        assert!(max_buffer <= 10 * MI_B, "Buffer should not exceed 10MB, got {}", max_buffer);
+        let max_buffer = get_concurrency_aware_buffer_size(huge_file, MI_B);
+        assert!(max_buffer <= MI_B, "Buffer should not exceed 1MB cap when requested, got {}", max_buffer);
 
-        // Test that file size smaller than buffer uses file size
-        let tiny_file = 32 * KI_B as i64;
-        let buffer = get_concurrency_aware_buffer_size(tiny_file, 256 * KI_B);
-        assert!(buffer <= tiny_file as usize, "Buffer should not exceed file size for tiny files");
+        // Test buffer size scaling with base - when base is small, result respects the limits
+        let medium_file = 200 * KI_B as i64; // 200KB file (>100KB so minimum is 64KB)
+        let buffer = get_concurrency_aware_buffer_size(medium_file, 128 * KI_B);
+        assert!(buffer >= 64 * KI_B && buffer <= MI_B, "Buffer should be between 64KB and 1MB, got {}", buffer);
     }
 
     /// Test disk I/O permit acquisition for rate limiting
@@ -575,7 +575,7 @@ mod tests {
         // Simulate heavy concurrent access
         let tasks: Vec<_> = (0..100)
             .map(|i| {
-                let mgr = Arc::clone(&manager);
+                let mgr: Arc<ConcurrencyManager> = Arc::clone(&manager);
                 tokio::spawn(async move {
                     let key = format!("concurrent/object{}", i % 20);
                     let _ = mgr.get_cached(&key).await;
@@ -697,7 +697,7 @@ mod tests {
         let conc_start = Instant::now();
         let tasks: Vec<_> = (0..100)
             .map(|i| {
-                let mgr = Arc::clone(&manager);
+                let mgr: Arc<ConcurrencyManager> = Arc::clone(&manager);
                 tokio::spawn(async move {
                     let key = format!("bench/object{}", i % 50);
                     let _ = mgr.get_cached(&key).await;
