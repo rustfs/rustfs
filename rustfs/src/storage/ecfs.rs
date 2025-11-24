@@ -1614,9 +1614,18 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        let request_start = std::time::Instant::now();
+        
         // Track this request for concurrency-aware optimizations
         let _request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
+
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::{counter, gauge};
+            counter!("rustfs_get_object_requests_total").increment(1);
+            gauge!("rustfs_concurrent_get_object_requests").set(concurrent_requests as f64);
+        }
 
         debug!("GetObject request started with {} concurrent requests", concurrent_requests);
 
@@ -1643,7 +1652,19 @@ impl S3 for FS {
         // Only attempt cache lookup for objects without range/part requests
         if part_number.is_none() && range.is_none() {
             if let Some(cached_data) = manager.get_cached(&cache_key).await {
-                debug!("Serving object from cache: {}", cache_key);
+                let cache_serve_duration = request_start.elapsed();
+                
+                debug!("Serving object from cache: {} (latency: {:?})", cache_key, cache_serve_duration);
+
+                #[cfg(feature = "metrics")]
+                {
+                    use metrics::{counter, histogram};
+                    counter!("rustfs_get_object_cache_served_total").increment(1);
+                    histogram!("rustfs_get_object_cache_serve_duration_seconds")
+                        .record(cache_serve_duration.as_secs_f64());
+                    histogram!("rustfs_get_object_cache_size_bytes")
+                        .record(cached_data.len() as f64);
+                }
 
                 let value = cached_data.clone();
                 // Build response from cached data
@@ -1700,7 +1721,16 @@ impl S3 for FS {
         let store = get_validated_store(&bucket).await?;
 
         // Acquire disk read permit to prevent I/O saturation under high concurrency
+        let permit_wait_start = std::time::Instant::now();
         let _disk_permit = manager.acquire_disk_read_permit().await;
+        let permit_wait_duration = permit_wait_start.elapsed();
+        
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::histogram;
+            histogram!("rustfs_disk_permit_wait_duration_seconds")
+                .record(permit_wait_duration.as_secs_f64());
+        }
 
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
@@ -2053,6 +2083,27 @@ impl S3 for FS {
 
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(event_info).version_id(version_id);
+
+        let total_duration = request_start.elapsed();
+        
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::{counter, histogram};
+            counter!("rustfs_get_object_requests_completed").increment(1);
+            histogram!("rustfs_get_object_total_duration_seconds")
+                .record(total_duration.as_secs_f64());
+            histogram!("rustfs_get_object_response_size_bytes")
+                .record(response_content_length as f64);
+            
+            // Record buffer size that was used
+            histogram!("rustfs_get_object_buffer_size_bytes")
+                .record(optimal_buffer_size as f64);
+        }
+
+        debug!(
+            "GetObject completed: key={} size={} duration={:?} buffer={}", 
+            cache_key, response_content_length, total_duration, optimal_buffer_size
+        );
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
