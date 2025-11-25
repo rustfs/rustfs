@@ -84,40 +84,6 @@ use tokio::sync::Semaphore;
 /// Access pattern: Lock-free atomic operations (Relaxed ordering for performance).
 static ACTIVE_GET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Maximum concurrent requests before applying aggressive optimization.
-///
-/// When concurrent requests exceed this threshold (>8), the system switches to
-/// aggressive memory optimization mode, reducing buffer sizes to 40% of base size
-/// to prevent memory exhaustion and ensure fair resource allocation.
-const HIGH_CONCURRENCY_THRESHOLD: usize = 8;
-
-/// Medium concurrency threshold for buffer size adjustment.
-///
-/// At this level (3-4 requests), buffers are reduced to 75% of base size to
-/// balance throughput and memory efficiency as load increases.
-const MEDIUM_CONCURRENCY_THRESHOLD: usize = 4;
-
-/// Time-to-live for cached objects (5 minutes = 300 seconds).
-///
-/// After this duration, cached objects are automatically expired by Moka's
-/// background cleanup process, even if they haven't been accessed. This prevents
-/// stale data from consuming cache capacity indefinitely.
-const CACHE_TTL_SECS: u64 = 300;
-
-/// Time-to-idle for cached objects (2 minutes = 120 seconds).
-///
-/// Objects that haven't been accessed for this duration are automatically evicted,
-/// even if their TTL hasn't expired. This ensures cache is populated with actively
-/// used objects and clears out one-time reads efficiently.
-const CACHE_TTI_SECS: u64 = 120;
-
-/// Minimum hit count to extend object lifetime beyond TTL.
-///
-/// "Hot" objects that have been accessed at least this many times are treated
-/// specially - they can survive longer in cache even as they approach TTL expiration.
-/// This prevents frequently accessed objects from being evicted prematurely.
-const HOT_OBJECT_MIN_HITS_TO_EXTEND: usize = 5;
-
 /// Global concurrency manager instance
 static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(ConcurrencyManager::new);
 
@@ -250,15 +216,23 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     if concurrent_requests <= 1 {
         return base_buffer_size;
     }
+    let medium_threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+    );
+    let high_threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+    );
 
     // Calculate adaptive multiplier based on concurrency level
     let adaptive_multiplier = if concurrent_requests <= 2 {
         // Low concurrency (1-2): use full buffer for maximum throughput
         1.0
-    } else if concurrent_requests <= MEDIUM_CONCURRENCY_THRESHOLD {
+    } else if concurrent_requests <= medium_threshold {
         // Medium concurrency (3-4): slightly reduce buffer size (75% of base)
         0.75
-    } else if concurrent_requests <= HIGH_CONCURRENCY_THRESHOLD {
+    } else if concurrent_requests <= high_threshold {
         // Higher concurrency (5-8): more aggressive reduction (50% of base)
         0.5
     } else {
@@ -276,7 +250,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
         64 * KI_B // Standard minimum buffer size
     };
 
-    let max_buffer = if concurrent_requests > HIGH_CONCURRENCY_THRESHOLD {
+    let max_buffer = if concurrent_requests > high_threshold {
         256 * KI_B // Cap at 256KB for high concurrency
     } else {
         MI_B // Cap at 1MB for lower concurrency
@@ -321,14 +295,21 @@ pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequ
 
     // Base calculation from standard function
     let standard_size = get_concurrency_aware_buffer_size(file_size, base_buffer_size);
-
+    let medium_threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+    );
+    let high_threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+    );
     // For sequential reads, we can be more aggressive with buffer sizes
-    if is_sequential && concurrent_requests <= MEDIUM_CONCURRENCY_THRESHOLD {
+    if is_sequential && concurrent_requests <= medium_threshold {
         return ((standard_size as f64 * 1.5) as usize).min(2 * MI_B);
     }
 
     // For high concurrency with large files, optimize for parallel processing
-    if concurrent_requests > HIGH_CONCURRENCY_THRESHOLD && file_size > 10 * MI_B as i64 {
+    if concurrent_requests > high_threshold && file_size > 10 * MI_B as i64 {
         // Use smaller, more numerous buffers for better parallelism
         return (standard_size as f64 * 0.8) as usize;
     }
@@ -388,14 +369,22 @@ impl HotObjectCache {
     /// - TTI of 2 minutes
     /// - Weigher function for accurate size tracking
     fn new() -> Self {
+        let max_capacity = rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_CACHE_CAPACITY_MB,
+            rustfs_config::DEFAULT_OBJECT_CACHE_CAPACITY_MB,
+        );
+        let cache_tti_secs =
+            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTI_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTI_SECS);
+        let cache_ttl_secs =
+            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
         let cache = Cache::builder()
-            .max_capacity(100 * MI_B as u64)
+            .max_capacity(max_capacity * MI_B as u64)
             .weigher(|_key: &String, value: &Arc<CachedObject>| -> u32 {
                 // Weight based on actual data size
                 value.size.min(u32::MAX as usize) as u32
             })
-            .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
-            .time_to_idle(Duration::from_secs(CACHE_TTI_SECS))
+            .time_to_live(Duration::from_secs(cache_ttl_secs))
+            .time_to_idle(Duration::from_secs(cache_tti_secs))
             .build();
 
         Self {
@@ -409,9 +398,15 @@ impl HotObjectCache {
     /// Soft expiration determination, the number of hits is insufficient and exceeds the soft TTL
     fn should_expire(&self, obj: &Arc<CachedObject>) -> bool {
         let age_secs = obj.cached_at.elapsed().as_secs();
-        if age_secs >= CACHE_TTL_SECS {
+        let cache_ttl_secs =
+            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
+        let hot_object_min_hits_to_extend = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_HOT_MIN_HITS_TO_EXTEND,
+            rustfs_config::DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND,
+        );
+        if age_secs >= cache_ttl_secs {
             let hits = obj.access_count.load(Ordering::Relaxed);
-            return hits < HOT_OBJECT_MIN_HITS_TO_EXTEND as u64;
+            return hits < hot_object_min_hits_to_extend as u64;
         }
         false
     }
