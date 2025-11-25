@@ -20,14 +20,14 @@
 //!
 //! # Test Coverage
 //!
-//! The suite includes 18 comprehensive tests organized into categories:
+//! The suite includes 20 comprehensive tests organized into categories:
 //!
 //! ## Request Management (3 tests)
 //! - **Request Tracking**: Validates RAII guards correctly track concurrent requests
 //! - **Adaptive Buffer Sizing**: Ensures buffers scale inversely with concurrency
 //! - **Buffer Size Bounds**: Verifies min/max constraints are enforced
 //!
-//! ## Cache Operations (8 tests)
+//! ## Cache Operations (11 tests)
 //! - **Basic Operations**: Insert, retrieve, stats, and clear operations
 //! - **Size Limits**: Large objects (>10MB) are correctly rejected
 //! - **Automatic Eviction**: Moka's LRU eviction maintains cache within capacity
@@ -36,6 +36,9 @@
 //! - **Cache Removal**: Explicit invalidation for stale data
 //! - **Hit Rate Calculation**: Accurate hit/miss ratio tracking
 //! - **TTL Configuration**: Time-to-live and time-to-idle validation
+//! - **Cache Writeback Flow**: Validates cache_object → get_cached round-trip
+//! - **Cache Writeback Size Limit**: Objects >10MB not cached during writeback
+//! - **Cache Writeback Concurrent**: Thread-safe concurrent writeback handling
 //!
 //! ## Performance (4 tests)
 //! - **Hot Keys Tracking**: Access pattern analysis for optimization
@@ -43,10 +46,9 @@
 //! - **Advanced Sizing**: File pattern optimization (small files, sequential reads)
 //! - **Performance Benchmark**: Sequential vs concurrent access comparison
 //!
-//! ## Advanced Features (3 tests)
+//! ## Advanced Features (2 tests)
 //! - **Disk I/O Permits**: Rate limiting prevents disk saturation
 //! - **Side-Effect Free Checks**: `is_cached()` doesn't inflate metrics
-//! - **TTL Expiration**: Automatic cleanup validation
 //!
 //! # Moka-Specific Test Patterns
 //!
@@ -728,5 +730,118 @@ mod tests {
         // Concurrent should be faster or similar (lock-free advantage)
         // Allow some margin for test variance
         assert!(conc_duration <= seq_duration * 2, "Concurrent access should not be significantly slower");
+    }
+
+    /// Test cache writeback mechanism
+    ///
+    /// This test validates that the cache_object method correctly stores objects
+    /// and they can be retrieved later. This simulates the cache writeback flow
+    /// implemented in ecfs.rs for objects meeting the caching criteria.
+    ///
+    /// # Cache Criteria (from ecfs.rs)
+    ///
+    /// Objects are cached when:
+    /// - No range/part request (full object)
+    /// - Object size <= 10MB (max_object_size threshold)
+    /// - Not encrypted (SSE-C or managed encryption)
+    ///
+    /// This test verifies the underlying cache_object → get_cached flow works correctly.
+    #[tokio::test]
+    async fn test_cache_writeback_flow() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate cache writeback for a small object (1MB)
+        let cache_key = "bucket/key".to_string();
+        let object_data = vec![42u8; 1 * MI_B]; // 1MB object
+
+        // Verify not in cache initially
+        let initial = manager.get_cached(&cache_key).await;
+        assert!(initial.is_none(), "Object should not be in cache initially");
+
+        // Simulate cache writeback (as done in ecfs.rs background task)
+        manager.cache_object(cache_key.clone(), object_data.clone()).await;
+
+        // Give Moka time to process the async insert
+        sleep(Duration::from_millis(50)).await;
+
+        // Verify object is now cached
+        let cached = manager.get_cached(&cache_key).await;
+        assert!(cached.is_some(), "Object should be cached after writeback");
+        assert_eq!(*cached.unwrap(), object_data, "Cached data should match original");
+
+        // Verify cache stats
+        let stats = manager.cache_stats().await;
+        assert_eq!(stats.entries, 1, "Should have exactly 1 cached entry");
+        assert!(stats.size >= object_data.len(), "Cache size should reflect object size");
+
+        // Second access should hit cache
+        let second_access = manager.get_cached(&cache_key).await;
+        assert!(second_access.is_some(), "Second access should hit cache");
+
+        // Verify hit count increased
+        let hit_rate = manager.cache_hit_rate();
+        assert!(hit_rate > 0.0, "Hit rate should be positive after cache hit");
+    }
+
+    /// Test cache writeback respects size limits
+    ///
+    /// Objects larger than 10MB should NOT be cached, even if cache_object is called.
+    /// This validates the size check in HotObjectCache::put().
+    #[tokio::test]
+    async fn test_cache_writeback_size_limit() {
+        let manager = ConcurrencyManager::new();
+
+        // Try to cache an object that exceeds the 10MB limit
+        let large_key = "bucket/large_object".to_string();
+        let large_data = vec![0u8; 12 * MI_B]; // 12MB > 10MB limit
+
+        manager.cache_object(large_key.clone(), large_data).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Should NOT be cached due to size limit
+        let cached = manager.get_cached(&large_key).await;
+        assert!(cached.is_none(), "Large object should not be cached");
+
+        // Cache should remain empty
+        let stats = manager.cache_stats().await;
+        assert_eq!(stats.entries, 0, "No entries should be cached");
+    }
+
+    /// Test cache writeback with concurrent requests
+    ///
+    /// Simulates multiple concurrent GetObject requests all trying to cache
+    /// the same object. Moka should handle this gracefully without data races.
+    #[tokio::test]
+    async fn test_cache_writeback_concurrent() {
+        let manager = Arc::new(ConcurrencyManager::new());
+        let cache_key = "concurrent/object".to_string();
+        let object_data = vec![99u8; 500 * KI_B]; // 500KB object
+
+        // Simulate 10 concurrent writebacks of the same object
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let mgr = Arc::clone(&manager);
+                let key = cache_key.clone();
+                let data = object_data.clone();
+                tokio::spawn(async move {
+                    mgr.cache_object(key, data).await;
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            task.await.expect("Task should complete");
+        }
+
+        sleep(Duration::from_millis(100)).await;
+
+        // Object should be cached (possibly written multiple times, but same data)
+        let cached = manager.get_cached(&cache_key).await;
+        assert!(cached.is_some(), "Object should be cached after concurrent writebacks");
+        assert_eq!(*cached.unwrap(), object_data, "Cached data should match original");
+
+        // Should have exactly 1 entry (Moka deduplicates by key)
+        let stats = manager.cache_stats().await;
+        assert_eq!(stats.entries, 1, "Should have exactly 1 entry despite concurrent writes");
     }
 }

@@ -1967,43 +1967,77 @@ impl S3 for FS {
             response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests
         );
 
-        // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
-        // because DecryptReader needs to read all encrypted data to produce decrypted output
-        let body = if stored_sse_algorithm.is_some() || managed_encryption_applied {
+        // Cache writeback logic for small, non-encrypted, non-range objects
+        // Only cache when:
+        // 1. No part/range request (full object)
+        // 2. Object size is known and within cache threshold (10MB)
+        // 3. Not encrypted (SSE-C or managed encryption)
+        let should_cache = part_number.is_none()
+            && rs.is_none()
+            && !managed_encryption_applied
+            && stored_sse_algorithm.is_none()
+            && response_content_length > 0
+            && (response_content_length as usize) <= 10 * 1024 * 1024;
+
+        let body = if should_cache {
+            // Read entire object into memory for caching
+            debug!(
+                "Reading object into memory for caching: key={} size={}",
+                cache_key, response_content_length
+            );
+
+            // Read the stream into a Vec<u8>
+            let mut buf = Vec::with_capacity(response_content_length as usize);
+            if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                error!("Failed to read object into memory for caching: {}", e);
+                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {}", e))).into());
+            }
+
+            // Verify we read the expected amount
+            if buf.len() != response_content_length as usize {
+                warn!(
+                    "Object size mismatch during cache read: expected={} actual={}",
+                    response_content_length,
+                    buf.len()
+                );
+            }
+
+            // Cache the object in background to avoid blocking the response
+            let cache_key_clone = cache_key.clone();
+            let buf_clone = buf.clone();
+            tokio::spawn(async move {
+                let manager = get_concurrency_manager();
+                manager.cache_object(cache_key_clone.clone(), buf_clone).await;
+                debug!("Object cached successfully: {}", cache_key_clone);
+            });
+
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::counter;
+                counter!("rustfs_object_cache_writeback_total").increment(1);
+            }
+
+            // Create response from the in-memory data
+            let mem_reader = InMemoryAsyncReader::new(buf);
+            Some(StreamingBlob::wrap(bytes_stream(
+                ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+                response_content_length as usize,
+            )))
+        } else if stored_sse_algorithm.is_some() || managed_encryption_applied {
+            // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
+            // because DecryptReader needs to read all encrypted data to produce decrypted output
             info!(
                 "Managed SSE: Using unlimited stream for decryption with buffer size {}",
                 optimal_buffer_size
             );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
+            // Standard streaming path for large objects or range/part requests
             Some(StreamingBlob::wrap(bytes_stream(
                 ReaderStream::with_capacity(final_stream, optimal_buffer_size),
                 response_content_length as usize,
             )))
         };
-
-        // TODO: Implement proper streaming cache for small objects
-        // For small objects (<= 10MB) with no range/part request, we could cache for future requests.
-        // However, this requires refactoring to capture the stream data while serving the response.
-        // Current implementation only provides cache lookup (lines 1644-1662), not cache insertion.
-        //
-        // Potential approaches:
-        // 1. Use a TeeReader to duplicate the stream - one copy to response, one to cache
-        // 2. Pre-load small objects into memory before streaming (impacts first request latency)
-        // 3. Background task to cache after response completes (requires stream copy)
-        //
-        // For now, cache can be manually populated via admin API or future background processes.
-        if response_content_length <= 10 * 1024 * 1024
-            && part_number.is_none()
-            && rs.is_none()
-            && !managed_encryption_applied
-            && stored_sse_algorithm.is_none()
-        {
-            debug!(
-                "Object {} is eligible for caching (size: {} bytes) but streaming cache not yet implemented",
-                cache_key, response_content_length
-            );
-        }
 
         // Extract SSE information from metadata for response
         let server_side_encryption = info
