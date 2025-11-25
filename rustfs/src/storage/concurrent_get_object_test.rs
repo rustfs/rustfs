@@ -878,7 +878,7 @@ mod tests {
         // Note: We can't easily test with the env var set to true in unit tests
         // because the LazyLock global manager is already initialized
         assert!(
-            !cache_enabled || cache_enabled,  // Either state is valid
+            !cache_enabled || cache_enabled, // Either state is valid
             "is_cache_enabled() should return a boolean"
         );
 

@@ -631,10 +631,8 @@ impl ConcurrencyManager {
     /// Reads configuration from environment variables:
     /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: false)
     pub fn new() -> Self {
-        let cache_enabled = rustfs_utils::get_env_bool(
-            rustfs_config::ENV_OBJECT_CACHE_ENABLE,
-            rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE,
-        );
+        let cache_enabled =
+            rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
 
         Self {
             cache: Arc::new(HotObjectCache::new()),
