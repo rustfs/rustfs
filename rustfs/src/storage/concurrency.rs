@@ -611,6 +611,8 @@ pub struct ConcurrencyManager {
     cache: Arc<HotObjectCache>,
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
+    /// Whether object caching is enabled (from RUSTFS_OBJECT_CACHE_ENABLE env var)
+    cache_enabled: bool,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -625,11 +627,34 @@ impl std::fmt::Debug for ConcurrencyManager {
 
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
+    ///
+    /// Reads configuration from environment variables:
+    /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: false)
     pub fn new() -> Self {
+        let cache_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_CACHE_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE,
+        );
+
         Self {
             cache: Arc::new(HotObjectCache::new()),
             disk_read_semaphore: Arc::new(Semaphore::new(64)),
+            cache_enabled,
         }
+    }
+
+    /// Check if object caching is enabled
+    ///
+    /// Returns true if the `RUSTFS_OBJECT_CACHE_ENABLE` environment variable
+    /// is set to "true" (case-insensitive). When disabled, cache lookups and
+    /// writebacks are skipped, reducing memory usage at the cost of repeated
+    /// disk reads for the same objects.
+    ///
+    /// # Returns
+    ///
+    /// `true` if caching is enabled, `false` otherwise
+    pub fn is_cache_enabled(&self) -> bool {
+        self.cache_enabled
     }
 
     /// Track a GetObject request

@@ -1649,8 +1649,8 @@ impl S3 for FS {
         let manager = get_concurrency_manager();
         let cache_key = format!("{}/{}", bucket, key);
 
-        // Only attempt cache lookup for objects without range/part requests
-        if part_number.is_none() && range.is_none() {
+        // Only attempt cache lookup if caching is enabled and for objects without range/part requests
+        if manager.is_cache_enabled() && part_number.is_none() && range.is_none() {
             if let Some(cached_data) = manager.get_cached(&cache_key).await {
                 let cache_serve_duration = request_start.elapsed();
 
@@ -1969,10 +1969,12 @@ impl S3 for FS {
 
         // Cache writeback logic for small, non-encrypted, non-range objects
         // Only cache when:
-        // 1. No part/range request (full object)
-        // 2. Object size is known and within cache threshold (10MB)
-        // 3. Not encrypted (SSE-C or managed encryption)
-        let should_cache = part_number.is_none()
+        // 1. Cache is enabled (RUSTFS_OBJECT_CACHE_ENABLE=true)
+        // 2. No part/range request (full object)
+        // 3. Object size is known and within cache threshold (10MB)
+        // 4. Not encrypted (SSE-C or managed encryption)
+        let should_cache = manager.is_cache_enabled()
+            && part_number.is_none()
             && rs.is_none()
             && !managed_encryption_applied
             && stored_sse_algorithm.is_none()
