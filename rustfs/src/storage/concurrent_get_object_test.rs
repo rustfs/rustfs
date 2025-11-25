@@ -877,10 +877,7 @@ mod tests {
         // This test validates the method works correctly
         // Note: We can't easily test with the env var set to true in unit tests
         // because the LazyLock global manager is already initialized
-        assert!(
-            !cache_enabled || cache_enabled, // Either state is valid
-            "is_cache_enabled() should return a boolean"
-        );
+        // Either state (true or false) is valid, as noted in the comment above
 
         // Cache operations should still work (the is_cache_enabled check is in ecfs.rs)
         // The ConcurrencyManager itself always has a cache, but ecfs.rs checks
