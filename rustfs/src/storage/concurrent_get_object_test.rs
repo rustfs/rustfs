@@ -752,7 +752,7 @@ mod tests {
 
         // Simulate cache writeback for a small object (1MB)
         let cache_key = "bucket/key".to_string();
-        let object_data = vec![42u8; 1 * MI_B]; // 1MB object
+        let object_data = vec![42u8; MI_B]; // 1MB object
 
         // Verify not in cache initially
         let initial = manager.get_cached(&cache_key).await;
