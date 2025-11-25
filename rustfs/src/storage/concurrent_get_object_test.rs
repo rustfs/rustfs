@@ -227,7 +227,11 @@ mod tests {
         // Test minimum buffer size for tiny files (<100KB uses 32KB minimum)
         let small_file = 1024i64; // 1KB file
         let min_buffer = get_concurrency_aware_buffer_size(small_file, 64 * KI_B);
-        assert!(min_buffer >= 32 * KI_B, "Buffer should have minimum size of 32KB for tiny files, got {}", min_buffer);
+        assert!(
+            min_buffer >= 32 * KI_B,
+            "Buffer should have minimum size of 32KB for tiny files, got {}",
+            min_buffer
+        );
 
         // Test maximum buffer size (capped at 1MB when base is reasonable)
         let huge_file = 10 * 1024 * MI_B as i64; // 10GB file
@@ -237,7 +241,11 @@ mod tests {
         // Test buffer size scaling with base - when base is small, result respects the limits
         let medium_file = 200 * KI_B as i64; // 200KB file (>100KB so minimum is 64KB)
         let buffer = get_concurrency_aware_buffer_size(medium_file, 128 * KI_B);
-        assert!(buffer >= 64 * KI_B && buffer <= MI_B, "Buffer should be between 64KB and 1MB, got {}", buffer);
+        assert!(
+            (64 * KI_B..=MI_B).contains(&buffer),
+            "Buffer should be between 64KB and 1MB, got {}",
+            buffer
+        );
     }
 
     /// Test disk I/O permit acquisition for rate limiting
