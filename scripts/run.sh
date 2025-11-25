@@ -77,7 +77,7 @@ export RUSTFS_OBS_LOG_FLUSH_MS=300
 #tokio runtime
 export RUSTFS_RUNTIME_WORKER_THREADS=16
 export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
-export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=true
+export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
 # shellcheck disable=SC2125
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
@@ -112,9 +112,9 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 #export RUSTFS_REGION="us-east-1"
 
-export RUSTFS_ENABLE_SCANNER=false
+export RUSTFS_ENABLE_SCANNER=true
 
-export RUSTFS_ENABLE_HEAL=false
+export RUSTFS_ENABLE_HEAL=true
 
 # Event message configuration
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
