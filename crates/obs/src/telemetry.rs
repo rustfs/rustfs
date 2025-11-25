@@ -363,7 +363,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
     };
 
     OBSERVABILITY_METRIC_ENABLED.set(false).ok();
-    counter!("rustfs.start.total").increment(1);
+    counter!("rustfs_start_total").increment(1);
     info!(
         "Init file logging at '{}', roll size {:?}MB, keep {}",
         log_directory, config.log_rotation_size_mb, keep_files
