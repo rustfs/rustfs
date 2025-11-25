@@ -871,7 +871,7 @@ mod tests {
 
         // By default (DEFAULT_OBJECT_CACHE_ENABLE = false), caching is disabled
         // This can be verified by checking the is_cache_enabled() method
-        let cache_enabled = manager.is_cache_enabled();
+        let _cache_enabled = manager.is_cache_enabled();
 
         // The default is false (as defined in rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE)
         // This test validates the method works correctly
