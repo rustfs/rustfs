@@ -123,7 +123,7 @@ tower-http = { version = "0.6.6", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.0", features = ["serde"] }
-bytesize = "2.2.0"
+bytesize = "2.3.0"
 byteorder = "1.5.0"
 flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
@@ -140,7 +140,7 @@ schemars = "1.1.0"
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.2", features = ["std"] }
-blake3 = { version = "1.8.2" }
+blake3 = { version = "1.8.2", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.6.0"
 hmac = { version = "0.13.0-rc.3" }
@@ -165,9 +165,9 @@ arc-swap = "1.7.1"
 astral-tokio-tar = "0.5.6"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
-aws-config = { version = "1.8.10" }
-aws-credential-types = { version = "1.2.9" }
-aws-sdk-s3 = { version = "1.113.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
+aws-config = { version = "1.8.11" }
+aws-credential-types = { version = "1.2.10" }
+aws-sdk-s3 = { version = "1.115.0", default-features = false, features = ["sigv4a", "rustls", "rt-tokio"] }
 aws-smithy-types = { version = "1.3.4" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -175,7 +175,7 @@ brotli = "8.0.2"
 cfg-if = "1.0.4"
 clap = { version = "4.5.53", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
-convert_case = "0.9.0"
+convert_case = "0.10.0"
 criterion = { version = "0.7", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "51.0.0"
@@ -187,7 +187,7 @@ flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_sta
 glob = "0.3.3"
 google-cloud-storage = "1.4.0"
 google-cloud-auth = "1.2.0"
-hashbrown = { version = "0.16.0", features = ["serde", "rayon"] }
+hashbrown = { version = "0.16.1", features = ["serde", "rayon"] }
 heed = { version = "0.22.0" }
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
@@ -209,7 +209,6 @@ nu-ansi-term = "0.50.3"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
 object_store = "0.12.4"
-once_cell = "1.21.3"
 parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
@@ -219,10 +218,10 @@ rand = { version = "0.10.0-rc.5", features = ["serde"] }
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.2" }
-rumqttc = { version = "0.25.0" }
+rumqttc = { version = "0.25.1" }
 rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/s3s-project/s3s.git", rev = "85144c53cf358bfb5e00fce9ce080f52e94e1b71", version = "0.12.0-rc.3", features = ["minio"] }
+s3s = { version = "0.12.0-rc.4", features = ["minio"] }
 serial_test = "3.2.0"
 shadow-rs = { version = "1.4.0", default-features = false }
 siphasher = "1.0.1"
@@ -230,7 +229,7 @@ smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.8.9"
 snap = "1.1.1"
-starshard = { version = "0.5.0", features = ["rayon", "async", "serde"] }
+starshard = { version = "0.6.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
 sysctl = "0.7.1"
 sysinfo = "0.37.2"
