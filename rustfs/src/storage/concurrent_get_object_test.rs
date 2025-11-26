@@ -90,7 +90,7 @@
 #[cfg(test)]
 mod tests {
     use crate::storage::concurrency::{
-        ConcurrencyManager, GetObjectGuard, get_advanced_buffer_size, get_concurrency_aware_buffer_size,
+        CachedGetObject, ConcurrencyManager, GetObjectGuard, get_advanced_buffer_size, get_concurrency_aware_buffer_size,
     };
     use rustfs_config::{KI_B, MI_B};
     use std::sync::Arc;
@@ -892,5 +892,207 @@ mod tests {
         // Retrieve from cache (this always works at the manager level)
         let cached = manager.get_cached(&cache_key).await;
         assert!(cached.is_some(), "Cache operations work regardless of is_cache_enabled flag");
+    }
+
+    // ============================================
+    // CachedGetObject Response Cache Tests
+    // ============================================
+
+    /// Test CachedGetObject response cache basic operations
+    ///
+    /// Validates that the full response cache (with metadata) works correctly.
+    /// This tests the new `get_cached_object` and `put_cached_object` methods
+    /// that store complete GetObject responses with body and metadata.
+    #[tokio::test]
+    async fn test_cached_get_object_basic() {
+        let manager = ConcurrencyManager::new();
+
+        // Create a CachedGetObject with metadata using builder pattern
+        let cache_key = "bucket/object_with_metadata".to_string();
+        let body_data = vec![42u8; 100 * KI_B];
+        
+        let cached_response = CachedGetObject::new(
+            bytes::Bytes::from(body_data.clone()),
+            body_data.len() as i64,
+        )
+        .with_content_type("application/octet-stream".to_string())
+        .with_e_tag("\"abc123def456\"".to_string())
+        .with_last_modified("2024-01-15T12:00:00Z".to_string())
+        .with_cache_control("max-age=3600".to_string())
+        .with_storage_class("STANDARD".to_string());
+
+        // Verify not in cache initially
+        let initial = manager.get_cached_object(&cache_key).await;
+        assert!(initial.is_none(), "Object should not be in cache initially");
+
+        // Put the response in cache
+        manager.put_cached_object(cache_key.clone(), cached_response.clone()).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Retrieve from cache
+        let retrieved = manager.get_cached_object(&cache_key).await;
+        assert!(retrieved.is_some(), "Object should be cached");
+
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.body.as_ref(), body_data.as_slice(), "Body should match");
+        assert_eq!(retrieved.content_length, body_data.len() as i64, "Content length should match");
+        assert_eq!(retrieved.content_type, Some("application/octet-stream".to_string()), "Content type should match");
+        assert_eq!(retrieved.e_tag, Some("\"abc123def456\"".to_string()), "ETag should match");
+        assert_eq!(retrieved.last_modified, Some("2024-01-15T12:00:00Z".to_string()), "Last modified should match");
+        assert_eq!(retrieved.storage_class, Some("STANDARD".to_string()), "Storage class should match");
+    }
+
+    /// Test CachedGetObject with versioned objects
+    ///
+    /// Validates that versioned cache keys work correctly using the format
+    /// "{bucket}/{key}?versionId={version_id}".
+    #[tokio::test]
+    async fn test_cached_get_object_versioned() {
+        let manager = ConcurrencyManager::new();
+
+        let bucket = "versioned-bucket";
+        let key = "object";
+        let version_id = "v1234567890";
+
+        // Create cache keys for latest and versioned
+        let latest_key = ConcurrencyManager::make_cache_key(bucket, key, None);
+        let versioned_key = ConcurrencyManager::make_cache_key(bucket, key, Some(version_id));
+
+        assert_eq!(latest_key, "versioned-bucket/object");
+        assert_eq!(versioned_key, "versioned-bucket/object?versionId=v1234567890");
+
+        // Cache different versions
+        let v1_body = vec![1u8; 10 * KI_B];
+        let v2_body = vec![2u8; 10 * KI_B];
+
+        let v1_response = CachedGetObject::new(
+            bytes::Bytes::from(v1_body.clone()),
+            v1_body.len() as i64,
+        ).with_version_id(version_id.to_string());
+
+        let v2_response = CachedGetObject::new(
+            bytes::Bytes::from(v2_body.clone()),
+            v2_body.len() as i64,
+        );
+
+        // Cache both versions
+        manager.put_cached_object(versioned_key.clone(), v1_response).await;
+        manager.put_cached_object(latest_key.clone(), v2_response).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Verify both can be retrieved independently
+        let retrieved_v1 = manager.get_cached_object(&versioned_key).await;
+        let retrieved_latest = manager.get_cached_object(&latest_key).await;
+
+        assert!(retrieved_v1.is_some(), "Versioned object should be cached");
+        assert!(retrieved_latest.is_some(), "Latest object should be cached");
+
+        assert_eq!(retrieved_v1.unwrap().body.as_ref(), v1_body.as_slice(), "V1 body should match");
+        assert_eq!(retrieved_latest.unwrap().body.as_ref(), v2_body.as_slice(), "Latest body should match");
+    }
+
+    /// Test cache invalidation for write operations
+    ///
+    /// Validates that `invalidate_cache` and `invalidate_cache_versioned` work correctly.
+    /// This is critical for cache consistency after put_object, delete_object, etc.
+    #[tokio::test]
+    async fn test_cache_invalidation() {
+        let manager = ConcurrencyManager::new();
+
+        let cache_key = "bucket/to_invalidate".to_string();
+        let body_data = vec![42u8; 10 * KI_B];
+
+        // Cache an object
+        let cached_response = CachedGetObject::new(
+            bytes::Bytes::from(body_data),
+            10 * KI_B as i64,
+        );
+
+        manager.put_cached_object(cache_key.clone(), cached_response).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Verify it's cached
+        assert!(manager.get_cached_object(&cache_key).await.is_some(), "Object should be cached");
+
+        // Invalidate the cache
+        manager.invalidate_cache(&cache_key).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Verify it's no longer cached
+        assert!(manager.get_cached_object(&cache_key).await.is_none(), "Object should be invalidated");
+    }
+
+    /// Test versioned cache invalidation
+    ///
+    /// Validates that invalidating a versioned object also invalidates the latest key
+    /// to prevent serving stale data after writes.
+    #[tokio::test]
+    async fn test_cache_invalidation_versioned() {
+        let manager = ConcurrencyManager::new();
+
+        let bucket = "bucket";
+        let key = "object";
+        let version_id = "v123";
+
+        let latest_key = ConcurrencyManager::make_cache_key(bucket, key, None);
+        let versioned_key = ConcurrencyManager::make_cache_key(bucket, key, Some(version_id));
+
+        let body_data = vec![42u8; 10 * KI_B];
+
+        // Cache both versions
+        let response = CachedGetObject::new(
+            bytes::Bytes::from(body_data),
+            10 * KI_B as i64,
+        );
+
+        manager.put_cached_object(latest_key.clone(), response.clone()).await;
+        manager.put_cached_object(versioned_key.clone(), response).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Verify both are cached
+        assert!(manager.get_cached_object(&latest_key).await.is_some(), "Latest should be cached");
+        assert!(manager.get_cached_object(&versioned_key).await.is_some(), "Versioned should be cached");
+
+        // Invalidate with version - should invalidate both
+        manager.invalidate_cache_versioned(bucket, key, Some(version_id)).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Both should be invalidated
+        assert!(manager.get_cached_object(&latest_key).await.is_none(), "Latest should be invalidated");
+        assert!(manager.get_cached_object(&versioned_key).await.is_none(), "Versioned should be invalidated");
+    }
+
+    /// Test CachedGetObject size limit enforcement
+    ///
+    /// Validates that objects larger than 10MB are not cached in the response cache.
+    #[tokio::test]
+    async fn test_cached_get_object_size_limit() {
+        let manager = ConcurrencyManager::new();
+
+        let cache_key = "bucket/large_response".to_string();
+        let large_body = vec![0u8; 12 * MI_B]; // 12MB > 10MB limit
+
+        let large_response = CachedGetObject::new(
+            bytes::Bytes::from(large_body),
+            12 * MI_B as i64,
+        );
+
+        // Try to cache - should be rejected due to size
+        manager.put_cached_object(cache_key.clone(), large_response).await;
+        sleep(Duration::from_millis(50)).await;
+
+        // Should NOT be cached
+        assert!(manager.get_cached_object(&cache_key).await.is_none(), "Large response should not be cached");
+    }
+
+    /// Test CachedGetObject max_object_size accessor
+    ///
+    /// Validates the max_object_size() method returns the correct threshold.
+    #[tokio::test]
+    async fn test_max_object_size() {
+        let manager = ConcurrencyManager::new();
+
+        // Default max object size is 10MB
+        assert_eq!(manager.max_object_size(), 10 * MI_B, "Max object size should be 10MB");
     }
 }

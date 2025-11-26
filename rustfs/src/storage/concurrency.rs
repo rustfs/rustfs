@@ -324,10 +324,21 @@ pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequ
 /// - Automatic TTL and TTI expiration
 /// - Size-based eviction with weigher function
 /// - Built-in metrics collection
+///
+/// # Dual Cache Architecture
+///
+/// The cache maintains two separate Moka cache instances:
+/// 1. `cache` - Simple byte array cache for raw object data (legacy support)
+/// 2. `response_cache` - Full GetObject response cache with metadata
+///
+/// The response cache is preferred for new code as it stores complete response
+/// metadata, enabling cache hits to bypass metadata lookups entirely.
 #[derive(Clone)]
 struct HotObjectCache {
-    /// Moka cache instance with size-based eviction
+    /// Moka cache instance for simple byte data (legacy)
     cache: Cache<String, Arc<CachedObject>>,
+    /// Moka cache instance for full GetObject responses with metadata
+    response_cache: Cache<String, Arc<CachedGetObjectInternal>>,
     /// Maximum size of individual objects to cache (10MB by default)
     max_object_size: usize,
     /// Global cache hit counter
@@ -360,6 +371,164 @@ struct CachedObject {
     access_count: Arc<AtomicU64>,
 }
 
+/// Comprehensive cached object with full response metadata for GetObject operations.
+///
+/// This structure stores all necessary fields to reconstruct a complete GetObjectOutput
+/// response from cache, avoiding repeated disk reads and metadata lookups for hot objects.
+///
+/// # Fields
+///
+/// All time fields are serialized as RFC3339 strings to avoid parsing issues with
+/// `Last-Modified` and other time headers.
+///
+/// # Usage
+///
+/// ```ignore
+/// let cached = CachedGetObject {
+///     body: Bytes::from(data),
+///     content_length: data.len() as i64,
+///     content_type: Some("application/octet-stream".to_string()),
+///     e_tag: Some("\"abc123\"".to_string()),
+///     last_modified: Some("2024-01-01T00:00:00Z".to_string()),
+///     ..Default::default()
+/// };
+/// manager.put_cached_object(cache_key, cached).await;
+/// ```
+#[derive(Clone, Debug)]
+pub struct CachedGetObject {
+    /// The object body data
+    pub body: bytes::Bytes,
+    /// Content length in bytes
+    pub content_length: i64,
+    /// MIME content type
+    pub content_type: Option<String>,
+    /// Entity tag for the object
+    pub e_tag: Option<String>,
+    /// Last modified time as RFC3339 string (e.g., "2024-01-01T12:00:00Z")
+    pub last_modified: Option<String>,
+    /// Expiration time as RFC3339 string
+    pub expires: Option<String>,
+    /// Cache-Control header value
+    pub cache_control: Option<String>,
+    /// Content-Disposition header value
+    pub content_disposition: Option<String>,
+    /// Content-Encoding header value
+    pub content_encoding: Option<String>,
+    /// Content-Language header value
+    pub content_language: Option<String>,
+    /// Storage class (STANDARD, REDUCED_REDUNDANCY, etc.)
+    pub storage_class: Option<String>,
+    /// Version ID for versioned objects
+    pub version_id: Option<String>,
+    /// Whether this is a delete marker (for versioned buckets)
+    pub delete_marker: bool,
+    /// Number of tags associated with the object
+    pub tag_count: Option<i32>,
+    /// Replication status
+    pub replication_status: Option<String>,
+    /// User-defined metadata (x-amz-meta-*)
+    pub user_metadata: std::collections::HashMap<String, String>,
+    /// When this object was cached (for internal use, automatically set)
+    cached_at: Option<Instant>,
+    /// Access count for hot key tracking (automatically managed)
+    access_count: Arc<AtomicU64>,
+}
+
+impl Default for CachedGetObject {
+    fn default() -> Self {
+        Self {
+            body: bytes::Bytes::new(),
+            content_length: 0,
+            content_type: None,
+            e_tag: None,
+            last_modified: None,
+            expires: None,
+            cache_control: None,
+            content_disposition: None,
+            content_encoding: None,
+            content_language: None,
+            storage_class: None,
+            version_id: None,
+            delete_marker: false,
+            tag_count: None,
+            replication_status: None,
+            user_metadata: std::collections::HashMap::new(),
+            cached_at: None,
+            access_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl CachedGetObject {
+    /// Create a new CachedGetObject with the given body and content length
+    pub fn new(body: bytes::Bytes, content_length: i64) -> Self {
+        Self {
+            body,
+            content_length,
+            cached_at: Some(Instant::now()),
+            access_count: Arc::new(AtomicU64::new(0)),
+            ..Default::default()
+        }
+    }
+
+    /// Builder method to set content_type
+    pub fn with_content_type(mut self, content_type: String) -> Self {
+        self.content_type = Some(content_type);
+        self
+    }
+
+    /// Builder method to set e_tag
+    pub fn with_e_tag(mut self, e_tag: String) -> Self {
+        self.e_tag = Some(e_tag);
+        self
+    }
+
+    /// Builder method to set last_modified
+    pub fn with_last_modified(mut self, last_modified: String) -> Self {
+        self.last_modified = Some(last_modified);
+        self
+    }
+
+    /// Builder method to set cache_control
+    pub fn with_cache_control(mut self, cache_control: String) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
+
+    /// Builder method to set storage_class
+    pub fn with_storage_class(mut self, storage_class: String) -> Self {
+        self.storage_class = Some(storage_class);
+        self
+    }
+
+    /// Builder method to set version_id
+    pub fn with_version_id(mut self, version_id: String) -> Self {
+        self.version_id = Some(version_id);
+        self
+    }
+
+    /// Get the size in bytes for cache eviction calculations
+    pub fn size(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Increment access count and return the new value
+    pub fn increment_access(&self) -> u64 {
+        self.access_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// Internal wrapper for CachedGetObject in the Moka cache
+#[derive(Clone)]
+struct CachedGetObjectInternal {
+    /// The cached response data
+    data: Arc<CachedGetObject>,
+    /// When this object was cached
+    cached_at: Instant,
+    /// Size in bytes for weigher function
+    size: usize,
+}
+
 impl HotObjectCache {
     /// Create a new hot object cache with Moka
     ///
@@ -377,6 +546,8 @@ impl HotObjectCache {
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTI_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTI_SECS);
         let cache_ttl_secs =
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
+        
+        // Legacy simple byte cache
         let cache = Cache::builder()
             .max_capacity(max_capacity * MI_B as u64)
             .weigher(|_key: &String, value: &Arc<CachedObject>| -> u32 {
@@ -387,8 +558,20 @@ impl HotObjectCache {
             .time_to_idle(Duration::from_secs(cache_tti_secs))
             .build();
 
+        // Full response cache with metadata
+        let response_cache = Cache::builder()
+            .max_capacity(max_capacity * MI_B as u64)
+            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 {
+                // Weight based on actual data size
+                value.size.min(u32::MAX as usize) as u32
+            })
+            .time_to_live(Duration::from_secs(cache_ttl_secs))
+            .time_to_idle(Duration::from_secs(cache_tti_secs))
+            .build();
+
         Self {
             cache,
+            response_cache,
             max_object_size: 10 * MI_B,
             hit_count: Arc::new(AtomicU64::new(0)),
             miss_count: Arc::new(AtomicU64::new(0)),
@@ -581,6 +764,166 @@ impl HotObjectCache {
             (hits as f64 / total as f64) * 100.0
         }
     }
+
+    // ============================================
+    // Response Cache Methods (CachedGetObject)
+    // ============================================
+
+    /// Get a cached GetObject response with full metadata
+    ///
+    /// This method retrieves a complete GetObject response from the response cache,
+    /// including body data and all response metadata (e_tag, last_modified, etc.).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Arc<CachedGetObject>)` - Cached response data if found and not expired
+    /// * `None` - Cache miss
+    #[allow(dead_code)]
+    async fn get_response(&self, key: &str) -> Option<Arc<CachedGetObject>> {
+        match self.response_cache.get(key).await {
+            Some(cached) => {
+                // Check soft expiration
+                let age_secs = cached.cached_at.elapsed().as_secs();
+                let cache_ttl_secs = rustfs_utils::get_env_u64(
+                    rustfs_config::ENV_OBJECT_CACHE_TTL_SECS,
+                    rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS,
+                );
+                let hot_object_min_hits = rustfs_utils::get_env_usize(
+                    rustfs_config::ENV_OBJECT_HOT_MIN_HITS_TO_EXTEND,
+                    rustfs_config::DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND,
+                );
+
+                if age_secs >= cache_ttl_secs {
+                    let hits = cached.data.access_count.load(Ordering::Relaxed);
+                    if hits < hot_object_min_hits as u64 {
+                        self.response_cache.invalidate(key).await;
+                        self.miss_count.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
+
+                // Update access count
+                cached.data.increment_access();
+                self.hit_count.fetch_add(1, Ordering::Relaxed);
+
+                #[cfg(feature = "metrics")]
+                {
+                    use metrics::counter;
+                    counter!("rustfs_object_response_cache_hits").increment(1);
+                    counter!("rustfs_object_cache_access_count", "key" => key.to_string()).increment(1);
+                }
+
+                Some(Arc::clone(&cached.data))
+            }
+            None => {
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+
+                #[cfg(feature = "metrics")]
+                {
+                    use metrics::counter;
+                    counter!("rustfs_object_response_cache_misses").increment(1);
+                }
+
+                None
+            }
+        }
+    }
+
+    /// Put a GetObject response into the response cache
+    ///
+    /// This method caches a complete GetObject response including body and metadata.
+    /// Objects larger than `max_object_size` or empty objects are not cached.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
+    /// * `response` - The complete cached response to store
+    #[allow(dead_code)]
+    async fn put_response(&self, key: String, response: CachedGetObject) {
+        let size = response.size();
+
+        // Only cache objects smaller than max_object_size
+        if size == 0 || size > self.max_object_size {
+            return;
+        }
+
+        let cached_internal = Arc::new(CachedGetObjectInternal {
+            data: Arc::new(response),
+            cached_at: Instant::now(),
+            size,
+        });
+
+        self.response_cache.insert(key.clone(), cached_internal).await;
+
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::{counter, gauge};
+            counter!("rustfs_object_response_cache_insertions").increment(1);
+            gauge!("rustfs_object_response_cache_size_bytes").set(self.response_cache.weighted_size() as f64);
+            gauge!("rustfs_object_response_cache_entry_count").set(self.response_cache.entry_count() as f64);
+        }
+    }
+
+    /// Invalidate a cache entry for a specific object
+    ///
+    /// This method removes both the simple byte cache entry and the response cache entry
+    /// for the given key. Used when objects are modified or deleted.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key to invalidate (e.g., "{bucket}/{key}")
+    #[allow(dead_code)]
+    async fn invalidate(&self, key: &str) {
+        // Invalidate both caches
+        self.cache.invalidate(key).await;
+        self.response_cache.invalidate(key).await;
+
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::counter;
+            counter!("rustfs_object_cache_invalidations").increment(1);
+        }
+    }
+
+    /// Invalidate cache entries for an object and its latest version
+    ///
+    /// For versioned buckets, this invalidates both:
+    /// - The specific version key: "{bucket}/{key}?versionId={version_id}"
+    /// - The latest version key: "{bucket}/{key}"
+    ///
+    /// This ensures that after a write/delete, clients don't receive stale data.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - Bucket name
+    /// * `key` - Object key
+    /// * `version_id` - Optional version ID (if None, only invalidates the base key)
+    #[allow(dead_code)]
+    async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
+        // Always invalidate the latest version key
+        let base_key = format!("{}/{}", bucket, key);
+        self.invalidate(&base_key).await;
+
+        // Also invalidate the specific version if provided
+        if let Some(vid) = version_id {
+            let versioned_key = format!("{}?versionId={}", base_key, vid);
+            self.invalidate(&versioned_key).await;
+        }
+    }
+
+    /// Clear all cached objects from both caches
+    #[allow(dead_code)]
+    async fn clear_all(&self) {
+        self.cache.invalidate_all();
+        self.response_cache.invalidate_all();
+        // Sync to ensure all entries are removed
+        self.cache.run_pending_tasks().await;
+        self.response_cache.run_pending_tasks().await;
+    }
 }
 
 /// Cache statistics for monitoring and debugging
@@ -740,6 +1083,155 @@ impl ConcurrencyManager {
     #[allow(dead_code)]
     pub fn buffer_size(&self, file_size: i64, base: usize, sequential: bool) -> usize {
         get_advanced_buffer_size(file_size, base, sequential)
+    }
+
+    // ============================================
+    // Response Cache Methods (CachedGetObject)
+    // ============================================
+
+    /// Get a cached GetObject response with full metadata
+    ///
+    /// This method retrieves a complete GetObject response from the response cache,
+    /// including body data and all response metadata (e_tag, last_modified, content_type, etc.).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Arc<CachedGetObject>)` - Cached response data if found and not expired
+    /// * `None` - Cache miss
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let cache_key = format!("{}/{}", bucket, key);
+    /// if let Some(cached) = manager.get_cached_object(&cache_key).await {
+    ///     // Build response from cached data
+    ///     let output = GetObjectOutput {
+    ///         body: Some(StreamingBlob::from(cached.body.clone())),
+    ///         content_length: Some(cached.content_length),
+    ///         e_tag: cached.e_tag.clone(),
+    ///         last_modified: cached.last_modified.as_ref().map(|s| parse_rfc3339(s)),
+    ///         ..Default::default()
+    ///     };
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_cached_object(&self, key: &str) -> Option<Arc<CachedGetObject>> {
+        self.cache.get_response(key).await
+    }
+
+    /// Cache a complete GetObject response for future retrievals
+    ///
+    /// This method caches a complete GetObject response including body and all metadata.
+    /// Objects larger than the maximum cache size (10MB by default) or empty objects
+    /// are not cached.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
+    /// * `response` - The complete cached response to store
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let cached = CachedGetObject {
+    ///     body: Bytes::from(data),
+    ///     content_length: data.len() as i64,
+    ///     content_type: Some("application/octet-stream".to_string()),
+    ///     e_tag: Some("\"abc123\"".to_string()),
+    ///     last_modified: Some("2024-01-01T00:00:00Z".to_string()),
+    ///     ..Default::default()
+    /// };
+    /// manager.put_cached_object(cache_key, cached).await;
+    /// ```
+    #[allow(dead_code)]
+    pub async fn put_cached_object(&self, key: String, response: CachedGetObject) {
+        self.cache.put_response(key, response).await;
+    }
+
+    /// Invalidate cache entries for a specific object
+    ///
+    /// This method removes both simple byte cache and response cache entries
+    /// for the given key. Should be called after write operations (put_object,
+    /// copy_object, delete_object, etc.) to prevent stale data from being served.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key to invalidate (e.g., "{bucket}/{key}")
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After put_object succeeds
+    /// let cache_key = format!("{}/{}", bucket, key);
+    /// manager.invalidate_cache(&cache_key).await;
+    /// ```
+    #[allow(dead_code)]
+    pub async fn invalidate_cache(&self, key: &str) {
+        self.cache.invalidate(key).await;
+    }
+
+    /// Invalidate cache entries for an object and its latest version
+    ///
+    /// For versioned buckets, this invalidates both:
+    /// - The specific version key: "{bucket}/{key}?versionId={version_id}"
+    /// - The latest version key: "{bucket}/{key}"
+    ///
+    /// This ensures that after a write/delete, clients don't receive stale data.
+    /// Should be called after any write operation that modifies object data or creates
+    /// new versions.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - Bucket name
+    /// * `key` - Object key
+    /// * `version_id` - Optional version ID (if None, only invalidates the base key)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After delete_object with version
+    /// manager.invalidate_cache_versioned(&bucket, &key, Some(&version_id)).await;
+    ///
+    /// // After put_object (invalidates latest)
+    /// manager.invalidate_cache_versioned(&bucket, &key, None).await;
+    /// ```
+    #[allow(dead_code)]
+    pub async fn invalidate_cache_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
+        self.cache.invalidate_versioned(bucket, key, version_id).await;
+    }
+
+    /// Generate a cache key for an object
+    ///
+    /// Creates a cache key in the appropriate format based on whether a version ID
+    /// is specified. For versioned requests, uses "{bucket}/{key}?versionId={version_id}".
+    /// For non-versioned requests, uses "{bucket}/{key}".
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - Bucket name
+    /// * `key` - Object key
+    /// * `version_id` - Optional version ID
+    ///
+    /// # Returns
+    ///
+    /// Cache key string
+    pub fn make_cache_key(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+        match version_id {
+            Some(vid) => format!("{}/{}?versionId={}", bucket, key, vid),
+            None => format!("{}/{}", bucket, key),
+        }
+    }
+
+    /// Get maximum cacheable object size
+    ///
+    /// Returns the maximum size in bytes for objects that can be cached.
+    /// Objects larger than this size are not cached to prevent memory exhaustion.
+    pub fn max_object_size(&self) -> usize {
+        self.cache.max_object_size
     }
 }
 
