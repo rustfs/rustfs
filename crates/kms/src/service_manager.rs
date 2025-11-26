@@ -266,7 +266,6 @@ pub fn get_global_kms_service_manager() -> Option<Arc<KmsServiceManager>> {
 
 /// Get global encryption service (if KMS is running)
 pub async fn get_global_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    let manager = get_global_kms_service_manager().unwrap_or_else(|| init_global_kms_service_manager());
-    let service = manager.get_encryption_service().await;
-    service
+    let manager = get_global_kms_service_manager().unwrap_or_else(init_global_kms_service_manager);
+    manager.get_encryption_service().await
 }
