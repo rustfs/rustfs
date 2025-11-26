@@ -71,9 +71,6 @@ impl KmsServiceManager {
 
     /// Configure KMS with new configuration
     pub async fn configure(&self, new_config: KmsConfig) -> Result<()> {
-        info!("CLAUDE DEBUG: configure() called with backend: {:?}", new_config.backend);
-        info!("Configuring KMS with backend: {:?}", new_config.backend);
-
         // Update configuration
         {
             let mut config = self.config.write().await;
@@ -92,7 +89,6 @@ impl KmsServiceManager {
 
     /// Start KMS service with current configuration
     pub async fn start(&self) -> Result<()> {
-        info!("CLAUDE DEBUG: start() called");
         let config = {
             let config_guard = self.config.read().await;
             match config_guard.as_ref() {
@@ -270,12 +266,6 @@ pub fn get_global_kms_service_manager() -> Option<Arc<KmsServiceManager>> {
 
 /// Get global encryption service (if KMS is running)
 pub async fn get_global_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    info!("CLAUDE DEBUG: get_global_encryption_service called");
-    let manager = get_global_kms_service_manager().unwrap_or_else(|| {
-        warn!("CLAUDE DEBUG: KMS service manager not initialized, initializing now as fallback");
-        init_global_kms_service_manager()
-    });
-    let service = manager.get_encryption_service().await;
-    info!("CLAUDE DEBUG: get_encryption_service returned: {}", service.is_some());
-    service
+    let manager = get_global_kms_service_manager().unwrap_or_else(init_global_kms_service_manager);
+    manager.get_encryption_service().await
 }
