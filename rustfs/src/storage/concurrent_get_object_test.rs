@@ -213,7 +213,7 @@ mod tests {
             let buffer_size = get_concurrency_aware_buffer_size(file_size, base_buffer);
             // Allow widened range due to parallel test execution affecting global counter
             assert!(
-                buffer_size >= 64 * KI_B && buffer_size <= MI_B,
+                (64 * KI_B..=MI_B).contains(&buffer_size),
                 "{}: buffer should be in valid range 64KB-1MB, got {} bytes",
                 description,
                 buffer_size
