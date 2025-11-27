@@ -363,7 +363,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
     };
 
     OBSERVABILITY_METRIC_ENABLED.set(false).ok();
-    counter!("rustfs_start_total").increment(1);
+    counter!("start_total").increment(1);
     info!(
         "Init file logging at '{}', roll size {:?}MB, keep {}",
         log_directory, config.log_rotation_size_mb, keep_files
@@ -421,7 +421,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
             .with_http()
             .with_endpoint(trace_ep.as_str())
             .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Zstd)
+            .with_compression(Compression::Gzip)
             .build()
             .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
 
@@ -526,7 +526,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
         .init();
 
     OBSERVABILITY_METRIC_ENABLED.set(true).ok();
-    counter!("rustfs.start.total").increment(1);
+    counter!("start_total").increment(1);
     info!(
         "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
         trace_ep, metric_ep, log_ep
