@@ -394,6 +394,7 @@ struct CachedObject {
 /// };
 /// manager.put_cached_object(cache_key, cached).await;
 /// ```
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct CachedGetObject {
     /// The object body data
@@ -490,18 +491,21 @@ impl CachedGetObject {
     }
 
     /// Builder method to set cache_control
+    #[allow(dead_code)]
     pub fn with_cache_control(mut self, cache_control: String) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Builder method to set storage_class
+    #[allow(dead_code)]
     pub fn with_storage_class(mut self, storage_class: String) -> Self {
         self.storage_class = Some(storage_class);
         self
     }
 
     /// Builder method to set version_id
+    #[allow(dead_code)]
     pub fn with_version_id(mut self, version_id: String) -> Self {
         self.version_id = Some(version_id);
         self
@@ -546,7 +550,7 @@ impl HotObjectCache {
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTI_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTI_SECS);
         let cache_ttl_secs =
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
-        
+
         // Legacy simple byte cache
         let cache = Cache::builder()
             .max_capacity(max_capacity * MI_B as u64)
@@ -1004,6 +1008,7 @@ impl ConcurrencyManager {
     }
 
     /// Try to get an object from cache
+    #[allow(dead_code)]
     pub async fn get_cached(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.cache.get(key).await
     }

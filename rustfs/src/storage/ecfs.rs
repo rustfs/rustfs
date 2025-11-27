@@ -18,7 +18,7 @@ use crate::config::workload_profiles::{
 };
 use crate::error::ApiError;
 use crate::storage::concurrency::{
-    ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
@@ -600,6 +600,14 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
+                // Invalidate cache for the written object to prevent stale data
+                let manager = get_concurrency_manager();
+                let fpath_clone = fpath.clone();
+                let bucket_clone = bucket.clone();
+                tokio::spawn(async move {
+                    manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
+                });
+
                 let e_tag = _obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
                 // // store.put_object(bucket, object, data, opts);
@@ -918,6 +926,17 @@ impl S3 for FS {
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Invalidate cache for the destination object to prevent stale data
+        let manager = get_concurrency_manager();
+        let dest_bucket = bucket.clone();
+        let dest_key = key.clone();
+        let dest_version = oi.version_id.map(|v| v.to_string());
+        tokio::spawn(async move {
+            manager
+                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version.as_deref())
+                .await;
+        });
 
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
@@ -1270,6 +1289,17 @@ impl S3 for FS {
             }
         };
 
+        // Invalidate cache for the deleted object
+        let manager = get_concurrency_manager();
+        let del_bucket = bucket.clone();
+        let del_key = key.clone();
+        let del_version = obj_info.version_id.map(|v| v.to_string());
+        tokio::spawn(async move {
+            manager
+                .invalidate_cache_versioned(&del_bucket, &del_key, del_version.as_deref())
+                .await;
+        });
+
         if obj_info.name.is_empty() {
             return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
         }
@@ -1450,6 +1480,22 @@ impl S3 for FS {
                 )
                 .await
         };
+
+        // Invalidate cache for successfully deleted objects
+        let manager = get_concurrency_manager();
+        let bucket_clone = bucket.clone();
+        let deleted_objects = dobjs.clone();
+        tokio::spawn(async move {
+            for dobj in deleted_objects {
+                manager
+                    .invalidate_cache_versioned(
+                        &bucket_clone,
+                        &dobj.object_name,
+                        dobj.version_id.map(|v| v.to_string()).as_deref(),
+                    )
+                    .await;
+            }
+        });
 
         if is_all_buckets_not_found(
             &errs
@@ -1647,33 +1693,57 @@ impl S3 for FS {
 
         // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
-        let cache_key = format!("{}/{}", bucket, key);
+        // Generate cache key with version support: "{bucket}/{key}" or "{bucket}/{key}?versionId={vid}"
+        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &key, version_id.as_deref());
 
         // Only attempt cache lookup if caching is enabled and for objects without range/part requests
         if manager.is_cache_enabled() && part_number.is_none() && range.is_none() {
-            if let Some(cached_data) = manager.get_cached(&cache_key).await {
+            if let Some(cached) = manager.get_cached_object(&cache_key).await {
                 let cache_serve_duration = request_start.elapsed();
 
-                debug!("Serving object from cache: {} (latency: {:?})", cache_key, cache_serve_duration);
+                debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
 
                 #[cfg(feature = "metrics")]
                 {
                     use metrics::{counter, histogram};
                     counter!("rustfs_get_object_cache_served_total").increment(1);
                     histogram!("rustfs_get_object_cache_serve_duration_seconds").record(cache_serve_duration.as_secs_f64());
-                    histogram!("rustfs_get_object_cache_size_bytes").record(cached_data.len() as f64);
+                    histogram!("rustfs_get_object_cache_size_bytes").record(cached.body.len() as f64);
                 }
 
-                let value = cached_data.clone();
-                // Build response from cached data
-                let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move {
-                    Ok(bytes::Bytes::from((*value).clone()))
-                })));
+                // Build response from cached data with full metadata
+                let body_data = cached.body.clone();
+                let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
+
+                // Parse last_modified from RFC3339 string if available
+                let last_modified = cached.last_modified.as_ref().and_then(|s| {
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                        .map(Timestamp::from)
+                });
+
+                // Parse content_type
+                let content_type = cached.content_type.as_ref().and_then(|ct| ContentType::from_str(ct).ok());
 
                 let output = GetObjectOutput {
                     body,
-                    content_length: Some(cached_data.len() as i64),
+                    content_length: Some(cached.content_length),
                     accept_ranges: Some("bytes".to_string()),
+                    e_tag: cached.e_tag.as_ref().map(|etag| to_s3s_etag(etag)),
+                    last_modified,
+                    content_type,
+                    cache_control: cached.cache_control.clone(),
+                    content_disposition: cached.content_disposition.clone(),
+                    content_encoding: cached.content_encoding.clone(),
+                    content_language: cached.content_language.clone(),
+                    version_id: cached.version_id.clone(),
+                    delete_marker: Some(cached.delete_marker),
+                    tag_count: cached.tag_count,
+                    metadata: if cached.user_metadata.is_empty() {
+                        None
+                    } else {
+                        Some(cached.user_metadata.clone())
+                    },
                     ..Default::default()
                 };
 
@@ -1979,7 +2049,7 @@ impl S3 for FS {
             && !managed_encryption_applied
             && stored_sse_algorithm.is_none()
             && response_content_length > 0
-            && (response_content_length as usize) <= 10 * 1024 * 1024;
+            && (response_content_length as usize) <= manager.max_object_size();
 
         let body = if should_cache {
             // Read entire object into memory for caching
@@ -2004,13 +2074,22 @@ impl S3 for FS {
                 );
             }
 
+            // Build CachedGetObject with full metadata for cache writeback
+            let cached_response = CachedGetObject::new(bytes::Bytes::from(buf.clone()), response_content_length)
+                .with_content_type(info.content_type.clone().unwrap_or_default())
+                .with_e_tag(info.etag.clone().unwrap_or_default())
+                .with_last_modified(
+                    info.mod_time
+                        .map(|t| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default())
+                        .unwrap_or_default(),
+                );
+
             // Cache the object in background to avoid blocking the response
             let cache_key_clone = cache_key.clone();
-            let buf_clone = buf.clone();
             tokio::spawn(async move {
                 let manager = get_concurrency_manager();
-                manager.cache_object(cache_key_clone.clone(), buf_clone).await;
-                debug!("Object cached successfully: {}", cache_key_clone);
+                manager.put_cached_object(cache_key_clone.clone(), cached_response).await;
+                debug!("Object cached successfully with metadata: {}", cache_key_clone);
             });
 
             #[cfg(feature = "metrics")]
@@ -2929,6 +3008,18 @@ impl S3 for FS {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Invalidate cache for the written object to prevent stale data
+        let manager = get_concurrency_manager();
+        let put_bucket = bucket.clone();
+        let put_key = key.clone();
+        let put_version = obj_info.version_id.map(|v| v.to_string());
+        tokio::spawn(async move {
+            manager
+                .invalidate_cache_versioned(&put_bucket, &put_key, put_version.as_deref())
+                .await;
+        });
+
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
         let repoptions =
@@ -3822,6 +3913,17 @@ impl S3 for FS {
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Invalidate cache for the completed multipart object
+        let manager = get_concurrency_manager();
+        let mpu_bucket = bucket.clone();
+        let mpu_key = key.clone();
+        let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        tokio::spawn(async move {
+            manager
+                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version.as_deref())
+                .await;
+        });
 
         info!(
             "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
