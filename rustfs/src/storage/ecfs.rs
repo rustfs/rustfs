@@ -1717,9 +1717,13 @@ impl S3 for FS {
 
                 // Parse last_modified from RFC3339 string if available
                 let last_modified = cached.last_modified.as_ref().and_then(|s| {
-                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-                        .ok()
-                        .map(Timestamp::from)
+                    match time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339) {
+                        Ok(dt) => Some(Timestamp::from(dt)),
+                        Err(e) => {
+                            warn!("Failed to parse cached last_modified '{}': {}", s, e);
+                            None
+                        }
+                    }
                 });
 
                 // Parse content_type
@@ -2075,14 +2079,20 @@ impl S3 for FS {
             }
 
             // Build CachedGetObject with full metadata for cache writeback
+            let last_modified_str = info
+                .mod_time
+                .and_then(|t| match t.format(&time::format_description::well_known::Rfc3339) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!("Failed to format last_modified for cache writeback: {}", e);
+                        None
+                    }
+                });
+
             let cached_response = CachedGetObject::new(bytes::Bytes::from(buf.clone()), response_content_length)
                 .with_content_type(info.content_type.clone().unwrap_or_default())
                 .with_e_tag(info.etag.clone().unwrap_or_default())
-                .with_last_modified(
-                    info.mod_time
-                        .map(|t| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default())
-                        .unwrap_or_default(),
-                );
+                .with_last_modified(last_modified_str.unwrap_or_default());
 
             // Cache the object in background to avoid blocking the response
             let cache_key_clone = cache_key.clone();
