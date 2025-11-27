@@ -176,9 +176,9 @@ impl Drop for GetObjectGuard {
         {
             use metrics::{counter, histogram};
             // Track total completed requests for throughput calculation
-            counter!("rustfs_get_object_requests_completed").increment(1);
+            counter!("rustfs.get.object.requests.completed").increment(1);
             // Track request duration histogram for latency percentiles (P50, P95, P99)
-            histogram!("rustfs_get_object_duration_seconds").record(self.elapsed().as_secs_f64());
+            histogram!("rustfs.get.object.duration.seconds").record(self.elapsed().as_secs_f64());
         }
     }
 }
@@ -209,7 +209,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     #[cfg(feature = "metrics")]
     {
         use metrics::gauge;
-        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
+        gauge!("rustfs.concurrent.get.requests").set(concurrent_requests as f64);
     }
 
     // For low concurrency, use the base buffer size for maximum throughput
@@ -619,8 +619,8 @@ impl HotObjectCache {
                 #[cfg(feature = "metrics")]
                 {
                     use metrics::counter;
-                    counter!("rustfs_object_cache_hits").increment(1);
-                    counter!("rustfs_object_cache_access_count", "key" => key.to_string()).increment(1);
+                    counter!("rustfs.object.cache.hits").increment(1);
+                    counter!("rustfs.object.cache.access.count", "key" => key.to_string()).increment(1);
                 }
 
                 Some(Arc::clone(&cached.data))
@@ -631,7 +631,7 @@ impl HotObjectCache {
                 #[cfg(feature = "metrics")]
                 {
                     use metrics::counter;
-                    counter!("rustfs_object_cache_misses").increment(1);
+                    counter!("rustfs.object.cache.misses").increment(1);
                 }
 
                 None
@@ -663,7 +663,7 @@ impl HotObjectCache {
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, gauge};
-            counter!("rustfs_object_cache_insertions").increment(1);
+            counter!("rustfs.object.cache.insertions").increment(1);
             gauge!("rustfs_object_cache_size_bytes").set(self.cache.weighted_size() as f64);
             gauge!("rustfs_object_cache_entry_count").set(self.cache.entry_count() as f64);
         }

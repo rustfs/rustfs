@@ -242,12 +242,12 @@ fn get_buffer_size_opt_in(file_size: i64) -> usize {
     #[cfg(feature = "metrics")]
     {
         use metrics::histogram;
-        histogram!("rustfs_buffer_size_bytes").record(buffer_size as f64);
-        counter!("rustfs_buffer_size_selections").increment(1);
+        histogram!("rustfs.buffer.size.bytes").record(buffer_size as f64);
+        counter!("rustfs.buffer.size.selections").increment(1);
 
         if file_size >= 0 {
             let ratio = buffer_size as f64 / file_size as f64;
-            histogram!("rustfs_buffer_to_file_ratio").record(ratio);
+            histogram!("rustfs.buffer.to.file.ratio").record(ratio);
         }
     }
 
@@ -1669,8 +1669,8 @@ impl S3 for FS {
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, gauge};
-            counter!("rustfs_get_object_requests_total").increment(1);
-            gauge!("rustfs_concurrent_get_object_requests").set(concurrent_requests as f64);
+            counter!("rustfs.get.object.requests.total").increment(1);
+            gauge!("rustfs.concurrent.get.object.requests").set(concurrent_requests as f64);
         }
 
         debug!("GetObject request started with {} concurrent requests", concurrent_requests);
@@ -1706,9 +1706,9 @@ impl S3 for FS {
                 #[cfg(feature = "metrics")]
                 {
                     use metrics::{counter, histogram};
-                    counter!("rustfs_get_object_cache_served_total").increment(1);
-                    histogram!("rustfs_get_object_cache_serve_duration_seconds").record(cache_serve_duration.as_secs_f64());
-                    histogram!("rustfs_get_object_cache_size_bytes").record(cached.body.len() as f64);
+                    counter!("rustfs.get.object.cache.served.total").increment(1);
+                    histogram!("rustfs.get.object.cache.serve.duration.seconds").record(cache_serve_duration.as_secs_f64());
+                    histogram!("rustfs.get.object.cache.size.bytes").record(cached.body.len() as f64);
                 }
 
                 // Build response from cached data with full metadata
@@ -1800,7 +1800,7 @@ impl S3 for FS {
         #[cfg(feature = "metrics")]
         {
             use metrics::histogram;
-            histogram!("rustfs_disk_permit_wait_duration_seconds").record(permit_wait_duration.as_secs_f64());
+            histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
         }
 
         let reader = store
@@ -2105,7 +2105,7 @@ impl S3 for FS {
             #[cfg(feature = "metrics")]
             {
                 use metrics::counter;
-                counter!("rustfs_object_cache_writeback_total").increment(1);
+                counter!("rustfs.object.cache.writeback.total").increment(1);
             }
 
             // Create response from the in-memory data
@@ -2211,12 +2211,12 @@ impl S3 for FS {
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, histogram};
-            counter!("rustfs_get_object_requests_completed").increment(1);
-            histogram!("rustfs_get_object_total_duration_seconds").record(total_duration.as_secs_f64());
-            histogram!("rustfs_get_object_response_size_bytes").record(response_content_length as f64);
+            counter!("rustfs.get.object.requests.completed").increment(1);
+            histogram!("rustfs.get.object.total.duration.seconds").record(total_duration.as_secs_f64());
+            histogram!("rustfs.get.object.response.size.bytes").record(response_content_length as f64);
 
             // Record buffer size that was used
-            histogram!("rustfs_get_object_buffer_size_bytes").record(optimal_buffer_size as f64);
+            histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
         }
 
         debug!(

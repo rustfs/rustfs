@@ -39,7 +39,7 @@ exporters:
       insecure: true  # TLS is disabled in the development environment and a certificate needs to be configured in the production environment.
   prometheus: # Prometheus exporter for metrics data
     endpoint: "0.0.0.0:8889"  # Prometheus scraping endpoint
-    namespace: "rustfs"  # indicator prefix
+    namespace: "metrics"  # indicator prefix
     send_timestamps: true  # Send timestamp
   otlphttp/loki: # Loki exporter for log data
     endpoint: "http://loki:3100/otlp/v1/logs"
