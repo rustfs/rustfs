@@ -393,9 +393,21 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
 
     // Endpoint
     let root_ep = config.endpoint.as_str();
-    let trace_ep = config.trace_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
-    let metric_ep = config.metric_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
-    let log_ep = config.log_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
+    let trace_ep = config
+        .trace_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(format!("{root_ep}/v1/traces").as_str());
+    let metric_ep = config
+        .metric_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(format!("{root_ep}/v1/metrics").as_str());
+    let log_ep = config
+        .log_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(format!("{root_ep}/v1/logs").as_str());
 
     // Tracer（HTTP）
     let tracer_provider = {
