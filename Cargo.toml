@@ -123,7 +123,7 @@ tower-http = { version = "0.6.7", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.0", features = ["serde"] }
-bytesize = "2.3.0"
+bytesize = "2.3.1"
 byteorder = "1.5.0"
 flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
@@ -238,7 +238,7 @@ tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.17"
 tracing = { version = "0.1.41" }
-tracing-appender = "0.2.3"
+tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
