@@ -200,7 +200,6 @@ lz4 = "1.28.1"
 matchit = "0.9.0"
 md-5 = "0.11.0-rc.3"
 md5 = "0.8.0"
-metrics = "0.24.2"
 mime_guess = "2.0.5"
 moka = { version = "0.12.11", features = ["future"] }
 netif = "0.1.6"
@@ -255,6 +254,7 @@ zip = "6.0.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
+metrics = "0.24.2"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.0", features = ["http-proto", "zstd-http"] }
