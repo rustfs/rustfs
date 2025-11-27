@@ -615,22 +615,6 @@ impl Scanner {
             }
         });
 
-        // same as above, but not needed
-        // // Trigger an immediate data usage collection so that admin APIs have fresh data after startup.
-        // let scanner = self.clone_for_background();
-        // tokio::spawn(async move {
-        //     let enable_stats = {
-        //         let cfg = scanner.config.read().await;
-        //         cfg.enable_data_usage_stats
-        //     };
-
-        //     if enable_stats {
-        //         if let Err(e) = scanner.collect_and_persist_data_usage().await {
-        //             warn!("Initial data usage collection failed: {}", e);
-        //         }
-        //     }
-        // });
-
         Ok(())
     }
 
