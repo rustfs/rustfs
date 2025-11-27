@@ -34,6 +34,7 @@ services:
     ports:
       - "3200:3200" # tempo
       - "24317:4317" # otlp grpc
+      - "24318:4318" # otlp http
     restart: unless-stopped
     networks:
       - otel-network

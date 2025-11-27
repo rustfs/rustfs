@@ -15,13 +15,13 @@
 receivers:
   otlp:
     protocols:
-      grpc: # OTLP gRPC 接收器
+      grpc: # OTLP gRPC receiver
         endpoint: 0.0.0.0:4317
-      http: # OTLP HTTP 接收器
+      http: # OTLP HTTP receiver
         endpoint: 0.0.0.0:4318
 
 processors:
-  batch: # 批处理处理器，提升吞吐量
+  batch: # Batch processor to improve throughput
     timeout: 5s
     send_batch_size: 1000
   memory_limiter:
@@ -29,20 +29,19 @@ processors:
     limit_mib: 512
 
 exporters:
-  otlp/traces: # OTLP 导出器，用于跟踪数据
-    endpoint: "jaeger:4317"  # Jaeger 的 OTLP gRPC 端点
+  otlp/traces: # OTLP exporter for trace data
+    endpoint: "jaeger:4318"  # OTLP HTTP endpoint for Jaeger
     tls:
-      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  otlp/tempo: # OTLP 导出器，用于跟踪数据
-    endpoint: "tempo:4317"  # tempo 的 OTLP gRPC 端点
+      insecure: true  # TLS is disabled in the development environment and a certificate needs to be configured in the production environment.
+  otlp/tempo: # OTLP exporter for trace data
+    endpoint: "tempo:4318"  # OTLP HTTP endpoint for tempo
     tls:
-      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  prometheus: # Prometheus 导出器，用于指标数据
-    endpoint: "0.0.0.0:8889"  # Prometheus 刮取端点
-    namespace: "rustfs"  # 指标前缀
-    send_timestamps: true  # 发送时间戳
-    # enable_open_metrics: true
-  otlphttp/loki: # Loki 导出器，用于日志数据
+      insecure: true  # TLS is disabled in the development environment and a certificate needs to be configured in the production environment.
+  prometheus: # Prometheus exporter for metrics data
+    endpoint: "0.0.0.0:8889"  # Prometheus scraping endpoint
+    namespace: "rustfs"  # indicator prefix
+    send_timestamps: true  # Send timestamp
+  otlphttp/loki: # Loki exporter for log data
     endpoint: "http://loki:3100/otlp/v1/logs"
     tls:
       insecure: true
@@ -51,7 +50,7 @@ extensions:
   pprof:
   zpages:
 service:
-  extensions: [ health_check, pprof, zpages ]  # 启用扩展
+  extensions: [ health_check, pprof, zpages ]  # Enable extension
   pipelines:
     traces:
       receivers: [ otlp ]
@@ -67,9 +66,9 @@ service:
       exporters: [ otlphttp/loki ]
   telemetry:
     logs:
-      level: "info"  # Collector 日志级别
+      level: "info"  # Collector log level
     metrics:
-      level: "detailed" # 可以是 basic, normal, detailed
+      level: "detailed" # Can be basic, normal, detailed
       readers:
         - periodic:
             exporter:

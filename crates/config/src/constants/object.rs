@@ -31,6 +31,16 @@ pub const ENV_OBJECT_CACHE_ENABLE: &str = "RUSTFS_OBJECT_CACHE_ENABLE";
 /// - Note: Actual memory usage will be slightly higher due to object headers and indexing overhead.
 pub const ENV_OBJECT_CACHE_CAPACITY_MB: &str = "RUSTFS_OBJECT_CACHE_CAPACITY_MB";
 
+/// Environment variable name for maximum object size eligible for caching in megabytes.
+///
+/// - Purpose: Define the upper size limit for individual objects to be considered for caching.
+/// - Unit: MB (1 MB = 1_048_576 bytes).
+/// - Valid values: any positive integer; objects larger than this size will not be cached.
+/// - Semantics: Prevents caching of excessively large objects that could monopolize cache capacity; tune based on typical object size distribution.
+/// - Example: `export RUSTFS_OBJECT_CACHE_MAX_OBJECT_SIZE_MB=50`
+/// - Note: Setting this too low may reduce cache effectiveness; setting it too high may lead to inefficient memory usage.
+pub const ENV_OBJECT_CACHE_MAX_OBJECT_SIZE_MB: &str = "RUSTFS_OBJECT_CACHE_MAX_OBJECT_SIZE_MB";
+
 /// Environment variable name for object cache TTL (time-to-live) in seconds.
 ///
 /// - Purpose: Specify the maximum lifetime of a cached entry from the moment it is written.
@@ -86,6 +96,12 @@ pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = false;
 /// - Default: 100 MB (can be overridden by `RUSTFS_OBJECT_CACHE_CAPACITY_MB`).
 /// - Note: Choose a conservative default to reduce memory pressure in development/testing.
 pub const DEFAULT_OBJECT_CACHE_CAPACITY_MB: u64 = 100;
+
+/// Default maximum object size eligible for caching in MB.
+///
+/// - Default: 10 MB (can be overridden by `RUSTFS_OBJECT_CACHE_MAX_OBJECT_SIZE_MB`).
+/// - Note: Balances caching effectiveness with memory usage.
+pub const DEFAULT_OBJECT_CACHE_MAX_OBJECT_SIZE_MB: usize = 10;
 
 /// Maximum concurrent requests before applying aggressive optimization.
 ///

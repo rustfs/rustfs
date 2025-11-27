@@ -572,11 +572,14 @@ impl HotObjectCache {
             .time_to_live(Duration::from_secs(cache_ttl_secs))
             .time_to_idle(Duration::from_secs(cache_tti_secs))
             .build();
-
+        let max_object_size = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_CACHE_MAX_OBJECT_SIZE_MB,
+            rustfs_config::DEFAULT_OBJECT_CACHE_MAX_OBJECT_SIZE_MB,
+        ) * MI_B;
         Self {
             cache,
             response_cache,
-            max_object_size: 10 * MI_B,
+            max_object_size,
             hit_count: Arc::new(AtomicU64::new(0)),
             miss_count: Arc::new(AtomicU64::new(0)),
         }
