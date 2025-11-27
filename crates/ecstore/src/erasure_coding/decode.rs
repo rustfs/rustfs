@@ -176,12 +176,10 @@ where
     let mut write_left = length;
 
     for block_op in &en_blocks[..data_blocks] {
-        if block_op.is_none() {
+        let Some(block) = block_op else {
             error!("write_data_blocks block_op.is_none()");
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
-        }
-
-        let block = block_op.as_ref().unwrap();
+        };
 
         if offset >= block.len() {
             offset -= block.len();
@@ -191,7 +189,7 @@ where
         let block_slice = &block[offset..];
         offset = 0;
 
-        if write_left < block.len() {
+        if write_left < block_slice.len() {
             writer.write_all(&block_slice[..write_left]).await.map_err(|e| {
                 error!("write_data_blocks write_all err: {}", e);
                 e
