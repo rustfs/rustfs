@@ -32,7 +32,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 
 与其他存储系统不同，RustFS 采用更宽松、商业友好的 Apache 2.0 许可证，避免了 AGPL 协议的限制。以 Rust 为基石，RustFS 为下一代对象存储提供了更快的速度和更安全的分布式特性。
 
-## 功能状态和功能状态
+## 特征和功能状态
 
 - **高性能**：基于 Rust 构建，确保极致的速度和资源效率。
 - **分布式架构**：可扩展且容错的设计，适用于大规模部署。
@@ -93,7 +93,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 ### 1. 一键安装脚本 (选项 1)
 
   ```bash
-  curl -O [https://rustfs.com/install_rustfs.sh](https://rustfs.com/install_rustfs.sh) && bash install_rustfs.sh
+  curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 ````
 
 ### 2\. Docker 快速启动 (选项 2)
@@ -202,19 +202,20 @@ make help-docker                      # 显示所有 Docker 相关命令
 
 RustFS 是一个社区驱动的项目，我们感谢所有的贡献。请查看 [贡献者](https://github.com/rustfs/rustfs/graphs/contributors) 页面，看看那些让 RustFS 变得更好的了不起的人们。
 
-\<a href="https://github.com/rustfs/rustfs/graphs/contributors"\>
-\<img src="https://opencollective.com/rustfs/contributors.svg?width=890\&limit=500\&button=false" alt="Contributors"/\>
-\</a\>
+<a href="https://github.com/rustfs/rustfs/graphs/contributors">
+<img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
+</a>
 
 ## Github Trending Top
 
 🚀 RustFS 深受全球开源爱好者和企业用户的喜爱，经常荣登 GitHub Trending 榜单。
 
-\<a href="https://trendshift.io/repositories/14181" target="\_blank"\>\<img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /\>\</a\>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
 ## Star 历史
 
-[](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+
 
 ## 许可证
 

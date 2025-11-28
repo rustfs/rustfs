@@ -32,7 +32,7 @@ RustFS is a high-performance, distributed object storage system built in Rust—
 
 Unlike other storage systems, RustFS is released under the permissible Apache 2.0 license, avoiding the restrictions of AGPL. With Rust as its foundation, RustFS delivers superior speed and secure distributed features for next-generation object storage.
 
-## Feature Status
+## Feature & Status
 
 - **High Performance**: Built with Rust to ensure maximum speed and resource efficiency.
 - **Distributed Architecture**: Scalable and fault-tolerant design suitable for large-scale deployments.
@@ -92,7 +92,7 @@ To get started with RustFS, follow these steps:
 ### 1. One-click Installation (Option 1)
 
   ```bash
-  curl -O [https://rustfs.com/install_rustfs.sh](https://rustfs.com/install_rustfs.sh) && bash install_rustfs.sh
+  curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 ````
 
 ### 2\. Docker Quick Start (Option 2)
@@ -201,19 +201,21 @@ If you have any questions or need assistance:
 
 RustFS is a community-driven project, and we appreciate all contributions. Check out the [Contributors](https://github.com/rustfs/rustfs/graphs/contributors) page to see the amazing people who have helped make RustFS better.
 
-\<a href="https://github.com/rustfs/rustfs/graphs/contributors"\>
-\<img src="https://opencollective.com/rustfs/contributors.svg?width=890\&limit=500\&button=false" alt="Contributors"/\>
-\</a\>
+<a href="https://github.com/rustfs/rustfs/graphs/contributors">
+<img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
+</a>
 
 ## Github Trending Top
 
 🚀 RustFS is beloved by open-source enthusiasts and enterprise users worldwide, often appearing on the GitHub Trending top charts.
 
-\<a href="https://trendshift.io/repositories/14181" target="\_blank"\>\<img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /\>\</a\>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
 ## Star History
 
-[](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
 
 ## License
 
