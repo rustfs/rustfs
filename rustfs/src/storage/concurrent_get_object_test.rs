@@ -1090,4 +1090,146 @@ mod tests {
         // Default max object size is 10MB
         assert_eq!(manager.max_object_size(), 10 * MI_B, "Max object size should be 10MB");
     }
+
+    // ============================================
+    // Adaptive I/O Strategy Tests
+    // ============================================
+
+    /// Test IoLoadLevel classification based on wait duration.
+    ///
+    /// This test validates that the IoLoadLevel enum correctly classifies
+    /// disk permit wait times into appropriate load levels.
+    #[test]
+    fn test_io_load_level_classification() {
+        use crate::storage::concurrency::IoLoadLevel;
+        use std::time::Duration;
+
+        // Low load: < 10ms
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(0)), IoLoadLevel::Low);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(5)), IoLoadLevel::Low);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(9)), IoLoadLevel::Low);
+
+        // Medium load: 10-50ms
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(10)), IoLoadLevel::Medium);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(30)), IoLoadLevel::Medium);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(49)), IoLoadLevel::Medium);
+
+        // High load: 50-200ms
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(50)), IoLoadLevel::High);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(100)), IoLoadLevel::High);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(199)), IoLoadLevel::High);
+
+        // Critical load: > 200ms
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(200)), IoLoadLevel::Critical);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(500)), IoLoadLevel::Critical);
+        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_secs(1)), IoLoadLevel::Critical);
+    }
+
+    /// Test IoStrategy buffer size calculation based on load level.
+    ///
+    /// This test validates that buffer sizes are appropriately reduced
+    /// under higher load conditions.
+    #[test]
+    fn test_io_strategy_buffer_sizing() {
+        use crate::storage::concurrency::IoStrategy;
+        use std::time::Duration;
+
+        let base_buffer = 256 * KI_B;
+
+        // Low load: 100% of base buffer
+        let strategy_low = IoStrategy::from_wait_duration(Duration::from_millis(5), base_buffer);
+        assert_eq!(strategy_low.buffer_multiplier, 1.0);
+        assert_eq!(strategy_low.buffer_size, base_buffer);
+        assert!(strategy_low.enable_readahead);
+        assert!(strategy_low.cache_writeback_enabled);
+
+        // Medium load: 75% of base buffer
+        let strategy_med = IoStrategy::from_wait_duration(Duration::from_millis(30), base_buffer);
+        assert_eq!(strategy_med.buffer_multiplier, 0.75);
+        assert_eq!(strategy_med.buffer_size, (base_buffer as f64 * 0.75) as usize);
+        assert!(strategy_med.enable_readahead);
+        assert!(strategy_med.cache_writeback_enabled);
+
+        // High load: 50% of base buffer
+        let strategy_high = IoStrategy::from_wait_duration(Duration::from_millis(100), base_buffer);
+        assert_eq!(strategy_high.buffer_multiplier, 0.5);
+        assert_eq!(strategy_high.buffer_size, (base_buffer as f64 * 0.5) as usize);
+        assert!(!strategy_high.enable_readahead); // Disabled under high load
+        assert!(strategy_high.cache_writeback_enabled);
+
+        // Critical load: 40% of base buffer
+        let strategy_crit = IoStrategy::from_wait_duration(Duration::from_millis(500), base_buffer);
+        assert_eq!(strategy_crit.buffer_multiplier, 0.4);
+        // Buffer size clamped to min 32KB, max 1MB
+        let expected = ((base_buffer as f64) * 0.4) as usize;
+        assert_eq!(strategy_crit.buffer_size, expected.clamp(32 * KI_B, MI_B));
+        assert!(!strategy_crit.enable_readahead);
+        assert!(!strategy_crit.cache_writeback_enabled); // Disabled under critical load
+    }
+
+    /// Test ConcurrencyManager adaptive I/O strategy calculation.
+    ///
+    /// This test validates that the calculate_io_strategy method correctly
+    /// produces IoStrategy instances with the expected parameters.
+    #[tokio::test]
+    async fn test_calculate_io_strategy() {
+        use crate::storage::concurrency::IoLoadLevel;
+        use std::time::Duration;
+
+        let manager = ConcurrencyManager::new();
+        let base_buffer = 256 * KI_B;
+
+        // Low load strategy
+        let strategy = manager.calculate_io_strategy(Duration::from_millis(5), base_buffer);
+        assert_eq!(strategy.load_level, IoLoadLevel::Low);
+        assert_eq!(strategy.buffer_size, base_buffer);
+
+        // Medium load strategy
+        let strategy = manager.calculate_io_strategy(Duration::from_millis(30), base_buffer);
+        assert_eq!(strategy.load_level, IoLoadLevel::Medium);
+
+        // High load strategy
+        let strategy = manager.calculate_io_strategy(Duration::from_millis(100), base_buffer);
+        assert_eq!(strategy.load_level, IoLoadLevel::High);
+        assert!(!strategy.enable_readahead);
+
+        // Critical load strategy
+        let strategy = manager.calculate_io_strategy(Duration::from_millis(500), base_buffer);
+        assert_eq!(strategy.load_level, IoLoadLevel::Critical);
+        assert!(!strategy.cache_writeback_enabled);
+    }
+
+    /// Test ConcurrencyManager I/O load stats tracking.
+    ///
+    /// This test validates that the io_load_stats method correctly returns
+    /// statistics about permit wait times.
+    #[tokio::test]
+    async fn test_io_load_stats() {
+        use std::time::Duration;
+
+        let manager = ConcurrencyManager::new();
+
+        // Record some wait observations
+        manager.record_permit_wait(Duration::from_millis(10));
+        manager.record_permit_wait(Duration::from_millis(20));
+        manager.record_permit_wait(Duration::from_millis(30));
+
+        let (avg, p95, max, count) = manager.io_load_stats();
+
+        // Check observation count
+        assert_eq!(count, 3, "Should have 3 observations");
+
+        // Average should be around 20ms
+        assert!(
+            avg >= Duration::from_millis(15) && avg <= Duration::from_millis(25),
+            "Average should be around 20ms, got {:?}",
+            avg
+        );
+
+        // Max should be 30ms
+        assert_eq!(max, Duration::from_millis(30), "Max should be 30ms");
+
+        // P95 should be at or near 30ms
+        assert!(p95 >= Duration::from_millis(25), "P95 should be near 30ms, got {:?}", p95);
+    }
 }

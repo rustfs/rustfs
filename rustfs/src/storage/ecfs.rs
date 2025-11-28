@@ -1792,16 +1792,52 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
-        // Acquire disk read permit to prevent I/O saturation under high concurrency
+        // ============================================
+        // Adaptive I/O Strategy with Disk Permit
+        // ============================================
+        //
+        // Acquire disk read permit and calculate adaptive I/O strategy
+        // based on the wait time. Longer wait times indicate higher system
+        // load, which triggers more conservative I/O parameters.
         let permit_wait_start = std::time::Instant::now();
         let _disk_permit = manager.acquire_disk_read_permit().await;
         let permit_wait_duration = permit_wait_start.elapsed();
 
+        // Calculate adaptive I/O strategy from permit wait time
+        // This adjusts buffer sizes, read-ahead, and caching behavior based on load
+        // Use 256KB as the base buffer size for strategy calculation
+        let base_buffer_size = get_global_buffer_config().base_config.default_unknown;
+        let io_strategy = manager.calculate_io_strategy(permit_wait_duration, base_buffer_size);
+
+        // Record detailed I/O metrics for monitoring
         #[cfg(feature = "metrics")]
         {
-            use metrics::histogram;
+            use metrics::{counter, gauge, histogram};
+            // Record permit wait time histogram
             histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
+            // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
+            let load_level_value = match io_strategy.load_level {
+                crate::storage::concurrency::IoLoadLevel::Low => 0.0,
+                crate::storage::concurrency::IoLoadLevel::Medium => 1.0,
+                crate::storage::concurrency::IoLoadLevel::High => 2.0,
+                crate::storage::concurrency::IoLoadLevel::Critical => 3.0,
+            };
+            gauge!("rustfs.io.load.level").set(load_level_value);
+            // Record buffer multiplier as gauge
+            gauge!("rustfs.io.buffer.multiplier").set(io_strategy.buffer_multiplier);
+            // Count strategy selections by load level
+            counter!("rustfs.io.strategy.selected", "level" => format!("{:?}", io_strategy.load_level)).increment(1);
         }
+
+        // Log strategy details at debug level for troubleshooting
+        debug!(
+            wait_ms = permit_wait_duration.as_millis() as u64,
+            load_level = ?io_strategy.load_level,
+            buffer_size = io_strategy.buffer_size,
+            readahead = io_strategy.enable_readahead,
+            cache_wb = io_strategy.cache_writeback_enabled,
+            "Adaptive I/O strategy calculated"
+        );
 
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
@@ -2033,12 +2069,19 @@ impl S3 for FS {
 
         // Calculate concurrency-aware buffer size for optimal performance
         // This adapts based on the number of concurrent GetObject requests
+        // AND the adaptive I/O strategy from permit wait time
         let base_buffer_size = get_buffer_size_opt_in(response_content_length);
-        let optimal_buffer_size = get_concurrency_aware_buffer_size(response_content_length, base_buffer_size);
+        let optimal_buffer_size = if io_strategy.buffer_size > 0 {
+            // Use adaptive I/O strategy buffer size (derived from permit wait time)
+            io_strategy.buffer_size.min(base_buffer_size)
+        } else {
+            // Fallback to concurrency-aware sizing
+            get_concurrency_aware_buffer_size(response_content_length, base_buffer_size)
+        };
 
         debug!(
-            "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}",
-            response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests
+            "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}, io_strategy={:?}",
+            response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests, io_strategy.load_level
         );
 
         // Cache writeback logic for small, non-encrypted, non-range objects
@@ -2047,7 +2090,9 @@ impl S3 for FS {
         // 2. No part/range request (full object)
         // 3. Object size is known and within cache threshold (10MB)
         // 4. Not encrypted (SSE-C or managed encryption)
+        // 5. I/O strategy allows cache writeback (disabled under critical load)
         let should_cache = manager.is_cache_enabled()
+            && io_strategy.cache_writeback_enabled
             && part_number.is_none()
             && rs.is_none()
             && !managed_encryption_applied

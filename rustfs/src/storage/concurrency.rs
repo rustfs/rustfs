@@ -71,9 +71,262 @@
 use moka::future::Cache;
 use rustfs_config::{KI_B, MI_B};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+
+// ============================================
+// Adaptive I/O Strategy Types
+// ============================================
+
+/// Load level classification based on disk permit wait times.
+///
+/// This enum represents the current I/O load on the system, determined by
+/// analyzing disk permit acquisition wait times. Longer wait times indicate
+/// higher contention and system load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoLoadLevel {
+    /// Low load: wait time < 10ms. System has ample I/O capacity.
+    Low,
+    /// Medium load: wait time 10-50ms. System is moderately loaded.
+    Medium,
+    /// High load: wait time 50-200ms. System is under significant load.
+    High,
+    /// Critical load: wait time > 200ms. System is heavily congested.
+    Critical,
+}
+
+impl IoLoadLevel {
+    /// Determine load level from disk permit wait duration.
+    ///
+    /// Thresholds are based on typical NVMe SSD characteristics:
+    /// - Low: < 10ms (normal operation)
+    /// - Medium: 10-50ms (moderate contention)
+    /// - High: 50-200ms (significant contention)
+    /// - Critical: > 200ms (severe congestion)
+    pub fn from_wait_duration(wait: Duration) -> Self {
+        let wait_ms = wait.as_millis();
+        if wait_ms < 10 {
+            IoLoadLevel::Low
+        } else if wait_ms < 50 {
+            IoLoadLevel::Medium
+        } else if wait_ms < 200 {
+            IoLoadLevel::High
+        } else {
+            IoLoadLevel::Critical
+        }
+    }
+}
+
+/// Adaptive I/O strategy calculated from current system load.
+///
+/// This structure provides optimized I/O parameters based on the observed
+/// disk permit wait times. It helps balance throughput vs. latency and
+/// prevents I/O saturation under high load.
+///
+/// # Usage Example
+///
+/// ```ignore
+/// let strategy = manager.calculate_io_strategy(permit_wait_duration);
+///
+/// // Apply strategy to I/O operations
+/// let buffer_size = strategy.buffer_size;
+/// let enable_readahead = strategy.enable_readahead;
+/// let enable_cache_writeback = strategy.cache_writeback_enabled;
+/// ```
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct IoStrategy {
+    /// Recommended buffer size for I/O operations (in bytes).
+    ///
+    /// Under high load, this is reduced to improve fairness and reduce memory pressure.
+    /// Under low load, this is maximized for throughput.
+    pub buffer_size: usize,
+
+    /// Buffer size multiplier (0.4 - 1.0) applied to base buffer size.
+    ///
+    /// - 1.0: Low load - use full buffer
+    /// - 0.75: Medium load - slightly reduced
+    /// - 0.5: High load - significantly reduced
+    /// - 0.4: Critical load - minimal buffer
+    pub buffer_multiplier: f64,
+
+    /// Whether to enable aggressive read-ahead for sequential reads.
+    ///
+    /// Disabled under high load to reduce I/O amplification.
+    pub enable_readahead: bool,
+
+    /// Whether to enable cache writeback for this request.
+    ///
+    /// May be disabled under extreme load to reduce memory pressure.
+    pub cache_writeback_enabled: bool,
+
+    /// Whether to use tokio BufReader for improved async I/O.
+    ///
+    /// Always enabled for better async performance.
+    pub use_buffered_io: bool,
+
+    /// The detected I/O load level.
+    pub load_level: IoLoadLevel,
+
+    /// The raw permit wait duration that was used to calculate this strategy.
+    pub permit_wait_duration: Duration,
+}
+
+impl IoStrategy {
+    /// Create a new IoStrategy from disk permit wait time and base buffer size.
+    ///
+    /// This analyzes the wait duration to determine the current I/O load level
+    /// and calculates appropriate I/O parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `permit_wait_duration` - Time spent waiting for disk read permit
+    /// * `base_buffer_size` - Base buffer size from workload configuration
+    ///
+    /// # Returns
+    ///
+    /// An IoStrategy with optimized parameters for the current load level.
+    pub fn from_wait_duration(permit_wait_duration: Duration, base_buffer_size: usize) -> Self {
+        let load_level = IoLoadLevel::from_wait_duration(permit_wait_duration);
+
+        // Calculate buffer multiplier based on load level
+        let buffer_multiplier = match load_level {
+            IoLoadLevel::Low => 1.0,
+            IoLoadLevel::Medium => 0.75,
+            IoLoadLevel::High => 0.5,
+            IoLoadLevel::Critical => 0.4,
+        };
+
+        // Calculate actual buffer size
+        let buffer_size = ((base_buffer_size as f64) * buffer_multiplier) as usize;
+        let buffer_size = buffer_size.clamp(32 * KI_B, MI_B);
+
+        // Determine feature toggles based on load
+        let enable_readahead = match load_level {
+            IoLoadLevel::Low | IoLoadLevel::Medium => true,
+            IoLoadLevel::High | IoLoadLevel::Critical => false,
+        };
+
+        let cache_writeback_enabled = match load_level {
+            IoLoadLevel::Low | IoLoadLevel::Medium | IoLoadLevel::High => true,
+            IoLoadLevel::Critical => false, // Disable under extreme load
+        };
+
+        Self {
+            buffer_size,
+            buffer_multiplier,
+            enable_readahead,
+            cache_writeback_enabled,
+            use_buffered_io: true, // Always enabled
+            load_level,
+            permit_wait_duration,
+        }
+    }
+
+    /// Get a human-readable description of the current I/O strategy.
+    #[allow(dead_code)]
+    pub fn description(&self) -> String {
+        format!(
+            "IoStrategy[{:?}]: buffer={}KB, multiplier={:.2}, readahead={}, cache_wb={}, wait={:?}",
+            self.load_level,
+            self.buffer_size / 1024,
+            self.buffer_multiplier,
+            self.enable_readahead,
+            self.cache_writeback_enabled,
+            self.permit_wait_duration
+        )
+    }
+}
+
+/// Rolling window metrics for I/O load tracking.
+///
+/// This structure maintains a sliding window of recent disk permit wait times
+/// to provide smoothed load level estimates. This helps prevent strategy
+/// oscillation from transient load spikes.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct IoLoadMetrics {
+    /// Recent permit wait durations (sliding window)
+    recent_waits: Vec<Duration>,
+    /// Maximum samples to keep in the window
+    max_samples: usize,
+    /// Total wait time observed (for averaging)
+    total_wait_ns: AtomicU64,
+    /// Total number of observations
+    observation_count: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl IoLoadMetrics {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            recent_waits: Vec::with_capacity(max_samples),
+            max_samples,
+            total_wait_ns: AtomicU64::new(0),
+            observation_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a new permit wait observation
+    fn record(&mut self, wait: Duration) {
+        // Add to recent waits (with eviction if full)
+        if self.recent_waits.len() >= self.max_samples {
+            self.recent_waits.remove(0);
+        }
+        self.recent_waits.push(wait);
+
+        // Update totals for overall statistics
+        self.total_wait_ns.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+        self.observation_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the average wait duration over the recent window
+    fn average_wait(&self) -> Duration {
+        if self.recent_waits.is_empty() {
+            return Duration::ZERO;
+        }
+        let total: Duration = self.recent_waits.iter().sum();
+        total / self.recent_waits.len() as u32
+    }
+
+    /// Get the maximum wait duration in the recent window
+    fn max_wait(&self) -> Duration {
+        self.recent_waits.iter().copied().max().unwrap_or(Duration::ZERO)
+    }
+
+    /// Get the P95 wait duration from the recent window
+    fn p95_wait(&self) -> Duration {
+        if self.recent_waits.is_empty() {
+            return Duration::ZERO;
+        }
+        let mut sorted = self.recent_waits.clone();
+        sorted.sort();
+        let p95_idx = ((sorted.len() as f64) * 0.95) as usize;
+        sorted.get(p95_idx.min(sorted.len() - 1)).copied().unwrap_or(Duration::ZERO)
+    }
+
+    /// Get the smoothed load level based on recent observations
+    fn smoothed_load_level(&self) -> IoLoadLevel {
+        IoLoadLevel::from_wait_duration(self.average_wait())
+    }
+
+    /// Get the overall average wait since startup
+    fn lifetime_average_wait(&self) -> Duration {
+        let total = self.total_wait_ns.load(Ordering::Relaxed);
+        let count = self.observation_count.load(Ordering::Relaxed);
+        if count == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(total / count)
+        }
+    }
+
+    /// Get the total observation count
+    fn observation_count(&self) -> u64 {
+        self.observation_count.load(Ordering::Relaxed)
+    }
+}
 
 /// Global concurrent request counter for adaptive buffer sizing.
 ///
@@ -954,6 +1207,12 @@ pub struct CacheStats {
 }
 
 /// Concurrency manager for coordinating concurrent GetObject requests
+///
+/// This manager provides:
+/// - Adaptive I/O strategy based on disk permit wait times
+/// - Hot object caching with Moka
+/// - Disk read permit management to prevent I/O saturation
+/// - Rolling metrics for load level smoothing
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct ConcurrencyManager {
@@ -963,14 +1222,22 @@ pub struct ConcurrencyManager {
     disk_read_semaphore: Arc<Semaphore>,
     /// Whether object caching is enabled (from RUSTFS_OBJECT_CACHE_ENABLE env var)
     cache_enabled: bool,
+    /// I/O load metrics for adaptive strategy calculation
+    io_metrics: Arc<Mutex<IoLoadMetrics>>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use std::sync::atomic::Ordering;
+        let io_metrics_info = if let Ok(metrics) = self.io_metrics.lock() {
+            format!("avg_wait={:?}, observations={}", metrics.average_wait(), metrics.observation_count())
+        } else {
+            "locked".to_string()
+        };
         f.debug_struct("ConcurrencyManager")
             .field("active_requests", &ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
             .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
+            .field("io_metrics", &io_metrics_info)
             .finish()
     }
 }
@@ -988,6 +1255,7 @@ impl ConcurrencyManager {
             cache: Arc::new(HotObjectCache::new()),
             disk_read_semaphore: Arc::new(Semaphore::new(64)),
             cache_enabled,
+            io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
         }
     }
 
@@ -1031,6 +1299,129 @@ impl ConcurrencyManager {
             .acquire()
             .await
             .expect("semaphore closed unexpectedly")
+    }
+
+    // ============================================
+    // Adaptive I/O Strategy Methods
+    // ============================================
+
+    /// Record a disk permit wait observation for load tracking.
+    ///
+    /// This method updates the rolling metrics used to calculate adaptive I/O
+    /// strategies. Should be called after each disk permit acquisition.
+    ///
+    /// # Arguments
+    ///
+    /// * `wait_duration` - Time spent waiting for the disk read permit
+    pub fn record_permit_wait(&self, wait_duration: Duration) {
+        if let Ok(mut metrics) = self.io_metrics.lock() {
+            metrics.record(wait_duration);
+        }
+
+        // Record histogram metric for Prometheus
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::histogram;
+            histogram!("rustfs.disk.permit.wait.duration.seconds").record(wait_duration.as_secs_f64());
+        }
+    }
+
+    /// Calculate an adaptive I/O strategy based on disk permit wait time.
+    ///
+    /// This method analyzes the permit wait duration to determine the current
+    /// I/O load level and returns optimized parameters for the read operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `permit_wait_duration` - Time spent waiting for disk read permit
+    /// * `base_buffer_size` - Base buffer size from workload configuration
+    ///
+    /// # Returns
+    ///
+    /// An `IoStrategy` containing optimized I/O parameters.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let permit_wait_start = Instant::now();
+    /// let _permit = manager.acquire_disk_read_permit().await;
+    /// let permit_wait_duration = permit_wait_start.elapsed();
+    ///
+    /// let strategy = manager.calculate_io_strategy(permit_wait_duration, 256 * 1024);
+    /// let optimal_buffer = strategy.buffer_size;
+    /// ```
+    pub fn calculate_io_strategy(&self, permit_wait_duration: Duration, base_buffer_size: usize) -> IoStrategy {
+        // Record the observation for future smoothing
+        self.record_permit_wait(permit_wait_duration);
+
+        // Calculate strategy from the current wait duration
+        IoStrategy::from_wait_duration(permit_wait_duration, base_buffer_size)
+    }
+
+    /// Get the smoothed I/O load level based on recent observations.
+    ///
+    /// This uses the rolling window of permit wait times to provide a more
+    /// stable estimate of the current load level, reducing oscillation from
+    /// transient spikes.
+    ///
+    /// # Returns
+    ///
+    /// The smoothed `IoLoadLevel` based on average recent wait times.
+    #[allow(dead_code)]
+    pub fn smoothed_load_level(&self) -> IoLoadLevel {
+        if let Ok(metrics) = self.io_metrics.lock() {
+            metrics.smoothed_load_level()
+        } else {
+            IoLoadLevel::Medium // Default to medium if lock fails
+        }
+    }
+
+    /// Get I/O load statistics for monitoring.
+    ///
+    /// Returns statistics about recent disk permit wait times for
+    /// monitoring dashboards and capacity planning.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (average_wait, p95_wait, max_wait, observation_count)
+    #[allow(dead_code)]
+    pub fn io_load_stats(&self) -> (Duration, Duration, Duration, u64) {
+        if let Ok(metrics) = self.io_metrics.lock() {
+            (
+                metrics.average_wait(),
+                metrics.p95_wait(),
+                metrics.max_wait(),
+                metrics.observation_count(),
+            )
+        } else {
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO, 0)
+        }
+    }
+
+    /// Get the recommended buffer size based on current I/O load.
+    ///
+    /// This is a convenience method that combines load level detection with
+    /// buffer size calculation. Uses the smoothed load level for stability.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_buffer_size` - Base buffer size from workload configuration
+    ///
+    /// # Returns
+    ///
+    /// Recommended buffer size in bytes.
+    #[allow(dead_code)]
+    pub fn adaptive_buffer_size(&self, base_buffer_size: usize) -> usize {
+        let load_level = self.smoothed_load_level();
+        let multiplier = match load_level {
+            IoLoadLevel::Low => 1.0,
+            IoLoadLevel::Medium => 0.75,
+            IoLoadLevel::High => 0.5,
+            IoLoadLevel::Critical => 0.4,
+        };
+
+        let buffer_size = ((base_buffer_size as f64) * multiplier) as usize;
+        buffer_size.clamp(32 * KI_B, MI_B)
     }
 
     /// Get cache statistics
