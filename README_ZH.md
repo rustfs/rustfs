@@ -1,185 +1,219 @@
 [![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-<p align="center">RustFS 是一个使用 Rust 构建的高性能分布式对象存储软件</p >
+<p align="center">RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。</p>
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
-  <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="Build and Push Docker Images" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
-  <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
-  <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
+  <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="构建并推送 Docker 镜像" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
+  <img alt="GitHub 提交活跃度" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
+  <img alt="Github 最新提交" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
   <a href="https://hellogithub.com/repository/rustfs/rustfs" target="_blank"><img src="https://abroad.hellogithub.com/v1/widgets/recommend.svg?rid=b95bcb72bdc340b68f16fdf6790b7d5b&claim_uid=MsbvjYeLDKAH457&theme=small" alt="Featured｜HelloGitHub" /></a>
-</p >
+</p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/zh/introduction.html">快速开始</a >
-  · <a href="https://docs.rustfs.com/zh/">文档</a >
-  · <a href="https://github.com/rustfs/rustfs/issues">问题报告</a >
-  · <a href="https://github.com/rustfs/rustfs/discussions">讨论</a >
-</p >
+  <a href="https://docs.rustfs.com/introduction.html">快速开始</a>
+  · <a href="https://docs.rustfs.com/">文档</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">报告 Bug</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">社区讨论</a>
+</p>
 
 <p align="center">
-<a href="https://github.com/rustfs/rustfs/blob/main/README.md">English</a > | 简体中文
-</p >
+  <a href="https://github.com/rustfs/rustfs/blob/main/README.md">English</a> | 简体中文 |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=de">Deutsch</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=es">Español</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=fr">français</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=ja">日本語</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=ko">한국어</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=pt">Portuguese</a> |
+  <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
+</p>
 
-RustFS 是一个使用 Rust（全球最受欢迎的编程语言之一）构建的高性能分布式对象存储软件。与 MinIO 一样，它具有简单性、S3
-兼容性、开源特性以及对数据湖、AI 和大数据的支持等一系列优势。此外，与其他存储系统相比，它采用 Apache
-许可证构建，拥有更好、更用户友好的开源许可证。由于以 Rust 为基础，RustFS 为高性能对象存储提供了更快的速度和更安全的分布式功能。
+RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust 是全球最受开发者喜爱的编程语言之一，RustFS 完美结合了 MinIO 的简洁性与 Rust 的内存安全及高性能优势。它提供完整的 S3 兼容性，完全开源，并专为数据湖、人工智能（AI）和大数据负载进行了优化。
 
-## 特性
+与其他存储系统不同，RustFS 采用更宽松、商业友好的 Apache 2.0 许可证，避免了 AGPL 协议的限制。以 Rust 为基石，RustFS 为下一代对象存储提供了更快的速度和更安全的分布式特性。
 
-- **高性能**：使用 Rust 构建，确保速度和效率。
+## 特征和功能状态
+
+- **高性能**：基于 Rust 构建，确保极致的速度和资源效率。
 - **分布式架构**：可扩展且容错的设计，适用于大规模部署。
-- **S3 兼容性**：与现有 S3 兼容应用程序无缝集成。
-- **数据湖支持**：针对大数据和 AI 工作负载进行了优化。
-- **开源**：采用 Apache 2.0 许可证，鼓励社区贡献和透明度。
-- **用户友好**：设计简单，易于部署和管理。
+- **S3 兼容性**：与现有的 S3 兼容应用和工具无缝集成。
+- **数据湖支持**：专为高吞吐量的大数据和 AI 工作负载优化。
+- **完全开源**：采用 Apache 2.0 许可证，鼓励社区贡献和商业使用。
+- **简单易用**：设计简洁，易于部署和管理。
 
-## RustFS vs MinIO
 
-压力测试服务器参数
+| 功能 | 状态 |   功能 | 状态 | 
+| :--- | :--- | :--- | :--- |
+| **S3 核心功能** | ✅ 可用 |    **Bitrot (防数据腐烂)** | ✅ 可用 |
+| **上传 / 下载** | ✅ 可用 |     **单机模式** | ✅ 可用 |
+| **版本控制** | ✅ 可用 | **存储桶复制** | ⚠️ 部分可用 |
+| **日志功能** | ✅ 可用 |  **生命周期管理** | 🚧 测试中 |
+| **事件通知** | ✅ 可用 |  **分布式模式** | 🚧 测试中 |
+| **K8s Helm Chart** | ✅ 可用 |  **OPA (策略引擎)** | 🚧 测试中 |
 
-| 类型  | 参数       | 备注                                                       |
-|-----|----------|----------------------------------------------------------|
-| CPU | 2 核心     | Intel Xeon(Sapphire Rapids) Platinum 8475B , 2.7/3.2 GHz |   |
-| 内存  | 4GB      |                                                          |
-| 网络  | 15Gbp    |                                                          |
-| 驱动器 | 40GB x 4 | IOPS 3800 / 驱动器                                          |
+
+
+
+## RustFS vs MinIO 性能对比
+
+**压力测试环境参数：**
+
+| 类型    | 参数 | 备注                                                   |
+|---------|-----------|----------------------------------------------------------|
+| CPU     | 2 核    | Intel Xeon (Sapphire Rapids) Platinum 8475B , 2.7/3.2 GHz |
+| 内存  | 4GB       |                                                          |
+| 网络 | 15Gbps     |                                                          |
+| 硬盘  | 40GB x 4  | IOPS 3800 / Drive                                       |
 
 <https://github.com/user-attachments/assets/2e4979b5-260c-4f2c-ac12-c87fd558072a>
 
 ### RustFS vs 其他对象存储
 
-| RustFS                   | 其他对象存储                              |
-|--------------------------|-------------------------------------|
-| 强大的控制台                   | 简单且无用的控制台                           |
-| 基于 Rust 语言开发，内存更安全       | 使用 Go 或 C 开发，存在内存 GC/泄漏等潜在问题        |
-| 不向第三方国家报告日志              | 向其他第三方国家报告日志可能违反国家安全法律              |
-| 采用 Apache 许可证，对商业更友好     | AGPL V3 许可证等其他许可证，污染开源和许可证陷阱，侵犯知识产权 |
-| 全面的 S3 支持，适用于国内外云提供商     | 完全支持 S3，但不支持本地云厂商                   |
-| 基于 Rust 开发，对安全和创新设备有强大支持 | 对边缘网关和安全创新设备支持较差                    |
-| 稳定的商业价格，免费社区支持           | 高昂的定价，1PiB 成本高达 $250,000            |
-| 无风险                      | 知识产权风险和禁止使用的风险                      |
+| 特性 | RustFS | 其他对象存储 |
+| :--- | :--- | :--- |
+| **控制台体验** | **功能强大的控制台**<br>提供全面的管理界面。 | **基础/简陋的控制台**<br>通常功能过于简单或缺失关键特性。 |
+| **语言与安全** | **基于 Rust 开发**<br>天生的内存安全。 | **基于 Go 或 C 开发**<br>存在内存 GC 停顿或内存泄漏的潜在风险。 |
+| **数据主权** | **无遥测 / 完全合规**<br>防止未经授权的数据跨境传输。完全符合 GDPR (欧盟/英国)、CCPA (美国) 和 APPI (日本) 等法规。 | **潜在风险**<br>可能存在法律风险和隐蔽的数据遥测（Telemetry）。 |
+| **开源协议** | **宽松的 Apache 2.0**<br>商业友好，无“毒丸”条款。 | **受限的 AGPL v3**<br>存在许可证陷阱和知识产权污染的风险。 |
+| **兼容性** | **100% S3 兼容**<br>适用于任何云提供商和客户端，随处运行。 | **兼容性不一**<br>虽然支持 S3，但可能缺乏对本地云厂商或特定 API 的支持。 |
+| **边缘与 IoT** | **强大的边缘支持**<br>非常适合安全、创新的边缘设备。 | **边缘支持较弱**<br>对于边缘网关来说通常过于沉重。 |
+| **成本** | **稳定且免费**<br>免费社区支持，稳定的商业定价。 | **高昂成本**<br>1PiB 的成本可能高达 250,000 美元。 |
+| **风险控制** | **企业级风险规避**<br>清晰的知识产权，商业使用安全无忧。 | **法律风险**<br>知识产权归属模糊及使用限制风险。 |
 
 ## 快速开始
 
-要开始使用 RustFS，请按照以下步骤操作：
+请按照以下步骤快速上手 RustFS：
 
-1. **一键脚本快速启动 (方案一)**
-
-   ```bash
-   curl -O  https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
-   ```
-
-2. **Docker 快速启动（方案二）**
+### 1. 一键安装脚本 (选项 1)
 
   ```bash
-   docker run -d -p 9000:9000  -v /data:/data rustfs/rustfs
-   ```
+  curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
+````
 
-对于使用 Docker 安装来讲，你还可以使用 `docker compose` 来启动 rustfs 实例。在仓库的根目录下面有一个 `docker-compose.yml`
-文件。运行如下命令即可：
+### 2\. Docker 快速启动 (选项 2)
 
-  ```
-  docker compose --profile observability up -d
-  ```
+RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 Docker 的 `-v` 参数挂载宿主机目录，请务必确保宿主机目录的所有者已更改为 `1000`，否则会遇到权限拒绝错误。
 
-**注意**：在使用 `docker compose` 之前，你应该仔细阅读一下 `docker-compose.yaml`，因为该文件中包含多个服务，除了 rustfs
-以外，还有 grafana、prometheus、jaeger 等，这些是为 rustfs 可观测性服务的，还有 redis 和 nginx。你想启动哪些容器，就需要用
-`--profile` 参数指定相应的 profile。
+```bash
+ # 创建数据和日志目录
+ mkdir -p data logs
 
-3. **从源码构建（方案三）- 高级用户**
+ # 更改这两个目录的所有者
+ chown -R 10001:10001 data logs
 
-   面向希望从源码构建支持多架构 Docker 镜像的开发者：
+ # 使用最新版本运行
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
-   ```bash
-   # 本地构建多架构镜像
-   ./docker-buildx.sh --build-arg RELEASE=latest
+ # 使用指定版本运行
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+```
 
-   # 构建并推送至镜像仓库
-   ./docker-buildx.sh --push
+您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
 
-   # 构建指定版本
-   ./docker-buildx.sh --release v1.0.0 --push
+```bash
+docker compose --profile observability up -d
+```
 
-   # 构建并推送到自定义镜像仓库
-   ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
-   ```
+**注意**: 我们建议您在运行前查看 `docker-compose.yaml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
 
-   `docker-buildx.sh` 脚本支持：
-    - **多架构构建**：`linux/amd64`、`linux/arm64`
-    - **自动版本检测**：可使用 git 标签或提交哈希
-    - **仓库灵活性**：支持 Docker Hub、GitHub Container Registry 等
-    - **构建优化**：包含缓存和并行构建
+### 3\. 源码编译 (选项 3) - 进阶用户
 
-   你也可以使用 Makefile 提供的目标命令以提升便捷性：
+适用于希望从源码构建支持多架构 RustFS Docker 镜像的开发者：
 
-  ```bash
-  make docker-buildx                    # 本地构建
-  make docker-buildx-push               # 构建并推送
-  make docker-buildx-version VERSION=v1.0.0  # 构建指定版本
-  make help-docker                      # 显示全部 Docker 相关命令
-  ```
+```bash
+# 在本地构建多架构镜像
+./docker-buildx.sh --build-arg RELEASE=latest
 
-   > **提示（macOS 交叉编译）**：macOS 默认的 `ulimit -n` 只有 256，使用 `cargo zigbuild` 或 `./build-rustfs.sh --platform ...` 编译 Linux 目标时容易触发 `ProcessFdQuotaExceeded` 链接错误。脚本会尝试自动提升该限制，如仍提示失败，请在构建前手动执行 `ulimit -n 4096`（或更大的值）。
+# 构建并推送到仓库
+./docker-buildx.sh --push
 
-4. **使用 Helm Chart 部署（方案四）- 云原生环境**
+# 构建指定版本
+./docker-buildx.sh --release v1.0.0 --push
 
-   按照 [helm chart 说明文档](./helm/README.md) 的指引，在 Kubernetes 集群中安装 RustFS。
+# 构建并推送到自定义仓库
+./docker-buildx.sh --registry your-registry.com --namespace yourname --push
+```
 
-5. **访问控制台**：打开 Web 浏览器并导航到 `http://localhost:9000` 以访问 RustFS 控制台，默认的用户名和密码是
-   `rustfsadmin` 。
-6. **创建存储桶**：使用控制台为您的对象创建新的存储桶。
-7. **上传对象**：您可以直接通过控制台上传文件，或使用 S3 兼容的 API 与您的 RustFS 实例交互。
+`docker-buildx.sh` 脚本支持：
+\- **多架构构建**: `linux/amd64`, `linux/arm64`
+\- **自动版本检测**: 使用 git tags 或 commit hash
+\- **灵活的仓库支持**: 支持 Docker Hub, GitHub Container Registry 等
+\- **构建优化**: 包含缓存和并行构建
 
-**注意**：如果你想通过 `https` 来访问 RustFS 实例，请参考 [TLS 配置文档](https://docs.rustfs.com/zh/integration/tls-configured.html)
+为了方便起见，您也可以使用 Make 命令：
+
+```bash
+make docker-buildx                    # 本地构建
+make docker-buildx-push               # 构建并推送
+make docker-buildx-version VERSION=v1.0.0  # 构建指定版本
+make help-docker                      # 显示所有 Docker 相关命令
+```
+
+> **注意 (macOS 交叉编译)**: macOS 默认的 `ulimit -n` 限制为 256，因此在使用 `cargo zigbuild` 或 `./build-rustfs.sh --platform ...` 交叉编译 Linux 版本时，可能会因 `ProcessFdQuotaExceeded` 失败。构建脚本会尝试自动提高限制，但如果您仍然看到警告，请在构建前在终端运行 `ulimit -n 4096` (或更高)。
+
+### 4\. 使用 Helm Chart 安装 (选项 4) - 云原生环境
+
+请按照 [Helm Chart README](https://www.google.com/search?q=./helm/README.md) 上的说明在 Kubernetes 集群上安装 RustFS。
+
+-----
+
+### 访问 RustFS
+
+5.  **访问控制台**: 打开浏览器并访问 `http://localhost:9000` 进入 RustFS 控制台。
+      * 默认账号/密码: `rustfsadmin` / `rustfsadmin`
+6.  **创建存储桶**: 使用控制台为您​​的对象创建一个新的存储桶 (Bucket)。
+7.  **上传对象**: 您可以直接通过控制台上传文件，或使用 S3 兼容的 API/客户端与您的 RustFS 实例进行交互。
+
+**注意**: 如果您希望通过 `https` 访问 RustFS 实例，请参考 [TLS 配置文档](https://docs.rustfs.com/integration/tls-configured.html)。
 
 ## 文档
 
-有关详细文档，包括配置选项、API 参考和高级用法，请访问我们的[文档](https://docs.rustfs.com)。
+有关详细文档，包括配置选项、API 参考和高级用法，请访问我们的 [官方文档](https://docs.rustfs.com)。
 
 ## 获取帮助
 
-如果您有任何问题或需要帮助，您可以：
+如果您有任何问题或需要帮助：
 
-- 查看[常见问题解答](https://github.com/rustfs/rustfs/discussions/categories/q-a)以获取常见问题和解决方案。
-- 加入我们的 [GitHub 讨论](https://github.com/rustfs/rustfs/discussions)来提问和分享您的经验。
-- 在我们的 [GitHub Issues](https://github.com/rustfs/rustfs/issues) 页面上开启问题，报告错误或功能请求。
+  - 查看 [FAQ](https://github.com/rustfs/rustfs/discussions/categories/q-a) 寻找常见问题和解决方案。
+  - 加入我们的 [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) 提问并分享您的经验。
+  - 在我们的 [GitHub Issues](https://github.com/rustfs/rustfs/issues) 页面提交 Bug 报告或功能请求。
 
 ## 链接
 
-- [文档](https://docs.rustfs.com) - 您应该阅读的手册
-- [更新日志](https://docs.rustfs.com/changelog) - 我们破坏和修复的内容
-- [GitHub 讨论](https://github.com/rustfs/rustfs/discussions) - 社区所在地
+  - [官方文档](https://docs.rustfs.com) - 必读手册
+  - [更新日志](https://github.com/rustfs/rustfs/releases) - 版本变更记录
+  - [社区讨论](https://github.com/rustfs/rustfs/discussions) - 社区交流地
 
-## 联系
+## 联系方式
 
-- **错误报告**：[GitHub Issues](https://github.com/rustfs/rustfs/issues)
-- **商务合作**：<hello@rustfs.com>
-- **招聘**：<jobs@rustfs.com>
-- **一般讨论**：[GitHub 讨论](https://github.com/rustfs/rustfs/discussions)
-- **贡献**：[CONTRIBUTING.md](CONTRIBUTING.md)
+  - **Bug 反馈**: [GitHub Issues](https://github.com/rustfs/rustfs/issues)
+  - **商务合作**: [hello@rustfs.com](mailto:hello@rustfs.com)
+  - **工作机会**: [jobs@rustfs.com](mailto:jobs@rustfs.com)
+  - **一般讨论**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
+  - **贡献指南**: [CONTRIBUTING.md](https://www.google.com/search?q=CONTRIBUTING.md)
 
 ## 贡献者
 
-RustFS 是一个社区驱动的项目，我们感谢所有的贡献。查看[贡献者](https://github.com/rustfs/rustfs/graphs/contributors)页面，了解帮助
-RustFS 变得更好的杰出人员。
+RustFS 是一个社区驱动的项目，我们感谢所有的贡献。请查看 [贡献者](https://github.com/rustfs/rustfs/graphs/contributors) 页面，看看那些让 RustFS 变得更好的了不起的人们。
 
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
-  <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="贡献者"/>
-</a >
+<img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
+</a>
 
-## Github 全球推荐榜
+## Github Trending Top
 
-🚀 RustFS 受到了全世界开源爱好者和企业用户的喜欢，多次登顶 Github Trending 全球榜。
+🚀 RustFS 深受全球开源爱好者和企业用户的喜爱，经常荣登 GitHub Trending 榜单。
 
 <a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
-## Star 历史图
+## Star 历史
 
-[![Star 历史图](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+
 
 ## 许可证
 
 [Apache 2.0](https://opensource.org/licenses/Apache-2.0)
 
 **RustFS** 是 RustFS, Inc. 的商标。所有其他商标均为其各自所有者的财产。
+
