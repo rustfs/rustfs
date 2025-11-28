@@ -51,15 +51,15 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # Observability related configuration
-export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
 # RustFS OR OTEL exporter configuration
-#export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318/v1/metrics # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
-#export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+#export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318/v1/traces # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
+#export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:14318/v1/traces
 #export RUSTFS_OBS_METRIC_ENDPOINT=http://localhost:9090/api/v1/otlp/v1/metrics # OpenTelemetry Collector metric address
 #export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://localhost:9090/api/v1/otlp/v1/metrics
 #export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp/v1/logs # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
 #export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
-export RUSTFS_OBS_USE_STDOUT=true # Whether to use standard output
+#export RUSTFS_OBS_USE_STDOUT=true # Whether to use standard output
 #export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
