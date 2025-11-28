@@ -1251,9 +1251,14 @@ impl ConcurrencyManager {
         let cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
 
+        let max_disk_reads = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
+            rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+        );
+
         Self {
             cache: Arc::new(HotObjectCache::new()),
-            disk_read_semaphore: Arc::new(Semaphore::new(64)),
+            disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
             cache_enabled,
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
         }

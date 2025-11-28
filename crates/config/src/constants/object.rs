@@ -86,9 +86,18 @@ pub const ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD: &str = "RUSTFS_OBJECT_HIGH_CONC
 /// - Note: Tune this value based on target workload and hardware.
 pub const ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: &str = "RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD";
 
+/// Environment variable name for maximum concurrent disk reads for object operations.
+/// - Purpose: Limit the number of concurrent disk read operations for object reads to prevent I/O saturation.
+/// - Unit: request count (usize).
+/// - Semantics: Throttling disk reads helps maintain overall system responsiveness under load.
+/// - Example: `export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=16`
+/// - Note: This setting may interact with OS-level I/O scheduling and should be tuned based on hardware capabilities.
+pub const ENV_OBJECT_MAX_CONCURRENT_DISK_READS: &str = "RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS";
+
 /// Default: object caching is disabled.
 ///
 /// - Semantics: Safe default to avoid unexpected memory usage or cache consistency concerns when not explicitly enabled.
+/// - Default is set to false (disabled).
 pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = false;
 
 /// Default object cache capacity in MB.
@@ -108,19 +117,37 @@ pub const DEFAULT_OBJECT_CACHE_MAX_OBJECT_SIZE_MB: usize = 10;
 /// When concurrent requests exceed this threshold (>8), the system switches to
 /// aggressive memory optimization mode, reducing buffer sizes to 40% of base size
 /// to prevent memory exhaustion and ensure fair resource allocation.
+///
+/// This helps maintain system stability under high load conditions.
+/// Default is set to 8 concurrent requests.
 pub const DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD: usize = 8;
 
 /// Medium concurrency threshold for buffer size adjustment.
 ///
 /// At this level (3-4 requests), buffers are reduced to 75% of base size to
 /// balance throughput and memory efficiency as load increases.
+///
+/// This helps maintain performance without overly aggressive memory reduction.
+///
+/// Default is set to 4 concurrent requests.
 pub const DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: usize = 4;
+
+/// Maximum concurrent disk reads for object operations.
+/// Limits the number of simultaneous disk read operations to prevent I/O saturation.
+///
+/// A higher value may improve throughput on high-performance storage,
+/// but could also lead to increased latency if the disk becomes overloaded.
+///
+/// Default is set to 64 concurrent reads.
+pub const DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS: usize = 64;
 
 /// Time-to-live for cached objects (5 minutes = 300 seconds).
 ///
 /// After this duration, cached objects are automatically expired by Moka's
 /// background cleanup process, even if they haven't been accessed. This prevents
 /// stale data from consuming cache capacity indefinitely.
+///
+/// Default is set to 300 seconds.
 pub const DEFAULT_OBJECT_CACHE_TTL_SECS: u64 = 300;
 
 /// Time-to-idle for cached objects (2 minutes = 120 seconds).
@@ -128,6 +155,8 @@ pub const DEFAULT_OBJECT_CACHE_TTL_SECS: u64 = 300;
 /// Objects that haven't been accessed for this duration are automatically evicted,
 /// even if their TTL hasn't expired. This ensures cache is populated with actively
 /// used objects and clears out one-time reads efficiently.
+///
+/// Default is set to 120 seconds.
 pub const DEFAULT_OBJECT_CACHE_TTI_SECS: u64 = 120;
 
 /// Minimum hit count to extend object lifetime beyond TTL.
@@ -135,4 +164,6 @@ pub const DEFAULT_OBJECT_CACHE_TTI_SECS: u64 = 120;
 /// "Hot" objects that have been accessed at least this many times are treated
 /// specially - they can survive longer in cache even as they approach TTL expiration.
 /// This prevents frequently accessed objects from being evicted prematurely.
+///
+/// Default is set to 5 hits.
 pub const DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND: usize = 5;
