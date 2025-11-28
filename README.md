@@ -41,20 +41,14 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 - **Open Source**: Licensed under Apache 2.0, encouraging unrestricted community contributions and commercial usage.
 - **User-Friendly**: Designed with simplicity in mind for easy deployment and management.
 
-| Feature | Status |
-| :--- | :--- |
-| **S3 Core Features** | ✅ Available |
-| **Upload / Download** | ✅ Available |
-| **Versioning** | ✅ Available |
-| **Logging** | ✅ Available |
-| **Event Notifications** | ✅ Available |
-| **K8s Helm Charts** | ✅ Available |
-| **Bitrot Protection** | ✅ Available |
-| **Single Node Mode** | ✅ Available |
-| **Bucket Replication** | ⚠️ Partial Support |
-| **Lifecycle Management** | 🚧 Under Testing |
-| **Distributed Mode** | 🚧 Under Testing |
-| **OPA (Open Policy Agent)** | 🚧 Under Testing |
+| Feature | Status | Feature | Status |
+| :--- | :--- | :--- | :--- |
+| **S3 Core Features** | ✅ Available | **Bitrot Protection** | ✅ Available |
+| **Upload / Download** | ✅ Available | **Single Node Mode** | ✅ Available |
+| **Versioning** | ✅ Available |  **Bucket Replication** | ⚠️ Partial Support |
+| **Logging** | ✅ Available |  **Lifecycle Management** | 🚧 Under Testing |
+| **Event Notifications** | ✅ Available |  **Distributed Mode** | 🚧 Under Testing |
+| **K8s Helm Charts** | ✅ Available |  **OPA (Open Policy Agent)** | 🚧 Under Testing |
 
 
 
