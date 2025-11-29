@@ -418,7 +418,10 @@ fn setup_console_middleware_stack(
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)
         // Add timeout layer - convert auth_timeout from seconds to Duration
-        .layer(TimeoutLayer::new(Duration::from_secs(auth_timeout)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(auth_timeout),
+        ))
         // Add request body limit (10MB for console uploads)
         .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 

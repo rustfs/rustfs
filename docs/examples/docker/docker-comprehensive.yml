@@ -25,7 +25,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"]
+      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -48,7 +48,7 @@ services:
       - RUSTFS_ACCESS_KEY=dev-admin
       - RUSTFS_SECRET_KEY=dev-password
       - RUST_LOG=debug
-      - RUSTFS_LOG_LEVEL=debug
+      - RUSTFS_OBS_LOGGER_LEVEL=debug
     volumes:
       - rustfs-dev-data:/data
       - rustfs-dev-logs:/logs
@@ -56,7 +56,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"]
+      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -92,7 +92,7 @@ services:
       - rustfs_secret_key
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"]
+      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -127,7 +127,7 @@ services:
       - rustfs_enterprise_secret_key
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -k -f https://localhost:9001/health"]
+      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -k -f https://localhost:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -152,7 +152,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3

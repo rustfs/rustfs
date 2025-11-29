@@ -106,7 +106,7 @@ futures-util = "0.3.31"
 hyper = { version = "1.8.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
 hyper-util = { version = "0.1.18", features = ["tokio", "server-auto", "server-graceful"] }
-http = "1.3.1"
+http = "1.4.0"
 http-body = "1.0.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
 socket2 = "0.6.1"
@@ -119,17 +119,17 @@ tonic = { version = "0.14.2", features = ["gzip"] }
 tonic-prost = { version = "0.14.2" }
 tonic-prost-build = { version = "0.14.2" }
 tower = { version = "0.5.2", features = ["timeout"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.6.7", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.0", features = ["serde"] }
-bytesize = "2.3.0"
+bytesize = "2.3.1"
 byteorder = "1.5.0"
 flatbuffers = "25.9.23"
 form_urlencoded = "1.2.2"
 prost = "0.14.1"
 quick-xml = "0.38.4"
-rmcp = { version = "0.9.0" }
+rmcp = { version = "0.9.1" }
 rmp = { version = "0.8.14" }
 rmp-serde = { version = "1.3.0" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -149,7 +149,7 @@ pbkdf2 = "0.13.0-rc.2"
 rsa = { version = "0.10.0-rc.10" }
 rustls = { version = "0.23.35", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pemfile = "2.2.0"
-rustls-pki-types = "1.13.0"
+rustls-pki-types = "1.13.1"
 sha1 = "0.11.0-rc.3"
 sha2 = "0.11.0-rc.3"
 zeroize = { version = "1.8.2", features = ["derive"] }
@@ -200,7 +200,6 @@ lz4 = "1.28.1"
 matchit = "0.9.0"
 md-5 = "0.11.0-rc.3"
 md5 = "0.8.0"
-metrics = "0.24.2"
 mime_guess = "2.0.5"
 moka = { version = "0.12.11", features = ["future"] }
 netif = "0.1.6"
@@ -237,11 +236,11 @@ temp-env = "0.3.6"
 tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.17"
-tracing = { version = "0.1.41" }
-tracing-appender = "0.2.3"
+tracing = { version = "0.1.43" }
+tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.32.0"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.7"
 urlencoding = "2.1.3"
@@ -255,9 +254,10 @@ zip = "6.0.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
+metrics = "0.24.3"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["http-proto", "zstd-http"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["gzip-http", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
