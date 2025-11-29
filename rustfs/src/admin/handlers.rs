@@ -115,7 +115,7 @@ impl Operation for HealthCheckHandler {
             let mut headers = HeaderMap::new();
             headers.insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
             return Ok(S3Response::with_headers(
-                (StatusCode::METHOD_NOT_ALLOWED, Body::from("Method Not Allowed")),
+                (StatusCode::METHOD_NOT_ALLOWED, Body::from("Method Not Allowed".to_string())),
                 headers,
             ));
         }

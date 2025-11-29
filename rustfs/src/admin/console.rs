@@ -15,7 +15,7 @@
 use crate::config::build;
 use crate::license::get_license;
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::Request,
     middleware,
@@ -438,7 +438,7 @@ fn setup_console_middleware_stack(
 
 /// Console health check handler with comprehensive health information
 async fn health_check(method: Method) -> Response {
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json");
     match method {
