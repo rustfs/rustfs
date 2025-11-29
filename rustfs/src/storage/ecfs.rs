@@ -1717,7 +1717,7 @@ impl S3 for FS {
 
                 // Parse last_modified from RFC3339 string if available
                 let last_modified = cached.last_modified.as_ref().and_then(|s| {
-                    match time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339) {
+                    match OffsetDateTime::parse(s, &Rfc3339) {
                         Ok(dt) => Some(Timestamp::from(dt)),
                         Err(e) => {
                             warn!("Failed to parse cached last_modified '{}': {}", s, e);
