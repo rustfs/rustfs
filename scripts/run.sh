@@ -116,11 +116,11 @@ export RUSTFS_ENABLE_SCANNER=false
 
 export RUSTFS_ENABLE_HEAL=false
 
-# Object cache configuration (Experimental feature)
+# Object cache configuration
 export RUSTFS_OBJECT_CACHE_ENABLE=true
 
-# Event message configuration
-#export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
+# Profiling configuration
+export RUSTFS_ENABLE_PROFILING=false
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
