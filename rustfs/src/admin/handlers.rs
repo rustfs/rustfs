@@ -20,7 +20,7 @@ use crate::auth::get_session_token;
 use crate::error::ApiError;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use http::{HeaderMap, Uri};
+use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
@@ -103,8 +103,22 @@ pub struct HealthCheckHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealthCheckHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         use serde_json::json;
+
+        // Extract the original HTTP Method (encapsulated by s3s into S3Request)
+        let method = req.method;
+
+        // Only GET and HEAD are allowed
+        if method != http::Method::GET && method != http::Method::HEAD {
+            // 405 Method Not Allowed
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+            return Ok(S3Response::with_headers(
+                (StatusCode::METHOD_NOT_ALLOWED, Body::from("Method Not Allowed".to_string())),
+                headers,
+            ));
+        }
 
         let health_info = json!({
             "status": "ok",
@@ -113,10 +127,19 @@ impl Operation for HealthCheckHandler {
             "version": env!("CARGO_PKG_VERSION")
         });
 
-        let body = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
-        let response_body = Body::from(body);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::new((StatusCode::OK, response_body)))
+        if method == http::Method::HEAD {
+            // HEAD: only returns the header and status code, not the body
+            return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), headers));
+        }
+
+        // GET: Return JSON body normally
+        let body_str = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
+        let body = Body::from(body_str);
+
+        Ok(S3Response::with_headers((StatusCode::OK, body), headers))
     }
 }
 
