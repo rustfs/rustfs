@@ -10,9 +10,9 @@ data:
   RUSTFS_OBS_LOGGER_LEVEL: {{ .Values.config.rustfs.log_level | quote }}
   {{- if .Values.mode.distributed.enabled }}
   {{- if eq (int .Values.replicaCount) 4 }}
-  RUSTFS_VOLUMES: "http://rustfs-{0...3}.rustfs-headless.rustfs.svc.cluster.local:9000/data/rustfs{0...3}"
+  RUSTFS_VOLUMES: "http://{{ include "rustfs.fullname" . }}-{0...3}.{{ include "rustfs.fullname" . }}-headless:9000/data/rustfs{0...3}"
   {{- else if eq (int .Values.replicaCount) 16 }}
-  RUSTFS_VOLUMES: "http://rustfs-{0...15}.rustfs-headless.rustfs.svc.cluster.local:9000/data"
+  RUSTFS_VOLUMES: "http://{{ include "rustfs.fullname" . }}-{0...15}.{{ include "rustfs.fullname" . }}-headless:9000/data"
   {{- end }}
   {{- else }}
   RUSTFS_VOLUMES: "/data"
