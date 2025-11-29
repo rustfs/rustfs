@@ -1716,15 +1716,16 @@ impl S3 for FS {
                 let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
 
                 // Parse last_modified from RFC3339 string if available
-                let last_modified = cached.last_modified.as_ref().and_then(|s| {
-                    match OffsetDateTime::parse(s, &Rfc3339) {
+                let last_modified = cached
+                    .last_modified
+                    .as_ref()
+                    .and_then(|s| match OffsetDateTime::parse(s, &Rfc3339) {
                         Ok(dt) => Some(Timestamp::from(dt)),
                         Err(e) => {
                             warn!("Failed to parse cached last_modified '{}': {}", s, e);
                             None
                         }
-                    }
-                });
+                    });
 
                 // Parse content_type
                 let content_type = cached.content_type.as_ref().and_then(|ct| ContentType::from_str(ct).ok());
@@ -1758,9 +1759,10 @@ impl S3 for FS {
                     bucket: bucket.clone(),
                     name: key.clone(),
                     storage_class: cached.storage_class.clone(),
-                    mod_time: cached.last_modified.as_ref().and_then(|s| {
-                        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
-                    }),
+                    mod_time: cached
+                        .last_modified
+                        .as_ref()
+                        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()),
                     size: cached.content_length,
                     actual_size: cached.content_length,
                     is_dir: false,
