@@ -1751,7 +1751,33 @@ impl S3 for FS {
                     ..Default::default()
                 };
 
-                // CRITICAL: Call helper.complete() for cache hits to ensure
+                // CRITICAL: Build ObjectInfo for event notification before calling complete().
+                // This ensures S3 bucket notifications (s3:GetObject events) include proper
+                // object metadata for event-driven workflows (Lambda, SNS, SQS).
+                let event_info = ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: key.clone(),
+                    storage_class: cached.storage_class.clone(),
+                    mod_time: cached.last_modified.as_ref().and_then(|s| {
+                        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+                    }),
+                    size: cached.content_length,
+                    actual_size: cached.content_length,
+                    is_dir: false,
+                    user_defined: cached.user_metadata.clone(),
+                    version_id: cached.version_id.as_ref().and_then(|v| uuid::Uuid::parse_str(v).ok()),
+                    delete_marker: cached.delete_marker,
+                    content_type: cached.content_type.clone(),
+                    content_encoding: cached.content_encoding.clone(),
+                    etag: cached.e_tag.clone(),
+                    ..Default::default()
+                };
+
+                // Set object info and version_id on helper for proper event notification
+                let version_id_str = req.input.version_id.clone().unwrap_or_default();
+                helper = helper.object(event_info).version_id(version_id_str);
+
+                // Call helper.complete() for cache hits to ensure
                 // S3 bucket notifications (s3:GetObject events) are triggered.
                 // This ensures event-driven workflows (Lambda, SNS) work correctly
                 // for both cache hits and misses.

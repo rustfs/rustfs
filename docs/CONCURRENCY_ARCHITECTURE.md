@@ -289,16 +289,40 @@ When serving from cache, the current implementation returns early WITHOUT callin
 
 ### Solution
 
-The cache hit path MUST call `helper.complete(&result)` before returning:
+The cache hit path MUST properly configure the helper with object info and version_id, then call `helper.complete(&result)` before returning:
 
 ```rust
 if manager.is_cache_enabled() && part_number.is_none() && range.is_none() {
     if let Some(cached) = manager.get_cached_object(&cache_key).await {
-        // ... build response ...
+        // ... build response output ...
+        
+        // CRITICAL: Build ObjectInfo for event notification
+        let event_info = ObjectInfo {
+            bucket: bucket.clone(),
+            name: key.clone(),
+            storage_class: cached.storage_class.clone(),
+            mod_time: cached.last_modified.as_ref().and_then(|s| {
+                time::OffsetDateTime::parse(s, &Rfc3339).ok()
+            }),
+            size: cached.content_length,
+            actual_size: cached.content_length,
+            is_dir: false,
+            user_defined: cached.user_metadata.clone(),
+            version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+            delete_marker: cached.delete_marker,
+            content_type: cached.content_type.clone(),
+            content_encoding: cached.content_encoding.clone(),
+            etag: cached.e_tag.clone(),
+            ..Default::default()
+        };
+
+        // Set object info and version_id on helper for proper event notification
+        let version_id_str = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(event_info).version_id(version_id_str);
         
         let result = Ok(S3Response::new(output));
         
-        // CRITICAL: Trigger S3 bucket notification event
+        // Trigger S3 bucket notification event
         let _ = helper.complete(&result);
         
         return result;
@@ -306,36 +330,30 @@ if manager.is_cache_enabled() && part_number.is_none() && range.is_none() {
 }
 ```
 
-### Considerations
+### Key Points for Proper Event Notification
 
-1. **helper.object()**: For cache hits, we may not have `ObjectInfo` from storage. Options:
-   - Call `helper.complete()` with minimal info (e_tag, size from cache)
-   - Skip `.object()` call since we have cached metadata
-   
-2. **Performance**: `helper.complete()` may involve async I/O (SQS, SNS). Consider:
+1. **ObjectInfo Construction**: The `event_info` must be built from cached metadata to provide:
+   - `bucket` and `name` (key) for object identification
+   - `size` and `actual_size` for event payload
+   - `etag` for integrity verification
+   - `version_id` for versioned object access
+   - `storage_class`, `content_type`, and other metadata
+
+2. **helper.object(event_info)**: Sets the object information for the notification event. This ensures:
+   - Lambda triggers receive proper object metadata
+   - SNS/SQS notifications include complete information
+   - Audit logs contain accurate object details
+
+3. **helper.version_id(version_id_str)**: Sets the version ID for versioned bucket access:
+   - Enables version-specific event routing
+   - Supports versioned object lifecycle policies
+   - Provides complete audit trail for versioned access
+
+4. **Performance**: The `helper.complete()` call may involve async I/O (SQS, SNS). Consider:
    - Fire-and-forget with `tokio::spawn()` for minimal latency impact
    - Accept slight latency increase for correctness
 
-3. **Metrics Alignment**: Ensure cache hit metrics don't double-count
-
-### Recommended Implementation
-
-```rust
-if let Some(cached) = manager.get_cached_object(&cache_key).await {
-    // ... build output ...
-    
-    // Prepare helper with cached metadata (optional, depends on notification needs)
-    // Note: We skip helper.object() as we don't have full ObjectInfo from cache
-    // The e_tag and size are available in cached object
-    
-    let result = Ok(S3Response::new(output));
-    
-    // Trigger S3 bucket notification event for cache hits
-    // This ensures event-driven workflows see all object access
-    let _ = helper.complete(&result);
-    
-    return result;
-}
+5. **Metrics Alignment**: Ensure cache hit metrics don't double-count
 ```
 
 ---
