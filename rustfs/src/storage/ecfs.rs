@@ -1751,7 +1751,13 @@ impl S3 for FS {
                     ..Default::default()
                 };
 
-                return Ok(S3Response::new(output));
+                // CRITICAL: Call helper.complete() for cache hits to ensure
+                // S3 bucket notifications (s3:GetObject events) are triggered.
+                // This ensures event-driven workflows (Lambda, SNS) work correctly
+                // for both cache hits and misses.
+                let result = Ok(S3Response::new(output));
+                let _ = helper.complete(&result);
+                return result;
             }
         }
 
