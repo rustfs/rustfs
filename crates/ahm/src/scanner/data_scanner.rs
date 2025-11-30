@@ -600,6 +600,7 @@ impl Scanner {
 
         // Initialize and start the node scanner
         self.node_scanner.initialize_stats().await?;
+        // update object count and size for each bucket
         self.node_scanner.start().await?;
 
         // Set local stats in aggregator
@@ -611,21 +612,6 @@ impl Scanner {
         tokio::spawn(async move {
             if let Err(e) = scanner.legacy_scan_loop().await {
                 error!("Legacy scanner loop failed: {}", e);
-            }
-        });
-
-        // Trigger an immediate data usage collection so that admin APIs have fresh data after startup.
-        let scanner = self.clone_for_background();
-        tokio::spawn(async move {
-            let enable_stats = {
-                let cfg = scanner.config.read().await;
-                cfg.enable_data_usage_stats
-            };
-
-            if enable_stats {
-                if let Err(e) = scanner.collect_and_persist_data_usage().await {
-                    warn!("Initial data usage collection failed: {}", e);
-                }
             }
         });
 

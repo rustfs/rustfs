@@ -139,6 +139,11 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     // if is_dist_erasure().await || is_erasure().await {
     r.insert(
         Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}").as_str(),
+        AdminOperation(&handlers::HealHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
         AdminOperation(&handlers::HealHandler {}),
     )?;
