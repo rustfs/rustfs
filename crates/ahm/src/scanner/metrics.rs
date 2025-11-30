@@ -45,6 +45,14 @@ pub struct ScannerMetrics {
     pub healthy_objects: u64,
     /// Total corrupted objects found
     pub corrupted_objects: u64,
+    /// Replication heal tasks queued
+    pub replication_tasks_queued: u64,
+    /// Objects observed with pending replication
+    pub replication_pending_objects: u64,
+    /// Objects observed with failed replication
+    pub replication_failed_objects: u64,
+    /// Objects with replication pending longer than grace period
+    pub replication_lagging_objects: u64,
     /// Last scan activity time
     pub last_activity: Option<SystemTime>,
     /// Current scan cycle
@@ -86,6 +94,14 @@ pub struct BucketMetrics {
     pub heal_tasks_completed: u64,
     /// Heal tasks failed for this bucket
     pub heal_tasks_failed: u64,
+    /// Objects observed with pending replication status
+    pub replication_pending: u64,
+    /// Objects observed with failed replication status
+    pub replication_failed: u64,
+    /// Objects exceeding replication grace period
+    pub replication_lagging: u64,
+    /// Replication heal tasks queued for this bucket
+    pub replication_tasks_queued: u64,
 }
 
 /// Disk-specific metrics
@@ -127,6 +143,10 @@ pub struct MetricsCollector {
     total_cycles: AtomicU64,
     healthy_objects: AtomicU64,
     corrupted_objects: AtomicU64,
+    replication_tasks_queued: AtomicU64,
+    replication_pending_objects: AtomicU64,
+    replication_failed_objects: AtomicU64,
+    replication_lagging_objects: AtomicU64,
 }
 
 impl MetricsCollector {
@@ -146,6 +166,10 @@ impl MetricsCollector {
             total_cycles: AtomicU64::new(0),
             healthy_objects: AtomicU64::new(0),
             corrupted_objects: AtomicU64::new(0),
+            replication_tasks_queued: AtomicU64::new(0),
+            replication_pending_objects: AtomicU64::new(0),
+            replication_failed_objects: AtomicU64::new(0),
+            replication_lagging_objects: AtomicU64::new(0),
         }
     }
 
@@ -194,6 +218,26 @@ impl MetricsCollector {
         self.heal_tasks_failed.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Increment replication tasks queued
+    pub fn increment_replication_tasks_queued(&self, count: u64) {
+        self.replication_tasks_queued.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment replication pending objects
+    pub fn increment_replication_pending_objects(&self, count: u64) {
+        self.replication_pending_objects.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment replication failed objects
+    pub fn increment_replication_failed_objects(&self, count: u64) {
+        self.replication_failed_objects.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment replication lagging objects
+    pub fn increment_replication_lagging_objects(&self, count: u64) {
+        self.replication_lagging_objects.fetch_add(count, Ordering::Relaxed);
+    }
+
     /// Set current cycle
     pub fn set_current_cycle(&self, cycle: u64) {
         self.current_cycle.store(cycle, Ordering::Relaxed);
@@ -228,6 +272,10 @@ impl MetricsCollector {
             heal_tasks_failed: self.heal_tasks_failed.load(Ordering::Relaxed),
             healthy_objects: self.healthy_objects.load(Ordering::Relaxed),
             corrupted_objects: self.corrupted_objects.load(Ordering::Relaxed),
+            replication_tasks_queued: self.replication_tasks_queued.load(Ordering::Relaxed),
+            replication_pending_objects: self.replication_pending_objects.load(Ordering::Relaxed),
+            replication_failed_objects: self.replication_failed_objects.load(Ordering::Relaxed),
+            replication_lagging_objects: self.replication_lagging_objects.load(Ordering::Relaxed),
             last_activity: Some(SystemTime::now()),
             current_cycle: self.current_cycle.load(Ordering::Relaxed),
             total_cycles: self.total_cycles.load(Ordering::Relaxed),
@@ -255,6 +303,10 @@ impl MetricsCollector {
         self.total_cycles.store(0, Ordering::Relaxed);
         self.healthy_objects.store(0, Ordering::Relaxed);
         self.corrupted_objects.store(0, Ordering::Relaxed);
+        self.replication_tasks_queued.store(0, Ordering::Relaxed);
+        self.replication_pending_objects.store(0, Ordering::Relaxed);
+        self.replication_failed_objects.store(0, Ordering::Relaxed);
+        self.replication_lagging_objects.store(0, Ordering::Relaxed);
 
         info!("Scanner metrics reset");
     }
