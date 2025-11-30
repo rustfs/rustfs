@@ -37,7 +37,7 @@ pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRet
 
     let mut mode_str = meta.get(X_AMZ_OBJECT_LOCK_MODE.as_str().to_lowercase().as_str());
     if mode_str.is_none() {
-        mode_str = Some(&meta[X_AMZ_OBJECT_LOCK_MODE.as_str()]);
+        mode_str = meta.get(X_AMZ_OBJECT_LOCK_MODE.as_str());
     }
     let mode = if let Some(mode_str) = mode_str {
         parse_ret_mode(mode_str.as_str())
@@ -50,7 +50,7 @@ pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRet
 
     let mut till_str = meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_lowercase().as_str());
     if till_str.is_none() {
-        till_str = Some(&meta[X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()]);
+        till_str = meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
     }
     if let Some(till_str) = till_str {
         let t = OffsetDateTime::parse(till_str, &format_description::well_known::Iso8601::DEFAULT);
@@ -67,7 +67,7 @@ pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRet
 pub fn get_object_legalhold_meta(meta: HashMap<String, String>) -> ObjectLockLegalHold {
     let mut hold_str = meta.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_lowercase().as_str());
     if hold_str.is_none() {
-        hold_str = Some(&meta[X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()]);
+        hold_str = meta.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str());
     }
     if let Some(hold_str) = hold_str {
         return ObjectLockLegalHold {

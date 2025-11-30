@@ -7024,6 +7024,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-madmin",
+ "rustfs-utils",
  "s3s",
  "serde",
  "serde_json",

@@ -14,30 +14,31 @@
 
 // IO throttling component is integrated into NodeScanner
 use crate::{
-    Error, HealRequest, Result, get_ahm_services_cancel_token,
+    Error, HealRequest, Result, get_ahm_services_cancel_token, get_heal_manager,
     heal::HealManager,
     scanner::{
         BucketMetrics, DecentralizedStatsAggregator, DecentralizedStatsAggregatorConfig, DiskMetrics, MetricsCollector,
         NodeScanner, NodeScannerConfig, ScannerMetrics,
-        lifecycle::ScannerItem,
+        lifecycle::{ReplicationMetricsHandle, ScannerItem},
         local_scan::{self, LocalObjectRecord, LocalScanOutcome},
     },
 };
-use rustfs_common::data_usage::{DataUsageInfo, SizeSummary};
+use rustfs_common::data_usage::{BucketUsageInfo, DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, global_metrics};
 use rustfs_ecstore::{
     self as ecstore, StorageAPI,
-    bucket::versioning::VersioningApi,
     bucket::versioning_sys::BucketVersioningSys,
+    bucket::{object_lock::objectlock_sys::BucketObjectLockSys, versioning::VersioningApi},
     data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
     disk::{Disk, DiskAPI, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions},
     set_disk::SetDisks,
     store_api::ObjectInfo,
 };
-use rustfs_filemeta::{MetacacheReader, VersionType};
+use rustfs_filemeta::{FileInfo, MetacacheReader, VersionType, file_info_from_raw};
 use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -74,6 +75,10 @@ pub struct ScannerConfig {
     pub scan_mode: ScanMode,
     /// Whether to enable data usage statistics collection
     pub enable_data_usage_stats: bool,
+    /// Maximum number of buckets refreshed per realtime data usage fallback cycle
+    pub realtime_usage_bucket_limit: usize,
+    /// Grace period before pending replication is considered lagging
+    pub replication_pending_grace: Duration,
 }
 
 impl Default for ScannerConfig {
@@ -86,6 +91,8 @@ impl Default for ScannerConfig {
             enable_metrics: true,
             scan_mode: ScanMode::Normal,
             enable_data_usage_stats: true,
+            realtime_usage_bucket_limit: 32,
+            replication_pending_grace: Duration::from_secs(300),
         }
     }
 }
@@ -109,6 +116,81 @@ pub struct ScannerState {
     pub scanning_buckets: Vec<String>,
     /// Disks being scanned
     pub scanning_disks: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct RealtimeUsageCache {
+    bucket_cursor: usize,
+    bucket_order: Vec<String>,
+    buckets_usage: HashMap<String, BucketUsageInfo>,
+}
+
+impl RealtimeUsageCache {
+    fn align_with_bucket_list(&mut self, bucket_names: &[String]) {
+        let valid: HashSet<_> = bucket_names.iter().cloned().collect();
+        self.buckets_usage.retain(|bucket, _| valid.contains(bucket));
+        self.bucket_order = bucket_names.to_vec();
+        if self.bucket_order.is_empty() {
+            self.bucket_cursor = 0;
+        } else {
+            self.bucket_cursor %= self.bucket_order.len();
+        }
+    }
+
+    fn record_snapshot(&mut self, snapshot: &DataUsageInfo) {
+        if snapshot.buckets_usage.is_empty() {
+            self.bucket_order.clear();
+            self.bucket_cursor = 0;
+            self.buckets_usage.clear();
+            return;
+        }
+
+        let mut ordered: Vec<String> = snapshot.buckets_usage.keys().cloned().collect();
+        ordered.sort();
+        self.bucket_order = ordered;
+        self.bucket_cursor = 0;
+        self.buckets_usage = snapshot.buckets_usage.clone();
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Vec<String> {
+        if self.bucket_order.is_empty() || batch_size == 0 {
+            return Vec::new();
+        }
+
+        let limit = batch_size.min(self.bucket_order.len());
+        let mut selected = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            let bucket = self.bucket_order[self.bucket_cursor].clone();
+            self.bucket_cursor = (self.bucket_cursor + 1) % self.bucket_order.len();
+            selected.push(bucket);
+        }
+
+        selected
+    }
+
+    fn upsert_bucket_usage(&mut self, bucket: &str, usage: BucketUsageInfo) {
+        self.buckets_usage.insert(bucket.to_string(), usage);
+    }
+
+    fn build_usage_info(&self, bucket_names: &[String]) -> DataUsageInfo {
+        let mut info = DataUsageInfo {
+            buckets_count: bucket_names.len() as u64,
+            last_update: Some(SystemTime::now()),
+            ..Default::default()
+        };
+
+        for bucket in bucket_names {
+            if let Some(usage) = self.buckets_usage.get(bucket) {
+                info.objects_total_count += usage.objects_count;
+                info.objects_total_size += usage.size;
+                info.versions_total_count += usage.versions_count;
+                info.buckets_usage.insert(bucket.clone(), usage.clone());
+                info.bucket_sizes.insert(bucket.clone(), usage.size);
+            }
+        }
+
+        info
+    }
 }
 
 /// AHM Scanner - Automatic Health Management Scanner (Optimized Version)
@@ -137,6 +219,8 @@ pub struct Scanner {
     data_usage_stats: Arc<Mutex<HashMap<String, DataUsageInfo>>>,
     /// Last data usage statistics collection time
     last_data_usage_collection: Arc<RwLock<Option<SystemTime>>>,
+    /// Cached realtime data usage fallback state
+    realtime_usage_cache: Arc<Mutex<RealtimeUsageCache>>,
     /// Heal manager for auto-heal integration
     heal_manager: Option<Arc<HealManager>>,
 
@@ -192,6 +276,7 @@ impl Scanner {
             disk_metrics: Arc::new(Mutex::new(HashMap::new())),
             data_usage_stats: Arc::new(Mutex::new(HashMap::new())),
             last_data_usage_collection: Arc::new(RwLock::new(None)),
+            realtime_usage_cache: Arc::new(Mutex::new(RealtimeUsageCache::default())),
             heal_manager,
             node_scanner,
             stats_aggregator,
@@ -217,9 +302,37 @@ impl Scanner {
         config.enable_data_usage_stats = enable;
     }
 
+    /// Configure realtime data usage fallback bucket limit.
+    pub async fn set_realtime_usage_bucket_limit(&self, limit: usize) {
+        let mut config = self.config.write().await;
+        config.realtime_usage_bucket_limit = limit.max(1);
+    }
+
     /// Set the heal manager after construction
     pub fn set_heal_manager(&mut self, heal_manager: Arc<HealManager>) {
         self.heal_manager = Some(heal_manager);
+    }
+
+    fn acquire_heal_manager(&self) -> Option<Arc<HealManager>> {
+        if let Some(local) = &self.heal_manager {
+            return Some(local.clone());
+        }
+        get_heal_manager().map(Arc::clone)
+    }
+
+    async fn ensure_heal_manager_ready(&self) -> bool {
+        if !self.config.read().await.enable_healing {
+            return true;
+        }
+
+        if self.acquire_heal_manager().is_some() {
+            true
+        } else {
+            warn!(
+                "Scanner healing is enabled but no HealManager is available; heal submissions will be skipped until it becomes ready"
+            );
+            false
+        }
     }
 
     /// Initialize scanner with ECStore disks (for testing and runtime)
@@ -247,6 +360,144 @@ impl Scanner {
         }
     }
 
+    /// Run volume consistency checks to detect missing buckets and trigger heals
+    pub async fn run_volume_consistency_check(&self) -> Result<()> {
+        if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
+            for pool in &ecstore.pools {
+                for set_disks in &pool.disk_set {
+                    let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
+                    if disks.is_empty() {
+                        continue;
+                    }
+
+                    self.check_and_heal_missing_volumes(&disks, set_disks.set_index, set_disks.pool_index)
+                        .await?;
+                }
+            }
+        } else {
+            warn!("run_volume_consistency_check: ECStore not available");
+        }
+
+        Ok(())
+    }
+
+    async fn handle_buckets_from_local_records(
+        &self,
+        ecstore: &Arc<rustfs_ecstore::store::ECStore>,
+        bucket_objects_map: &HashMap<String, Vec<LocalObjectRecord>>,
+        enable_healing: bool,
+        enable_deep_scan: bool,
+        run_lifecycle: bool,
+    ) -> Result<u64> {
+        debug!("Listing buckets for lifecycle/replication evaluation");
+        let buckets = ecstore
+            .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
+            .await
+            .map_err(Error::from)?;
+
+        let mut total_objects_scanned = 0u64;
+        let replication_pending_grace = {
+            let cfg = self.config.read().await;
+            cfg.replication_pending_grace
+        };
+
+        for bucket_info in buckets {
+            let bucket_name = &bucket_info.name;
+
+            if bucket_name.starts_with('.') {
+                debug!("Skipping system bucket: {}", bucket_name);
+                continue;
+            }
+
+            let lifecycle_config = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name)
+                .await
+                .ok()
+                .map(|(c, _)| Arc::new(c));
+            let versioning_config = Arc::new(VersioningConfiguration {
+                status: if bucket_info.versioning {
+                    Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
+                } else {
+                    None
+                },
+                ..Default::default()
+            });
+
+            let records_cow: Cow<[LocalObjectRecord]> = if let Some(existing) = bucket_objects_map.get(bucket_name) {
+                if existing.is_empty() {
+                    debug!("Bucket {} had empty local snapshot entries; refreshing via ECStore listing", bucket_name);
+                    let fetched = self.collect_bucket_records_from_store(ecstore, bucket_name).await?;
+                    if fetched.is_empty() {
+                        debug!("No objects discovered via ECStore listing for bucket {}; skipping", bucket_name);
+                        continue;
+                    }
+                    Cow::Owned(fetched)
+                } else {
+                    Cow::Borrowed(existing.as_slice())
+                }
+            } else {
+                debug!(
+                    "No local snapshot entries found for bucket {}; falling back to ECStore listing",
+                    bucket_name
+                );
+                let fetched = self.collect_bucket_records_from_store(ecstore, bucket_name).await?;
+                if fetched.is_empty() {
+                    debug!("No objects discovered via ECStore listing for bucket {}; skipping", bucket_name);
+                    continue;
+                }
+                Cow::Owned(fetched)
+            };
+
+            let records = records_cow.as_ref();
+            if records.is_empty() {
+                continue;
+            }
+
+            self.reset_bucket_replication_counters(bucket_name).await;
+
+            let live_objects = records.iter().filter(|record| record.usage.has_live_object).count() as u64;
+            total_objects_scanned = total_objects_scanned.saturating_add(live_objects);
+            debug!("Counted {} objects in bucket {} using local snapshots", live_objects, bucket_name);
+
+            if run_lifecycle {
+                if lifecycle_config.is_some() {
+                    debug!("Processing lifecycle actions for bucket: {}", bucket_name);
+                } else {
+                    debug!("Processing replication checks for bucket without lifecycle config: {}", bucket_name);
+                }
+                let object_lock_config = BucketObjectLockSys::get(bucket_name).await;
+                let replication_metrics =
+                    Some(ReplicationMetricsHandle::new(Arc::clone(&self.metrics), Arc::clone(&self.bucket_metrics)));
+                let mut scanner_item = ScannerItem::new(
+                    bucket_name.to_string(),
+                    lifecycle_config.clone(),
+                    Some(versioning_config.clone()),
+                    object_lock_config,
+                    replication_pending_grace,
+                    replication_metrics,
+                );
+
+                if let Err(e) = self
+                    .process_bucket_objects_for_lifecycle(ecstore, bucket_name, &mut scanner_item, records)
+                    .await
+                {
+                    warn!("Failed to process lifecycle/replication actions for bucket {}: {}", bucket_name, e);
+                }
+            }
+
+            if enable_deep_scan && enable_healing {
+                debug!("Deep scan enabled, verifying object integrity in bucket {}", bucket_name);
+                if let Err(e) = self
+                    .deep_scan_bucket_objects_with_records(ecstore, bucket_name, records)
+                    .await
+                {
+                    warn!("Deep scan failed for bucket {}: {}", bucket_name, e);
+                }
+            }
+        }
+
+        Ok(total_objects_scanned)
+    }
+
     /// Perform basic test scan for testing environments
     async fn perform_basic_test_scan(&self) -> Result<()> {
         debug!("Starting basic test scan using ECStore directly");
@@ -269,92 +520,28 @@ impl Scanner {
             };
             let bucket_objects_map = &scan_outcome.bucket_objects;
 
-            // List all buckets
-            debug!("Listing buckets");
-            match ecstore
-                .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
-                .await
-            {
-                Ok(buckets) => {
-                    debug!("Found {} buckets", buckets.len());
-                    for bucket_info in buckets {
-                        let bucket_name = &bucket_info.name;
+            let lifecycle_result = self
+                .handle_buckets_from_local_records(&ecstore, bucket_objects_map, enable_healing, enable_deep_scan, false)
+                .await;
 
-                        // Skip system buckets
-                        if bucket_name.starts_with('.') {
-                            debug!("Skipping system bucket: {}", bucket_name);
-                            continue;
-                        }
-
-                        // Get bucket lifecycle configuration
-                        let lifecycle_config = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name)
-                            .await
-                            .ok()
-                            .map(|(c, _)| Arc::new(c));
-
-                        // Get bucket versioning configuration
-                        let versioning_config = Arc::new(VersioningConfiguration {
-                            status: if bucket_info.versioning {
-                                Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
-                            } else {
-                                None
-                            },
-                            ..Default::default()
-                        });
-
-                        let records = match bucket_objects_map.get(bucket_name) {
-                            Some(records) => records,
-                            None => {
-                                debug!(
-                                    "No local snapshot entries found for bucket {}; skipping lifecycle/integrity",
-                                    bucket_name
-                                );
-                                continue;
-                            }
-                        };
-
-                        let live_objects = records.iter().filter(|record| record.usage.has_live_object).count() as u64;
-                        total_objects_scanned = total_objects_scanned.saturating_add(live_objects);
-                        debug!("Counted {} objects in bucket {} using local snapshots", live_objects, bucket_name);
-
-                        // Process objects for lifecycle actions
-                        if let Some(lifecycle_config) = &lifecycle_config {
-                            debug!("Processing lifecycle actions for bucket: {}", bucket_name);
-                            let mut scanner_item = ScannerItem::new(
-                                bucket_name.to_string(),
-                                Some(lifecycle_config.clone()),
-                                Some(versioning_config.clone()),
-                            );
-
-                            match self
-                                .process_bucket_objects_for_lifecycle(bucket_name, &mut scanner_item, records)
-                                .await
-                            {
-                                Ok(processed_count) => {
-                                    debug!("Processed {} objects for lifecycle in bucket {}", processed_count, bucket_name);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to process lifecycle actions for bucket {}: {}", bucket_name, e);
-                                }
-                            }
-                        }
-
-                        // If deep scan is enabled, verify each object's integrity
-                        if enable_deep_scan && enable_healing {
-                            debug!("Deep scan enabled, verifying object integrity in bucket {}", bucket_name);
-                            if let Err(e) = self
-                                .deep_scan_bucket_objects_with_records(&ecstore, bucket_name, records)
-                                .await
-                            {
-                                warn!("Deep scan failed for bucket {}: {}", bucket_name, e);
-                            }
-                        }
-                    }
-
+            match lifecycle_result {
+                Ok(total) => {
+                    total_objects_scanned = total;
                     self.update_data_usage_statistics(&scan_outcome, &ecstore).await;
                 }
                 Err(e) => {
-                    error!("Failed to list buckets: {}", e);
+                    error!("Failed to process buckets during basic scan: {}", e);
+                }
+            }
+
+            for pool in &ecstore.pools {
+                for set_disks in &pool.disk_set {
+                    if let Err(err) = self.scan_set_disks(set_disks.clone()).await {
+                        warn!(
+                            "Set disk scan failed for pool {} set {}: {}",
+                            set_disks.pool_index, set_disks.set_index, err
+                        );
+                    }
                 }
             }
 
@@ -497,7 +684,10 @@ impl Scanner {
             }
 
             let object_name = &record.usage.object;
-            if let Err(err) = self.verify_object_integrity(bucket_name, object_name).await {
+            if let Err(err) = self
+                .verify_object_integrity(bucket_name, object_name, record.file_info.as_ref())
+                .await
+            {
                 warn!(
                     "Object integrity verification failed for {}/{} during deep scan: {}",
                     bucket_name, object_name, err
@@ -530,7 +720,8 @@ impl Scanner {
                                         if let Some(object_name) = entry.file_name().to_str() {
                                             if !object_name.starts_with('.') {
                                                 debug!("Deep scanning object: {}/{}", bucket_name, object_name);
-                                                if let Err(e) = self.verify_object_integrity(bucket_name, object_name).await {
+                                                if let Err(e) = self.verify_object_integrity(bucket_name, object_name, None).await
+                                                {
                                                     warn!(
                                                         "Object integrity verification failed for {}/{}: {}",
                                                         bucket_name, object_name, e
@@ -559,6 +750,7 @@ impl Scanner {
     /// Process bucket objects for lifecycle actions
     async fn process_bucket_objects_for_lifecycle(
         &self,
+        ecstore: &Arc<rustfs_ecstore::store::ECStore>,
         bucket_name: &str,
         scanner_item: &mut ScannerItem,
         records: &[LocalObjectRecord],
@@ -571,7 +763,14 @@ impl Scanner {
                 continue;
             }
 
-            let object_info = Self::convert_record_to_object_info(record);
+            let mut object_info = Self::convert_record_to_object_info(record);
+            if object_info.replication_status.is_empty() && object_info.replication_status_internal.is_none() {
+                let object_name = object_info.name.clone();
+                let object_opts = rustfs_ecstore::store_api::ObjectOptions::default();
+                if let Ok(fresh_info) = ecstore.get_object_info(bucket_name, &object_name, &object_opts).await {
+                    object_info = fresh_info;
+                }
+            }
             let mut size_summary = SizeSummary::default();
             let (deleted, _size) = scanner_item.apply_actions(&object_info, &mut size_summary).await;
             if deleted {
@@ -582,6 +781,39 @@ impl Scanner {
 
         info!("Processed {} objects for lifecycle in bucket {}", processed_count, bucket_name);
         Ok(processed_count)
+    }
+
+    async fn collect_bucket_records_from_store(
+        &self,
+        ecstore: &Arc<rustfs_ecstore::store::ECStore>,
+        bucket_name: &str,
+    ) -> Result<Vec<LocalObjectRecord>> {
+        let mut records = Vec::new();
+
+        let list_result = ecstore
+            .clone()
+            .list_objects_v2(bucket_name, "", None, None, 1000, false, None, false)
+            .await
+            .map_err(Error::from)?;
+
+        for object in list_result.objects {
+            let usage = local_scan::LocalObjectUsage {
+                bucket: bucket_name.to_string(),
+                object: object.name.clone(),
+                last_modified_ns: object.mod_time.map(|ts| ts.unix_timestamp_nanos()),
+                versions_count: 1,
+                delete_markers_count: 0,
+                total_size: object.size.max(0) as u64,
+                has_live_object: true,
+            };
+            records.push(LocalObjectRecord {
+                usage,
+                object_info: Some(object),
+                file_info: None,
+            });
+        }
+
+        Ok(records)
     }
 
     /// Start the optimized scanner
@@ -614,6 +846,14 @@ impl Scanner {
             }
         });
 
+        // Launch the primary scan loop to drive healing and lifecycle workflows
+        let scanner = self.clone_for_background();
+        tokio::spawn(async move {
+            if let Err(e) = scanner.scan_loop().await {
+                error!("Scanner loop failed: {}", e);
+            }
+        });
+
         // Trigger an immediate data usage collection so that admin APIs have fresh data after startup.
         let scanner = self.clone_for_background();
         tokio::spawn(async move {
@@ -626,6 +866,14 @@ impl Scanner {
                 if let Err(e) = scanner.collect_and_persist_data_usage().await {
                     warn!("Initial data usage collection failed: {}", e);
                 }
+            }
+        });
+
+        // Kick off an initial scan cycle so we do not wait one full interval to run healing checks
+        let scanner = self.clone_for_background();
+        tokio::spawn(async move {
+            if let Err(e) = scanner.scan_cycle().await {
+                warn!("Initial scan cycle failed: {}", e);
             }
         });
 
@@ -780,6 +1028,8 @@ impl Scanner {
             self.metrics.get_metrics().current_cycle + 1
         );
 
+        let _ = self.ensure_heal_manager_ready().await;
+
         // Update state
         {
             let mut state = self.state.write().await;
@@ -866,6 +1116,10 @@ impl Scanner {
             }
         }
 
+        if let Err(e) = self.run_lifecycle_evaluation().await {
+            warn!("Lifecycle evaluation step failed: {}", e);
+        }
+
         // Phase 2: Minimal EC verification for critical objects only
         // Note: The main scanning is now handled by NodeScanner in the background
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
@@ -937,6 +1191,9 @@ impl Scanner {
             data_usage.last_update = Some(SystemTime::now());
         }
 
+        // Keep realtime fallback cache in sync with the fresh consolidated snapshot.
+        self.update_realtime_cache_from_snapshot(&data_usage).await;
+
         // Publish to node stats manager
         self.node_scanner.update_data_usage(data_usage.clone()).await;
 
@@ -973,80 +1230,161 @@ impl Scanner {
         Ok(())
     }
 
+    async fn update_realtime_cache_from_snapshot(&self, snapshot: &DataUsageInfo) {
+        let mut cache = self.realtime_usage_cache.lock().await;
+        cache.record_snapshot(snapshot);
+    }
+
+    async fn run_lifecycle_evaluation(&self) -> Result<()> {
+        let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() else {
+            warn!("Cannot run lifecycle evaluation without ECStore");
+            return Ok(());
+        };
+
+        let scan_outcome = match local_scan::scan_and_persist_local_usage(ecstore.clone()).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                warn!("Lifecycle evaluation skipped: failed to collect local usage snapshots: {}", err);
+                return Ok(());
+            }
+        };
+
+        if scan_outcome.bucket_objects.is_empty() {
+            debug!("No bucket records available for lifecycle evaluation");
+            return Ok(());
+        }
+
+        if let Err(e) = self
+            .handle_buckets_from_local_records(&ecstore, &scan_outcome.bucket_objects, false, false, true)
+            .await
+        {
+            warn!("Lifecycle evaluation encountered errors: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Record that a heal task has been queued and update related metrics.
+    async fn record_heal_submission(&self, bucket: Option<&str>) {
+        self.metrics.increment_heal_tasks_queued(1);
+
+        if let Some(bucket_name) = bucket {
+            let mut bucket_metrics_guard = self.bucket_metrics.lock().await;
+            let entry = bucket_metrics_guard
+                .entry(bucket_name.to_string())
+                .or_insert_with(|| BucketMetrics {
+                    bucket: bucket_name.to_string(),
+                    ..Default::default()
+                });
+            entry.heal_tasks_queued = entry.heal_tasks_queued.saturating_add(1);
+        }
+    }
+
+    async fn reset_bucket_replication_counters(&self, bucket: &str) {
+        let mut bucket_metrics_guard = self.bucket_metrics.lock().await;
+        let entry = bucket_metrics_guard
+            .entry(bucket.to_string())
+            .or_insert_with(|| BucketMetrics {
+                bucket: bucket.to_string(),
+                ..Default::default()
+            });
+        entry.replication_pending = 0;
+        entry.replication_failed = 0;
+        entry.replication_lagging = 0;
+        entry.replication_tasks_queued = 0;
+    }
+
     /// Build data usage statistics directly from ECStore
     async fn build_data_usage_from_ecstore(&self, ecstore: &Arc<rustfs_ecstore::store::ECStore>) -> Result<DataUsageInfo> {
-        let mut data_usage = DataUsageInfo::default();
-
-        // Get bucket list
-        match ecstore
+        let bucket_list = match ecstore
             .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
             .await
         {
-            Ok(buckets) => {
-                data_usage.buckets_count = buckets.len() as u64;
-                data_usage.last_update = Some(SystemTime::now());
-
-                let mut total_objects = 0u64;
-                let mut total_size = 0u64;
-
-                for bucket_info in buckets {
-                    if bucket_info.name.starts_with('.') {
-                        continue; // Skip system buckets
-                    }
-
-                    // Try to get actual object count for this bucket
-                    let (object_count, bucket_size) = match ecstore
-                        .clone()
-                        .list_objects_v2(
-                            &bucket_info.name,
-                            "",    // prefix
-                            None,  // continuation_token
-                            None,  // delimiter
-                            100,   // max_keys - small limit for performance
-                            false, // fetch_owner
-                            None,  // start_after
-                            false, // incl_deleted
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            let count = result.objects.len() as u64;
-                            let size = result.objects.iter().map(|obj| obj.size as u64).sum();
-                            (count, size)
-                        }
-                        Err(_) => (0, 0),
-                    };
-
-                    total_objects += object_count;
-                    total_size += bucket_size;
-
-                    let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
-                        size: bucket_size,
-                        objects_count: object_count,
-                        versions_count: object_count, // Simplified
-                        delete_markers_count: 0,
-                        ..Default::default()
-                    };
-
-                    data_usage.buckets_usage.insert(bucket_info.name.clone(), bucket_usage);
-                    data_usage.bucket_sizes.insert(bucket_info.name, bucket_size);
-                }
-
-                data_usage.objects_total_count = total_objects;
-                data_usage.objects_total_size = total_size;
-                data_usage.versions_total_count = total_objects;
-            }
+            Ok(list) => list,
             Err(e) => {
                 warn!("Failed to list buckets for data usage collection: {}", e);
+                return Ok(DataUsageInfo::default());
+            }
+        };
+
+        let bucket_names: Vec<String> = bucket_list
+            .into_iter()
+            .map(|info| info.name)
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+
+        if bucket_names.is_empty() {
+            return Ok(DataUsageInfo::default());
+        }
+
+        let bucket_limit = {
+            let cfg = self.config.read().await;
+            cfg.realtime_usage_bucket_limit
+        };
+        let bucket_limit = bucket_limit.max(1);
+
+        let refresh_targets = {
+            let mut cache = self.realtime_usage_cache.lock().await;
+            cache.align_with_bucket_list(&bucket_names);
+            cache.next_batch(bucket_limit)
+        };
+
+        let mut refreshed_usage = Vec::with_capacity(refresh_targets.len());
+        for bucket in &refresh_targets {
+            if let Some(usage) = self.collect_bucket_usage_from_ecstore(ecstore, bucket).await {
+                refreshed_usage.push((bucket.clone(), usage));
             }
         }
+
+        let data_usage = {
+            let mut cache = self.realtime_usage_cache.lock().await;
+            for (bucket, usage) in refreshed_usage {
+                cache.upsert_bucket_usage(&bucket, usage);
+            }
+            cache.build_usage_info(&bucket_names)
+        };
+
+        info!(
+            "Realtime data usage fallback refreshed {} of {} buckets ({} cached entries)",
+            refresh_targets.len(),
+            bucket_names.len(),
+            data_usage.buckets_usage.len()
+        );
 
         Ok(data_usage)
     }
 
+    async fn collect_bucket_usage_from_ecstore(
+        &self,
+        ecstore: &Arc<rustfs_ecstore::store::ECStore>,
+        bucket: &str,
+    ) -> Option<BucketUsageInfo> {
+        match ecstore
+            .clone()
+            .list_objects_v2(bucket, "", None, None, 100, false, None, false)
+            .await
+        {
+            Ok(result) => {
+                let object_count = result.objects.len() as u64;
+                let bucket_size = result.objects.iter().map(|obj| obj.size as u64).sum();
+                let usage = BucketUsageInfo {
+                    size: bucket_size,
+                    objects_count: object_count,
+                    versions_count: object_count,
+                    ..Default::default()
+                };
+                Some(usage)
+            }
+            Err(e) => {
+                warn!("Failed to list objects during realtime data usage fallback for bucket {}: {}", bucket, e);
+                None
+            }
+        }
+    }
+
     /// Verify object integrity and trigger healing if necessary
     #[allow(dead_code)]
-    async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<()> {
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, file_info_hint: Option<&FileInfo>) -> Result<()> {
         debug!("Starting verify_object_integrity for {}/{}", bucket, object);
 
         let config = self.config.read().await;
@@ -1059,9 +1397,10 @@ impl Scanner {
             // First check whether the object still logically exists.
             // If it's already deleted (e.g., non-versioned bucket), do not trigger heal.
             let object_opts = ecstore::store_api::ObjectOptions::default();
+            let mut object_info_cache: Option<rustfs_ecstore::store_api::ObjectInfo> = None;
             match ecstore.get_object_info(bucket, object, &object_opts).await {
-                Ok(_) => {
-                    // Object exists logically, continue with verification below
+                Ok(info) => {
+                    object_info_cache = Some(info);
                 }
                 Err(e) => {
                     if matches!(e, ecstore::error::StorageError::ObjectNotFound(_, _)) {
@@ -1084,7 +1423,10 @@ impl Scanner {
                 Ok(_) => {
                     debug!("Standard verification passed for {}/{}", bucket, object);
                     // Standard verification passed, now check for missing data parts
-                    match self.check_data_parts_integrity(bucket, object).await {
+                    match self
+                        .check_data_parts_integrity(bucket, object, object_info_cache.as_ref(), file_info_hint)
+                        .await
+                    {
                         Ok(_) => {
                             // Object is completely healthy
                             debug!("Data parts integrity check passed for {}/{}", bucket, object);
@@ -1158,7 +1500,10 @@ impl Scanner {
 
                             // Object is accessible, but let's still check data parts integrity
                             // to catch real issues like missing data files
-                            match self.check_data_parts_integrity(bucket, object).await {
+                            match self
+                                .check_data_parts_integrity(bucket, object, object_info_cache.as_ref(), file_info_hint)
+                                .await
+                            {
                                 Ok(_) => {
                                     debug!("Object {}/{} accessible and data parts intact - treating as healthy", bucket, object);
                                     self.metrics.increment_healthy_objects();
@@ -1189,13 +1534,15 @@ impl Scanner {
             if integrity_failed {
                 self.metrics.increment_corrupted_objects();
 
-                if let Some(heal_manager) = &self.heal_manager {
+                if let Some(heal_manager) = self.acquire_heal_manager() {
                     debug!("Submitting heal request for {}/{}", bucket, object);
                     let heal_request = HealRequest::object(bucket.to_string(), object.to_string(), None);
                     if let Err(e) = heal_manager.submit_heal_request(heal_request).await {
                         error!("Failed to submit heal task for {}/{}: {}", bucket, object, e);
+                        self.metrics.increment_heal_tasks_failed(1);
                     } else {
                         debug!("Successfully submitted heal request for {}/{}", bucket, object);
+                        self.record_heal_submission(Some(bucket)).await;
                     }
                 } else {
                     debug!("No heal manager available for {}/{}", bucket, object);
@@ -1211,97 +1558,111 @@ impl Scanner {
 
     /// Check data parts integrity by verifying all parts exist on disks
     #[allow(dead_code)]
-    async fn check_data_parts_integrity(&self, bucket: &str, object: &str) -> Result<()> {
+    async fn check_data_parts_integrity(
+        &self,
+        bucket: &str,
+        object: &str,
+        object_info_hint: Option<&rustfs_ecstore::store_api::ObjectInfo>,
+        file_info_hint: Option<&FileInfo>,
+    ) -> Result<()> {
         debug!("Checking data parts integrity for {}/{}", bucket, object);
 
         if let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() {
-            // Get object info
-            let object_info = match ecstore.get_object_info(bucket, object, &Default::default()).await {
-                Ok(info) => info,
-                Err(e) => {
-                    return Err(Error::Other(format!("Failed to get object info: {e}")));
-                }
+            // Get object info from cache or load it
+            let object_info_cow = if let Some(info) = object_info_hint {
+                Cow::Borrowed(info)
+            } else {
+                Cow::Owned(
+                    ecstore
+                        .get_object_info(bucket, object, &Default::default())
+                        .await
+                        .map_err(|e| Error::Other(format!("Failed to get object info: {e}")))?,
+                )
+            };
+            // Get file info from hint or read from disks
+            let file_info_cow = if let Some(info) = file_info_hint {
+                Cow::Borrowed(info)
+            } else {
+                Cow::Owned(self.load_file_info_from_disks(&ecstore, bucket, object).await?)
             };
 
             debug!(
                 "Object info for {}/{}: data_blocks={}, parity_blocks={}, parts={}",
                 bucket,
                 object,
-                object_info.data_blocks,
-                object_info.parity_blocks,
-                object_info.parts.len()
+                object_info_cow.data_blocks,
+                object_info_cow.parity_blocks,
+                object_info_cow.parts.len()
             );
-
-            // Create FileInfo from ObjectInfo
-            let file_info = rustfs_filemeta::FileInfo {
-                volume: bucket.to_string(),
-                name: object.to_string(),
-                version_id: object_info.version_id,
-                is_latest: object_info.is_latest,
-                deleted: object_info.delete_marker,
-                size: object_info.size,
-                mod_time: object_info.mod_time,
-                parts: object_info
-                    .parts
-                    .iter()
-                    .map(|p| rustfs_filemeta::ObjectPartInfo {
-                        etag: p.etag.clone(),
-                        number: 0, // Will be set by erasure info
-                        size: p.size,
-                        actual_size: p.actual_size,
-                        mod_time: p.mod_time,
-                        index: p.index.clone(),
-                        checksums: p.checksums.clone(),
-                        error: None,
-                    })
-                    .collect(),
-                erasure: rustfs_filemeta::ErasureInfo {
-                    algorithm: "ReedSolomon".to_string(),
-                    data_blocks: object_info.data_blocks,
-                    parity_blocks: object_info.parity_blocks,
-                    block_size: 0, // Default value
-                    index: 1,      // Default index
-                    distribution: (1..=object_info.data_blocks + object_info.parity_blocks).collect(),
-                    checksums: vec![],
-                },
-                ..Default::default()
-            };
 
             debug!(
                 "Object {}/{}: data_blocks={}, parity_blocks={}, parts={}",
                 bucket,
                 object,
-                object_info.data_blocks,
-                object_info.parity_blocks,
-                object_info.parts.len()
+                object_info_cow.data_blocks,
+                object_info_cow.parity_blocks,
+                object_info_cow.parts.len()
             );
 
             // Check if this is an EC object or regular object
             // In the test environment, objects might have data_blocks=0 and parity_blocks=0
             // but still be stored in EC mode. We need to be more lenient.
-            let is_ec_object = object_info.data_blocks > 0 && object_info.parity_blocks > 0;
+            let is_ec_object = object_info_cow.data_blocks > 0 && object_info_cow.parity_blocks > 0;
 
             if is_ec_object {
                 debug!(
                     "Treating {}/{} as EC object with data_blocks={}, parity_blocks={}",
-                    bucket, object, object_info.data_blocks, object_info.parity_blocks
+                    bucket, object, object_info_cow.data_blocks, object_info_cow.parity_blocks
                 );
                 // For EC objects, use EC-aware integrity checking
-                self.check_ec_object_integrity(&ecstore, bucket, object, &object_info, &file_info)
+                self.check_ec_object_integrity(&ecstore, bucket, object, &object_info_cow, &file_info_cow)
                     .await
             } else {
                 debug!(
                     "Treating {}/{} as regular object stored in EC system (data_blocks={}, parity_blocks={})",
-                    bucket, object, object_info.data_blocks, object_info.parity_blocks
+                    bucket, object, object_info_cow.data_blocks, object_info_cow.parity_blocks
                 );
                 // For regular objects in EC storage, we should be more lenient
                 // In EC storage, missing parts on some disks is normal
-                self.check_ec_stored_object_integrity(&ecstore, bucket, object, &file_info)
+                self.check_ec_stored_object_integrity(&ecstore, bucket, object, &file_info_cow)
                     .await
             }
         } else {
             Ok(())
         }
+    }
+
+    async fn load_file_info_from_disks(
+        &self,
+        ecstore: &rustfs_ecstore::store::ECStore,
+        bucket: &str,
+        object: &str,
+    ) -> Result<FileInfo> {
+        for (pool_idx, pool_disks) in &ecstore.disk_map {
+            for (disk_idx, disk_opt) in pool_disks.iter().enumerate() {
+                if let Some(disk) = disk_opt {
+                    match disk.read_xl(bucket, object, false).await {
+                        Ok(raw) => match file_info_from_raw(raw, bucket, object, false).await {
+                            Ok(info) => return Ok(info),
+                            Err(err) => {
+                                debug!(
+                                    "Failed to decode xl.meta for {}/{} on pool {} disk {}: {}",
+                                    bucket, object, pool_idx, disk_idx, err
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            debug!(
+                                "Failed to read xl.meta for {}/{} on pool {} disk {}: {}",
+                                bucket, object, pool_idx, disk_idx, err
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(Error::Other(format!("Unable to load file info for {}/{} from any disk", bucket, object)))
     }
 
     /// Check integrity for EC (erasure coded) objects
@@ -1422,6 +1783,12 @@ impl Scanner {
             return Err(Error::Other(format!(
                 "Object has insufficient healthy parts for recovery: {bucket}/{object} (healthy: {}, required: {})",
                 disks_with_parts, object_info.data_blocks
+            )));
+        }
+
+        if missing_parts_found > 0 {
+            return Err(Error::Other(format!(
+                "Object has missing data parts across disks: {bucket}/{object} (missing parts: {missing_parts_found})"
             )));
         }
 
@@ -1562,6 +1929,7 @@ impl Scanner {
 
         // Get online disks from this EC set
         let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
+        let disks_for_analysis = disks.clone();
 
         // Check volume consistency across disks and heal missing buckets
         if !disks.is_empty() {
@@ -1630,6 +1998,11 @@ impl Scanner {
             set_index, pool_index, successful_scans, failed_scans
         );
 
+        // Analyze object distribution across disks to detect missing metadata/objects
+        if let Err(err) = self.analyze_object_distribution(&all_disk_objects, &disks_for_analysis).await {
+            error!("Failed to analyze object distribution for pool {} set {}: {}", pool_index, set_index, err);
+        }
+
         Ok(all_disk_objects)
     }
 
@@ -1637,7 +2010,6 @@ impl Scanner {
     #[allow(dead_code)]
     async fn scan_disk(&self, disk: &DiskStore) -> Result<HashMap<String, HashMap<String, rustfs_filemeta::FileMeta>>> {
         let disk_path = disk.path().to_string_lossy().to_string();
-
         // Start global metrics collection for disk scan
         let stop_fn = Metrics::time(Metric::ScanBucketDrive);
 
@@ -1670,40 +2042,12 @@ impl Scanner {
 
                 // check disk status, if offline, submit erasure set heal task
                 if !metrics.is_online {
-                    let enable_healing = self.config.read().await.enable_healing;
-                    if enable_healing {
-                        if let Some(heal_manager) = &self.heal_manager {
-                            // Get bucket list for erasure set healing
-                            let buckets = match rustfs_ecstore::new_object_layer_fn() {
-                                Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
-                                    Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
-                                    Err(e) => {
-                                        error!("Failed to get bucket list for disk healing: {}", e);
-                                        return Err(Error::Storage(e));
-                                    }
-                                },
-                                None => {
-                                    error!("No ECStore available for getting bucket list");
-                                    return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
-                                }
-                            };
-
-                            let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
-                            let req = HealRequest::new(
-                                crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
-                                crate::heal::task::HealOptions::default(),
-                                crate::heal::task::HealPriority::High,
-                            );
-                            match heal_manager.submit_heal_request(req).await {
-                                Ok(task_id) => {
-                                    warn!("disk offline, submit erasure set heal task: {} {}", task_id, disk_path);
-                                }
-                                Err(e) => {
-                                    error!("disk offline, submit erasure set heal task failed: {} {}", disk_path, e);
-                                }
-                            }
-                        }
-                    }
+                    self.submit_erasure_set_heal_for_disk(
+                        disk,
+                        crate::heal::task::HealPriority::High,
+                        "disk offline detected during scan",
+                    )
+                    .await;
                 }
 
                 // Additional disk info for debugging
@@ -1726,48 +2070,19 @@ impl Scanner {
             Err(e) => {
                 error!("Failed to list volumes on disk {}: {}", disk_path, e);
 
-                // disk access failed, submit erasure set heal task
-                let enable_healing = self.config.read().await.enable_healing;
-                if enable_healing {
-                    if let Some(heal_manager) = &self.heal_manager {
-                        // Get bucket list for erasure set healing
-                        let buckets = match rustfs_ecstore::new_object_layer_fn() {
-                            Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
-                                Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
-                                Err(e) => {
-                                    error!("Failed to get bucket list for disk healing: {}", e);
-                                    return Err(Error::Storage(e));
-                                }
-                            },
-                            None => {
-                                error!("No ECStore available for getting bucket list");
-                                return Err(Error::Storage(ecstore::error::StorageError::other("No ECStore available")));
-                            }
-                        };
-
-                        let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
-                        let req = HealRequest::new(
-                            crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
-                            crate::heal::task::HealOptions::default(),
-                            crate::heal::task::HealPriority::Urgent,
-                        );
-                        match heal_manager.submit_heal_request(req).await {
-                            Ok(task_id) => {
-                                warn!("disk access failed, submit erasure set heal task: {} {}", task_id, disk_path);
-                            }
-                            Err(heal_err) => {
-                                error!("disk access failed, submit erasure set heal task failed: {} {}", disk_path, heal_err);
-                            }
-                        }
-                    }
-                }
-
+                self.submit_erasure_set_heal_for_disk(
+                    disk,
+                    crate::heal::task::HealPriority::Urgent,
+                    "disk access failed while listing volumes",
+                )
+                .await;
                 return Err(Error::Storage(e.into()));
             }
         };
 
         // Scan each volume and collect object metadata
         let mut disk_objects = HashMap::new();
+        let mut submitted_volume_access_heal = false;
         for volume in volumes {
             // check cancel token
             if let Some(cancel_token) = get_ahm_services_cancel_token() {
@@ -1783,6 +2098,15 @@ impl Scanner {
                 }
                 Err(e) => {
                     error!("Failed to scan volume {} on disk {}: {}", volume.name, disk_path, e);
+                    if !submitted_volume_access_heal {
+                        self.submit_erasure_set_heal_for_disk(
+                            disk,
+                            crate::heal::task::HealPriority::High,
+                            &format!("volume scan failed for {}", volume.name),
+                        )
+                        .await;
+                        submitted_volume_access_heal = true;
+                    }
                     continue;
                 }
             }
@@ -1808,6 +2132,52 @@ impl Scanner {
         stop_fn();
 
         Ok(disk_objects)
+    }
+
+    async fn submit_erasure_set_heal_for_disk(&self, disk: &DiskStore, priority: crate::heal::task::HealPriority, reason: &str) {
+        if !self.config.read().await.enable_healing {
+            return;
+        }
+
+        let Some(heal_manager) = self.acquire_heal_manager() else {
+            warn!(
+                "{} -> HealManager unavailable, skipping erasure set heal for disk {}",
+                reason,
+                disk.to_string()
+            );
+            return;
+        };
+
+        let buckets = match rustfs_ecstore::new_object_layer_fn() {
+            Some(ecstore) => match ecstore.list_bucket(&ecstore::store_api::BucketOptions::default()).await {
+                Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+                Err(e) => {
+                    error!("Failed to list buckets for erasure set heal ({}): {}", reason, e);
+                    return;
+                }
+            },
+            None => {
+                error!("No ECStore available while building erasure set heal request ({})", reason);
+                return;
+            }
+        };
+
+        let set_disk_id = format!("pool_{}_set_{}", disk.endpoint().pool_idx, disk.endpoint().set_idx);
+        let req = HealRequest::new(
+            crate::heal::task::HealType::ErasureSet { buckets, set_disk_id },
+            crate::heal::task::HealOptions::default(),
+            priority,
+        );
+        match heal_manager.submit_heal_request(req).await {
+            Ok(task_id) => {
+                warn!("{} -> submitted erasure set heal task {} for disk {}", reason, task_id, disk.to_string());
+                self.record_heal_submission(None).await;
+            }
+            Err(e) => {
+                error!("{} -> failed to submit erasure set heal for disk {}: {}", reason, disk.to_string(), e);
+                self.metrics.increment_heal_tasks_failed(1);
+            }
+        }
     }
 
     /// Scan a single volume (bucket) and collect object information
@@ -1906,7 +2276,7 @@ impl Scanner {
                         // object metadata damaged, submit metadata heal task
                         let enable_healing = self.config.read().await.enable_healing;
                         if enable_healing {
-                            if let Some(heal_manager) = &self.heal_manager {
+                            if let Some(heal_manager) = self.acquire_heal_manager() {
                                 let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
                                 match heal_manager.submit_heal_request(req).await {
                                     Ok(task_id) => {
@@ -1914,12 +2284,14 @@ impl Scanner {
                                             "object metadata damaged, submit heal task: {} {} / {}",
                                             task_id, bucket, entry.name
                                         );
+                                        self.record_heal_submission(Some(bucket)).await;
                                     }
                                     Err(e) => {
                                         error!(
                                             "object metadata damaged, submit heal task failed: {} / {} {}",
                                             bucket, entry.name, e
                                         );
+                                        self.metrics.increment_heal_tasks_failed(1);
                                     }
                                 }
                             }
@@ -1930,13 +2302,24 @@ impl Scanner {
                             if let Disk::Local(_local_disk) = &**disk {
                                 let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
-                                let mut scanner_item = ScannerItem {
-                                    bucket: bucket.to_string(),
-                                    object_name: entry.name.clone(),
-                                    lifecycle: Some(lifecycle_config.clone()),
-                                    versioning: versioning_config.clone(),
+                                let object_lock_config = BucketObjectLockSys::get(bucket).await;
+                                let replication_metrics = Some(ReplicationMetricsHandle::new(
+                                    Arc::clone(&self.metrics),
+                                    Arc::clone(&self.bucket_metrics),
+                                ));
+                                let replication_pending_grace = {
+                                    let cfg = self.config.read().await;
+                                    cfg.replication_pending_grace
                                 };
-                                //ScannerItem::new(bucket.to_string(), Some(lifecycle_config.clone()), versioning_config.clone());
+                                let mut scanner_item = ScannerItem::new(
+                                    bucket.to_string(),
+                                    Some(lifecycle_config.clone()),
+                                    versioning_config.clone(),
+                                    object_lock_config,
+                                    replication_pending_grace,
+                                    replication_metrics,
+                                );
+                                scanner_item.object_name = entry.name.clone();
                                 let fivs = match entry.clone().file_info_versions(&scanner_item.bucket) {
                                     Ok(fivs) => fivs,
                                     Err(_err) => {
@@ -2015,7 +2398,7 @@ impl Scanner {
                     // object metadata parse failed, submit metadata heal task
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
-                        if let Some(heal_manager) = &self.heal_manager {
+                        if let Some(heal_manager) = self.acquire_heal_manager() {
                             let req = HealRequest::metadata(bucket.to_string(), entry.name.clone());
                             match heal_manager.submit_heal_request(req).await {
                                 Ok(task_id) => {
@@ -2023,12 +2406,14 @@ impl Scanner {
                                         "object metadata parse failed, submit heal task: {} {} / {}",
                                         task_id, bucket, entry.name
                                     );
+                                    self.record_heal_submission(Some(bucket)).await;
                                 }
                                 Err(e) => {
                                     error!(
                                         "object metadata parse failed, submit heal task failed: {} / {} {}",
                                         bucket, entry.name, e
                                     );
+                                    self.metrics.increment_heal_tasks_failed(1);
                                 }
                             }
                         }
@@ -2199,7 +2584,7 @@ impl Scanner {
                     // submit heal task
                     let enable_healing = self.config.read().await.enable_healing;
                     if enable_healing {
-                        if let Some(heal_manager) = &self.heal_manager {
+                        if let Some(heal_manager) = self.acquire_heal_manager() {
                             use crate::heal::{HealPriority, HealRequest};
                             let req = HealRequest::new(
                                 crate::heal::HealType::Object {
@@ -2216,9 +2601,11 @@ impl Scanner {
                                         "object missing, submit heal task: {} {} / {} (missing disks: {:?})",
                                         task_id, bucket, object_name, missing_disks
                                     );
+                                    self.record_heal_submission(Some(bucket)).await;
                                 }
                                 Err(e) => {
                                     error!("object missing, submit heal task failed: {} / {} {}", bucket, object_name, e);
+                                    self.metrics.increment_heal_tasks_failed(1);
                                 }
                             }
                         }
@@ -2228,7 +2615,16 @@ impl Scanner {
                 // Step 3: Deep scan EC verification
                 let config = self.config.read().await;
                 if config.scan_mode == ScanMode::Deep {
-                    if let Err(e) = self.verify_object_integrity(bucket, object_name).await {
+                    let file_info_hint = all_disk_objects.iter().find_map(|disk_map| {
+                        disk_map
+                            .get(bucket)
+                            .and_then(|object_map| object_map.get(object_name))
+                            .and_then(|meta| meta.into_fileinfo(bucket, object_name, "", false, false).ok())
+                    });
+                    if let Err(e) = self
+                        .verify_object_integrity(bucket, object_name, file_info_hint.as_ref())
+                        .await
+                    {
                         objects_with_ec_issues += 1;
                         warn!("Object integrity verification failed for object {}/{}: {}", bucket, object_name, e);
                     }
@@ -2254,7 +2650,6 @@ impl Scanner {
     }
 
     /// Background scan loop with graceful shutdown
-    #[allow(dead_code)]
     async fn scan_loop(self) -> Result<()> {
         let config = self.config.read().await;
         let mut interval = tokio::time::interval(config.scan_interval);
@@ -2427,7 +2822,7 @@ impl Scanner {
                 // Step 3: Submit heal tasks for missing buckets
                 let enable_healing = self.config.read().await.enable_healing;
                 if enable_healing {
-                    if let Some(heal_manager) = &self.heal_manager {
+                    if let Some(heal_manager) = self.acquire_heal_manager() {
                         for bucket in missing_buckets {
                             let req = crate::heal::HealRequest::bucket(bucket.clone());
                             match heal_manager.submit_heal_request(req).await {
@@ -2436,9 +2831,11 @@ impl Scanner {
                                         "Submitted bucket heal task {} for missing bucket '{}' on disk {}",
                                         task_id, bucket, disk_idx
                                     );
+                                    self.record_heal_submission(Some(bucket)).await;
                                 }
                                 Err(e) => {
                                     error!("Failed to submit bucket heal task for '{}' on disk {}: {}", bucket, disk_idx, e);
+                                    self.metrics.increment_heal_tasks_failed(1);
                                 }
                             }
                         }
@@ -2568,6 +2965,7 @@ impl Scanner {
             disk_metrics: Arc::clone(&self.disk_metrics),
             data_usage_stats: Arc::clone(&self.data_usage_stats),
             last_data_usage_collection: Arc::clone(&self.last_data_usage_collection),
+            realtime_usage_cache: Arc::clone(&self.realtime_usage_cache),
             heal_manager: self.heal_manager.clone(),
             node_scanner: Arc::clone(&self.node_scanner),
             stats_aggregator: Arc::clone(&self.stats_aggregator),
@@ -3583,5 +3981,81 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(std::path::Path::new(TEST_DIR_HEALTHY));
+    }
+
+    #[test]
+    fn realtime_usage_cache_batches_wrap_in_order() {
+        let mut cache = RealtimeUsageCache::default();
+        let buckets = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        cache.align_with_bucket_list(&buckets);
+
+        let first = cache.next_batch(2);
+        assert_eq!(first, vec!["alpha".to_string(), "beta".to_string()]);
+
+        let second = cache.next_batch(2);
+        assert_eq!(second, vec!["gamma".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn realtime_usage_cache_builds_usage_info() {
+        let mut cache = RealtimeUsageCache::default();
+        let buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        cache.align_with_bucket_list(&buckets);
+
+        cache.upsert_bucket_usage(
+            "bucket-a",
+            BucketUsageInfo {
+                size: 128,
+                objects_count: 4,
+                versions_count: 4,
+                ..Default::default()
+            },
+        );
+        cache.upsert_bucket_usage(
+            "bucket-b",
+            BucketUsageInfo {
+                size: 64,
+                objects_count: 1,
+                versions_count: 1,
+                ..Default::default()
+            },
+        );
+
+        let usage = cache.build_usage_info(&buckets);
+        assert_eq!(usage.buckets_count, 2);
+        assert_eq!(usage.objects_total_count, 5);
+        assert_eq!(usage.objects_total_size, 192);
+        assert!(usage.buckets_usage.contains_key("bucket-a"));
+        assert!(usage.buckets_usage.contains_key("bucket-b"));
+    }
+
+    #[test]
+    fn realtime_usage_cache_records_snapshots() {
+        let mut cache = RealtimeUsageCache::default();
+        let mut snapshot = DataUsageInfo::default();
+        snapshot.buckets_usage.insert(
+            "primary".to_string(),
+            BucketUsageInfo {
+                size: 256,
+                objects_count: 10,
+                versions_count: 10,
+                ..Default::default()
+            },
+        );
+        snapshot.buckets_usage.insert(
+            "secondary".to_string(),
+            BucketUsageInfo {
+                size: 512,
+                objects_count: 3,
+                versions_count: 3,
+                ..Default::default()
+            },
+        );
+
+        cache.record_snapshot(&snapshot);
+        assert_eq!(cache.bucket_order.len(), 2);
+        assert!(cache.bucket_order.contains(&"primary".to_string()));
+        assert!(cache.bucket_order.contains(&"secondary".to_string()));
+        assert_eq!(cache.bucket_cursor, 0);
     }
 }
