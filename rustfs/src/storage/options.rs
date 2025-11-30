@@ -43,6 +43,32 @@ use crate::auth::AuthType;
 use crate::auth::get_request_auth_type;
 use crate::auth::is_request_presigned_signature_v4;
 
+/// Extract append operation options from HTTP headers
+/// Returns the write offset if x-amz-write-offset-bytes header is present
+pub fn extract_append_opts(headers: &HeaderMap<HeaderValue>) -> Result<Option<i64>> {
+    if let Some(offset_value) = headers.get(rustfs_utils::http::headers::AMZ_WRITE_OFFSET_BYTES) {
+        let offset_str = offset_value.to_str().map_err(|_| {
+            StorageError::InvalidArgument(String::new(), String::new(), "Invalid write offset header encoding".to_string())
+        })?;
+
+        let offset = offset_str.parse::<i64>().map_err(|_| {
+            StorageError::InvalidArgument(String::new(), String::new(), "Write offset must be a valid integer".to_string())
+        })?;
+
+        if offset < 0 {
+            return Err(StorageError::InvalidArgument(
+                String::new(),
+                String::new(),
+                "Write offset cannot be negative".to_string(),
+            ));
+        }
+
+        Ok(Some(offset))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
     bucket: &str,
@@ -556,6 +582,7 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue};
+    use rustfs_utils::http::headers as http_headers;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1070,5 +1097,46 @@ mod tests {
         assert!(parse_copy_source_range("bytes=").is_err());
         assert!(parse_copy_source_range("bytes=abc-def").is_err());
         assert!(parse_copy_source_range("bytes=100-50").is_err()); // start > end
+    }
+
+    #[test]
+    fn test_extract_append_opts_absent() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_append_opts(&headers).unwrap(), None);
+    }
+
+    #[test]
+    fn test_extract_append_opts_positive_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http_headers::AMZ_WRITE_OFFSET_BYTES, HeaderValue::from_static("12345"));
+        assert_eq!(extract_append_opts(&headers).unwrap(), Some(12345));
+    }
+
+    #[test]
+    fn test_extract_append_opts_zero_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http_headers::AMZ_WRITE_OFFSET_BYTES, HeaderValue::from_static("0"));
+        assert_eq!(extract_append_opts(&headers).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_extract_append_opts_negative_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http_headers::AMZ_WRITE_OFFSET_BYTES, HeaderValue::from_static("-2"));
+        assert!(matches!(extract_append_opts(&headers), Err(StorageError::InvalidArgument(_, _, _))));
+    }
+
+    #[test]
+    fn test_extract_append_opts_invalid_string_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http_headers::AMZ_WRITE_OFFSET_BYTES, HeaderValue::from_static("abc"));
+        assert!(matches!(extract_append_opts(&headers), Err(StorageError::InvalidArgument(_, _, _))));
+    }
+
+    #[test]
+    fn test_extract_append_opts_invalid_utf8_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http_headers::AMZ_WRITE_OFFSET_BYTES, HeaderValue::from_bytes(b"\xFF").unwrap());
+        assert!(matches!(extract_append_opts(&headers), Err(StorageError::InvalidArgument(_, _, _))));
     }
 }

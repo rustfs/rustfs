@@ -1130,6 +1130,47 @@ impl ObjectIO for ECStore {
 
         self.pools[idx].put_object(bucket, &object, data, opts).await
     }
+
+    #[instrument(level = "debug", skip(self, data))]
+    async fn append_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        check_put_object_args(bucket, object)?;
+
+        let object = encode_dir_object(object);
+
+        // Validate write_offset is provided
+        let write_offset = opts.write_offset.ok_or_else(|| {
+            Error::InvalidArgument(bucket.to_string(), object.to_string(), "write_offset required for append".to_string())
+        })?;
+
+        if self.single_pool() {
+            return self.pools[0].append_object_part(bucket, object.as_str(), data, opts).await;
+        }
+
+        // For multi-pool: must append to the same pool as existing object
+        let (existing_oi, idx) = self
+            .get_latest_object_info_with_idx(bucket, &object, &ObjectOptions::default())
+            .await?;
+
+        // Validate offset matches current size
+        if write_offset != existing_oi.size {
+            return Err(Error::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                format!(
+                    "Write offset {} does not match object size {}. Object may have been modified.",
+                    write_offset, existing_oi.size
+                ),
+            ));
+        }
+
+        self.pools[idx].append_object_part(bucket, object.as_str(), data, opts).await
+    }
 }
 
 lazy_static! {

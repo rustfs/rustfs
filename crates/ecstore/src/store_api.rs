@@ -395,6 +395,13 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 
     pub want_checksum: Option<Checksum>,
+
+    /// Append mode: write offset for append operations (bytes)
+    /// When set, indicates this is an append operation
+    pub write_offset: Option<i64>,
+
+    /// Internal: treat this as an appendable object (multi-part based)
+    pub appendable: bool,
 }
 
 impl ObjectOptions {
@@ -1197,6 +1204,17 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
     ) -> Result<GetObjectReader>;
     // PutObject
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
+    /// Append data to an existing object by adding a new part
+    /// This leverages the existing multipart architecture to efficiently append data
+    /// Each append creates a new part, avoiding the need to rewrite existing data
+    async fn append_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo>;
 }
 
 #[async_trait::async_trait]

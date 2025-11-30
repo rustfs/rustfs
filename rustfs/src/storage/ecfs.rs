@@ -2649,10 +2649,49 @@ impl S3 for FS {
             opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
 
-        let obj_info = store
-            .put_object(&bucket, &key, &mut reader, &opts)
-            .await
-            .map_err(ApiError::from)?;
+        // Extract append options from headers
+        let write_offset = crate::storage::options::extract_append_opts(&req.headers).map_err(ApiError::from)?;
+
+        // Route to appropriate method based on append header
+        let obj_info = if let Some(offset) = write_offset {
+            if offset == 0 {
+                // Offset zero behaves like a normal PUT only if the object truly does not exist yet.
+                match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+                    Ok(_) => {
+                        return Err(ApiError::from(StorageError::InvalidArgument(
+                            bucket.to_string(),
+                            key.to_string(),
+                            "Append with write offset 0 is not allowed for existing objects".to_string(),
+                        ))
+                        .into());
+                    }
+                    Err(err) => {
+                        if is_err_object_not_found(&err) {
+                            store
+                                .put_object(&bucket, &key, &mut reader, &opts)
+                                .await
+                                .map_err(ApiError::from)?
+                        } else {
+                            return Err(ApiError::from(err).into());
+                        }
+                    }
+                }
+            } else {
+                // Append mode: add as new part
+                opts.write_offset = Some(offset);
+                opts.appendable = true;
+                store
+                    .append_object_part(&bucket, &key, &mut reader, &opts)
+                    .await
+                    .map_err(ApiError::from)?
+            }
+        } else {
+            // Normal PUT
+            store
+                .put_object(&bucket, &key, &mut reader, &opts)
+                .await
+                .map_err(ApiError::from)?
+        };
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
         let repoptions =

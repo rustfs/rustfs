@@ -58,6 +58,8 @@ use crate::{
     },
     store_init::load_format_erasure,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::Utc;
@@ -65,6 +67,7 @@ use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
+use pin_project_lite::pin_project;
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
@@ -75,7 +78,9 @@ use rustfs_filemeta::{
 };
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
+use rustfs_rio::{
+    Checksum, ChecksumHasher, ChecksumType, EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader,
+};
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER};
@@ -94,12 +99,14 @@ use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
     path::Path,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 use time::OffsetDateTime;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     sync::{RwLock, broadcast},
 };
 use tokio::{
@@ -2291,8 +2298,19 @@ impl SetDisks {
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
+                // Determine if we should use inline data for this part
+                // For multi-part objects, only the first part (if any) may be in inline data
+                // Subsequent parts added via append will have separate part files
+                let use_inline_data = if current_part == 0 && files[idx].data.is_some() {
+                    // Part 1 may use inline data
+                    files[idx].data.as_deref()
+                } else {
+                    // Part 2+ always use disk files, not inline data
+                    None
+                };
+
                 match create_bitrot_reader(
-                    files[idx].data.as_deref(),
+                    use_inline_data,
                     disk_op.as_ref(),
                     bucket,
                     &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
@@ -3919,6 +3937,452 @@ impl ObjectIO for SetDisks {
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
+
+    #[tracing::instrument(level = "debug", skip(self, data))]
+    async fn append_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let disks_snapshot = self.get_disks_internal().await;
+        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
+
+        // Acquire exclusive lock for append operation
+        let _object_lock_guard = if !opts.no_lock {
+            Some(
+                self.fast_lock_manager
+                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                    .await
+                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+            )
+        } else {
+            None
+        };
+
+        // Step 1: Get existing FileInfo
+        let (mut fi, files_metas, existing_disks) = self
+            .get_object_fileinfo(bucket, object, opts, false)
+            .await
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+
+        // Append is only supported for unencrypted and uncompressed objects.
+        let is_encrypted = [
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-aws-kms-key-id",
+        ]
+        .iter()
+        .any(|k| fi.metadata.contains_key(*k));
+        if is_encrypted {
+            return Err(Error::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                "Append is not supported for encrypted objects".to_string(),
+            ));
+        }
+
+        let compression_key = format!("{RESERVED_METADATA_PREFIX_LOWER}compression");
+        if fi.metadata.contains_key(&compression_key) {
+            return Err(Error::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                "Append is not supported for compressed objects".to_string(),
+            ));
+        }
+
+        // Step 2: Validate write_offset
+        let write_offset = opts.write_offset.ok_or_else(|| {
+            Error::InvalidArgument(bucket.to_string(), object.to_string(), "write_offset required for append".to_string())
+        })?;
+
+        if write_offset != fi.size {
+            return Err(Error::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                format!(
+                    "Write offset {} does not match object size {}. Object may have been modified.",
+                    write_offset, fi.size
+                ),
+            ));
+        }
+
+        // Check if object is a delete marker
+        if fi.deleted {
+            return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
+        }
+
+        let write_quorum = fi.write_quorum(self.default_write_quorum());
+
+        if filtered_online < write_quorum {
+            warn!(
+                "online disk snapshot {} below write quorum {} for append {}/{}; returning erasure write quorum error",
+                filtered_online, write_quorum, bucket, object
+            );
+            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        }
+
+        // Step 3: Calculate next part number (preserve ordering even if existing parts have gaps)
+        let next_part_number = fi.parts.iter().map(|p| p.number).max().unwrap_or(0) + 1;
+
+        info!(
+            "Appending part {} to object {}/{}, current parts: {}, current size: {}, append size: {}",
+            next_part_number,
+            bucket,
+            object,
+            fi.parts.len(),
+            fi.size,
+            data.size()
+        );
+
+        // Step 4: Write new part using standard erasure coding
+        let append_size = data.size();
+        let actual_append_size = data.actual_size();
+        let mut logical_append_size = if append_size >= 0 { append_size } else { actual_append_size };
+        if logical_append_size < 0 {
+            logical_append_size = 0;
+        }
+
+        // Use the same erasure coding configuration as the original object
+        let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+
+        let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files_metas, &fi);
+
+        // Create temporary directory for the new part
+        let tmp_dir = Uuid::new_v4().to_string();
+        let part_suffix = format!("part.{next_part_number}");
+        let tmp_part_path = Arc::new(format!("{tmp_dir}/{part_suffix}"));
+
+        // Create writers for each disk
+        let mut writers = Vec::with_capacity(shuffle_disks.len());
+        let mut errors = Vec::with_capacity(shuffle_disks.len());
+
+        for disk_op in shuffle_disks.iter() {
+            if let Some(disk) = disk_op {
+                match create_bitrot_writer(
+                    false,
+                    Some(disk),
+                    RUSTFS_META_TMP_BUCKET,
+                    &tmp_part_path,
+                    erasure.shard_file_size(append_size),
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256,
+                )
+                .await
+                {
+                    Ok(writer) => {
+                        writers.push(Some(writer));
+                        errors.push(None);
+                    }
+                    Err(e) => {
+                        errors.push(Some(e));
+                        writers.push(None);
+                    }
+                }
+            } else {
+                errors.push(Some(DiskError::DiskNotFound));
+                writers.push(None);
+            }
+        }
+
+        let nil_count = errors.iter().filter(|&e| e.is_none()).count();
+        if nil_count < write_quorum {
+            if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+                return Err(to_object_err(write_err.into(), vec![bucket, object]));
+            }
+            return Err(Error::other(format!("not enough disks to write append part: {errors:?}")));
+        }
+
+        // Determine if we need to compute checksums based on existing object checksum
+        let mut tracker_types = Vec::new();
+        if data.as_hash_reader().content_crc().is_empty() {
+            if let Some(existing_bytes) = fi.checksum.as_ref() {
+                let (existing_map, _) = rustfs_rio::read_checksums(existing_bytes.as_ref(), 0);
+                for (alg, _) in existing_map.iter() {
+                    if alg.eq_ignore_ascii_case("x-amz-checksum-type") {
+                        continue;
+                    }
+                    let checksum_type = ChecksumType::from_string(alg);
+                    if !checksum_type.is_set() {
+                        continue;
+                    }
+                    let base_type = checksum_type.base();
+                    if !base_type.can_merge() {
+                        continue;
+                    }
+                    tracker_types.push((alg.clone(), base_type));
+                }
+            }
+        }
+
+        // Encode and write the data
+        let stream = mem::replace(
+            &mut data.stream,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
+        );
+
+        let append_reader = AppendChecksumReader::new(stream, tracker_types);
+        let (reader, w_size) = Arc::new(erasure).encode(append_reader, &mut writers, write_quorum).await?;
+        let (reader, tracked_checksums) = reader.into_inner();
+
+        let _ = mem::replace(&mut data.stream, reader);
+
+        if (w_size as i64) < append_size {
+            warn!(
+                "append_object_part write size < data.size(), w_size={}, data.size={}",
+                w_size, append_size
+            );
+            return Err(Error::other(format!(
+                "append_object_part write size < data.size(), w_size={}, data.size={}",
+                w_size, append_size
+            )));
+        }
+
+        // Get etag and checksums for the new part
+        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let etag = data.stream.try_resolve_etag().unwrap_or_default();
+
+        let mut actual_size = actual_append_size;
+        if actual_size < 0 {
+            let is_compressed = fi.is_compressed();
+            if !is_compressed {
+                actual_size = w_size as i64;
+            }
+        }
+
+        let mut checksums = data.as_hash_reader().content_crc();
+        if checksums.is_empty() && !tracked_checksums.is_empty() {
+            checksums = tracked_checksums;
+        }
+
+        if checksums.is_empty() {
+            if fi.checksum.is_some() {
+                tracing::debug!(
+                    "append_object_part: clearing existing full object checksum for {}/{} due to missing append checksum",
+                    bucket,
+                    object
+                );
+                fi.checksum = None;
+                for meta in parts_metadatas.iter_mut() {
+                    meta.checksum = None;
+                }
+            }
+        } else if let Some(existing_bytes) = fi.checksum.clone() {
+            match merge_full_object_checksums(existing_bytes.as_ref(), &checksums, logical_append_size) {
+                Ok(serialized) => {
+                    fi.checksum = Some(serialized.clone());
+                    for meta in parts_metadatas.iter_mut() {
+                        meta.checksum = Some(serialized.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("append_object_part: failed to merge checksums for {}/{}: {}", bucket, object, err);
+                    fi.checksum = None;
+                    for meta in parts_metadatas.iter_mut() {
+                        meta.checksum = None;
+                    }
+                }
+            }
+        }
+
+        // Create part info for the new part
+        let part_info = ObjectPartInfo {
+            etag: etag.clone(),
+            number: next_part_number,
+            size: w_size,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            actual_size,
+            index: index_op.clone(),
+            checksums: if checksums.is_empty() { None } else { Some(checksums) },
+            ..Default::default()
+        };
+
+        drop(writers); // Close all files before renaming
+
+        // Step 5: Update FileInfo with the new part
+        let mod_time = Some(OffsetDateTime::now_utc());
+
+        // Add the new part to FileInfo
+        fi.add_object_part(
+            next_part_number,
+            part_info.etag.clone(),
+            part_info.size,
+            part_info.mod_time,
+            part_info.actual_size,
+            part_info.index.clone(),
+            part_info.checksums.clone(),
+        );
+
+        // Update total size
+        fi.size += w_size as i64;
+        fi.mod_time = mod_time;
+
+        if let Some(new_etag) = recompute_object_etag(&fi.parts) {
+            fi.metadata.insert("etag".to_owned(), new_etag.clone());
+            for meta in parts_metadatas.iter_mut() {
+                meta.metadata.insert("etag".to_owned(), new_etag.clone());
+            }
+        }
+
+        // Update parts_metadatas with new part info
+        for pfi in parts_metadatas.iter_mut() {
+            pfi.add_object_part(
+                next_part_number,
+                part_info.etag.clone(),
+                part_info.size,
+                part_info.mod_time,
+                part_info.actual_size,
+                part_info.index.clone(),
+                part_info.checksums.clone(),
+            );
+            pfi.size = fi.size;
+            pfi.mod_time = mod_time;
+        }
+
+        // Step 6: Rename the temporary part to the object's data directory
+        let data_dir = fi.data_dir.ok_or_else(|| Error::other("object data_dir not found"))?;
+        // Construct the part path: object/data_dir/part_suffix
+        // Note: rename_part will add the bucket prefix, so we don't include it here
+        let final_part_path = format!("{}/{}/{}", object, data_dir, part_suffix);
+
+        // Rename part data from temp to final location
+        Self::rename_part(
+            &disks,
+            RUSTFS_META_TMP_BUCKET,
+            &tmp_part_path,
+            bucket,
+            &final_part_path,
+            part_info.marshal_msg()?.into(),
+            write_quorum,
+        )
+        .await?;
+
+        // Step 7: Update metadata on all disks
+        let (online_disks, _, _) = Self::rename_data(
+            &shuffle_disks,
+            RUSTFS_META_TMP_BUCKET,
+            tmp_dir.as_str(),
+            &parts_metadatas,
+            bucket,
+            object,
+            write_quorum,
+        )
+        .await?;
+
+        self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
+
+        // Get the final FileInfo from an online disk
+        for (i, op_disk) in online_disks.iter().enumerate() {
+            if let Some(disk) = op_disk {
+                if disk.is_online().await {
+                    fi = parts_metadatas[i].clone();
+                    break;
+                }
+            }
+        }
+
+        fi.replication_state_internal = Some(opts.put_replication_state());
+        fi.is_latest = true;
+
+        info!(
+            "Append completed: {}/{}, new total size: {}, parts count: {}, checksum_present={}",
+            bucket,
+            object,
+            fi.size,
+            fi.parts.len(),
+            fi.checksum.is_some()
+        );
+
+        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
+    }
+}
+
+pin_project! {
+    struct AppendChecksumReader<R> {
+        #[pin]
+        inner: R,
+        trackers: Vec<ChecksumTracker>,
+        computed: HashMap<String, String>,
+        finalized: bool,
+    }
+}
+
+impl<R> AppendChecksumReader<R> {
+    fn new(inner: R, tracker_types: Vec<(String, ChecksumType)>) -> Self {
+        let mut trackers = Vec::new();
+        for (alg, checksum_type) in tracker_types {
+            if let Some(hasher) = checksum_type.hasher() {
+                trackers.push(ChecksumTracker { alg, hasher });
+            }
+        }
+
+        Self {
+            inner,
+            trackers,
+            computed: HashMap::new(),
+            finalized: false,
+        }
+    }
+
+    fn finalize_if_needed(&mut self) {
+        Self::finalize_tracker_slice(&mut self.trackers, &mut self.computed, &mut self.finalized);
+    }
+
+    fn finalize_tracker_slice(trackers: &mut [ChecksumTracker], computed: &mut HashMap<String, String>, finalized: &mut bool) {
+        if *finalized {
+            return;
+        }
+        *finalized = true;
+
+        for tracker in trackers.iter_mut() {
+            let raw = tracker.hasher.finalize();
+            if raw.is_empty() {
+                continue;
+            }
+            let encoded = BASE64_STANDARD.encode(raw);
+            computed.insert(tracker.alg.clone(), encoded);
+        }
+    }
+
+    fn into_inner(mut self) -> (R, HashMap<String, String>) {
+        self.finalize_if_needed();
+        (self.inner, self.computed)
+    }
+}
+
+impl<R> AsyncRead for AppendChecksumReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let mut this = self.project();
+        let before = buf.filled().len();
+        match this.inner.as_mut().poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                let after = buf.filled().len();
+                let read = after - before;
+                if read > 0 && !this.trackers.is_empty() {
+                    let data = &buf.filled()[before..after];
+                    for tracker in this.trackers.iter_mut() {
+                        if let Err(err) = tracker.hasher.write_all(data) {
+                            return Poll::Ready(Err(err));
+                        }
+                    }
+                } else if read == 0 {
+                    AppendChecksumReader::<R>::finalize_tracker_slice(this.trackers, this.computed, this.finalized);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+struct ChecksumTracker {
+    alg: String,
+    hasher: Box<dyn ChecksumHasher>,
 }
 
 #[async_trait::async_trait]
@@ -6568,6 +7032,76 @@ fn is_min_allowed_part_size(size: i64) -> bool {
     size >= GLOBAL_MIN_PART_SIZE.as_u64() as i64
 }
 
+fn recompute_object_etag(parts: &[ObjectPartInfo]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+
+    if parts.len() == 1 {
+        return Some(parts[0].etag.clone());
+    }
+
+    let complete_parts = parts
+        .iter()
+        .map(|part| CompletePart {
+            part_num: part.number,
+            etag: Some(part.etag.clone()),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+    Some(get_complete_multipart_md5(&complete_parts))
+}
+
+fn merge_full_object_checksums(
+    existing_bytes: &[u8],
+    append_checksums: &HashMap<String, String>,
+    append_size: i64,
+) -> std::result::Result<Bytes, String> {
+    if append_checksums.is_empty() {
+        return Err("no append checksums provided".to_string());
+    }
+
+    let (existing_map, _) = rustfs_rio::read_checksums(existing_bytes, 0);
+    if existing_map.is_empty() {
+        return Err("existing object checksum map empty".to_string());
+    }
+
+    let mut merged_entries: Vec<(String, Checksum)> = Vec::new();
+    for (alg, existing_value) in existing_map.iter() {
+        if alg.eq_ignore_ascii_case("x-amz-checksum-type") {
+            continue;
+        }
+
+        let Some(part_value) = append_checksums.get(alg) else {
+            return Err(format!("missing append checksum for algorithm {alg}"));
+        };
+
+        let mut total_checksum =
+            Checksum::new_from_string(alg, existing_value).ok_or_else(|| format!("invalid checksum for {alg}"))?;
+        let part_checksum =
+            Checksum::new_from_string(alg, part_value).ok_or_else(|| format!("invalid append checksum for {alg}"))?;
+
+        total_checksum
+            .add_part(&part_checksum, append_size)
+            .map_err(|e| format!("failed merging checksum {alg}: {e}"))?;
+
+        merged_entries.push((alg.clone(), total_checksum));
+    }
+
+    if merged_entries.is_empty() {
+        return Err("no mergeable checksum entries found".to_string());
+    }
+
+    merged_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut buffer = Vec::new();
+    for (_, checksum) in merged_entries {
+        buffer = checksum.append_to(buffer, &[]);
+    }
+
+    Ok(Bytes::from(buffer))
+}
+
 fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     let mut buf = Vec::new();
 
@@ -7227,5 +7761,245 @@ mod tests {
         assert!(!is_infrequent_access_class(storageclass::RRS));
         assert!(!is_infrequent_access_class(storageclass::DEEP_ARCHIVE));
         assert!(!is_infrequent_access_class(storageclass::EXPRESS_ONEZONE));
+    }
+
+    #[test]
+    fn test_object_options_append_fields() {
+        // Test ObjectOptions with append-related fields
+        let mut opts = ObjectOptions::default();
+        assert_eq!(opts.write_offset, None);
+        assert!(!opts.appendable);
+
+        // Set append fields
+        opts.write_offset = Some(1024);
+        opts.appendable = true;
+        assert_eq!(opts.write_offset, Some(1024));
+        assert!(opts.appendable);
+
+        // Test negative offset
+        opts.write_offset = Some(-1);
+        assert_eq!(opts.write_offset, Some(-1));
+    }
+
+    #[test]
+    fn test_object_part_info_structure() {
+        // Test ObjectPartInfo creation for append operations
+        let now = OffsetDateTime::now_utc();
+
+        let part = ObjectPartInfo {
+            etag: "test-etag".to_string(),
+            number: 1,
+            size: 1024,
+            actual_size: 1024,
+            mod_time: Some(now),
+            index: None,
+            checksums: Some(HashMap::new()),
+            error: None,
+        };
+
+        assert_eq!(part.number, 1);
+        assert_eq!(part.size, 1024);
+        assert_eq!(part.etag, "test-etag");
+    }
+
+    #[test]
+    fn test_file_info_add_object_part() {
+        // Test FileInfo.add_object_part method used in append
+        let mut file_info = rustfs_filemeta::FileInfo {
+            volume: "test-volume".to_string(),
+            name: "test-object".to_string(),
+            version_id: None,
+            is_latest: true,
+            deleted: false,
+            transition_status: "".to_string(),
+            transitioned_objname: "".to_string(),
+            transition_tier: "".to_string(),
+            transition_version_id: None,
+            expire_restored: false,
+            data_dir: None,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1024,
+            mode: None,
+            written_by_version: None,
+            metadata: HashMap::new(),
+            parts: vec![],
+            erasure: ErasureInfo {
+                algorithm: "".to_string(),
+                data_blocks: 4,
+                parity_blocks: 2,
+                block_size: 1024 * 1024,
+                index: 1,
+                distribution: vec![1, 2, 3, 4, 5, 6],
+                checksums: vec![],
+            },
+            mark_deleted: false,
+            replication_state_internal: None,
+            data: None,
+            num_versions: 1,
+            successor_mod_time: None,
+            fresh: false,
+            idx: 0,
+            checksum: None,
+            versioned: false,
+        };
+
+        // Add first part
+        file_info.add_object_part(
+            1,
+            "etag1".to_string(),
+            1024,
+            Some(OffsetDateTime::now_utc()),
+            1024,
+            None,
+            Some(HashMap::new()),
+        );
+
+        assert_eq!(file_info.parts.len(), 1);
+        assert_eq!(file_info.parts[0].number, 1);
+        assert_eq!(file_info.parts[0].size, 1024);
+
+        // Add second part (simulating append)
+        file_info.add_object_part(
+            2,
+            "etag2".to_string(),
+            512,
+            Some(OffsetDateTime::now_utc()),
+            512,
+            None,
+            Some(HashMap::new()),
+        );
+
+        assert_eq!(file_info.parts.len(), 2);
+        assert_eq!(file_info.parts[1].number, 2);
+        assert_eq!(file_info.parts[1].size, 512);
+    }
+
+    #[test]
+    fn test_recompute_object_etag_single_part() {
+        let part = ObjectPartInfo {
+            etag: "3f786850e387550fdab836ed7e6dc881".to_string(),
+            number: 1,
+            size: 1024,
+            actual_size: 1024,
+            ..Default::default()
+        };
+
+        let etag = recompute_object_etag(std::slice::from_ref(&part));
+        assert_eq!(etag, Some(part.etag));
+    }
+
+    #[test]
+    fn test_recompute_object_etag_multi_part() {
+        let part1 = ObjectPartInfo {
+            etag: "3f786850e387550fdab836ed7e6dc881".to_string(),
+            number: 1,
+            size: 1024,
+            actual_size: 1024,
+            ..Default::default()
+        };
+        let part2 = ObjectPartInfo {
+            etag: "7d793037a0760186574b0282f2f435e7".to_string(),
+            number: 2,
+            size: 512,
+            actual_size: 512,
+            ..Default::default()
+        };
+
+        let expected = get_complete_multipart_md5(&[
+            CompletePart {
+                part_num: 1,
+                etag: Some(part1.etag.clone()),
+                ..Default::default()
+            },
+            CompletePart {
+                part_num: 2,
+                etag: Some(part2.etag.clone()),
+                ..Default::default()
+            },
+        ]);
+
+        let computed = recompute_object_etag(&[part1, part2]);
+        assert_eq!(computed, Some(expected));
+    }
+
+    #[test]
+    fn test_merge_full_object_checksums_multiple_algorithms() {
+        use rustfs_rio::ChecksumType;
+
+        let base_data = b"initial-data";
+        let append_data = b"more-data";
+
+        let checksum_types = [ChecksumType::CRC32, ChecksumType::CRC32C];
+        let mut existing_bytes = Vec::new();
+        let mut append_checksums = HashMap::new();
+
+        for ty in checksum_types {
+            let checksum = Checksum::new_from_data(ty, base_data).unwrap();
+            existing_bytes = checksum.append_to(existing_bytes, &[]);
+
+            let part_checksum = Checksum::new_from_data(ty, append_data).unwrap();
+            append_checksums.insert(ty.to_string(), part_checksum.encoded.clone());
+        }
+
+        let merged = merge_full_object_checksums(existing_bytes.as_slice(), &append_checksums, append_data.len() as i64).unwrap();
+
+        let (decoded, _) = rustfs_rio::read_checksums(merged.as_ref(), 0);
+        let mut combined = Vec::new();
+        combined.extend_from_slice(base_data);
+        combined.extend_from_slice(append_data);
+
+        for ty in checksum_types {
+            let expected = Checksum::new_from_data(ty, &combined).unwrap();
+            assert_eq!(decoded.get(&ty.to_string()), Some(&expected.encoded));
+        }
+    }
+
+    #[test]
+    fn test_merge_full_object_checksums_missing_algorithm_err() {
+        use rustfs_rio::ChecksumType;
+
+        let checksum = Checksum::new_from_data(ChecksumType::CRC32, b"hello").unwrap();
+        let existing_bytes = checksum.append_to(Vec::new(), &[]);
+
+        let err = merge_full_object_checksums(existing_bytes.as_slice(), &HashMap::new(), 5).unwrap_err();
+        assert!(err.contains("no append checksums"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_merge_full_object_checksums_invalid_append_checksum() {
+        use rustfs_rio::ChecksumType;
+
+        let checksum = Checksum::new_from_data(ChecksumType::CRC32, b"hello").unwrap();
+        let existing_bytes = checksum.append_to(Vec::new(), &[]);
+
+        let mut append_checksums = HashMap::new();
+        append_checksums.insert(ChecksumType::CRC32.to_string(), "not-base64".to_string());
+
+        let err = merge_full_object_checksums(existing_bytes.as_slice(), &append_checksums, 5).expect_err("should fail parsing");
+        assert!(err.contains("invalid append checksum"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_merge_full_object_checksums_non_mergeable_type() {
+        use rustfs_rio::ChecksumType;
+
+        let checksum = Checksum::new_from_data(ChecksumType::SHA256, b"hello").unwrap();
+        let existing_bytes = checksum.append_to(Vec::new(), &[]);
+
+        let mut append_checksums = HashMap::new();
+        append_checksums.insert(
+            ChecksumType::SHA256.to_string(),
+            Checksum::new_from_data(ChecksumType::SHA256, b"world")
+                .unwrap()
+                .encoded
+                .clone(),
+        );
+
+        let err = merge_full_object_checksums(existing_bytes.as_slice(), &append_checksums, 5).expect_err("should fail merge");
+        assert!(
+            err.contains("cannot be merged") || err.contains("checksum type cannot be merged"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

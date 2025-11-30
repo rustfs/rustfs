@@ -362,6 +362,19 @@ impl ObjectIO for Sets {
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
+
+    #[tracing::instrument(level = "debug", skip(self, data))]
+    async fn append_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object)
+            .append_object_part(bucket, object, data, opts)
+            .await
+    }
 }
 
 #[async_trait::async_trait]

@@ -189,6 +189,14 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_with_env(extra_args, &[]).await
+    }
+
+    pub async fn start_rustfs_server_with_env(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.cleanup_existing_processes().await?;
 
         let mut args = vec![
@@ -209,7 +217,12 @@ impl RustFSTestEnvironment {
         info!("Starting RustFS server with args: {:?}", args);
 
         let binary_path = rustfs_binary_path();
-        let process = Command::new(&binary_path).args(&args).spawn()?;
+        let mut command = Command::new(&binary_path);
+        command.args(&args);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let process = command.spawn()?;
 
         self.process = Some(process);
 
