@@ -176,7 +176,7 @@ cfg-if = "1.0.4"
 clap = { version = "4.5.53", features = ["derive", "env"] }
 const-str = { version = "0.7.0", features = ["std", "proc"] }
 convert_case = "0.10.0"
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "51.0.0"
 derive_builder = "0.20.2"
