@@ -28,6 +28,12 @@ RustFS KMS delivers enterprise-grade key management and data encryption.
 | [Troubleshooting](./kms/troubleshooting.md) | Diagnosis tips and solutions for common issues | Operations engineers |
 | [Security Guide](./kms/security.md) | Security best practices and compliance guidance | Security architects |
 
+### 📥 Object Operations
+
+| Document | Description | Audience |
+|------|------|----------|
+| [Append Upload Guide](./append/README.md) | Explains the `x-amz-write-offset-bytes` workflow, CLIs, SDK samples, and guardrails for appendable objects | Application developers & ingestion teams |
+
 ## 🚀 Quick Start
 
 ### 1. Deploy KMS in 5 Minutes
