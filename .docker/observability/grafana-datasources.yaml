@@ -42,7 +42,7 @@ datasources:
         customQuery: true
         query: 'method="$${__span.tags.method}"'
         tracesToMetrics:
-          datasourceUid: 'prom'
+          datasourceUid: 'prometheus'
           spanStartTimeShift: '-1h'
           spanEndTimeShift: '1h'
           tags: [ { key: 'service.name', value: 'service' }, { key: 'job' } ]
@@ -91,7 +91,7 @@ datasources:
         customQuery: true
         query: 'method="$${__span.tags.method}"'
       tracesToMetrics:
-        datasourceUid: 'prom'
+        datasourceUid: 'Prometheus'
         spanStartTimeShift: '1h'
         spanEndTimeShift: '-1h'
         tags: [ { key: 'service.name', value: 'service' }, { key: 'job' } ]

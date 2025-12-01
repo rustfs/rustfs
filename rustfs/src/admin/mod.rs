@@ -45,6 +45,7 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 
     // Health check endpoint for monitoring and orchestration
     r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::HEAD, "/health", AdminOperation(&HealthCheckHandler {}))?;
     r.insert(Method::GET, "/profile/cpu", AdminOperation(&TriggerProfileCPU {}))?;
     r.insert(Method::GET, "/profile/memory", AdminOperation(&TriggerProfileMemory {}))?;
 

@@ -536,17 +536,17 @@ fn process_connection(
                             ("key_request_method", format!("{}", request.method())),
                             ("key_request_uri_path", request.uri().path().to_owned().to_string()),
                         ];
-                        counter!("rustfs_api_requests_total", &labels).increment(1);
+                        counter!("rustfs.api.requests.total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
                         let _enter = span.enter();
-                        histogram!("request.latency.ms").record(latency.as_millis() as f64);
+                        histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        histogram!("request.body.len").record(chunk.len() as f64);
+                        histogram!("rustfs.request.body.len").record(chunk.len() as f64);
                         debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
@@ -555,7 +555,7 @@ fn process_connection(
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        counter!("rustfs_api_requests_failure_total").increment(1);
+                        counter!("rustfs.api.requests.failure.total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )

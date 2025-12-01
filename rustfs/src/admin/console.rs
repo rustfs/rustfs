@@ -15,7 +15,7 @@
 use crate::config::build;
 use crate::license::get_license;
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::Request,
     middleware,
@@ -405,7 +405,7 @@ fn setup_console_middleware_stack(
         .route("/favicon.ico", get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
         .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
-        .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check))
+        .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
@@ -418,7 +418,10 @@ fn setup_console_middleware_stack(
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)
         // Add timeout layer - convert auth_timeout from seconds to Duration
-        .layer(TimeoutLayer::new(Duration::from_secs(auth_timeout)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(auth_timeout),
+        ))
         // Add request body limit (10MB for console uploads)
         .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 
@@ -434,42 +437,104 @@ fn setup_console_middleware_stack(
 }
 
 /// Console health check handler with comprehensive health information
-async fn health_check() -> Json<serde_json::Value> {
-    use rustfs_ecstore::new_object_layer_fn;
+async fn health_check(method: Method) -> Response {
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json");
+    match method {
+        // GET: Returns complete JSON
+        Method::GET => {
+            let mut health_status = "ok";
+            let mut details = json!({});
 
-    let mut health_status = "ok";
-    let mut details = json!({});
+            // Check storage backend health
+            if let Some(_store) = rustfs_ecstore::new_object_layer_fn() {
+                details["storage"] = json!({"status": "connected"});
+            } else {
+                health_status = "degraded";
+                details["storage"] = json!({"status": "disconnected"});
+            }
 
-    // Check storage backend health
-    if let Some(_store) = new_object_layer_fn() {
-        details["storage"] = json!({"status": "connected"});
-    } else {
-        health_status = "degraded";
-        details["storage"] = json!({"status": "disconnected"});
-    }
+            // Check IAM system health
+            match rustfs_iam::get() {
+                Ok(_) => {
+                    details["iam"] = json!({"status": "connected"});
+                }
+                Err(_) => {
+                    health_status = "degraded";
+                    details["iam"] = json!({"status": "disconnected"});
+                }
+            }
 
-    // Check IAM system health
-    match rustfs_iam::get() {
-        Ok(_) => {
-            details["iam"] = json!({"status": "connected"});
+            let body_json = json!({
+                "status": health_status,
+                "service": "rustfs-console",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "details": details,
+                "uptime": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+            // Return a minimal JSON when serialization fails to avoid panic
+            let body_str = serde_json::to_string(&body_json).unwrap_or_else(|e| {
+                error!(
+                    target: "rustfs::console::health",
+                    "failed to serialize health check body: {}",
+                    e
+                );
+                // Simplified back-up JSON
+                "{\"status\":\"error\",\"service\":\"rustfs-console\"}".to_string()
+            });
+            builder.body(Body::from(body_str)).unwrap_or_else(|e| {
+                error!(
+                    target: "rustfs::console::health",
+                    "failed to build GET health response: {}",
+                    e
+                );
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("failed to build response"))
+                    .unwrap_or_else(|_| Response::new(Body::from("")))
+            })
         }
-        Err(_) => {
-            health_status = "degraded";
-            details["iam"] = json!({"status": "disconnected"});
-        }
-    }
 
-    Json(json!({
-        "status": health_status,
-        "service": "rustfs-console",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "details": details,
-        "uptime": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }))
+        // HEAD: Only status + headers are returned, body is empty
+        Method::HEAD => builder.body(Body::empty()).unwrap_or_else(|e| {
+            error!(
+                target: "rustfs::console::health",
+                "failed to build HEAD health response: {}",
+                e
+            );
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("failed to build response"))
+                .unwrap_or_else(|e| {
+                    error!(
+                        target: "rustfs::console::health",
+                        "failed to build HEAD health empty response, reason: {}",
+                        e
+                    );
+                    Response::new(Body::from(""))
+                })
+        }),
+
+        // Other methods: 405
+        _ => Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header("allow", "GET, HEAD")
+            .body(Body::from("Method Not Allowed"))
+            .unwrap_or_else(|e| {
+                error!(
+                    target: "rustfs::console::health",
+                    "failed to build 405 response: {}",
+                    e
+                );
+                Response::new(Body::from("Method Not Allowed"))
+            }),
+    }
 }
 
 /// Parse CORS allowed origins from configuration
