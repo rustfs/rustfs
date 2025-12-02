@@ -21,6 +21,8 @@ pub use constants::console::*;
 #[cfg(feature = "constants")]
 pub use constants::env::*;
 #[cfg(feature = "constants")]
+pub use constants::object::*;
+#[cfg(feature = "constants")]
 pub use constants::profiler::*;
 #[cfg(feature = "constants")]
 pub use constants::runtime::*;

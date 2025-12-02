@@ -2003,17 +2003,6 @@ impl DiskAPI for LocalDisk {
             }
         };
 
-        // CLAUDE DEBUG: Check if inline data is being preserved
-        tracing::info!(
-            "CLAUDE DEBUG: rename_data - Adding version to xlmeta. fi.data.is_some()={}, fi.inline_data()={}, fi.size={}",
-            fi.data.is_some(),
-            fi.inline_data(),
-            fi.size
-        );
-        if let Some(ref data) = fi.data {
-            tracing::info!("CLAUDE DEBUG: rename_data - FileInfo has inline data: {} bytes", data.len());
-        }
-
         xlmeta.add_version(fi.clone())?;
 
         if xlmeta.versions.len() <= 10 {
@@ -2021,10 +2010,6 @@ impl DiskAPI for LocalDisk {
         }
 
         let new_dst_buf = xlmeta.marshal_msg()?;
-        tracing::info!(
-            "CLAUDE DEBUG: rename_data - Marshaled xlmeta, new_dst_buf size: {} bytes",
-            new_dst_buf.len()
-        );
 
         self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
             .await?;

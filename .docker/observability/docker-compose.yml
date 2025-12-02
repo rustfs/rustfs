@@ -34,61 +34,111 @@ services:
     ports:
       - "3200:3200" # tempo
       - "24317:4317" # otlp grpc
+      - "24318:4318" # otlp http
     restart: unless-stopped
     networks:
       - otel-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/metrics" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "1888:1888"
-      - "8888:8888"
-      - "8889:8889"
-      - "13133:13133"
-      - "4317:4317"
-      - "4318:4318"
-      - "55679:55679"
+      - "1888:1888" # pprof
+      - "8888:8888" # Prometheus metrics for Collector
+      - "8889:8889" # Prometheus metrics for application indicators
+      - "13133:13133" # health check
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "55679:55679" # zpages
     networks:
       - otel-network
+    depends_on:
+      jaeger:
+        condition: service_started
+      tempo:
+        condition: service_started
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   jaeger:
     image: jaegertracing/jaeger:latest
     environment:
       - TZ=Asia/Shanghai
+      - SPAN_STORAGE_TYPE=memory
+      - COLLECTOR_OTLP_ENABLED=true
     ports:
-      - "16686:16686"
-      - "14317:4317"
-      - "14318:4318"
+      - "16686:16686" # Web UI
+      - "14317:4317" # OTLP gRPC
+      - "14318:4318" # OTLP HTTP
+      - "18888:8888" # collector
     networks:
       - otel-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:16686" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
   prometheus:
     image: prom/prometheus:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-data:/prometheus
     ports:
       - "9090:9090"
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--web.enable-otlp-receiver' # Enable OTLP
+      - '--web.enable-remote-write-receiver' # Enable remote write
       - '--enable-feature=promql-experimental-functions' # Enable info()
+      - '--storage.tsdb.min-block-duration=15m' # Minimum block duration
+      - '--storage.tsdb.max-block-duration=1h'  # Maximum block duration
+      - '--log.level=info'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    restart: unless-stopped
     networks:
       - otel-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
   loki:
     image: grafana/loki:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./loki-config.yaml:/etc/loki/local-config.yaml
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
     networks:
       - otel-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3100/ready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -97,14 +147,32 @@ services:
       - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
       - TZ=Asia/Shanghai
+      - GF_INSTALL_PLUGINS=grafana-pyroscope-datasource
+    restart: unless-stopped
     networks:
       - otel-network
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
+volumes:
+  prometheus-data:
+  tempo-data:
 
 networks:
   otel-network:
     driver: bridge
     name: "network_otel_config"
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
     driver_opts:
       com.docker.network.enable_ipv6: "true"

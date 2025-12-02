@@ -85,7 +85,13 @@ where
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
         let path = uri.path();
-        if method == Method::GET && (path == "/health" || path == "/profile/cpu" || path == "/profile/memory") {
+        // Profiling endpoints
+        if method == Method::GET && (path == "/profile/cpu" || path == "/profile/memory") {
+            return true;
+        }
+
+        // Health check
+        if (method == Method::HEAD || method == Method::GET) && path == "/health" {
             return true;
         }
 
@@ -105,9 +111,17 @@ where
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         // Allow unauthenticated access to health check
         let path = req.uri.path();
-        if req.method == Method::GET && (path == "/health" || path == "/profile/cpu" || path == "/profile/memory") {
+
+        // Profiling endpoints
+        if req.method == Method::GET && (path == "/profile/cpu" || path == "/profile/memory") {
             return Ok(());
         }
+
+        // Health check
+        if (req.method == Method::HEAD || req.method == Method::GET) && path == "/health" {
+            return Ok(());
+        }
+
         // Allow unauthenticated access to console static files if console is enabled
         if self.console_enabled && is_console_path(path) {
             return Ok(());

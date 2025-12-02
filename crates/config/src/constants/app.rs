@@ -25,7 +25,7 @@ pub const VERSION: &str = "1.0.0";
 
 /// Default configuration logger level
 /// Default value: error
-/// Environment variable: RUSTFS_LOG_LEVEL
+/// Environment variable: RUSTFS_OBS_LOGGER_LEVEL
 pub const DEFAULT_LOG_LEVEL: &str = "error";
 
 /// Default configuration use stdout
