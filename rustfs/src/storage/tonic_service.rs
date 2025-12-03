@@ -451,7 +451,7 @@ impl Node for NodeService {
                     }));
                 }
             };
-            match disk.verify_file(&request.volume, &request.path, &file_info).await {
+            match disk.check_parts(&request.volume, &request.path, &file_info).await {
                 Ok(check_parts_resp) => {
                     let check_parts_resp = match serde_json::to_string(&check_parts_resp) {
                         Ok(check_parts_resp) => check_parts_resp,
