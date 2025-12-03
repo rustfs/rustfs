@@ -76,7 +76,6 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | **Licensing** | **Permissive Apache 2.0**<br>Business-friendly, no "poison pill" clauses. | **Restrictive AGPL v3**<br>Risk of license traps and intellectual property pollution. |
 | **Compatibility** | **100% S3 Compatible**<br>Works with any cloud provider or client, anywhere. | **Variable Compatibility**<br>May lack support for local cloud vendors or specific APIs. |
 | **Edge & IoT** | **Strong Edge Support**<br>Ideal for secure, innovative edge devices. | **Weak Edge Support**<br>Often too heavy for edge gateways. |
-| **Cost** | **Stable & Free**<br>Free community support, stable commercial pricing. | **High Cost**<br>Can cost up to $250,000 for 1PiB. |
 | **Risk Profile** | **Enterprise Risk Mitigation**<br>Clear IP rights and safe for commercial use. | **Legal Risks**<br>Intellectual property ambiguity and usage restrictions. |
 
 ## Quickstart
