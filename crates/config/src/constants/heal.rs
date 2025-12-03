@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Environment variable name that enables or disables authentication for heal operations.
-/// - Purpose: Control whether authentication is required for heal operations.
+/// Environment variable name that enables or disables auto-heal functionality.
+/// - Purpose: Control whether the system automatically performs heal operations.
 /// - Valid values: "true" or "false" (case insensitive).
-/// - Semantics: When set to "true", heal operations will require valid authentication credentials; when set to "false", heal operations can be performed without authentication.
+/// - Semantics: When set to "true", auto-heal is enabled and the system will automatically attempt to heal detected issues; when set to "false", auto-heal is disabled and healing must be triggered manually.
 /// - Example: `export RUSTFS_HEAL_AUTO_HEAL_ENABLE=true`
-/// - Note: Enabling authentication for heal operations enhances security but may introduce additional overhead; evaluate based on your security requirements.
+/// - Note: Enabling auto-heal can improve system resilience by automatically addressing issues, but may increase resource usage; evaluate based on your operational requirements.
 pub const ENV_HEAL_AUTO_HEAL_ENABLE: &str = "RUSTFS_HEAL_AUTO_HEAL_ENABLE";
 
 /// Environment variable name that specifies the heal queue size.
@@ -59,7 +59,7 @@ pub const ENV_HEAL_MAX_CONCURRENT_HEALS: &str = "RUSTFS_HEAL_MAX_CONCURRENT_HEAL
 /// Default value for enabling authentication for heal operations if not specified in the environment variable.
 /// - Value: true (authentication enabled).
 /// - Rationale: Enabling authentication by default enhances security for heal operations.
-/// - Adjustments: Users may disable this feature via the `RUSTFS_HEAL_AUTH_ENABLE` environment variable based on their security requirements.
+/// - Adjustments: Users may disable this feature via the `RUSTFS_HEAL_AUTO_HEAL_ENABLE` environment variable based on their security requirements.
 pub const DEFAULT_HEAL_AUTO_HEAL_ENABLE: bool = true;
 
 /// Default heal queue size if not specified in the environment variable.
