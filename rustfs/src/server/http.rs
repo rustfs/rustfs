@@ -215,7 +215,7 @@ pub async fn start_http_server(
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
-        admin::console::init_console_cfg(local_ip, server_port);
+        admin::console::init_console_cfg(local_ip, server_port, opt.api_public_endpoint.clone());
 
         info!(
             target: "rustfs::console::startup",
