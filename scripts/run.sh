@@ -29,7 +29,7 @@ current_dir=$(pwd)
 echo "Current directory: $current_dir"
 
 # mkdir -p ./target/volume/test
-mkdir -p ./target/volume/test{1..4}
+mkdir -p ./target/volume/test{1..16}
 
 
 if [ -z "$RUST_LOG" ]; then
@@ -41,7 +41,7 @@ fi
 
 # export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
-export RUSTFS_VOLUMES="./target/volume/test{1...4}"
+export RUSTFS_VOLUMES="./target/volume/test{1...16}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
@@ -66,7 +66,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=production # Environment name
 export RUSTFS_OBS_LOGGER_LEVEL=warn # Log level, supports trace, debug, info, warn, error
-export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
@@ -77,7 +77,7 @@ export RUSTFS_OBS_LOG_FLUSH_MS=300 # Log flush interval in milliseconds
 #tokio runtime
 export RUSTFS_RUNTIME_WORKER_THREADS=16
 export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
-export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=true
+export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
 # shellcheck disable=SC2125
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
@@ -114,7 +114,7 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 export RUSTFS_ENABLE_SCANNER=false
 
-export RUSTFS_ENABLE_HEAL=false
+export RUSTFS_ENABLE_HEAL=true
 
 # Object cache configuration
 export RUSTFS_OBJECT_CACHE_ENABLE=true
