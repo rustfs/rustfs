@@ -6440,8 +6440,10 @@ async fn disks_with_all_parts(
     object: &str,
     scan_mode: HealScanMode,
 ) -> disk::error::Result<(Vec<Option<DiskStore>>, HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
+    let object_name = latest_meta.name.clone();
     info!(
-        "disks_with_all_parts: starting with online_disks.len()={}, scan_mode={:?}",
+        "disks_with_all_parts: starting with object_name={}, online_disks.len()={}, scan_mode={:?}",
+        object_name,
         online_disks.len(),
         scan_mode
     );
@@ -6460,7 +6462,7 @@ async fn disks_with_all_parts(
         if meta.is_valid() && !meta.deleted && meta.erasure.distribution.len() != online_disks.len()
             || (!meta.erasure.distribution.is_empty() && meta.erasure.distribution[index] != meta.erasure.index)
         {
-            warn!("file info inconsistent, meta: {:?}", meta);
+            warn!("file info inconsistent, object_name={}, meta: {:?}", object_name, meta);
             inconsistent += 1;
         }
     });
@@ -6490,28 +6492,31 @@ async fn disks_with_all_parts(
         }
         let meta = &parts_metadata[index];
         if !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir) {
-            warn!("mod_time is not Eq, file corrupt, index: {index}");
+            warn!("mod_time is not Eq, file corrupt, object_name={}, index: {index}", object_name);
             meta_errs[index] = Some(DiskError::FileCorrupt);
             parts_metadata[index] = FileInfo::default();
             continue;
         }
         if erasure_distribution_reliable {
             if !meta.is_valid() {
-                warn!("file info is not valid, file corrupt, index: {index}");
+                warn!("file info is not valid, file corrupt, object_name={}, index: {index}", object_name);
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
                 continue;
             }
 
             if !meta.deleted && meta.erasure.distribution.len() != online_disks.len() {
-                warn!("file info distribution len not Eq online_disks len, file corrupt, index: {index}");
+                warn!(
+                    "file info distribution len not Eq online_disks len, file corrupt, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
                 continue;
             }
         }
     }
-    // info!("meta_errs: {:?}, errs: {:?}", meta_errs, errs);
+    info!("meta_errs: {:?}, errs: {:?}, object_name={}", meta_errs, errs, object_name);
     meta_errs.iter().enumerate().for_each(|(index, err)| {
         if err.is_some() {
             let part_err = conv_part_err_to_int(err);
@@ -6521,7 +6526,10 @@ async fn disks_with_all_parts(
         }
     });
 
-    // info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
+    info!(
+        "data_errs_by_part: {:?}, data_errs_by_disk: {:?}, object_name={}",
+        data_errs_by_part, data_errs_by_disk, object_name
+    );
     for (index, disk) in online_disks.iter().enumerate() {
         if meta_errs[index].is_some() {
             continue;
@@ -6558,7 +6566,7 @@ async fn disks_with_all_parts(
                 if let Some(vec) = data_errs_by_part.get_mut(&0) {
                     if index < vec.len() {
                         vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                        info!("bitrot check result: {}", vec[index]);
+                        info!("bitrot check result: object_name={}, index: {index}, result: {}", object_name, vec[index]);
                     }
                 }
             }
@@ -6595,17 +6603,23 @@ async fn disks_with_all_parts(
             if let Some(vec) = data_errs_by_part.get_mut(&p) {
                 if index < vec.len() {
                     if verify_err.is_some() {
-                        info!("verify_err");
+                        info!("verify_err, object_name={}, index: {index}", object_name);
                         vec[index] = conv_part_err_to_int(&verify_err.clone());
                     } else {
-                        info!("verify_resp, verify_resp.results {}", verify_resp.results[p]);
+                        info!(
+                            "verify_resp, object_name={}, index: {index}, verify_resp.results {}",
+                            object_name, verify_resp.results[p]
+                        );
                         vec[index] = verify_resp.results[p];
                     }
                 }
             }
         }
     }
-    // info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
+    info!(
+        "data_errs_by_part: {:?}, data_errs_by_disk: {:?}, object_name={}",
+        data_errs_by_part, data_errs_by_disk, object_name
+    );
     for (part, disks) in data_errs_by_part.iter() {
         for (idx, disk) in disks.iter().enumerate() {
             if let Some(vec) = data_errs_by_disk.get_mut(&idx) {
@@ -6613,8 +6627,13 @@ async fn disks_with_all_parts(
             }
         }
     }
-    // info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
+    info!(
+        "data_errs_by_part: {:?}, data_errs_by_disk: {:?}, object_name={}",
+        data_errs_by_part, data_errs_by_disk, object_name
+    );
     for (i, disk) in online_disks.iter().enumerate() {
+        info!("data_errs_by_disk {i}: {:?}, object_name={}", data_errs_by_disk[&i], object_name);
+
         if meta_errs[i].is_none() && disk.is_some() && !has_part_err(&data_errs_by_disk[&i]) {
             available_disks[i] = Some(disk.clone().unwrap());
         } else {
