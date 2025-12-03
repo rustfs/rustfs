@@ -15,6 +15,7 @@
 pub(crate) mod app;
 pub(crate) mod console;
 pub(crate) mod env;
+pub(crate) mod heal;
 pub(crate) mod object;
 pub(crate) mod profiler;
 pub(crate) mod runtime;
