@@ -122,6 +122,9 @@ export RUSTFS_OBJECT_CACHE_ENABLE=true
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false
 
+# Heal configuration queue size
+export RUSTFS_HEAL_QUEUE_SIZE=10000
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi

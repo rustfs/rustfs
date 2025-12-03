@@ -195,12 +195,28 @@ pub struct HealConfig {
 
 impl Default for HealConfig {
     fn default() -> Self {
+        let queue_size: usize =
+            rustfs_utils::get_env_usize(rustfs_config::ENV_HEAL_QUEUE_SIZE, rustfs_config::DEFAULT_HEAL_QUEUE_SIZE);
+        let heal_interval = Duration::from_secs(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEAL_INTERVAL_SECS,
+            rustfs_config::DEFAULT_HEAL_INTERVAL_SECS,
+        ));
+        let enable_auto_heal =
+            rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_AUTO_HEAL_ENABLE, rustfs_config::DEFAULT_HEAL_AUTO_HEAL_ENABLE);
+        let task_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEAL_TASK_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_HEAL_TASK_TIMEOUT_SECS,
+        ));
+        let max_concurrent_heals = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_MAX_CONCURRENT_HEALS,
+            rustfs_config::DEFAULT_HEAL_MAX_CONCURRENT_HEALS,
+        );
         Self {
-            enable_auto_heal: true,
-            heal_interval: Duration::from_secs(10), // 10 seconds
-            max_concurrent_heals: 4,
-            task_timeout: Duration::from_secs(300), // 5 minutes
-            queue_size: 1000,
+            enable_auto_heal,
+            heal_interval,        // 10 seconds
+            max_concurrent_heals, // max 4,
+            task_timeout,         // 5 minutes
+            queue_size,
         }
     }
 }
