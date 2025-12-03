@@ -2583,6 +2583,7 @@ impl S3 for FS {
             prefix: v2.prefix,
             max_keys: v2.max_keys,
             common_prefixes: v2.common_prefixes,
+            is_truncated: v2.is_truncated,
             ..Default::default()
         }))
     }
