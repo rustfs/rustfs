@@ -153,6 +153,11 @@ impl<'de> Deserialize<'de> for HealScanMode {
             where
                 E: serde::de::Error,
             {
+                // Try parsing as number string first (for URL-encoded values)
+                if let Ok(num) = value.parse::<u8>() {
+                    return self.visit_u8(num);
+                }
+                // Try parsing as named string
                 match value {
                     "Unknown" | "unknown" => Ok(HealScanMode::Unknown),
                     "Normal" | "normal" => Ok(HealScanMode::Normal),

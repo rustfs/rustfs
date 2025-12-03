@@ -6431,6 +6431,10 @@ fn join_errs(errs: &[Option<DiskError>]) -> String {
     errs.join(", ")
 }
 
+/// disks_with_all_partsv2 is a corrected version based on Go implementation.
+/// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
+/// It also checks if the status of each part (corrupted, missing, ok) in each drive.
+/// Returns (availableDisks, dataErrsByDisk, dataErrsByPart).
 async fn disks_with_all_parts(
     online_disks: &[Option<DiskStore>],
     parts_metadata: &mut [FileInfo],
@@ -6440,234 +6444,8 @@ async fn disks_with_all_parts(
     object: &str,
     scan_mode: HealScanMode,
 ) -> disk::error::Result<(Vec<Option<DiskStore>>, HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
-    return disks_with_all_partsv2(online_disks, parts_metadata, errs, latest_meta, bucket, object, scan_mode).await;
-
     let object_name = latest_meta.name.clone();
-    info!(
-        "disks_with_all_parts: starting with object_name={}, online_disks.len()={}, scan_mode={:?}",
-        object_name,
-        online_disks.len(),
-        scan_mode
-    );
-    let mut available_disks = vec![None; online_disks.len()];
-    let mut data_errs_by_disk: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..online_disks.len() {
-        data_errs_by_disk.insert(i, vec![1; latest_meta.parts.len()]);
-    }
-    let mut data_errs_by_part: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..latest_meta.parts.len() {
-        data_errs_by_part.insert(i, vec![1; online_disks.len()]);
-    }
-
-    let mut inconsistent = 0;
-    parts_metadata.iter().enumerate().for_each(|(index, meta)| {
-        if meta.is_valid() && !meta.deleted && meta.erasure.distribution.len() != online_disks.len()
-            || (!meta.erasure.distribution.is_empty() && meta.erasure.distribution[index] != meta.erasure.index)
-        {
-            warn!("file info inconsistent, object_name={}, meta: {:?}", object_name, meta);
-            inconsistent += 1;
-        }
-    });
-
-    let erasure_distribution_reliable = inconsistent <= parts_metadata.len() / 2;
-
-    let mut meta_errs = Vec::with_capacity(errs.len());
-    for _ in 0..errs.len() {
-        meta_errs.push(None);
-    }
-
-    for (index, disk) in online_disks.iter().enumerate() {
-        let disk = if let Some(disk) = disk {
-            disk
-        } else {
-            meta_errs[index] = Some(DiskError::DiskNotFound);
-            continue;
-        };
-
-        if let Some(err) = &errs[index] {
-            meta_errs[index] = Some(err.clone());
-            continue;
-        }
-        if !disk.is_online().await {
-            meta_errs[index] = Some(DiskError::DiskNotFound);
-            continue;
-        }
-        let meta = &parts_metadata[index];
-        if !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir) {
-            warn!("mod_time is not Eq, file corrupt, object_name={}, index: {index}", object_name);
-            meta_errs[index] = Some(DiskError::FileCorrupt);
-            parts_metadata[index] = FileInfo::default();
-            continue;
-        }
-        if erasure_distribution_reliable {
-            if !meta.is_valid() {
-                warn!("file info is not valid, file corrupt, object_name={}, index: {index}", object_name);
-                parts_metadata[index] = FileInfo::default();
-                meta_errs[index] = Some(DiskError::FileCorrupt);
-                continue;
-            }
-
-            if !meta.deleted && meta.erasure.distribution.len() != online_disks.len() {
-                warn!(
-                    "file info distribution len not Eq online_disks len, file corrupt, object_name={}, index: {index}",
-                    object_name
-                );
-                parts_metadata[index] = FileInfo::default();
-                meta_errs[index] = Some(DiskError::FileCorrupt);
-                continue;
-            }
-        }
-    }
-    info!("meta_errs: {:?}, errs: {:?}, object_name={}", meta_errs, errs, object_name);
-    meta_errs.iter().enumerate().for_each(|(index, err)| {
-        if err.is_some() {
-            let part_err = conv_part_err_to_int(err);
-            for p in 0..latest_meta.parts.len() {
-                data_errs_by_part.entry(p).or_insert(vec![0; meta_errs.len()])[index] = part_err;
-            }
-        }
-    });
-
-    info!(
-        "data_errs_by_part: {:?}, data_errs_by_disk: {:?}, object_name={}",
-        data_errs_by_part, data_errs_by_disk, object_name
-    );
-    for (index, disk) in online_disks.iter().enumerate() {
-        if meta_errs[index].is_some() {
-            continue;
-        }
-
-        let disk = if let Some(disk) = disk {
-            disk
-        } else {
-            meta_errs[index] = Some(DiskError::DiskNotFound);
-            continue;
-        };
-
-        let meta = &mut parts_metadata[index];
-        if meta.deleted || meta.is_remote() {
-            continue;
-        }
-
-        // Always check data, if we got it.
-        if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
-            if let Some(data) = &meta.data {
-                let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
-                let data_len = data.len();
-                let verify_err = bitrot_verify(
-                    Box::new(Cursor::new(data.clone())),
-                    data_len,
-                    meta.erasure.shard_file_size(meta.size) as usize,
-                    checksum_info.algorithm,
-                    checksum_info.hash,
-                    meta.erasure.shard_size(),
-                )
-                .await
-                .err();
-
-                if let Some(vec) = data_errs_by_part.get_mut(&0) {
-                    if index < vec.len() {
-                        vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                        info!("bitrot check result: object_name={}, index: {index}, result: {}", object_name, vec[index]);
-                    }
-                }
-            }
-            continue;
-        }
-
-        let mut verify_resp = CheckPartsResp::default();
-        let mut verify_err = None;
-        meta.data_dir = latest_meta.data_dir;
-        if scan_mode == HealScanMode::Deep {
-            // disk has a valid xl.meta but may not have all the
-            // parts. This is considered an outdated disk, since
-            // it needs healing too.
-            match disk.verify_file(bucket, object, meta).await {
-                Ok(v) => {
-                    verify_resp = v;
-                }
-                Err(err) => {
-                    verify_err = Some(err);
-                }
-            }
-        } else {
-            match disk.check_parts(bucket, object, meta).await {
-                Ok(v) => {
-                    verify_resp = v;
-                }
-                Err(err) => {
-                    verify_err = Some(err);
-                }
-            }
-        }
-
-        for p in 0..latest_meta.parts.len() {
-            if let Some(vec) = data_errs_by_part.get_mut(&p) {
-                if index < vec.len() {
-                    if verify_err.is_some() {
-                        info!("verify_err, object_name={}, index: {index}", object_name);
-                        vec[index] = conv_part_err_to_int(&verify_err.clone());
-                    } else {
-                        info!(
-                            "verify_resp, object_name={}, index: {index}, verify_resp.results {}",
-                            object_name, verify_resp.results[p]
-                        );
-                        vec[index] = verify_resp.results[p];
-                    }
-                }
-            }
-        }
-    }
-    info!(
-        "data_errs_by_part: {:?}, data_errs_by_disk: {:?}, object_name={}",
-        data_errs_by_part, data_errs_by_disk, object_name
-    );
-    for (part, disks) in data_errs_by_part.iter() {
-        for (idx, disk) in disks.iter().enumerate() {
-            if let Some(vec) = data_errs_by_disk.get_mut(&idx) {
-                vec[*part] = *disk;
-            }
-        }
-    }
-    info!(
-        "data_errs_by_part: {:?}, data_errs_by_disk: {:?}, object_name={}",
-        data_errs_by_part, data_errs_by_disk, object_name
-    );
-    for (i, disk) in online_disks.iter().enumerate() {
-        info!(
-            "data_errs_by_disk {i}: meta_errs={:?}, data_errs_by_disk={:?}, disk_is_some={:?}, object_name={}",
-            meta_errs[i],
-            data_errs_by_disk[&i],
-            disk.is_some(),
-            object_name
-        );
-
-        if meta_errs[i].is_none() && disk.is_some() && !has_part_err(&data_errs_by_disk[&i]) {
-            available_disks[i] = Some(disk.clone().unwrap());
-        } else {
-            warn!("disks_with_all_parts: disk is not available, object_name={}, index: {i}", object_name);
-            parts_metadata[i] = FileInfo::default();
-        }
-    }
-
-    Ok((available_disks, data_errs_by_disk, data_errs_by_part))
-}
-
-/// disks_with_all_partsv2 is a corrected version based on Go implementation.
-/// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
-/// It also checks if the status of each part (corrupted, missing, ok) in each drive.
-/// Returns (availableDisks, dataErrsByDisk, dataErrsByPart).
-async fn disks_with_all_partsv2(
-    online_disks: &[Option<DiskStore>],
-    parts_metadata: &mut [FileInfo],
-    errs: &[Option<DiskError>],
-    latest_meta: &FileInfo,
-    bucket: &str,
-    object: &str,
-    scan_mode: HealScanMode,
-) -> disk::error::Result<(Vec<Option<DiskStore>>, HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
-    let object_name = latest_meta.name.clone();
-    info!(
+    debug!(
         "disks_with_all_partsv2: starting with object_name={}, online_disks.len()={}, scan_mode={:?}",
         object_name,
         online_disks.len(),
@@ -6881,7 +6659,7 @@ async fn disks_with_all_partsv2(
                             );
                             vec[index] = verify_resp.results[p];
                         } else {
-                            warn!(
+                            debug!(
                                 "data_errs_by_part: verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
                                 p + 1,
                                 verify_resp.results.len(),
