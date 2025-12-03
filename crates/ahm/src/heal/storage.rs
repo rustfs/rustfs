@@ -107,8 +107,20 @@ pub trait HealStorageAPI: Send + Sync {
     /// Heal format using ecstore
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
 
-    /// List objects for healing
+    /// List objects for healing (returns all objects, may use significant memory for large buckets)
+    ///
+    /// WARNING: This method loads all objects into memory at once. For buckets with many objects,
+    /// consider using `list_objects_for_heal_page` instead to process objects in pages.
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>>;
+
+    /// List objects for healing with pagination (returns one page and continuation token)
+    /// Returns (objects, next_continuation_token, is_truncated)
+    async fn list_objects_for_heal_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>, bool)>;
 
     /// Get disk for resume functionality
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore>;
@@ -493,24 +505,67 @@ impl HealStorageAPI for ECStoreHealStorage {
 
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
         debug!("Listing objects for heal: {}/{}", bucket, prefix);
+        warn!(
+            "list_objects_for_heal loads all objects into memory. For large buckets, consider using list_objects_for_heal_page instead."
+        );
 
-        // Use list_objects_v2 to get objects
-        match self
-            .ecstore
-            .clone()
-            .list_objects_v2(bucket, prefix, None, None, 1000, false, None, false)
-            .await
-        {
-            Ok(list_info) => {
-                let objects: Vec<String> = list_info.objects.into_iter().map(|obj| obj.name).collect();
-                info!("Found {} objects for heal in {}/{}", objects.len(), bucket, prefix);
-                Ok(objects)
+        let mut all_objects = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let (page_objects, next_token, is_truncated) = self
+                .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref())
+                .await?;
+
+            all_objects.extend(page_objects);
+
+            if !is_truncated {
+                break;
             }
-            Err(e) => {
-                error!("Failed to list objects for heal: {}/{} - {}", bucket, prefix, e);
-                Err(Error::other(e))
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                warn!("List is truncated but no continuation token provided for {}/{}", bucket, prefix);
+                break;
             }
         }
+
+        info!("Found {} objects for heal in {}/{}", all_objects.len(), bucket, prefix);
+        Ok(all_objects)
+    }
+
+    async fn list_objects_for_heal_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>, bool)> {
+        debug!("Listing objects for heal (page): {}/{}", bucket, prefix);
+
+        const MAX_KEYS: i32 = 1000;
+        let continuation_token_opt = continuation_token.map(|s| s.to_string());
+
+        // Use list_objects_v2 to get objects with pagination
+        let list_info = match self
+            .ecstore
+            .clone()
+            .list_objects_v2(bucket, prefix, continuation_token_opt, None, MAX_KEYS, false, None, false)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                error!("Failed to list objects for heal: {}/{} - {}", bucket, prefix, e);
+                return Err(Error::other(e));
+            }
+        };
+
+        // Collect objects from this page
+        let page_objects: Vec<String> = list_info.objects.into_iter().map(|obj| obj.name).collect();
+        let page_count = page_objects.len();
+
+        debug!("Listed {} objects (page) for heal in {}/{}", page_count, bucket, prefix);
+
+        Ok((page_objects, list_info.next_continuation_token, list_info.is_truncated))
     }
 
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
