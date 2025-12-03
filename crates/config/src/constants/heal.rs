@@ -16,9 +16,9 @@
 /// - Purpose: Control whether authentication is required for heal operations.
 /// - Valid values: "true" or "false" (case insensitive).
 /// - Semantics: When set to "true", heal operations will require valid authentication credentials; when set to "false", heal operations can be performed without authentication.
-/// - Example: `export RUSTFS_HEAL_AUTH_ENABLE=true`
+/// - Example: `export RUSTFS_HEAL_AUTO_HEAL_ENABLE=true`
 /// - Note: Enabling authentication for heal operations enhances security but may introduce additional overhead; evaluate based on your security requirements.
-pub const ENV_HEAL_AUTH_ENABLE: &str = "RUSTFS_HEAL_AUTH_ENABLE";
+pub const ENV_HEAL_AUTO_HEAL_ENABLE: &str = "RUSTFS_HEAL_AUTO_HEAL_ENABLE";
 
 /// Environment variable name that specifies the heal queue size.
 ///
@@ -29,7 +29,7 @@ pub const ENV_HEAL_AUTH_ENABLE: &str = "RUSTFS_HEAL_AUTH_ENABLE";
 /// - Example: `export RUSTFS_HEAL_QUEUE_SIZE=10000`
 /// - Note: A larger queue size can accommodate bursts of heal requests but may increase memory usage.
 pub const ENV_HEAL_QUEUE_SIZE: &str = "RUSTFS_HEAL_QUEUE_SIZE";
-//// Environment variable name that specifies the heal interval in seconds.
+/// Environment variable name that specifies the heal interval in seconds.
 /// - Purpose: Define the time interval between successive heal operations.
 /// - Unit: seconds (u64).
 /// - Valid values: any positive integer.
@@ -60,7 +60,7 @@ pub const ENV_HEAL_MAX_CONCURRENT_HEALS: &str = "RUSTFS_HEAL_MAX_CONCURRENT_HEAL
 /// - Value: true (authentication enabled).
 /// - Rationale: Enabling authentication by default enhances security for heal operations.
 /// - Adjustments: Users may disable this feature via the `RUSTFS_HEAL_AUTH_ENABLE` environment variable based on their security requirements.
-pub const DEFAULT_HEAL_AUTH_ENABLE: bool = true;
+pub const DEFAULT_HEAL_AUTO_HEAL_ENABLE: bool = true;
 
 /// Default heal queue size if not specified in the environment variable.
 ///

@@ -202,7 +202,7 @@ impl Default for HealConfig {
             rustfs_config::DEFAULT_HEAL_INTERVAL_SECS,
         ));
         let enable_auto_heal =
-            rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_AUTH_ENABLE, rustfs_config::DEFAULT_HEAL_AUTH_ENABLE);
+            rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_AUTO_HEAL_ENABLE, rustfs_config::DEFAULT_HEAL_AUTO_HEAL_ENABLE);
         let task_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
             rustfs_config::ENV_HEAL_TASK_TIMEOUT_SECS,
             rustfs_config::DEFAULT_HEAL_TASK_TIMEOUT_SECS,
