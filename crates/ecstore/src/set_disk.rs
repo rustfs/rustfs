@@ -3781,10 +3781,8 @@ impl ObjectIO for SetDisks {
             )
             .await
             {
-                error!("get_object_with_fileinfo err {:?}", e);
+                error!("get_object_with_fileinfo  {bucket}/{object} err {:?}", e);
             };
-
-            // error!("get_object_with_fileinfo end {}/{}", bucket, object);
         });
 
         Ok(reader)
