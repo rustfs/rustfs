@@ -1551,7 +1551,7 @@ impl DiskAPI for LocalDisk {
                 .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
                 .join(format!("part.{}", part.number));
 
-            match lstat(file_path).await {
+            match lstat(&file_path).await {
                 Ok(st) => {
                     if st.is_dir() {
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
@@ -1577,6 +1577,8 @@ impl DiskAPI for LocalDisk {
                             }
                         }
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
+                    } else {
+                        error!("check_parts: failed to stat file: {:?}, error: {:?}", &file_path, &e);
                     }
                     continue;
                 }

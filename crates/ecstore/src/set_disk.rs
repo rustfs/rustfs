@@ -6679,11 +6679,11 @@ async fn disks_with_all_partsv2(
     // Initialize dataErrsByDisk and dataErrsByPart with 0 (CHECK_PART_UNKNOWN) to match Go
     let mut data_errs_by_disk: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..online_disks.len() {
-        data_errs_by_disk.insert(i, vec![CHECK_PART_UNKNOWN; latest_meta.parts.len()]);
+        data_errs_by_disk.insert(i, vec![CHECK_PART_SUCCESS; latest_meta.parts.len()]);
     }
     let mut data_errs_by_part: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..latest_meta.parts.len() {
-        data_errs_by_part.insert(i, vec![CHECK_PART_UNKNOWN; online_disks.len()]);
+        data_errs_by_part.insert(i, vec![CHECK_PART_SUCCESS; online_disks.len()]);
     }
 
     // Check for inconsistent erasure distribution
@@ -6774,6 +6774,10 @@ async fn disks_with_all_partsv2(
             for p in 0..latest_meta.parts.len() {
                 if let Some(vec) = data_errs_by_part.get_mut(&p) {
                     if index < vec.len() {
+                        info!(
+                            "data_errs_by_part: copy meta errors to part errors: object_name={}, index: {index}, part: {p}, part_err: {part_err}",
+                            object_name
+                        );
                         vec[index] = part_err;
                     }
                 }
@@ -6817,7 +6821,10 @@ async fn disks_with_all_partsv2(
                 if let Some(vec) = data_errs_by_part.get_mut(&0) {
                     if index < vec.len() {
                         vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                        info!("bitrot check result: object_name={}, index: {index}, result: {}", object_name, vec[index]);
+                        info!(
+                            "data_errs_by_part:bitrot check result: object_name={}, index: {index}, result: {}",
+                            object_name, vec[index]
+                        );
                     }
                 }
             }
@@ -6859,20 +6866,28 @@ async fn disks_with_all_partsv2(
             if let Some(vec) = data_errs_by_part.get_mut(&p) {
                 if index < vec.len() {
                     if verify_err.is_some() {
+                        info!(
+                            "data_errs_by_part: verify_err: object_name={}, index: {index}, part: {p}, verify_err: {verify_err:?}",
+                            object_name
+                        );
                         vec[index] = conv_part_err_to_int(&verify_err.clone());
                     } else {
                         // Fix: verify_resp.results length is based on meta.parts, not latest_meta.parts
                         // We need to check bounds to avoid panic
                         if p < verify_resp.results.len() {
+                            info!(
+                                "data_errs_by_part: update data_errs_by_part: object_name={}, index: {}, part: {}, verify_resp.results: {:?}",
+                                object_name, index, p, verify_resp.results[p]
+                            );
                             vec[index] = verify_resp.results[p];
                         } else {
                             warn!(
-                                "verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
+                                "data_errs_by_part: verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
                                 p + 1,
                                 verify_resp.results.len(),
                                 object_name
                             );
-                            vec[index] = CHECK_PART_UNKNOWN;
+                            vec[index] = CHECK_PART_SUCCESS;
                         }
                     }
                 }
@@ -6886,6 +6901,10 @@ async fn disks_with_all_partsv2(
             if let Some(vec) = data_errs_by_disk.get_mut(&disk_idx) {
                 if *part < vec.len() {
                     vec[*part] = *disk_err;
+                    info!(
+                        "data_errs_by_disk: update data_errs_by_disk: object_name={}, part: {part}, disk_idx: {disk_idx}, disk_err: {disk_err}",
+                        object_name,
+                    );
                 }
             }
         }
