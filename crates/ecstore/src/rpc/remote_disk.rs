@@ -42,7 +42,7 @@ use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
 use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
 use tonic::Request;
-use tracing::info;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -596,14 +596,16 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
-        info!("list_dir {}/{}", volume, _dir_path);
+    async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
+        debug!("list_dir {}/{}", volume, dir_path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
         let request = Request::new(ListDirRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
+            dir_path: dir_path.to_string(),
+            count,
         });
 
         let response = client.list_dir(request).await?.into_inner();
