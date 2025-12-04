@@ -48,7 +48,7 @@ use crate::auth::is_request_presigned_signature_v4;
 pub fn extract_append_opts(headers: &HeaderMap<HeaderValue>) -> Result<Option<i64>> {
     if let Some(offset_value) = headers.get(rustfs_utils::http::headers::AMZ_WRITE_OFFSET_BYTES) {
         let offset_str = offset_value.to_str().map_err(|_| {
-            StorageError::InvalidArgument(String::new(), String::new(), "Invalid write offset header encoding".to_string())
+            StorageError::InvalidArgument(String::new(), String::new(), "Invalid encoding for x-amz-write-offset-bytes header".to_string())
         })?;
 
         let offset = offset_str.parse::<i64>().map_err(|_| {
