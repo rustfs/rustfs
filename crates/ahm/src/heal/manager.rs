@@ -31,7 +31,7 @@ use tokio::{
     time::interval,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
@@ -418,7 +418,12 @@ impl HealManager {
 
     /// Get statistics
     pub async fn get_statistics(&self) -> HealStatistics {
-        self.statistics.read().await.clone()
+        let stats = self.statistics.read().await.clone();
+        debug!(
+            "HealManager stats snapshot: total_tasks={}, successful_tasks={}, failed_tasks={}, running_tasks={}",
+            stats.total_tasks, stats.successful_tasks, stats.failed_tasks, stats.running_tasks
+        );
+        stats
     }
 
     /// Get active task count

@@ -62,6 +62,7 @@ struct DiskScanResult {
 pub struct LocalObjectRecord {
     pub usage: LocalObjectUsage,
     pub object_info: Option<rustfs_ecstore::store_api::ObjectInfo>,
+    pub file_info: Option<FileInfo>,
 }
 
 #[derive(Debug, Default)]
@@ -256,6 +257,7 @@ fn scan_disk_blocking(root: PathBuf, meta: LocalUsageSnapshotMeta, mut state: In
             .push(LocalObjectRecord {
                 usage: usage.clone(),
                 object_info: None,
+                file_info: None,
             });
     }
 
@@ -319,6 +321,7 @@ fn compute_object_usage(bucket: &str, object: &str, file_meta: &FileMeta) -> Res
         let versioned = fi.version_id.is_some();
         ObjectInfo::from_file_info(fi, bucket, object, versioned)
     });
+    let file_info = latest_file_info.clone();
 
     Ok(Some(LocalObjectRecord {
         usage: LocalObjectUsage {
@@ -331,6 +334,7 @@ fn compute_object_usage(bucket: &str, object: &str, file_meta: &FileMeta) -> Res
             has_live_object,
         },
         object_info,
+        file_info,
     }))
 }
 
