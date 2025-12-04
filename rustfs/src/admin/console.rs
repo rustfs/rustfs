@@ -418,7 +418,7 @@ async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<R
 }
 
 /// Get console configuration from environment variables
-/// Returns a tuple of the above values.
+/// Returns a tuple containing console configuration values from environment variables.
 ///
 /// # Returns:
 /// - rate_limit_enable: bool indicating if rate limiting is enabled.

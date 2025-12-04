@@ -231,7 +231,7 @@ pub async fn start_http_server(
         println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
-        info!(target: "rustfs::console::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
+        info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
         if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
