@@ -832,6 +832,7 @@ impl Scanner {
 
         // Initialize and start the node scanner
         self.node_scanner.initialize_stats().await?;
+        // update object count and size for each bucket
         self.node_scanner.start().await?;
 
         // Set local stats in aggregator

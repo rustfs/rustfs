@@ -681,7 +681,10 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
         Some(DiskError::VolumeNotFound) => CHECK_PART_VOLUME_NOT_FOUND,
         Some(DiskError::DiskNotFound) => CHECK_PART_DISK_NOT_FOUND,
         None => CHECK_PART_SUCCESS,
-        _ => CHECK_PART_UNKNOWN,
+        _ => {
+            tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");
+            CHECK_PART_UNKNOWN
+        }
     }
 }
 
