@@ -58,13 +58,13 @@ struct StaticFiles;
 /// If the requested file is not found, it serves index.html as a fallback.
 /// If index.html is also not found, it returns a 404 Not Found response.
 ///
-/// Arguments:
+/// # Arguments:
 /// - `uri`: The request URI.
 ///
-/// Returns:
+/// # Returns:
 /// - An `impl IntoResponse` containing the static file content or a 404 response.
 ///
-pub(crate) async fn static_handler(uri: Uri) -> impl IntoResponse {
+async fn static_handler(uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html"
@@ -180,7 +180,8 @@ struct License {
     url: String,
 }
 
-pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
+/// Global console configuration
+static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[allow(clippy::const_is_empty)]
 pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
@@ -199,12 +200,13 @@ pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     });
 }
 
-// fn is_socket_addr_or_ip_addr(host: &str) -> bool {
-//     host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
-// }
-
-#[allow(dead_code)]
-pub async fn license_handler() -> impl IntoResponse {
+/// License handler
+/// Returns the current license information of the console.
+///
+/// # Returns:
+/// - 200 OK with JSON body containing license details.
+#[instrument]
+async fn license_handler() -> impl IntoResponse {
     let license = get_license().unwrap_or_default();
 
     Response::builder()
@@ -214,6 +216,7 @@ pub async fn license_handler() -> impl IntoResponse {
         .unwrap()
 }
 
+/// Check if the given IP address is a private IP
 fn _is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -229,8 +232,48 @@ fn _is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Version handler
+/// Returns the current version information of the console.
+///
+/// # Returns:
+/// - 200 OK with JSON body containing version details if configuration is initialized.
+/// - 500 Internal Server Error if configuration is not initialized.
+#[instrument]
+async fn version_handler() -> impl IntoResponse {
+    match CONSOLE_CONFIG.get() {
+        Some(cfg) => Response::builder()
+            .header("content-type", "application/json")
+            .status(StatusCode::OK)
+            .body(Body::from(
+                json!({
+                    "version": cfg.release.version,
+                    "version_info": cfg.version_info(),
+                    "date": cfg.release.date,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Console configuration not initialized"))
+            .unwrap(),
+    }
+}
+
+/// Configuration handler
+/// Returns the current console configuration in JSON format.
+/// The configuration is dynamically adjusted based on the request's host and scheme.
+///
+/// # Arguments:
+/// - `uri`: The request URI.
+/// - `Host(host)`: The host extracted from the request.
+/// - `headers`: The request headers.
+///
+/// # Returns:
+/// - 200 OK with JSON body containing the console configuration if initialized.
+/// - 500 Internal Server Error if configuration is not initialized.
 #[instrument(fields(host))]
-pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
@@ -275,7 +318,15 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
 }
 
 /// Console access logging middleware
-async fn console_logging_middleware(req: Request, next: axum::middleware::Next) -> axum::response::Response {
+/// Logs each console access with method, URI, status code, and duration.
+///
+/// # Arguments:
+/// - `req`: The incoming request.
+/// - `next`: The next middleware or handler in the chain.
+///
+/// # Returns:
+/// - The response from the next middleware or handler.
+async fn console_logging_middleware(req: Request, next: middleware::Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let start = std::time::Instant::now();
@@ -367,6 +418,14 @@ async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<R
 }
 
 /// Get console configuration from environment variables
+/// Returns a tuple containing console configuration values from environment variables.
+///
+/// # Returns:
+/// - rate_limit_enable: bool indicating if rate limiting is enabled.
+/// - rate_limit_rpm: u32 indicating the rate limit in requests per minute.
+/// - auth_timeout: u64 indicating the authentication timeout in seconds.
+/// - cors_allowed_origins: String containing allowed CORS origins.
+///
 fn get_console_config_from_env() -> (bool, u32, u64, String) {
     let rate_limit_enable = std::env::var(rustfs_config::ENV_CONSOLE_RATE_LIMIT_ENABLE)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE.to_string())
@@ -390,11 +449,27 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
     (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins)
 }
 
+/// Check if the given path is for console access
+///
+/// # Arguments:
+/// - `path`: The request path.
+///
+/// # Returns:
+/// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
     path == "/favicon.ico" || path.starts_with(CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
+///
+/// # Arguments:
+/// - `cors_layer`: The CORS layer to apply.
+/// - `rate_limit_enable`: bool indicating if rate limiting is enabled.
+/// - `rate_limit_rpm`: u32 indicating the rate limit in requests per minute.
+/// - `auth_timeout`: u64 indicating the authentication timeout in seconds.
+///
+/// # Returns:
+/// - A `Router` with the configured middleware stack.
 fn setup_console_middleware_stack(
     cors_layer: CorsLayer,
     rate_limit_enable: bool,
@@ -405,6 +480,7 @@ fn setup_console_middleware_stack(
         .route("/favicon.ico", get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
         .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
+        .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
         .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
@@ -437,6 +513,13 @@ fn setup_console_middleware_stack(
 }
 
 /// Console health check handler with comprehensive health information
+///
+/// # Arguments:
+/// - `method`: The HTTP method of the request.
+///
+/// # Returns:
+/// - A `Response` containing the health check result.
+#[instrument]
 async fn health_check(method: Method) -> Response {
     let builder = Response::builder()
         .status(StatusCode::OK)
@@ -538,6 +621,12 @@ async fn health_check(method: Method) -> Response {
 }
 
 /// Parse CORS allowed origins from configuration
+///
+/// # Arguments:
+/// - `origins`: An optional reference to a string containing allowed origins.
+///
+/// # Returns:
+/// - A `CorsLayer` configured with the specified origins.
 pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
@@ -580,6 +669,10 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     }
 }
 
+/// Create and configure the console server router
+///
+/// # Returns:
+/// - A `Router` configured for the console server with middleware.
 pub(crate) fn make_console_server() -> Router {
     let (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins) = get_console_config_from_env();
     // String to Option<&String>
