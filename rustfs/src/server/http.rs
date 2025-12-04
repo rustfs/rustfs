@@ -111,18 +111,22 @@ fn get_cors_allowed_origins() -> String {
 /// Predicate to determine if a response should be compressed.
 ///
 /// This predicate implements intelligent compression selection to avoid issues
-/// with error responses and small payloads. It excludes:
+/// with error responses, small payloads, and already-compressed content. It excludes:
 /// - Client error responses (4xx status codes) - typically small XML/JSON error messages
 /// - Server error responses (5xx status codes) - ensures error details are preserved
 /// - Very small responses (< 256 bytes) - compression overhead outweighs benefits
+/// - Already compressed content types (images, videos, audio, zip, gzip, etc.)
 ///
 /// # Rationale
 /// The CompressionLayer can cause Content-Length header mismatches with error responses,
 /// particularly when the s3s library generates XML error responses (~119 bytes for NoSuchKey).
+/// Additionally, compressing already-compressed content provides no benefit and removes
+/// the Content-Length header, causing browsers to show "unknown file size" during downloads.
 /// By excluding these responses from compression, we ensure:
 /// 1. Error responses are sent with accurate Content-Length headers
 /// 2. Clients receive complete error bodies without truncation
 /// 3. Small responses avoid compression overhead
+/// 4. Browsers can display accurate file sizes for downloads (preserves Content-Length)
 ///
 /// # Performance
 /// This predicate is evaluated per-response and has O(1) complexity.
@@ -143,6 +147,63 @@ impl Predicate for ShouldCompress {
             return false;
         }
 
+        // Skip compression for already-compressed content types
+        // These formats are already compressed and re-compressing provides no benefit
+        // while removing the Content-Length header (causing "unknown file size" in browsers)
+        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE) {
+            if let Ok(ct) = content_type.to_str() {
+                let ct_lower = ct.to_lowercase();
+
+                // Skip images - most image formats are already compressed (JPEG, PNG, GIF, WebP, etc.)
+                if ct_lower.starts_with("image/") {
+                    debug!("Skipping compression for image content: {}", ct);
+                    return false;
+                }
+
+                // Skip video - all video formats use internal compression
+                if ct_lower.starts_with("video/") {
+                    debug!("Skipping compression for video content: {}", ct);
+                    return false;
+                }
+
+                // Skip audio - most audio formats are compressed (MP3, AAC, OGG, etc.)
+                if ct_lower.starts_with("audio/") {
+                    debug!("Skipping compression for audio content: {}", ct);
+                    return false;
+                }
+
+                // Skip compressed archive formats
+                if ct_lower.contains("zip")
+                    || ct_lower.contains("gzip")
+                    || ct_lower.contains("x-gz")
+                    || ct_lower.contains("compress")
+                    || ct_lower.contains("x-rar")
+                    || ct_lower.contains("x-7z")
+                    || ct_lower.contains("x-bzip")
+                    || ct_lower.contains("x-xz")
+                    || ct_lower.contains("x-lzma")
+                    || ct_lower.contains("x-lz4")
+                    || ct_lower.contains("zstd")
+                    || ct_lower.contains("x-tar")
+                {
+                    debug!("Skipping compression for compressed archive: {}", ct);
+                    return false;
+                }
+
+                // Skip binary/octet-stream - often already compressed or not compressible
+                if ct_lower == "application/octet-stream" {
+                    debug!("Skipping compression for binary content: {}", ct);
+                    return false;
+                }
+
+                // Skip PDF - internally compressed
+                if ct_lower == "application/pdf" {
+                    debug!("Skipping compression for PDF content: {}", ct);
+                    return false;
+                }
+            }
+        }
+
         // Check Content-Length header to avoid compressing very small responses
         // Responses smaller than 256 bytes typically don't benefit from compression
         // and may actually increase in size due to compression overhead
@@ -157,7 +218,7 @@ impl Predicate for ShouldCompress {
             }
         }
 
-        // Compress successful responses with sufficient size
+        // Compress successful responses with sufficient size and compressible content
         true
     }
 }
