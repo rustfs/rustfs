@@ -17,9 +17,9 @@ use std::{cmp, env, fs, io::Write, path::Path, process::Command};
 type AnyError = Box<dyn std::error::Error>;
 
 /// Expected version of `protoc` compiler.
-const VERSION_PROTOBUF: Version = Version(30, 2, 0); // 30.2.0
+const VERSION_PROTOBUF: Version = Version(33, 1, 0); // 31.1.0
 /// Expected version of `flatc` compiler.
-const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
+const VERSION_FLATBUFFERS: Version = Version(25, 9, 23); // 25.9.23
 /// Build protos if the major version of `flatc` or `protoc` is greater
 /// or lesser than the expected version.
 const ENV_BUILD_PROTOS: &str = "BUILD_PROTOS";
@@ -156,6 +156,7 @@ fn compile_flatbuffers_models<P: AsRef<Path>, S: AsRef<str>>(
     let version = flatbuffers_compiler_version(flatc_path)?;
     let need_compile = match version.compare_ext(&VERSION_FLATBUFFERS) {
         Ok(cmp::Ordering::Greater) => true,
+        Ok(cmp::Ordering::Equal) => true,
         Ok(_) => {
             if let Some(version_err) = Version::build_error_message(&version, &VERSION_FLATBUFFERS) {
                 println!("cargo:warning=Tool `{flatc_path}` {version_err}, skip compiling.");
