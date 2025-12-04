@@ -28,6 +28,7 @@ fn main() -> Result<(), AnyError> {
     let version = protobuf_compiler_version()?;
     let need_compile = match version.compare_ext(&VERSION_PROTOBUF) {
         Ok(cmp::Ordering::Greater) => true,
+        Ok(cmp::Ordering::Equal) => true,
         Ok(_) => {
             if let Some(version_err) = Version::build_error_message(&version, &VERSION_PROTOBUF) {
                 println!("cargo:warning=Tool `protoc` {version_err}, skip compiling.");
