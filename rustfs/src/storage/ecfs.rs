@@ -2773,7 +2773,7 @@ impl S3 for FS {
             .collect::<Vec<_>>();
 
         let output = ListObjectVersionsOutput {
-            // is_truncated: Some(object_infos.is_truncated),
+            is_truncated: Some(object_infos.is_truncated),
             max_keys: Some(key_count),
             delimiter,
             name: Some(bucket),
