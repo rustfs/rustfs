@@ -782,7 +782,7 @@ impl Node for NodeService {
     async fn list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.list_dir("", &request.volume, "", 0).await {
+            match disk.list_dir("", &request.volume, &request.dir_path, request.count).await {
                 Ok(volumes) => Ok(Response::new(ListDirResponse {
                     success: true,
                     volumes,
@@ -2623,6 +2623,8 @@ mod tests {
         let request = Request::new(ListDirRequest {
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
+            dir_path: "test-dir-path".to_string(),
+            count: 10,
         });
 
         let response = service.list_dir(request).await;
