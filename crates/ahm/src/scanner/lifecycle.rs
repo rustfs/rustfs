@@ -18,7 +18,6 @@ use crate::{
 };
 use rustfs_common::data_usage::SizeSummary;
 use rustfs_common::metrics::IlmAction;
-use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, ReplicationConfig, get_heal_replicate_object_info};
 use rustfs_ecstore::bucket::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
@@ -30,6 +29,10 @@ use rustfs_ecstore::bucket::{
     object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion},
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
+};
+use rustfs_ecstore::bucket::{
+    replication::{GLOBAL_REPLICATION_POOL, ReplicationConfig, get_heal_replicate_object_info},
+    utils::is_meta_bucketname,
 };
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_filemeta::{FileInfo, ReplicationStatusType, replication_statuses_map};
@@ -288,7 +291,7 @@ impl ScannerItem {
 
         info!("apply_lifecycle: Lifecycle config exists for object: {}", oi.name);
 
-        let (olcfg, rcfg) = if self.bucket != ".minio.sys" {
+        let (olcfg, rcfg) = if !is_meta_bucketname(&self.bucket) {
             (
                 get_object_lock_config(&self.bucket).await.ok(),
                 None, // FIXME: replication config

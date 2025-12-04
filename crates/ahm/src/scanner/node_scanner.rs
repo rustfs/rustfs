@@ -19,6 +19,7 @@ use crate::scanner::{
 };
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::StorageAPI;
+use rustfs_ecstore::bucket::utils::is_meta_bucketname;
 use rustfs_ecstore::disk::{DiskAPI, DiskStore};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -879,7 +880,7 @@ impl NodeScanner {
                         let bucket_name = &bucket_info.name;
 
                         // skip system internal buckets
-                        if bucket_name == ".minio.sys" {
+                        if is_meta_bucketname(bucket_name) {
                             continue;
                         }
 
