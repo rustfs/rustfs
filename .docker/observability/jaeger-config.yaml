@@ -65,6 +65,7 @@ extensions:
       some_store:
         memory:
           max_traces: 1000000
+          max_events: 100000
       another_store:
         memory:
           max_traces: 1000000
@@ -102,6 +103,7 @@ receivers:
 
 processors:
   batch:
+  metadata_keys: [ "span.kind", "http.method", "http.status_code", "db.system", "db.statement", "messaging.system", "messaging.destination", "messaging.operation","span.events","span.links" ]
   # Adaptive Sampling Processor is required to support adaptive sampling.
   # It expects remote_sampling extension with `adaptive:` config to be enabled.
   adaptive_sampling:

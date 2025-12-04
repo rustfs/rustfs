@@ -51,7 +51,7 @@ pub enum HealType {
 }
 
 /// Heal priority
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HealPriority {
     /// Low priority
     Low = 0,
@@ -272,6 +272,7 @@ impl HealTask {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
     pub async fn execute(&self) -> Result<()> {
         // update status and timestamps atomically to avoid race conditions
         let now = SystemTime::now();
@@ -285,7 +286,7 @@ impl HealTask {
             *task_start_instant = Some(start_instant);
         }
 
-        info!("Starting heal task: {} with type: {:?}", self.id, self.heal_type);
+        info!("Task started");
 
         let result = match &self.heal_type {
             HealType::Object {
@@ -315,7 +316,7 @@ impl HealTask {
             Ok(_) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
-                info!("Heal task completed successfully: {}", self.id);
+                info!("Task completed successfully");
             }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
@@ -354,8 +355,9 @@ impl HealTask {
     }
 
     // specific heal implementation method
+    #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
     async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        info!("Healing object: {}/{}", bucket, object);
+        info!("Starting object heal workflow");
 
         // update progress
         {
@@ -365,7 +367,7 @@ impl HealTask {
         }
 
         // Step 1: Check if object exists and get metadata
-        info!("Step 1: Checking object existence and metadata");
+        warn!("Step 1: Checking object existence and metadata");
         self.check_control_flags().await?;
         let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
         if !object_exists {
@@ -424,7 +426,7 @@ impl HealTask {
 
                     // If heal failed and remove_corrupted is enabled, delete the corrupted object
                     if self.options.remove_corrupted {
-                        warn!("Removing corrupted object: {}/{}", bucket, object);
+                        info!("Removing corrupted object: {}/{}", bucket, object);
                         if !self.options.dry_run {
                             self.await_with_control(self.storage.delete_object(bucket, object)).await?;
                             info!("Successfully deleted corrupted object: {}/{}", bucket, object);
@@ -447,11 +449,9 @@ impl HealTask {
                 info!("Step 3: Verifying heal result");
                 let object_size = result.object_size as u64;
                 info!(
-                    "Heal completed successfully: {}/{} ({} bytes, {} drives healed)",
-                    bucket,
-                    object,
-                    object_size,
-                    result.after.drives.len()
+                    object_size = object_size,
+                    drives_healed = result.after.drives.len(),
+                    "Heal completed successfully"
                 );
 
                 {
@@ -481,7 +481,7 @@ impl HealTask {
 
                 // If heal failed and remove_corrupted is enabled, delete the corrupted object
                 if self.options.remove_corrupted {
-                    warn!("Removing corrupted object: {}/{}", bucket, object);
+                    info!("Removing corrupted object: {}/{}", bucket, object);
                     if !self.options.dry_run {
                         self.await_with_control(self.storage.delete_object(bucket, object)).await?;
                         info!("Successfully deleted corrupted object: {}/{}", bucket, object);

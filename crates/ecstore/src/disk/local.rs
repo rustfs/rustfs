@@ -967,9 +967,7 @@ impl LocalDisk {
         sum: &[u8],
         shard_size: usize,
     ) -> Result<()> {
-        let file = super::fs::open_file(part_path, O_CREATE | O_WRONLY)
-            .await
-            .map_err(to_file_error)?;
+        let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
 
         let meta = file.metadata().await.map_err(to_file_error)?;
         let file_size = meta.len() as usize;
@@ -1465,6 +1463,7 @@ impl DiskAPI for LocalDisk {
             resp.results[i] = conv_part_err_to_int(&err);
             if resp.results[i] == CHECK_PART_UNKNOWN {
                 if let Some(err) = err {
+                    error!("verify_file: failed to bitrot verify file: {:?}, error: {:?}", &part_path, &err);
                     if err == DiskError::FileAccessDenied {
                         continue;
                     }
@@ -1551,7 +1550,7 @@ impl DiskAPI for LocalDisk {
                 .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
                 .join(format!("part.{}", part.number));
 
-            match lstat(file_path).await {
+            match lstat(&file_path).await {
                 Ok(st) => {
                     if st.is_dir() {
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
@@ -1577,6 +1576,8 @@ impl DiskAPI for LocalDisk {
                             }
                         }
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
+                    } else {
+                        error!("check_parts: failed to stat file: {:?}, error: {:?}", &file_path, &e);
                     }
                     continue;
                 }
@@ -2003,17 +2004,6 @@ impl DiskAPI for LocalDisk {
             }
         };
 
-        // CLAUDE DEBUG: Check if inline data is being preserved
-        tracing::info!(
-            "CLAUDE DEBUG: rename_data - Adding version to xlmeta. fi.data.is_some()={}, fi.inline_data()={}, fi.size={}",
-            fi.data.is_some(),
-            fi.inline_data(),
-            fi.size
-        );
-        if let Some(ref data) = fi.data {
-            tracing::info!("CLAUDE DEBUG: rename_data - FileInfo has inline data: {} bytes", data.len());
-        }
-
         xlmeta.add_version(fi.clone())?;
 
         if xlmeta.versions.len() <= 10 {
@@ -2021,10 +2011,6 @@ impl DiskAPI for LocalDisk {
         }
 
         let new_dst_buf = xlmeta.marshal_msg()?;
-        tracing::info!(
-            "CLAUDE DEBUG: rename_data - Marshaled xlmeta, new_dst_buf size: {} bytes",
-            new_dst_buf.len()
-        );
 
         self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
             .await?;

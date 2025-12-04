@@ -15,66 +15,108 @@
 receivers:
   otlp:
     protocols:
-      grpc: # OTLP gRPC 接收器
+      grpc: # OTLP gRPC receiver
         endpoint: 0.0.0.0:4317
-      http: # OTLP HTTP 接收器
+      http: # OTLP HTTP receiver
         endpoint: 0.0.0.0:4318
 
 processors:
-  batch: # 批处理处理器，提升吞吐量
+  batch: # Batch processor to improve throughput
     timeout: 5s
     send_batch_size: 1000
+    metadata_keys: [ ]
+    metadata_cardinality_limit: 1000
   memory_limiter:
     check_interval: 1s
     limit_mib: 512
+  transform/logs:
+    log_statements:
+      - context: log
+        statements:
+          # Extract Body as attribute "message"
+          - set(attributes["message"], body.string)
+          # Retain the original Body
+          - set(attributes["log.body"], body.string)
 
 exporters:
-  otlp/traces: # OTLP 导出器，用于跟踪数据
-    endpoint: "jaeger:4317"  # Jaeger 的 OTLP gRPC 端点
+  otlp/traces: # OTLP exporter for trace data
+    endpoint: "http://jaeger:4317"  # OTLP gRPC endpoint for Jaeger
     tls:
-      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  otlp/tempo: # OTLP 导出器，用于跟踪数据
-    endpoint: "tempo:4317"  # tempo 的 OTLP gRPC 端点
+      insecure: true  # TLS is disabled in the development environment and a certificate needs to be configured in the production environment.
+    compression: gzip  # Enable compression to reduce network bandwidth
+    retry_on_failure:
+      enabled: true  # Enable retry on failure
+      initial_interval: 1s  # Initial interval for retry
+      max_interval: 30s  # Maximum interval for retry
+      max_elapsed_time: 300s  # Maximum elapsed time for retry
+    sending_queue:
+      enabled: true  # Enable sending queue
+      num_consumers: 10  # Number of consumers
+      queue_size: 5000  # Queue size
+  otlp/tempo: # OTLP exporter for trace data
+    endpoint: "http://tempo:4317"  # OTLP gRPC endpoint for tempo
     tls:
-      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  prometheus: # Prometheus 导出器，用于指标数据
-    endpoint: "0.0.0.0:8889"  # Prometheus 刮取端点
-    namespace: "rustfs"  # 指标前缀
-    send_timestamps: true  # 发送时间戳
-    # enable_open_metrics: true
-  otlphttp/loki: # Loki 导出器，用于日志数据
-    endpoint: "http://loki:3100/otlp/v1/logs"
+      insecure: true  # TLS is disabled in the development environment and a certificate needs to be configured in the production environment.
+    compression: gzip  # Enable compression to reduce network bandwidth
+    retry_on_failure:
+      enabled: true  # Enable retry on failure
+      initial_interval: 1s  # Initial interval for retry
+      max_interval: 30s  # Maximum interval for retry
+      max_elapsed_time: 300s  # Maximum elapsed time for retry
+    sending_queue:
+      enabled: true  # Enable sending queue
+      num_consumers: 10  # Number of consumers
+      queue_size: 5000  # Queue size
+  prometheus: # Prometheus exporter for metrics data
+    endpoint: "0.0.0.0:8889"  # Prometheus scraping endpoint
+    namespace: "metrics"  # indicator prefix
+    send_timestamps: true  # Send timestamp
+    metric_expiration: 5m  # Metric expiration time
+    resource_to_telemetry_conversion:
+      enabled: true  # Enable resource to telemetry conversion
+  otlphttp/loki: # Loki exporter for log data
+    endpoint: "http://loki:3100/otlp"
     tls:
       insecure: true
+    compression: gzip  # Enable compression to reduce network bandwidth
 extensions:
   health_check:
+    endpoint: 0.0.0.0:13133
   pprof:
+    endpoint: 0.0.0.0:1888
   zpages:
+    endpoint: 0.0.0.0:55679
 service:
-  extensions: [ health_check, pprof, zpages ]  # 启用扩展
+  extensions: [ health_check, pprof, zpages ]  # Enable extension
   pipelines:
     traces:
       receivers: [ otlp ]
-      processors: [ memory_limiter,batch ]
-      exporters: [ otlp/traces,otlp/tempo ]
+      processors: [ memory_limiter, batch ]
+      exporters: [ otlp/traces, otlp/tempo ]
     metrics:
       receivers: [ otlp ]
       processors: [ batch ]
       exporters: [ prometheus ]
     logs:
       receivers: [ otlp ]
-      processors: [ batch ]
+      processors: [ batch, transform/logs ]
       exporters: [ otlphttp/loki ]
   telemetry:
     logs:
-      level: "info"  # Collector 日志级别
+      level: "debug"  # Collector log level
+      encoding: "json"  # Log encoding: console or json
     metrics:
-      level: "detailed" # 可以是 basic, normal, detailed
+      level: "detailed" # Can be basic, normal, detailed
       readers:
         - periodic:
             exporter:
               otlp:
                 protocol: http/protobuf
                 endpoint: http://otel-collector:4318
+        - pull:
+            exporter:
+              prometheus:
+                host: '0.0.0.0'
+                port: 8888
 
 

@@ -1,0 +1,96 @@
+{{- if .Values.mode.standalone.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rustfs.fullname" . }}
+  labels:
+    app: {{ include "rustfs.name" . }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "rustfs.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "rustfs.name" . }}
+    spec:
+      {{- if .Values.podSecurityContext }}
+      securityContext:
+      {{- toYaml .Values.podSecurityContext | nindent 12 }}
+      {{- end }}
+      initContainers:
+        - name: init-step
+          image: busybox
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /data /logs
+              chown -R 10001:10001 /data /logs
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: logs
+              mountPath: /logs
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["/usr/bin/rustfs"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.containerSecurityContext }}
+          securityContext:
+          {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- end }}
+          ports:
+            - containerPort: {{ .Values.service.ep_port }}
+              name: endpoint
+            - containerPort: {{ .Values.service.console_port }}
+              name: console
+          envFrom:
+            - configMapRef:
+                name: {{ include "rustfs.fullname" . }}-config
+            - secretRef:
+                name: {{ include "rustfs.fullname" . }}-secret
+          resources:
+            requests:
+              memory: {{ .Values.resources.requests.memory }}
+              cpu: {{ .Values.resources.requests.cpu }}
+            limits:
+              memory: {{ .Values.resources.limits.memory }}
+              cpu: {{ .Values.resources.limits.cpu }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: logs
+              mountPath: /logs
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: {{ include "rustfs.fullname" . }}-logs
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "rustfs.fullname" . }}-data
+{{- end }}

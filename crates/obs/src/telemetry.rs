@@ -363,7 +363,6 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
     };
 
     OBSERVABILITY_METRIC_ENABLED.set(false).ok();
-    counter!("rustfs.start.total").increment(1);
     info!(
         "Init file logging at '{}', roll size {:?}MB, keep {}",
         log_directory, config.log_rotation_size_mb, keep_files
@@ -392,18 +391,36 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
     };
 
     // Endpoint
-    let root_ep = config.endpoint.as_str();
-    let trace_ep = config.trace_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
-    let metric_ep = config.metric_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
-    let log_ep = config.log_endpoint.as_deref().filter(|s| !s.is_empty()).unwrap_or(root_ep);
+    let root_ep = config.endpoint.clone(); // owned String
+
+    let trace_ep: String = config
+        .trace_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{root_ep}/v1/traces"));
+
+    let metric_ep: String = config
+        .metric_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{root_ep}/v1/metrics"));
+
+    let log_ep: String = config
+        .log_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{root_ep}/v1/logs"));
 
     // Tracer（HTTP）
     let tracer_provider = {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(trace_ep)
+            .with_endpoint(trace_ep.as_str())
             .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Zstd)
+            .with_compression(Compression::Gzip)
             .build()
             .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
 
@@ -426,10 +443,10 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
     let meter_provider = {
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(metric_ep)
+            .with_endpoint(metric_ep.as_str())
             .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
             .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Zstd)
+            .with_compression(Compression::Gzip)
             .build()
             .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
         let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
@@ -457,9 +474,9 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
     let logger_provider = {
         let exporter = opentelemetry_otlp::LogExporter::builder()
             .with_http()
-            .with_endpoint(log_ep)
+            .with_endpoint(log_ep.as_str())
             .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Zstd)
+            .with_compression(Compression::Gzip)
             .build()
             .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
 

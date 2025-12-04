@@ -531,12 +531,13 @@ impl FileMeta {
             return Err(Error::other("file meta version invalid"));
         }
 
-        // 1000 is the limit of versions TODO: make it configurable
-        if self.versions.len() + 1 > 1000 {
-            return Err(Error::other(
-                "You've exceeded the limit on the number of versions you can create on this object",
-            ));
-        }
+        // TODO: make it configurable
+        // 1000 is the limit of versions
+        // if self.versions.len() + 1 > 1000 {
+        //     return Err(Error::other(
+        //         "You've exceeded the limit on the number of versions you can create on this object",
+        //     ));
+        // }
 
         if self.versions.is_empty() {
             self.versions.push(FileMetaShallowVersion::try_from(version)?);
@@ -614,7 +615,7 @@ impl FileMeta {
             }
         }
 
-        let mut update_version = fi.mark_deleted;
+        let mut update_version = false;
         if fi.version_purge_status().is_empty()
             && (fi.delete_marker_replication_status() == ReplicationStatusType::Replica
                 || fi.delete_marker_replication_status() == ReplicationStatusType::Empty)
@@ -1707,7 +1708,7 @@ impl MetaObject {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
-        // let version_id = self.version_id.filter(|&vid| !vid.is_nil());
+        let version_id = self.version_id.filter(|&vid| !vid.is_nil());
 
         let parts = if all_parts {
             let mut parts = vec![ObjectPartInfo::default(); self.part_numbers.len()];
@@ -1811,7 +1812,7 @@ impl MetaObject {
             .unwrap_or_default();
 
         FileInfo {
-            version_id: self.version_id,
+            version_id,
             erasure,
             data_dir: self.data_dir,
             mod_time: self.mod_time,

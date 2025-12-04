@@ -39,7 +39,7 @@ services:
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
-      - RUSTFS_LOG_LEVEL=info
+      - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_TLS_PATH=/opt/tls
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
     volumes:
@@ -54,7 +54,7 @@ services:
         [
           "CMD",
           "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
+          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health"
         ]
       interval: 30s
       timeout: 10s
@@ -84,7 +84,7 @@ services:
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin
-      - RUSTFS_LOG_LEVEL=debug
+      - RUSTFS_OBS_LOGGER_LEVEL=debug
     volumes:
       - .:/app # Mount source code to /app for development
       - deploy/data/dev:/data
@@ -96,7 +96,7 @@ services:
         [
           "CMD",
           "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"
+          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health"
         ]
       interval: 30s
       timeout: 10s

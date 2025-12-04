@@ -43,7 +43,7 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::CompressionLayer;
+use tower_http::compression::{CompressionLayer, predicate::Predicate};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -108,6 +108,60 @@ fn get_cors_allowed_origins() -> String {
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
 }
 
+/// Predicate to determine if a response should be compressed.
+///
+/// This predicate implements intelligent compression selection to avoid issues
+/// with error responses and small payloads. It excludes:
+/// - Client error responses (4xx status codes) - typically small XML/JSON error messages
+/// - Server error responses (5xx status codes) - ensures error details are preserved
+/// - Very small responses (< 256 bytes) - compression overhead outweighs benefits
+///
+/// # Rationale
+/// The CompressionLayer can cause Content-Length header mismatches with error responses,
+/// particularly when the s3s library generates XML error responses (~119 bytes for NoSuchKey).
+/// By excluding these responses from compression, we ensure:
+/// 1. Error responses are sent with accurate Content-Length headers
+/// 2. Clients receive complete error bodies without truncation
+/// 3. Small responses avoid compression overhead
+///
+/// # Performance
+/// This predicate is evaluated per-response and has O(1) complexity.
+#[derive(Clone, Copy, Debug)]
+struct ShouldCompress;
+
+impl Predicate for ShouldCompress {
+    fn should_compress<B>(&self, response: &Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        let status = response.status();
+
+        // Never compress error responses (4xx and 5xx status codes)
+        // This prevents Content-Length mismatch issues with error responses
+        if status.is_client_error() || status.is_server_error() {
+            debug!("Skipping compression for error response: status={}", status.as_u16());
+            return false;
+        }
+
+        // Check Content-Length header to avoid compressing very small responses
+        // Responses smaller than 256 bytes typically don't benefit from compression
+        // and may actually increase in size due to compression overhead
+        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
+            if let Ok(length_str) = content_length.to_str() {
+                if let Ok(length) = length_str.parse::<u64>() {
+                    if length < 256 {
+                        debug!("Skipping compression for small response: size={} bytes", length);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Compress successful responses with sufficient size
+        true
+    }
+}
+
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
@@ -159,7 +213,7 @@ pub async fn start_http_server(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
-
+    let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
@@ -173,11 +227,13 @@ pub async fn start_http_server(
 
         );
 
+        println!("Console WebUI Start Time: {now_time}");
         println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
-        info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-        println!("   API: {api_endpoints}  {localhost_endpoint}");
+        info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Start Time: {now_time}");
         if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
@@ -482,17 +538,17 @@ fn process_connection(
                             ("key_request_method", format!("{}", request.method())),
                             ("key_request_uri_path", request.uri().path().to_owned().to_string()),
                         ];
-                        counter!("rustfs_api_requests_total", &labels).increment(1);
+                        counter!("rustfs.api.requests.total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
                         let _enter = span.enter();
-                        histogram!("request.latency.ms").record(latency.as_millis() as f64);
+                        histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        histogram!("request.body.len").record(chunk.len() as f64);
+                        histogram!("rustfs.request.body.len").record(chunk.len() as f64);
                         debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
@@ -501,14 +557,14 @@ fn process_connection(
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        counter!("rustfs_api_requests_failure_total").increment(1);
+                        counter!("rustfs.api.requests.failure.total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(cors_layer)
-            // Compress responses
-            .layer(CompressionLayer::new())
+            // Compress responses, but exclude error responses to avoid Content-Length mismatch issues
+            .layer(CompressionLayer::new().compress_when(ShouldCompress))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 
