@@ -271,10 +271,10 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
+    async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         match self {
-            Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
-            Disk::Remote(remote_disk) => remote_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
+            Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, dir_path, count).await,
+            Disk::Remote(remote_disk) => remote_disk.list_dir(_origvolume, volume, dir_path, count).await,
         }
     }
 
