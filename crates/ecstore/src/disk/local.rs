@@ -1985,13 +1985,14 @@ impl DiskAPI for LocalDisk {
 
         // TODO: Healing
 
+        // Check if there's an existing version with the same version_id that has a data_dir to clean up
+        // Note: For non-versioned buckets, fi.version_id is None, but in xl.meta it's stored as Some(Uuid::nil())
         let has_old_data_dir = {
-            if let Ok((_, ver)) = xlmeta.find_version(fi.version_id) {
-                let has_data_dir = ver.get_data_dir();
-                if let Some(data_dir) = has_data_dir {
-                    if xlmeta.shard_data_dir_count(&fi.version_id, &Some(data_dir)) == 0 {
-                        // TODO: Healing
-                        // remove inlinedata\
+            let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+            if let Ok((_, ver)) = xlmeta.find_version(search_version_id) {
+                if let Some(data_dir) = ver.get_data_dir() {
+                    // shard_count == 0 means no other version shares this data_dir
+                    if xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0 {
                         Some(data_dir)
                     } else {
                         None
