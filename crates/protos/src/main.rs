@@ -16,8 +16,10 @@ use std::{cmp, env, fs, io::Write, path::Path, process::Command};
 
 type AnyError = Box<dyn std::error::Error>;
 
-const VERSION_PROTOBUF: Version = Version(33, 1, 0); // 31.1.0
-const VERSION_FLATBUFFERS: Version = Version(25, 9, 23); // 25.9.23
+/// Expected version of `protoc` compiler.
+const VERSION_PROTOBUF: Version = Version(30, 2, 0); // 30.2.0
+/// Expected version of `flatc` compiler.
+const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
 /// Build protos if the major version of `flatc` or `protoc` is greater
 /// or lesser than the expected version.
 const ENV_BUILD_PROTOS: &str = "BUILD_PROTOS";
@@ -26,6 +28,7 @@ const ENV_FLATC_PATH: &str = "FLATC_PATH";
 
 fn main() -> Result<(), AnyError> {
     let version = protobuf_compiler_version()?;
+
     let need_compile = match version.compare_ext(&VERSION_PROTOBUF) {
         Ok(cmp::Ordering::Greater) => true,
         Ok(cmp::Ordering::Equal) => true,
@@ -43,6 +46,7 @@ fn main() -> Result<(), AnyError> {
     };
 
     if !need_compile {
+        println!("no need to compile protos.{}", need_compile);
         return Ok(());
     }
 
@@ -122,13 +126,20 @@ fn main() -> Result<(), AnyError> {
         Err(_) => "flatc".to_string(),
     };
 
-    compile_flatbuffers_models(
+    match compile_flatbuffers_models(
         &mut generated_mod_rs,
         &flatc_path,
         proto_dir.clone(),
         flatbuffer_out_dir.clone(),
         vec!["models"],
-    )?;
+    ) {
+        Ok(_) => {
+            println!("Successfully compiled flatbuffers models.");
+        }
+        Err(e) => {
+            return Err(format!("Failed to compile flatbuffers models: {e}").into());
+        }
+    }
 
     fmt();
     Ok(())
@@ -162,6 +173,23 @@ fn compile_flatbuffers_models<P: AsRef<Path>, S: AsRef<str>>(
 
     // $rust_dir/mod.rs
     let mut sub_mod_rs = fs::File::create(rust_dir.join("mod.rs"))?;
+    writeln!(
+        &mut sub_mod_rs,
+        r#"// Copyright 2024 RustFS Team
+    //
+    // Licensed under the Apache License, Version 2.0 (the "License");
+    // you may not use this file except in compliance with the License.
+    // You may obtain a copy of the License at
+    //
+    //     http://www.apache.org/licenses/LICENSE-2.0
+    //
+    // Unless required by applicable law or agreed to in writing, software
+    // distributed under the License is distributed on an "AS IS" BASIS,
+    // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    // See the License for the specific language governing permissions and
+    // limitations under the License."#
+    )?;
+    writeln!(&mut sub_mod_rs, "\n")?;
     writeln!(generated_mod_rs)?;
     writeln!(generated_mod_rs, "mod flatbuffers_generated;")?;
     for mod_name in mod_names.iter() {
