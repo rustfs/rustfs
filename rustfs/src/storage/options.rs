@@ -52,7 +52,11 @@ pub fn extract_append_opts(headers: &HeaderMap<HeaderValue>) -> Result<Option<i6
         })?;
 
         let offset = offset_str.parse::<i64>().map_err(|_| {
-            StorageError::InvalidArgument(String::new(), String::new(), "Write offset must be a valid integer".to_string())
+            StorageError::InvalidArgument(
+                String::new(),
+                String::new(),
+                format!("Write offset '{}' must be a valid integer", offset_str),
+            )
         })?;
 
         if offset < 0 {
