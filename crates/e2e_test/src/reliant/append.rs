@@ -103,7 +103,7 @@ async fn put_object_with_append_header(
 
     let host_header = match (url.host_str(), url.port_or_known_default()) {
         (Some(host), Some(port)) => {
-            if url.scheme() == "http" && port == 80 || url.scheme() == "https" && port == 443 {
+            if (url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443) {
                 host.to_string()
             } else {
                 format!("{host}:{port}")
