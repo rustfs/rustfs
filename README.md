@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/introduction.html">Getting Started</a>
+  <a href="https://docs.rustfs.com/installation/">Getting Started</a>
   · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
@@ -151,7 +151,7 @@ make help-docker                      # Show all Docker-related commands
 
 ### 4\. Build with Helm Chart (Option 4) - Cloud Native
 
-Follow the instructions in the [Helm Chart README](https://www.google.com/search?q=./helm/README.md) to install RustFS on a Kubernetes cluster.
+Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) to install RustFS on a Kubernetes cluster.
 
 -----
 
