@@ -2336,7 +2336,14 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        self.delete_file(&volume_dir, &xl_path, true, false).await
+        // All versions deleted, remove the entire object directory (including any orphan data dirs)
+        self.move_to_trash(&file_path, true, false).await?;
+        // Clean up parent directories if empty
+        if let Some(parent_path) = file_path.parent() {
+            self.delete_file(&volume_dir, &PathBuf::from(parent_path), false, false)
+                .await?;
+        }
+        Ok(())
     }
     #[tracing::instrument(level = "debug", skip(self))]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, _opts: DeleteOptions) -> Vec<Option<Error>> {

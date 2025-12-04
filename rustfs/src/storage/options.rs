@@ -54,15 +54,14 @@ pub async fn del_opts(
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::suspended(bucket).await;
 
-    let vid = if vid.is_none() {
-        headers
-            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().unwrap().to_owned())
-    } else {
-        vid
-    };
-
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
+    let vid = vid
+        .or_else(|| {
+            headers
+                .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned())
+        })
+        .map(|v| v.trim().to_owned());
 
     if let Some(ref id) = vid {
         if *id != Uuid::nil().to_string()
@@ -173,15 +172,14 @@ pub async fn put_opts(
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
 
-    let vid = if vid.is_none() {
-        headers
-            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().unwrap().to_owned())
-    } else {
-        vid
-    };
-
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
+    let vid = vid
+        .or_else(|| {
+            headers
+                .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned())
+        })
+        .map(|v| v.trim().to_owned());
 
     if let Some(ref id) = vid {
         if *id != Uuid::nil().to_string()
