@@ -1,0 +1,73 @@
+name: Publish helm chart to artifacthub
+
+on:
+  workflow_run:
+    workflows: ["Build and Release"]
+    types: [completed]
+
+env:
+  new_version: ${{ github.ref_name }}
+
+jobs:
+  build-helm-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout helm chart repo
+        uses: actions/checkout@v2
+
+      - name: Replace chart appversion
+        run: |
+          set -e
+          set -x
+          old_version=$(grep "^appVersion:" helm/rustfs/Chart.yaml | awk '{print $2}')
+          sed -i "s/$old_version/$new_version/g" helm/rustfs/Chart.yaml
+          sed  -i "/^image:/,/^[^ ]/ s/tag:.*/tag: "$new_version"/" helm/rustfs/values.yaml
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.0
+
+      - name: Package Helm Chart
+        run: |
+          cp helm/README.md helm/rustfs/
+          package_version=$(echo $new_version | awk -F '-' '{print $2}' | awk -F '.' '{print $NF}') 
+          helm package ./helm/rustfs --destination helm/rustfs/ --version "0.0.$package_version"
+        
+      - name: Upload helm package as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-package
+          path: helm/rustfs/*.tgz
+          retention-days: 1
+
+  publish-helm-package:
+    runs-on: ubuntu-latest
+    needs: [build-helm-package]
+
+    steps:
+      - name: Checkout helm package repo
+        uses: actions/checkout@v2
+        with:
+          repository: rustfs/helm 
+          token: ${{ secrets.RUSTFS_HELM_PACKAGE }}
+      
+      - name: Download helm package
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-package
+          path: ./
+          
+      - name: Set up helm
+        uses: azure/setup-helm@v4.3.0
+        
+      - name: Generate index
+        run: helm repo index . --url https://charts.rustfs.com
+
+      - name: Push helm package and index file
+        run: |
+          git config --global user.name "xiaomage"
+          git config --global user.email "devops008@sina.com"
+          git status .
+          git add .
+          git commit -m "Update rustfs helm package with $new_version."
+          git push origin main
