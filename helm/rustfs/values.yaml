@@ -27,6 +27,7 @@ mode:
     enabled: true
 
 secret:
+  existingSecret: ""
   rustfs:
     access_key: rustfsadmin
     secret_key: rustfsadmin
@@ -147,3 +148,5 @@ affinity: {}
 storageclass:
   name: local-path
   size: 256Mi
+
+extraManifests: []
