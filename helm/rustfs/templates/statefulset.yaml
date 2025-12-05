@@ -76,7 +76,7 @@ spec:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
             - secretRef:
-                name: {{ include "rustfs.fullname" . }}-secret
+                name: {{ include "rustfs.secretName" . }}
           resources:
             requests:
               memory: {{ .Values.resources.requests.memory }}
