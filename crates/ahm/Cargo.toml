@@ -13,10 +13,12 @@ keywords = ["RustFS", "AHM", "health-management", "scanner", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 
 [dependencies]
+rustfs-config = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
+rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

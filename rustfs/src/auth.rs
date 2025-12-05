@@ -89,10 +89,14 @@ impl S3Auth for IAMAuth {
         if let Ok(iam_store) = rustfs_iam::get() {
             if let Some(id) = iam_store.get_user(access_key).await {
                 return Ok(SecretKey::from(id.credentials.secret_key.clone()));
+            } else {
+                tracing::warn!("get_user failed: no such user, access_key: {access_key}");
             }
+        } else {
+            tracing::warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
         }
 
-        Err(s3_error!(UnauthorizedAccess, "Your account is not signed up2"))
+        Err(s3_error!(UnauthorizedAccess, "Your account is not signed up2, access_key: {access_key}"))
     }
 }
 

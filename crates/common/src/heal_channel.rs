@@ -85,12 +85,90 @@ impl Display for DriveState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum HealScanMode {
-    Unknown,
+    Unknown = 0,
     #[default]
-    Normal,
-    Deep,
+    Normal = 1,
+    Deep = 2,
+}
+
+impl Serialize for HealScanMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for HealScanMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HealScanModeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HealScanModeVisitor {
+            type Value = HealScanMode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an integer between 0 and 2")
+            }
+
+            fn visit_u8<E>(self, value: u8) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    0 => Ok(HealScanMode::Unknown),
+                    1 => Ok(HealScanMode::Normal),
+                    2 => Ok(HealScanMode::Deep),
+                    _ => Err(E::custom(format!("invalid HealScanMode value: {}", value))),
+                }
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value > u8::MAX as u64 {
+                    return Err(E::custom(format!("HealScanMode value too large: {}", value)));
+                }
+                self.visit_u8(value as u8)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 || value > u8::MAX as i64 {
+                    return Err(E::custom(format!("invalid HealScanMode value: {}", value)));
+                }
+                self.visit_u8(value as u8)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // Try parsing as number string first (for URL-encoded values)
+                if let Ok(num) = value.parse::<u8>() {
+                    return self.visit_u8(num);
+                }
+                // Try parsing as named string
+                match value {
+                    "Unknown" | "unknown" => Ok(HealScanMode::Unknown),
+                    "Normal" | "normal" => Ok(HealScanMode::Normal),
+                    "Deep" | "deep" => Ok(HealScanMode::Deep),
+                    _ => Err(E::custom(format!("invalid HealScanMode string: {}", value))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(HealScanModeVisitor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -106,7 +184,9 @@ pub struct HealOpts {
     pub update_parity: bool,
     #[serde(rename = "nolock")]
     pub no_lock: bool,
+    #[serde(rename = "pool", default)]
     pub pool: Option<usize>,
+    #[serde(rename = "set", default)]
     pub set: Option<usize>,
 }
 

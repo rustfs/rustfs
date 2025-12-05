@@ -38,7 +38,7 @@ use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
@@ -389,7 +389,7 @@ impl Store for ObjectStore {
         data = match Self::decrypt_data(&data) {
             Ok(v) => v,
             Err(err) => {
-                debug!("decrypt_data failed: {}", err);
+                warn!("delete the config file when decrypt failed failed: {}, path: {}", err, path.as_ref());
                 // delete the config file when decrypt failed
                 let _ = self.delete_iam_config(path.as_ref()).await;
                 return Err(Error::ConfigNotFound);
@@ -439,8 +439,10 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
+                    warn!("load_user_identity failed: no such user, name: {name}, user_type: {user_type:?}");
                     Error::NoSuchUser(name.to_owned())
                 } else {
+                    warn!("load_user_identity failed: {err:?}, name: {name}, user_type: {user_type:?}");
                     err
                 }
             })?;
@@ -448,6 +450,9 @@ impl Store for ObjectStore {
         if u.credentials.is_expired() {
             let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
             let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
+            warn!(
+                "load_user_identity failed: user is expired, delete the user and mapped policy, name: {name}, user_type: {user_type:?}"
+            );
             return Err(Error::NoSuchUser(name.to_owned()));
         }
 
@@ -465,7 +470,7 @@ impl Store for ObjectStore {
                         let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
                         let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
                     }
-                    warn!("extract_jwt_claims failed: {}", err);
+                    warn!("extract_jwt_claims failed: {err:?}, name: {name}, user_type: {user_type:?}");
                     return Err(Error::NoSuchUser(name.to_owned()));
                 }
             }

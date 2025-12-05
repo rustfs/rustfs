@@ -45,6 +45,7 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 
     // Health check endpoint for monitoring and orchestration
     r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::HEAD, "/health", AdminOperation(&HealthCheckHandler {}))?;
     r.insert(Method::GET, "/profile/cpu", AdminOperation(&TriggerProfileCPU {}))?;
     r.insert(Method::GET, "/profile/memory", AdminOperation(&TriggerProfileMemory {}))?;
 
@@ -136,6 +137,11 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 
     // Some APIs are only available in EC mode
     // if is_dist_erasure().await || is_erasure().await {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}").as_str(),
+        AdminOperation(&handlers::HealHandler {}),
+    )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),

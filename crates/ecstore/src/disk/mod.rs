@@ -271,10 +271,10 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
+    async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         match self {
-            Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
-            Disk::Remote(remote_disk) => remote_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
+            Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, dir_path, count).await,
+            Disk::Remote(remote_disk) => remote_disk.list_dir(_origvolume, volume, dir_path, count).await,
         }
     }
 
@@ -681,7 +681,10 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
         Some(DiskError::VolumeNotFound) => CHECK_PART_VOLUME_NOT_FOUND,
         Some(DiskError::DiskNotFound) => CHECK_PART_DISK_NOT_FOUND,
         None => CHECK_PART_SUCCESS,
-        _ => CHECK_PART_UNKNOWN,
+        _ => {
+            tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");
+            CHECK_PART_UNKNOWN
+        }
     }
 }
 

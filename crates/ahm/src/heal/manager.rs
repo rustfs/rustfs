@@ -195,12 +195,28 @@ pub struct HealConfig {
 
 impl Default for HealConfig {
     fn default() -> Self {
+        let queue_size: usize =
+            rustfs_utils::get_env_usize(rustfs_config::ENV_HEAL_QUEUE_SIZE, rustfs_config::DEFAULT_HEAL_QUEUE_SIZE);
+        let heal_interval = Duration::from_secs(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEAL_INTERVAL_SECS,
+            rustfs_config::DEFAULT_HEAL_INTERVAL_SECS,
+        ));
+        let enable_auto_heal =
+            rustfs_utils::get_env_bool(rustfs_config::ENV_HEAL_AUTO_HEAL_ENABLE, rustfs_config::DEFAULT_HEAL_AUTO_HEAL_ENABLE);
+        let task_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEAL_TASK_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_HEAL_TASK_TIMEOUT_SECS,
+        ));
+        let max_concurrent_heals = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_MAX_CONCURRENT_HEALS,
+            rustfs_config::DEFAULT_HEAL_MAX_CONCURRENT_HEALS,
+        );
         Self {
-            enable_auto_heal: true,
-            heal_interval: Duration::from_secs(10), // 10 seconds
-            max_concurrent_heals: 4,
-            task_timeout: Duration::from_secs(300), // 5 minutes
-            queue_size: 1000,
+            enable_auto_heal,
+            heal_interval,        // 10 seconds
+            max_concurrent_heals, // max 4,
+            task_timeout,         // 5 minutes
+            queue_size,
         }
     }
 }
@@ -270,7 +286,7 @@ impl HealManager {
         // start scheduler
         self.start_scheduler().await?;
 
-        // start auto disk scanner
+        // start auto disk scanner to heal unformatted disks
         self.start_auto_disk_scanner().await?;
 
         info!("HealManager started successfully");
@@ -453,13 +469,18 @@ impl HealManager {
         let cancel_token = self.cancel_token.clone();
         let storage = self.storage.clone();
 
+        info!(
+            "start_auto_disk_scanner: Starting auto disk scanner with interval: {:?}",
+            config.read().await.heal_interval
+        );
+
         tokio::spawn(async move {
             let mut interval = interval(config.read().await.heal_interval);
 
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        info!("Auto disk scanner received shutdown signal");
+                        info!("start_auto_disk_scanner: Auto disk scanner received shutdown signal");
                         break;
                     }
                     _ = interval.tick() => {
@@ -478,6 +499,7 @@ impl HealManager {
                         }
 
                         if endpoints.is_empty() {
+                            info!("start_auto_disk_scanner: No endpoints need healing");
                             continue;
                         }
 
@@ -485,7 +507,7 @@ impl HealManager {
                         let buckets = match storage.list_buckets().await {
                             Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
                             Err(e) => {
-                                error!("Failed to get bucket list for auto healing: {}", e);
+                                error!("start_auto_disk_scanner: Failed to get bucket list for auto healing: {}", e);
                                 continue;
                             }
                         };
@@ -495,7 +517,7 @@ impl HealManager {
                             let Some(set_disk_id) =
                                 crate::heal::utils::format_set_disk_id_from_i32(ep.pool_idx, ep.set_idx)
                             else {
-                                warn!("Skipping endpoint {} without valid pool/set index", ep);
+                                warn!("start_auto_disk_scanner: Skipping endpoint {} without valid pool/set index", ep);
                                 continue;
                             };
                             // skip if already queued or healing
@@ -521,6 +543,7 @@ impl HealManager {
                             }
 
                             if skip {
+                                info!("start_auto_disk_scanner: Skipping auto erasure set heal for endpoint: {} (set_disk_id: {}) because it is already queued or healing", ep, set_disk_id);
                                 continue;
                             }
 
@@ -535,7 +558,7 @@ impl HealManager {
                             );
                             let mut queue = heal_queue.lock().await;
                             queue.push(req);
-                            info!("Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
+                            info!("start_auto_disk_scanner: Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
                         }
                     }
                 }
