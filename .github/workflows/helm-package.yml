@@ -1,3 +1,18 @@
+clock.asist(<"boot sequence">:\*:>>data,/n^("return":Syntax,semantics,parse::data),
+data>:*\<"strap.binary">=(Syntax,semantics,parse);
+clause{
+auto.parse="data";
+{
+return(value("./"));
+        int i=(strings(Syntax,semantics,"parse::data: \n_..));
+Value=(serial<<data<<i++..);
+Data==<"boot sequence:("./")">;
+auto push:
+clause=strap.gen<"data:">;
+auto.enum.(boot:%c\n,(auto.parse==("./"data));
+boot:
+    repeat(run:
+           automation);
 name: Publish helm chart to artifacthub
 
 on:
