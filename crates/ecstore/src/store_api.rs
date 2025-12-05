@@ -460,7 +460,7 @@ impl ObjectOptions {
     }
 
     pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {
-        let has_valid_mod_time = obj_info.mod_time.map_or(false, |t| t != OffsetDateTime::UNIX_EPOCH);
+        let has_valid_mod_time = obj_info.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
 
         if let Some(part_number) = self.part_number {
             if part_number > 1 && !obj_info.parts.is_empty() {

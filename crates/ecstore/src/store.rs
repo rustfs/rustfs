@@ -1398,9 +1398,7 @@ impl StorageAPI for ECStore {
 
         let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
 
-        if let Err(e) = opts.precondition_check(&info) {
-            return Err(e);
-        }
+        opts.precondition_check(&info)?;
         Ok(info)
     }
 
