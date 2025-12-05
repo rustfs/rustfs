@@ -263,6 +263,16 @@ async fn create_test_tier(server: u32) {
                 region: "".to_string(),
                 ..Default::default()
             })
+        } else if server == 2 {
+            Some(TierMinIO {
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+                bucket: "mblock2".to_string(),
+                endpoint: "http://m1ddns.pvtool.com:9020".to_string(),
+                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
+                region: "".to_string(),
+                ..Default::default()
+            })
         } else {
             Some(TierMinIO {
                 access_key: "minioadmin".to_string(),
@@ -598,11 +608,11 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore]
+    //#[ignore]
     async fn test_lifecycle_transition_basic() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
-        create_test_tier(1).await;
+        create_test_tier(2).await;
 
         // Create test bucket and object
         let suffix = uuid::Uuid::new_v4().simple().to_string();

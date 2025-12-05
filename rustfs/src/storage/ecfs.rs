@@ -989,22 +989,22 @@ impl S3 for FS {
         }*/
         let Ok(opts) = post_restore_opts(&version_id.unwrap(), &bucket, &object).await else {
             return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
-                "post restore object failed",
+                S3ErrorCode::Custom("ErrPostRestoreOpts".into()),
+                "restore object failed.",
             ));
         };
 
         let Ok(mut obj_info) = store.get_object_info(&bucket, &object, &opts).await else {
             return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
-                "post restore object failed",
+                S3ErrorCode::Custom("ErrInvalidObjectState".into()),
+                "restore object failed.",
             ));
         };
 
         if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
             return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
-                "post restore object failed",
+                S3ErrorCode::Custom("ErrInvalidTransitionedState".into()),
+                "restore object failed.",
             ));
         }
 
@@ -1015,14 +1015,14 @@ impl S3 for FS {
             //api_err = to_api_err(ErrMalformedXML);
             //api_err.description = err.to_string();
             return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
-                "post restore object failed",
+                S3ErrorCode::Custom("ErrValidRestoreObject".into()),
+                "restore object failed",
             ));
         } else {
             if obj_info.restore_ongoing && (rreq.type_.is_none() || rreq.type_.as_ref().unwrap().as_str() != "SELECT") {
                 return Err(S3Error::with_message(
                     S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()),
-                    "post restore object failed",
+                    "restore object failed.",
                 ));
             }
             if !obj_info.restore_ongoing && obj_info.restore_expires.unwrap().unix_timestamp() != 0 {
@@ -1081,8 +1081,8 @@ impl S3 for FS {
                 .await
             {
                 return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("ErrInvalidObjectState".into()),
-                    "post restore object failed",
+                    S3ErrorCode::Custom("ErrCopyObject".into()),
+                    "restore object failed",
                 ));
             }
             if already_restored {

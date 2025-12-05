@@ -495,6 +495,26 @@ mod serial_tests {
                             object_name,
                         } = &elm.1;
                         println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
+                        //eval_inner(&oi.to_lifecycle_opts(), OffsetDateTime::now_utc()).await;
+                        eval_inner(
+                            &lifecycle::ObjectOpts {
+                                name: oi.name.clone(),
+                                user_tags: oi.user_tags.clone(),
+                                version_id: oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                                mod_time: oi.mod_time,
+                                size: oi.size as usize,
+                                is_latest: oi.is_latest,
+                                num_versions: oi.num_versions,
+                                delete_marker: oi.delete_marker,
+                                successor_mod_time: oi.successor_mod_time,
+                                restore_ongoing: oi.restore_ongoing,
+                                restore_expires: oi.restore_expires,
+                                transition_status: oi.transitioned_object.status.clone(),
+                                ..Default::default()
+                            },
+                            OffsetDateTime::now_utc(),
+                        )
+                        .await;
                     }
                     println!("row:{row:?}");
                 }
@@ -505,4 +525,262 @@ mod serial_tests {
 
         println!("Lifecycle cache test completed");
     }
+}
+
+async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event {
+    let mut events = Vec::<Event>::new();
+    info!(
+        "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
+        obj.name, obj.mod_time, now, obj.is_latest, obj.delete_marker
+    );
+    if obj.mod_time.expect("err").unix_timestamp() == 0 {
+        info!("eval_inner: mod_time is 0, returning default event");
+        return Event::default();
+    }
+
+    if let Some(restore_expires) = obj.restore_expires {
+        if !restore_expires.unix_timestamp() == 0 && now.unix_timestamp() > restore_expires.unix_timestamp() {
+            let mut action = IlmAction::DeleteRestoredAction;
+            if !obj.is_latest {
+                action = IlmAction::DeleteRestoredVersionAction;
+            }
+
+            events.push(Event {
+                action,
+                due: Some(now),
+                rule_id: "".into(),
+                noncurrent_days: 0,
+                newer_noncurrent_versions: 0,
+                storage_class: "".into(),
+            });
+        }
+    }
+
+    if let Some(ref lc_rules) = self.filter_rules(obj).await {
+        for rule in lc_rules.iter() {
+            if obj.expired_object_deletemarker() {
+                if let Some(expiration) = rule.expiration.as_ref() {
+                    if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                        events.push(Event {
+                            action: IlmAction::DeleteVersionAction,
+                            rule_id: rule.id.clone().expect("err!"),
+                            due: Some(now),
+                            noncurrent_days: 0,
+                            newer_noncurrent_versions: 0,
+                            storage_class: "".into(),
+                        });
+                        break;
+                    }
+
+                    if let Some(days) = expiration.days {
+                        let expected_expiry = expected_expiry_time(obj.mod_time.unwrap(), days /*, date*/);
+                        if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
+                            events.push(Event {
+                                action: IlmAction::DeleteVersionAction,
+                                rule_id: rule.id.clone().expect("err!"),
+                                due: Some(expected_expiry),
+                                noncurrent_days: 0,
+                                newer_noncurrent_versions: 0,
+                                storage_class: "".into(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if obj.is_latest {
+                if let Some(ref expiration) = rule.expiration {
+                    if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                        if obj.delete_marker && expired_object_delete_marker {
+                            let due = expiration.next_due(obj);
+                            if let Some(due) = due {
+                                if now.unix_timestamp() >= due.unix_timestamp() {
+                                    events.push(Event {
+                                        action: IlmAction::DelMarkerDeleteAllVersionsAction,
+                                        rule_id: rule.id.clone().expect("err!"),
+                                        due: Some(due),
+                                        noncurrent_days: 0,
+                                        newer_noncurrent_versions: 0,
+                                        storage_class: "".into(),
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if !obj.is_latest {
+                if let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration {
+                    if let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions {
+                        if newer_noncurrent_versions > 0 {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if !obj.is_latest {
+                if let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration {
+                    if let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days {
+                        if noncurrent_days != 0 {
+                            if let Some(successor_mod_time) = obj.successor_mod_time {
+                                let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
+                                if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
+                                    events.push(Event {
+                                        action: IlmAction::DeleteVersionAction,
+                                        rule_id: rule.id.clone().expect("err!"),
+                                        due: Some(expected_expiry),
+                                        noncurrent_days: 0,
+                                        newer_noncurrent_versions: 0,
+                                        storage_class: "".into(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !obj.is_latest {
+                if let Some(ref noncurrent_version_transitions) = rule.noncurrent_version_transitions {
+                    if let Some(ref storage_class) = noncurrent_version_transitions[0].storage_class {
+                        if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE {
+                            let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
+                            if let Some(due0) = due {
+                                if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
+                                    events.push(Event {
+                                        action: IlmAction::TransitionVersionAction,
+                                        rule_id: rule.id.clone().expect("err!"),
+                                        due,
+                                        storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
+                                            .storage_class
+                                            .clone()
+                                            .unwrap()
+                                            .as_str()
+                                            .to_string(),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!(
+                "eval_inner: checking expiration condition - is_latest={}, delete_marker={}, version_id={:?}, condition_met={}",
+                obj.is_latest,
+                obj.delete_marker,
+                obj.version_id,
+                (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker
+            );
+            // Allow expiration for latest objects OR non-versioned objects (empty version_id)
+            if (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker {
+                info!("eval_inner: entering expiration check");
+                if let Some(ref expiration) = rule.expiration {
+                    if let Some(ref date) = expiration.date {
+                        let date0 = OffsetDateTime::from(date.clone());
+                        if date0.unix_timestamp() != 0 && (now.unix_timestamp() >= date0.unix_timestamp()) {
+                            info!("eval_inner: expiration by date - date0={:?}", date0);
+                            events.push(Event {
+                                action: IlmAction::DeleteAction,
+                                rule_id: rule.id.clone().expect("err!"),
+                                due: Some(date0),
+                                noncurrent_days: 0,
+                                newer_noncurrent_versions: 0,
+                                storage_class: "".into(),
+                            });
+                        }
+                    } else if let Some(days) = expiration.days {
+                        let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.unwrap(), days);
+                        info!(
+                            "eval_inner: expiration check - days={}, obj_time={:?}, expiry_time={:?}, now={:?}, should_expire={}",
+                            days,
+                            obj.mod_time.expect("err!"),
+                            expected_expiry,
+                            now,
+                            now.unix_timestamp() > expected_expiry.unix_timestamp()
+                        );
+                        if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
+                            info!("eval_inner: object should expire, adding DeleteAction");
+                            let mut event = Event {
+                                action: IlmAction::DeleteAction,
+                                rule_id: rule.id.clone().expect("err!"),
+                                due: Some(expected_expiry),
+                                noncurrent_days: 0,
+                                newer_noncurrent_versions: 0,
+                                storage_class: "".into(),
+                            };
+                            /*if rule.expiration.expect("err!").delete_all.val {
+                                event.action = IlmAction::DeleteAllVersionsAction
+                            }*/
+                            events.push(event);
+                        }
+                    } else {
+                        info!("eval_inner: expiration.days is None");
+                    }
+                } else {
+                    info!("eval_inner: rule.expiration is None");
+                }
+
+                if obj.transition_status != TRANSITION_COMPLETE {
+                    if let Some(ref transitions) = rule.transitions {
+                        let due = transitions[0].next_due(obj);
+                        if let Some(due0) = due {
+                            if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
+                                events.push(Event {
+                                    action: IlmAction::TransitionAction,
+                                    rule_id: rule.id.clone().expect("err!"),
+                                    due,
+                                    storage_class: transitions[0].storage_class.clone().expect("err!").as_str().to_string(),
+                                    noncurrent_days: 0,
+                                    newer_noncurrent_versions: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if events.len() > 0 {
+        events.sort_by(|a, b| {
+            if now.unix_timestamp() > a.due.expect("err!").unix_timestamp()
+                && now.unix_timestamp() > b.due.expect("err").unix_timestamp()
+                || a.due.expect("err").unix_timestamp() == b.due.expect("err").unix_timestamp()
+            {
+                match a.action {
+                    IlmAction::DeleteAllVersionsAction
+                    | IlmAction::DelMarkerDeleteAllVersionsAction
+                    | IlmAction::DeleteAction
+                    | IlmAction::DeleteVersionAction => {
+                        return Ordering::Less;
+                    }
+                    _ => (),
+                }
+                match b.action {
+                    IlmAction::DeleteAllVersionsAction
+                    | IlmAction::DelMarkerDeleteAllVersionsAction
+                    | IlmAction::DeleteAction
+                    | IlmAction::DeleteVersionAction => {
+                        return Ordering::Greater;
+                    }
+                    _ => (),
+                }
+                return Ordering::Less;
+            }
+
+            if a.due.expect("err").unix_timestamp() < b.due.expect("err").unix_timestamp() {
+                return Ordering::Less;
+            }
+            return Ordering::Greater;
+        });
+        return events[0].clone();
+    }
+
+    Event::default()
 }
