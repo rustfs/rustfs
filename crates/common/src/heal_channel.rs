@@ -125,7 +125,7 @@ impl<'de> Deserialize<'de> for HealScanMode {
                     0 => Ok(HealScanMode::Unknown),
                     1 => Ok(HealScanMode::Normal),
                     2 => Ok(HealScanMode::Deep),
-                    _ => Err(E::custom(format!("invalid HealScanMode value: {}", value))),
+                    _ => Err(E::custom(format!("invalid HealScanMode value: {value}"))),
                 }
             }
 
@@ -134,7 +134,7 @@ impl<'de> Deserialize<'de> for HealScanMode {
                 E: serde::de::Error,
             {
                 if value > u8::MAX as u64 {
-                    return Err(E::custom(format!("HealScanMode value too large: {}", value)));
+                    return Err(E::custom(format!("HealScanMode value too large: {value}")));
                 }
                 self.visit_u8(value as u8)
             }
@@ -144,7 +144,7 @@ impl<'de> Deserialize<'de> for HealScanMode {
                 E: serde::de::Error,
             {
                 if value < 0 || value > u8::MAX as i64 {
-                    return Err(E::custom(format!("invalid HealScanMode value: {}", value)));
+                    return Err(E::custom(format!("invalid HealScanMode value: {value}")));
                 }
                 self.visit_u8(value as u8)
             }
@@ -162,7 +162,7 @@ impl<'de> Deserialize<'de> for HealScanMode {
                     "Unknown" | "unknown" => Ok(HealScanMode::Unknown),
                     "Normal" | "normal" => Ok(HealScanMode::Normal),
                     "Deep" | "deep" => Ok(HealScanMode::Deep),
-                    _ => Err(E::custom(format!("invalid HealScanMode string: {}", value))),
+                    _ => Err(E::custom(format!("invalid HealScanMode string: {value}"))),
                 }
             }
         }
