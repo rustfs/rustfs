@@ -1985,16 +1985,20 @@ impl DiskAPI for LocalDisk {
 
         // TODO: Healing
 
+        let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
         // Note: For non-versioned buckets, fi.version_id is None, but in xl.meta it's stored as Some(Uuid::nil())
         let has_old_data_dir = {
-            let search_version_id = fi.version_id.or(Some(Uuid::nil()));
             xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
                 // shard_count == 0 means no other version shares this data_dir
                 ver.get_data_dir()
                     .filter(|&data_dir| xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0)
             })
         };
+        if let Some(old_data_dir) = has_old_data_dir.as_ref() {
+            let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
+        }
 
         xlmeta.add_version(fi.clone())?;
 
