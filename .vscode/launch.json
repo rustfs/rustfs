@@ -22,6 +22,7 @@
             "env": {
                 "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=debug",
                 "RUSTFS_SKIP_BACKGROUND_TASK": "on",
+                //"RUSTFS_OBS_LOG_DIRECTORY": "./deploy/logs",
                 // "RUSTFS_POLICY_PLUGIN_URL":"http://localhost:8181/v1/data/rustfs/authz/allow",
                 // "RUSTFS_POLICY_PLUGIN_AUTH_TOKEN":"your-opa-token" 
             },
