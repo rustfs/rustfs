@@ -274,7 +274,7 @@ pub async fn start_http_server(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
-
+    let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
@@ -288,11 +288,13 @@ pub async fn start_http_server(
 
         );
 
+        println!("Console WebUI Start Time: {now_time}");
         println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
-        info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-        println!("   API: {api_endpoints}  {localhost_endpoint}");
+        info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Start Time: {now_time}");
         if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
@@ -597,17 +599,17 @@ fn process_connection(
                             ("key_request_method", format!("{}", request.method())),
                             ("key_request_uri_path", request.uri().path().to_owned().to_string()),
                         ];
-                        counter!("rustfs_api_requests_total", &labels).increment(1);
+                        counter!("rustfs.api.requests.total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
                         let _enter = span.enter();
-                        histogram!("request.latency.ms").record(latency.as_millis() as f64);
+                        histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        histogram!("request.body.len").record(chunk.len() as f64);
+                        histogram!("rustfs.request.body.len").record(chunk.len() as f64);
                         debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
@@ -616,7 +618,7 @@ fn process_connection(
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        counter!("rustfs_api_requests_failure_total").increment(1);
+                        counter!("rustfs.api.requests.failure.total").increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )

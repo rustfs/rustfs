@@ -91,7 +91,7 @@ echo "Test 4: Testing Console endpoints..."
 CONSOLE_PORTS=(9001 9011 9021 9031)
 CONSOLE_SUCCESS=0
 for port in "${CONSOLE_PORTS[@]}"; do
-  if curl -sf http://localhost:${port}/health >/dev/null 2>&1; then
+  if curl -sf http://localhost:${port}/rustfs/console/health >/dev/null 2>&1; then
     echo -e "  ${GREEN}✓ Console on port $port is responding${NC}"
     CONSOLE_SUCCESS=$((CONSOLE_SUCCESS + 1))
   else

@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/introduction.html">快速开始</a>
+  <a href="https://docs.rustfs.com/installation/">快速开始</a>
   · <a href="https://docs.rustfs.com/">文档</a>
   · <a href="https://github.com/rustfs/rustfs/issues">报告 Bug</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">社区讨论</a>
@@ -153,7 +153,7 @@ make help-docker                      # 显示所有 Docker 相关命令
 
 ### 4\. 使用 Helm Chart 安装 (选项 4) - 云原生环境
 
-请按照 [Helm Chart README](https://www.google.com/search?q=./helm/README.md) 上的说明在 Kubernetes 集群上安装 RustFS。
+请按照 [Helm Chart README](https://charts.rustfs.com) 上的说明在 Kubernetes 集群上安装 RustFS。
 
 -----
 

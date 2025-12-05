@@ -244,6 +244,14 @@ fn test_heal_task_status_atomic_update() {
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_ahm::Result<Vec<String>> {
             Ok(vec![])
         }
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> rustfs_ahm::Result<(Vec<String>, Option<String>, bool)> {
+            Ok((vec![], None, false))
+        }
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_ahm::Result<rustfs_ecstore::disk::DiskStore> {
             Err(rustfs_ahm::Error::other("Not implemented in mock"))
         }

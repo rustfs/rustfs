@@ -29,7 +29,7 @@ docker-compose logs -f
 
 # Test the deployment
 curl http://localhost:9000/health
-curl http://localhost:9001/health
+curl http://localhost:9001/rustfs/console/health
 
 # Run comprehensive tests
 ./test-deployment.sh
@@ -173,7 +173,7 @@ done
 # 3. Test console endpoints
 for port in 9001 9011 9021 9031; do
   echo "Testing console port $port..."
-  curl -s http://localhost:${port}/health | jq '.'
+  curl -s http://localhost:${port}/rustfs/console/health | jq '.'
 done
 
 # 4. Check inter-node connectivity

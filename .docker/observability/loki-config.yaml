@@ -41,6 +41,9 @@ query_range:
 
 limits_config:
   metric_aggregation_enabled: true
+  max_line_size: 256KB
+  max_line_size_truncate: false
+  allow_structured_metadata: true
 
 schema_config:
   configs:
@@ -51,6 +54,7 @@ schema_config:
       index:
         prefix: index_
         period: 24h
+      row_shards: 16
 
 pattern_ingester:
   enabled: true
