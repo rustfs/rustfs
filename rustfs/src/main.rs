@@ -60,7 +60,7 @@ use rustfs_ecstore::{
 use rustfs_iam::init_iam_sys;
 use rustfs_notify::notifier_global;
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_targets::arn::TargetID;
+use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::s3_error;
 use std::env;
@@ -516,9 +516,9 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
                     "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
 
                 let mut event_rules = Vec::new();
-                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), TargetID::from_str);
-                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), TargetID::from_str);
-                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), TargetID::from_str);
+                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), |arn_str| ARN::parse(arn_str).map(|arn| arn.target_id).map_err(|e| TargetIDError::InvalidFormat(e.to_string())));
+                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), |arn_str| ARN::parse(arn_str).map(|arn| arn.target_id).map_err(|e| TargetIDError::InvalidFormat(e.to_string())));
+                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), |arn_str| ARN::parse(arn_str).map(|arn| arn.target_id).map_err(|e| TargetIDError::InvalidFormat(e.to_string())));
 
                 if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
                     .await
