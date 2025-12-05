@@ -65,8 +65,8 @@ jobs:
 
       - name: Push helm package and index file
         run: |
-          git config --global user.name "xiaomage"
-          git config --global user.email "devops008@sina.com"
+          git config --global user.name "${{ secrets.USERNAME }}"
+          git config --global user.email "${{ secrets.EMAIL_ADDRESS }}"
           git status .
           git add .
           git commit -m "Update rustfs helm package with $new_version."
