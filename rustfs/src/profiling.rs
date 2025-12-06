@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use chrono::Utc;
+#[cfg(not(target_arch = "aarch64"))]
 use jemalloc_pprof::PROF_CTL;
 use pprof::protos::Message;
 use rustfs_config::{
@@ -102,6 +103,7 @@ pub async fn dump_cpu_pprof_for(duration: Duration) -> Result<PathBuf, String> {
 }
 
 // Public API: dump memory pprof now (jemalloc)
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
     let out = output_dir().join(format!("mem_profile_{}.pb", ts()));
     let mut f = File::create(&out).map_err(|e| format!("create file failed: {e}"))?;
@@ -121,7 +123,13 @@ pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
     Ok(out)
 }
 
+#[cfg(target_arch = "aarch64")]
+pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
+    Err("Memory profiling is not supported on aarch64 architectures".to_string())
+}
+
 // Jemalloc status check (No forced placement, only status observation)
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn check_jemalloc_profiling() {
     use tikv_jemalloc_ctl::{config, epoch, stats};
 
@@ -160,6 +168,11 @@ pub async fn check_jemalloc_profiling() {
     show!("mapped", stats::mapped::read());
     show!("metadata", stats::metadata::read());
     show!("active", stats::active::read());
+}
+
+#[cfg(target_arch = "aarch64")]
+pub async fn check_jemalloc_profiling() {
+    info!("Jemalloc profiling is disabled on aarch64 architectures");
 }
 
 // Internal: start continuous CPU profiling
@@ -213,6 +226,7 @@ async fn start_cpu_periodic(freq_hz: i32, interval: Duration, duration: Duration
 }
 
 // Internal: start periodic memory dump when jemalloc profiling is active
+#[cfg(not(target_arch = "aarch64"))]
 async fn start_memory_periodic(interval: Duration) {
     info!(?interval, "start periodic memory pprof dump");
     tokio::spawn(async move {
@@ -249,6 +263,11 @@ async fn start_memory_periodic(interval: Duration) {
             }
         }
     });
+}
+
+#[cfg(target_arch = "aarch64")]
+async fn start_memory_periodic(_interval: Duration) {
+    warn!("Periodic memory profiling is not supported on aarch64 architectures");
 }
 
 // Public: unified init entry, avoid duplication/conflict
