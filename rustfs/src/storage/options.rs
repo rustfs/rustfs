@@ -93,6 +93,8 @@ pub async fn del_opts(
         .map(|v| v.to_str().unwrap() == "true")
         .unwrap_or_default();
 
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
+
     Ok(opts)
 }
 
@@ -132,6 +134,8 @@ pub async fn get_opts(
 
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
+
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
     Ok(opts)
 }

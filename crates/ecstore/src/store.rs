@@ -767,6 +767,12 @@ impl ECStore {
 
             def_pool = pinfo.clone();
             has_def_pool = true;
+            // https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html
+            if is_err_object_not_found(err) {
+                if let Err(err) = opts.precondition_check(&pinfo.object_info) {
+                    return Err(err.clone());
+                }
+            }
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
                 return Err(err.clone());
@@ -1392,6 +1398,7 @@ impl StorageAPI for ECStore {
 
         let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
 
+        opts.precondition_check(&info)?;
         Ok(info)
     }
 
