@@ -192,6 +192,21 @@ impl From<ApiError> for S3Error {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
+        // Special handling for Io errors that may contain ChecksumMismatch
+        if let StorageError::Io(ref io_err) = err {
+            if let Some(inner) = io_err.get_ref() {
+                if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
+                    || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some()
+                {
+                    return ApiError {
+                        code: S3ErrorCode::BadDigest,
+                        message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                        source: Some(Box::new(err)),
+                    };
+                }
+            }
+        }
+
         let code = match &err {
             StorageError::NotImplemented => S3ErrorCode::NotImplemented,
             StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
@@ -239,6 +254,23 @@ impl From<StorageError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
+        // Check if the error is a ChecksumMismatch (BadDigest)
+        if let Some(inner) = err.get_ref() {
+            if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
+                return ApiError {
+                    code: S3ErrorCode::BadDigest,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    source: Some(Box::new(err)),
+                };
+            }
+            if inner.downcast_ref::<rustfs_rio::BadDigest>().is_some() {
+                return ApiError {
+                    code: S3ErrorCode::BadDigest,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    source: Some(Box::new(err)),
+                };
+            }
+        }
         ApiError {
             code: S3ErrorCode::InternalError,
             message: err.to_string(),
