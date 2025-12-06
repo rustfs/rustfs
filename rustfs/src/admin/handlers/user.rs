@@ -14,7 +14,7 @@
 
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_session_token, constant_time_eq},
+    auth::{check_key_valid, constant_time_eq, get_session_token},
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::utils::has_space_be;
-use crate::auth::{get_condition_values, get_session_token, constant_time_eq};
+use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::{admin::router::Operation, auth::check_key_valid};
 use http::HeaderMap;
 use hyper::StatusCode;
