@@ -6960,6 +6960,7 @@ dependencies = [
  "flatbuffers",
  "futures",
  "futures-util",
+ "h2 0.4.12",
  "hex-simd",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -7615,6 +7616,7 @@ dependencies = [
  "async-compression",
  "tokio",
  "tokio-stream",
+ "zip",
 ]
 
 [[package]]

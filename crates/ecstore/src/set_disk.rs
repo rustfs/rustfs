@@ -236,7 +236,7 @@ impl SetDisks {
             LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
         }
     }
-    async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
+    pub(crate) async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
         let rl = self.disks.read().await;
 
         rl.clone()

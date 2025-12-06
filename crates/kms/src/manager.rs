@@ -46,6 +46,14 @@ impl KmsManager {
         self.config.default_key_id.as_ref()
     }
 
+    /// Get the KMS configuration
+    ///
+    /// # Returns
+    /// Reference to the current KMS configuration
+    pub fn get_config(&self) -> &KmsConfig {
+        &self.config
+    }
+
     /// Create a new master key
     pub async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         let response = self.backend.create_key(request).await?;

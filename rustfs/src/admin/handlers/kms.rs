@@ -125,7 +125,7 @@ impl Operation for CreateKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)], // TODO: Add specific KMS action
+            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
         )
         .await?;
 
@@ -406,8 +406,11 @@ impl Operation for KmsStatusHandler {
             miss_count: misses,
         });
 
+        // Get backend type from actual configuration
+        let backend_type = service.get_config().backend.to_string();
+
         let response = KmsStatusResponse {
-            backend_type: "vault".to_string(), // TODO: Get from config
+            backend_type,
             backend_status,
             cache_enabled: cache_stats.is_some(),
             cache_stats,
@@ -449,13 +452,14 @@ impl Operation for KmsConfigHandler {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
-        // TODO: Get actual config from service
+        // Get actual config from service
+        let config = service.get_config();
         let response = KmsConfigResponse {
-            backend: "vault".to_string(),
-            cache_enabled: true,
-            cache_max_keys: 1000,
-            cache_ttl_seconds: 300,
-            default_key_id: service.get_default_key_id().cloned(),
+            backend: config.backend.to_string(),
+            cache_enabled: config.enable_cache,
+            cache_max_keys: config.cache_config.max_keys,
+            cache_ttl_seconds: config.cache_config.ttl.as_secs(),
+            default_key_id: config.default_key_id.clone(),
         };
 
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;

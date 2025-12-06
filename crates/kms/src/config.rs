@@ -30,6 +30,15 @@ pub enum KmsBackend {
     Local,
 }
 
+impl std::fmt::Display for KmsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KmsBackend::Vault => write!(f, "vault"),
+            KmsBackend::Local => write!(f, "local"),
+        }
+    }
+}
+
 /// Main KMS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KmsConfig {

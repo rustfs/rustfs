@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::pin_mut;
+use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
@@ -29,7 +30,7 @@ use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::ObjectIO;
+use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectIO};
 use rustfs_ecstore::store_api::ObjectOptions;
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -89,12 +90,28 @@ impl std::fmt::Display for EcObjectStore {
 
 #[async_trait]
 impl ObjectStore for EcObjectStore {
-    async fn put_opts(&self, _location: &Path, _payload: PutPayload, _opts: PutOptions) -> Result<PutResult> {
-        unimplemented!()
+    /// Put operations are not supported for S3 Select API.
+    /// S3 Select is a read-only query interface for retrieving subsets of object data.
+    async fn put_opts(&self, location: &Path, _payload: PutPayload, _opts: PutOptions) -> Result<PutResult> {
+        Err(o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support put operations. Location: {}",
+                location
+            )
+            .into(),
+        })
     }
 
-    async fn put_multipart_opts(&self, _location: &Path, _opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
-        unimplemented!()
+    /// Multipart upload is not supported for S3 Select API.
+    /// S3 Select is a read-only query interface.
+    async fn put_multipart_opts(&self, location: &Path, _opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
+        Err(o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support multipart upload operations. Location: {}",
+                location
+            )
+            .into(),
+        })
     }
 
     async fn get_opts(&self, location: &Path, _options: GetOptions) -> Result<GetResult> {
@@ -147,8 +164,64 @@ impl ObjectStore for EcObjectStore {
         })
     }
 
-    async fn get_ranges(&self, _location: &Path, _ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        unimplemented!()
+    /// Get multiple byte ranges from an object.
+    /// This is useful for efficiently reading specific portions of large objects.
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        info!("get_ranges: {:?} with {} ranges", location, ranges.len());
+
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Explicit type annotation for futures to ensure homogeneity
+        let mut futures: Vec<Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send>>> = Vec::with_capacity(ranges.len());
+
+        for range in ranges {
+            // Check for empty range
+            if range.start >= range.end {
+                futures.push(Box::pin(async { Ok(Bytes::new()) }));
+                continue;
+            }
+
+            let bucket = self.input.bucket.clone();
+            let key = self.input.key.clone();
+            let store = self.store.clone();
+            
+            // Convert u64 range to i64 range for HTTPRangeSpec
+            let start = range.start as i64;
+            let end = (range.end - 1) as i64;
+
+            futures.push(Box::pin(async move {
+                let opts = ObjectOptions::default();
+                let h = HeaderMap::new();
+                let range_spec = HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start,
+                    end,
+                };
+                
+                let mut reader = store
+                    .get_object_reader(&bucket, &key, Some(range_spec), h, &opts)
+                    .await
+                    .map_err(|e| o_Error::NotFound {
+                        path: format!("{}/{}", bucket, key),
+                        source: format!("Failed to get object range: {}", e).into(),
+                    })?;
+                    
+                let mut buf = Vec::new();
+                tokio::io::copy(&mut reader.stream, &mut buf)
+                    .await
+                    .map_err(|e| o_Error::Generic {
+                         store: "EcObjectStore",
+                         source: Box::new(e),
+                    })?;
+                    
+                Ok(Bytes::from(buf))
+            }));
+        }
+
+        let results = join_all(futures).await;
+        results.into_iter().collect()
     }
 
     async fn head(&self, location: &Path) -> Result<ObjectMeta> {
@@ -172,24 +245,66 @@ impl ObjectStore for EcObjectStore {
         })
     }
 
-    async fn delete(&self, _location: &Path) -> Result<()> {
-        unimplemented!()
+    /// Delete operations are not supported for S3 Select API.
+    /// S3 Select is a read-only query interface.
+    async fn delete(&self, location: &Path) -> Result<()> {
+        Err(o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support delete operations. Location: {}",
+                location
+            )
+            .into(),
+        })
     }
 
-    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        unimplemented!()
+    /// List operations are not supported for S3 Select API.
+    /// S3 Select operates on a single, specific object.
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let prefix_str = prefix.map(|p| p.to_string()).unwrap_or_default();
+        let error = o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support list operations. Prefix: {}",
+                prefix_str
+            )
+            .into(),
+        };
+        futures::stream::once(async move { Err(error) }).boxed()
     }
 
-    async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> Result<ListResult> {
-        unimplemented!()
+    /// List with delimiter is not supported for S3 Select API.
+    /// S3 Select operates on a single, specific object.
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Err(o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support list operations. Prefix: {:?}",
+                prefix
+            )
+            .into(),
+        })
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
-        unimplemented!()
+    /// Copy operations are not supported for S3 Select API.
+    /// S3 Select is a read-only query interface.
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        Err(o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support copy operations. From: {}, To: {}",
+                from, to
+            )
+            .into(),
+        })
     }
 
-    async fn copy_if_not_exists(&self, _from: &Path, _too: &Path) -> Result<()> {
-        unimplemented!()
+    /// Copy if not exists is not supported for S3 Select API.
+    /// S3 Select is a read-only query interface.
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+        Err(o_Error::NotSupported {
+            source: format!(
+                "S3 Select API does not support copy operations. From: {}, To: {}",
+                from, to
+            )
+            .into(),
+        })
     }
 }
 

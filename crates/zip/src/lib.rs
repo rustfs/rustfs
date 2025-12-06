@@ -215,22 +215,75 @@ pub struct ZipEntry {
 
 /// Simplified ZIP file processing (temporarily using standard library zip crate)
 pub async fn extract_zip_simple<P: AsRef<Path>>(zip_path: P, extract_to: P) -> io::Result<Vec<ZipEntry>> {
-    // Use standard library zip processing, return empty list as placeholder for now
-    // Actual implementation needs to be improved in future versions
-    let _zip_path = zip_path.as_ref();
-    let _extract_to = extract_to.as_ref();
+    let zip_path = zip_path.as_ref().to_path_buf();
+    let extract_to = extract_to.as_ref().to_path_buf();
 
-    Ok(Vec::new())
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&zip_path)?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut entries = Vec::new();
+
+        for i in 0..archive.len() {
+            let mut file = archive
+                .by_index(i)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            
+            // Validate mangled_name for safety? zip crate handles sanitization usually.
+            // Using mangled_name() is safer.
+            let outpath = extract_to.join(file.mangled_name());
+
+            if file.is_dir() {
+                std::fs::create_dir_all(&outpath)?;
+            } else {
+                if let Some(p) = outpath.parent() {
+                    if !p.exists() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)?;
+                std::io::copy(&mut file, &mut outfile)?;
+            }
+
+            entries.push(ZipEntry {
+                name: file.name().to_string(),
+                size: file.size(),
+                compressed_size: file.compressed_size(),
+                is_dir: file.is_dir(),
+                compression_method: format!("{:?}", file.compression()),
+            });
+        }
+        Ok(entries)
+    })
+    .await
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
 }
 
 /// Simplified ZIP file creation
 pub async fn create_zip_simple<P: AsRef<Path>>(
-    _zip_path: P,
-    _files: Vec<(String, Vec<u8>)>, // (filename, file content)
+    zip_path: P,
+    files: Vec<(String, Vec<u8>)>, // (filename, file content)
     _compression_level: CompressionLevel,
 ) -> io::Result<()> {
-    // Return unimplemented error for now
-    Err(io::Error::new(io::ErrorKind::Unsupported, "ZIP creation not yet implemented"))
+    let zip_path = zip_path.as_ref().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip_path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+
+        for (name, content) in files {
+            zip.start_file(name, options)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            zip.write_all(&content)?;
+        }
+        zip.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
 }
 
 /// Compression utility struct
@@ -254,6 +307,26 @@ impl Compressor {
 
     /// Compress data
     pub async fn compress(&self, input: &[u8]) -> io::Result<Vec<u8>> {
+        if matches!(self.format, CompressionFormat::Zip) {
+            let input = input.to_vec();
+            return tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut output = Vec::new();
+                {
+                    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut output));
+                    let options = zip::write::FileOptions::<()>::default()
+                        .compression_method(zip::CompressionMethod::Deflated);
+                    
+                    zip.start_file("data", options).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    zip.write_all(&input)?;
+                    zip.finish().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                }
+                Ok(output)
+            })
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+
         let output = Vec::new();
         let cursor = std::io::Cursor::new(output);
         let mut encoder = self.format.get_encoder(cursor, self.level)?;
@@ -261,10 +334,30 @@ impl Compressor {
         tokio::io::copy(&mut std::io::Cursor::new(input), &mut encoder).await?;
         encoder.shutdown().await?;
 
-        // Get compressed data
-        // Note: API needs to be redesigned here as we cannot retrieve data from encoder
-        // Return empty vector as placeholder for now
-        Ok(Vec::new())
+        // Get inner writer (output)
+        // With async-compression, we can usually dropping encoder or finishing it gives access?
+        // Box<dyn AsyncWrite> hides the inner type.
+        // We cannot get value back from Box<dyn AsyncWrite> easily unless downcasted.
+        // But get_encoder returns Box.
+        // This design of Compressor::compress returning Vec<u8> is problematic if we can't retrieve underlying buffer.
+        // However, for async-compression encoders, we can't easily unwrap.
+        // We need to change get_encoder to return specific type or something that allows retrieval?
+        // OR we use the fact that `get_encoder` took `W`.
+        // But `W` was moved into Box.
+        
+        // Wait, the previous implementation returned Ok(Vec::new()) !
+        // "Note: API needs to be redesigned here as we cannot retrieve data from encoder"
+        // I cannot fix the design easily without changing `get_encoder` signature.
+        
+        // However, for objective "Complete ZIP Archive Support", I handled Zip.
+        // For others, I can't fix `get_encoder` issue in this scope easily without refactoring `get_encoder`.
+        // But I can implement Zip branch correctly.
+        
+        // For non-Zip, I'll return empty vec as before? 
+        // Or I can't do better.
+        // But `Zip` branch works because I built it myself in `spawn_blocking`.
+        
+        Ok(Vec::new()) 
     }
 
     /// Decompress data

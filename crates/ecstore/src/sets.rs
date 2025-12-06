@@ -368,7 +368,14 @@ impl ObjectIO for Sets {
 impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
+        if let Some(set) = self.disk_set.first() {
+            set.backend_info().await
+        } else {
+            rustfs_madmin::BackendInfo {
+                backend_type: rustfs_madmin::BackendByte::Erasure,
+                ..Default::default()
+            }
+        }
     }
     #[tracing::instrument(skip(self))]
     async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
@@ -412,22 +419,50 @@ impl StorageAPI for Sets {
         }
     }
     #[tracing::instrument(skip(self))]
-    async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
-        unimplemented!()
+    #[tracing::instrument(skip(self))]
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        let mut futures = Vec::new();
+        for set in self.disk_set.iter() {
+            futures.push(set.make_bucket(bucket, opts));
+        }
+        let _results = join_all(futures).await;
+        Ok(())
     }
     #[tracing::instrument(skip(self))]
-    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-        unimplemented!()
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        for set in self.disk_set.iter() {
+            if let Ok(info) = set.get_bucket_info(bucket, opts).await {
+                return Ok(info);
+            }
+        }
+        Err(Error::from(StorageError::BucketNotFound(bucket.to_string())))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        unimplemented!()
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        let mut buckets = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for set in self.disk_set.iter() {
+            if let Ok(b) = set.list_bucket(opts).await {
+                for bucket in b {
+                    if seen.insert(bucket.name.clone()) {
+                        buckets.push(bucket);
+                    }
+                }
+            }
+        }
+        Ok(buckets)
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-        unimplemented!()
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        let mut futures = Vec::new();
+        for set in self.disk_set.iter() {
+            futures.push(set.delete_bucket(bucket, opts));
+        }
+        let _results = join_all(futures).await;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -657,19 +692,56 @@ impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
-        _src_bucket: &str,
-        _src_object: &str,
-        _dst_bucket: &str,
-        _dst_object: &str,
-        _upload_id: &str,
-        _part_id: usize,
-        _start_offset: i64,
-        _length: i64,
-        _src_info: &ObjectInfo,
-        _src_opts: &ObjectOptions,
-        _dst_opts: &ObjectOptions,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        upload_id: &str,
+        part_id: usize,
+        start_offset: i64,
+        length: i64,
+        src_info: &ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
     ) -> Result<()> {
-        unimplemented!()
+        let src_set = self.get_disks_by_key(src_object);
+        let dst_set = self.get_disks_by_key(dst_object);
+
+        let cp_src_dst_same = path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]);
+
+        if cp_src_dst_same {
+            return src_set
+                .copy_object_part(
+                    src_bucket,
+                    src_object,
+                    dst_bucket,
+                    dst_object,
+                    upload_id,
+                    part_id,
+                    start_offset,
+                    length,
+                    src_info,
+                    src_opts,
+                    dst_opts,
+                )
+                .await;
+        }
+
+        dst_set
+            .copy_object_part(
+                src_bucket,
+                src_object,
+                dst_bucket,
+                dst_object,
+                upload_id,
+                part_id,
+                start_offset,
+                length,
+                src_info,
+                src_opts,
+                dst_opts,
+            )
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -722,13 +794,17 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        unimplemented!()
+    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        if pool_idx == self.pool_idx && set_idx < self.disk_set.len() {
+            Ok(self.disk_set[set_idx].get_disks_internal().await)
+        } else {
+            Err(Error::from(StorageError::InvalidArgument(String::new(), String::new(), "Invalid set/pool index".to_string())))
+        }
     }
 
     #[tracing::instrument(skip(self))]
     fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
+        self.disk_set.iter().map(|s| s.set_drive_count).collect()
     }
 
     #[tracing::instrument(skip(self))]

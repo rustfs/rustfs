@@ -154,6 +154,15 @@ impl ObjectEncryptionService {
         self.kms_manager.health_check().await
     }
 
+    /// Get the KMS configuration
+    ///
+    /// # Returns
+    /// Reference to the current KMS configuration
+    ///
+    pub fn get_config(&self) -> &crate::config::KmsConfig {
+        self.kms_manager.get_config()
+    }
+
     /// Create a data encryption key for object encryption
     ///
     /// # Arguments
