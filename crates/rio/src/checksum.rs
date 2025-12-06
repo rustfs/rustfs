@@ -959,31 +959,47 @@ pub fn read_part_checksums(mut buf: &[u8]) -> Vec<HashMap<String, String>> {
 /// CRC64 NVME polynomial constant
 const CRC64_NVME_POLYNOMIAL: u64 = 0xad93d23594c93659;
 
-/// GF(2) matrix multiplication
-fn gf2_matrix_times(mat: &[u64], mut vec: u64) -> u64 {
-    let mut sum = 0u64;
-    let mut mat_iter = mat.iter();
+/// GF(2) matrix multiplication for 32-bit values
+fn gf2_matrix_times_u32(mat: &[u32], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut idx = 0usize;
 
     while vec != 0 {
-        if vec & 1 != 0 {
-            if let Some(&m) = mat_iter.next() {
-                sum ^= m;
-            }
+        if (vec & 1) != 0 {
+            sum ^= mat[idx];
         }
         vec >>= 1;
-        mat_iter.next();
+        idx += 1;
     }
     sum
 }
 
-/// Square a GF(2) matrix
-fn gf2_matrix_square(square: &mut [u64], mat: &[u64]) {
-    if square.len() != mat.len() {
-        panic!("square matrix size mismatch");
-    }
-
+/// Square a GF(2) matrix for 32-bit values
+fn gf2_matrix_square_u32(square: &mut [u32], mat: &[u32]) {
     for (i, &m) in mat.iter().enumerate() {
-        square[i] = gf2_matrix_times(mat, m);
+        square[i] = gf2_matrix_times_u32(mat, m);
+    }
+}
+
+/// GF(2) matrix multiplication for 64-bit values
+fn gf2_matrix_times_u64(mat: &[u64], mut vec: u64) -> u64 {
+    let mut sum = 0u64;
+    let mut idx = 0usize;
+
+    while vec != 0 {
+        if (vec & 1) != 0 {
+            sum ^= mat[idx];
+        }
+        vec >>= 1;
+        idx += 1;
+    }
+    sum
+}
+
+/// Square a GF(2) matrix for 64-bit values
+fn gf2_matrix_square_u64(square: &mut [u64], mat: &[u64]) {
+    for (i, &m) in mat.iter().enumerate() {
+        square[i] = gf2_matrix_times_u64(mat, m);
     }
 }
 
@@ -998,33 +1014,33 @@ fn crc32_combine(poly: u32, crc1: u32, crc2: u32, len2: i64) -> u32 {
         return crc1;
     }
 
-    let mut even = [0u64; 32]; // even-power-of-two zeros operator
-    let mut odd = [0u64; 32]; // odd-power-of-two zeros operator
+    let mut even = [0u32; 32]; // even-power-of-two zeros operator
+    let mut odd = [0u32; 32]; // odd-power-of-two zeros operator
 
     // Put operator for one zero bit in odd
-    odd[0] = poly as u64; // CRC-32 polynomial
-    let mut row = 1u64;
-    for (_i, odd_val) in odd.iter_mut().enumerate().skip(1) {
+    odd[0] = poly;
+    let mut row = 1u32;
+    for odd_val in odd.iter_mut().skip(1) {
         *odd_val = row;
         row <<= 1;
     }
 
     // Put operator for two zero bits in even
-    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square_u32(&mut even, &odd);
 
     // Put operator for four zero bits in odd
-    gf2_matrix_square(&mut odd, &even);
+    gf2_matrix_square_u32(&mut odd, &even);
 
     // Apply len2 zeros to crc1 (first square will put the operator for one
     // zero byte, eight zero bits, in even)
-    let mut crc1n = crc1 as u64;
-    let mut len2 = len2;
+    let mut crc1 = crc1;
+    let mut len2 = len2 as u64;
 
     loop {
         // Apply zeros operator for this bit of len2
-        gf2_matrix_square(&mut even, &odd);
+        gf2_matrix_square_u32(&mut even, &odd);
         if len2 & 1 != 0 {
-            crc1n = gf2_matrix_times(&even, crc1n);
+            crc1 = gf2_matrix_times_u32(&even, crc1);
         }
         len2 >>= 1;
 
@@ -1034,9 +1050,9 @@ fn crc32_combine(poly: u32, crc1: u32, crc2: u32, len2: i64) -> u32 {
         }
 
         // Another iteration of the loop with odd and even swapped
-        gf2_matrix_square(&mut odd, &even);
+        gf2_matrix_square_u32(&mut odd, &even);
         if len2 & 1 != 0 {
-            crc1n = gf2_matrix_times(&odd, crc1n);
+            crc1 = gf2_matrix_times_u32(&odd, crc1);
         }
         len2 >>= 1;
 
@@ -1047,8 +1063,7 @@ fn crc32_combine(poly: u32, crc1: u32, crc2: u32, len2: i64) -> u32 {
     }
 
     // Return combined crc
-    crc1n ^= crc2 as u64;
-    crc1n as u32
+    crc1 ^ crc2
 }
 
 /// Combine two CRC64 values
@@ -1064,48 +1079,71 @@ fn crc64_combine(poly: u64, crc1: u64, crc2: u64, len2: i64) -> u64 {
     // Put operator for one zero bit in odd
     odd[0] = poly; // CRC-64 polynomial
     let mut row = 1u64;
-    for (_i, odd_val) in odd.iter_mut().enumerate().skip(1) {
+    for odd_val in odd.iter_mut().skip(1) {
         *odd_val = row;
         row <<= 1;
     }
 
     // Put operator for two zero bits in even
-    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square_u64(&mut even, &odd);
 
     // Put operator for four zero bits in odd
-    gf2_matrix_square(&mut odd, &even);
+    gf2_matrix_square_u64(&mut odd, &even);
 
-    // Apply len2 zeros to crc1 (first square will put the operator for one
-    // zero byte, eight zero bits, in even)
-    let mut crc1n = crc1;
+    // Apply len2 zeros to crc1
+    let mut crc1 = crc1;
     let mut len2 = len2;
 
     loop {
-        // Apply zeros operator for this bit of len2
-        gf2_matrix_square(&mut even, &odd);
+        gf2_matrix_square_u64(&mut even, &odd);
         if len2 & 1 != 0 {
-            crc1n = gf2_matrix_times(&even, crc1n);
+            crc1 = gf2_matrix_times_u64(&even, crc1);
         }
         len2 >>= 1;
-
-        // If no more bits set, then done
         if len2 == 0 {
             break;
         }
 
-        // Another iteration of the loop with odd and even swapped
-        gf2_matrix_square(&mut odd, &even);
+        gf2_matrix_square_u64(&mut odd, &even);
         if len2 & 1 != 0 {
-            crc1n = gf2_matrix_times(&odd, crc1n);
+            crc1 = gf2_matrix_times_u64(&odd, crc1);
         }
         len2 >>= 1;
-
-        // If no more bits set, then done
         if len2 == 0 {
             break;
         }
     }
 
-    // Return combined crc
-    crc1n ^ crc2
+    crc1 ^ crc2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Checksum, ChecksumType};
+
+    fn make_patterned_data(size: usize) -> Vec<u8> {
+        let pattern = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        (0..size).map(|i| pattern[i % pattern.len()]).collect()
+    }
+
+    #[test]
+    fn merges_crc32_part_into_total() {
+        let initial = make_patterned_data(1024);
+        let append = make_patterned_data(512);
+
+        let base_checksum = Checksum::new_from_data(ChecksumType::CRC32, &initial).expect("base checksum should parse");
+        assert_eq!(base_checksum.raw, [0x22, 0x27, 0x6f, 0x16]);
+
+        let append_checksum = Checksum::new_from_data(ChecksumType::CRC32, &append).expect("append checksum should parse");
+        assert_eq!(append_checksum.raw, [0x8a, 0x36, 0x1e, 0x92]);
+
+        let mut total = base_checksum.clone();
+        total
+            .add_part(&append_checksum, append.len() as i64)
+            .expect("merge should succeed");
+
+        let recomputed = Checksum::new_from_data(ChecksumType::CRC32, &[initial, append].concat()).expect("recomputed checksum");
+
+        assert_eq!(total.raw, recomputed.raw);
+    }
 }

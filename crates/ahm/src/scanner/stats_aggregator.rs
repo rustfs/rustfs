@@ -342,30 +342,28 @@ impl DecentralizedStatsAggregator {
 
         // cache expired, re-aggregate
         info!("cache expired, start re-aggregating stats data");
-        let aggregation_timestamp = now;
-        let aggregated = self.aggregate_stats_from_all_nodes(aggregation_timestamp).await?;
+        let aggregated = self.aggregate_stats_from_all_nodes().await?;
 
         // update cache
         *self.cached_stats.write().await = Some(aggregated.clone());
-        *self.cache_timestamp.write().await = aggregation_timestamp;
+        *self.cache_timestamp.write().await = aggregated.aggregation_timestamp;
 
         Ok(aggregated)
     }
 
     /// force refresh aggregated stats (ignore cache)
     pub async fn force_refresh_aggregated_stats(&self) -> Result<AggregatedStats> {
-        let now = SystemTime::now();
-        let aggregated = self.aggregate_stats_from_all_nodes(now).await?;
+        let aggregated = self.aggregate_stats_from_all_nodes().await?;
 
         // update cache
         *self.cached_stats.write().await = Some(aggregated.clone());
-        *self.cache_timestamp.write().await = now;
+        *self.cache_timestamp.write().await = aggregated.aggregation_timestamp;
 
         Ok(aggregated)
     }
 
     /// aggregate stats data from all nodes
-    async fn aggregate_stats_from_all_nodes(&self, aggregation_timestamp: SystemTime) -> Result<AggregatedStats> {
+    async fn aggregate_stats_from_all_nodes(&self) -> Result<AggregatedStats> {
         let node_clients = self.node_clients.read().await;
         let config = self.config.read().await;
 
@@ -420,6 +418,7 @@ impl DecentralizedStatsAggregator {
         drop(config);
 
         // aggregate stats data
+        let aggregation_timestamp = SystemTime::now();
         let aggregated = self.aggregate_node_summaries(node_summaries, aggregation_timestamp).await;
 
         info!(

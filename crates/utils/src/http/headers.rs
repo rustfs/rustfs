@@ -138,6 +138,9 @@ pub const AMZ_CHECKSUM_TYPE: &str = "x-amz-checksum-type";
 pub const AMZ_CHECKSUM_TYPE_FULL_OBJECT: &str = "FULL_OBJECT";
 pub const AMZ_CHECKSUM_TYPE_COMPOSITE: &str = "COMPOSITE";
 
+// Append operation header for S3 Express One Zone compatibility
+pub const AMZ_WRITE_OFFSET_BYTES: &str = "x-amz-write-offset-bytes";
+
 // Post Policy related
 pub const AMZ_META_UUID: &str = "X-Amz-Meta-Uuid";
 pub const AMZ_META_NAME: &str = "X-Amz-Meta-Name";
