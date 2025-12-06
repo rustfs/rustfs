@@ -60,12 +60,11 @@ use rustfs_ecstore::{
 use rustfs_iam::init_iam_sys;
 use rustfs_notify::notifier_global;
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
+use rustfs_targets::arn::{ARN, TargetIDError};
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::s3_error;
 use std::env;
 use std::io::{Error, Result};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
