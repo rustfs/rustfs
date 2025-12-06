@@ -147,6 +147,7 @@ affinity: {}
 
 storageclass:
   name: local-path
-  size: 256Mi
+  dataStorageSize: 256Mi
+  logStorageSize: 256Mi
 
 extraManifests: []
