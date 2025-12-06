@@ -92,6 +92,7 @@ serde_urlencoded = { workspace = true }
 
 # Cryptography and Security
 rustls = { workspace = true }
+subtle = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
