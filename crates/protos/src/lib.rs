@@ -45,7 +45,13 @@ pub async fn node_service_time_out_client(
     let channel = match channel {
         Some(channel) => channel,
         None => {
-            let connector = Endpoint::from_shared(addr.to_string())?.connect_timeout(Duration::from_secs(60));
+            let connector = Endpoint::from_shared(addr.to_string())?
+                .connect_timeout(Duration::from_secs(5))
+                .tcp_keepalive(Some(Duration::from_secs(10)))
+                .http2_keep_alive_interval(Duration::from_secs(5))
+                .keep_alive_timeout(Duration::from_secs(3))
+                .keep_alive_while_idle(true)
+                .timeout(Duration::from_secs(60));
             let channel = connector.connect().await?;
 
             {
@@ -55,7 +61,6 @@ pub async fn node_service_time_out_client(
         }
     };
 
-    // let timeout_channel = Timeout::new(channel, Duration::from_secs(60));
     Ok(NodeServiceClient::with_interceptor(
         channel,
         Box::new(move |mut req: Request<()>| {
