@@ -28,17 +28,33 @@ use s3s::auth::SecretKey;
 use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 
+/// Performs constant-time string comparison to prevent timing attacks.
+///
+/// This function should be used when comparing sensitive values like passwords,
+/// API keys, or authentication tokens. It ensures the comparison time is
+/// independent of the position where strings differ and handles length differences
+/// securely.
+///
+/// # Security Note
+/// This implementation uses the `subtle` crate to provide cryptographically
+/// sound constant-time guarantees. The function is resistant to timing side-channel
+/// attacks and suitable for security-critical comparisons.
+///
+/// # Example
+/// ```
+/// use rustfs::auth::constant_time_eq;
+///
+/// let secret1 = "my-secret-key";
+/// let secret2 = "my-secret-key";
+/// let secret3 = "wrong-secret";
+///
+/// assert!(constant_time_eq(secret1, secret2));
+/// assert!(!constant_time_eq(secret1, secret3));
+/// ```
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    if a.len() != b.len() {
-        return false;
-    }
-    let result = AtomicU8::new(0);
-    for (byte_a, byte_b) in a.bytes().zip(b.bytes()) {
-        result.fetch_or(byte_a ^ byte_b, Ordering::Relaxed);
-    }
-    result.load(Ordering::Relaxed) == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 use std::collections::HashMap;
 use time::OffsetDateTime;

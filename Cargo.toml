@@ -152,6 +152,7 @@ rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.13.1"
 sha1 = "0.11.0-rc.3"
 sha2 = "0.11.0-rc.3"
+subtle = "2.6"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
 # Time and Date
