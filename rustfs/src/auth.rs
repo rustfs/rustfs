@@ -28,6 +28,18 @@ use s3s::auth::SecretKey;
 use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
+
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    if a.len() != b.len() {
+        return false;
+    }
+    let result = AtomicU8::new(0);
+    for (byte_a, byte_b) in a.bytes().zip(b.bytes()) {
+        result.fetch_or(byte_a ^ byte_b, Ordering::Relaxed);
+    }
+    result.load(Ordering::Relaxed) == 0
+}
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -111,7 +123,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
     let sys_cred = cred.clone();
 
-    if cred.access_key != access_key {
+    if !constant_time_eq(&cred.access_key, access_key) {
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
@@ -146,7 +158,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
 
-    let mut owner = sys_cred.access_key == cred.access_key || cred.parent_user == sys_cred.access_key;
+    let mut owner = constant_time_eq(&sys_cred.access_key, &cred.access_key) || constant_time_eq(&cred.parent_user, &sys_cred.access_key);
 
     // permitRootAccess
     if let Some(claims) = &cred.claims {
@@ -225,7 +237,7 @@ pub fn get_condition_values(
     let principal_type = if !username.is_empty() {
         if claims.is_some() {
             "AssumedRole"
-        } else if sys_cred.access_key == username {
+        } else if constant_time_eq(&sys_cred.access_key, &username) {
             "Account"
         } else {
             "User"
@@ -1101,5 +1113,22 @@ mod tests {
         let auth_type = get_request_auth_type(&headers);
 
         assert_eq!(auth_type, AuthType::Unknown);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq("test", "test"));
+        assert!(!constant_time_eq("test", "Test"));
+        assert!(!constant_time_eq("test", "test1"));
+        assert!(!constant_time_eq("test1", "test"));
+        assert!(!constant_time_eq("", "test"));
+        assert!(constant_time_eq("", ""));
+        
+        // Test with credentials-like strings
+        let key1 = "AKIAIOSFODNN7EXAMPLE";
+        let key2 = "AKIAIOSFODNN7EXAMPLE";
+        let key3 = "AKIAIOSFODNN7EXAMPLF";
+        assert!(constant_time_eq(key1, key2));
+        assert!(!constant_time_eq(key1, key3));
     }
 }
