@@ -41,6 +41,11 @@ pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(mut reader: R, mut bu
                 if total == 0 {
                     return Err(e);
                 }
+                // If the error is InvalidData (e.g., checksum mismatch), preserve it
+                // instead of wrapping it as UnexpectedEof, so proper error handling can occur
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    return Err(e);
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     format!("read {total} bytes, error: {e}"),
