@@ -108,7 +108,7 @@ use rustfs_s3select_api::{
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
     EventName,
-    arn::{TargetID, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::{
     CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
@@ -4949,20 +4949,24 @@ impl S3 for FS {
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
-            process_queue_configurations(
-                &mut event_rules,
-                notification_configuration.queue_configurations.clone(),
-                TargetID::from_str,
-            );
-            process_topic_configurations(
-                &mut event_rules,
-                notification_configuration.topic_configurations.clone(),
-                TargetID::from_str,
-            );
+            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
+            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
             process_lambda_configurations(
                 &mut event_rules,
                 notification_configuration.lambda_function_configurations.clone(),
-                TargetID::from_str,
+                |arn_str| {
+                    ARN::parse(arn_str)
+                        .map(|arn| arn.target_id)
+                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                },
             );
 
             event_rules
