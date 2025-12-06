@@ -2,6 +2,35 @@
 
 This document describes the environment variables that can be used to configure RustFS behavior.
 
+## Console and Reverse Proxy Configuration
+
+### RUSTFS_API_PUBLIC_ENDPOINT
+
+Specifies the public S3 API endpoint URL for the console when running behind a reverse proxy.
+
+- **Default**: None (uses console URL from forwarded headers)
+- **Format**: `https://domain[:port]` or `http://domain[:port]`
+- **Description**: When set, the console's `config.json` will use this endpoint for S3 API operations instead of deriving it from the console's own URL. This is useful when the API and console are served from different domains or when behind a reverse proxy.
+
+**Examples**:
+```bash
+# Separate domains for API and Console
+export RUSTFS_API_PUBLIC_ENDPOINT=https://api.example.com
+
+# API on non-standard port
+export RUSTFS_API_PUBLIC_ENDPOINT=https://api.example.com:9000
+
+# HTTP endpoint
+export RUSTFS_API_PUBLIC_ENDPOINT=http://api.internal.local
+```
+
+**Use Case**:
+When running behind Nginx or another reverse proxy with different domains:
+- Console: `https://console.rustfs.example.com`
+- API: `https://rustfs.example.com`
+
+Without this setting, the console would try to use `https://console.rustfs.example.com` for S3 API calls, which would fail.
+
 ## Background Services Control
 
 ### RUSTFS_ENABLE_SCANNER

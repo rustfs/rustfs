@@ -633,9 +633,38 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
     }
 }
 ```
+
+### Reverse Proxy with Separate API and Console Domains
+
+When the API and Console are served from different domains, set the `RUSTFS_API_PUBLIC_ENDPOINT` environment variable:
+
+```yaml
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ADDRESS=:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_API_PUBLIC_ENDPOINT=https://api.example.com
+      - RUSTFS_ACCESS_KEY=your_access_key
+      - RUSTFS_SECRET_KEY=your_secret_key
+```
+
+With this configuration:
+- Console is accessed via: `https://admin.example.com`
+- API is accessed via: `https://api.example.com`
+- The console's `config.json` will correctly reference the API endpoint
+
+**Important Headers**: RustFS relies on standard forwarded headers to determine the correct public URLs:
+- `X-Forwarded-Proto`: Protocol (http/https)
+- `X-Forwarded-Host`: Original host header
+- `X-Forwarded-Port`: Original port (optional, inferred from proto if not set)
 
 ## Health Monitoring
 
