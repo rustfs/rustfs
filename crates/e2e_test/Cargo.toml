@@ -50,3 +50,5 @@ base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+env_logger = "0.10"
+log = "0.4"

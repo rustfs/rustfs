@@ -246,6 +246,14 @@ pub enum S3Action {
     ResetBucketReplicationStateAction,
     #[strum(serialize = "s3:PutObjectFanOut")]
     PutObjectFanOutAction,
+    #[strum(serialize = "s3:GetBucketAcl")]
+    GetBucketAclAction,
+    #[strum(serialize = "s3:PutBucketAcl")]
+    PutBucketAclAction,
+    #[strum(serialize = "s3:GetObjectAcl")]
+    GetObjectAclAction,
+    #[strum(serialize = "s3:PutObjectAcl")]
+    PutObjectAclAction,
 }
 
 // #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]

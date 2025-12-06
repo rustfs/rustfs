@@ -14,7 +14,7 @@
 
 use crate::StorageAPI as _;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
-use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
+use crate::bucket::metadata::{BUCKET_ACL_CONFIG, BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
@@ -159,6 +159,20 @@ pub async fn get_versioning_config(bucket: &str) -> Result<(VersioningConfigurat
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_versioning_config(bucket).await
+}
+
+pub async fn get_bucket_acl_config(bucket: &str) -> Result<(String, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_acl_config(bucket).await
+}
+
+pub async fn set_bucket_acl_config(bucket: &str, acl: &str) -> Result<OffsetDateTime> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+
+    bucket_meta_sys.set_bucket_acl_config(bucket, acl).await
 }
 
 pub async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
@@ -550,5 +564,33 @@ impl BucketMetadataSys {
         } else {
             Err(Error::ConfigNotFound)
         }
+    }
+
+    pub async fn get_bucket_acl_config(&self, bucket: &str) -> Result<(String, OffsetDateTime)> {
+        let (bm, _reload) = self.get_config(bucket).await?;
+
+        if !bm.acl_config_xml.is_empty() {
+            let acl_str = String::from_utf8_lossy(&bm.acl_config_xml).to_string();
+            Ok((acl_str, bm.acl_config_updated_at))
+        } else {
+            // Default to private ACL
+            Ok(("private".to_string(), bm.acl_config_updated_at))
+        }
+    }
+
+    pub async fn set_bucket_acl_config(&mut self, bucket: &str, acl: &str) -> Result<OffsetDateTime> {
+        let now = OffsetDateTime::now_utc();
+        let acl_bytes = acl.as_bytes().to_vec();
+
+        self.update(bucket, BUCKET_ACL_CONFIG, acl_bytes).await?;
+
+        // Update in-memory cache by reloading the bucket metadata
+        let bm = load_bucket_metadata_parse(self.api.clone(), bucket, true)
+            .await
+            .map_err(|e| Error::other(format!("Failed to reload bucket metadata: {}", e)))?;
+
+        self.set(bucket.to_string(), Arc::new(bm)).await;
+
+        Ok(now)
     }
 }

@@ -15,7 +15,11 @@
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::license::license_check;
+use rustfs_ecstore::StorageAPI;
+use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::auth;
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -35,10 +39,95 @@ pub(crate) struct ReqInfo {
     pub region: Option<String>,
 }
 
+/// Checks if a bucket allows access based on its ACL for list operations
+async fn is_bucket_list_accessible(bucket: &str, is_authenticated: bool) -> bool {
+    // Get the bucket ACL
+    let acl_result = metadata_sys::get_bucket_acl_config(bucket).await;
+    let acl = match acl_result {
+        Ok((acl_str, _timestamp)) => acl_str,
+        Err(_) => {
+            "private".to_string() // Default to private
+        }
+    };
+
+    // Check ACL type for list access:
+    // - Private: Only owner can list (handled elsewhere)
+    // - PublicRead: Anyone can list
+    // - PublicReadWrite: Anyone can list
+    // - AuthenticatedRead: Authenticated users can list
+    match acl.as_str() {
+        "public-read" | "public-read-write" => true, // Public ACLs allow anyone to list
+        "authenticated-read" => is_authenticated,    // AuthenticatedRead allows authenticated users to list
+        "private" => false,                          // Private only allows owner (handled elsewhere)
+        _ => false,
+    }
+}
+
+/// Checks if an object allows access based on its ACL (unified for both authenticated and anonymous users)
+async fn check_object_acl_unified(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    is_write: bool,
+    is_authenticated: bool,
+) -> bool {
+    let Some(store) = new_object_layer_fn() else {
+        return false;
+    };
+    let mut opts = ObjectOptions::default();
+    if let Some(vid) = version_id {
+        opts.version_id = Some(vid.to_string());
+    }
+
+    let object_info = match store.get_object_info(bucket, object, &opts).await {
+        Ok(info) => info,
+        Err(_) => {
+            return false; // Object does not exist, cannot check object ACL
+        }
+    };
+
+    if let Some(acl) = object_info.user_defined.get("x-amz-acl") {
+        match (acl.as_str(), is_write, is_authenticated) {
+            ("private", _, _) => false,
+            ("public-read-write", true, _) => true,
+            ("public-read-write", false, _) => true,
+            ("public-read", false, _) => true,
+            ("authenticated-read", false, true) => true,
+            _ => false,
+        }
+    } else {
+        false // Default private
+    }
+}
+
+/// Checks if a bucket allows to write access based on its ACL
+async fn check_bucket_acl_allow_write(bucket: &str) -> bool {
+    let acl_result = metadata_sys::get_bucket_acl_config(bucket).await;
+    let acl = match acl_result {
+        Ok((s, _)) => s,
+        Err(_) => "private".to_string(),
+    };
+    acl == "public-read-write"
+}
+
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
+    // Owner channel
+    if req_info.is_owner {
+        return Ok(());
+    }
+
+    let bucket = req_info.bucket.as_deref().unwrap_or("");
+    let object = req_info.object.as_deref().unwrap_or("");
+
+    // Prepare Bucket Policy parameters (shared by IAM and Policy)
+    let anon_cred = auth::Credentials::default();
+    let cred_ref = req_info.cred.as_ref().unwrap_or(&anon_cred);
+    let conditions = get_condition_values(&req.headers, cred_ref, req_info.version_id.as_deref(), req.region.as_deref());
+
+    // IAM check (only for authenticated users)
     if let Some(cred) = &req_info.cred {
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(S3Error::with_message(
@@ -49,11 +138,10 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None);
 
-        if action == Action::S3Action(S3Action::DeleteObjectAction)
-            && req_info.version_id.is_some()
-            && !iam_store
+        // Check DeleteObjectVersion
+        if action == Action::S3Action(S3Action::DeleteObjectAction) && req_info.version_id.is_some() {
+            let delete_version_allowed = iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
@@ -65,81 +153,80 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     claims,
                     deny_only: false,
                 })
-                .await
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+                .await;
+
+            if !delete_version_allowed {
+                return Err(s3_error!(AccessDenied, "Access Denied"));
+            }
         }
 
-        if iam_store
+        // Check regular operations
+        let iam_allowed = iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
                 groups: &cred.groups,
                 action,
-                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                bucket,
+                object,
                 conditions: &conditions,
-                is_owner: req_info.is_owner,
-                object: req_info.object.as_deref().unwrap_or(""),
+                is_owner: false,
                 claims,
                 deny_only: false,
             })
-            .await
-        {
+            .await;
+
+        if iam_allowed {
             return Ok(());
         }
+    }
 
-        if action == Action::S3Action(S3Action::ListBucketVersionsAction)
-            && iam_store
-                .is_allowed(&Args {
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    action: Action::S3Action(S3Action::ListBucketAction),
-                    bucket: req_info.bucket.as_deref().unwrap_or(""),
-                    conditions: &conditions,
-                    is_owner: req_info.is_owner,
-                    object: req_info.object.as_deref().unwrap_or(""),
-                    claims,
-                    deny_only: false,
-                })
-                .await
-        {
+    // Bucket Policy check
+    if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
+        let policy_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket,
+            action,
+            is_owner: false,
+            account: req_info.cred.as_ref().map(|c| c.access_key.as_str()).unwrap_or(""),
+            groups: &None,
+            conditions: &conditions,
+            object,
+        })
+        .await;
+
+        if policy_allowed {
             return Ok(());
         }
-    } else {
-        let conditions = get_condition_values(
-            &req.headers,
-            &auth::Credentials::default(),
-            req_info.version_id.as_deref(),
-            req.region.as_deref(),
-        );
+    }
 
-        if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
-            if PolicySys::is_allowed(&BucketPolicyArgs {
-                bucket: req_info.bucket.as_deref().unwrap_or(""),
-                action,
-                is_owner: false,
-                account: "",
-                groups: &None,
-                conditions: &conditions,
-                object: req_info.object.as_deref().unwrap_or(""),
-            })
-            .await
-            {
+    // 4. ACL fallback (fallback mechanism)
+    if !bucket.is_empty() {
+        // ListBucket check Bucket ACL
+        if action == Action::S3Action(S3Action::ListBucketAction) {
+            let acl_result = is_bucket_list_accessible(bucket, req_info.cred.is_some()).await;
+            if acl_result {
+                return Ok(());
+            }
+        }
+
+        // Read/Write objects check Object ACL / Bucket ACL
+        if !object.is_empty()
+            && (action == Action::S3Action(S3Action::GetObjectAction) || action == Action::S3Action(S3Action::PutObjectAction))
+        {
+            let is_write = action == Action::S3Action(S3Action::PutObjectAction);
+
+            // Check object ACL (for existing objects)
+            let object_acl_result =
+                check_object_acl_unified(bucket, object, req_info.version_id.as_deref(), is_write, req_info.cred.is_some()).await;
+            if object_acl_result {
                 return Ok(());
             }
 
-            if action == Action::S3Action(S3Action::ListBucketVersionsAction)
-                && PolicySys::is_allowed(&BucketPolicyArgs {
-                    bucket: req_info.bucket.as_deref().unwrap_or(""),
-                    action: Action::S3Action(S3Action::ListBucketAction),
-                    is_owner: false,
-                    account: "",
-                    groups: &None,
-                    conditions: &conditions,
-                    object: "",
-                })
-                .await
-            {
-                return Ok(());
+            // Check Bucket ACL (for new objects / PublicReadWrite Bucket)
+            if is_write {
+                let bucket_acl_result = check_bucket_acl_allow_write(bucket).await;
+                if bucket_acl_result {
+                    return Ok(());
+                }
             }
         }
     }
@@ -452,7 +539,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketAclAction)).await
     }
 
     /// Checks whether the GetBucketAnalyticsConfiguration request has accesses to the resources.
@@ -647,7 +734,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAclAction)).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
@@ -861,7 +948,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketAclAction)).await
     }
 
     /// Checks whether the PutBucketAnalyticsConfiguration request has accesses to the resources.
@@ -1038,7 +1125,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAclAction)).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
