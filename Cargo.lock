@@ -7006,6 +7006,7 @@ dependencies = [
  "serde_urlencoded",
  "shadow-rs",
  "socket2 0.6.1",
+ "subtle",
  "sysctl",
  "sysinfo",
  "thiserror 2.0.17",
