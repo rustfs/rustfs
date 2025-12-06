@@ -106,8 +106,10 @@ impl IAMAuth {
 #[async_trait::async_trait]
 impl S3Auth for IAMAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
+        // For anonymous access (empty access key), return a dummy secret key
+        // The access control will be handled in the authorize_request function
         if access_key.is_empty() {
-            return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
+            return Ok(SecretKey::from("Anonymous-Access"));
         }
 
         if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
@@ -139,7 +141,10 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
     let sys_cred = cred.clone();
 
-    if !constant_time_eq(&cred.access_key, access_key) {
+    if access_key.is_empty() {
+        // For anonymous access, use default credentials
+        cred = auth::Credentials::default();
+    } else if !constant_time_eq(&cred.access_key, access_key) {
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,

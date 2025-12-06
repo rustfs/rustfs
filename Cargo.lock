@@ -3047,8 +3047,10 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "env_logger 0.10.2",
  "flatbuffers",
  "futures",
+ "log",
  "md5",
  "rand 0.10.0-rc.5",
  "reqwest",
@@ -3215,6 +3217,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
+dependencies = [
+ "humantime",
+ "is-terminal",
+ "log",
+ "regex",
+ "termcolor",
 ]
 
 [[package]]
@@ -4474,7 +4489,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
  "dashmap",
- "env_logger",
+ "env_logger 0.11.8",
  "indexmap 2.12.1",
  "itoa",
  "log",
@@ -8831,6 +8846,15 @@ dependencies = [
  "once_cell",
  "rustix 1.1.2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
 ]
 
 [[package]]

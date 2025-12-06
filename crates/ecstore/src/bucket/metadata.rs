@@ -48,6 +48,7 @@ pub const BUCKET_SSECONFIG: &str = "bucket-encryption.xml";
 pub const BUCKET_TAGGING_CONFIG: &str = "tagging.xml";
 pub const BUCKET_QUOTA_CONFIG_FILE: &str = "quota.json";
 pub const OBJECT_LOCK_CONFIG: &str = "object-lock.xml";
+pub const BUCKET_ACL_CONFIG: &str = "acl.xml";
 pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
 pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
 pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
@@ -69,6 +70,7 @@ pub struct BucketMetadata {
     pub replication_config_xml: Vec<u8>,
     pub bucket_targets_config_json: Vec<u8>,
     pub bucket_targets_config_meta_json: Vec<u8>,
+    pub acl_config_xml: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -81,6 +83,7 @@ pub struct BucketMetadata {
     pub notification_config_updated_at: OffsetDateTime,
     pub bucket_targets_config_updated_at: OffsetDateTime,
     pub bucket_targets_config_meta_updated_at: OffsetDateTime,
+    pub acl_config_updated_at: OffsetDateTime,
 
     #[serde(skip)]
     pub new_field_updated_at: OffsetDateTime,
@@ -107,6 +110,8 @@ pub struct BucketMetadata {
     pub bucket_target_config: Option<BucketTargets>,
     #[serde(skip)]
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
+    #[serde(skip)]
+    pub acl_config: Option<String>,
 }
 
 impl Default for BucketMetadata {
@@ -126,6 +131,7 @@ impl Default for BucketMetadata {
             replication_config_xml: Default::default(),
             bucket_targets_config_json: Default::default(),
             bucket_targets_config_meta_json: Default::default(),
+            acl_config_xml: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -137,6 +143,7 @@ impl Default for BucketMetadata {
             notification_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_targets_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_targets_config_meta_updated_at: OffsetDateTime::UNIX_EPOCH,
+            acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -149,6 +156,7 @@ impl Default for BucketMetadata {
             replication_config: Default::default(),
             bucket_target_config: Default::default(),
             bucket_target_config_meta: Default::default(),
+            acl_config: Default::default(),
         }
     }
 }
@@ -296,6 +304,10 @@ impl BucketMetadata {
                 // println!("update config:{}", str);
                 self.bucket_targets_config_json = data.clone();
                 self.bucket_targets_config_updated_at = updated;
+            }
+            BUCKET_ACL_CONFIG => {
+                self.acl_config_xml = data;
+                self.acl_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }

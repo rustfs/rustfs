@@ -404,6 +404,7 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-tagging",
         "expires",
         "x-amz-replication-status",
+        "x-amz-acl",
     ]
 });
 

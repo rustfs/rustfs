@@ -1683,6 +1683,45 @@ impl S3 for FS {
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
         // mc get 3
 
+        // Perform access control check before processing the request
+        let mut auth_req = req.clone();
+        let GetObjectInput {
+            ref bucket,
+            ref key,
+            ref version_id,
+            ..
+        } = auth_req.input;
+
+        // Set up ReqInfo for access control check
+        let cred = if let Some(credentials) = &req.credentials {
+            // Get the session token from headers
+            let session_token = req
+                .headers
+                .get("x-amz-security-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            // Use check_key_valid to get rustfs_policy::auth::Credentials
+            match crate::auth::check_key_valid(session_token, &credentials.access_key).await {
+                Ok((cred, _is_owner)) => Some(cred),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let req_info = ReqInfo {
+            cred,
+            bucket: Some(bucket.clone()),
+            object: Some(key.clone()),
+            version_id: version_id.clone(),
+            region: rustfs_ecstore::global::get_global_region(),
+            ..Default::default()
+        };
+
+        auth_req.extensions.insert(req_info);
+        authorize_request(&mut auth_req, Action::S3Action(S3Action::GetObjectAction)).await?;
+
         let GetObjectInput {
             bucket,
             key,
@@ -2301,6 +2340,43 @@ impl S3 for FS {
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadObject");
         // mc get 2
+
+        let mut auth_req = req.clone();
+        let HeadObjectInput {
+            ref bucket,
+            ref key,
+            ref version_id,
+            ..
+        } = auth_req.input;
+
+        let cred = if let Some(credentials) = &req.credentials {
+            // Get the session token from headers
+            let session_token = req
+                .headers
+                .get("x-amz-security-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            match crate::auth::check_key_valid(session_token, &credentials.access_key).await {
+                Ok((cred, _is_owner)) => Some(cred),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let req_info = ReqInfo {
+            cred,
+            bucket: Some(bucket.clone()),
+            object: Some(key.clone()),
+            version_id: version_id.clone(),
+            region: rustfs_ecstore::global::get_global_region(),
+            ..Default::default()
+        };
+
+        auth_req.extensions.insert(req_info);
+        authorize_request(&mut auth_req, Action::S3Action(S3Action::GetObjectAction)).await?;
+
         let HeadObjectInput {
             bucket,
             key,
@@ -2795,6 +2871,7 @@ impl S3 for FS {
             content_md5,
             if_match,
             if_none_match,
+            acl,
             ..
         } = input;
 
@@ -2907,6 +2984,9 @@ impl S3 for FS {
 
         extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
 
+        if let Some(canned_acl) = acl {
+            metadata.insert("x-amz-acl".to_string(), canned_acl.as_str().to_string());
+        }
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
         }
@@ -4912,16 +4992,20 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
+        let acl_result = metadata_sys::get_bucket_acl_config(&bucket).await;
+        let acl = match acl_result {
+            Ok((acl_str, _timestamp)) => acl_str,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to get bucket ACL config for bucket '{}': {}, defaulting to private ACL",
+                    bucket,
+                    e
+                );
+                BucketCannedACL::PRIVATE.to_string() // Default to private ACL
+            }
+        };
+
+        let grants = build_grants_from_acl(&acl);
 
         Ok(S3Response::new(GetBucketAclOutput {
             grants: Some(grants),
@@ -4948,10 +5032,16 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        if let Some(canned_acl) = acl {
-            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
-                return Err(s3_error!(NotImplemented));
+        let acl_value = if let Some(canned_acl) = acl {
+            let acl_str = canned_acl.as_str();
+            if acl_str != BucketCannedACL::PRIVATE
+                && acl_str != BucketCannedACL::PUBLIC_READ
+                && acl_str != BucketCannedACL::PUBLIC_READ_WRITE
+                && acl_str != BucketCannedACL::AUTHENTICATED_READ
+            {
+                return Err(s3_error!(InvalidArgument, "Invalid canned ACL specified"));
             }
+            acl_str.to_string()
         } else {
             let is_full_control = access_control_policy.is_some_and(|v| {
                 v.grants.is_some_and(|gs| {
@@ -4968,7 +5058,14 @@ impl S3 for FS {
             if !is_full_control {
                 return Err(s3_error!(NotImplemented));
             }
-        }
+            // For full access control policy, store default private ACL
+            BucketCannedACL::PRIVATE.to_string()
+        };
+
+        metadata_sys::set_bucket_acl_config(&bucket, &acl_value)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to store bucket ACL: {e}")))?;
+
         Ok(S3Response::new(PutBucketAclOutput::default()))
     }
 
@@ -4979,20 +5076,21 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
-        }
+        // Get object info with metadata
+        let object_info = store
+            .get_object_info(&bucket, &key, &ObjectOptions::default())
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))?;
 
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
+        // Extract ACL from object metadata, default to private if not set
+        let acl = object_info
+            .user_defined
+            .get("x-amz-acl")
+            .map(|s| s.as_str())
+            .unwrap_or(BucketCannedACL::PRIVATE);
+
+        // Build grants based on ACL type
+        let grants = build_grants_from_acl(acl);
 
         Ok(S3Response::new(GetObjectAclOutput {
             grants: Some(grants),
@@ -5040,26 +5138,33 @@ impl S3 for FS {
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        let PutObjectAclInput {
-            bucket,
-            key,
-            acl,
-            access_control_policy,
-            ..
-        } = req.input;
+        let bucket = req.input.bucket;
+        let key = req.input.key;
+        let acl = req.input.acl;
+        let access_control_policy = req.input.access_control_policy;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
-        }
+        let obj_info = store
+            .get_object_info(&bucket, &key, &ObjectOptions::default())
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))?;
+
+        let mut user_defined = obj_info.user_defined.clone();
 
         if let Some(canned_acl) = acl {
-            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
-                return Err(s3_error!(NotImplemented));
+            let acl_str = canned_acl.as_str();
+            if acl_str != BucketCannedACL::PRIVATE
+                && acl_str != BucketCannedACL::PUBLIC_READ
+                && acl_str != BucketCannedACL::PUBLIC_READ_WRITE
+                && acl_str != BucketCannedACL::AUTHENTICATED_READ
+            {
+                return Err(s3_error!(InvalidArgument, "Invalid canned ACL specified"));
             }
+
+            user_defined.insert("x-amz-acl".to_string(), acl_str.to_string());
         } else {
             let is_full_control = access_control_policy.is_some_and(|v| {
                 v.grants.is_some_and(|gs| {
@@ -5074,9 +5179,22 @@ impl S3 for FS {
             });
 
             if !is_full_control {
-                return Err(s3_error!(NotImplemented));
+                return Err(s3_error!(InvalidArgument, "Invalid access control policy specified"));
             }
+
+            user_defined.insert("x-amz-acl".to_string(), BucketCannedACL::PRIVATE.to_string());
         }
+
+        let opts = ObjectOptions {
+            user_defined,
+            ..Default::default()
+        };
+
+        store
+            .put_object_metadata(&bucket, &key, &opts)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update object ACL: {e}")))?;
+
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
 
@@ -5469,6 +5587,98 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
         }
     }
     false
+}
+
+/// Build grants based on ACL type
+fn build_grants_from_acl(acl: &str) -> Vec<Grant> {
+    match acl {
+        BucketCannedACL::PUBLIC_READ => vec![
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::CANONICAL_USER),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: None,
+                }),
+                permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+            },
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::GROUP),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: Some("http://acs.amazonaws.com/groups/global/AllUsers".to_string()),
+                }),
+                permission: Some(Permission::from_static(Permission::READ)),
+            },
+        ],
+        BucketCannedACL::PUBLIC_READ_WRITE => vec![
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::CANONICAL_USER),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: None,
+                }),
+                permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+            },
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::GROUP),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: Some("http://acs.amazonaws.com/groups/global/AllUsers".to_string()),
+                }),
+                permission: Some(Permission::from_static(Permission::READ)),
+            },
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::GROUP),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: Some("http://acs.amazonaws.com/groups/global/AllUsers".to_string()),
+                }),
+                permission: Some(Permission::from_static(Permission::WRITE)),
+            },
+        ],
+        BucketCannedACL::AUTHENTICATED_READ => vec![
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::CANONICAL_USER),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: None,
+                }),
+                permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+            },
+            Grant {
+                grantee: Some(Grantee {
+                    type_: Type::from_static(Type::GROUP),
+                    display_name: None,
+                    email_address: None,
+                    id: None,
+                    uri: Some("http://acs.amazonaws.com/groups/global/AuthenticatedUsers".to_string()),
+                }),
+                permission: Some(Permission::from_static(Permission::READ)),
+            },
+        ],
+        _ => vec![Grant {
+            grantee: Some(Grantee {
+                type_: Type::from_static(Type::CANONICAL_USER),
+                display_name: None,
+                email_address: None,
+                id: None,
+                uri: None,
+            }),
+            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+        }],
+    }
 }
 
 #[cfg(test)]
