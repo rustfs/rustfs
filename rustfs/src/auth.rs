@@ -28,7 +28,10 @@ use s3s::auth::SecretKey;
 use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
+use std::collections::HashMap;
 use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// Performs constant-time string comparison to prevent timing attacks.
 ///
@@ -56,9 +59,6 @@ use subtle::ConstantTimeEq;
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
-use std::collections::HashMap;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 // Authentication type constants
 const JWT_ALGORITHM: &str = "Bearer ";
