@@ -25,7 +25,7 @@ pub async fn dump_memory_pprof_now() -> Result<std::path::PathBuf, String> {
     Err("Memory profiling is only supported on Linux".to_string())
 }
 
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 mod linux_impl {
     use chrono::Utc;
     use jemalloc_pprof::PROF_CTL;
@@ -298,5 +298,5 @@ mod linux_impl {
     }
 }
 
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub use linux_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env};
