@@ -18,8 +18,8 @@
 //! which moves infrequently accessed files to cheaper storage backends.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 /// Default number of days since last access to consider a file "cold"
 pub const DEFAULT_COLD_THRESHOLD_DAYS: i64 = 30;
@@ -91,15 +91,12 @@ impl ColdTierConfig {
 
     /// Get the access time sampling rate
     pub fn get_sample_rate(&self) -> u32 {
-        self.access_time_sample_rate
-            .unwrap_or(DEFAULT_ACCESS_TIME_SAMPLE_RATE)
-            .max(1)
+        self.access_time_sample_rate.unwrap_or(DEFAULT_ACCESS_TIME_SAMPLE_RATE).max(1)
     }
 
     /// Get max concurrent transitions
     pub fn get_max_concurrent_transitions(&self) -> usize {
-        self.max_concurrent_transitions
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSITIONS)
+        self.max_concurrent_transitions.unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSITIONS)
     }
 }
 
@@ -137,10 +134,8 @@ impl GlobalColdTierConfig {
         self.enabled.store(config.enabled, Ordering::SeqCst);
         self.cold_threshold_days
             .store(config.get_cold_threshold_days(), Ordering::SeqCst);
-        self.min_file_size
-            .store(config.get_min_file_size(), Ordering::SeqCst);
-        self.access_time_sample_rate
-            .store(config.get_sample_rate(), Ordering::SeqCst);
+        self.min_file_size.store(config.get_min_file_size(), Ordering::SeqCst);
+        self.access_time_sample_rate.store(config.get_sample_rate(), Ordering::SeqCst);
 
         if let Ok(mut tier) = self.target_tier.write() {
             *tier = config.target_tier.clone();
@@ -166,10 +161,7 @@ impl GlobalColdTierConfig {
 
     /// Get the target tier name
     pub fn get_target_tier(&self) -> String {
-        self.target_tier
-            .read()
-            .map(|t| t.clone())
-            .unwrap_or_default()
+        self.target_tier.read().map(|t| t.clone()).unwrap_or_default()
     }
 
     /// Get minimum file size for cold tiering
