@@ -692,7 +692,7 @@ impl ObjectInfo {
     pub fn is_multipart(&self) -> bool {
         self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
-    
+
     /// ObjectInfo stores the raw etag value (without quotes), which is
     /// considered a strong etag.
     pub fn etag_strong_cmp(&self, other: &ETag) -> bool {
