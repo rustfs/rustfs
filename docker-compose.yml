@@ -90,9 +90,9 @@ services:
       - sh
       - -c
       - |
-        export VOLIUMES="$$(echo $$RUSTFS_VOLUMES | tr ',' ' ')"
-        mkdir -p $$VOLIUMES
-        cargo run --bin rustfs -- $$VOLIUMES
+        export VOLUMES="$$(echo $$RUSTFS_VOLUMES | tr ',' ' ')"
+        mkdir -p $$VOLUMES
+        cargo run --bin rustfs -- $$VOLUMES
     healthcheck:
       test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
       interval: 30s
