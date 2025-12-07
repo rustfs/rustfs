@@ -28,7 +28,7 @@ services:
       - "9000:9000" # S3 API port
       - "9001:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3 # Define 4 storage volumes
+      - RUSTFS_VOLUMES=/data/rustfs{0..3} # Define 4 storage volumes
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -53,10 +53,12 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    # depends_on:
-    #   - otel-collector
+    depends_on:
+      otel-collector:
+        condition: service_started
+        required: false
 
-    # Development environment
+  # Development environment
   rustfs-dev:
     image: rustfs/rustfs:devenv
     container_name: rustfs-dev
@@ -69,7 +71,7 @@ services:
       - "9010:9000" # S3 API port  
       - "9011:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3
+      - RUSTFS_VOLUMES=/data/rustfs{0..3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -86,13 +88,6 @@ services:
     networks:
       - rustfs-network
     restart: unless-stopped
-    command:
-      - sh
-      - -c
-      - |
-        export VOLUMES="$$(echo $$RUSTFS_VOLUMES | tr ',' ' ')"
-        mkdir -p $$VOLUMES
-        cargo run --bin rustfs -- $$VOLUMES
     healthcheck:
       test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
       interval: 30s

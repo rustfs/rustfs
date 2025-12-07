@@ -65,7 +65,7 @@ docker compose --profile dev build rustfs-dev
 
 ### `VolumeNotFound` Error
 If you see an error like `Error: Custom { kind: Other, error: VolumeNotFound }`, it means the `rustfs` binary was started without valid volume arguments.
-The `docker-compose.yml` uses a custom command to ensure volumes are created and passed correctly to `cargo run`. Ensure you are using the latest `docker-compose.yml` configuration.
+The development image uses `entrypoint.sh` to parse the `RUSTFS_VOLUMES` environment variable (supporting `{N..M}` syntax), create the directories, and pass them to `cargo run`. Ensure your `RUSTFS_VOLUMES` variable is correctly formatted.
 
 ### Slow Initial Build
 This is expected. The `dev` stage in `Dockerfile.source` compiles all dependencies from scratch. Because the `/usr/local/cargo/registry` is mounted as a volume, these compiled artifacts are preserved between restarts, making future builds fast.

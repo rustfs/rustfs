@@ -152,6 +152,10 @@ ENV RUSTFS_ADDRESS=":9000" \
 # We rely on cargo run to build and run
 EXPOSE 9000 9001
 
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["cargo", "run", "--bin", "rustfs", "--"]
 
 # -----------------------------
