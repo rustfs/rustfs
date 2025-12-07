@@ -277,11 +277,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    // Create default buckets if configured via RUSTFS_DEFAULT_BUCKETS
-    create_default_buckets(&opt, &store).await;
+    // Create default buckets if configured via --default-buckets or RUSTFS_DEFAULT_BUCKETS
+    let buckets_created = create_default_buckets(&opt, &store).await;
 
-    // Re-fetch bucket list if default buckets were created
-    let buckets = if opt.default_buckets.is_some() {
+    // Re-fetch bucket list only if buckets were actually created
+    let buckets = if buckets_created {
         store
             .list_bucket(&BucketOptions {
                 no_metadata: true,
@@ -719,17 +719,21 @@ fn init_buffer_profile_system(opt: &config::Opt) {
     }
 }
 
-/// Create default buckets specified via RUSTFS_DEFAULT_BUCKETS environment variable.
+/// Create default buckets specified via `--default-buckets` CLI argument
+/// or `RUSTFS_DEFAULT_BUCKETS` environment variable.
 ///
 /// This function creates buckets on startup for local development and automation testing.
 /// Buckets that already exist are silently skipped.
-/// Invalid bucket names are logged and skipped.
+/// Invalid bucket names are logged, counted, and skipped.
 ///
 /// # Arguments
 /// * `opt` - Application configuration options
 /// * `store` - The ECStore instance for bucket operations
+///
+/// # Returns
+/// `true` if any buckets were successfully created, `false` otherwise
 #[instrument(skip(store))]
-async fn create_default_buckets(opt: &config::Opt, store: &ECStore) {
+async fn create_default_buckets(opt: &config::Opt, store: &ECStore) -> bool {
     use rustfs_ecstore::bucket::utils::check_valid_bucket_name_strict;
     use rustfs_ecstore::error::is_err_bucket_exists;
     use rustfs_ecstore::store_api::MakeBucketOptions;
@@ -741,7 +745,7 @@ async fn create_default_buckets(opt: &config::Opt, store: &ECStore) {
                 target: "rustfs::main::create_default_buckets",
                 "No default buckets configured"
             );
-            return;
+            return false;
         }
     };
 
@@ -753,6 +757,7 @@ async fn create_default_buckets(opt: &config::Opt, store: &ECStore) {
 
     let mut created_count = 0;
     let mut exists_count = 0;
+    let mut invalid_count = 0;
     let mut error_count = 0;
 
     for raw_name in buckets_str.split(',') {
@@ -768,8 +773,9 @@ async fn create_default_buckets(opt: &config::Opt, store: &ECStore) {
                 target: "rustfs::main::create_default_buckets",
                 bucket = %name,
                 error = %e,
-                "Skipping invalid bucket name in RUSTFS_DEFAULT_BUCKETS"
+                "Skipping invalid bucket name"
             );
+            invalid_count += 1;
             continue;
         }
 
@@ -814,7 +820,10 @@ async fn create_default_buckets(opt: &config::Opt, store: &ECStore) {
         target: "rustfs::main::create_default_buckets",
         created = created_count,
         already_exists = exists_count,
+        invalid = invalid_count,
         errors = error_count,
         "Default bucket creation completed"
     );
+
+    created_count > 0
 }
