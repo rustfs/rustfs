@@ -99,7 +99,7 @@ async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.7"
 axum-extra = "0.12.2"
-axum-server = { version = "0.7.3", features = ["tls-rustls-no-provider"], default-features = false }
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], default-features = false }
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
@@ -196,7 +196,7 @@ ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
 libc = "0.2.178"
 libsystemd = "0.7.2"
-local-ip-address = "0.6.5"
+local-ip-address = "0.6.6"
 lz4 = "1.28.1"
 matchit = "0.9.0"
 md-5 = "0.11.0-rc.3"
@@ -264,6 +264,7 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_
 opentelemetry-stdout = { version = "0.31.0" }
 
 # Performance Analysis and Memory Profiling
+mimalloc = "0.1"
 # Use tikv-jemallocator as memory allocator and enable performance analysis
 tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
 # Used to control and obtain statistics for jemalloc at runtime
@@ -272,7 +273,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-mimalloc = "0.1"
+
 
 
 [workspace.metadata.cargo-shear]

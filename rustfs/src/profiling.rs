@@ -12,20 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(target_os = "linux"))]
-pub async fn init_from_env() {}
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+pub async fn init_from_env() {
+    let (target_os, target_env, target_arch) = get_platform_info();
+    tracing::info!(
+        target: "rustfs::main::run",
+        target_os = %target_os,
+        target_env = %target_env,
+        target_arch = %target_arch,
+        "profiling: disabled on this platform. target_os={}, target_env={}, target_arch={}",
+        target_os, target_env, target_arch
+    );
+}
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+fn get_platform_info() -> (String, String, String) {
+    (
+        std::env::consts::OS.to_string(),
+        option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown").to_string(),
+        std::env::consts::ARCH.to_string(),
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub async fn dump_cpu_pprof_for(_duration: std::time::Duration) -> Result<std::path::PathBuf, String> {
-    Err("CPU profiling is only supported on Linux".to_string())
+    let (target_os, target_env, target_arch) = get_platform_info();
+    let msg = format!(
+        "CPU profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}",
+        target_os, target_env, target_arch
+    );
+    Err(msg)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub async fn dump_memory_pprof_now() -> Result<std::path::PathBuf, String> {
-    Err("Memory profiling is only supported on Linux".to_string())
+    let (target_os, target_env, target_arch) = get_platform_info();
+    let msg = format!(
+        "Memory profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}",
+        target_os, target_env, target_arch
+    );
+    Err(msg)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod linux_impl {
     use chrono::Utc;
     use jemalloc_pprof::PROF_CTL;
@@ -298,5 +327,5 @@ mod linux_impl {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 pub use linux_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env};
