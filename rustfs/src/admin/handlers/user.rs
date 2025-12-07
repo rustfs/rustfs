@@ -14,7 +14,7 @@
 
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_session_token},
+    auth::{check_key_valid, constant_time_eq, get_session_token},
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -95,7 +95,7 @@ impl Operation for AddUser {
         }
 
         if let Some(sys_cred) = get_global_action_cred() {
-            if sys_cred.access_key == ak {
+            if constant_time_eq(&sys_cred.access_key, ak) {
                 return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
             }
         }
@@ -162,7 +162,7 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        if input_cred.access_key == ak {
+        if constant_time_eq(&input_cred.access_key, ak) {
             return Err(s3_error!(InvalidArgument, "can't change status of self"));
         }
 

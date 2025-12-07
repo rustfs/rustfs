@@ -29,7 +29,7 @@ use tracing::warn;
 
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_session_token},
+    auth::{check_key_valid, constant_time_eq, get_session_token},
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -240,7 +240,7 @@ impl Operation for UpdateGroupMembers {
 
                     get_global_action_cred()
                         .map(|cred| {
-                            if cred.access_key == *member {
+                            if constant_time_eq(&cred.access_key, member) {
                                 return Err(S3Error::with_message(
                                     S3ErrorCode::MethodNotAllowed,
                                     format!("can't add root {member}"),

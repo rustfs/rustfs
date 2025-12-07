@@ -188,7 +188,7 @@ If you have any questions or need assistance:
   - **Business**: [hello@rustfs.com](mailto:hello@rustfs.com)
   - **Jobs**: [jobs@rustfs.com](mailto:jobs@rustfs.com)
   - **General Discussion**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
-  - **Contributing**: [CONTRIBUTING.md](https://www.google.com/search?q=CONTRIBUTING.md)
+  - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Contributors
 
