@@ -1276,15 +1276,20 @@ pub struct ProfileHandler {}
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        #[cfg(target_os = "windows")]
+        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from("CPU profiling is not supported on Windows platform".to_string()),
-            )));
+            let requested_url = req.uri.to_string();
+            let target_os = std::env::consts::OS;
+            let target_arch = std::env::consts::ARCH;
+            let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+            let msg = format!(
+                "CPU profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}, requested_url={}",
+                target_os, target_env, target_arch, requested_url
+            );
+            return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         {
             use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
             use rustfs_utils::get_env_usize;
@@ -1369,7 +1374,7 @@ impl Operation for ProfileStatusHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         use std::collections::HashMap;
 
-        #[cfg(target_os = "windows")]
+        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         let status = HashMap::from([
             ("enabled", "false"),
             ("status", "not_supported"),
@@ -1377,7 +1382,7 @@ impl Operation for ProfileStatusHandler {
             ("message", "CPU profiling is not supported on Windows platform"),
         ]);
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         let status = {
             use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
             use rustfs_utils::get_env_bool;
