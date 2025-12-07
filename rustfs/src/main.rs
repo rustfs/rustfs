@@ -277,6 +277,25 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
+    // Create default buckets if configured via RUSTFS_DEFAULT_BUCKETS
+    create_default_buckets(&opt, &store).await;
+
+    // Re-fetch bucket list if default buckets were created
+    let buckets = if opt.default_buckets.is_some() {
+        store
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(Error::other)?
+            .into_iter()
+            .map(|v| v.name)
+            .collect()
+    } else {
+        buckets
+    };
+
     if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
         pool.clone().init_resync(ctx.clone(), buckets.clone()).await?;
     }
@@ -698,4 +717,104 @@ fn init_buffer_profile_system(opt: &config::Opt) {
 
         info!("Buffer profiling system initialized successfully");
     }
+}
+
+/// Create default buckets specified via RUSTFS_DEFAULT_BUCKETS environment variable.
+///
+/// This function creates buckets on startup for local development and automation testing.
+/// Buckets that already exist are silently skipped.
+/// Invalid bucket names are logged and skipped.
+///
+/// # Arguments
+/// * `opt` - Application configuration options
+/// * `store` - The ECStore instance for bucket operations
+#[instrument(skip(store))]
+async fn create_default_buckets(opt: &config::Opt, store: &ECStore) {
+    use rustfs_ecstore::bucket::utils::check_valid_bucket_name_strict;
+    use rustfs_ecstore::error::is_err_bucket_exists;
+    use rustfs_ecstore::store_api::MakeBucketOptions;
+
+    let buckets_str = match &opt.default_buckets {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            debug!(
+                target: "rustfs::main::create_default_buckets",
+                "No default buckets configured"
+            );
+            return;
+        }
+    };
+
+    info!(
+        target: "rustfs::main::create_default_buckets",
+        buckets = %buckets_str,
+        "Processing default buckets configuration"
+    );
+
+    let mut created_count = 0;
+    let mut exists_count = 0;
+    let mut error_count = 0;
+
+    for raw_name in buckets_str.split(',') {
+        let name = raw_name.trim();
+
+        if name.is_empty() {
+            continue;
+        }
+
+        // Validate bucket name
+        if let Err(e) = check_valid_bucket_name_strict(name) {
+            warn!(
+                target: "rustfs::main::create_default_buckets",
+                bucket = %name,
+                error = %e,
+                "Skipping invalid bucket name in RUSTFS_DEFAULT_BUCKETS"
+            );
+            continue;
+        }
+
+        let opts = MakeBucketOptions {
+            lock_enabled: false,
+            versioning_enabled: false,
+            force_create: false,
+            created_at: None,
+            no_lock: false,
+        };
+
+        match store.make_bucket(name, &opts).await {
+            Ok(()) => {
+                info!(
+                    target: "rustfs::main::create_default_buckets",
+                    bucket = %name,
+                    "Created default bucket"
+                );
+                created_count += 1;
+            }
+            Err(ref e) if is_err_bucket_exists(e) => {
+                info!(
+                    target: "rustfs::main::create_default_buckets",
+                    bucket = %name,
+                    "Default bucket already exists"
+                );
+                exists_count += 1;
+            }
+            Err(e) => {
+                error!(
+                    target: "rustfs::main::create_default_buckets",
+                    bucket = %name,
+                    error = %e,
+                    "Failed to create default bucket"
+                );
+                error_count += 1;
+            }
+        }
+    }
+
+    info!(
+        target: "rustfs::main::create_default_buckets",
+        created = created_count,
+        already_exists = exists_count,
+        errors = error_count,
+        "Default bucket creation completed"
+    );
 }

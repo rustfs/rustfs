@@ -124,6 +124,11 @@ pub struct Opt {
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
     #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
+
+    /// Comma-separated list of bucket names to create on startup.
+    /// Example: "bucket1,bucket2,bucket3"
+    #[arg(long, env = "RUSTFS_DEFAULT_BUCKETS")]
+    pub default_buckets: Option<String>,
 }
 
 // lazy_static::lazy_static! {
