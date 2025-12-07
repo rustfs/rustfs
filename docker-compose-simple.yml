@@ -32,7 +32,6 @@ services:
       - rustfs_data_2:/data/rustfs2
       - rustfs_data_3:/data/rustfs3
       - logs:/app/logs
-        #- deploy/data/certs/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
     networks:
       - rustfs-network
     restart: unless-stopped
