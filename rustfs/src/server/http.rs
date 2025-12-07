@@ -371,13 +371,13 @@ pub async fn start_http_server(
             };
 
             let socket_ref = SockRef::from(&socket);
-            
+
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
             // Idle: 10s, Interval: 5s, Retries: 3
             let ka = TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(5));
-            
+
             #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
             let ka = ka.with_retries(3);
 
