@@ -1703,6 +1703,6 @@ mod truncation_tests {
 
         // Case 5: Empty objects
         let mut objects: Vec<ObjectInfo> = vec![];
-        assert!(!determine_truncation(10, &mut objects, true)); 
+        assert!(!determine_truncation(10, &mut objects, true));
     }
 }
