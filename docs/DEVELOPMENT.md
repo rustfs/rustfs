@@ -37,7 +37,7 @@ To follow the application logs:
 docker compose --profile dev logs -f rustfs-dev
 ```
 
-### 3. Access the Services
+### 4. Access the Services
 
 - **S3 API**: `http://localhost:9010`
 - **Console UI**: `http://localhost:9011/rustfs/console/index.html`
