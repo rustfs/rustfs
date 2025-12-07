@@ -32,7 +32,16 @@ use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 fn get_http_client() -> Client {
     // Reuse the HTTP connection pool in the global `reqwest::Client` instance
     // TODO: interact with load balancing?
-    static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+    static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+        Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tcp_keepalive(std::time::Duration::from_secs(10))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(5))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .expect("Failed to create global HTTP client")
+    });
     CLIENT.clone()
 }
 

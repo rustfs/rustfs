@@ -25,6 +25,21 @@ To resolve this, we needed to transform the passive failure detection (waiting f
 ## 3. Implemented Solution
 We modified the internal gRPC client configuration in `crates/protos/src/lib.rs` to implement a multi-layered health check strategy.
 
+### Solution Overview
+The fix implements a multi-layered detection strategy covering both Control Plane (RPC) and Data Plane (Streaming):
+
+1.  **Control Plane (gRPC)**:
+    *   Enabled `http2_keep_alive_interval` (5s) and `keep_alive_timeout` (3s) in `tonic` clients.
+    *   Enforced `tcp_keepalive` (10s) on underlying transport.
+    *   Context: Ensures cluster metadata operations (raft, status checks) fail fast if a node dies.
+
+2.  **Data Plane (File Uploads/Downloads)**:
+    *   **Client (Rio)**: Updated `reqwest` client builder in `crates/rio` to enable TCP Keepalive (10s) and HTTP/2 Keepalive (5s). This prevents hangs during large file streaming (e.g., 1GB uploads).
+    *   **Server**: Enabled `SO_KEEPALIVE` on all incoming TCP connections in `rustfs/src/server/http.rs` to forcefully close sockets from dead clients.
+
+3.  **Cross-Platform Build Stability**:
+    *   Guarded Linux-specific profiling code (`jemalloc_pprof`) with `#[cfg(target_os = "linux")]` to fix build failures on macOS/AArch64.
+
 ### Configuration Changes
 
 ```rust
