@@ -29,8 +29,8 @@ pub async fn init_from_env() {
 fn get_platform_info() -> (String, String, String) {
     (
         std::env::consts::OS.to_string(),
-        std::env::consts::ARCH.to_string(),
         option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown").to_string(),
+        std::env::consts::ARCH.to_string(),
     )
 }
 

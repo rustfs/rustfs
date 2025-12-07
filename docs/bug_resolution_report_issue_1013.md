@@ -41,8 +41,7 @@ The application crashes immediately upon startup, including during simple versio
 
 The crash stems from a fundamental incompatibility in the `tikv-jemallocator` build configuration:
 
-1. **Static Configuration:** Experimental builds of `jemalloc` are often compiled expecting a standard **4KB memory page
-   **.
+1. **Static Configuration:** Experimental builds of `jemalloc` are often compiled expecting a standard **4KB memory page**.
 2. **Runtime Mismatch:** Modern AArch64 kernels (like on RPi 5) often use **16KB or 64KB pages** for improved TLB
    efficiency.
 3. **Fatal Error:** When `jemalloc` initializes, it detects that the actual system page size exceeds its compiled
@@ -173,4 +172,3 @@ The codebase is now **110% secure** against the "Unsupported system page size" c
 * **Robustness:** Achieved via reliable, architecture-native allocators (`mimalloc` on ARM).
 * **Stability:** Build process is deterministic; no "lucky" builds.
 * **Maintainability:** Uses standard Cargo features (`cfg`) without custom build scripts or hacks.
-
