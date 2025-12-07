@@ -14,9 +14,7 @@
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub async fn init_from_env() {
-    let target_os = std::env::consts::OS;
-    let target_arch = std::env::consts::ARCH;
-    let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+    let (target_os, target_env, target_arch) = get_platform_info();
     tracing::info!(
         target: "rustfs::main::run",
         target_os = %target_os,
@@ -28,10 +26,17 @@ pub async fn init_from_env() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+fn get_platform_info() -> (String, String, String) {
+    (
+        std::env::consts::OS.to_string(),
+        std::env::consts::ARCH.to_string(),
+        option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown").to_string(),
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub async fn dump_cpu_pprof_for(_duration: std::time::Duration) -> Result<std::path::PathBuf, String> {
-    let target_os = std::env::consts::OS;
-    let target_arch = std::env::consts::ARCH;
-    let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+    let (target_os, target_env, target_arch) = get_platform_info();
     let msg = format!(
         "CPU profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}",
         target_os, target_env, target_arch
@@ -41,9 +46,7 @@ pub async fn dump_cpu_pprof_for(_duration: std::time::Duration) -> Result<std::p
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub async fn dump_memory_pprof_now() -> Result<std::path::PathBuf, String> {
-    let target_os = std::env::consts::OS;
-    let target_arch = std::env::consts::ARCH;
-    let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+    let (target_os, target_env, target_arch) = get_platform_info();
     let msg = format!(
         "Memory profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}",
         target_os, target_env, target_arch

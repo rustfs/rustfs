@@ -97,19 +97,20 @@ link on AArch64.
 
 * **Old Config:** `jemalloc` included for all Linux GNU targets.
 * **New Config:**
-    * `mimalloc` enabled for `target_arch = "aarch64"`.
-    * `tikv-jemallocator` restricted to `not(target_arch = "aarch64")`.
+    * `mimalloc` enabled for `not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))` (i.e.,
+      everything except Linux GNU x86_64).
+    * `tikv-jemallocator` restricted to `all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")`.
 
 ### 5.2 Global Allocator Logic (`rustfs/src/main.rs`)
 
 The global allocator is now conditionally selected at compile time:
 
 ```rust
-#[cfg(all(target_os = "linux", target_env = "gnu", not(target_arch = "aarch64")))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(target_os = "linux", any(target_env = "musl", target_arch = "aarch64")))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 ```
