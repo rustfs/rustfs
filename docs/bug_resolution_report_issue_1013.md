@@ -119,9 +119,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 Since `jemalloc` provides specific profiling features (memory dumping) that `mimalloc` does not mirror 1:1, we added
 feature guards.
 
-* **Guard:** `#[cfg(not(target_arch = "aarch64"))]`
-* **Behavior:** On AArch64, calls to dump memory profiles now return a "Not Supported" error log instead of crashing or
-  failing to compile.
+* **Guard:** `#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]` (profiling enabled only on
+  Linux GNU x86_64)
+* **Behavior:** On all other platforms (including AArch64), calls to dump memory profiles now return a "Not Supported"
+  error log instead of crashing or failing to compile.
 
 ---
 

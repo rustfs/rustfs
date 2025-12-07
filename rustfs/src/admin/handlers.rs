@@ -1378,8 +1378,11 @@ impl Operation for ProfileStatusHandler {
         let status = HashMap::from([
             ("enabled", "false"),
             ("status", "not_supported"),
-            ("platform", "windows"),
-            ("message", "CPU profiling is not supported on Windows platform"),
+            ("platform", std::env::consts::OS),
+            (
+                "message",
+                format!("CPU profiling is not supported on {} platform", std::env::consts::OS).as_str(),
+            ),
         ]);
 
         #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
