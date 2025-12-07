@@ -28,3 +28,16 @@ pub static GLOBAL_Conn_Map: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLoc
 pub async fn set_global_addr(addr: &str) {
     *GLOBAL_Rustfs_Addr.write().await = addr.to_string();
 }
+
+/// Clears a stale connection from the connection cache.
+/// This should be called when a connection error occurs to allow
+/// the next request to establish a fresh connection.
+pub async fn clear_connection(addr: &str) {
+    GLOBAL_Conn_Map.write().await.remove(addr);
+}
+
+/// Clears all connections from the connection cache.
+/// This can be used during shutdown or when a major network event occurs.
+pub async fn clear_all_connections() {
+    GLOBAL_Conn_Map.write().await.clear();
+}

@@ -30,6 +30,13 @@ use tonic::{
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 
+/// Clears a connection from the cache. This should be called when a
+/// connection error occurs to allow the next request to establish a
+/// fresh connection. Re-exported from rustfs_common for convenience.
+pub async fn clear_node_connection(addr: &str) {
+    rustfs_common::globals::clear_connection(addr).await;
+}
+
 pub async fn node_service_time_out_client(
     addr: &String,
 ) -> Result<
@@ -45,14 +52,26 @@ pub async fn node_service_time_out_client(
     let channel = match channel {
         Some(channel) => channel,
         None => {
-            let connector = Endpoint::from_shared(addr.to_string())?
+            // Use connect_lazy() instead of connect().await for several benefits:
+            // 1. Does not block on initial connection - connection is established lazily on first use
+            // 2. Handles automatic reconnection when the remote node comes back online
+            // 3. Allows the cluster to remain responsive even when nodes are unreachable
+            //
+            // This is critical for handling abrupt node failures (power-off) where
+            // connect().await would block waiting for TCP timeouts (can be 2+ minutes)
+            let endpoint = Endpoint::from_shared(addr.to_string())?
                 .connect_timeout(Duration::from_secs(5))
                 .tcp_keepalive(Some(Duration::from_secs(10)))
                 .http2_keep_alive_interval(Duration::from_secs(5))
                 .keep_alive_timeout(Duration::from_secs(3))
                 .keep_alive_while_idle(true)
-                .timeout(Duration::from_secs(60));
-            let channel = connector.connect().await?;
+                .timeout(Duration::from_secs(30)); // Reduced from 60s for faster failure detection
+
+            // connect_lazy() returns immediately without actually connecting.
+            // The connection will be established when the first request is made.
+            // If the node is unreachable, the request will fail with a timeout error
+            // rather than blocking indefinitely.
+            let channel = endpoint.connect_lazy();
 
             {
                 GLOBAL_Conn_Map.write().await.insert(addr.to_string(), channel.clone());
