@@ -2350,7 +2350,7 @@ impl S3 for FS {
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
+            if info.etag_strong_cmp(match_etag) {
                 return Err(S3Error::new(S3ErrorCode::NotModified));
             }
         }
@@ -2366,7 +2366,7 @@ impl S3 for FS {
         }
 
         if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
+            if !info.etag_strong_cmp(match_etag) {
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
         } else if let Some(unmodified_since) = if_unmodified_since {
@@ -3603,22 +3603,17 @@ impl S3 for FS {
 
         let mut src_info = src_reader.object_info;
 
-        // Validate copy conditions (simplified for now)
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if etag != &if_match {
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
+        // Validate copy conditions
+        // If-Match uses strong comparison (RFC 7232 §2.3.2)
+        if let Some(ref if_match) = copy_source_if_match {
+            if !src_info.etag_strong_cmp(if_match) {
                 return Err(s3_error!(PreconditionFailed));
             }
         }
 
-        if let Some(if_none_match) = copy_source_if_none_match {
-            if let Some(ref etag) = src_info.etag {
-                if etag == &if_none_match {
-                    return Err(s3_error!(PreconditionFailed));
-                }
+        if let Some(ref if_none_match) = copy_source_if_none_match {
+            if src_info.etag_strong_cmp(if_none_match) {
+                return Err(s3_error!(PreconditionFailed));
             }
         }
 

@@ -37,6 +37,7 @@ use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
+use s3s::dto::ETag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -690,6 +691,17 @@ impl ObjectInfo {
 
     pub fn is_multipart(&self) -> bool {
         self.etag.as_ref().is_some_and(|v| v.len() != 32)
+    }
+    
+    /// ObjectInfo stores the raw etag value (without quotes), which is
+    /// considered a strong etag.
+    pub fn etag_strong_cmp(&self, other: &ETag) -> bool {
+        match (&self.etag, other) {
+            // Strong comparison: both must be strong ETags with same value
+            (Some(etag_str), ETag::Strong(other_val)) => etag_str == other_val,
+            // If other is weak, or self has no etag, strong comparison fails
+            _ => false,
+        }
     }
 
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
