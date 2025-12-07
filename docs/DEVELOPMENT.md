@@ -29,7 +29,7 @@ docker compose --profile dev up -d rustfs-dev
 
 **Note**: The first run will take some time (5-10 minutes) because it builds the docker image and compiles all Rust dependencies from source. Subsequent runs will be much faster.
 
-### 2. View Logs
+### 3. View Logs
 
 To follow the application logs:
 
