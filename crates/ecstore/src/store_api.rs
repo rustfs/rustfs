@@ -625,6 +625,8 @@ pub struct ObjectInfo {
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
     pub checksum: Option<Bytes>,
+    /// Last access time for cold file tiering
+    pub last_access_time: Option<OffsetDateTime>,
 }
 
 impl Clone for ObjectInfo {
@@ -664,6 +666,7 @@ impl Clone for ObjectInfo {
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
             expires: self.expires,
+            last_access_time: self.last_access_time,
         }
     }
 }
@@ -810,6 +813,7 @@ impl ObjectInfo {
             transitioned_object,
             checksum: fi.checksum.clone(),
             storage_class,
+            last_access_time: fi.last_access_time,
             ..Default::default()
         }
     }

@@ -659,11 +659,32 @@ pub struct ObjectOpts {
     pub restore_expires: Option<OffsetDateTime>,
     pub versioned: bool,
     pub version_suspended: bool,
+    /// Last access time for access-based lifecycle transitions (cold file tiering)
+    pub access_time: Option<OffsetDateTime>,
 }
 
 impl ObjectOpts {
     pub fn expired_object_deletemarker(&self) -> bool {
         self.delete_marker && self.num_versions == 1
+    }
+
+    /// Check if the object is considered "cold" based on access time
+    /// Returns true if the object hasn't been accessed for the specified number of days
+    pub fn is_cold(&self, threshold_days: i64) -> bool {
+        // Use access_time if available, otherwise fall back to mod_time
+        let reference_time = self.access_time.or(self.mod_time);
+
+        if let Some(time) = reference_time {
+            let now = OffsetDateTime::now_utc();
+            let days_since_access = (now - time).whole_days();
+            return days_since_access >= threshold_days;
+        }
+        false
+    }
+
+    /// Get the effective access time (access_time if set, otherwise mod_time)
+    pub fn effective_access_time(&self) -> Option<OffsetDateTime> {
+        self.access_time.or(self.mod_time)
     }
 }
 

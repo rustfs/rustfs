@@ -67,6 +67,9 @@ pub const TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const TRANSITION_TIER: &str = "transition-tier";
 
+// Cold file tiering: metadata key for tracking last access time
+pub const LAST_ACCESS_TIME: &str = "x-rustfs-last-access-time";
+
 // type ScanHeaderVersionFn = Box<dyn Fn(usize, &[u8], &[u8]) -> Result<()>>;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
