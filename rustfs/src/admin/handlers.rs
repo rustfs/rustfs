@@ -89,6 +89,14 @@ pub mod tier;
 pub mod trace;
 pub mod user;
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct IsAdminResponse {
+    pub is_admin: bool,
+    pub access_key: String,
+    pub message: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -140,6 +148,42 @@ impl Operation for HealthCheckHandler {
         let body = Body::from(body_str);
 
         Ok(S3Response::with_headers((StatusCode::OK, body), headers))
+    }
+}
+
+pub struct IsAdminHandler {}
+#[async_trait::async_trait]
+impl Operation for IsAdminHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (_cred, _owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        let access_key_to_check = input_cred.access_key.clone();
+
+        // Check if the user is admin by comparing with global credentials
+        let is_admin = if let Some(sys_cred) = get_global_action_cred() {
+            sys_cred.access_key == access_key_to_check
+        } else {
+            false
+        };
+
+        let response = IsAdminResponse {
+            is_admin,
+            access_key: access_key_to_check,
+            message: format!("User is {} an administrator", if is_admin { "" } else { "not" }),
+        };
+
+        let data = serde_json::to_vec(&response)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse IsAdminResponse failed"))?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
