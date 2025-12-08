@@ -166,7 +166,7 @@ jobs:
                   # After the version is stable, you need to remove the following line and restore the original logic (latest is created only for stable versions)
                   if [[ "$version" == *"alpha"* ]]; then
                     create_latest=true
-                    echo "🧪 Building Docker image for prerelease: $version (临时允许创建 latest 标签)"
+                     echo "🧪 Building Docker image for prerelease: $version (temporarily allowing creation of latest tag)"
                   else
                     echo "🧪 Building Docker image for prerelease: $version"
                   fi
@@ -219,7 +219,7 @@ jobs:
                 # After the version is stable, you need to remove the if block below and restore the original logic.
                 if [[ "$input_version" == *"alpha"* ]]; then
                   create_latest=true
-                  echo "🧪 Building with prerelease version: $input_version (临时允许创建 latest 标签)"
+                   echo "🧪 Building with prerelease version: $input_version (temporarily allowing creation of latest tag)"
                 else
                   echo "🧪 Building with prerelease version: $input_version"
                 fi
@@ -332,7 +332,7 @@ jobs:
           if [[ "$CREATE_LATEST" == "true" ]]; then
             # TODO: Temporary change - the current alpha version will also create the latest tag
             # After the version is stabilized, the logic here remains unchanged, but the upstream CREATE_LATEST setting needs to be restored.
-            # Stable release (以及临时的 alpha 版本)
+            # Stable release (and temporary alpha versions)
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
