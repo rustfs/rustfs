@@ -55,30 +55,14 @@ services:
       - rustfs_data_1:/data1
       - rustfs_data_2:/data2
       - rustfs_data_3:/data3
-      - redis_data:/redis_data
       - logs:/logs
     command: >
       sh -c "
         chown -R 10001:10001 /data0 /data1 /data2 /data3 /logs &&
-        chown -R 999:999 /redis_data &&
         echo 'Volume Permissions fixed' &&
         exit 0
       "
     restart: "no"
-
-# RustFS cache service
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - rustfs-network
-    restart: unless-stopped
-    profiles:
-      - cache
 
 networks:
   rustfs-network:
@@ -88,5 +72,4 @@ volumes:
   rustfs_data_1:
   rustfs_data_2:
   rustfs_data_3:
-  redis_data:
   logs:
