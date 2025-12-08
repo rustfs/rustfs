@@ -44,7 +44,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -119,7 +119,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
