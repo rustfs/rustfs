@@ -322,14 +322,7 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        let is_truncated = determine_truncation(max_keys, &mut get_objects, list_result.err.is_none());
 
         let next_marker = {
             if is_truncated {
@@ -635,7 +628,10 @@ impl ECStore {
 
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                let (send, recv) = mpsc::channel(100);
+                // Use a buffer size that matches the listing limit to prevent blocking
+                // when listing large numbers of objects
+                let buffer_size = opts.limit.max(100) as usize;
+                let (send, recv) = mpsc::channel(buffer_size);
 
                 inputs.push(recv);
                 let opts = opts.clone();
@@ -1662,4 +1658,51 @@ mod test {
     //         println!("get entry {:?}", entry)
     //     }
     // }
+}
+
+fn determine_truncation(max_keys: i32, objects: &mut Vec<ObjectInfo>, err_is_none: bool) -> bool {
+    if max_keys > 0 && objects.len() > max_keys as usize {
+        // We received more than max_keys objects, definitely truncated
+        objects.truncate(max_keys as usize);
+        true
+    } else if max_keys > 0 && (objects.len() as i32) < max_keys {
+        // We received fewer than max_keys objects, definitely not truncated
+        false
+    } else {
+        // We received exactly max_keys objects - use the error sentinel to determine
+        // if there are more objects: err.is_none() means limit was hit (more data),
+        // err.is_some() means listing completed naturally (no more data)
+        err_is_none && !objects.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+    use crate::store_api::ObjectInfo;
+
+    #[test]
+    fn test_determine_truncation() {
+        // Case 1: More than max_keys
+        let mut objects = vec![ObjectInfo::default(); 11];
+        assert!(determine_truncation(10, &mut objects, true));
+        assert_eq!(objects.len(), 10);
+
+        // Case 2: Less than max_keys
+        let mut objects = vec![ObjectInfo::default(); 5];
+        assert!(!determine_truncation(10, &mut objects, true)); // err_is_none shouldn't matter here
+        assert!(!determine_truncation(10, &mut objects, false));
+
+        // Case 3: Exactly max_keys, err is None (truncated)
+        let mut objects = vec![ObjectInfo::default(); 10];
+        assert!(determine_truncation(10, &mut objects, true));
+
+        // Case 4: Exactly max_keys, err is Some (not truncated)
+        let mut objects = vec![ObjectInfo::default(); 10];
+        assert!(!determine_truncation(10, &mut objects, false));
+
+        // Case 5: Empty objects
+        let mut objects: Vec<ObjectInfo> = vec![];
+        assert!(!determine_truncation(10, &mut objects, true));
+    }
 }
