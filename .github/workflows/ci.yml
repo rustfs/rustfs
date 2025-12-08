@@ -91,7 +91,7 @@ jobs:
     name: Typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
@@ -135,7 +135,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -149,8 +149,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: s3s-e2e
-          git: https://github.com/Nugine/s3s.git
-          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
+          git: https://github.com/s3s-project/s3s.git
+          rev: 0e52387e53743c1eac70a96ce41fbab29553e8f5
 
       - name: Build debug binary
         run: |
