@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::constants::MAX_ADMIN_REQUEST_BODY_SIZE;
 use super::router::AdminOperation;
 use super::router::Operation;
 use super::router::S3Router;
@@ -141,11 +142,11 @@ impl Operation for WalkDir {
         };
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "RPC request body too large or failed to read"));
             }
         };
 

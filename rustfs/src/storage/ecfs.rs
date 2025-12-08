@@ -2350,8 +2350,10 @@ impl S3 for FS {
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                    return Err(S3Error::new(S3ErrorCode::NotModified));
+                }
             }
         }
 
@@ -2366,8 +2368,10 @@ impl S3 for FS {
         }
 
         if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
             }
         } else if let Some(unmodified_since) = if_unmodified_since {
             if info.mod_time.is_some_and(|mod_time| {
@@ -2807,13 +2811,17 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                            if let Some(strong_etag) = ifmatch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
                                 return Err(s3_error!(PreconditionFailed));
+                            }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                            if let Some(strong_etag) = ifnonematch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
                                 return Err(s3_error!(PreconditionFailed));
+                            }
                             }
                         }
                     }
@@ -3606,7 +3614,12 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if etag != &if_match {
+                if let Some(strong_etag) = if_match.as_strong() {
+                    if etag != strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                } else {
+                    // Weak ETag in If-Match should fail
                     return Err(s3_error!(PreconditionFailed));
                 }
             } else {
@@ -3616,9 +3629,12 @@ impl S3 for FS {
 
         if let Some(if_none_match) = copy_source_if_none_match {
             if let Some(ref etag) = src_info.etag {
-                if etag == &if_none_match {
-                    return Err(s3_error!(PreconditionFailed));
+                if let Some(strong_etag) = if_none_match.as_strong() {
+                    if etag == strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
                 }
+                // Weak ETag in If-None-Match is ignored (doesn't match)
             }
         }
 
@@ -3890,13 +3906,17 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                            if let Some(strong_etag) = ifmatch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
                                 return Err(s3_error!(PreconditionFailed));
+                            }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                            if let Some(strong_etag) = ifnonematch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
                                 return Err(s3_error!(PreconditionFailed));
+                            }
                             }
                         }
                     }

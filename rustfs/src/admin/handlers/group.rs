@@ -31,6 +31,7 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, constant_time_eq, get_session_token},
 };
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct GroupQuery {
@@ -213,11 +214,11 @@ impl Operation for UpdateGroupMembers {
         .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "group configuration body too large or failed to read"));
             }
         };
 

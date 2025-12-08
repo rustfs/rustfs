@@ -22,6 +22,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use time::OffsetDateTime;
+use super::body_limits::MAX_S3_RESPONSE_SIZE;
 
 use crate::client::constants::{GET_OBJECT_ATTRIBUTES_MAX_PARTS, GET_OBJECT_ATTRIBUTES_TAGS, ISO8601_DATEFORMAT};
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
@@ -136,7 +137,7 @@ impl ObjectAttributes {
         self.last_modified = mod_time;
         self.version_id = h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap().to_string();
 
-        let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
+        let b = resp.body_mut().store_all_limited(MAX_S3_RESPONSE_SIZE).await.unwrap().to_vec();
         let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
@@ -217,7 +218,7 @@ impl TransitionClient {
         }
 
         if resp.status() != http::StatusCode::OK {
-            let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
+            let b = resp.body_mut().store_all_limited(MAX_S3_RESPONSE_SIZE).await.unwrap().to_vec();
             let err_body = String::from_utf8(b).unwrap();
             let mut er = match quick_xml::de::from_str::<AccessControlPolicy>(&err_body) {
                 Ok(result) => result,

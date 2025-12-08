@@ -16,6 +16,7 @@ use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
 };
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use http::StatusCode;
 use matchit::Params;
 use rustfs_ecstore::bucket::utils::serialize;
@@ -71,15 +72,15 @@ impl Operation for AssumeRoleHandle {
 
         let mut input = req.input;
 
-        let bytes = match input.store_all_unlimited().await {
+        let bytes = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "STS request body too large or failed to read"));
             }
         };
 
-        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "invalid STS request format"))?;
 
         if body.action.as_str() != ASSUME_ROLE_ACTION {
             return Err(s3_error!(InvalidArgument, "not support action"));

@@ -15,6 +15,7 @@
 use crate::admin::utils::has_space_be;
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::{admin::router::Operation, auth::check_key_valid};
+use crate::admin::constants::MAX_ADMIN_REQUEST_BODY_SIZE;
 use http::HeaderMap;
 use hyper::StatusCode;
 use matchit::Params;
@@ -48,11 +49,11 @@ impl Operation for AddServiceAccount {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &req_cred.access_key).await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "service account configuration body too large or failed to read"));
             }
         };
 
@@ -235,11 +236,11 @@ impl Operation for UpdateServiceAccount {
         // })?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "service account configuration body too large or failed to read"));
             }
         };
 
@@ -440,7 +441,7 @@ impl Operation for ListServiceAccount {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: ListServiceAccountQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "invalid service account query parameters"))?;
                 input
             } else {
                 ListServiceAccountQuery::default()
@@ -550,7 +551,7 @@ impl Operation for DeleteServiceAccount {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AccessKeyQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "invalid access key query parameters"))?;
                 input
             } else {
                 AccessKeyQuery::default()

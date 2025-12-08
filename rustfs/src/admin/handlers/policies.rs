@@ -16,6 +16,7 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, get_session_token},
 };
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::global::get_global_action_cred;
@@ -139,11 +140,11 @@ impl Operation for AddCannedPolicy {
         }
 
         let mut input = req.input;
-        let policy_bytes = match input.store_all_unlimited().await {
+        let policy_bytes = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "policy configuration body too large or failed to read"));
             }
         };
 
