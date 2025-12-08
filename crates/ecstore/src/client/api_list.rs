@@ -102,7 +102,7 @@ impl TransitionClient {
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();
-        let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
         let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {

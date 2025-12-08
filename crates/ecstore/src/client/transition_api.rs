@@ -291,7 +291,7 @@ impl TransitionClient {
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
             //self.dump_http(&cloned_req, &resp)?;
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
             warn!("err_body: {}", String::from_utf8(b).unwrap());
         }
 
@@ -334,7 +334,7 @@ impl TransitionClient {
                 }
             }
 
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
             let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
 

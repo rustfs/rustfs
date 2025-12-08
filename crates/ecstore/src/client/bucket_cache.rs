@@ -20,13 +20,10 @@
 
 use http::Request;
 use hyper::StatusCode;
-use hyper::body::Incoming;
-use std::{collections::HashMap, sync::Arc};
-use tracing::warn;
-use tracing::{debug, error, info};
+use std::collections::HashMap;
 
 use crate::client::{
-    api_error_response::{http_resp_to_error_response, to_error_response},
+    api_error_response::http_resp_to_error_response,
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
@@ -212,7 +209,7 @@ async fn process_bucket_location_response(
     }
     //}
 
-    let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+    let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
     let mut location = "".to_string();
     if tier_type == "huaweicloud" {
         let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();

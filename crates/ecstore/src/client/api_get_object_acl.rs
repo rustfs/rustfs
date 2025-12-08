@@ -22,13 +22,11 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use s3s::dto::Owner;
 use std::collections::HashMap;
-use std::io::Cursor;
-use tokio::io::BufReader;
 
 use crate::client::{
-    api_error_response::{err_invalid_argument, http_resp_to_error_response},
+    api_error_response::http_resp_to_error_response,
     api_get_options::GetObjectOptions,
-    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
+    transition_api::{ObjectInfo, ReaderImpl, RequestMetadata, TransitionClient},
 };
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 
@@ -90,7 +88,7 @@ impl TransitionClient {
             return Err(std::io::Error::other(http_resp_to_error_response(&resp, b, bucket_name, object_name)));
         }
 
-        let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
         let mut res = match quick_xml::de::from_str::<AccessControlPolicy>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
