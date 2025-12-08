@@ -95,7 +95,7 @@ impl Operation for AddTier {
         validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
@@ -223,7 +223,7 @@ impl Operation for EditTier {
         validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);

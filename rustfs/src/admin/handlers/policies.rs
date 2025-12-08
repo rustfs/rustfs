@@ -139,7 +139,7 @@ impl Operation for AddCannedPolicy {
         }
 
         let mut input = req.input;
-        let policy_bytes = match input.store_all_unlimited().await {
+        let policy_bytes = match input.store_all_limited(usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);

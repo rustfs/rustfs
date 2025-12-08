@@ -131,7 +131,7 @@ impl Operation for CreateKeyHandler {
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(usize::MAX)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -325,7 +325,7 @@ impl Operation for GenerateDataKeyHandler {
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(usize::MAX)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 

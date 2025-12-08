@@ -140,7 +140,7 @@ impl Operation for NotificationTarget {
 
         // 4. The parsing request body is KVS (Key-Value Store)
         let mut input = req.input;
-        let body = input.store_all_unlimited().await.map_err(|e| {
+        let body = input.store_all_limited(usize::MAX).await.map_err(|e| {
             warn!("failed to read request body: {:?}", e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;

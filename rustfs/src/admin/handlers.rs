@@ -816,7 +816,7 @@ impl Operation for HealHandler {
         let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
         info!("cred: {:?}", cred);
         let mut input = req.input;
-        let bytes = match input.store_all_unlimited().await {
+        let bytes = match input.store_all_limited(usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
@@ -1008,7 +1008,7 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
