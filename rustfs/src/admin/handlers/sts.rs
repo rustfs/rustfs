@@ -80,7 +80,7 @@ impl Operation for AssumeRoleHandle {
             }
         };
 
-        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "STS request body too large or failed to read"))?;
+        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "invalid STS request format"))?;
 
         if body.action.as_str() != ASSUME_ROLE_ACTION {
             return Err(s3_error!(InvalidArgument, "not support action"));

@@ -441,7 +441,7 @@ impl Operation for ListServiceAccount {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: ListServiceAccountQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "service account configuration body too large or failed to read"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "invalid service account query parameters"))?;
                 input
             } else {
                 ListServiceAccountQuery::default()
@@ -551,7 +551,7 @@ impl Operation for DeleteServiceAccount {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AccessKeyQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "service account configuration body too large or failed to read"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "invalid access key query parameters"))?;
                 input
             } else {
                 AccessKeyQuery::default()
