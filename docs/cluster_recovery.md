@@ -30,78 +30,22 @@ To resolve this, we implemented a comprehensive multi-layered resilience strateg
 
 ## 3. Implemented Solution
 
-### Fix 1: Connection Health Check and Automatic Eviction
+### Solution Overview
+The fix implements a multi-layered detection strategy covering both Control Plane (RPC) and Data Plane (Streaming):
 
-**Files Modified**: 
-- `crates/common/src/globals.rs`
-- `crates/protos/src/lib.rs`
-- `crates/ecstore/src/rpc/peer_rest_client.rs`
+1.  **Control Plane (gRPC)**:
+    *   Enabled `http2_keep_alive_interval` (5s) and `keep_alive_timeout` (3s) in `tonic` clients.
+    *   Enforced `tcp_keepalive` (10s) on underlying transport.
+    *   Context: Ensures cluster metadata operations (raft, status checks) fail fast if a node dies.
 
-**Problem**: Stale gRPC channels cached in `GLOBAL_Conn_Map` caused subsequent RPC calls to block on dead peers, even with keepalives enabled.
+2.  **Data Plane (File Uploads/Downloads)**:
+    *   **Client (Rio)**: Updated `reqwest` client builder in `crates/rio` to enable TCP Keepalive (10s) and HTTP/2 Keepalive (5s). This prevents hangs during large file streaming (e.g., 1GB uploads).
+    *   **Server**: Enabled `SO_KEEPALIVE` on all incoming TCP connections in `rustfs/src/server/http.rs` to forcefully close sockets from dead clients.
 
-**Solution**: 
-1. Added `evict_connection()` function to remove dead connections from cache.
-2. Added `evict_failed_connection()` helper for automatic cleanup after RPC failures.
-3. PeerRestClient now evicts connections automatically on any RPC failure.
-4. Reduced connection timeout from 5s to 3s for faster failure detection.
-5. Reduced overall RPC timeout from 60s to 30s.
+3.  **Cross-Platform Build Stability**:
+    *   Guarded Linux-specific profiling code (`jemalloc_pprof`) with `#[cfg(target_os = "linux")]` to fix build failures on macOS/AArch64.
 
-```rust
-// crates/common/src/globals.rs
-/// Evict a stale/dead connection from the global connection cache.
-pub async fn evict_connection(addr: &str) {
-    let removed = GLOBAL_Conn_Map.write().await.remove(addr);
-    if removed.is_some() {
-        tracing::warn!("Evicted stale connection from cache: {}", addr);
-    }
-}
-
-// crates/ecstore/src/rpc/peer_rest_client.rs
-pub async fn server_info(&self) -> Result<ServerProperties> {
-    let result = self.server_info_inner().await;
-    if result.is_err() {
-        // Evict stale connection on any error for cluster recovery
-        self.evict_connection().await;
-    }
-    result
-}
-```
-
-### Fix 2: Non-Blocking IAM Notifications
-
-**File Modified**: `crates/iam/src/sys.rs`
-
-**Problem**: Login operations blocked waiting for ALL peer nodes to acknowledge user/policy synchronization.
-
-**Solution**: Changed IAM notification functions to fire-and-forget using `tokio::spawn()`:
-
-```rust
-async fn notify_for_user(&self, name: &str, is_temp: bool) {
-    if self.has_watcher() { return; }
-
-    // Fire-and-forget notification to peers - don't block auth operations
-    let name = name.to_string();
-    tokio::spawn(async move {
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_user(&name, is_temp).await;
-            // Log errors but don't block
-        }
-    });
-}
-```
-
-**Functions Updated**:
-- `notify_for_user()` - User login/creation
-- `notify_for_service_account()` - Service account operations
-- `notify_for_group()` - Group operations
-
-### Fix 3: Per-Peer Timeouts in Console Aggregation
-
-**File Modified**: `crates/ecstore/src/notification_sys.rs`
-
-**Problem**: `storage_info()` and `server_info()` calls waited for ALL peers without individual timeouts.
-
-**Solution**: Added 2-second per-peer timeout with fallback to offline status:
+### Configuration Changes
 
 ```rust
 pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
