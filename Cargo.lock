@@ -7119,6 +7119,7 @@ dependencies = [
  "serde",
  "tokio",
  "tonic",
+ "tracing",
  "uuid",
 ]
 
@@ -7446,6 +7447,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
