@@ -500,7 +500,13 @@ impl ScannerItem {
             return false;
         };
 
-        let grace = TimeDuration::try_from(self.replication_pending_grace).unwrap_or_else(|_| TimeDuration::seconds(0));
+        let grace = TimeDuration::try_from(self.replication_pending_grace).unwrap_or_else(|_| {
+            warn!(
+                "replication_pending_grace is invalid, using default value: 0 seconds, grace: {:?}",
+                self.replication_pending_grace
+            );
+            TimeDuration::seconds(0)
+        });
         if grace.is_zero() {
             return true;
         }

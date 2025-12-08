@@ -783,35 +783,58 @@ impl Scanner {
         Ok(processed_count)
     }
 
+    // TODO: optimize this function
     async fn collect_bucket_records_from_store(
         &self,
         ecstore: &Arc<rustfs_ecstore::store::ECStore>,
         bucket_name: &str,
     ) -> Result<Vec<LocalObjectRecord>> {
         let mut records = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        const MAX_KEYS: i32 = 1000;
 
-        let list_result = ecstore
-            .clone()
-            .list_objects_v2(bucket_name, "", None, None, 1000, false, None, false)
-            .await
-            .map_err(Error::from)?;
+        loop {
+            let list_result = ecstore
+                .clone()
+                .list_objects_v2(bucket_name, "", continuation_token.clone(), None, MAX_KEYS, false, None, false)
+                .await
+                .map_err(Error::from)?;
 
-        for object in list_result.objects {
-            let usage = local_scan::LocalObjectUsage {
-                bucket: bucket_name.to_string(),
-                object: object.name.clone(),
-                last_modified_ns: object.mod_time.map(|ts| ts.unix_timestamp_nanos()),
-                versions_count: 1,
-                delete_markers_count: 0,
-                total_size: object.size.max(0) as u64,
-                has_live_object: true,
-            };
-            records.push(LocalObjectRecord {
-                usage,
-                object_info: Some(object),
-                file_info: None,
-            });
+            // Process objects from this page
+            for object in list_result.objects {
+                let usage = local_scan::LocalObjectUsage {
+                    bucket: bucket_name.to_string(),
+                    object: object.name.clone(),
+                    last_modified_ns: object.mod_time.map(|ts| ts.unix_timestamp_nanos()),
+                    versions_count: 1,
+                    delete_markers_count: 0,
+                    total_size: object.size.max(0) as u64,
+                    has_live_object: true,
+                };
+                records.push(LocalObjectRecord {
+                    usage,
+                    object_info: Some(object),
+                    file_info: None,
+                });
+            }
+
+            // Check if there are more pages to fetch
+            if !list_result.is_truncated {
+                break;
+            }
+
+            // Get continuation token for next page
+            continuation_token = list_result.next_continuation_token;
+            if continuation_token.is_none() {
+                warn!(
+                    "List objects response is truncated but no continuation token provided for bucket {}",
+                    bucket_name
+                );
+                break;
+            }
         }
+
+        debug!("Collected {} objects from bucket {} via paginated listing", records.len(), bucket_name);
 
         Ok(records)
     }
@@ -839,15 +862,27 @@ impl Scanner {
         let local_stats = self.node_scanner.get_stats_summary().await;
         self.stats_aggregator.set_local_stats(local_stats).await;
 
-        // Start background legacy scan loop for backward compatibility
-        let scanner = self.clone_for_background();
-        tokio::spawn(async move {
-            if let Err(e) = scanner.legacy_scan_loop().await {
-                error!("Legacy scanner loop failed: {}", e);
-            }
-        });
+        // Background tasks overview:
+        // The following three tasks can be started in parallel with no ordering dependencies. Each task
+        // serves a specific purpose:
+        //
+        // 1. scan_loop: Primary scan loop that periodically calls scan_cycle() at configured intervals
+        //    to drive healing and lifecycle workflows. This is the core of the new optimized scanning
+        //    mechanism, responsible for continuous health checks and data management. Each scan_cycle()
+        //    also updates local stats in the aggregator and collects data usage statistics.
+        //
+        // 2. Initial data usage collection: Performs an immediate data usage collection after startup
+        //    to ensure admin APIs have fresh data available right away. Subsequent collections will be
+        //    handled periodically by scan_loop.
+        //
+        // 3. Initial scan cycle: Executes an immediate scan cycle to avoid waiting for a full interval
+        //    before starting healing checks. Subsequent cycles will be triggered by scan_loop at
+        //    configured intervals.
 
-        // Launch the primary scan loop to drive healing and lifecycle workflows
+        // Task 1: Launch the primary scan loop to drive healing and lifecycle workflows
+        // Reason: Core scanning mechanism that periodically triggers scan_cycle() at configured intervals
+        //         to perform health checks and data management. Each scan_cycle() also updates local stats
+        //         in the aggregator and collects data usage statistics, replacing the legacy_scan_loop.
         let scanner = self.clone_for_background();
         tokio::spawn(async move {
             if let Err(e) = scanner.scan_loop().await {
@@ -855,7 +890,10 @@ impl Scanner {
             }
         });
 
-        // Trigger an immediate data usage collection so that admin APIs have fresh data after startup.
+        // Task 2: Trigger an immediate data usage collection so that admin APIs have fresh data after startup
+        // Reason: Provide immediate data availability to admin APIs without waiting for the first scheduled
+        //         collection. Subsequent collections will be handled by scan_loop.
+        // Dependency: None - can run independently
         let scanner = self.clone_for_background();
         tokio::spawn(async move {
             let enable_stats = {
@@ -870,7 +908,11 @@ impl Scanner {
             }
         });
 
-        // Kick off an initial scan cycle so we do not wait one full interval to run healing checks
+        // Task 3: Kick off an initial scan cycle so we do not wait one full interval to run healing checks
+        // Reason: Start healing and lifecycle checks immediately rather than waiting for the first interval
+        //         in scan_loop. Subsequent cycles will be triggered by scan_loop at configured intervals.
+        // Dependency: None - can run independently, though it will also trigger data usage collection
+        //             if enabled (which may overlap with Task 2, but that's safe)
         let scanner = self.clone_for_background();
         tokio::spawn(async move {
             if let Err(e) = scanner.scan_cycle().await {
@@ -1138,6 +1180,11 @@ impl Scanner {
             state.current_scan_duration = Some(scan_duration);
         }
 
+        // Update local stats in aggregator so other nodes can get the latest stats during aggregation
+        // This replaces the functionality previously provided by legacy_scan_loop
+        let local_stats = self.node_scanner.get_stats_summary().await;
+        self.stats_aggregator.set_local_stats(local_stats).await;
+
         // Complete global metrics collection for this cycle
         stop_fn();
 
@@ -1360,27 +1407,73 @@ impl Scanner {
         ecstore: &Arc<rustfs_ecstore::store::ECStore>,
         bucket: &str,
     ) -> Option<BucketUsageInfo> {
-        match ecstore
-            .clone()
-            .list_objects_v2(bucket, "", None, None, 100, false, None, false)
-            .await
-        {
-            Ok(result) => {
-                let object_count = result.objects.len() as u64;
-                let bucket_size = result.objects.iter().map(|obj| obj.size as u64).sum();
-                let usage = BucketUsageInfo {
-                    size: bucket_size,
-                    objects_count: object_count,
-                    versions_count: object_count,
-                    ..Default::default()
+        let mut continuation: Option<String> = None;
+        let mut objects_count: u64 = 0;
+        let mut versions_count: u64 = 0;
+        let mut total_size: u64 = 0;
+        let mut delete_markers: u64 = 0;
+
+        loop {
+            let result = match ecstore
+                .clone()
+                .list_objects_v2(bucket, "", continuation.clone(), None, 1000, false, None, false)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("Failed to list objects during realtime data usage fallback for bucket {}: {}", bucket, e);
+                    return None;
+                }
+            };
+
+            for object in result.objects.iter() {
+                if object.is_dir {
+                    continue;
+                }
+
+                if object.delete_marker {
+                    delete_markers = delete_markers.saturating_add(1);
+                    continue;
+                }
+
+                let object_size = object.size.max(0) as u64;
+                objects_count = objects_count.saturating_add(1);
+                total_size = total_size.saturating_add(object_size);
+
+                let detected_versions = if object.num_versions > 0 {
+                    object.num_versions as u64
+                } else {
+                    1
                 };
-                Some(usage)
+                versions_count = versions_count.saturating_add(detected_versions);
             }
-            Err(e) => {
-                warn!("Failed to list objects during realtime data usage fallback for bucket {}: {}", bucket, e);
-                None
+
+            if !result.is_truncated {
+                break;
+            }
+
+            continuation = result.next_continuation_token.clone();
+            if continuation.is_none() {
+                warn!(
+                    "Bucket {} listing marked truncated but no continuation token returned; stopping early",
+                    bucket
+                );
+                break;
             }
         }
+
+        if versions_count == 0 {
+            versions_count = objects_count;
+        }
+
+        let usage = BucketUsageInfo {
+            size: total_size,
+            objects_count,
+            versions_count,
+            delete_markers_count: delete_markers,
+            ..Default::default()
+        };
+        Some(usage)
     }
 
     /// Verify object integrity and trigger healing if necessary
@@ -1736,7 +1829,7 @@ impl Scanner {
                                         debug!("Part {} not found on disk {}", part_idx, disk.path().display());
                                     }
                                     _ => {
-                                        debug!("Part {} check result: {} on disk {}", part_idx, result, disk.path().display());
+                                        warn!("Part {} check result: {} on disk {}", part_idx, result, disk.path().display());
                                     }
                                 }
                             }
@@ -1787,12 +1880,6 @@ impl Scanner {
             )));
         }
 
-        if missing_parts_found > 0 {
-            return Err(Error::Other(format!(
-                "Object has missing data parts across disks: {bucket}/{object} (missing parts: {missing_parts_found})"
-            )));
-        }
-
         // Special case: if this is a single-part object and we have missing parts on multiple disks,
         // it might indicate actual data loss rather than normal EC distribution
         if object_info.parts.len() == 1 && missing_parts_found > (total_disks_checked / 2) {
@@ -1809,6 +1896,12 @@ impl Scanner {
                     "Single-part object has too few healthy copies: {bucket}/{object} (healthy: {disks_with_parts}, total_disks: {total_disks_checked})"
                 )));
             }
+        }
+
+        if missing_parts_found > 0 {
+            return Err(Error::Other(format!(
+                "Object has missing data parts across disks: {bucket}/{object} (missing parts: {missing_parts_found})"
+            )));
         }
 
         debug!("EC data parts integrity verified for {}/{}", bucket, object);
@@ -2864,50 +2957,6 @@ impl Scanner {
                 set_index,
                 pool_index
             );
-        }
-
-        Ok(())
-    }
-
-    /// Legacy scan loop for backward compatibility (runs in background)
-    async fn legacy_scan_loop(&self) -> Result<()> {
-        info!("Starting legacy scan loop for backward compatibility");
-
-        loop {
-            if let Some(token) = get_ahm_services_cancel_token() {
-                if token.is_cancelled() {
-                    info!("Cancellation requested, exiting legacy scan loop");
-                    break;
-                }
-            }
-
-            let (enable_data_usage_stats, scan_interval) = {
-                let config = self.config.read().await;
-                (config.enable_data_usage_stats, config.scan_interval)
-            };
-
-            if enable_data_usage_stats {
-                if let Err(e) = self.collect_and_persist_data_usage().await {
-                    warn!("Background data usage collection failed: {}", e);
-                }
-            }
-
-            // Update local stats in aggregator after latest scan
-            let local_stats = self.node_scanner.get_stats_summary().await;
-            self.stats_aggregator.set_local_stats(local_stats).await;
-
-            match get_ahm_services_cancel_token() {
-                Some(token) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(scan_interval) => {}
-                        _ = token.cancelled() => {
-                            info!("Cancellation requested, exiting legacy scan loop");
-                            break;
-                        }
-                    }
-                }
-                None => tokio::time::sleep(scan_interval).await,
-            }
         }
 
         Ok(())
