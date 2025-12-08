@@ -3614,7 +3614,12 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if etag != if_match.as_strong().unwrap_or("") {
+                if let Some(strong_etag) = if_match.as_strong() {
+                    if etag != strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                } else {
+                    // Weak ETag in If-Match should fail
                     return Err(s3_error!(PreconditionFailed));
                 }
             } else {
@@ -3624,9 +3629,12 @@ impl S3 for FS {
 
         if let Some(if_none_match) = copy_source_if_none_match {
             if let Some(ref etag) = src_info.etag {
-                if etag == if_none_match.as_strong().unwrap_or("") {
-                    return Err(s3_error!(PreconditionFailed));
+                if let Some(strong_etag) = if_none_match.as_strong() {
+                    if etag == strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
                 }
+                // Weak ETag in If-None-Match is ignored (doesn't match)
             }
         }
 
