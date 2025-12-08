@@ -17,9 +17,9 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use hyper::StatusCode;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{

@@ -16,9 +16,9 @@ use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
 };
-use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use http::StatusCode;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};

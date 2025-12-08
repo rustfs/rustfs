@@ -15,7 +15,6 @@
 pub mod admin_handler_utils;
 pub mod api_bucket_policy;
 pub mod api_error_response;
-mod body_limits;
 pub mod api_get_object;
 pub mod api_get_object_acl;
 pub mod api_get_object_attributes;

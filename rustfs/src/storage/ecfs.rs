@@ -2813,15 +2813,15 @@ impl S3 for FS {
                         if let Some(ifmatch) = if_match {
                             if let Some(strong_etag) = ifmatch.as_strong() {
                                 if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
                             if let Some(strong_etag) = ifnonematch.as_strong() {
                                 if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                     }
@@ -3908,15 +3908,15 @@ impl S3 for FS {
                         if let Some(ifmatch) = if_match {
                             if let Some(strong_etag) = ifmatch.as_strong() {
                                 if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
                             if let Some(strong_etag) = ifnonematch.as_strong() {
                                 if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                     }

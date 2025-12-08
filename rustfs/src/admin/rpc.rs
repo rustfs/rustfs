@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::constants::MAX_ADMIN_REQUEST_BODY_SIZE;
 use super::router::AdminOperation;
 use super::router::Operation;
 use super::router::S3Router;
@@ -20,6 +19,7 @@ use futures::StreamExt;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::WalkDirOptions;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;

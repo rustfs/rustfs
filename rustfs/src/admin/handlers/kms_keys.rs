@@ -17,9 +17,9 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KmsError, get_global_kms_service_manager, types::*};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;

@@ -13,25 +13,13 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use http::{HeaderMap, StatusCode};
-//use iam::get_global_action_cred;
-use matchit::Params;
-use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
-};
-use serde_urlencoded::from_bytes;
-use time::OffsetDateTime;
-use tracing::{debug, warn};
-
 use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
 };
-use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
-
+use http::{HeaderMap, StatusCode};
+use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::{
     config::storageclass,
     global::GLOBAL_TierConfigMgr,
@@ -45,6 +33,15 @@ use rustfs_ecstore::{
         },
     },
 };
+use rustfs_policy::policy::action::{Action, AdminAction};
+use s3s::{
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    s3_error,
+};
+use serde_urlencoded::from_bytes;
+use time::OffsetDateTime;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {

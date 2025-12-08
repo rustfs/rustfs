@@ -44,8 +44,13 @@ pub const MAX_HEAL_REQUEST_SIZE: usize = 1024 * 1024; // 1 MB
 /// Rationale: Responses from external services should be bounded.
 /// Large responses (>10MB) indicate misconfiguration or potential attack.
 /// Typical responses: ACL XML < 10KB, List responses < 1MB
-/// 
-/// Note: This constant is defined for completeness but client-specific limits
-/// are used in practice (see ecstore::client::body_limits::MAX_S3_RESPONSE_SIZE)
-#[allow(dead_code)]
+///
+/// Rationale: Responses from external S3-compatible services should be bounded.
+/// - ACL XML responses: typically < 10KB
+/// - Object attributes: typically < 100KB
+/// - List responses: typically < 1MB (1000 objects with metadata)
+/// - Location/error responses: typically < 10KB
+///
+/// 10MB provides generous headroom for legitimate responses while preventing
+/// memory exhaustion from malicious or misconfigured remote services.
 pub const MAX_S3_CLIENT_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10 MB

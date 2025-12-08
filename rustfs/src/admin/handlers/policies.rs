@@ -16,9 +16,9 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, get_session_token},
 };
-use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_user;
 use rustfs_iam::store::MappedPolicy;

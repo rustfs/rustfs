@@ -21,10 +21,9 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
 };
-use crate::admin::constants::{MAX_BUCKET_METADATA_IMPORT_SIZE};
-
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::{

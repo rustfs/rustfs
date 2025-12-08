@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod auth;
-mod constants;
 pub mod console;
 pub mod handlers;
 pub mod router;
