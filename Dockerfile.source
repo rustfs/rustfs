@@ -39,7 +39,9 @@ RUN set -eux; \
     libssl-dev \
     lld \
     protobuf-compiler \
-    flatbuffers-compiler; \
+    flatbuffers-compiler \
+    gcc-aarch64-linux-gnu \
+    gcc-x86-64-linux-gnu; \
     rm -rf /var/lib/apt/lists/*
 
 # Optional: cross toolchain for aarch64 (only when targeting linux/arm64)
@@ -51,18 +53,18 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Add Rust targets based on TARGETPLATFORM
+# Add Rust targets for both arches (to support cross-builds on multi-arch runners)
 RUN set -eux; \
-    case "${TARGETPLATFORM:-linux/amd64}" in \
-    linux/amd64) rustup target add x86_64-unknown-linux-gnu ;; \
-    linux/arm64) rustup target add aarch64-unknown-linux-gnu ;; \
-    *) echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 ;; \
-    esac
+    rustup target add x86_64-unknown-linux-gnu; \
+    rustup target add aarch64-unknown-linux-gnu
 
 # Cross-compilation environment (used only when targeting aarch64)
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
+ENV CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++
 
 WORKDIR /usr/src/rustfs
 
