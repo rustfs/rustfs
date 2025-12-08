@@ -28,3 +28,28 @@ pub static GLOBAL_Conn_Map: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLoc
 pub async fn set_global_addr(addr: &str) {
     *GLOBAL_Rustfs_Addr.write().await = addr.to_string();
 }
+
+/// Evict a stale/dead connection from the global connection cache.
+/// This is critical for cluster recovery when a node dies unexpectedly (e.g., power-off).
+/// By removing the cached connection, subsequent requests will establish a fresh connection.
+pub async fn evict_connection(addr: &str) {
+    let removed = GLOBAL_Conn_Map.write().await.remove(addr);
+    if removed.is_some() {
+        tracing::warn!("Evicted stale connection from cache: {}", addr);
+    }
+}
+
+/// Check if a connection exists in the cache for the given address.
+pub async fn has_cached_connection(addr: &str) -> bool {
+    GLOBAL_Conn_Map.read().await.contains_key(addr)
+}
+
+/// Clear all cached connections. Useful for full cluster reset/recovery.
+pub async fn clear_all_connections() {
+    let mut map = GLOBAL_Conn_Map.write().await;
+    let count = map.len();
+    map.clear();
+    if count > 0 {
+        tracing::warn!("Cleared {} cached connections from global map", count);
+    }
+}
