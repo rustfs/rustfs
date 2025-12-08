@@ -19,6 +19,7 @@ env:
   ACCESS_KEY: rustfsadmin
   SECRET_KEY: rustfsadmin
   RUST_LOG: info
+  PLATFORM: linux/amd64
 
 jobs:
   mint-single:
@@ -31,17 +32,19 @@ jobs:
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build RustFS image
+      - name: Build RustFS image (source)
         run: |
-          DOCKER_BUILDKIT=1 docker build -t rustfs-ci -f Dockerfile.source .
+          DOCKER_BUILDKIT=1 docker buildx build --load \
+            --platform ${PLATFORM} \
+            -t rustfs-ci \
+            -f Dockerfile.source .
 
       - name: Create network
         run: |
           docker network inspect rustfs-net >/dev/null 2>&1 || docker network create rustfs-net
 
       - name: Remove existing rustfs-single (if any)
-        run: |
-          docker rm -f rustfs-single >/dev/null 2>&1 || true
+        run: docker rm -f rustfs-single >/dev/null 2>&1 || true
 
       - name: Start single RustFS
         run: |
@@ -66,10 +69,11 @@ jobs:
           docker logs rustfs-single || true
           exit 1
 
-      - name: Run Mint (single)
+      - name: Run Mint (single, S3-only)
         run: |
           mkdir -p artifacts/mint-single
           docker run --rm --network rustfs-net \
+            --platform ${PLATFORM} \
             -e SERVER_ENDPOINT=rustfs-single:9000 \
             -e ACCESS_KEY=$ACCESS_KEY \
             -e SECRET_KEY=$SECRET_KEY \
@@ -105,9 +109,12 @@ jobs:
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build RustFS image
+      - name: Build RustFS image (source)
         run: |
-          DOCKER_BUILDKIT=1 docker build -t rustfs-ci -f Dockerfile.source .
+          DOCKER_BUILDKIT=1 docker buildx build --load \
+            --platform ${PLATFORM} \
+            -t rustfs-ci \
+            -f Dockerfile.source .
 
       - name: Prepare cluster compose
         run: |
@@ -122,7 +129,7 @@ jobs:
                 - RUSTFS_ADDRESS=0.0.0.0:9000
                 - RUSTFS_ACCESS_KEY=${ACCESS_KEY}
                 - RUSTFS_SECRET_KEY=${SECRET_KEY}
-                - "RUSTFS_VOLUMES=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3"
+                - RUSTFS_VOLUMES=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3
               volumes:
                 - rustfs1-data:/data
             rustfs2:
@@ -133,7 +140,7 @@ jobs:
                 - RUSTFS_ADDRESS=0.0.0.0:9000
                 - RUSTFS_ACCESS_KEY=${ACCESS_KEY}
                 - RUSTFS_SECRET_KEY=${SECRET_KEY}
-                - RUSTFS_VOLUMES=/data/rustfs{0..3}
+                - RUSTFS_VOLUMES=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3
               volumes:
                 - rustfs2-data:/data
             rustfs3:
@@ -144,7 +151,7 @@ jobs:
                 - RUSTFS_ADDRESS=0.0.0.0:9000
                 - RUSTFS_ACCESS_KEY=${ACCESS_KEY}
                 - RUSTFS_SECRET_KEY=${SECRET_KEY}
-                - RUSTFS_VOLUMES=/data/rustfs{0..3}
+                - RUSTFS_VOLUMES=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3
               volumes:
                 - rustfs3-data:/data
             rustfs4:
@@ -155,7 +162,7 @@ jobs:
                 - RUSTFS_ADDRESS=0.0.0.0:9000
                 - RUSTFS_ACCESS_KEY=${ACCESS_KEY}
                 - RUSTFS_SECRET_KEY=${SECRET_KEY}
-                - RUSTFS_VOLUMES=/data/rustfs{0..3}
+                - RUSTFS_VOLUMES=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3
               volumes:
                 - rustfs4-data:/data
             lb:
@@ -210,10 +217,11 @@ jobs:
           docker compose -f compose.yml logs --tail=200 || true
           exit 1
 
-      - name: Run Mint (multi)
+      - name: Run Mint (multi, S3-only)
         run: |
           mkdir -p artifacts/mint-multi
           docker run --rm --network rustfs-net \
+            --platform ${PLATFORM} \
             -e SERVER_ENDPOINT=lb:9000 \
             -e ACCESS_KEY=$ACCESS_KEY \
             -e SECRET_KEY=$SECRET_KEY \
