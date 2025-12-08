@@ -21,6 +21,7 @@
 use http::Request;
 use hyper::StatusCode;
 use std::collections::HashMap;
+use super::body_limits::MAX_S3_RESPONSE_SIZE;
 
 use crate::client::{
     api_error_response::http_resp_to_error_response,
@@ -209,7 +210,7 @@ async fn process_bucket_location_response(
     }
     //}
 
-    let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
+    let b = resp.body_mut().store_all_limited(MAX_S3_RESPONSE_SIZE).await.unwrap().to_vec();
     let mut location = "".to_string();
     if tier_type == "huaweicloud" {
         let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();

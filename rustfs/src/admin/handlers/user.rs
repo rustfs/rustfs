@@ -16,6 +16,7 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, constant_time_eq, get_session_token},
 };
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::global::get_global_action_cred;
@@ -76,7 +77,7 @@ impl Operation for AddUser {
         }
 
         let mut input = req.input;
-        let body = match input.store_all_limited(usize::MAX).await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
@@ -636,7 +637,7 @@ impl Operation for ImportIam {
             .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_limited(usize::MAX).await {
+        let body = match input.store_all_limited(MAX_IAM_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);

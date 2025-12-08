@@ -17,6 +17,7 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_ecstore::config::com::{read_config, save_config};
@@ -102,7 +103,7 @@ impl Operation for ConfigureKmsHandler {
 
         let body = req
             .input
-            .store_all_limited(usize::MAX)
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -200,7 +201,7 @@ impl Operation for StartKmsHandler {
 
         let body = req
             .input
-            .store_all_limited(usize::MAX)
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -469,7 +470,7 @@ impl Operation for ReconfigureKmsHandler {
 
         let body = req
             .input
-            .store_all_limited(usize::MAX)
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 

@@ -30,6 +30,7 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
 };
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 
 use rustfs_ecstore::{
     config::storageclass,
@@ -95,11 +96,11 @@ impl Operation for AddTier {
         validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
-        let body = match input.store_all_limited(usize::MAX).await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "tier configuration body too large or failed to read"));
             }
         };
 
@@ -223,11 +224,11 @@ impl Operation for EditTier {
         validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
-        let body = match input.store_all_limited(usize::MAX).await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "tier configuration body too large or failed to read"));
             }
         };
 

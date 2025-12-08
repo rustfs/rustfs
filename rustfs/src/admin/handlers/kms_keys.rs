@@ -17,6 +17,7 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::admin::constants::{MAX_ADMIN_REQUEST_BODY_SIZE};
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_kms::{KmsError, get_global_kms_service_manager, types::*};
@@ -83,7 +84,7 @@ impl Operation for CreateKmsKeyHandler {
 
         let body = req
             .input
-            .store_all_limited(usize::MAX)
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -216,7 +217,7 @@ impl Operation for DeleteKmsKeyHandler {
 
         let body = req
             .input
-            .store_all_limited(usize::MAX)
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -364,7 +365,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
 
         let body = req
             .input
-            .store_all_limited(usize::MAX)
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 

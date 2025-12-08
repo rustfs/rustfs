@@ -21,6 +21,7 @@
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use std::collections::HashMap;
+use super::body_limits::MAX_S3_RESPONSE_SIZE;
 
 use crate::client::{
     api_error_response::http_resp_to_error_response,
@@ -102,7 +103,7 @@ impl TransitionClient {
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();
-        let b = resp.body_mut().store_all_limited(usize::MAX).await.unwrap().to_vec();
+        let b = resp.body_mut().store_all_limited(MAX_S3_RESPONSE_SIZE).await.unwrap().to_vec();
         let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
