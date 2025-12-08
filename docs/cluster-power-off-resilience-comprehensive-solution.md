@@ -50,9 +50,9 @@ When a process is killed gracefully:
 
 The `GLOBAL_Conn_Map` in `crates/common/src/globals.rs` caches gRPC channels for performance. However:
 
-- Cached connections are reused without checking if they're still alive
+- Cached connections are reused without proactive liveness checks
 - When a cached connection is dead, RPC calls block waiting for TCP timeout
-- Dead connections are only evicted after explicit errors occur
+- Dead connections are evicted only after explicit errors occur (reactive, not proactive)
 - During the blocking period, all operations waiting on that connection hang
 
 #### 3. Blocking Cluster Coordination Operations
@@ -193,8 +193,12 @@ During large file uploads (1GB+):
 **Why It Helped But Didn't Fully Solve:**
 - Keepalive detection takes 5-10 seconds
 - During that 5-10s window, operations still block
-- Some code paths may not use the keepalive-enabled channels
+- Some code paths may bypass the keepalive-enabled channels:
+  - Direct HTTP client usage in data plane operations (file uploads/downloads)
+  - Admin/console handlers that create their own connections
+  - Background workers that might cache old client instances
 - Eviction logic may not be triggered fast enough
+- **Action Required**: Audit all network client creation to ensure consistent keepalive configuration
 
 #### Fix Attempt #1054
 **Changes Made:**
@@ -317,12 +321,23 @@ pub async fn start_connection_health_checker() {
 
 #### C. HTTP Client Configuration for Data Plane
 
-**Problem**: The data plane (file uploads/downloads) may use separate HTTP clients that don't have the same keepalive configuration as gRPC.
+**Problem**: The data plane (file uploads/downloads) uses separate HTTP clients that likely don't have the same keepalive configuration as gRPC.
 
-**Files to Review:**
-- `crates/rio/src/*.rs` - Look for reqwest::Client usage
-- `crates/ecstore/src/put_object.rs` - Upload handling
-- `crates/ecstore/src/get_object.rs` - Download handling
+**Status**: Requires verification through code audit.
+
+**Files to Review and Verify:**
+- `crates/rio/src/*.rs` - Check for reqwest::Client usage and configuration
+- `crates/ecstore/src/put_object.rs` - Verify upload handling client configuration
+- `crates/ecstore/src/get_object.rs` - Verify download handling client configuration
+- `crates/ahm/src/scanner/stats_aggregator.rs:163` - Known reqwest::Client::builder() usage
+- `crates/policy/src/policy/opa.rs:104` - Known reqwest::Client::builder() usage
+
+**Verification Checklist:**
+1. [ ] Identify all locations where HTTP clients are created
+2. [ ] Verify each client has tcp_keepalive configured
+3. [ ] Verify each client has http2_keep_alive_interval configured
+4. [ ] Ensure timeout values are appropriate for operation type
+5. [ ] Test that dead peer detection works for data plane operations
 
 **Recommendation:**
 Create a centralized HTTP client factory with consistent keepalive settings:
@@ -573,7 +588,8 @@ pub async fn sync_metadata_with_quorum(
     let mut futures = Vec::new();
     for client in self.peer_clients.iter() {
         if let Some(client) = client {
-            futures.push(client.sync_metadata(metadata));
+            let metadata_clone = metadata.clone();
+            futures.push(async move { client.sync_metadata(&metadata_clone).await });
         }
     }
     
@@ -774,12 +790,13 @@ done
 
 # While uploads are running, cause rolling failures
 sleep 30
-echo "Powering off node 2..."
-docker stop rustfs_node2 &
+echo "Simulating abrupt power-off on node 2..."
+# Use 'docker kill' to simulate abrupt power-off (no graceful shutdown)
+docker kill rustfs_node2 &
 
 sleep 60
-echo "Powering off node 3..."
-docker stop rustfs_node3 &
+echo "Simulating abrupt power-off on node 3..."
+docker kill rustfs_node3 &
 
 sleep 60
 echo "Recovering node 2..."
@@ -1166,7 +1183,7 @@ With systematic implementation of these solutions, the RustFS cluster will achie
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
-| 1.0 | 2024-12-08 | Senior Rust Architect | Initial comprehensive solution document |
+| 1.0 | 2024-12-08 | GitHub Copilot (Architecture Analysis) | Initial comprehensive solution document |
 
 ---
 
