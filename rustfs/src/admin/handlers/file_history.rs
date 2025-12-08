@@ -28,29 +28,11 @@ use rustfs_ecstore::point_in_time::{
 };
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Iso8601;
 use tracing::{error, warn};
 use url::form_urlencoded;
-
-/// Request for getting file history
-#[derive(Debug, Deserialize)]
-pub struct GetFileHistoryRequest {
-    pub bucket: String,
-    pub object: String,
-    #[serde(default)]
-    pub max_versions: Option<usize>,
-}
-
-/// Request for getting object at a specific time
-#[derive(Debug, Deserialize)]
-pub struct GetObjectAtTimeRequest {
-    pub bucket: String,
-    pub object: String,
-    /// ISO 8601 datetime string (e.g., "2025-01-15T10:30:00Z")
-    pub at: String,
-}
 
 /// Response for point-in-time query
 #[derive(Debug, Serialize)]
