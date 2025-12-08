@@ -2,6 +2,7 @@
 
 ## Communication Rules
 - Respond to the user in Chinese; use English in all other contexts.
+- Code and documentation must be written in English only. Chinese text is allowed solely as test data/fixtures when a case explicitly requires Chinese-language content for validation.
 
 ## Project Structure & Module Organization
 The workspace root hosts shared dependencies in `Cargo.toml`. The service binary lives under `rustfs/src/main.rs`, while reusable crates sit in `crates/` (`crypto`, `iam`, `kms`, and `e2e_test`). Local fixtures for standalone flows reside in `test_standalone/`, deployment manifests are under `deploy/`, Docker assets sit at the root, and automation lives in `scripts/`. Skim each crate’s README or module docs before contributing changes.
