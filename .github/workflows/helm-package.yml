@@ -6,11 +6,16 @@ on:
     types: [completed]
 
 env:
-  new_version: ${{ github.ref_name }}
+  new_version: ${{ github.event.workflow_run.head_branch }}
 
 jobs:
   build-helm-package:
     runs-on: ubuntu-latest
+    # Only run on successful builds triggered by tag pushes (version format: x.y.z or x.y.z-suffix)
+    if: |
+      github.event.workflow_run.conclusion == 'success' && 
+      github.event.workflow_run.event == 'push' &&
+      contains(github.event.workflow_run.head_branch, '.')
 
     steps:
       - name: Checkout helm chart repo
@@ -65,8 +70,8 @@ jobs:
 
       - name: Push helm package and index file
         run: |
-          git config --global user.name "xiaomage"
-          git config --global user.email "devops008@sina.com"
+          git config --global user.name "${{ secrets.USERNAME }}"
+          git config --global user.email "${{ secrets.EMAIL_ADDRESS }}"
           git status .
           git add .
           git commit -m "Update rustfs helm package with $new_version."

@@ -108,7 +108,7 @@ use rustfs_s3select_api::{
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
     EventName,
-    arn::{TargetID, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::{
     CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
@@ -1418,12 +1418,17 @@ impl S3 for FS {
                 ..Default::default()
             };
 
-            let opts = ObjectOptions {
-                version_id: object.version_id.map(|v| v.to_string()),
-                versioned: version_cfg.prefix_enabled(&object.object_name),
-                version_suspended: version_cfg.suspended(),
-                ..Default::default()
-            };
+            let metadata = extract_metadata(&req.headers);
+
+            let opts: ObjectOptions = del_opts(
+                &bucket,
+                &object.object_name,
+                object.version_id.map(|f| f.to_string()),
+                &req.headers,
+                metadata,
+            )
+            .await
+            .map_err(ApiError::from)?;
 
             let mut goi = ObjectInfo::default();
             let mut gerr = None;
@@ -1684,10 +1689,6 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -1879,35 +1880,6 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
-
-        if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since {
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        }
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
@@ -4194,6 +4166,13 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        if tagging.tag_set.len() > 10 {
+            // TOTO: Note that Amazon S3 limits the maximum number of tags to 10 tags per object.
+            // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
+            // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
+            // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
+        }
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -4890,20 +4869,24 @@ impl S3 for FS {
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
-            process_queue_configurations(
-                &mut event_rules,
-                notification_configuration.queue_configurations.clone(),
-                TargetID::from_str,
-            );
-            process_topic_configurations(
-                &mut event_rules,
-                notification_configuration.topic_configurations.clone(),
-                TargetID::from_str,
-            );
+            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
+            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
             process_lambda_configurations(
                 &mut event_rules,
                 notification_configuration.lambda_function_configurations.clone(),
-                TargetID::from_str,
+                |arn_str| {
+                    ARN::parse(arn_str)
+                        .map(|arn| arn.target_id)
+                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                },
             );
 
             event_rules

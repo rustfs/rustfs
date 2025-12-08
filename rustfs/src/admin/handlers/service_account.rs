@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::utils::has_space_be;
-use crate::auth::{get_condition_values, get_session_token};
+use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::{admin::router::Operation, auth::check_key_valid};
 use http::HeaderMap;
 use hyper::StatusCode;
@@ -83,7 +83,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
-        if sys_cred.access_key == create_req.access_key {
+        if constant_time_eq(&sys_cred.access_key, &create_req.access_key) {
             return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
@@ -107,7 +107,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let deny_only = cred.access_key == target_user || cred.parent_user == target_user;
+        let deny_only = constant_time_eq(&cred.access_key, &target_user) || constant_time_eq(&cred.parent_user, &target_user);
 
         if !iam_store
             .is_allowed(&Args {
