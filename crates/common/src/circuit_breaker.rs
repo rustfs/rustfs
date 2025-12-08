@@ -113,11 +113,22 @@ impl PeerCircuitBreaker {
         *self.last_failure.write().await = Some(Instant::now());
 
         if failures >= self.failure_threshold {
-            let prev_state = CircuitState::from(self.state.load(Ordering::Relaxed));
-            self.state.store(CircuitState::Open as u8, Ordering::Relaxed);
-
-            if prev_state != CircuitState::Open {
-                warn!("Circuit breaker for {} opened after {} failures", self.peer, failures);
+            // Use compare_exchange to avoid race conditions in state transitions
+            match self
+                .state
+                .compare_exchange(CircuitState::Closed as u8, CircuitState::Open as u8, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    warn!("Circuit breaker for {} opened after {} failures", self.peer, failures);
+                }
+                Err(prev) if CircuitState::from(prev) == CircuitState::HalfOpen => {
+                    // Transition from HalfOpen to Open
+                    self.state.store(CircuitState::Open as u8, Ordering::Relaxed);
+                    warn!("Circuit breaker for {} reopened after failed recovery attempt", self.peer);
+                }
+                Err(_) => {
+                    // Already Open, no action needed
+                }
             }
         }
     }
