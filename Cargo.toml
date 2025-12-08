@@ -139,13 +139,13 @@ schemars = "1.1.0"
 
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
-argon2 = { version = "0.6.0-rc.2", features = ["std"] }
+argon2 = { version = "0.6.0-rc.3", features = ["std"] }
 blake3 = { version = "1.8.2", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.6.0"
 hmac = { version = "0.13.0-rc.3" }
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-pbkdf2 = "0.13.0-rc.2"
+pbkdf2 = "0.13.0-rc.3"
 rsa = { version = "0.10.0-rc.10" }
 rustls = { version = "0.23.35", features = ["ring", "logging", "std", "tls12"], default-features = false }
 rustls-pemfile = "2.2.0"
