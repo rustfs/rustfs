@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-policy/latest/rustfs_policy/"
 workspace = true
 
 [dependencies]
+rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants","opa"] }
 tokio = { workspace = true, features = ["full"] }
 time = { workspace = true, features = ["serde-human-readable"] }

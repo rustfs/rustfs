@@ -14,8 +14,9 @@
 
 #![allow(non_upper_case_globals)] // FIXME
 
+use crate::circuit_breaker::CircuitBreakerRegistry;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
@@ -24,6 +25,11 @@ pub static GLOBAL_Rustfs_Host: LazyLock<RwLock<String>> = LazyLock::new(|| RwLoc
 pub static GLOBAL_Rustfs_Port: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("9000".to_string()));
 pub static GLOBAL_Rustfs_Addr: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
 pub static GLOBAL_Conn_Map: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Global circuit breaker registry for peer health tracking.
+/// Prevents repeated attempts to communicate with dead/unhealthy peers.
+pub static GLOBAL_Circuit_Breakers: LazyLock<Arc<CircuitBreakerRegistry>> =
+    LazyLock::new(|| Arc::new(CircuitBreakerRegistry::new()));
 
 pub async fn set_global_addr(addr: &str) {
     *GLOBAL_Rustfs_Addr.write().await = addr.to_string();
@@ -52,4 +58,22 @@ pub async fn clear_all_connections() {
     if count > 0 {
         tracing::warn!("Cleared {} cached connections from global map", count);
     }
+}
+
+/// Check if peer should be contacted based on circuit breaker state.
+/// Returns true if the peer is healthy or in half-open state (testing recovery).
+pub async fn should_attempt_peer(addr: &str) -> bool {
+    GLOBAL_Circuit_Breakers.should_attempt(addr).await
+}
+
+/// Record successful peer communication.
+/// Resets failure count and closes circuit breaker if it was open.
+pub async fn record_peer_success(addr: &str) {
+    GLOBAL_Circuit_Breakers.record_success(addr).await;
+}
+
+/// Record failed peer communication.
+/// Increments failure count and may open circuit breaker after threshold.
+pub async fn record_peer_failure(addr: &str) {
+    GLOBAL_Circuit_Breakers.record_failure(addr).await;
 }

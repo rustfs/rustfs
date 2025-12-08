@@ -13,10 +13,12 @@
 // limitations under the License.
 
 pub mod bucket_stats;
+pub mod circuit_breaker;
 // pub mod error;
 pub mod data_usage;
 pub mod globals;
 pub mod heal_channel;
+pub mod http_client;
 pub mod last_minute;
 pub mod metrics;
 

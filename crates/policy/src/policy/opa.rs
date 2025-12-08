@@ -16,7 +16,7 @@ use crate::policy::Args as PArgs;
 use rustfs_config::{ENV_PREFIX, opa::*};
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::HashMap, env, time::Duration};
+use std::{collections::HashMap, env};
 use tracing::{error, info};
 
 #[derive(Debug, Clone, Default)]
@@ -101,17 +101,16 @@ pub async fn lookup_config() -> Result<Args, String> {
 
 impl AuthZPlugin {
     pub fn new(config: Args) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(1))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .tcp_nodelay(true)
-            .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-            .http2_keep_alive_timeout(Duration::from_secs(15))
-            .build()
-            .unwrap();
+        // Use centralized HTTP client factory with aggressive keepalive for fast failure detection
+        let client_config = rustfs_common::http_client::FastHttpClientConfig {
+            connect_timeout_secs: 1,
+            request_timeout_secs: 5,
+            pool_idle_timeout_secs: 60,
+            ..Default::default()
+        };
+        
+        let client = rustfs_common::http_client::create_fast_http_client_with_config(client_config)
+            .expect("Failed to create OPA HTTP client");
 
         Self { client, args: config }
     }

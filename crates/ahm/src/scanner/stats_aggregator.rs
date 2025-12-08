@@ -158,12 +158,16 @@ pub struct NodeClient {
 }
 
 impl NodeClient {
-    /// create new node client
+    /// create new node client with resilient HTTP configuration
     pub fn new(node_info: NodeInfo, config: NodeClientConfig) -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .connect_timeout(config.connect_timeout)
-            .build()
+        // Use centralized HTTP client factory with keepalive for dead peer detection
+        let http_client = rustfs_common::http_client::FastHttpClientConfig {
+            connect_timeout_secs: config.connect_timeout.as_secs(),
+            request_timeout_secs: config.request_timeout.as_secs(),
+            ..Default::default()
+        };
+        
+        let http_client = rustfs_common::http_client::create_fast_http_client_with_config(http_client)
             .expect("Failed to create HTTP client");
 
         Self {

@@ -198,11 +198,25 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
+                    
+                    // Check circuit breaker before attempting communication
+                    if !rustfs_common::globals::should_attempt_peer(&host).await {
+                        warn!("peer {} circuit breaker open, returning offline storage info", host);
+                        return Some(rustfs_madmin::StorageInfo {
+                            disks: get_offline_disks(&host, &endpoints),
+                            ..Default::default()
+                        });
+                    }
+                    
                     // Wrap in timeout to ensure we don't hang on dead peers
                     match timeout(peer_timeout, client.local_storage_info()).await {
-                        Ok(Ok(info)) => Some(info),
+                        Ok(Ok(info)) => {
+                            rustfs_common::globals::record_peer_success(&host).await;
+                            Some(info)
+                        }
                         Ok(Err(err)) => {
                             warn!("peer {} storage_info failed: {}", host, err);
+                            rustfs_common::globals::record_peer_failure(&host).await;
                             Some(rustfs_madmin::StorageInfo {
                                 disks: get_offline_disks(&host, &endpoints),
                                 ..Default::default()
@@ -210,6 +224,7 @@ impl NotificationSys {
                         }
                         Err(_) => {
                             warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
+                            rustfs_common::globals::record_peer_failure(&host).await;
                             client.evict_connection().await;
                             Some(rustfs_madmin::StorageInfo {
                                 disks: get_offline_disks(&host, &endpoints),
@@ -246,15 +261,27 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
+                    
+                    // Check circuit breaker before attempting communication
+                    if !rustfs_common::globals::should_attempt_peer(&host).await {
+                        warn!("peer {} circuit breaker open, skipping server_info call", host);
+                        return offline_server_properties(&host, &endpoints);
+                    }
+                    
                     match timeout(peer_timeout, client.server_info()).await {
-                        Ok(Ok(info)) => info,
+                        Ok(Ok(info)) => {
+                            rustfs_common::globals::record_peer_success(&host).await;
+                            info
+                        }
                         Ok(Err(err)) => {
                             warn!("peer {} server_info failed: {}", host, err);
+                            rustfs_common::globals::record_peer_failure(&host).await;
                             // client.server_info handles eviction internally on error, but fallback needed
                             offline_server_properties(&host, &endpoints)
                         }
                         Err(_) => {
                             warn!("peer {} server_info timed out after {:?}", host, peer_timeout);
+                            rustfs_common::globals::record_peer_failure(&host).await;
                             client.evict_connection().await;
                             offline_server_properties(&host, &endpoints)
                         }
