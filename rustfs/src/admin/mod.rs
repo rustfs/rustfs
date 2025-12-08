@@ -23,8 +23,8 @@ pub mod utils;
 mod console_test;
 
 use handlers::{
-    GetReplicationMetricsHandler, HealthCheckHandler, IsAdminHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
-    bucket_meta,
+    GetReplicationMetricsHandler, HealthCheckHandler, IsAdminHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler,
+    SetRemoteTargetHandler, bucket_meta,
     event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
     group, kms, kms_dynamic, kms_keys, policies, pools,
     profile::{TriggerProfileCPU, TriggerProfileMemory},
