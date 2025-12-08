@@ -169,3 +169,36 @@ jobs:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log
           retention-days: 3
+  analyze:
+    name: Analyze Rust
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      contents: read
+    
+    strategy:
+      fail-fast: false
+      matrix: 
+        language: [ rust ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          ram: 6000
+          threads: 2
+          db-location: /home/runner/work/codeql_dbs
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+          ram: 6000
+          threads: 2
