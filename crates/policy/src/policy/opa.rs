@@ -108,7 +108,7 @@ impl AuthZPlugin {
             pool_idle_timeout_secs: 60,
             ..Default::default()
         };
-        
+
         let client = rustfs_common::http_client::create_fast_http_client_with_config(client_config)
             .expect("Failed to create OPA HTTP client");
 

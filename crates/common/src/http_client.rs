@@ -109,9 +109,7 @@ pub fn create_fast_http_client() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 /// Create an HTTP client with custom fast configuration.
-pub fn create_fast_http_client_with_config(
-    config: FastHttpClientConfig,
-) -> Result<reqwest::Client, reqwest::Error> {
+pub fn create_fast_http_client_with_config(config: FastHttpClientConfig) -> Result<reqwest::Client, reqwest::Error> {
     ClientBuilder::new()
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))
@@ -142,9 +140,7 @@ pub fn create_bulk_http_client() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 /// Create an HTTP client with custom bulk configuration.
-pub fn create_bulk_http_client_with_config(
-    config: BulkHttpClientConfig,
-) -> Result<reqwest::Client, reqwest::Error> {
+pub fn create_bulk_http_client_with_config(config: BulkHttpClientConfig) -> Result<reqwest::Client, reqwest::Error> {
     ClientBuilder::new()
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))

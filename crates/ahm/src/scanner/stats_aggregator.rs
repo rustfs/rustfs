@@ -166,9 +166,9 @@ impl NodeClient {
             request_timeout_secs: config.request_timeout.as_secs(),
             ..Default::default()
         };
-        
-        let http_client = rustfs_common::http_client::create_fast_http_client_with_config(http_client)
-            .expect("Failed to create HTTP client");
+
+        let http_client =
+            rustfs_common::http_client::create_fast_http_client_with_config(http_client).expect("Failed to create HTTP client");
 
         Self {
             node_info,

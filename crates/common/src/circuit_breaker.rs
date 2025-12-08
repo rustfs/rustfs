@@ -18,8 +18,8 @@
 //! reducing latency and improving cluster resilience during failures.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -117,10 +117,7 @@ impl PeerCircuitBreaker {
             self.state.store(CircuitState::Open as u8, Ordering::Relaxed);
 
             if prev_state != CircuitState::Open {
-                warn!(
-                    "Circuit breaker for {} opened after {} failures",
-                    self.peer, failures
-                );
+                warn!("Circuit breaker for {} opened after {} failures", self.peer, failures);
             }
         }
     }
@@ -181,11 +178,7 @@ impl CircuitBreakerRegistry {
             return breaker.clone();
         }
 
-        let breaker = Arc::new(PeerCircuitBreaker::new(
-            peer.to_string(),
-            self.failure_threshold,
-            self.recovery_timeout,
-        ));
+        let breaker = Arc::new(PeerCircuitBreaker::new(peer.to_string(), self.failure_threshold, self.recovery_timeout));
         breakers.insert(peer.to_string(), breaker.clone());
         debug!("Created circuit breaker for peer: {}", peer);
         breaker
@@ -236,12 +229,7 @@ impl CircuitBreakerRegistry {
         let breakers = self.breakers.read().await;
         breakers
             .iter()
-            .map(|(peer, breaker)| {
-                (
-                    peer.clone(),
-                    (breaker.get_state(), breaker.get_failure_count()),
-                )
-            })
+            .map(|(peer, breaker)| (peer.clone(), (breaker.get_state(), breaker.get_failure_count())))
             .collect()
     }
 }
@@ -277,8 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_circuit_breaker_recovery() {
-        let breaker =
-            PeerCircuitBreaker::new("test-peer".to_string(), 2, Duration::from_millis(100));
+        let breaker = PeerCircuitBreaker::new("test-peer".to_string(), 2, Duration::from_millis(100));
 
         // Open the circuit
         breaker.record_failure().await;
