@@ -2819,7 +2819,7 @@ impl S3 for FS {
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
@@ -3902,7 +3902,7 @@ impl S3 for FS {
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
