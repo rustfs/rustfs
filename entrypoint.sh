@@ -24,13 +24,12 @@ DATA_VOLUMES=""
 process_data_volumes() {
   VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
   # Convert comma/tab to space
-  # Convert comma/tab to space first
   VOLUME_LIST_RAW=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
   
   VOLUME_LIST=""
   for vol in $VOLUME_LIST_RAW; do
       # Helper to manually expand {N..M} since sh doesn't support it on variables
-      if echo "$vol" | grep -q "{.*..*}"; then
+      if echo "$vol" | grep -E -q "\{[0-9]+\.\.[0-9]+\}"; then
            PREFIX=${vol%%\{*}
            SUFFIX=${vol##*\}}
            RANGE=${vol#*\{}

@@ -83,7 +83,7 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     volumes:
       - .:/app # Mount source code to /app for development
-      - /usr/local/cargo/registry # Mount cargo registry to avoid re-downloading
+      - cargo_registry:/usr/local/cargo/registry # Mount cargo registry to avoid re-downloading
       - ./deploy/data/dev:/data
     networks:
       - rustfs-network
@@ -229,4 +229,6 @@ volumes:
   redis_data:
     driver: local
   logs:
+    driver: local
+  cargo_registry:
     driver: local

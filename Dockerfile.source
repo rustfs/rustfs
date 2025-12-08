@@ -135,6 +135,8 @@ LABEL name="RustFS (dev-source)" \
 # (builder already has build-essential, lld, etc.)
 WORKDIR /app
 
+ENV CARGO_INCREMENTAL=1
+
 # Ensure we have the same default env vars available
 ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_ACCESS_KEY="rustfsadmin" \
