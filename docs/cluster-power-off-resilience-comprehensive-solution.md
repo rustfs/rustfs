@@ -2,11 +2,17 @@
 
 ## Executive Summary
 
-This document provides a complete architectural analysis and solution for the critical reliability issue where a RustFS distributed storage cluster becomes unresponsive when a node experiences an abrupt power-off (hard failure), despite gracefully handling process-level terminations (kill signals).
+This document provides a complete architectural analysis and solution for the critical reliability issue where a RustFS
+distributed storage cluster becomes unresponsive when a node experiences an abrupt power-off (hard failure), despite
+gracefully handling process-level terminations (kill signals).
 
-**Problem Statement**: When one node in a 4-node RustFS cluster is abruptly powered off, the entire cluster becomes unresponsive - file uploads fail, the Console Web UI hangs, and administrative operations time out. This behavior differs significantly from graceful process termination, which the cluster handles correctly.
+**Problem Statement**: When one node in a 4-node RustFS cluster is abruptly powered off, the entire cluster becomes
+unresponsive - file uploads fail, the Console Web UI hangs, and administrative operations time out. This behavior
+differs significantly from graceful process termination, which the cluster handles correctly.
 
-**Status**: Previous attempts (#1035, #1054) to address this issue through HTTP/2 keepalive configurations have been implemented but the issue persists, indicating deeper architectural challenges that require a comprehensive multi-layered solution.
+**Status**: Previous attempts (#1035, #1054) to address this issue through HTTP/2 keepalive configurations have been
+implemented but the issue persists, indicating deeper architectural challenges that require a comprehensive
+multi-layered solution.
 
 ---
 
@@ -32,7 +38,8 @@ This document provides a complete architectural analysis and solution for the cr
 #### 1. TCP Connection State Management
 
 **The Fundamental Problem:**
-When a node experiences abrupt power-off, the TCP connections to that node remain in an established state on peer nodes. The TCP protocol does not immediately detect the peer's disappearance because:
+When a node experiences abrupt power-off, the TCP connections to that node remain in an established state on peer nodes.
+The TCP protocol does not immediately detect the peer's disappearance because:
 
 - No `FIN` (finish) packet is sent during power-off
 - No `RST` (reset) packet is sent during power-off
@@ -41,6 +48,7 @@ When a node experiences abrupt power-off, the TCP connections to that node remai
 
 **Why Graceful Kill Works Differently:**
 When a process is killed gracefully:
+
 - The OS sends `FIN` packets to close all open connections
 - Peers receive immediate notification that connections are closed
 - Connection pools can evict dead connections immediately
@@ -58,9 +66,11 @@ The `GLOBAL_Conn_Map` in `crates/common/src/globals.rs` caches gRPC channels for
 #### 3. Blocking Cluster Coordination Operations
 
 **IAM Notification Synchronization:**
-Before recent fixes, IAM operations (login, user creation) attempted to synchronously notify all peers. If any peer is unresponsive, this blocks the entire login operation.
+Before recent fixes, IAM operations (login, user creation) attempted to synchronously notify all peers. If any peer is
+unresponsive, this blocks the entire login operation.
 
-**Current Status**: This has been partially fixed with `tokio::spawn` for fire-and-forget notifications, but may not cover all cases.
+**Current Status**: This has been partially fixed with `tokio::spawn` for fire-and-forget notifications, but may not
+cover all cases.
 
 #### 4. Console Aggregation Operations
 
@@ -70,7 +80,8 @@ The Console Web UI aggregates data from all nodes:
 - `server_info()` - Collects server properties from all nodes
 - Performance metrics - Aggregates real-time metrics
 
-**Problem**: If any peer times out, the entire aggregation can hang or return incomplete data, making the UI appear frozen.
+**Problem**: If any peer times out, the entire aggregation can hang or return incomplete data, making the UI appear
+frozen.
 
 **Current Status**: Timeout wrappers exist (2s per peer) but may be insufficient for worst-case scenarios.
 
@@ -81,9 +92,9 @@ During large file uploads (1GB+):
 - Multiple chunks are streamed across the cluster for erasure coding
 - Each chunk may go to different nodes
 - If a target node experiences power-off mid-upload:
-  - The HTTP/2 stream hangs waiting for acknowledgment
-  - Without aggressive keepalive, detection can take 10-20 seconds or more
-  - The entire upload operation appears frozen
+    - The HTTP/2 stream hangs waiting for acknowledgment
+    - Without aggressive keepalive, detection can take 10-20 seconds or more
+    - The entire upload operation appears frozen
 
 ---
 
@@ -119,31 +130,34 @@ During large file uploads (1GB+):
 ### Communication Layers
 
 #### Control Plane (gRPC)
+
 - **Purpose**: Cluster coordination, metadata operations, IAM synchronization
 - **Protocol**: HTTP/2 over TCP with tonic
 - **Configuration Location**: `crates/protos/src/lib.rs`
 - **Critical Operations**:
-  - User/policy synchronization (`load_user`, `load_policy`)
-  - Bucket metadata (`load_bucket_metadata`)
-  - Server health checks (`server_info`, `local_storage_info`)
+    - User/policy synchronization (`load_user`, `load_policy`)
+    - Bucket metadata (`load_bucket_metadata`)
+    - Server health checks (`server_info`, `local_storage_info`)
 
 #### Data Plane (HTTP)
+
 - **Purpose**: File upload/download, streaming operations
 - **Protocol**: HTTP/1.1 or HTTP/2 over TCP
 - **Configuration Location**: Various (needs comprehensive review)
 - **Critical Operations**:
-  - Multipart upload chunking
-  - Erasure-coded data distribution
-  - Cross-node data streaming
+    - Multipart upload chunking
+    - Erasure-coded data distribution
+    - Cross-node data streaming
 
 #### Management Plane (Console)
+
 - **Purpose**: Web UI for monitoring and administration
 - **Protocol**: HTTP + WebSocket
 - **Configuration Location**: `rustfs/src/admin/` and `rustfs/src/server/`
 - **Critical Operations**:
-  - Dashboard data aggregation
-  - Real-time performance metrics
-  - Administrative commands
+    - Dashboard data aggregation
+    - Real-time performance metrics
+    - Administrative commands
 
 ---
 
@@ -154,22 +168,26 @@ During large file uploads (1GB+):
 #### Timeline of Failure
 
 **T=0s: Upload Begins**
+
 - Client initiates 1GB file upload via S3 API
 - RustFS receives upload, calculates erasure coding distribution
 - File is split into chunks distributed across all 4 nodes
 
 **T=5s: Node 3 Powers Off**
+
 - Node 3 loses power without warning
 - TCP connections remain in ESTABLISHED state on other nodes
 - No FIN or RST packets sent
 - Cached gRPC channels in `GLOBAL_Conn_Map` remain "valid"
 
 **T=5s-10s: Initial Impact**
+
 - Chunks destined for Node 3 begin to hang
 - Upload progress stalls
 - Client sees upload progress freeze at partial completion
 
 **T=10s-20s: Cascading Effects**
+
 - Upload handler waits for Node 3 acknowledgment
 - No timeout triggers (or timeout is too long)
 - Console UI attempts to refresh server info
@@ -178,6 +196,7 @@ During large file uploads (1GB+):
 - New login attempts may hang if IAM notification tries to reach Node 3
 
 **T=20s+: Complete Cluster Hang**
+
 - Multiple operations blocked waiting for Node 3
 - Connection pool exhaustion possible
 - User perceives entire cluster as down
@@ -186,26 +205,32 @@ During large file uploads (1GB+):
 ### Why Previous Fixes Were Insufficient
 
 #### Fix Attempt #1035
+
 **Changes Made:**
+
 - Added HTTP/2 keepalive to tonic channels
 - Enabled TCP keepalive
 
 **Why It Helped But Didn't Fully Solve:**
+
 - Keepalive detection takes 5-10 seconds
 - During that 5-10s window, operations still block
 - Some code paths may bypass the keepalive-enabled channels:
-  - Direct HTTP client usage in data plane operations (file uploads/downloads)
-  - Admin/console handlers that create their own connections
-  - Background workers that might cache old client instances
+    - Direct HTTP client usage in data plane operations (file uploads/downloads)
+    - Admin/console handlers that create their own connections
+    - Background workers that might cache old client instances
 - Eviction logic may not be triggered fast enough
 - **Action Required**: Audit all network client creation to ensure consistent keepalive configuration
 
 #### Fix Attempt #1054
+
 **Changes Made:**
+
 - Further refinement of keepalive settings
 - Connection eviction on error
 
 **Why It Still Wasn't Enough:**
+
 - Timeout values may still be too generous for user-facing operations
 - Not all operation types have timeout protection
 - Large file uploads may exceed all timeout values
@@ -227,18 +252,22 @@ During large file uploads (1GB+):
 ### Solution Layers
 
 #### Layer 1: Aggressive Connection Management
+
 - **Goal**: Detect dead connections within 3-5 seconds
 - **Mechanisms**: HTTP/2 PING, TCP keepalive, connection timeouts
 
 #### Layer 2: Operation-Specific Timeouts
+
 - **Goal**: No single operation hangs indefinitely
 - **Mechanisms**: Per-operation timeout wrappers, circuit breakers
 
 #### Layer 3: Quorum-Based Operations
+
 - **Goal**: Continue with majority of healthy nodes
 - **Mechanisms**: Partial response acceptance, degraded mode operation
 
 #### Layer 4: Monitoring & Alerting
+
 - **Goal**: Operators understand cluster health in real-time
 - **Mechanisms**: Metrics, structured logging, health endpoints
 
@@ -253,6 +282,7 @@ During large file uploads (1GB+):
 **File**: `crates/protos/src/lib.rs`
 
 **Current Implementation:**
+
 ```rust
 const CONNECT_TIMEOUT_SECS: u64 = 3;
 const TCP_KEEPALIVE_SECS: u64 = 10;
@@ -321,11 +351,13 @@ pub async fn start_connection_health_checker() {
 
 #### C. HTTP Client Configuration for Data Plane
 
-**Problem**: The data plane (file uploads/downloads) uses separate HTTP clients that likely don't have the same keepalive configuration as gRPC.
+**Problem**: The data plane (file uploads/downloads) uses separate HTTP clients that likely don't have the same
+keepalive configuration as gRPC.
 
 **Status**: Requires verification through code audit.
 
 **Files to Review and Verify:**
+
 - `crates/rio/src/*.rs` - Check for reqwest::Client usage and configuration
 - `crates/ecstore/src/put_object.rs` - Verify upload handling client configuration
 - `crates/ecstore/src/get_object.rs` - Verify download handling client configuration
@@ -333,6 +365,7 @@ pub async fn start_connection_health_checker() {
 - `crates/policy/src/policy/opa.rs:104` - Known reqwest::Client::builder() usage
 
 **Verification Checklist:**
+
 1. [ ] Identify all locations where HTTP clients are created
 2. [ ] Verify each client has tcp_keepalive configured
 3. [ ] Verify each client has http2_keep_alive_interval configured
@@ -374,6 +407,7 @@ pub fn create_resilient_http_client() -> Result<reqwest::Client, Box<dyn Error>>
 **File**: `crates/iam/src/sys.rs`
 
 **Current Implementation:**
+
 ```rust
 async fn notify_for_user(&self, name: &str, is_temp: bool) {
     // Fire-and-forget with tokio::spawn - GOOD
@@ -405,7 +439,7 @@ async fn notify_for_user(&self, name: &str, is_temp: bool) {
                 vec![]
             }
         }).await;
-        
+
         match result {
             Ok(resp) => {
                 for r in resp {
@@ -427,10 +461,11 @@ async fn notify_for_user(&self, name: &str, is_temp: bool) {
 **File**: `crates/ecstore/src/notification_sys.rs`
 
 **Current Implementation:**
+
 ```rust
 pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
     let peer_timeout = Duration::from_secs(2); // GOOD
-    
+
     for client in self.peer_clients.iter() {
         futures.push(async move {
             if let Some(client) = client {
@@ -453,6 +488,7 @@ pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::Stora
 **Enhancement Recommendations:**
 
 1. **Tunable Timeout Per Environment:**
+
 ```rust
 // Allow operators to tune timeout via environment variable
 fn get_peer_timeout() -> Duration {
@@ -465,6 +501,7 @@ fn get_peer_timeout() -> Duration {
 ```
 
 2. **Circuit Breaker Pattern:**
+
 ```rust
 // Track peer health to avoid repeatedly trying dead peers
 pub struct PeerCircuitBreaker {
@@ -489,12 +526,12 @@ impl PeerCircuitBreaker {
         }
         true // Half-open - allow one attempt
     }
-    
+
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::Relaxed);
         self.state.store(0, Ordering::Relaxed); // Close circuit
     }
-    
+
     pub fn record_failure(&self) {
         let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
         *self.last_failure.write().unwrap() = Some(Instant::now());
@@ -510,12 +547,14 @@ impl PeerCircuitBreaker {
 **Problem Area**: Large file uploads that span multiple nodes.
 
 **Files to Review and Enhance:**
+
 - `crates/ecstore/src/put_object.rs`
 - `crates/ecstore/src/erasure/encode.rs`
 
 **Enhancement Strategy:**
 
 1. **Chunk-Level Timeout:**
+
 ```rust
 // Each chunk upload should have its own timeout
 async fn upload_chunk_to_node(
@@ -523,16 +562,17 @@ async fn upload_chunk_to_node(
     chunk: &[u8],
 ) -> Result<(), Error> {
     let chunk_timeout = Duration::from_secs(10); // Adjust based on chunk size
-    
+
     timeout(chunk_timeout, async {
         // Actual upload logic
     })
-    .await
-    .map_err(|_| Error::UploadTimeout(node.to_string()))?
+        .await
+        .map_err(|_| Error::UploadTimeout(node.to_string()))?
 }
 ```
 
 2. **Retry with Different Node:**
+
 ```rust
 // If one node fails, try another in the same erasure set
 async fn upload_chunk_with_fallback(
@@ -548,7 +588,7 @@ async fn upload_chunk_with_fallback(
             evict_connection(primary_node).await;
         }
     }
-    
+
     // Try fallbacks
     for node in fallback_nodes {
         match upload_chunk_to_node(node, chunk).await {
@@ -560,7 +600,7 @@ async fn upload_chunk_with_fallback(
             }
         }
     }
-    
+
     Err(Error::AllNodesFailed)
 }
 ```
@@ -584,7 +624,7 @@ pub async fn sync_metadata_with_quorum(
 ) -> Result<(), Error> {
     let total_peers = self.peer_clients.len();
     let required_acks = quorum_size.min(total_peers);
-    
+
     let mut futures = Vec::new();
     for client in self.peer_clients.iter() {
         if let Some(client) = client {
@@ -592,11 +632,11 @@ pub async fn sync_metadata_with_quorum(
             futures.push(async move { client.sync_metadata(&metadata_clone).await });
         }
     }
-    
+
     // Use select! to complete when we have enough acks
     let mut success_count = 0;
     let mut pending = futures;
-    
+
     while !pending.is_empty() && success_count < required_acks {
         match futures::future::select_all(pending).await {
             (Ok(()), _, remaining) => {
@@ -609,7 +649,7 @@ pub async fn sync_metadata_with_quorum(
             }
         }
     }
-    
+
     if success_count >= required_acks {
         Ok(())
     } else {
@@ -626,6 +666,7 @@ pub async fn sync_metadata_with_quorum(
 #### A. Metrics to Add
 
 **Connection Health Metrics:**
+
 ```rust
 // File: crates/obs/src/metrics/cluster_health.rs (ENHANCE)
 
@@ -654,6 +695,7 @@ counter!(
 ```
 
 **Operation Metrics:**
+
 ```rust
 // Upload operation tracking
 histogram!("rustfs_upload_duration_seconds", size_bucket => "1mb_10mb");
@@ -668,6 +710,7 @@ counter!("rustfs_console_aggregation_partial_total");
 #### B. Structured Logging
 
 **Enhancement Recommendations:**
+
 ```rust
 // Use structured logging with context
 use tracing::{info, warn, error, instrument};
@@ -675,7 +718,7 @@ use tracing::{info, warn, error, instrument};
 #[instrument(skip(self, data), fields(peer = %peer_host, size = data.len()))]
 async fn send_data_to_peer(&self, peer_host: &str, data: &[u8]) -> Result<()> {
     let start = Instant::now();
-    
+
     match timeout(Duration::from_secs(10), self.send_internal(peer_host, data)).await {
         Ok(Ok(())) => {
             info!(
@@ -710,11 +753,14 @@ async fn send_data_to_peer(&self, peer_host: &str, data: &[u8]) -> Result<()> {
 ### Test Scenarios
 
 #### Scenario 1: Single Node Abrupt Power-Off During Idle
+
 **Setup:**
+
 - 4-node cluster, all healthy
 - No active operations
 
 **Test Steps:**
+
 1. Power off Node 3 abruptly
 2. Wait 10 seconds
 3. Attempt to login via Console
@@ -722,31 +768,39 @@ async fn send_data_to_peer(&self, peer_host: &str, data: &[u8]) -> Result<()> {
 5. Verify 3 nodes shown as online, 1 as offline
 
 **Success Criteria:**
+
 - Login completes within 5 seconds
 - Dashboard loads within 5 seconds
 - Correct node status displayed
 
 #### Scenario 2: Single Node Abrupt Power-Off During 1GB Upload
+
 **Setup:**
+
 - 4-node cluster, all healthy
 - Start uploading a 1GB file
 
 **Test Steps:**
+
 1. Start 1GB file upload
 2. After 30% progress, power off Node 3 abruptly
 3. Monitor upload progress
 
 **Success Criteria:**
+
 - Upload either completes successfully (using remaining nodes)
 - OR upload fails with clear error within 15 seconds
 - Other uploads can be initiated immediately
 - Console remains responsive throughout
 
 #### Scenario 3: Multiple Sequential Node Failures
+
 **Setup:**
+
 - 4-node cluster, all healthy
 
 **Test Steps:**
+
 1. Power off Node 4
 2. Wait for detection (should be <10s)
 3. Verify cluster still operational with 3 nodes
@@ -754,19 +808,24 @@ async fn send_data_to_peer(&self, peer_host: &str, data: &[u8]) -> Result<()> {
 5. Verify cluster still operational with 2 nodes (if quorum allows)
 
 **Success Criteria:**
+
 - Each failure detected within 10 seconds
 - Cluster continues serving requests after each failure (as long as quorum maintained)
 - Console accurately reflects cluster state
 
 #### Scenario 4: Node Recovery After Power-On
+
 **Setup:**
+
 - 4-node cluster with Node 3 powered off
 
 **Test Steps:**
+
 1. Power on Node 3
 2. Monitor cluster behavior
 
 **Success Criteria:**
+
 - Node 3 rejoins cluster within 30 seconds
 - Cached connections to Node 3 re-established
 - Data rebalancing begins (if needed)
@@ -823,6 +882,7 @@ s3cmd ls s3://testbucket/ | wc -l
 **Grafana Panel Recommendations:**
 
 #### Panel 1: Peer Connection Health
+
 ```promql
 # Active connections per peer
 rustfs_peer_connections_active{peer_host=~".*"}
@@ -835,6 +895,7 @@ rate(rustfs_peer_connection_evictions_total[5m])
 ```
 
 #### Panel 2: RPC Performance
+
 ```promql
 # P99 latency per peer
 histogram_quantile(0.99, 
@@ -846,6 +907,7 @@ rate(rustfs_peer_timeout_total[5m])
 ```
 
 #### Panel 3: Upload Operations
+
 ```promql
 # Upload success rate
 rate(rustfs_upload_success_total[5m]) / 
@@ -876,7 +938,7 @@ groups:
         annotations:
           summary: "High connection failure rate to peer {{ $labels.peer_host }}"
           description: "Peer {{ $labels.peer_host }} has {{ $value }} connection failures per second"
-      
+
       - alert: PeerUnreachable
         expr: rustfs_peer_connections_active == 0
         for: 1m
@@ -885,7 +947,7 @@ groups:
         annotations:
           summary: "Peer {{ $labels.peer_host }} is unreachable"
           description: "No active connections to peer {{ $labels.peer_host }} for 1 minute"
-      
+
       - alert: UploadFailureRateHigh
         expr: |
           rate(rustfs_upload_failures_total[5m]) / 
@@ -908,11 +970,13 @@ groups:
 #### 1. Cluster Sizing for Resilience
 
 **Minimum Recommendations:**
+
 - **Production**: 5+ nodes to tolerate 2 simultaneous failures
 - **Staging**: 3+ nodes to tolerate 1 failure
 - **Development**: 3+ nodes to test failure scenarios
 
 **Quorum Calculation:**
+
 ```
 Quorum = floor(N/2) + 1
 Tolerable Failures = N - Quorum
@@ -926,6 +990,7 @@ For N=7: Quorum=4, Tolerable=3
 #### 2. Network Configuration
 
 **TCP Tuning (Linux):**
+
 ```bash
 # File: /etc/sysctl.d/99-rustfs.conf
 
@@ -945,6 +1010,7 @@ net.netfilter.nf_conntrack_max = 262144
 ```
 
 Apply with:
+
 ```bash
 sudo sysctl -p /etc/sysctl.d/99-rustfs.conf
 ```
@@ -952,6 +1018,7 @@ sudo sysctl -p /etc/sysctl.d/99-rustfs.conf
 #### 3. Resource Limits
 
 **Ensure adequate file descriptors:**
+
 ```bash
 # File: /etc/security/limits.d/rustfs.conf
 rustfs soft nofile 65536
@@ -959,6 +1026,7 @@ rustfs hard nofile 65536
 ```
 
 **Systemd service configuration:**
+
 ```ini
 # File: /etc/systemd/system/rustfs.service
 [Service]
@@ -970,6 +1038,7 @@ RestartSec=10
 #### 4. Configuration Tuning
 
 **Environment Variables:**
+
 ```bash
 # Connection timeouts (seconds)
 RUSTFS_CONNECT_TIMEOUT=3
@@ -1001,27 +1070,33 @@ RUSTFS_CIRCUIT_BREAKER_TIMEOUT=30
 ### Symptom: Console Web UI Hangs
 
 **Diagnosis Steps:**
+
 1. Check peer connectivity:
+
 ```bash
 curl -v http://<peer_ip>:9000/minio/health/live
 ```
 
 2. Check gRPC connectivity:
+
 ```bash
 grpcurl -plaintext <peer_ip>:9001 grpc.health.v1.Health/Check
 ```
 
 3. Review connection pool metrics:
+
 ```bash
 curl http://localhost:9090/api/v1/query?query=rustfs_peer_connections_active
 ```
 
 4. Check logs for timeout messages:
+
 ```bash
 journalctl -u rustfs -f | grep -i "timeout\|unreachable"
 ```
 
 **Resolution:**
+
 - If peer is truly down: Wait for automatic detection (~10s)
 - If peer is network-partitioned: Fix network routing
 - If connection pool exhausted: Restart RustFS service (last resort)
@@ -1029,12 +1104,15 @@ journalctl -u rustfs -f | grep -i "timeout\|unreachable"
 ### Symptom: Upload Hangs at Partial Progress
 
 **Diagnosis Steps:**
+
 1. Identify which node is receiving stuck chunks:
+
 ```bash
 journalctl -u rustfs -f | grep -i "upload\|chunk"
 ```
 
 2. Check if target node is reachable:
+
 ```bash
 nc -zv <target_node_ip> 9000
 ```
@@ -1042,6 +1120,7 @@ nc -zv <target_node_ip> 9000
 3. Review RPC metrics for slow peers
 
 **Resolution:**
+
 - If node is down: Manual intervention to mark node offline
 - If network is slow: Increase timeouts temporarily
 - If upload is truly stuck: Cancel and retry
@@ -1053,34 +1132,43 @@ nc -zv <target_node_ip> 9000
 ### Short-Term (1-3 Months)
 
 #### 1. Adaptive Timeout Mechanism
+
 Dynamically adjust timeouts based on measured peer latency
 
 #### 2. Health Score Per Peer
+
 Replace binary healthy/unhealthy with gradient scoring
 
 #### 3. Predictive Failure Detection
+
 Use trends to predict impending failures
 
 ### Mid-Term (3-6 Months)
 
 #### 1. Intelligent Request Routing
+
 Route requests based on peer health scores
 
 #### 2. Multi-Datacenter Support
+
 Enhanced resilience across datacenters
 
 #### 3. Automated Remediation
+
 Self-healing cluster capabilities
 
 ### Long-Term (6+ Months)
 
 #### 1. Chaos Engineering Integration
+
 Built-in chaos testing framework
 
 #### 2. Time-Series Anomaly Detection
+
 Continuous analysis of metrics
 
 #### 3. Zero-Downtime Rolling Updates
+
 Coordinate updates to ensure quorum
 
 ---
@@ -1090,6 +1178,7 @@ Coordinate updates to ensure quorum
 ### Appendix A: TCP State Machine and Keepalive
 
 **TCP Connection States**
+
 ```
 ESTABLISHED → (peer power-off, no packets sent)
    ↓ (keepalive timer expires)
@@ -1101,17 +1190,20 @@ CLOSED → (connection declared dead)
 ```
 
 **Key Parameters:**
+
 - `tcp_keepalive_time`: Wait before first probe (we set 10s)
 - `tcp_keepalive_intvl`: Wait between probes (we set 5s)
 - `tcp_keepalive_probes`: Number of probes (we set 3)
 
 **Total Detection Time:**
+
 ```
 tcp_keepalive_time + (tcp_keepalive_probes * tcp_keepalive_intvl)
 = 10s + (3 * 5s) = 25s
 ```
 
 **HTTP/2 PING is faster:**
+
 ```
 http2_keep_alive_interval + http2_keep_alive_timeout
 = 5s + 3s = 8s
@@ -1119,12 +1211,12 @@ http2_keep_alive_interval + http2_keep_alive_timeout
 
 ### Appendix B: Failure Detection Comparison
 
-| Mechanism | Detection Time | Overhead | Reliability |
-|-----------|----------------|----------|-------------|
-| TCP FIN/RST | Immediate | None | 100% (graceful) |
-| TCP Keepalive | 10-30s | Low | High |
-| HTTP/2 PING | 5-10s | Medium | Very High |
-| Application Heartbeat | 1-5s | High | Medium |
+| Mechanism             | Detection Time | Overhead | Reliability     |
+|-----------------------|----------------|----------|-----------------|
+| TCP FIN/RST           | Immediate      | None     | 100% (graceful) |
+| TCP Keepalive         | 10-30s         | Low      | High            |
+| HTTP/2 PING           | 5-10s          | Medium   | Very High       |
+| Application Heartbeat | 1-5s           | High     | Medium          |
 
 **Recommendation:** Use HTTP/2 PING for fast detection (8s), TCP keepalive as backup (25s).
 
@@ -1132,7 +1224,8 @@ http2_keep_alive_interval + http2_keep_alive_timeout
 
 ## Conclusion
 
-The cluster power-off resilience issue is a multi-faceted problem requiring defense-in-depth solutions across multiple architectural layers:
+The cluster power-off resilience issue is a multi-faceted problem requiring defense-in-depth solutions across multiple
+architectural layers:
 
 1. **Connection Management**: Aggressive keepalive and rapid eviction of dead connections
 2. **Operation Timeouts**: Bounded execution time for all operations
@@ -1142,16 +1235,19 @@ The cluster power-off resilience issue is a multi-faceted problem requiring defe
 **Current Status Assessment:**
 
 ✅ **Already Implemented:**
+
 - HTTP/2 keepalive in gRPC channels
 - TCP keepalive configuration
 - Per-peer timeouts in console aggregation
 - Fire-and-forget IAM notifications
 
 ⚠️ **Partially Implemented:**
+
 - Connection eviction (exists but may need enhancement)
 - Timeout handling (exists but not comprehensive)
 
 ❌ **Not Yet Implemented:**
+
 - Data plane (upload/download) keepalive configuration
 - Circuit breaker pattern
 - Adaptive timeouts
@@ -1161,29 +1257,33 @@ The cluster power-off resilience issue is a multi-faceted problem requiring defe
 **Priority Action Items:**
 
 **P0 (Critical - Immediate):**
+
 1. Verify and enhance HTTP client keepalive for data plane operations
 2. Add comprehensive timeout wrappers around all peer communication
 3. Implement and test circuit breaker pattern
 
 **P1 (High - Within 2 Weeks):**
+
 1. Add detailed metrics and dashboards
 2. Implement automated resilience testing
 3. Create operational runbooks
 
 **P2 (Medium - Within 1 Month):**
+
 1. Adaptive timeout mechanism
 2. Health scoring system
 3. Enhanced observability
 
-With systematic implementation of these solutions, the RustFS cluster will achieve production-grade resilience against abrupt node failures.
+With systematic implementation of these solutions, the RustFS cluster will achieve production-grade resilience against
+abrupt node failures.
 
 ---
 
 ## Document Revision History
 
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 1.0 | 2024-12-08 | GitHub Copilot (Architecture Analysis) | Initial comprehensive solution document |
+| Version | Date       | Author                                 | Changes                                 |
+|---------|------------|----------------------------------------|-----------------------------------------|
+| 1.0     | 2025-12-08 | GitHub Copilot (Architecture Analysis) | Initial comprehensive solution document |
 
 ---
 
