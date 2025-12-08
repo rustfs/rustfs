@@ -2202,6 +2202,13 @@ impl S3 for FS {
         let mut checksum_sha256 = None;
         let mut checksum_crc64nvme = None;
         let mut checksum_type = None;
+        // Prefer explicit storage_class from object info; fall back to persisted metadata header.
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
+            .filter(|s| !s.is_empty())
+            .map(ObjectStorageClass::from);
 
         // checksum
         if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
@@ -2463,6 +2470,7 @@ impl S3 for FS {
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
+            storage_class,
             // metadata: object_metadata,
             ..Default::default()
         };

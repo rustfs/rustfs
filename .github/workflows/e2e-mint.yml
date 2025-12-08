@@ -33,7 +33,7 @@ jobs:
 
       - name: Build RustFS image
         run: |
-          DOCKER_BUILDKIT=1 docker build -t rustfs-ci -f Dockerfile .
+          DOCKER_BUILDKIT=1 docker build -t rustfs-ci -f Dockerfile.source .
 
       - name: Create network
         run: |
@@ -107,7 +107,7 @@ jobs:
 
       - name: Build RustFS image
         run: |
-          DOCKER_BUILDKIT=1 docker build -t rustfs-ci -f Dockerfile .
+          DOCKER_BUILDKIT=1 docker build -t rustfs-ci -f Dockerfile.source .
 
       - name: Prepare cluster compose
         run: |

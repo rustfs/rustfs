@@ -72,7 +72,6 @@ COPY Cargo.toml Cargo.lock ./
 # 2) workspace member manifests (adjust if workspace layout changes)
 COPY rustfs/Cargo.toml rustfs/Cargo.toml
 COPY crates/*/Cargo.toml crates/
-COPY cli/rustfs-gui/Cargo.toml cli/rustfs-gui/Cargo.toml
 
 # Pre-fetch dependencies for better caching
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
