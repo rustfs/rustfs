@@ -3884,13 +3884,13 @@ impl S3 for FS {
             match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
                 Ok(info) => {
                     if !info.delete_marker {
-                        if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                        if let Some(ref ifmatch) = if_match {
+                            if !info.etag_strong_cmp(&to_s3s_etag(ifmatch)) {
                                 return Err(s3_error!(PreconditionFailed));
                             }
                         }
-                        if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                        if let Some(ref ifnonematch) = if_none_match {
+                            if info.etag_strong_cmp(&to_s3s_etag(ifnonematch)) {
                                 return Err(s3_error!(PreconditionFailed));
                             }
                         }
