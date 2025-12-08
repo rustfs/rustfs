@@ -174,18 +174,14 @@ impl Operation for IsAdminHandler {
         let response = IsAdminResponse {
             is_admin,
             access_key: access_key_to_check,
-            message: if is_admin {
-                "User is an administrator".to_string()
-            } else {
-                "User is not an administrator".to_string()
-            },
+            message: format!("User is {} an administrator", if is_admin { "" } else { "not" }),
         };
 
         let data = serde_json::to_vec(&response)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse IsAdminResponse failed"))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
