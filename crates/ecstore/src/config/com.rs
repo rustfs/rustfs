@@ -46,6 +46,31 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
     file: &str,
     opts: &ObjectOptions,
 ) -> Result<(Vec<u8>, ObjectInfo)> {
+    // Add timeout to prevent hanging on dead nodes during config reads (especially IAM)
+    const CONFIG_READ_TIMEOUT_SECS: u64 = 10;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(CONFIG_READ_TIMEOUT_SECS),
+        read_config_with_metadata_inner(api, file, opts),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            error!(
+                "read_config_with_metadata timed out after {}s for file: {} (likely dead node or lock contention)",
+                CONFIG_READ_TIMEOUT_SECS, file
+            );
+            Err(Error::ConfigNotFound)
+        }
+    }
+}
+
+async fn read_config_with_metadata_inner<S: StorageAPI>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+) -> Result<(Vec<u8>, ObjectInfo)> {
     let h = HeaderMap::new();
     let mut rd = api
         .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)

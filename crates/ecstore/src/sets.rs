@@ -147,15 +147,31 @@ impl Sets {
                     disk = local_disk;
                 }
 
-                let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
-                    if err == DiskError::UnformattedDisk {
-                        error!("get_disk_id err {:?}", err);
-                    } else {
-                        warn!("get_disk_id err {:?}", err);
+                // Add timeout to prevent hanging on dead nodes during disk state checks
+                const DISK_STATE_CHECK_TIMEOUT_SECS: u64 = 3;
+                let has_disk_id = match tokio::time::timeout(
+                    std::time::Duration::from_secs(DISK_STATE_CHECK_TIMEOUT_SECS),
+                    disk.as_ref().unwrap().get_disk_id(),
+                )
+                .await
+                {
+                    Ok(Ok(id)) => id,
+                    Ok(Err(err)) => {
+                        if err == DiskError::UnformattedDisk {
+                            error!("get_disk_id err {:?}", err);
+                        } else {
+                            warn!("get_disk_id err {:?}", err);
+                        }
+                        None
                     }
-
-                    None
-                });
+                    Err(_) => {
+                        error!(
+                            "get_disk_id timed out after {}s for set_drive {}-{} (likely dead node)",
+                            DISK_STATE_CHECK_TIMEOUT_SECS, i, j
+                        );
+                        None
+                    }
+                };
 
                 if let Some(_disk_id) = has_disk_id {
                     set_drive.push(disk);
