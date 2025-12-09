@@ -202,3 +202,6 @@ jobs:
           category: "/language:${{ matrix.language }}"
           ram: 6000
           threads: 2
+      - uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
