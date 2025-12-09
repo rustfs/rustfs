@@ -199,11 +199,11 @@ impl Endpoint {
     }
 
     pub fn get_file_path(&self) -> String {
-        let path = self.url.path();
-        let decoded = urlencoding::decode(path).unwrap_or(std::borrow::Cow::Borrowed(path));
+        let path: &str = self.url.path();
+        let decoded: std::borrow::Cow<'_, str> = urlencoding::decode(path).unwrap_or(std::borrow::Cow::Borrowed(path));
         #[cfg(windows)]
         if self.url.scheme() == "file" {
-            let stripped = decoded.strip_prefix('/').unwrap_or(&decoded);
+            let stripped: &str = decoded.strip_prefix('/').unwrap_or(&decoded);
             debug!("get_file_path windows: path={}", stripped);
             return stripped.to_string();
         }
