@@ -108,7 +108,7 @@ hyper-rustls = { version = "0.27.7", default-features = false, features = ["nati
 hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful"] }
 http = "1.4.0"
 http-body = "1.0.1"
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
+reqwest = { version = "0.12.25", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
 socket2 = "0.6.1"
 tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
@@ -119,7 +119,7 @@ tonic = { version = "0.14.2", features = ["gzip"] }
 tonic-prost = { version = "0.14.2" }
 tonic-prost-build = { version = "0.14.2" }
 tower = { version = "0.5.2", features = ["timeout"] }
-tower-http = { version = "0.6.7", features = ["cors"] }
+tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.0", features = ["serde"] }
