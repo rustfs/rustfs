@@ -18,7 +18,7 @@ mod config;
 mod error;
 // mod grpc;
 mod init;
-pub mod license;
+mod license;
 mod profiling;
 mod server;
 mod storage;
