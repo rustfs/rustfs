@@ -2488,6 +2488,7 @@ impl S3 for FS {
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
+            content_encoding: info.content_encoding.clone(),
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
