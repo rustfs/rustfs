@@ -440,6 +440,7 @@ impl ScannerItem {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn needs_replication_heal(&self, oi: &ObjectInfo, pending_lagging: bool) -> bool {
         if matches!(oi.replication_status, ReplicationStatusType::Failed) {
             return true;
