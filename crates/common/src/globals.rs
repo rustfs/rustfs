@@ -28,7 +28,7 @@ pub static GLOBAL_Conn_Map: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLoc
 
 /// Global circuit breaker registry for peer health tracking.
 /// Prevents repeated attempts to communicate with dead/unhealthy peers.
-pub static GLOBAL_Circuit_Breakers: LazyLock<Arc<CircuitBreakerRegistry>> =
+pub static GLOBAL_CircuitBreakers: LazyLock<Arc<CircuitBreakerRegistry>> =
     LazyLock::new(|| Arc::new(CircuitBreakerRegistry::new()));
 
 pub async fn set_global_addr(addr: &str) {
@@ -63,17 +63,17 @@ pub async fn clear_all_connections() {
 /// Check if peer should be contacted based on circuit breaker state.
 /// Returns true if the peer is healthy or in half-open state (testing recovery).
 pub async fn should_attempt_peer(addr: &str) -> bool {
-    GLOBAL_Circuit_Breakers.should_attempt(addr).await
+    GLOBAL_CircuitBreakers.should_attempt(addr).await
 }
 
 /// Record successful peer communication.
 /// Resets failure count and closes circuit breaker if it was open.
 pub async fn record_peer_success(addr: &str) {
-    GLOBAL_Circuit_Breakers.record_success(addr).await;
+    GLOBAL_CircuitBreakers.record_success(addr).await;
 }
 
 /// Record failed peer communication.
 /// Increments failure count and may open circuit breaker after threshold.
 pub async fn record_peer_failure(addr: &str) {
-    GLOBAL_Circuit_Breakers.record_failure(addr).await;
+    GLOBAL_CircuitBreakers.record_failure(addr).await;
 }
