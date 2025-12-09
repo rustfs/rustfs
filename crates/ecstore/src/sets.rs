@@ -172,8 +172,7 @@ impl Sets {
                         None
                     }
                     Err(_) => {
-                        metrics::counter!("rustfs_disk_state_check_timeouts_total", "set" => format!("{}-{}", i, j))
-                            .increment(1);
+                        metrics::counter!("rustfs_disk_state_check_timeouts_total", "set" => format!("{}-{}", i, j)).increment(1);
                         error!(
                             "get_disk_id timed out after {}s for set_drive {}-{} (likely dead node)",
                             DISK_STATE_CHECK_TIMEOUT_SECS, i, j

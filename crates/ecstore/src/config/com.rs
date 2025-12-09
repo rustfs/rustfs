@@ -72,26 +72,20 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
                 if is_lock_timeout_error(&err) && attempts < MAX_LOCK_RETRIES {
                     attempts += 1;
                     let delay_ms = LOCK_RETRY_BASE_DELAY_MS * 2_u64.pow(attempts as u32);
-                    metrics::counter!("rustfs_config_lock_retries_total", "operation" => operation_type)
-                        .increment(1);
-                    warn!(
-                        "Lock timeout on {}, retry {}/{} after {}ms",
-                        file, attempts, MAX_LOCK_RETRIES, delay_ms
-                    );
+                    metrics::counter!("rustfs_config_lock_retries_total", "operation" => operation_type).increment(1);
+                    warn!("Lock timeout on {}, retry {}/{} after {}ms", file, attempts, MAX_LOCK_RETRIES, delay_ms);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
                 let duration = start.elapsed().as_secs_f64();
                 metrics::histogram!("rustfs_config_read_duration_seconds", "operation" => operation_type).record(duration);
                 if is_lock_timeout_error(&err) {
-                    metrics::counter!("rustfs_config_lock_timeouts_total", "operation" => operation_type)
-                        .increment(1);
+                    metrics::counter!("rustfs_config_lock_timeouts_total", "operation" => operation_type).increment(1);
                 }
                 return Err(err);
             }
             Err(_) => {
-                metrics::counter!("rustfs_config_read_timeouts_total", "operation" => operation_type)
-                    .increment(1);
+                metrics::counter!("rustfs_config_read_timeouts_total", "operation" => operation_type).increment(1);
                 error!(
                     "read_config_with_metadata timed out after {}s for file: {} (likely dead node or lock contention)",
                     CONFIG_READ_TIMEOUT_SECS, file
