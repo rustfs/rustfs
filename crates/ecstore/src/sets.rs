@@ -15,6 +15,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::cascading_failure_detector::{FailureType, GLOBAL_CASCADING_DETECTOR};
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
@@ -177,6 +178,10 @@ impl Sets {
                             "get_disk_id timed out after {}s for set_drive {}-{} (likely dead node)",
                             DISK_STATE_CHECK_TIMEOUT_SECS, i, j
                         );
+                        // P3: Record cascading failure event
+                        GLOBAL_CASCADING_DETECTOR
+                            .record_failure(FailureType::DiskStateCheckTimeout, format!("set-{}-{}", i, j))
+                            .await;
                         None
                     }
                 };

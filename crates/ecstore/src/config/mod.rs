@@ -16,6 +16,7 @@ mod audit;
 pub mod com;
 #[allow(dead_code)]
 pub mod heal;
+pub mod lock_health;
 mod notify;
 pub mod storageclass;
 

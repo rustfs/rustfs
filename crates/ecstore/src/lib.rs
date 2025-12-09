@@ -20,6 +20,7 @@ pub mod batch_processor;
 pub mod bitrot;
 pub mod bucket;
 pub mod cache_value;
+pub mod cascading_failure_detector;
 mod chunk_stream;
 pub mod compress;
 pub mod config;

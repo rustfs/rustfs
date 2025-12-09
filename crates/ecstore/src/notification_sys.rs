@@ -217,6 +217,11 @@ impl NotificationSys {
                         Ok(Err(err)) => {
                             warn!("peer {} storage_info failed: {}", host, err);
                             rustfs_common::globals::record_peer_failure(&host).await;
+                            // P3: Record cascading failure event
+                            use crate::cascading_failure_detector::{FailureType, GLOBAL_CASCADING_DETECTOR};
+                            GLOBAL_CASCADING_DETECTOR
+                                .record_failure(FailureType::PeerUnreachable, host.clone())
+                                .await;
                             Some(rustfs_madmin::StorageInfo {
                                 disks: get_offline_disks(&host, &endpoints),
                                 ..Default::default()
@@ -226,6 +231,11 @@ impl NotificationSys {
                             warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
                             rustfs_common::globals::record_peer_failure(&host).await;
                             client.evict_connection().await;
+                            // P3: Record cascading failure event
+                            use crate::cascading_failure_detector::{FailureType, GLOBAL_CASCADING_DETECTOR};
+                            GLOBAL_CASCADING_DETECTOR
+                                .record_failure(FailureType::PeerUnreachable, host.clone())
+                                .await;
                             Some(rustfs_madmin::StorageInfo {
                                 disks: get_offline_disks(&host, &endpoints),
                                 ..Default::default()
