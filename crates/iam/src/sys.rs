@@ -240,14 +240,19 @@ impl<T: Store> IamSys<T> {
             return;
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_user(name, is_temp).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify load_user failed: {}", err);
+        // Fire-and-forget notification to peers - don't block auth operations
+        // This is critical for cluster recovery: login should not wait for dead peers
+        let name = name.to_string();
+        tokio::spawn(async move {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_user(&name, is_temp).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_user failed (non-blocking): {}", err);
+                    }
                 }
             }
-        }
+        });
     }
 
     async fn notify_for_service_account(&self, name: &str) {
@@ -255,14 +260,18 @@ impl<T: Store> IamSys<T> {
             return;
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_service_account(name).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify load_service_account failed: {}", err);
+        // Fire-and-forget notification to peers - don't block service account operations
+        let name = name.to_string();
+        tokio::spawn(async move {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_service_account(&name).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_service_account failed (non-blocking): {}", err);
+                    }
                 }
             }
-        }
+        });
     }
 
     pub async fn current_policies(&self, name: &str) -> String {
@@ -571,14 +580,18 @@ impl<T: Store> IamSys<T> {
             return;
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_group(group).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify load_group failed: {}", err);
+        // Fire-and-forget notification to peers - don't block group operations
+        let group = group.to_string();
+        tokio::spawn(async move {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_group(&group).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_group failed (non-blocking): {}", err);
+                    }
                 }
             }
-        }
+        });
     }
 
     pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {

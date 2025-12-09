@@ -39,3 +39,4 @@ prost = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
+tracing = { workspace = true }
