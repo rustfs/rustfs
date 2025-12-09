@@ -99,11 +99,21 @@ impl PeerCircuitBreaker {
     /// Record a successful operation
     pub async fn record_success(&self) {
         let prev_state = CircuitState::from(self.state.load(Ordering::Relaxed));
-        self.failure_count.store(0, Ordering::Relaxed);
-        self.state.store(CircuitState::Closed as u8, Ordering::Relaxed);
-
+        // Only reset if we're actually transitioning from a non-Closed state
         if prev_state != CircuitState::Closed {
-            debug!("Circuit breaker for {} closed (peer recovered)", self.peer);
+            // Use compare_exchange to ensure atomic state transition
+            if self.state.compare_exchange(
+                prev_state as u8,
+                CircuitState::Closed as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed
+            ).is_ok() {
+                self.failure_count.store(0, Ordering::Relaxed);
+                debug!("Circuit breaker for {} closed (peer recovered)", self.peer);
+            }
+        } else {
+            // Already closed, just reset counter
+            self.failure_count.store(0, Ordering::Relaxed);
         }
     }
 
