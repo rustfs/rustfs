@@ -90,7 +90,6 @@ pub mod trace;
 pub mod user;
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct IsAdminResponse {
     pub is_admin: bool,
     pub access_key: String,
@@ -174,7 +173,7 @@ impl Operation for IsAdminHandler {
         let response = IsAdminResponse {
             is_admin,
             access_key: access_key_to_check,
-            message: format!("User is {} an administrator", if is_admin { "" } else { "not" }),
+            message: format!("User is {}an administrator", if is_admin { "" } else { "not " }),
         };
 
         let data = serde_json::to_vec(&response)
