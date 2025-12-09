@@ -25,7 +25,7 @@ use rustfs_ecstore::bucket::{
         lifecycle,
         lifecycle::Lifecycle,
     },
-    metadata_sys::{get_bucket_targets_config, get_object_lock_config, get_replication_config},
+    metadata_sys::get_object_lock_config,
     object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion},
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
@@ -58,6 +58,7 @@ static SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE: AtomicU64 = AtomicU64::new(102
 pub struct ScannerItem {
     pub bucket: String,
     pub object_name: String,
+    pub replication: Option<ReplicationConfig>,
     pub lifecycle: Option<Arc<LifecycleConfig>>,
     pub versioning: Option<Arc<VersioningConfiguration>>,
     pub object_lock_config: Option<DefaultRetention>,
@@ -129,6 +130,7 @@ impl ScannerItem {
 
     pub fn new(
         bucket: String,
+        replication: Option<ReplicationConfig>,
         lifecycle: Option<Arc<LifecycleConfig>>,
         versioning: Option<Arc<VersioningConfiguration>>,
         object_lock_config: Option<DefaultRetention>,
@@ -138,6 +140,7 @@ impl ScannerItem {
         Self {
             bucket,
             object_name: "".to_string(),
+            replication,
             lifecycle,
             versioning,
             object_lock_config,
@@ -377,32 +380,36 @@ impl ScannerItem {
             enriched.bucket, enriched.name, enriched.replication_status, enriched.replication_status_internal
         );
 
-        if !self.needs_replication_heal(&enriched, pending_lagging) {
-            return Ok(());
-        }
+        // if !self.needs_replication_heal(&enriched, pending_lagging) {
+        //     return Ok(());
+        // }
 
-        let replication_cfg = match get_replication_config(&self.bucket).await {
-            Ok((cfg, _)) => Some(cfg),
-            Err(err) => {
-                debug!("heal_replication: failed to fetch replication config for bucket {}: {}", self.bucket, err);
-                None
-            }
-        };
+        // let replication_cfg = match get_replication_config(&self.bucket).await {
+        //     Ok((cfg, _)) => Some(cfg),
+        //     Err(err) => {
+        //         debug!("heal_replication: failed to fetch replication config for bucket {}: {}", self.bucket, err);
+        //         None
+        //     }
+        // };
 
-        if replication_cfg.is_none() {
-            return Ok(());
-        }
+        // if replication_cfg.is_none() {
+        //     return Ok(());
+        // }
 
-        let bucket_targets = match get_bucket_targets_config(&self.bucket).await {
-            Ok(targets) => Some(targets),
-            Err(err) => {
-                debug!("heal_replication: no bucket targets for bucket {}: {}", self.bucket, err);
-                None
-            }
-        };
+        // let bucket_targets = match get_bucket_targets_config(&self.bucket).await {
+        //     Ok(targets) => Some(targets),
+        //     Err(err) => {
+        //         debug!("heal_replication: no bucket targets for bucket {}: {}", self.bucket, err);
+        //         None
+        //     }
+        // };
 
-        let replication_cfg = ReplicationConfig::new(replication_cfg, bucket_targets);
-        if replication_cfg.is_empty() {
+        // let replication_cfg = ReplicationConfig::new(replication_cfg, bucket_targets);
+
+        let replication_cfg = self.replication.clone().unwrap_or_default();
+
+        if replication_cfg.config.is_none() && replication_cfg.remotes.is_none() {
+            debug!("heal_replication: no replication config for {}/{}", enriched.bucket, enriched.name);
             return Ok(());
         }
 

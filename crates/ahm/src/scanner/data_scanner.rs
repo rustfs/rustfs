@@ -27,8 +27,14 @@ use rustfs_common::data_usage::{BucketUsageInfo, DataUsageInfo, SizeSummary};
 use rustfs_common::metrics::{Metric, Metrics, global_metrics};
 use rustfs_ecstore::{
     self as ecstore, StorageAPI,
-    bucket::versioning_sys::BucketVersioningSys,
-    bucket::{object_lock::objectlock_sys::BucketObjectLockSys, versioning::VersioningApi},
+    bucket::{
+        bucket_target_sys::BucketTargetSys,
+        metadata_sys::get_replication_config,
+        object_lock::objectlock_sys::BucketObjectLockSys,
+        replication::{ReplicationConfig, ReplicationConfigurationExt},
+        versioning::VersioningApi,
+        versioning_sys::BucketVersioningSys,
+    },
     data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
     disk::{Disk, DiskAPI, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions},
     set_disk::SetDisks,
@@ -389,7 +395,10 @@ impl Scanner {
         enable_deep_scan: bool,
         run_lifecycle: bool,
     ) -> Result<u64> {
-        debug!("Listing buckets for lifecycle/replication evaluation");
+        debug!(
+            "Listing buckets for lifecycle/replication evaluation, enable_healing: {}, enable_deep_scan: {}, run_lifecycle: {}",
+            enable_healing, enable_deep_scan, run_lifecycle
+        );
         let buckets = ecstore
             .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
             .await
@@ -400,6 +409,8 @@ impl Scanner {
             let cfg = self.config.read().await;
             cfg.replication_pending_grace
         };
+
+        let bucket_target_sys = BucketTargetSys::get();
 
         for bucket_info in buckets {
             let bucket_name = &bucket_info.name;
@@ -467,8 +478,25 @@ impl Scanner {
                 let object_lock_config = BucketObjectLockSys::get(bucket_name).await;
                 let replication_metrics =
                     Some(ReplicationMetricsHandle::new(Arc::clone(&self.metrics), Arc::clone(&self.bucket_metrics)));
+
+                let replication_config = {
+                    if let Ok((cfg, _)) = get_replication_config(bucket_name).await {
+                        if cfg.has_active_rules("", true) {
+                            Some(ReplicationConfig::new(
+                                Some(cfg),
+                                bucket_target_sys.list_bucket_targets(bucket_name).await.ok(),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 let mut scanner_item = ScannerItem::new(
                     bucket_name.to_string(),
+                    replication_config,
                     lifecycle_config.clone(),
                     Some(versioning_config.clone()),
                     object_lock_config,
@@ -477,7 +505,7 @@ impl Scanner {
                 );
 
                 if let Err(e) = self
-                    .process_bucket_objects_for_lifecycle(ecstore, bucket_name, &mut scanner_item, records)
+                    .process_bucket_objects_for_lifecycle(bucket_name, &mut scanner_item, records)
                     .await
                 {
                     warn!("Failed to process lifecycle/replication actions for bucket {}: {}", bucket_name, e);
@@ -750,7 +778,6 @@ impl Scanner {
     /// Process bucket objects for lifecycle actions
     async fn process_bucket_objects_for_lifecycle(
         &self,
-        ecstore: &Arc<rustfs_ecstore::store::ECStore>,
         bucket_name: &str,
         scanner_item: &mut ScannerItem,
         records: &[LocalObjectRecord],
@@ -763,14 +790,7 @@ impl Scanner {
                 continue;
             }
 
-            let mut object_info = Self::convert_record_to_object_info(record);
-            if object_info.replication_status.is_empty() && object_info.replication_status_internal.is_none() {
-                let object_name = object_info.name.clone();
-                let object_opts = rustfs_ecstore::store_api::ObjectOptions::default();
-                if let Ok(fresh_info) = ecstore.get_object_info(bucket_name, &object_name, &object_opts).await {
-                    object_info = fresh_info;
-                }
-            }
+            let object_info = Self::convert_record_to_object_info(record);
             let mut size_summary = SizeSummary::default();
             let (deleted, _size) = scanner_item.apply_actions(&object_info, &mut size_summary).await;
             if deleted {
@@ -2405,8 +2425,21 @@ impl Scanner {
                                     let cfg = self.config.read().await;
                                     cfg.replication_pending_grace
                                 };
+
+                                let replication_config = {
+                                    if let Ok((cfg, _)) = get_replication_config(bucket).await {
+                                        Some(ReplicationConfig::new(
+                                            Some(cfg),
+                                            BucketTargetSys::get().list_bucket_targets(bucket).await.ok(),
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                };
+
                                 let mut scanner_item = ScannerItem::new(
                                     bucket.to_string(),
+                                    replication_config,
                                     Some(lifecycle_config.clone()),
                                     versioning_config.clone(),
                                     object_lock_config,
@@ -2762,12 +2795,13 @@ impl Scanner {
                 _ = interval.tick() => {
                     // Check if scanner should still be running
                     if !self.state.read().await.is_running {
+                        warn!("Scanner is not running, exiting scanner loop");
                         break;
                     }
 
                     // check cancel signal
                     if cancel_token.is_cancelled() {
-                        info!("Cancellation requested, exiting scanner loop");
+                        warn!("Cancellation requested, exiting scanner loop");
                         break;
                     }
 
@@ -2787,13 +2821,13 @@ impl Scanner {
                     }
                 }
                 _ = cancel_token.cancelled() => {
-                    info!("Received cancellation, stopping scanner loop");
+                    warn!("Received cancellation, exiting scanner loop");
                     break;
                 }
             }
         }
 
-        info!("Scanner loop stopped");
+        warn!("Scanner loop stopped");
         Ok(())
     }
 
