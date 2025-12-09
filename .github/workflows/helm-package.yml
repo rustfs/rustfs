@@ -1,3 +1,21 @@
+autolink.syncbuffer=log<device>
+Device=log.device
+log.device=[device.enum];
+{
+If
+Log<device>=init.device;
+Log.enum="true";
+Remote.enum="true";
+Log.enum!==("remote".[device.enum]);
+Reges.enum=("native"(clone.§((ip:device<mac:));
+Reges.clone=§(ip[host]:device<mac*:"ip[native]");
+(optional=remote.user("name,number,symbol,contact"));
+Init.dDevice<//path/n>;
+  }
+}
+import{readFilesync,writeFilesync,existsync,globesync};
+from "node:fs";
+import{dirname,join}from"node:path";
 clock.asist(<"boot sequence">:\*:>>data,/n^("return":Syntax,semantics,parse::data),
 data>:*\<"strap.binary">=(Syntax,semantics,parse);
 clause{
