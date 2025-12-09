@@ -26,9 +26,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{init_logging, RustFSTestEnvironment, TEST_BUCKET};
-    use aws_sdk_s3::primitives::ByteStream;
+    use crate::common::{RustFSTestEnvironment, TEST_BUCKET, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -48,9 +48,7 @@ mod tests {
             }
             Err(e) => {
                 // Ignore if bucket already exists
-                if e.to_string().contains("BucketAlreadyOwnedByYou")
-                    || e.to_string().contains("BucketAlreadyExists")
-                {
+                if e.to_string().contains("BucketAlreadyOwnedByYou") || e.to_string().contains("BucketAlreadyExists") {
                     info!("Bucket {} already exists", bucket);
                     Ok(())
                 } else {
@@ -194,7 +192,12 @@ mod tests {
 
         // LIST objects with prefix containing plus
         info!("Testing LIST objects with prefix: dashboards/ES+net/");
-        let result = client.list_objects_v2().bucket(bucket).prefix("dashboards/ES+net/").send().await;
+        let result = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("dashboards/ES+net/")
+            .send()
+            .await;
 
         assert!(result.is_ok(), "Failed to LIST objects with plus in prefix: {:?}", result.err());
 
@@ -358,7 +361,13 @@ mod tests {
         // Step 2: Navigate to folder (like navigating to "%20f+/" in UI)
         // This is equivalent to listing with prefix "a f+/"
         info!("Listing folder 'a f+/' (this should show subdirectories)");
-        let result = client.list_objects_v2().bucket(bucket).prefix("a f+/").delimiter("/").send().await;
+        let result = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("a f+/")
+            .delimiter("/")
+            .send()
+            .await;
         assert!(result.is_ok(), "Failed to list folder: {:?}", result.err());
 
         let output = result.unwrap();
@@ -380,10 +389,7 @@ mod tests {
         let output = result.unwrap();
         let contents = output.contents();
         assert!(!contents.is_empty(), "Deep folder should show the file");
-        assert!(
-            contents.iter().any(|obj| obj.key().unwrap() == key),
-            "README.md should be in the list"
-        );
+        assert!(contents.iter().any(|obj| obj.key().unwrap() == key), "README.md should be in the list");
         info!("✅ Deep folder listing succeeded - file found");
 
         // Cleanup

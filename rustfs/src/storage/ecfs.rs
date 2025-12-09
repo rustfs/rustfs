@@ -1696,10 +1696,10 @@ impl S3 for FS {
         if key.contains(['\0', '\n', '\r']) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidArgument,
-                format!("Object key contains invalid control characters: {:?}", key)
+                format!("Object key contains invalid control characters: {:?}", key),
             ));
         }
-        
+
         // Log debug info for keys with special characters
         if key.contains([' ', '+', '%']) {
             debug!("GET object with special characters in key: {:?}", key);
@@ -2588,12 +2588,12 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        
+
         // Log debug info for prefixes with special characters to help diagnose encoding issues
         if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
             debug!("LIST objects with special characters in prefix: {:?}", prefix);
         }
-        
+
         let max_keys = max_keys.unwrap_or(1000);
         if max_keys < 0 {
             return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
@@ -2821,10 +2821,10 @@ impl S3 for FS {
         if key.contains(['\0', '\n', '\r']) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidArgument,
-                format!("Object key contains invalid control characters: {:?}", key)
+                format!("Object key contains invalid control characters: {:?}", key),
             ));
         }
-        
+
         // Log debug info for keys with special characters to help diagnose encoding issues
         if key.contains([' ', '+', '%']) {
             debug!("PUT object with special characters in key: {:?}", key);
