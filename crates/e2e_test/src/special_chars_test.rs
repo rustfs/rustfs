@@ -73,9 +73,9 @@ mod tests {
         info!("Starting test: object with space in path");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.await.expect("Failed to start RustFS");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
-        let client = create_s3_client(&env).await;
+        let client = create_s3_client(&env);
         let bucket = "test-special-chars";
 
         // Create bucket
@@ -155,9 +155,9 @@ mod tests {
         info!("Starting test: object with plus sign in path");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.await.expect("Failed to start RustFS");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
-        let client = create_s3_client(&env).await;
+        let client = create_s3_client(&env);
         let bucket = "test-plus-chars";
 
         // Create bucket
@@ -220,9 +220,9 @@ mod tests {
         info!("Starting test: object with mixed special characters");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.await.expect("Failed to start RustFS");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
-        let client = create_s3_client(&env).await;
+        let client = create_s3_client(&env);
         let bucket = "test-mixed-chars";
 
         // Create bucket
@@ -281,9 +281,9 @@ mod tests {
         info!("Starting test: DELETE object with special characters");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.await.expect("Failed to start RustFS");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
-        let client = create_s3_client(&env).await;
+        let client = create_s3_client(&env);
         let bucket = "test-delete-special";
 
         // Create bucket
@@ -329,9 +329,9 @@ mod tests {
         info!("Starting test: Exact scenario from GitHub issue");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.await.expect("Failed to start RustFS");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
-        let client = create_s3_client(&env).await;
+        let client = create_s3_client(&env);
         let bucket = "dummy";
 
         // Create bucket
