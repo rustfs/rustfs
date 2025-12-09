@@ -512,6 +512,36 @@ mod test {
     }
 
     #[test]
+    fn test_endpoint_percent_encoding_roundtrip() {
+        let path_with_spaces = "/Users/test/Library/Application Support/rustfs/data";
+        let endpoint = Endpoint::try_from(path_with_spaces).unwrap();
+
+        // Verify that the URL internally stores percent-encoded path
+        assert!(
+            endpoint.url.path().contains("%20"),
+            "URL path should contain percent-encoded spaces: {}",
+            endpoint.url.path()
+        );
+
+        // Verify that get_file_path() decodes the percent-encoded path correctly
+        assert_eq!(
+            endpoint.get_file_path(),
+            "/Users/test/Library/Application Support/rustfs/data",
+            "get_file_path() should decode percent-encoded spaces"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_with_various_special_characters() {
+        // Test path with multiple special characters that get percent-encoded
+        let path_with_special = "/tmp/test path/data[1]/file#2";
+        let endpoint = Endpoint::try_from(path_with_special).unwrap();
+
+        // get_file_path() should return the original path with decoded characters
+        assert_eq!(endpoint.get_file_path(), path_with_special);
+    }
+
+    #[test]
     fn test_endpoint_update_is_local() {
         let mut endpoint = Endpoint::try_from("http://localhost:9000/path").unwrap();
         let result = endpoint.update_is_local(9000);
