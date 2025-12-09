@@ -114,10 +114,12 @@ impl PeerCircuitBreaker {
 
         if failures >= self.failure_threshold {
             // Use compare_exchange to avoid race conditions in state transitions
-            match self
-                .state
-                .compare_exchange(CircuitState::Closed as u8, CircuitState::Open as u8, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.state.compare_exchange(
+                CircuitState::Closed as u8,
+                CircuitState::Open as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     warn!("Circuit breaker for {} opened after {} failures", self.peer, failures);
                 }
