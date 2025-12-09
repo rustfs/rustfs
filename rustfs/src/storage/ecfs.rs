@@ -452,6 +452,31 @@ fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }
 
+/// Validate object key for control characters and log special characters
+///
+/// This function:
+/// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
+/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+///
+/// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
+/// This validation ensures that invalid characters that could cause issues are rejected early.
+fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
+    // Validate object key doesn't contain control characters
+    if key.contains(['\0', '\n', '\r']) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("Object key contains invalid control characters: {:?}", key),
+        ));
+    }
+
+    // Log debug info for keys with special characters to help diagnose encoding issues
+    if key.contains([' ', '+', '%']) {
+        debug!("{} object with special characters in key: {:?}", operation, key);
+    }
+
+    Ok(())
+}
+
 impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
@@ -778,6 +803,10 @@ impl S3 for FS {
                 version_id,
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
+
+        // Validate both source and destination keys
+        validate_object_key(&src_key, "COPY (source)")?;
+        validate_object_key(&key, "COPY (dest)")?;
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
@@ -1229,6 +1258,9 @@ impl S3 for FS {
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "DELETE")?;
 
         let replica = req
             .headers
@@ -1691,6 +1723,9 @@ impl S3 for FS {
             range,
             ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "GET")?;
 
         // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
@@ -2314,6 +2349,9 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        // Validate object key
+        validate_object_key(&key, "HEAD")?;
+
         let part_number = part_number.map(|v| v as usize);
 
         if let Some(part_num) = part_number {
@@ -2575,6 +2613,12 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
+
+        // Log debug info for prefixes with special characters to help diagnose encoding issues
+        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
+            debug!("LIST objects with special characters in prefix: {:?}", prefix);
+        }
+
         let max_keys = max_keys.unwrap_or(1000);
         if max_keys < 0 {
             return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
@@ -2797,6 +2841,9 @@ impl S3 for FS {
             if_none_match,
             ..
         } = input;
+
+        // Validate object key
+        validate_object_key(&key, "PUT")?;
 
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
