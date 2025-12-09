@@ -20,26 +20,26 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
-pub static GLOBAL_Local_Node_Name: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
-pub static GLOBAL_Rustfs_Host: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
-pub static GLOBAL_Rustfs_Port: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("9000".to_string()));
-pub static GLOBAL_Rustfs_Addr: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
-pub static GLOBAL_Conn_Map: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+pub static GLOBAL_LOCAL_NODE_NAME: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
+pub static GLOBAL_RUSTFS_HOST: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
+pub static GLOBAL_RUSTFS_PORT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("9000".to_string()));
+pub static GLOBAL_RUSTFS_ADDR: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
+pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Global circuit breaker registry for peer health tracking.
 /// Prevents repeated attempts to communicate with dead/unhealthy peers.
-pub static GLOBAL_CircuitBreakers: LazyLock<Arc<CircuitBreakerRegistry>> =
+pub static GLOBAL_CIRCUIT_BREAKERS: LazyLock<Arc<CircuitBreakerRegistry>> =
     LazyLock::new(|| Arc::new(CircuitBreakerRegistry::new()));
 
 pub async fn set_global_addr(addr: &str) {
-    *GLOBAL_Rustfs_Addr.write().await = addr.to_string();
+    *GLOBAL_RUSTFS_ADDR.write().await = addr.to_string();
 }
 
 /// Evict a stale/dead connection from the global connection cache.
 /// This is critical for cluster recovery when a node dies unexpectedly (e.g., power-off).
 /// By removing the cached connection, subsequent requests will establish a fresh connection.
 pub async fn evict_connection(addr: &str) {
-    let removed = GLOBAL_Conn_Map.write().await.remove(addr);
+    let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
         tracing::warn!("Evicted stale connection from cache: {}", addr);
     }
@@ -47,12 +47,12 @@ pub async fn evict_connection(addr: &str) {
 
 /// Check if a connection exists in the cache for the given address.
 pub async fn has_cached_connection(addr: &str) -> bool {
-    GLOBAL_Conn_Map.read().await.contains_key(addr)
+    GLOBAL_CONN_MAP.read().await.contains_key(addr)
 }
 
 /// Clear all cached connections. Useful for full cluster reset/recovery.
 pub async fn clear_all_connections() {
-    let mut map = GLOBAL_Conn_Map.write().await;
+    let mut map = GLOBAL_CONN_MAP.write().await;
     let count = map.len();
     map.clear();
     if count > 0 {
@@ -63,17 +63,17 @@ pub async fn clear_all_connections() {
 /// Check if peer should be contacted based on circuit breaker state.
 /// Returns true if the peer is healthy or in half-open state (testing recovery).
 pub async fn should_attempt_peer(addr: &str) -> bool {
-    GLOBAL_CircuitBreakers.should_attempt(addr).await
+    GLOBAL_CIRCUIT_BREAKERS.should_attempt(addr).await
 }
 
 /// Record successful peer communication.
 /// Resets failure count and closes circuit breaker if it was open.
 pub async fn record_peer_success(addr: &str) {
-    GLOBAL_CircuitBreakers.record_success(addr).await;
+    GLOBAL_CIRCUIT_BREAKERS.record_success(addr).await;
 }
 
 /// Record failed peer communication.
 /// Increments failure count and may open circuit breaker after threshold.
 pub async fn record_peer_failure(addr: &str) {
-    GLOBAL_CircuitBreakers.record_failure(addr).await;
+    GLOBAL_CIRCUIT_BREAKERS.record_failure(addr).await;
 }
