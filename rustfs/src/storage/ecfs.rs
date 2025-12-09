@@ -2272,6 +2272,7 @@ impl S3 for FS {
             content_length: Some(response_content_length),
             last_modified,
             content_type,
+            content_encoding: info.content_encoding.clone(),
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
