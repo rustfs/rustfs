@@ -26,12 +26,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, TEST_BUCKET, init_logging};
+    use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
-    use std::time::Duration;
-    use tokio::time::timeout;
     use tracing::{debug, info};
 
     /// Helper function to create an S3 client for testing
@@ -136,7 +134,7 @@ mod tests {
         info!("✅ LIST objects with deeper prefix succeeded");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -211,7 +209,7 @@ mod tests {
         info!("✅ LIST objects with plus in prefix succeeded");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -239,26 +237,26 @@ mod tests {
             ("ES+net/folder name/file.txt", b"Content 4"),
         ];
 
-        for (key, content) in test_cases {
+        for (key, content) in &test_cases {
             info!("Testing with key: {}", key);
 
             // PUT
             let result = client
                 .put_object()
                 .bucket(bucket)
-                .key(key)
+                .key(*key)
                 .body(ByteStream::from(content.to_vec()))
                 .send()
                 .await;
             assert!(result.is_ok(), "Failed to PUT object with key '{}': {:?}", key, result.err());
 
             // GET
-            let result = client.get_object().bucket(bucket).key(key).send().await;
+            let result = client.get_object().bucket(bucket).key(*key).send().await;
             assert!(result.is_ok(), "Failed to GET object with key '{}': {:?}", key, result.err());
 
             let output = result.unwrap();
             let body_bytes = output.body.collect().await.unwrap().into_bytes();
-            assert_eq!(body_bytes.as_ref(), content, "Content mismatch for key '{}'", key);
+            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for key '{}'", key);
 
             info!("✅ PUT/GET succeeded for key: {}", key);
         }
@@ -272,7 +270,7 @@ mod tests {
         assert_eq!(contents.len(), test_cases.len(), "Number of objects mismatch");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -320,7 +318,7 @@ mod tests {
         assert!(result.is_err(), "Object should not exist after DELETE");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -393,7 +391,7 @@ mod tests {
         info!("✅ Deep folder listing succeeded - file found");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("✅ Exact issue scenario test completed successfully");
     }
 
@@ -437,7 +435,7 @@ mod tests {
         info!("✅ HEAD object with special characters succeeded");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -496,7 +494,7 @@ mod tests {
         info!("✅ Copied object verified successfully");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -526,26 +524,26 @@ mod tests {
             ("mixed/测试 test/file.txt", b"Mixed languages"),
         ];
 
-        for (key, content) in test_cases {
+        for (key, content) in &test_cases {
             info!("Testing Unicode key: {}", key);
 
             // PUT
             let result = client
                 .put_object()
                 .bucket(bucket)
-                .key(key)
+                .key(*key)
                 .body(ByteStream::from(content.to_vec()))
                 .send()
                 .await;
             assert!(result.is_ok(), "Failed to PUT object with Unicode key '{}': {:?}", key, result.err());
 
             // GET
-            let result = client.get_object().bucket(bucket).key(key).send().await;
+            let result = client.get_object().bucket(bucket).key(*key).send().await;
             assert!(result.is_ok(), "Failed to GET object with Unicode key '{}': {:?}", key, result.err());
 
             let output = result.unwrap();
             let body_bytes = output.body.collect().await.unwrap().into_bytes();
-            assert_eq!(body_bytes.as_ref(), content, "Content mismatch for Unicode key '{}'", key);
+            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for Unicode key '{}'", key);
 
             info!("✅ PUT/GET succeeded for Unicode key: {}", key);
         }
@@ -560,7 +558,7 @@ mod tests {
         info!("✅ All Unicode objects listed successfully");
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -593,32 +591,32 @@ mod tests {
             ("'quotes'/\"double\"/file.txt", b"Quote characters"),
         ];
 
-        for (key, content) in test_cases {
+        for (key, content) in &test_cases {
             info!("Testing key: {}", key);
 
             // PUT
             let result = client
                 .put_object()
                 .bucket(bucket)
-                .key(key)
+                .key(*key)
                 .body(ByteStream::from(content.to_vec()))
                 .send()
                 .await;
             assert!(result.is_ok(), "Failed to PUT object with key '{}': {:?}", key, result.err());
 
             // GET
-            let result = client.get_object().bucket(bucket).key(key).send().await;
+            let result = client.get_object().bucket(bucket).key(*key).send().await;
             assert!(result.is_ok(), "Failed to GET object with key '{}': {:?}", key, result.err());
 
             let output = result.unwrap();
             let body_bytes = output.body.collect().await.unwrap().into_bytes();
-            assert_eq!(body_bytes.as_ref(), content, "Content mismatch for key '{}'", key);
+            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for key '{}'", key);
 
             info!("✅ PUT/GET succeeded for key: {}", key);
         }
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -668,7 +666,7 @@ mod tests {
         }
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -702,7 +700,7 @@ mod tests {
             client
                 .put_object()
                 .bucket(bucket)
-                .key(key)
+                .key(*key)
                 .body(ByteStream::from_static(b"test"))
                 .send()
                 .await
@@ -737,7 +735,7 @@ mod tests {
         }
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 
@@ -770,7 +768,7 @@ mod tests {
             client
                 .put_object()
                 .bucket(bucket)
-                .key(key)
+                .key(*key)
                 .body(ByteStream::from_static(b"test"))
                 .send()
                 .await
@@ -795,7 +793,7 @@ mod tests {
         info!("✅ LIST with delimiter returned {} common prefixes", common_prefixes.len());
 
         // Cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
         info!("Test completed successfully");
     }
 }
