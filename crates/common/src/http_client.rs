@@ -95,7 +95,7 @@ impl Default for BulkHttpClientConfig {
 /// Create an HTTP client optimized for latency-sensitive operations.
 ///
 /// This client is configured with aggressive keepalive settings to detect
-/// dead peers within 3-5 seconds. Use for console, admin, and IAM operations.
+/// dead peers within ~5 seconds (3s keepalive interval + 2s timeout). Use for console, admin, and IAM operations.
 ///
 /// # Examples
 /// ```no_run
@@ -126,7 +126,7 @@ pub fn create_fast_http_client_with_config(config: FastHttpClientConfig) -> Resu
 /// Create an HTTP client optimized for bulk data operations.
 ///
 /// This client is configured with balanced keepalive settings suitable for
-/// large file transfers. Detects dead peers within 5-8 seconds.
+/// large file transfers. Detects dead peers within ~8 seconds (5s keepalive interval + 3s timeout).
 ///
 /// # Examples
 /// ```no_run
