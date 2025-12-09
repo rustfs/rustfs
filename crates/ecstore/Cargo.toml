@@ -39,6 +39,7 @@ async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
 rustfs-common.workspace = true
+metrics = { workspace = true }
 rustfs-policy.workspace = true
 chrono.workspace = true
 glob = { workspace = true }

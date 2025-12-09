@@ -1,0 +1,44 @@
+# Prometheus Alert Rules for RustFS Cluster Power-Off Resilience
+# 
+# These alerts monitor the health of RustFS clusters and detect issues
+# related to abrupt node failures, metadata lock timeouts, and disk state checks.
+
+groups:
+  - name: rustfs_metadata_health
+    interval: 30s
+    rules:
+      # Alert when IAM lock timeouts are frequent
+      - alert: IAMLockTimeoutHigh
+        expr: rate(rustfs_config_lock_timeouts_total{operation="iam"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          component: iam
+        annotations:
+          summary: "High rate of IAM lock timeouts detected"
+          description: "IAM lock timeout rate is {{ $value | humanize }} per second for the last 5 minutes. This indicates distributed lock contention or dead nodes."
+          remediation: "Check for dead nodes in the cluster. Consider restarting affected nodes if lock contention persists."
+
+      # Alert when config read operations timeout frequently
+      - alert: ConfigReadTimeoutHigh
+        expr: rate(rustfs_config_read_timeouts_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          component: metadata
+        annotations:
+          summary: "High rate of config read timeouts"
+          description: "Config read timeout rate is {{ $value | humanize }} per second. This may indicate network issues or dead nodes."
+          remediation: "Investigate network connectivity and node health. Check logs for timeout patterns."
+
+      # Alert when disk state check timeouts are frequent
+      - alert: DiskStateCheckTimeoutHigh
+        expr: rate(rustfs_disk_state_check_timeouts_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "High rate of disk state check timeouts"
+          description: "Disk state check timeout rate is {{ $value | humanize }} per second. Remote disks or nodes may be unresponsive."
+          remediation: "Check disk connectivity and node health. Verify network between nodes."

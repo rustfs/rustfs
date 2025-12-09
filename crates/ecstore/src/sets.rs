@@ -149,14 +149,21 @@ impl Sets {
 
                 // Add timeout to prevent hanging on dead nodes during disk state checks
                 const DISK_STATE_CHECK_TIMEOUT_SECS: u64 = 3;
+                let start = std::time::Instant::now();
                 let has_disk_id = match tokio::time::timeout(
                     std::time::Duration::from_secs(DISK_STATE_CHECK_TIMEOUT_SECS),
                     disk.as_ref().unwrap().get_disk_id(),
                 )
                 .await
                 {
-                    Ok(Ok(id)) => id,
+                    Ok(Ok(id)) => {
+                        let duration = start.elapsed().as_secs_f64();
+                        metrics::histogram!("rustfs_disk_state_check_duration_seconds").record(duration);
+                        id
+                    }
                     Ok(Err(err)) => {
+                        let duration = start.elapsed().as_secs_f64();
+                        metrics::histogram!("rustfs_disk_state_check_duration_seconds").record(duration);
                         if err == DiskError::UnformattedDisk {
                             error!("get_disk_id err {:?}", err);
                         } else {
@@ -165,6 +172,8 @@ impl Sets {
                         None
                     }
                     Err(_) => {
+                        metrics::counter!("rustfs_disk_state_check_timeouts_total", "set" => format!("{}-{}", i, j))
+                            .increment(1);
                         error!(
                             "get_disk_id timed out after {}s for set_drive {}-{} (likely dead node)",
                             DISK_STATE_CHECK_TIMEOUT_SECS, i, j

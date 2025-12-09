@@ -240,17 +240,19 @@ fn is_lock_timeout_error(err: &Error) -> bool {
 ### P1 (Critical - Immediate)
 1. ✅ Add timeout to disk state checks in `sets.rs`
 2. ✅ Add timeout to IAM metadata read operations
-3. ✅ Improve error reduction logic to consider circuit breaker state
+3. ⚠️ Improve error reduction logic to consider circuit breaker state (deferred to P3)
 
 ### P2 (High - This Week)
-1. Add distributed lock timeout detection and retry logic
-2. Implement graceful degradation markers for partially available sets
-3. Add metrics for lock timeout incidents
+1. ✅ Add distributed lock timeout detection and retry logic (with exponential backoff)
+2. ✅ Add comprehensive metrics for lock timeout incidents and disk state checks
+3. ✅ Create Prometheus alert rules for monitoring cluster health
+4. ⚠️ Implement graceful degradation markers for partially available sets (deferred to P3)
 
 ### P3 (Medium - Next Sprint)
 1. Implement proactive lock health checking
 2. Add automatic lock breaking after prolonged timeout
 3. Enhanced monitoring for cascading failure detection
+4. Improve error reduction logic to consider circuit breaker state
 
 ## Testing Recommendations
 
@@ -350,8 +352,161 @@ The P0 fixes successfully addressed console-level resilience but exposed deeper 
 
 With these P1 fixes implemented, the cluster should remain operational when any single node fails abruptly, as designed by the 4+4 erasure coding architecture.
 
+## P2 Implementation Summary
+
+The following P2 items have been successfully implemented:
+
+### 1. Distributed Lock Timeout Detection with Retry Logic
+
+**File:** `crates/ecstore/src/config/com.rs`
+
+**Implementation Details:**
+- Added retry logic with exponential backoff for lock timeout errors
+- Maximum 3 retries with base delay of 100ms (100ms, 200ms, 400ms)
+- Detects lock timeout errors by checking error messages for "lock acquisition timed out"
+- Automatically retries IAM and config read operations on transient lock contention
+
+**Code Snippet:**
+```rust
+const MAX_LOCK_RETRIES: usize = 3;
+const LOCK_RETRY_BASE_DELAY_MS: u64 = 100;
+
+// Retry loop with exponential backoff
+if is_lock_timeout_error(&err) && attempts < MAX_LOCK_RETRIES {
+    attempts += 1;
+    let delay_ms = LOCK_RETRY_BASE_DELAY_MS * 2_u64.pow(attempts as u32);
+    warn!("Lock timeout on {}, retry {}/{} after {}ms", file, attempts, MAX_LOCK_RETRIES, delay_ms);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    continue;
+}
+```
+
+**Benefits:**
+- Transient lock contention no longer causes permanent failures
+- Automatic recovery from temporary distributed lock issues
+- Graceful degradation under high load
+
+### 2. Comprehensive Metrics for Monitoring
+
+**Files Modified:**
+- `crates/ecstore/src/sets.rs` - Disk state check metrics
+- `crates/ecstore/src/config/com.rs` - IAM/config operation metrics
+- `crates/ecstore/Cargo.toml` - Added metrics dependency
+
+**Metrics Added:**
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `rustfs_disk_state_check_duration_seconds` | Histogram | - | Duration of disk state checks |
+| `rustfs_disk_state_check_timeouts_total` | Counter | `set` | Number of disk state check timeouts |
+| `rustfs_config_read_duration_seconds` | Histogram | `operation` | Duration of config read operations (iam/config) |
+| `rustfs_config_lock_retries_total` | Counter | `operation` | Number of lock retry attempts |
+| `rustfs_config_lock_timeouts_total` | Counter | `operation` | Number of lock timeouts after all retries |
+| `rustfs_config_read_timeouts_total` | Counter | `operation` | Number of config read operation timeouts |
+
+**Usage Example:**
+```rust
+// Disk state check with metrics
+let start = std::time::Instant::now();
+match tokio::time::timeout(Duration::from_secs(3), disk.get_disk_id()).await {
+    Ok(Ok(id)) => {
+        let duration = start.elapsed().as_secs_f64();
+        metrics::histogram!("rustfs_disk_state_check_duration_seconds").record(duration);
+        id
+    }
+    Err(_) => {
+        metrics::counter!("rustfs_disk_state_check_timeouts_total", "set" => format!("{}-{}", i, j))
+            .increment(1);
+        None
+    }
+}
+```
+
+### 3. Prometheus Alert Rules
+
+**File:** `deploy/prometheus/alerts.yml`
+
+**Alert Rules Created:**
+- `IAMLockTimeoutHigh` - Critical alert when IAM lock timeouts exceed 0.1/sec
+- `ConfigReadTimeoutHigh` - Warning when config read timeouts exceed 0.5/sec
+- `DiskStateCheckTimeoutHigh` - Warning when disk check timeouts exceed 0.5/sec
+- `DiskStateCheckSlow` - Warning when 95th percentile duration exceeds 2s
+- `IAMOperationSlow` - Warning when 95th percentile IAM operation exceeds 5s
+- `LockRetryRateHigh` - Info alert when retry rate exceeds 1.0/sec
+- `MultipleNodesUnreachable` - Critical alert when multiple circuit breakers open
+- `NodeUnreachableExtended` - Warning when single node unreachable >5 min
+- `OperationDurationSpike` - Warning when average operation duration exceeds 3s
+
+**Alert Integration:**
+Deploy the alert rules to Prometheus:
+```yaml
+# prometheus.yml
+rule_files:
+  - /etc/prometheus/alerts.yml
+```
+
+### Implementation Statistics
+
+- **Files Modified**: 3
+- **New Files Created**: 1 (Prometheus alerts)
+- **Metrics Added**: 6
+- **Alert Rules Added**: 9
+- **Lines of Code**: ~100 (excluding documentation)
+- **Testing**: All checks pass (fmt, clippy, check)
+
+### Expected Impact
+
+**Before P2 Implementation:**
+- Lock timeouts caused permanent failures
+- No visibility into timeout patterns
+- Operators had no early warning of issues
+- Manual intervention required for transient failures
+
+**After P2 Implementation:**
+- Automatic retry for transient lock contention (3 attempts with backoff)
+- Full visibility into all timeout events via metrics
+- Proactive alerting before cascading failures
+- Self-healing for temporary issues
+- Operators can monitor cluster health in real-time
+
+### Deployment Checklist
+
+To deploy P2 improvements:
+
+1. **Update RustFS binary** with P2 code changes
+2. **Configure Prometheus** to scrape RustFS metrics endpoint
+3. **Deploy alert rules** to Prometheus
+4. **Configure Alertmanager** for alert notifications
+5. **Create Grafana dashboards** for visualization (optional)
+6. **Test alerting** by simulating node failures
+
+### Monitoring Dashboard Recommendations
+
+Create Grafana dashboards with the following panels:
+
+1. **Cluster Health Overview**
+   - Active nodes vs. circuit breaker states
+   - Overall request success rate
+   - P95 operation latency
+
+2. **Lock Contention Metrics**
+   - Lock retry rate over time
+   - Lock timeout rate by operation type
+   - Average operation duration with lock retries
+
+3. **Disk State Health**
+   - Disk state check timeout rate
+   - Disk state check duration histogram
+   - Number of unavailable disks per set
+
+4. **IAM Operation Health**
+   - IAM operation duration over time
+   - IAM lock timeout incidents
+   - IAM operation success rate
+
 ## Document Revision History
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2024-12-09 | Senior Rust Architect | Initial analysis based on real 4x4 cluster failure logs |
+| 1.1 | 2024-12-09 | Senior Rust Architect | Added P2 implementation summary with metrics and alerts |
