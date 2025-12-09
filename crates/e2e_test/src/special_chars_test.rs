@@ -396,4 +396,406 @@ mod tests {
         env.stop_server().await.expect("Failed to stop RustFS");
         info!("✅ Exact issue scenario test completed successfully");
     }
+
+    /// Test HEAD object with special characters
+    #[tokio::test]
+    #[serial]
+    async fn test_head_object_with_special_chars() {
+        init_logging();
+        info!("Starting test: HEAD object with special characters");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-head-special";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let key = "folder with spaces/ES+net/file.txt";
+        let content = b"Test content for HEAD";
+
+        // PUT object
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .expect("Failed to PUT object");
+
+        info!("Testing HEAD object with key: {}", key);
+
+        // HEAD object
+        let result = client.head_object().bucket(bucket).key(key).send().await;
+        assert!(result.is_ok(), "Failed to HEAD object with special chars: {:?}", result.err());
+
+        let output = result.unwrap();
+        assert_eq!(output.content_length().unwrap_or(0), content.len() as i64, "Content length mismatch");
+        info!("✅ HEAD object with special characters succeeded");
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
+
+    /// Test COPY object with special characters in both source and destination
+    #[tokio::test]
+    #[serial]
+    async fn test_copy_object_with_special_chars() {
+        init_logging();
+        info!("Starting test: COPY object with special characters");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-copy-special";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let src_key = "source/folder with spaces/file.txt";
+        let dest_key = "dest/ES+net/copied file.txt";
+        let content = b"Test content for COPY";
+
+        // PUT source object
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .expect("Failed to PUT source object");
+
+        info!("Testing COPY from '{}' to '{}'", src_key, dest_key);
+
+        // COPY object
+        let copy_source = format!("{}/{}", bucket, src_key);
+        let result = client
+            .copy_object()
+            .bucket(bucket)
+            .key(dest_key)
+            .copy_source(&copy_source)
+            .send()
+            .await;
+
+        assert!(result.is_ok(), "Failed to COPY object with special chars: {:?}", result.err());
+        info!("✅ COPY operation succeeded");
+
+        // Verify destination exists
+        let result = client.get_object().bucket(bucket).key(dest_key).send().await;
+        assert!(result.is_ok(), "Failed to GET copied object");
+
+        let output = result.unwrap();
+        let body_bytes = output.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body_bytes.as_ref(), content, "Copied content mismatch");
+        info!("✅ Copied object verified successfully");
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
+
+    /// Test Unicode characters in object keys
+    #[tokio::test]
+    #[serial]
+    async fn test_unicode_characters_in_path() {
+        init_logging();
+        info!("Starting test: Unicode characters in object paths");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-unicode";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Test various Unicode characters
+        let test_cases = vec![
+            ("测试/文件.txt", b"Chinese characters" as &[u8]),
+            ("テスト/ファイル.txt", b"Japanese characters"),
+            ("테스트/파일.txt", b"Korean characters"),
+            ("тест/файл.txt", b"Cyrillic characters"),
+            ("emoji/😀/file.txt", b"Emoji in path"),
+            ("mixed/测试 test/file.txt", b"Mixed languages"),
+        ];
+
+        for (key, content) in test_cases {
+            info!("Testing Unicode key: {}", key);
+
+            // PUT
+            let result = client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(content.to_vec()))
+                .send()
+                .await;
+            assert!(result.is_ok(), "Failed to PUT object with Unicode key '{}': {:?}", key, result.err());
+
+            // GET
+            let result = client.get_object().bucket(bucket).key(key).send().await;
+            assert!(result.is_ok(), "Failed to GET object with Unicode key '{}': {:?}", key, result.err());
+
+            let output = result.unwrap();
+            let body_bytes = output.body.collect().await.unwrap().into_bytes();
+            assert_eq!(body_bytes.as_ref(), content, "Content mismatch for Unicode key '{}'", key);
+
+            info!("✅ PUT/GET succeeded for Unicode key: {}", key);
+        }
+
+        // LIST to verify all objects
+        let result = client.list_objects_v2().bucket(bucket).send().await;
+        assert!(result.is_ok(), "Failed to LIST objects with Unicode keys");
+
+        let output = result.unwrap();
+        let contents = output.contents();
+        assert_eq!(contents.len(), test_cases.len(), "Number of Unicode objects mismatch");
+        info!("✅ All Unicode objects listed successfully");
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
+
+    /// Test special characters in different parts of the path
+    #[tokio::test]
+    #[serial]
+    async fn test_special_chars_in_different_path_positions() {
+        init_logging();
+        info!("Starting test: Special characters in different path positions");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-path-positions";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Test special characters in different positions
+        let test_cases = vec![
+            ("start with space/file.txt", b"Space at start" as &[u8]),
+            ("folder/end with space /file.txt", b"Space at end of folder"),
+            ("multiple   spaces/file.txt", b"Multiple consecutive spaces"),
+            ("folder/file with space.txt", b"Space in filename"),
+            ("a+b/c+d/e+f.txt", b"Plus signs throughout"),
+            ("a%b/c%d/e%f.txt", b"Percent signs throughout"),
+            ("folder/!@#$%^&*()/file.txt", b"Multiple special chars"),
+            ("(parentheses)/[brackets]/file.txt", b"Parentheses and brackets"),
+            ("'quotes'/\"double\"/file.txt", b"Quote characters"),
+        ];
+
+        for (key, content) in test_cases {
+            info!("Testing key: {}", key);
+
+            // PUT
+            let result = client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(content.to_vec()))
+                .send()
+                .await;
+            assert!(result.is_ok(), "Failed to PUT object with key '{}': {:?}", key, result.err());
+
+            // GET
+            let result = client.get_object().bucket(bucket).key(key).send().await;
+            assert!(result.is_ok(), "Failed to GET object with key '{}': {:?}", key, result.err());
+
+            let output = result.unwrap();
+            let body_bytes = output.body.collect().await.unwrap().into_bytes();
+            assert_eq!(body_bytes.as_ref(), content, "Content mismatch for key '{}'", key);
+
+            info!("✅ PUT/GET succeeded for key: {}", key);
+        }
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
+
+    /// Test that control characters are properly rejected
+    #[tokio::test]
+    #[serial]
+    async fn test_control_characters_rejected() {
+        init_logging();
+        info!("Starting test: Control characters should be rejected");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-control-chars";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Test that control characters are rejected
+        let invalid_keys = vec![
+            "file\0with\0null.txt",
+            "file\nwith\nnewline.txt",
+            "file\rwith\rcarriage.txt",
+            "file\twith\ttab.txt", // Tab might be allowed, but let's test
+        ];
+
+        for key in invalid_keys {
+            info!("Testing rejection of control character in key: {:?}", key);
+
+            let result = client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"test"))
+                .send()
+                .await;
+
+            // Note: The validation happens on the server side, so we expect an error
+            // For null byte, newline, and carriage return
+            if key.contains('\0') || key.contains('\n') || key.contains('\r') {
+                assert!(result.is_err(), "Control character should be rejected for key: {:?}", key);
+                if let Err(e) = result {
+                    info!("✅ Control character correctly rejected: {:?}", e);
+                }
+            }
+        }
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
+
+    /// Test LIST with various special character prefixes
+    #[tokio::test]
+    #[serial]
+    async fn test_list_with_special_char_prefixes() {
+        init_logging();
+        info!("Starting test: LIST with special character prefixes");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-list-prefixes";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create objects with various special characters
+        let test_objects = vec![
+            "prefix with spaces/file1.txt",
+            "prefix with spaces/file2.txt",
+            "prefix+plus/file1.txt",
+            "prefix+plus/file2.txt",
+            "prefix%percent/file1.txt",
+            "prefix%percent/file2.txt",
+        ];
+
+        for key in &test_objects {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"test"))
+                .send()
+                .await
+                .expect("Failed to PUT object");
+        }
+
+        // Test LIST with different prefixes
+        let prefix_tests = vec![
+            ("prefix with spaces/", 2),
+            ("prefix+plus/", 2),
+            ("prefix%percent/", 2),
+            ("prefix", 6), // Should match all
+        ];
+
+        for (prefix, expected_count) in prefix_tests {
+            info!("Testing LIST with prefix: '{}'", prefix);
+
+            let result = client.list_objects_v2().bucket(bucket).prefix(prefix).send().await;
+            assert!(result.is_ok(), "Failed to LIST with prefix '{}': {:?}", prefix, result.err());
+
+            let output = result.unwrap();
+            let contents = output.contents();
+            assert_eq!(
+                contents.len(),
+                expected_count,
+                "Expected {} objects with prefix '{}', got {}",
+                expected_count,
+                prefix,
+                contents.len()
+            );
+            info!("✅ LIST with prefix '{}' returned {} objects", prefix, contents.len());
+        }
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
+
+    /// Test delimiter-based listing with special characters
+    #[tokio::test]
+    #[serial]
+    async fn test_list_with_delimiter_and_special_chars() {
+        init_logging();
+        info!("Starting test: LIST with delimiter and special characters");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-delimiter-special";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create hierarchical structure with special characters
+        let test_objects = vec![
+            "folder with spaces/subfolder1/file.txt",
+            "folder with spaces/subfolder2/file.txt",
+            "folder with spaces/file.txt",
+            "folder+plus/subfolder1/file.txt",
+            "folder+plus/file.txt",
+        ];
+
+        for key in &test_objects {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"test"))
+                .send()
+                .await
+                .expect("Failed to PUT object");
+        }
+
+        // Test LIST with delimiter
+        info!("Testing LIST with delimiter for 'folder with spaces/'");
+        let result = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("folder with spaces/")
+            .delimiter("/")
+            .send()
+            .await;
+
+        assert!(result.is_ok(), "Failed to LIST with delimiter");
+
+        let output = result.unwrap();
+        let common_prefixes = output.common_prefixes();
+        assert_eq!(common_prefixes.len(), 2, "Should have 2 common prefixes (subdirectories)");
+        info!("✅ LIST with delimiter returned {} common prefixes", common_prefixes.len());
+
+        // Cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
+        info!("Test completed successfully");
+    }
 }
