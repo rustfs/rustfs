@@ -85,9 +85,17 @@ impl PeerCircuitBreaker {
                 // Check if we should transition to half-open
                 if let Some(last) = *self.last_failure.read().await {
                     if last.elapsed() >= self.recovery_timeout {
-                        debug!("Circuit breaker for {} transitioning to half-open", self.peer);
-                        self.state.store(CircuitState::HalfOpen as u8, Ordering::Relaxed);
-                        return true;
+                        if self.state.compare_exchange(
+                            CircuitState::Open as u8,
+                            CircuitState::HalfOpen as u8,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed
+                        ).is_ok() {
+                            debug!("Circuit breaker for {} transitioning to half-open", self.peer);
+                            return true;
+                        }
+                        // Another thread transitioned, check new state
+                        return CircuitState::from(self.state.load(Ordering::Relaxed)) != CircuitState::Open;
                     }
                 }
                 false
