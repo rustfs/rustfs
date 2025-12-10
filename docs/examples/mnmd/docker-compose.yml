@@ -29,6 +29,7 @@ x-node-template: &node-template
     - RUSTFS_ACCESS_KEY=rustfsadmin
     - RUSTFS_SECRET_KEY=rustfsadmin
     - RUSTFS_CMD=rustfs
+    - RUSTFS_OBS_LOG_DIRECTORY=/logs
   command: [ "sh", "-c", "sleep 3 && rustfs" ]
   healthcheck:
     test:
