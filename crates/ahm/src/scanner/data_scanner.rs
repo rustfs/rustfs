@@ -435,18 +435,19 @@ impl Scanner {
 
             let records_cow: Cow<[LocalObjectRecord]> = if let Some(existing) = bucket_objects_map.get(bucket_name) {
                 if existing.is_empty() {
-                    debug!("Bucket {} had empty local snapshot entries; refreshing via ECStore listing", bucket_name);
+                    warn!("Bucket {} had empty local snapshot entries; refreshing via ECStore listing", bucket_name);
                     let fetched = self.collect_bucket_records_from_store(ecstore, bucket_name).await?;
                     if fetched.is_empty() {
-                        debug!("No objects discovered via ECStore listing for bucket {}; skipping", bucket_name);
+                        warn!("No objects discovered via ECStore listing for bucket {}; skipping", bucket_name);
                         continue;
                     }
                     Cow::Owned(fetched)
                 } else {
+                    warn!("Bucket {} had non-empty local snapshot entries; using them", bucket_name);
                     Cow::Borrowed(existing.as_slice())
                 }
             } else {
-                debug!(
+                warn!(
                     "No local snapshot entries found for bucket {}; falling back to ECStore listing",
                     bucket_name
                 );
@@ -547,7 +548,7 @@ impl Scanner {
                 }
             };
             let bucket_objects_map = &scan_outcome.bucket_objects;
-
+            warn!("Basic test scan: bucket_objects: {:?}", bucket_objects_map);
             let lifecycle_result = self
                 .handle_buckets_from_local_records(&ecstore, bucket_objects_map, enable_healing, enable_deep_scan, false)
                 .await;
@@ -679,6 +680,8 @@ impl Scanner {
         if let Some(info) = &record.object_info {
             return info.clone();
         }
+
+        warn!("convert_record_to_object_info no object info found, record: {:?}", record);
 
         let usage = &record.usage;
 
@@ -1322,6 +1325,8 @@ impl Scanner {
             return Ok(());
         }
 
+        warn!("Lifecycle evaluation: bucket_objects: {:?}", scan_outcome.bucket_objects);
+
         if let Err(e) = self
             .handle_buckets_from_local_records(&ecstore, &scan_outcome.bucket_objects, false, false, true)
             .await
@@ -1593,11 +1598,14 @@ impl Scanner {
                                     }
                                 } else {
                                     // This is a real data loss scenario - trigger healing
-                                    warn!("Data parts integrity check failed for {}/{}: {}. Triggering heal.", bucket, object, e);
+                                    warn!(
+                                        "Data parts integrity check failed 1 for {}/{}: {}. Triggering heal.",
+                                        bucket, object, e
+                                    );
                                     integrity_failed = true;
                                 }
                             } else {
-                                warn!("Data parts integrity check failed for {}/{}: {}. Triggering heal.", bucket, object, e);
+                                warn!("Data parts integrity check failed 2 for {}/{}: {}. Triggering heal.", bucket, object, e);
                                 integrity_failed = true;
                             }
                         }

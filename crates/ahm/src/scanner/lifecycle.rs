@@ -366,6 +366,9 @@ impl ScannerItem {
     }
 
     async fn heal_replication(&self, oi: &ObjectInfo) -> Result<()> {
+        warn!("heal_replication: healing replication for {}/{}", oi.bucket, oi.name);
+        warn!("heal_replication: ObjectInfo oi: {:?}", oi);
+
         let enriched = Self::hydrate_replication_metadata(oi);
         let pending_lagging = self.is_pending_lagging(&enriched);
 
@@ -429,7 +432,7 @@ impl ScannerItem {
             if let Some(handle) = &self.replication_metrics {
                 handle.record_task_submission(&self.bucket).await;
             }
-            debug!("heal_replication: queued replication heal task for {}/{}", enriched.bucket, enriched.name);
+            warn!("heal_replication: queued replication heal task for {}/{}", enriched.bucket, enriched.name);
         } else {
             warn!(
                 "heal_replication: GLOBAL_REPLICATION_POOL not initialized, skipping heal for {}/{}",
