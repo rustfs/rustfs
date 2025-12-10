@@ -47,6 +47,18 @@ jobs
     []*Only run on successful builds triggered by tag pushes (version format:x.y.z or x.y.z-suffix);
  If
      github.event.workflow_run.conclusion == 'success' && 
+permissions:
+  contents: read
+
+env:
+  new_version: ${{ github.event.workflow_run.head_branch }}
+
+jobs:
+  build-helm-package:
+    runs-on: ubuntu-latest
+    # Only run on successful builds triggered by tag pushes (version format: x.y.z or x.y.z-suffix)
+    if: |
+      github.event.workflow_run.conclusion == 'success' && 
       github.event.workflow_run.event == 'push' &&
       contains(github.event.workflow_run.head_branch, '.')
 
