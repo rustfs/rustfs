@@ -200,7 +200,13 @@ impl Endpoint {
 
     pub fn get_file_path(&self) -> String {
         let path: &str = self.url.path();
-        let decoded: std::borrow::Cow<'_, str> = urlencoding::decode(path).unwrap_or(std::borrow::Cow::Borrowed(path));
+        let decoded: std::borrow::Cow<'_, str> = match urlencoding::decode(path) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                debug!("Failed to decode path '{}': {}, using original path", path, e);
+                std::borrow::Cow::Borrowed(path)
+            }
+        };
         #[cfg(windows)]
         if self.url.scheme() == "file" {
             let stripped: &str = decoded.strip_prefix('/').unwrap_or(&decoded);
@@ -534,7 +540,7 @@ mod test {
     #[test]
     fn test_endpoint_with_various_special_characters() {
         // Test path with multiple special characters that get percent-encoded
-        let path_with_special = "/tmp/test path/data[1]/file#2";
+        let path_with_special = "/tmp/test path/data[1]/file+name&more";
         let endpoint = Endpoint::try_from(path_with_special).unwrap();
 
         // get_file_path() should return the original path with decoded characters
