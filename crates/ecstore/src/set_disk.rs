@@ -3840,6 +3840,15 @@ impl ObjectIO for SetDisks {
             return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
         }
 
+        let (_, online_after_planning) = self.filter_online_disks(self.get_disks_internal().await).await;
+        if online_after_planning < write_quorum {
+            warn!(
+                "online disk recheck {} below write quorum {} for {}/{}; returning erasure write quorum error",
+                online_after_planning, write_quorum, bucket, object
+            );
+            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        }
+
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
         fi.version_id = {
@@ -5136,6 +5145,15 @@ impl StorageAPI for SetDisks {
             warn!(
                 "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
                 filtered_online, write_quorum, bucket, object
+            );
+            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        }
+
+        let (_, online_after_planning) = self.filter_online_disks(self.get_disks_internal().await).await;
+        if online_after_planning < write_quorum {
+            warn!(
+                "online disk recheck {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
+                online_after_planning, write_quorum, bucket, object
             );
             return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
         }
