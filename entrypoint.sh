@@ -84,7 +84,20 @@ process_data_volumes() {
 
 # 3) Process log directory (separate from data volumes)
 process_log_directory() {
-  LOG_DIR="${RUSTFS_OBS_LOG_DIRECTORY:-/logs}"
+  # Output logs to stdout
+  if [ -z "$RUSTFS_OBS_LOG_DIRECTORY" ]; then
+    echo "OBS log directory not configured and logs outputs to stdout"
+    return
+  fi
+
+  # Output logs to remote endpoint
+  if [ "${RUSTFS_OBS_LOG_DIRECTORY}" != "${RUSTFS_OBS_LOG_DIRECTORY#*://}" ]; then
+    echo "Output logs to remote endpoint"
+    return
+  fi
+
+  # Outputs logs to local directory
+  LOG_DIR="${RUSTFS_OBS_LOG_DIRECTORY}"
   
   echo "Initializing log directory: $LOG_DIR"
   if [ ! -d "$LOG_DIR" ]; then
