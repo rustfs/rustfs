@@ -283,7 +283,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
             "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
             obj.name, obj.mod_time, now, obj.is_latest, obj.delete_marker
         );
-        
+
         // Gracefully handle missing mod_time instead of panicking
         let mod_time = match obj.mod_time {
             Some(t) => t,
@@ -292,7 +292,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 return Event::default();
             }
         };
-        
+
         if mod_time.unix_timestamp() == 0 {
             info!("eval_inner: mod_time is 0, returning default event");
             return Event::default();
