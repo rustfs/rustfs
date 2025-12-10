@@ -85,6 +85,7 @@ services:
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin
       - RUSTFS_OBS_LOGGER_LEVEL=debug
+      - RUSTFS_OBS_LOG_DIRECTORY=/logs
     volumes:
       - .:/app # Mount source code to /app for development
       - deploy/data/dev:/data
@@ -180,20 +181,6 @@ services:
     profiles:
       - observability
 
-  # Redis for caching (optional)
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - rustfs-network
-    restart: unless-stopped
-    profiles:
-      - cache
-
   # NGINX reverse proxy (optional)
   nginx:
     security_opt:
@@ -240,8 +227,6 @@ volumes:
   prometheus_data:
     driver: local
   grafana_data:
-    driver: local
-  redis_data:
     driver: local
   logs:
     driver: local
