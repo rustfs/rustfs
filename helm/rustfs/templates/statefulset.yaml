@@ -103,6 +103,8 @@ spec:
             successThreshold: 1
             failureThreshold: 3
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: logs
               mountPath: /logs
             {{- if eq (int .Values.replicaCount) 4 }}
@@ -114,6 +116,9 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: logs
