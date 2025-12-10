@@ -150,7 +150,7 @@ jobs:
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
-          rev: 0e52387e53743c1eac70a96ce41fbab29553e8f5
+          rev: 0d6fe98f06d91eb86c07c13823b037fec64ae683
 
       - name: Build debug binary
         run: |
