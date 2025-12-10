@@ -12,7 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures::lock::Mutex;
@@ -22,15 +29,15 @@ use rustfs_protos::{
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
         DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-        ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+        RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
 
 use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
     ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    endpoint::Endpoint,
+    endpoint::Endpoint, local::ScanGuard,
 };
 use crate::disk::{FileReader, FileWriter};
 use crate::{
@@ -52,6 +59,7 @@ pub struct RemoteDisk {
     pub url: url::Url,
     pub root: PathBuf,
     endpoint: Endpoint,
+    pub scanning: Arc<AtomicU32>,
 }
 
 const REMOTE_DISK_ONLINE_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
@@ -71,6 +79,7 @@ impl RemoteDisk {
             url: ep.url.clone(),
             root,
             endpoint: ep.clone(),
+            scanning: Arc::new(AtomicU32::new(0)),
         })
     }
 }
@@ -476,6 +485,25 @@ impl DiskAPI for RemoteDisk {
         }
 
         Ok(())
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        let request = Request::new(ReadMetadataRequest {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            disk: self.endpoint.to_string(),
+        });
+
+        let response = client.read_metadata(request).await?.into_inner();
+
+        if !response.success {
+            return Err(response.error.unwrap_or_default().into());
+        }
+
+        Ok(response.data)
     }
 
     #[tracing::instrument(skip(self))]
@@ -963,6 +991,12 @@ impl DiskAPI for RemoteDisk {
         let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
 
         Ok(disk_info)
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn start_scan(&self) -> ScanGuard {
+        self.scanning.fetch_add(1, Ordering::Relaxed);
+        ScanGuard(Arc::clone(&self.scanning))
     }
 }
 

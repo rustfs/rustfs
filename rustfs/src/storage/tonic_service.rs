@@ -1072,6 +1072,29 @@ impl Node for NodeService {
             }))
         }
     }
+    async fn read_metadata(&self, request: Request<ReadMetadataRequest>) -> Result<Response<ReadMetadataResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk.read_metadata(&request.volume, &request.path).await {
+                Ok(data) => Ok(Response::new(ReadMetadataResponse {
+                    success: true,
+                    data,
+                    error: None,
+                })),
+                Err(err) => Ok(Response::new(ReadMetadataResponse {
+                    success: false,
+                    data: Bytes::new(),
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(ReadMetadataResponse {
+                success: false,
+                data: Bytes::new(),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
+            }))
+        }
+    }
 
     async fn update_metadata(&self, request: Request<UpdateMetadataRequest>) -> Result<Response<UpdateMetadataResponse>, Status> {
         let request = request.into_inner();

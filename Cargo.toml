@@ -34,6 +34,7 @@ members = [
     "crates/targets", # Target-specific configurations and utilities
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
+    "crates/scanner", # Scanner for data integrity checks and health monitoring
     "crates/signer", # client signer
     "crates/checksums", # client checksums
     "crates/utils", # Utility functions and helpers
@@ -86,6 +87,7 @@ rustfs-protos = { path = "crates/protos", version = "0.0.5" }
 rustfs-rio = { path = "crates/rio", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-s3select-query = { path = "crates/s3select-query", version = "0.0.5" }
+rustfs-scanner = { path = "crates/scanner", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 rustfs-utils = { path = "crates/utils", version = "0.0.5" }

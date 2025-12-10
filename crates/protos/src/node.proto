@@ -313,6 +313,18 @@ message DeletePathsResponse {
   optional Error error = 2;
 }
 
+message ReadMetadataRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+}
+
+message ReadMetadataResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes data = 3;
+}
+
 message UpdateMetadataRequest {
   string disk = 1;
   string volume = 2;
@@ -786,6 +798,7 @@ service NodeService {
   rpc StatVolume(StatVolumeRequest) returns (StatVolumeResponse) {};
   rpc DeletePaths(DeletePathsRequest) returns (DeletePathsResponse) {};
   rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse) {};
+  rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse) {};
   rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
   rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
@@ -794,6 +807,7 @@ service NodeService {
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
+  
 
 /* -------------------------------lock service-------------------------- */
 

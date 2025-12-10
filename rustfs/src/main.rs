@@ -56,6 +56,7 @@ use rustfs_ecstore::{
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_scanner::init_data_scanner;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::io::{Error, Result};
 use std::sync::Arc;
@@ -301,23 +302,29 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize heal manager and scanner based on environment variables
     if enable_heal || enable_scanner {
-        if enable_heal {
-            // Initialize heal manager with channel processor
-            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-            let heal_manager = init_heal_manager(heal_storage, None).await?;
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
 
-            if enable_scanner {
-                info!(target: "rustfs::main::run","Starting scanner with heal manager...");
-                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-                scanner.start().await?;
-            } else {
-                info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
-            }
-        } else if enable_scanner {
-            info!("Starting scanner without heal manager...");
-            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
-            scanner.start().await?;
-        }
+        init_heal_manager(heal_storage, None).await?;
+
+        init_data_scanner(ctx.clone(), store.clone()).await;
+
+        // if enable_heal {
+        //     // Initialize heal manager with channel processor
+        //     let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+        //     let heal_manager = init_heal_manager(heal_storage, None).await?;
+
+        //     if enable_scanner {
+        //         info!(target: "rustfs::main::run","Starting scanner with heal manager...");
+        //         let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
+        //         scanner.start().await?;
+        //     } else {
+        //         info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
+        //     }
+        // } else if enable_scanner {
+        //     info!("Starting scanner without heal manager...");
+        //     let scanner = Scanner::new(Some(ScannerConfig::default()), None);
+        //     scanner.start().await?;
+        // }
     } else {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }

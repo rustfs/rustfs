@@ -1468,17 +1468,7 @@ impl SetDisks {
             let version_id = version_id.clone();
             tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    if version_id.is_empty() {
-                        match disk.read_xl(&bucket, &object, read_data).await {
-                            Ok(info) => {
-                                let fi = file_info_from_raw(info, &bucket, &object, read_data).await?;
-                                Ok(fi)
-                            }
-                            Err(err) => Err(err),
-                        }
-                    } else {
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
-                    }
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
@@ -2672,7 +2662,7 @@ impl SetDisks {
         let (mut parts_metadata, errs) = {
             let mut retry_count = 0;
             loop {
-                let (parts, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+                let (parts, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false).await?;
 
                 // Check if we have enough valid metadata to proceed
                 // If we have too many errors, and we haven't exhausted retries, try again
@@ -2699,7 +2689,14 @@ impl SetDisks {
                 retry_count += 1;
             }
         };
-        info!(parts_count = parts_metadata.len(), ?errs, "File info read complete");
+        info!(
+            parts_count = parts_metadata.len(),
+            bucket = bucket,
+            object = object,
+            version_id = version_id,
+            ?errs,
+            "File info read complete"
+        );
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
