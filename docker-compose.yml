@@ -30,7 +30,7 @@ services:
       - "9000:9000" # S3 API port
       - "9001:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs{0..3}  # Define 4 storage volumes
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}  # Define 4 storage volumes
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -75,7 +75,7 @@ services:
       - "9010:9000" # S3 API port  
       - "9011:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs{1..4}
+      - RUSTFS_VOLUMES=/data/rustfs{1...4}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -85,6 +85,7 @@ services:
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin
       - RUSTFS_OBS_LOGGER_LEVEL=debug
+      - RUSTFS_OBS_LOG_DIRECTORY=/logs
     volumes:
       - .:/app # Mount source code to /app for development
       - deploy/data/dev:/data
@@ -180,22 +181,10 @@ services:
     profiles:
       - observability
 
-  # Redis for caching (optional)
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - rustfs-network
-    restart: unless-stopped
-    profiles:
-      - cache
-
   # NGINX reverse proxy (optional)
   nginx:
+    security_opt:
+      - "no-new-privileges:true"
     image: nginx:alpine
     container_name: nginx-proxy
     ports:
@@ -204,9 +193,14 @@ services:
     volumes:
       - ./.docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./.docker/nginx/ssl:/etc/nginx/ssl:ro
+    tmpfs:
+      - /var/run
+      - /var/cache/nginx
+      - /var/log/nginx
     networks:
       - rustfs-network
     restart: unless-stopped
+    read_only: true
     profiles:
       - proxy
     depends_on:
@@ -233,8 +227,6 @@ volumes:
   prometheus_data:
     driver: local
   grafana_data:
-    driver: local
-  redis_data:
     driver: local
   logs:
     driver: local

@@ -108,7 +108,7 @@ use rustfs_s3select_api::{
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
     EventName,
-    arn::{TargetID, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::{
     CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
@@ -452,6 +452,31 @@ fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }
 
+/// Validate object key for control characters and log special characters
+///
+/// This function:
+/// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
+/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+///
+/// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
+/// This validation ensures that invalid characters that could cause issues are rejected early.
+fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
+    // Validate object key doesn't contain control characters
+    if key.contains(['\0', '\n', '\r']) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("Object key contains invalid control characters: {:?}", key),
+        ));
+    }
+
+    // Log debug info for keys with special characters to help diagnose encoding issues
+    if key.contains([' ', '+', '%']) {
+        debug!("{} object with special characters in key: {:?}", operation, key);
+    }
+
+    Ok(())
+}
+
 impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
@@ -778,6 +803,10 @@ impl S3 for FS {
                 version_id,
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
+
+        // Validate both source and destination keys
+        validate_object_key(&src_key, "COPY (source)")?;
+        validate_object_key(&key, "COPY (dest)")?;
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
@@ -1230,6 +1259,9 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        // Validate object key
+        validate_object_key(&key, "DELETE")?;
+
         let replica = req
             .headers
             .get(AMZ_BUCKET_REPLICATION_STATUS)
@@ -1418,12 +1450,17 @@ impl S3 for FS {
                 ..Default::default()
             };
 
-            let opts = ObjectOptions {
-                version_id: object.version_id.map(|v| v.to_string()),
-                versioned: version_cfg.prefix_enabled(&object.object_name),
-                version_suspended: version_cfg.suspended(),
-                ..Default::default()
-            };
+            let metadata = extract_metadata(&req.headers);
+
+            let opts: ObjectOptions = del_opts(
+                &bucket,
+                &object.object_name,
+                object.version_id.map(|f| f.to_string()),
+                &req.headers,
+                metadata,
+            )
+            .await
+            .map_err(ApiError::from)?;
 
             let mut goi = ObjectInfo::default();
             let mut gerr = None;
@@ -1684,12 +1721,11 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "GET")?;
 
         // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
@@ -1879,35 +1915,6 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
-
-        if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since {
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        }
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
@@ -2265,6 +2272,7 @@ impl S3 for FS {
             content_length: Some(response_content_length),
             last_modified,
             content_type,
+            content_encoding: info.content_encoding.clone(),
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
@@ -2341,6 +2349,9 @@ impl S3 for FS {
             if_unmodified_since,
             ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "HEAD")?;
 
         let part_number = part_number.map(|v| v as usize);
 
@@ -2477,6 +2488,7 @@ impl S3 for FS {
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
+            content_encoding: info.content_encoding.clone(),
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
@@ -2603,6 +2615,12 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
+
+        // Log debug info for prefixes with special characters to help diagnose encoding issues
+        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
+            debug!("LIST objects with special characters in prefix: {:?}", prefix);
+        }
+
         let max_keys = max_keys.unwrap_or(1000);
         if max_keys < 0 {
             return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
@@ -2826,6 +2844,9 @@ impl S3 for FS {
             ..
         } = input;
 
+        // Validate object key
+        validate_object_key(&key, "PUT")?;
+
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2847,7 +2868,7 @@ impl S3 for FS {
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
@@ -3930,7 +3951,7 @@ impl S3 for FS {
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
@@ -4193,6 +4214,13 @@ impl S3 for FS {
             tagging,
             ..
         } = req.input.clone();
+
+        if tagging.tag_set.len() > 10 {
+            // TOTO: Note that Amazon S3 limits the maximum number of tags to 10 tags per object.
+            // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
+            // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
+            // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -4492,18 +4520,16 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => Some(cfg.rules),
+            Ok((cfg, _)) => cfg.rules,
             Err(_err) => {
-                // if BucketMetadataError::BucketLifecycleNotFound.is(&err) {
-                //     return Err(s3_error!(NoSuchLifecycleConfiguration));
-                // }
-                // warn!("get_lifecycle_config err {:?}", err);
-                None
+                // Return NoSuchLifecycleConfiguration error as expected by S3 clients
+                // This fixes issue #990 where Ansible S3 roles fail with KeyError: 'Rules'
+                return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules,
+            rules: Some(rules),
             ..Default::default()
         }))
     }
@@ -4890,20 +4916,24 @@ impl S3 for FS {
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
-            process_queue_configurations(
-                &mut event_rules,
-                notification_configuration.queue_configurations.clone(),
-                TargetID::from_str,
-            );
-            process_topic_configurations(
-                &mut event_rules,
-                notification_configuration.topic_configurations.clone(),
-                TargetID::from_str,
-            );
+            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
+            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
             process_lambda_configurations(
                 &mut event_rules,
                 notification_configuration.lambda_function_configurations.clone(),
-                TargetID::from_str,
+                |arn_str| {
+                    ARN::parse(arn_str)
+                        .map(|arn| arn.target_id)
+                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                },
             );
 
             event_rules

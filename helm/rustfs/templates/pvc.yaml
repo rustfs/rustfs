@@ -8,7 +8,7 @@ spec:
   storageClassName: {{ .Values.storageclass.name }}
   resources:
     requests:
-      storage: {{ .Values.storageclass.size }}
+      storage: {{ .Values.storageclass.dataStorageSize }}
 
 ---
 apiVersion: v1
@@ -20,5 +20,5 @@ spec:
   storageClassName: {{ .Values.storageclass.name }}
   resources:
     requests:
-      storage: {{ .Values.storageclass.size }}
+      storage: {{ .Values.storageclass.logStorageSize }}
 {{- end }}

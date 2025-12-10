@@ -92,6 +92,7 @@ serde_urlencoded = { workspace = true }
 
 # Cryptography and Security
 rustls = { workspace = true }
+subtle = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
@@ -132,11 +133,11 @@ sysctl = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
-[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+[target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
-[target.'cfg(all(not(target_env = "msvc"), not(target_os = "windows")))'.dependencies]
 tikv-jemalloc-ctl = { workspace = true }
 jemalloc_pprof = { workspace = true }
 pprof = { workspace = true }

@@ -21,6 +21,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | secret.rustfs.access_key | RustFS Access Key ID | `rustfsadmin` |
 | secret.rustfs.secret_key | RustFS Secret Key ID | `rustfsadmin` |
 | storageclass.name | The name for StorageClass. | `local-path` |
+| storageclass.dataStorageSize | The storage size for data PVC. | `256Mi` |
+| storageclass.logStorageSize | The storage size for log PVC. | `256Mi` |
 | ingress.className | Specify the ingress class, traefik or nginx. | `nginx` |
 
 

@@ -33,7 +33,7 @@ use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServ
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
-use socket2::SockRef;
+use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -371,6 +371,20 @@ pub async fn start_http_server(
             };
 
             let socket_ref = SockRef::from(&socket);
+
+            // Enable TCP Keepalive to detect dead clients (e.g. power loss)
+            // Idle: 10s, Interval: 5s, Retries: 3
+            let ka = TcpKeepalive::new()
+                .with_time(Duration::from_secs(10))
+                .with_interval(Duration::from_secs(5));
+
+            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+            let ka = ka.with_retries(3);
+
+            if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
+                warn!(?err, "Failed to set TCP_KEEPALIVE");
+            }
+
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }

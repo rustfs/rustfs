@@ -34,7 +34,7 @@ use std::{collections::HashMap, io::Cursor};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -444,8 +444,9 @@ impl FileMeta {
 
     // Find version
     pub fn find_version(&self, vid: Option<Uuid>) -> Result<(usize, FileMetaVersion)> {
+        let vid = vid.unwrap_or_default();
         for (i, fver) in self.versions.iter().enumerate() {
-            if fver.header.version_id == vid {
+            if fver.header.version_id == Some(vid) {
                 let version = self.get_idx(i)?;
                 return Ok((i, version));
             }
@@ -456,9 +457,12 @@ impl FileMeta {
 
     // shard_data_dir_count queries the count of data_dir under vid
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
+        let vid = vid.unwrap_or_default();
         self.versions
             .iter()
-            .filter(|v| v.header.version_type == VersionType::Object && v.header.version_id != *vid && v.header.user_data_dir())
+            .filter(|v| {
+                v.header.version_type == VersionType::Object && v.header.version_id != Some(vid) && v.header.user_data_dir()
+            })
             .map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).unwrap_or_default())
             .filter(|v| v == data_dir)
             .count()
@@ -890,12 +894,11 @@ impl FileMeta {
         read_data: bool,
         all_parts: bool,
     ) -> Result<FileInfo> {
-        let has_vid = {
+        let vid = {
             if !version_id.is_empty() {
-                let id = Uuid::parse_str(version_id)?;
-                if !id.is_nil() { Some(id) } else { None }
+                Uuid::parse_str(version_id)?
             } else {
-                None
+                Uuid::nil()
             }
         };
 
@@ -905,12 +908,12 @@ impl FileMeta {
         for ver in self.versions.iter() {
             let header = &ver.header;
 
-            if let Some(vid) = has_vid {
-                if header.version_id != Some(vid) {
-                    is_latest = false;
-                    succ_mod_time = header.mod_time;
-                    continue;
-                }
+            // TODO: freeVersion
+
+            if !version_id.is_empty() && header.version_id != Some(vid) {
+                is_latest = false;
+                succ_mod_time = header.mod_time;
+                continue;
             }
 
             let mut fi = ver.into_fileinfo(volume, path, all_parts)?;
@@ -932,7 +935,7 @@ impl FileMeta {
             return Ok(fi);
         }
 
-        if has_vid.is_none() {
+        if version_id.is_empty() {
             Err(Error::FileNotFound)
         } else {
             Err(Error::FileVersionNotFound)
@@ -1091,13 +1094,10 @@ impl FileMeta {
 
     /// Count shared data directories
     pub fn shared_data_dir_count(&self, version_id: Option<Uuid>, data_dir: Option<Uuid>) -> usize {
+        let version_id = version_id.unwrap_or_default();
+
         if self.data.entries().unwrap_or_default() > 0
-            && version_id.is_some()
-            && self
-                .data
-                .find(version_id.unwrap().to_string().as_str())
-                .unwrap_or_default()
-                .is_some()
+            && self.data.find(version_id.to_string().as_str()).unwrap_or_default().is_some()
         {
             return 0;
         }
@@ -1105,7 +1105,9 @@ impl FileMeta {
         self.versions
             .iter()
             .filter(|v| {
-                v.header.version_type == VersionType::Object && v.header.version_id != version_id && v.header.user_data_dir()
+                v.header.version_type == VersionType::Object
+                    && v.header.version_id != Some(version_id)
+                    && v.header.user_data_dir()
             })
             .filter_map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).ok())
             .filter(|&dir| dir == data_dir)

@@ -416,76 +416,88 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
 
     // Tracer（HTTP）
     let tracer_provider = {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(trace_ep.as_str())
-            .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Gzip)
-            .build()
-            .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
+        if trace_ep.is_empty() {
+            None
+        } else {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(trace_ep.as_str())
+                .with_protocol(Protocol::HttpBinary)
+                .with_compression(Compression::Gzip)
+                .build()
+                .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
 
-        let mut builder = SdkTracerProvider::builder()
-            .with_sampler(sampler)
-            .with_id_generator(RandomIdGenerator::default())
-            .with_resource(res.clone())
-            .with_batch_exporter(exporter);
+            let mut builder = SdkTracerProvider::builder()
+                .with_sampler(sampler)
+                .with_id_generator(RandomIdGenerator::default())
+                .with_resource(res.clone())
+                .with_batch_exporter(exporter);
 
-        if use_stdout {
-            builder = builder.with_batch_exporter(opentelemetry_stdout::SpanExporter::default());
+            if use_stdout {
+                builder = builder.with_batch_exporter(opentelemetry_stdout::SpanExporter::default());
+            }
+
+            let provider = builder.build();
+            global::set_tracer_provider(provider.clone());
+            Some(provider)
         }
-
-        let provider = builder.build();
-        global::set_tracer_provider(provider.clone());
-        provider
     };
 
     // Meter（HTTP）
     let meter_provider = {
-        let exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(metric_ep.as_str())
-            .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
-            .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Gzip)
-            .build()
-            .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
-        let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+        if metric_ep.is_empty() {
+            None
+        } else {
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
+                .with_http()
+                .with_endpoint(metric_ep.as_str())
+                .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
+                .with_protocol(Protocol::HttpBinary)
+                .with_compression(Compression::Gzip)
+                .build()
+                .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
+            let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
 
-        let (provider, recorder) = Recorder::builder(service_name.clone())
-            .with_meter_provider(|b| {
-                let b = b.with_resource(res.clone()).with_reader(
-                    PeriodicReader::builder(exporter)
-                        .with_interval(Duration::from_secs(meter_interval))
-                        .build(),
-                );
-                if use_stdout {
-                    b.with_reader(create_periodic_reader(meter_interval))
-                } else {
-                    b
-                }
-            })
-            .build();
-        global::set_meter_provider(provider.clone());
-        metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
-        provider
+            let (provider, recorder) = Recorder::builder(service_name.clone())
+                .with_meter_provider(|b| {
+                    let b = b.with_resource(res.clone()).with_reader(
+                        PeriodicReader::builder(exporter)
+                            .with_interval(Duration::from_secs(meter_interval))
+                            .build(),
+                    );
+                    if use_stdout {
+                        b.with_reader(create_periodic_reader(meter_interval))
+                    } else {
+                        b
+                    }
+                })
+                .build();
+            global::set_meter_provider(provider.clone());
+            metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+            Some(provider)
+        }
     };
 
     // Logger（HTTP）
     let logger_provider = {
-        let exporter = opentelemetry_otlp::LogExporter::builder()
-            .with_http()
-            .with_endpoint(log_ep.as_str())
-            .with_protocol(Protocol::HttpBinary)
-            .with_compression(Compression::Gzip)
-            .build()
-            .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
+        if log_ep.is_empty() {
+            None
+        } else {
+            let exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_http()
+                .with_endpoint(log_ep.as_str())
+                .with_protocol(Protocol::HttpBinary)
+                .with_compression(Compression::Gzip)
+                .build()
+                .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
 
-        let mut builder = SdkLoggerProvider::builder().with_resource(res);
-        builder = builder.with_batch_exporter(exporter);
-        if use_stdout {
-            builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+            let mut builder = SdkLoggerProvider::builder().with_resource(res);
+            builder = builder.with_batch_exporter(exporter);
+            if use_stdout {
+                builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+            }
+            Some(builder.build())
         }
-        builder.build()
     };
 
     // Tracing layer
@@ -512,16 +524,21 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
     };
 
     let filter = build_env_filter(logger_level, None);
-    let otel_bridge = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(build_env_filter(logger_level, None));
-    let tracer = tracer_provider.tracer(service_name.to_string());
+    let otel_bridge = logger_provider
+        .as_ref()
+        .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
+    let tracer_layer = tracer_provider
+        .as_ref()
+        .map(|p| OpenTelemetryLayer::new(p.tracer(service_name.to_string())));
+    let metrics_layer = meter_provider.as_ref().map(|p| MetricsLayer::new(p.clone()));
 
     tracing_subscriber::registry()
         .with(filter)
         .with(ErrorLayer::default())
         .with(fmt_layer_opt)
-        .with(OpenTelemetryLayer::new(tracer))
+        .with(tracer_layer)
         .with(otel_bridge)
-        .with(MetricsLayer::new(meter_provider.clone()))
+        .with(metrics_layer)
         .init();
 
     OBSERVABILITY_METRIC_ENABLED.set(true).ok();
@@ -532,9 +549,9 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
     );
 
     Ok(OtelGuard {
-        tracer_provider: Some(tracer_provider),
-        meter_provider: Some(meter_provider),
-        logger_provider: Some(logger_provider),
+        tracer_provider,
+        meter_provider,
+        logger_provider,
         flexi_logger_handles: None,
         tracing_guard: None,
     })

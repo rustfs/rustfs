@@ -190,16 +190,32 @@ impl NotificationSys {
 
     pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
+        let endpoints = get_global_endpoints();
+        let peer_timeout = Duration::from_secs(2); // Same timeout as server_info
 
         for client in self.peer_clients.iter() {
+            let endpoints = endpoints.clone();
             futures.push(async move {
                 if let Some(client) = client {
-                    match client.local_storage_info().await {
-                        Ok(info) => Some(info),
-                        Err(_) => Some(rustfs_madmin::StorageInfo {
-                            disks: get_offline_disks(&client.host.to_string(), &get_global_endpoints()),
-                            ..Default::default()
-                        }),
+                    let host = client.host.to_string();
+                    // Wrap in timeout to ensure we don't hang on dead peers
+                    match timeout(peer_timeout, client.local_storage_info()).await {
+                        Ok(Ok(info)) => Some(info),
+                        Ok(Err(err)) => {
+                            warn!("peer {} storage_info failed: {}", host, err);
+                            Some(rustfs_madmin::StorageInfo {
+                                disks: get_offline_disks(&host, &endpoints),
+                                ..Default::default()
+                            })
+                        }
+                        Err(_) => {
+                            warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
+                            client.evict_connection().await;
+                            Some(rustfs_madmin::StorageInfo {
+                                disks: get_offline_disks(&host, &endpoints),
+                                ..Default::default()
+                            })
+                        }
                     }
                 } else {
                     None
@@ -230,13 +246,19 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
-                    call_peer_with_timeout(
-                        peer_timeout,
-                        &host,
-                        || client.server_info(),
-                        || offline_server_properties(&host, &endpoints),
-                    )
-                    .await
+                    match timeout(peer_timeout, client.server_info()).await {
+                        Ok(Ok(info)) => info,
+                        Ok(Err(err)) => {
+                            warn!("peer {} server_info failed: {}", host, err);
+                            // client.server_info handles eviction internally on error, but fallback needed
+                            offline_server_properties(&host, &endpoints)
+                        }
+                        Err(_) => {
+                            warn!("peer {} server_info timed out after {:?}", host, peer_timeout);
+                            client.evict_connection().await;
+                            offline_server_properties(&host, &endpoints)
+                        }
+                    }
                 } else {
                     ServerProperties::default()
                 }
