@@ -166,14 +166,13 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE="true" \
     RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
-    RUSTFS_OBS_LOG_DIRECTORY="/logs" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
     RUSTFS_UID="1000" \
     RUSTFS_GID="1000"
 
 EXPOSE 9000
-VOLUME ["/data", "/logs"]
+VOLUME ["/data"]
 
 # Keep root here; entrypoint will drop privileges using chroot --userspec
 ENTRYPOINT ["/entrypoint.sh"]
