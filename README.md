@@ -153,6 +153,23 @@ make help-docker                      # Show all Docker-related commands
 
 Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) to install RustFS on a Kubernetes cluster.
 
+### 5\. Nix Flake (Option 5)
+
+If you have [Nix with flakes enabled](https://nixos.wiki/wiki/Flakes#Enable_flakes):
+
+```bash
+# Run directly without installing
+nix run github:rustfs/rustfs
+
+# Build the binary
+nix build github:rustfs/rustfs
+./result/bin/rustfs --help
+
+# Or from a local checkout
+nix build
+nix run
+```
+
 -----
 
 ### Accessing RustFS
