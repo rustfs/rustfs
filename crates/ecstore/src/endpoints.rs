@@ -232,7 +232,7 @@ impl PoolEndpointList {
 
         for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
-            let mut path_ip_map: HashMap<&str, HashSet<IpAddr>> = HashMap::new();
+            let mut path_ip_map: HashMap<String, HashSet<IpAddr>> = HashMap::new();
             let mut host_ip_cache = HashMap::new();
             for ep in endpoints.as_ref() {
                 if !ep.url.has_host() {
@@ -275,8 +275,9 @@ impl PoolEndpointList {
                 match path_ip_map.entry(path) {
                     Entry::Occupied(mut e) => {
                         if e.get().intersection(host_ip_set).count() > 0 {
+                            let path_key = e.key().clone();
                             return Err(Error::other(format!(
-                                "same path '{path}' can not be served by different port on same address"
+                                "same path '{path_key}' can not be served by different port on same address"
                             )));
                         }
                         e.get_mut().extend(host_ip_set.iter());
@@ -295,7 +296,7 @@ impl PoolEndpointList {
                 }
 
                 let path = ep.get_file_path();
-                if local_path_set.contains(path) {
+                if local_path_set.contains(&path) {
                     return Err(Error::other(format!(
                         "path '{path}' cannot be served by different address on same server"
                     )));
