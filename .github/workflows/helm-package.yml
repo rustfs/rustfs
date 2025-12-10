@@ -5,6 +5,9 @@ on:
     workflows: ["Build and Release"]
     types: [completed]
 
+permissions:
+  contents: read
+
 env:
   new_version: ${{ github.event.workflow_run.head_branch }}
 
