@@ -50,3 +50,8 @@ base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
+http = { workspace = true }
+sha2 = { workspace = true }
+faster-hex = { workspace = true }
