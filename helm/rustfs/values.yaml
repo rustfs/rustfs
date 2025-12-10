@@ -5,6 +5,9 @@
 # This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
 replicaCount: 4
 
+# This allows to mount multiple volume per replica
+volumesPerReplica: 4
+
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
   repository: rustfs/rustfs
