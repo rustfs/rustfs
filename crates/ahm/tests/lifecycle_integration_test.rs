@@ -12,10 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use async_trait::async_trait;
 use rustfs_ahm::scanner::{Scanner, data_scanner::ScannerConfig};
 use rustfs_ecstore::{
-    bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
-    bucket::metadata_sys,
+    bucket::{
+        metadata::BUCKET_LIFECYCLE_CONFIG,
+        metadata_sys,
+        replication::{
+            DeletedObjectReplicationInfo, DynReplicationPool, GLOBAL_REPLICATION_POOL, ReplicationPoolTrait, ReplicationPriority,
+        },
+        target::{BucketTarget, BucketTargetType, BucketTargets},
+        utils::serialize,
+    },
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     global::GLOBAL_TierConfigMgr,
@@ -23,18 +31,27 @@ use rustfs_ecstore::{
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
+use rustfs_filemeta::{ReplicateObjectInfo, ReplicationStatusType};
+use rustfs_utils::http::headers::{AMZ_BUCKET_REPLICATION_STATUS, RESERVED_METADATA_PREFIX_LOWER};
+use s3s::dto::{
+    BucketVersioningStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicationConfiguration,
+    ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+};
 use serial_test::serial;
 use std::{
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
+const TEST_REPLICATION_TARGET_ARN: &str = "arn:aws:s3:::rustfs-lifecycle-replication-test";
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -157,6 +174,167 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
         .expect("Failed to upload test object");
 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
+}
+
+#[derive(Debug, Default)]
+struct RecordingReplicationPool {
+    replica_tasks: Mutex<Vec<ReplicateObjectInfo>>,
+    delete_tasks: Mutex<Vec<DeletedObjectReplicationInfo>>,
+}
+
+impl RecordingReplicationPool {
+    async fn take_replica_tasks(&self) -> Vec<ReplicateObjectInfo> {
+        let mut guard = self.replica_tasks.lock().await;
+        guard.drain(..).collect()
+    }
+}
+
+#[async_trait]
+impl ReplicationPoolTrait for RecordingReplicationPool {
+    async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
+        self.replica_tasks.lock().await.push(ri);
+    }
+
+    async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) {
+        self.delete_tasks.lock().await.push(ri);
+    }
+
+    async fn resize(&self, _priority: ReplicationPriority, _max_workers: usize, _max_l_workers: usize) {}
+
+    async fn init_resync(
+        self: Arc<Self>,
+        _cancellation_token: CancellationToken,
+        _buckets: Vec<String>,
+    ) -> Result<(), rustfs_ecstore::error::Error> {
+        Ok(())
+    }
+}
+
+async fn ensure_test_replication_pool() -> Arc<RecordingReplicationPool> {
+    static POOL: OnceLock<Arc<RecordingReplicationPool>> = OnceLock::new();
+    if let Some(existing) = POOL.get() {
+        existing.replica_tasks.lock().await.clear();
+        existing.delete_tasks.lock().await.clear();
+        return existing.clone();
+    }
+
+    let pool = Arc::new(RecordingReplicationPool::default());
+    let dyn_pool: Arc<DynReplicationPool> = pool.clone();
+    GLOBAL_REPLICATION_POOL
+        .get_or_init(|| {
+            let pool_clone = dyn_pool.clone();
+            async move { pool_clone }
+        })
+        .await;
+    let _ = POOL.set(pool.clone());
+    pool
+}
+
+async fn configure_bucket_replication(bucket: &str) {
+    let meta = metadata_sys::get(bucket)
+        .await
+        .expect("bucket metadata should exist for replication configuration");
+    let mut metadata = (*meta).clone();
+
+    let replication_rule = ReplicationRule {
+        delete_marker_replication: None,
+        delete_replication: None,
+        destination: Destination {
+            access_control_translation: None,
+            account: None,
+            bucket: TEST_REPLICATION_TARGET_ARN.to_string(),
+            encryption_configuration: None,
+            metrics: None,
+            replication_time: None,
+            storage_class: None,
+        },
+        existing_object_replication: Some(ExistingObjectReplication {
+            status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+        }),
+        filter: None,
+        id: Some("lifecycle-replication-rule".to_string()),
+        prefix: Some(String::new()),
+        priority: Some(1),
+        source_selection_criteria: None,
+        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+    };
+
+    let replication_cfg = ReplicationConfiguration {
+        role: TEST_REPLICATION_TARGET_ARN.to_string(),
+        rules: vec![replication_rule],
+    };
+
+    let bucket_targets = BucketTargets {
+        targets: vec![BucketTarget {
+            source_bucket: bucket.to_string(),
+            endpoint: "replication.invalid".to_string(),
+            target_bucket: "replication-target".to_string(),
+            arn: TEST_REPLICATION_TARGET_ARN.to_string(),
+            target_type: BucketTargetType::ReplicationService,
+            ..Default::default()
+        }],
+    };
+
+    metadata.replication_config = Some(replication_cfg.clone());
+    metadata.replication_config_xml = serialize(&replication_cfg).expect("serialize replication config");
+    metadata.bucket_target_config = Some(bucket_targets.clone());
+    metadata.bucket_targets_config_json = serde_json::to_vec(&bucket_targets).expect("serialize bucket targets");
+
+    let versioning_cfg = VersioningConfiguration {
+        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        ..Default::default()
+    };
+    metadata.versioning_config = Some(versioning_cfg.clone());
+    metadata.versioning_config_xml = serialize(&versioning_cfg).expect("serialize versioning config");
+
+    metadata_sys::set_bucket_metadata(bucket.to_string(), metadata)
+        .await
+        .expect("failed to persist bucket metadata with replication config");
+}
+
+async fn upload_object_with_replication_status(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    status: ReplicationStatusType,
+) {
+    let mut reader = PutObjReader::from_vec(b"replication-state".to_vec());
+    let mut opts = ObjectOptions::default();
+    opts.user_defined
+        .insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), status.as_str().to_string());
+    let internal_key = format!("{}replication-status", RESERVED_METADATA_PREFIX_LOWER);
+    opts.user_defined
+        .insert(internal_key, format!("{}={};", TEST_REPLICATION_TARGET_ARN, status.as_str()));
+
+    (**ecstore)
+        .put_object(bucket, object, &mut reader, &opts)
+        .await
+        .expect("failed to upload replication test object");
+}
+
+async fn upload_object_with_retention(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8], retain_for: Duration) {
+    use s3s::header::{X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
+    use time::format_description::well_known::Rfc3339;
+
+    let mut reader = PutObjReader::from_vec(data.to_vec());
+    let mut opts = ObjectOptions::default();
+    let retain_duration = TimeDuration::try_from(retain_for).unwrap_or_else(|_| TimeDuration::seconds(0));
+    let retain_until = OffsetDateTime::now_utc() + retain_duration;
+    let retain_until_str = retain_until.format(&Rfc3339).expect("format retain date");
+    let lock_mode_key = X_AMZ_OBJECT_LOCK_MODE.as_str().to_string();
+    let lock_mode_lower = lock_mode_key.to_lowercase();
+    opts.user_defined.insert(lock_mode_lower, "GOVERNANCE".to_string());
+    opts.user_defined.insert(lock_mode_key, "GOVERNANCE".to_string());
+
+    let retain_key = X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string();
+    let retain_key_lower = retain_key.to_lowercase();
+    opts.user_defined.insert(retain_key_lower, retain_until_str.clone());
+    opts.user_defined.insert(retain_key, retain_until_str);
+
+    (**ecstore)
+        .put_object(bucket, object, &mut reader, &opts)
+        .await
+        .expect("Failed to upload retained object");
 }
 
 /// Test helper: Set bucket lifecycle configuration
@@ -693,5 +871,128 @@ mod serial_tests {
         println!("✅ Scanner stopped");
 
         println!("Lifecycle transition basic test completed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_lifecycle_respects_object_lock_retention() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let bucket_name = format!("test-lc-lock-retention-{}", &suffix[..8]);
+        let object_name = "test/locked-object.txt";
+        let test_data = b"retained payload";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_object_with_retention(&ecstore, bucket_name.as_str(), object_name, test_data, Duration::from_secs(3600)).await;
+
+        assert!(
+            object_exists(&ecstore, bucket_name.as_str(), object_name).await,
+            "Object should exist before lifecycle processing"
+        );
+
+        set_bucket_lifecycle(bucket_name.as_str())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let scanner_config = ScannerConfig {
+            scan_interval: Duration::from_millis(100),
+            deep_scan_interval: Duration::from_millis(500),
+            max_concurrent_scans: 1,
+            ..Default::default()
+        };
+        let scanner = Scanner::new(Some(scanner_config), None);
+        scanner.start().await.expect("Failed to start scanner");
+
+        for _ in 0..3 {
+            scanner.scan_cycle().await.expect("scan cycle should succeed");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert!(
+            object_exists(&ecstore, bucket_name.as_str(), object_name).await,
+            "Object with active retention should not be deleted by lifecycle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_lifecycle_triggers_replication_heal_for_lagging_and_failed_objects() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let bucket_name = format!("lc-replication-{}", &suffix[..8]);
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        configure_bucket_replication(bucket_name.as_str()).await;
+        let replication_pool = ensure_test_replication_pool().await;
+
+        upload_object_with_replication_status(
+            &ecstore,
+            bucket_name.as_str(),
+            "test/lagging-pending",
+            ReplicationStatusType::Pending,
+        )
+        .await;
+        upload_object_with_replication_status(
+            &ecstore,
+            bucket_name.as_str(),
+            "test/failed-object",
+            ReplicationStatusType::Failed,
+        )
+        .await;
+
+        let scanner_config = ScannerConfig {
+            scan_interval: Duration::from_millis(100),
+            deep_scan_interval: Duration::from_millis(500),
+            max_concurrent_scans: 2,
+            replication_pending_grace: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let scanner = Scanner::new(Some(scanner_config), None);
+
+        scanner.scan_cycle().await.expect("scan cycle should complete");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let replica_tasks = replication_pool.take_replica_tasks().await;
+        assert!(
+            replica_tasks.iter().any(|t| t.name == "test/lagging-pending"),
+            "Pending object should be enqueued for replication heal: {:?}",
+            replica_tasks
+        );
+        assert!(
+            replica_tasks.iter().any(|t| t.name == "test/failed-object"),
+            "Failed object should be enqueued for replication heal: {:?}",
+            replica_tasks
+        );
+
+        let metrics = scanner.get_metrics().await;
+        assert_eq!(
+            metrics.replication_tasks_queued,
+            replica_tasks.len() as u64,
+            "Replication tasks queued metric should match recorded tasks"
+        );
+        assert!(
+            metrics.replication_pending_objects >= 1,
+            "Pending replication metric should be incremented"
+        );
+        assert!(metrics.replication_failed_objects >= 1, "Failed replication metric should be incremented");
+        assert!(
+            metrics.replication_lagging_objects >= 1,
+            "Lagging replication metric should track pending object beyond grace"
+        );
+
+        let bucket_metrics = metrics
+            .bucket_metrics
+            .get(&bucket_name)
+            .expect("bucket metrics should contain replication counters");
+        assert!(
+            bucket_metrics.replication_pending >= 1 && bucket_metrics.replication_failed >= 1,
+            "Bucket-level replication metrics should reflect observed statuses"
+        );
+        assert_eq!(
+            bucket_metrics.replication_tasks_queued,
+            replica_tasks.len() as u64,
+            "Bucket-level queued counter should match enqueued tasks"
+        );
     }
 }

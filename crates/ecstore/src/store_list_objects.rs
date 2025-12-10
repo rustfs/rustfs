@@ -314,13 +314,15 @@ impl ECStore {
 
         // contextCanceled
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-        )
-        .await;
+        let entries = list_result.entries.unwrap_or_default();
+        for entry in entries.entries() {
+            if entry.is_object() {
+                let fi = entry.to_fileinfo(bucket).unwrap();
+                tracing::warn!("list_objects_generic file_info: {:?}", fi);
+            }
+        }
+
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, bucket, prefix, delimiter.clone()).await;
 
         let is_truncated = {
             if max_keys > 0 && get_objects.len() > max_keys as usize {

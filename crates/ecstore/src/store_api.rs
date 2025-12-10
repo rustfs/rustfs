@@ -34,8 +34,8 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
-use rustfs_utils::http::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_STORAGE_CLASS};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -745,7 +745,22 @@ impl ObjectInfo {
         let inlined = fi.inline_data();
 
         // TODO:expires
-        // TODO:ReplicationState
+
+        let mut replication_status_internal = None;
+        let mut version_purge_status_internal = None;
+        if let Some(replication_state) = fi.replication_state_internal.as_ref() {
+            replication_status_internal = replication_state.replication_status_internal.clone();
+            version_purge_status_internal = replication_state.version_purge_status_internal.clone();
+        }
+        let mut replication_status = fi.replication_status();
+        if replication_status.is_empty()
+            && let Some(status) = fi.metadata.get(AMZ_BUCKET_REPLICATION_STATUS)
+            && status == ReplicationStatusType::Replica.as_str()
+        {
+            replication_status = ReplicationStatusType::Replica;
+        }
+
+        let version_purge_status = fi.version_purge_status();
 
         let transitioned_object = TransitionedObject {
             name: fi.transitioned_objname.clone(),
@@ -810,6 +825,10 @@ impl ObjectInfo {
             transitioned_object,
             checksum: fi.checksum.clone(),
             storage_class,
+            replication_status_internal,
+            version_purge_status_internal,
+            replication_status,
+            version_purge_status,
             ..Default::default()
         }
     }

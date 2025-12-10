@@ -62,6 +62,7 @@ struct DiskScanResult {
 pub struct LocalObjectRecord {
     pub usage: LocalObjectUsage,
     pub object_info: Option<rustfs_ecstore::store_api::ObjectInfo>,
+    pub file_info: Option<FileInfo>,
 }
 
 #[derive(Debug, Default)]
@@ -223,9 +224,11 @@ fn scan_disk_blocking(root: PathBuf, meta: LocalUsageSnapshotMeta, mut state: In
                             record.usage.last_modified_ns = mtime_ns;
                             state.objects.insert(rel_path.clone(), record.usage.clone());
                             emitted.insert(rel_path.clone());
+                            warn!("compute_object_usage: record: {:?}", record.clone());
                             objects_by_bucket.entry(record.usage.bucket.clone()).or_default().push(record);
                         }
                         Ok(None) => {
+                            warn!("compute_object_usage: None, rel_path: {:?}", rel_path);
                             state.objects.remove(&rel_path);
                         }
                         Err(err) => {
@@ -240,24 +243,27 @@ fn scan_disk_blocking(root: PathBuf, meta: LocalUsageSnapshotMeta, mut state: In
                     warn!("Failed to read xl.meta {:?}: {}", xl_path, err);
                 }
             }
+        } else {
+            warn!("should_parse: false, rel_path: {:?}", rel_path);
         }
     }
 
     state.objects.retain(|key, _| visited.contains(key));
     state.last_scan_ns = Some(now_ns);
 
-    for (key, usage) in &state.objects {
-        if emitted.contains(key) {
-            continue;
-        }
-        objects_by_bucket
-            .entry(usage.bucket.clone())
-            .or_default()
-            .push(LocalObjectRecord {
-                usage: usage.clone(),
-                object_info: None,
-            });
-    }
+    // for (key, usage) in &state.objects {
+    //     if emitted.contains(key) {
+    //         continue;
+    //     }
+    //     objects_by_bucket
+    //         .entry(usage.bucket.clone())
+    //         .or_default()
+    //         .push(LocalObjectRecord {
+    //             usage: usage.clone(),
+    //             object_info: None,
+    //             file_info: None,
+    //         });
+    // }
 
     let snapshot = build_snapshot(meta, &state.objects, now);
     status.snapshot_exists = true;
@@ -319,6 +325,7 @@ fn compute_object_usage(bucket: &str, object: &str, file_meta: &FileMeta) -> Res
         let versioned = fi.version_id.is_some();
         ObjectInfo::from_file_info(fi, bucket, object, versioned)
     });
+    let file_info = latest_file_info.clone();
 
     Ok(Some(LocalObjectRecord {
         usage: LocalObjectUsage {
@@ -331,6 +338,7 @@ fn compute_object_usage(bucket: &str, object: &str, file_meta: &FileMeta) -> Res
             has_live_object,
         },
         object_info,
+        file_info,
     }))
 }
 
