@@ -57,7 +57,7 @@ process_data_volumes() {
 process_log_directory() {
   # Output logs to stdout
   if [ -z "$RUSTFS_OBS_LOG_DIRECTORY" ]; then
-    echo "OBS log directory not configurated and logs outputs to stdout"
+    echo "OBS log directory not configured and logs outputs to stdout"
     return
   fi
 
