@@ -440,11 +440,11 @@ impl PoolMeta {
     }
 }
 
-fn path2_bucket_object(name: &str) -> (String, String) {
+pub fn path2_bucket_object(name: &str) -> (String, String) {
     path2_bucket_object_with_base_path("", name)
 }
 
-fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
     // Trim the base path and leading slash
     let trimmed_path = path
         .strip_prefix(base_path)

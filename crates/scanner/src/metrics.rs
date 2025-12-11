@@ -546,3 +546,31 @@ impl Default for Metrics {
         Self::new()
     }
 }
+
+pub struct CloseDiskGuard(CloseDiskFn);
+
+impl CloseDiskGuard {
+    pub fn new(close_disk: CloseDiskFn) -> Self {
+        Self(close_disk)
+    }
+
+    pub async fn close(&self) {
+        (self.0)().await;
+    }
+}
+
+impl Drop for CloseDiskGuard {
+    fn drop(&mut self) {
+        // Drop cannot be async, so we spawn the async cleanup task
+        // The task will run in the background and complete asynchronously
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let close_fn = self.0.clone();
+            handle.spawn(async move {
+                close_fn().await;
+            });
+        } else {
+            // If we're not in a tokio runtime context, we can't spawn
+            // This is a best-effort cleanup, so we just skip it
+        }
+    }
+}

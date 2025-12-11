@@ -31,4 +31,4 @@ pub mod scanner_io;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
-pub use scanner::run_scanner;
+pub use scanner::init_data_scanner;

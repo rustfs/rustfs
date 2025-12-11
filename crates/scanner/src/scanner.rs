@@ -34,6 +34,24 @@ use tracing::{error, info, warn};
 const DATA_USAGE_UPDATE_DIR_CYCLES: usize = 16;
 const DATA_SCANNER_START_DELAY: Duration = Duration::from_secs(60);
 
+pub fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
+    let ctx_clone = ctx.clone();
+    let storeapi_clone = storeapi.clone();
+    tokio::spawn(async move {
+        loop {
+            if ctx_clone.is_cancelled() {
+                break;
+            }
+
+            if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
+                error!("Failed to run data scanner: {e}");
+            }
+            tokio::time::sleep(DATA_SCANNER_START_DELAY).await;
+        }
+    });
+    Ok(())
+}
+
 fn get_cycle_scan_mode(_current_cycle: u64, _bitrot_start_cycle: u64, _bitrot_start_time: Option<DateTime<Utc>>) -> HealScanMode {
     // TODO: from config
     HealScanMode::Normal
@@ -99,7 +117,7 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
     }
 }
 
-pub async fn run_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
+pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
     // TODO: leader lock
 
     let mut cycle_info = CurrentCycle::default();

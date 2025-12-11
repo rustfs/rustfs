@@ -953,7 +953,7 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            version_id: self.version_id.clone(),
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,

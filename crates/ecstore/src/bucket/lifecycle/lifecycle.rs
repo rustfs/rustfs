@@ -18,19 +18,23 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
     ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
 };
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Display;
 use std::sync::Arc;
 use time::macros::{datetime, offset};
 use time::{self, Duration, OffsetDateTime};
 use tracing::info;
+use uuid::Uuid;
 
 use crate::bucket::lifecycle::rule::TransitionOps;
+use crate::store_api::ObjectInfo;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
@@ -131,11 +135,11 @@ impl RuleValidate for LifecycleRule {
 pub trait Lifecycle {
     async fn has_transition(&self) -> bool;
     fn has_expiry(&self) -> bool;
-    async fn has_active_rules(&self, prefix: &str) -> bool;
+    fn has_active_rules(&self, prefix: &str) -> bool;
     async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error>;
     async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<LifecycleRule>>;
     async fn eval(&self, obj: &ObjectOpts) -> Event;
-    async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event;
+    async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime, newer_noncurrent_versions: usize) -> Event;
     //fn set_prediction_headers(&self, w: http.ResponseWriter, obj: ObjectOpts);
     async fn noncurrent_versions_expiration_limit(self: Arc<Self>, obj: &ObjectOpts) -> Event;
 }
@@ -160,7 +164,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         false
     }
 
-    async fn has_active_rules(&self, prefix: &str) -> bool {
+    fn has_active_rules(&self, prefix: &str) -> bool {
         if self.rules.len() == 0 {
             return false;
         }
@@ -274,10 +278,10 @@ impl Lifecycle for BucketLifecycleConfiguration {
     }
 
     async fn eval(&self, obj: &ObjectOpts) -> Event {
-        self.eval_inner(obj, OffsetDateTime::now_utc()).await
+        self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await
     }
 
-    async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event {
+    async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime, newer_noncurrent_versions: usize) -> Event {
         let mut events = Vec::<Event>::new();
         info!(
             "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
@@ -436,10 +440,10 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     obj.is_latest,
                     obj.delete_marker,
                     obj.version_id,
-                    (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker
+                    (obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) && !obj.delete_marker
                 );
                 // Allow expiration for latest objects OR non-versioned objects (empty version_id)
-                if (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker {
+                if (obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) && !obj.delete_marker {
                     info!("eval_inner: entering expiration check");
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
@@ -659,7 +663,7 @@ pub struct ObjectOpts {
     pub user_tags: String,
     pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
-    pub version_id: String,
+    pub version_id: Option<Uuid>,
     pub is_latest: bool,
     pub delete_marker: bool,
     pub num_versions: usize,
@@ -669,11 +673,36 @@ pub struct ObjectOpts {
     pub restore_expires: Option<OffsetDateTime>,
     pub versioned: bool,
     pub version_suspended: bool,
+    pub user_defined: HashMap<String, String>,
+    pub version_purge_status: VersionPurgeStatusType,
+    pub replication_status: ReplicationStatusType,
 }
 
 impl ObjectOpts {
     pub fn expired_object_deletemarker(&self) -> bool {
         self.delete_marker && self.num_versions == 1
+    }
+
+    pub fn from_object_info(oi: &ObjectInfo) -> Self {
+        Self {
+            name: oi.name.clone(),
+            user_tags: oi.user_tags.clone(),
+            mod_time: oi.mod_time,
+            size: oi.size as usize,
+            version_id: oi.version_id.clone(),
+            is_latest: oi.is_latest,
+            delete_marker: oi.delete_marker,
+            num_versions: oi.num_versions,
+            successor_mod_time: oi.successor_mod_time,
+            transition_status: oi.transitioned_object.status.clone(),
+            restore_ongoing: oi.restore_ongoing,
+            restore_expires: oi.restore_expires,
+            versioned: false,
+            version_suspended: false,
+            user_defined: oi.user_defined.clone(),
+            version_purge_status: oi.version_purge_status.clone(),
+            replication_status: oi.replication_status.clone(),
+        }
     }
 }
 

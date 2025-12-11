@@ -15,7 +15,7 @@
 pub mod objectlock;
 pub mod objectlock_sys;
 
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHoldStatus};
 
 pub trait ObjectLockApi {
     fn enabled(&self) -> bool;
@@ -26,5 +26,15 @@ impl ObjectLockApi for ObjectLockConfiguration {
         self.object_lock_enabled
             .as_ref()
             .is_some_and(|v| v.as_str() == ObjectLockEnabled::ENABLED)
+    }
+}
+
+pub trait ObjectLockStatusExt {
+    fn valid(&self) -> bool;
+}
+
+impl ObjectLockStatusExt for ObjectLockLegalHoldStatus {
+    fn valid(&self) -> bool {
+        matches!(self.as_str(), ObjectLockLegalHoldStatus::ON | ObjectLockLegalHoldStatus::OFF)
     }
 }

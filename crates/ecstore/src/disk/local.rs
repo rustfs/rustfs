@@ -717,7 +717,7 @@ impl LocalDisk {
         Ok((buf, mtime))
     }
 
-    async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    pub async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
         // Try to use cached file content reading for better performance, with safe fallback
         let path = file_path.as_ref().to_path_buf();
 

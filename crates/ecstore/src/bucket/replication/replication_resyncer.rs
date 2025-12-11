@@ -744,7 +744,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicationConfig {
     pub config: Option<ReplicationConfiguration>,
     pub remotes: Option<BucketTargets>,

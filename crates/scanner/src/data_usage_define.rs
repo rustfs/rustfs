@@ -26,11 +26,11 @@ use std::{
 use http::HeaderMap;
 use rustfs_ecstore::{
     StorageAPI,
-    bucket::replication::ReplicationConfig,
-    config::com::save_config,
+    bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
+    config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::ObjectOptions,
+    store_api::{ObjectInfo, ObjectOptions},
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::{
@@ -74,6 +74,14 @@ impl TierStats {
             total_size: self.total_size + u.total_size,
             num_versions: self.num_versions + u.num_versions,
             num_objects: self.num_objects + u.num_objects,
+        }
+    }
+
+    pub fn from_object_info(oi: &ObjectInfo) -> Self {
+        TierStats {
+            total_size: oi.size as u64,
+            num_versions: 1,
+            num_objects: if oi.is_latest { 1 } else { 0 },
         }
     }
 }
@@ -210,15 +218,15 @@ pub struct SizeSummary {
     /// Number of delete markers
     pub delete_markers: usize,
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Replica size
-    pub replica_size: usize,
+    pub replica_size: i64,
     /// Replica count
     pub replica_count: usize,
     /// Pending count
@@ -227,19 +235,47 @@ pub struct SizeSummary {
     pub failed_count: usize,
     /// Replication target stats
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
+    pub tier_stats: HashMap<String, TierStats>,
+}
+
+impl SizeSummary {
+    pub fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
+        if oi.delete_marker {
+            self.delete_markers += 1;
+        }
+
+        if oi.version_id.is_some_and(|v| !v.is_nil()) && size == actual_size {
+            self.versions += 1;
+        }
+
+        self.total_size += if size > 0 { size as usize } else { 0 };
+
+        if oi.delete_marker || oi.transitioned_object.free_version {
+            return;
+        }
+
+        let mut tier = oi.storage_class.clone().unwrap_or(storageclass::STANDARD.to_string());
+        if oi.transitioned_object.status == TRANSITION_COMPLETE {
+            tier = oi.transitioned_object.tier.clone();
+        }
+
+        if let Some(tier_stats) = self.tier_stats.get_mut(&tier) {
+            tier_stats.add(&TierStats::from_object_info(oi));
+        }
+    }
 }
 
 /// Replication target size summary
 #[derive(Debug, Default, Clone)]
 pub struct ReplTargetSizeSummary {
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Pending count
     pub pending_count: usize,
     /// Failed count
@@ -551,8 +587,8 @@ pub struct DataUsageCacheInfo {
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
-    // pub lifecycle: Option<BucketLifecycleConfiguration>,
-    // pub replication: Option<ReplicationConfig>,
+    pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+    pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(skip)]
     pub updates: Option<Arc<Mutex<mpsc::Sender<DataUsageEntry>>>>,
 }
@@ -887,7 +923,6 @@ impl DataUsageCache {
         Ok(t)
     }
 
-    /// Load the cache content with name from minioMetaBackgroundOpsBucket.
     /// Only backend errors are returned as errors.
     /// The loader is optimistic and has no locking, but tries 5 times before giving up.
     /// If the object is not found, a nil error with empty data usage cache is returned.
@@ -899,9 +934,7 @@ impl DataUsageCache {
         let mut retries = 0;
         while retries < 5 {
             let (should_retry, cache_opt, result) = Self::try_load_inner(store.clone(), name, Duration::from_secs(60)).await;
-            if let Err(e) = result {
-                return Err(e);
-            }
+            result?;
             if let Some(cache) = cache_opt {
                 *self = cache;
                 return Ok(());
@@ -911,10 +944,10 @@ impl DataUsageCache {
             }
 
             // Try backup file
-            let backup_name = format!("{}.bkp", name);
+            let backup_name = format!("{name}.bkp");
             let (backup_retry, backup_cache_opt, backup_result) =
                 Self::try_load_inner(store.clone(), &backup_name, Duration::from_secs(30)).await;
-            if let Err(_) = backup_result {
+            if backup_result.is_err() {
                 // Error loading backup, continue retry
             } else if let Some(cache) = backup_cache_opt {
                 // Only return when we have valid data from the backup
@@ -966,18 +999,16 @@ impl DataUsageCache {
                     match reader.read_all().await {
                         Ok(data) => {
                             match DataUsageCache::unmarshal(&data) {
-                                Ok(cache) => {
-                                    return Ok(Some(cache));
-                                }
+                                Ok(cache) => Ok(Some(cache)),
                                 Err(_) => {
                                     // Deserialization failed, but we got data
-                                    return Ok(None);
+                                    Ok(None)
                                 }
                             }
                         }
                         Err(e) => {
                             // Read error
-                            return Err(e);
+                            Err(e)
                         }
                     }
                 }
@@ -986,7 +1017,7 @@ impl DataUsageCache {
                         // Try second location: DATA_USAGE_BUCKET/name
                         match store
                             .get_object_reader(
-                                &*DATA_USAGE_BUCKET,
+                                &DATA_USAGE_BUCKET,
                                 load_name,
                                 None,
                                 HeaderMap::new(),
@@ -999,25 +1030,19 @@ impl DataUsageCache {
                         {
                             Ok(mut reader) => match reader.read_all().await {
                                 Ok(data) => match DataUsageCache::unmarshal(&data) {
-                                    Ok(cache) => {
-                                        return Ok(Some(cache));
-                                    }
-                                    Err(_) => {
-                                        return Ok(None);
-                                    }
+                                    Ok(cache) => Ok(Some(cache)),
+                                    Err(_) => Ok(None),
                                 },
-                                Err(e) => {
-                                    return Err(e);
-                                }
+                                Err(e) => Err(e),
                             },
                             Err(inner_err) => match inner_err {
                                 Error::FileNotFound | Error::VolumeNotFound => {
                                     // Object not found in both locations
-                                    return Ok(None);
+                                    Ok(None)
                                 }
                                 Error::ErasureReadQuorum => {
                                     // InsufficientReadQuorum - retry
-                                    return Ok(None);
+                                    Ok(None)
                                 }
                                 _ => {
                                     // Other storage errors - retry
@@ -1027,21 +1052,21 @@ impl DataUsageCache {
                                     ) {
                                         return Ok(None);
                                     }
-                                    return Err(inner_err);
+                                    Err(inner_err)
                                 }
                             },
                         }
                     }
                     Error::ErasureReadQuorum => {
                         // InsufficientReadQuorum - retry
-                        return Ok(None);
+                        Ok(None)
                     }
                     _ => {
                         // Other storage errors - retry
                         if matches!(err, Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown) {
                             return Ok(None);
                         }
-                        return Err(err);
+                        Err(err)
                     }
                 },
             }
@@ -1093,7 +1118,7 @@ impl DataUsageCache {
         }
 
         let store_clone = store.clone();
-        let backup_name = format!("{}.bkp", name);
+        let backup_name = format!("{name}.bkp");
         let res = timeout(Duration::from_secs(5), async move {
             save_config(store_clone, backup_name.as_str(), buf).await?;
             Ok::<(), StorageError>(())
