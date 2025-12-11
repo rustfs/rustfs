@@ -7228,7 +7228,6 @@ dependencies = [
  "lazy_static",
  "md-5 0.11.0-rc.3",
  "moka",
- "nix 0.30.1",
  "num_cpus",
  "parking_lot",
  "path-absolutize",
@@ -7273,7 +7272,6 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
- "winapi",
  "xxhash-rust",
 ]
 
@@ -7343,7 +7341,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
- "tokio-test",
  "tracing",
  "url",
  "uuid",
