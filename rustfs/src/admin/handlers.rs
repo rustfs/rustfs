@@ -158,14 +158,15 @@ impl Operation for IsAdminHandler {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let access_key_to_check = input_cred.access_key.clone();
 
         // Check if the user is admin by comparing with global credentials
         let is_admin = if let Some(sys_cred) = get_global_action_cred() {
-            sys_cred.access_key == access_key_to_check
+            crate::auth::constant_time_eq(&access_key_to_check, &sys_cred.access_key)
+                || crate::auth::constant_time_eq(&cred.parent_user, &sys_cred.access_key)
         } else {
             false
         };

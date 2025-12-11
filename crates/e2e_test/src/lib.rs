@@ -18,6 +18,10 @@ mod reliant;
 #[cfg(test)]
 pub mod common;
 
+// Data usage regression tests
+#[cfg(test)]
+mod data_usage_test;
+
 // KMS-specific test modules
 #[cfg(test)]
 mod kms;
