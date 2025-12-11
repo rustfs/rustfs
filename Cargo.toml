@@ -277,7 +277,7 @@ pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rustfs-mcp", "tokio-test"]
+ignored = ["rustfs", "rustfs-mcp"]
 
 [profile.release]
 opt-level = 3
