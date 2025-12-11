@@ -18,10 +18,6 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
-use http::{HeaderMap, StatusCode};
-use std::collections::HashMap;
-
 use crate::client::{
     api_error_response::http_resp_to_error_response,
     api_s3_datatypes::{
@@ -31,7 +27,11 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
 use crate::store_api::BucketInfo;
+use bytes::Bytes;
+use http::{HeaderMap, StatusCode};
+use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use std::collections::HashMap;
 
 impl TransitionClient {
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, std::io::Error> {
@@ -102,7 +102,12 @@ impl TransitionClient {
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();
-        let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        let b = resp
+            .body_mut()
+            .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+            .await
+            .unwrap()
+            .to_vec();
         let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {

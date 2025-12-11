@@ -18,6 +18,20 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::client::bucket_cache::BucketLocationCache;
+use crate::client::{
+    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
+    api_get_options::GetObjectOptions,
+    api_put_object::PutObjectOptions,
+    api_put_object_multipart::UploadPartParams,
+    api_s3_datatypes::{
+        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
+        ListObjectPartsResult, ObjectPart,
+    },
+    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
+    credentials::{CredContext, Credentials, SignatureType, Static},
+};
+use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use bytes::Bytes;
 use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
@@ -30,7 +44,18 @@ use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector,
 use md5::Digest;
 use md5::Md5;
 use rand::Rng;
+use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::{
+    net::get_endpoint_url,
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
+};
+use s3s::S3ErrorCode;
+use s3s::dto::ReplicationStatus;
+use s3s::{Body, dto::Owner};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Cursor;
@@ -47,31 +72,6 @@ use tokio::io::BufReader;
 use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
-
-use crate::client::bucket_cache::BucketLocationCache;
-use crate::client::{
-    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
-    api_get_options::GetObjectOptions,
-    api_put_object::PutObjectOptions,
-    api_put_object_multipart::UploadPartParams,
-    api_s3_datatypes::{
-        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
-        ListObjectPartsResult, ObjectPart,
-    },
-    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
-    credentials::{CredContext, Credentials, SignatureType, Static},
-};
-use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
-use rustfs_rio::HashReader;
-use rustfs_utils::{
-    net::get_endpoint_url,
-    retry::{
-        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
-    },
-};
-use s3s::S3ErrorCode;
-use s3s::dto::ReplicationStatus;
-use s3s::{Body, dto::Owner};
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
@@ -291,7 +291,12 @@ impl TransitionClient {
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
             //self.dump_http(&cloned_req, &resp)?;
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp
+                .body_mut()
+                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await
+                .unwrap()
+                .to_vec();
             warn!("err_body: {}", String::from_utf8(b).unwrap());
         }
 
@@ -334,7 +339,12 @@ impl TransitionClient {
                 }
             }
 
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp
+                .body_mut()
+                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await
+                .unwrap()
+                .to_vec();
             let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
 

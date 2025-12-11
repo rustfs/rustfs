@@ -198,15 +198,22 @@ impl Endpoint {
         }
     }
 
-    pub fn get_file_path(&self) -> &str {
-        let path = self.url.path();
+    pub fn get_file_path(&self) -> String {
+        let path: &str = self.url.path();
+        let decoded: std::borrow::Cow<'_, str> = match urlencoding::decode(path) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                debug!("Failed to decode path '{}': {}, using original path", path, e);
+                std::borrow::Cow::Borrowed(path)
+            }
+        };
         #[cfg(windows)]
         if self.url.scheme() == "file" {
-            let stripped = path.strip_prefix('/').unwrap_or(path);
+            let stripped: &str = decoded.strip_prefix('/').unwrap_or(&decoded);
             debug!("get_file_path windows: path={}", stripped);
-            return stripped;
+            return stripped.to_string();
         }
-        path
+        decoded.into_owned()
     }
 }
 
@@ -499,6 +506,45 @@ mod test {
         assert_eq!(endpoint.get_file_path(), complex_path);
         assert!(endpoint.is_local);
         assert_eq!(endpoint.get_type(), EndpointType::Path);
+    }
+
+    #[test]
+    fn test_endpoint_with_spaces_in_path() {
+        let path_with_spaces = "/Users/test/Library/Application Support/rustfs/data";
+        let endpoint = Endpoint::try_from(path_with_spaces).unwrap();
+        assert_eq!(endpoint.get_file_path(), path_with_spaces);
+        assert!(endpoint.is_local);
+        assert_eq!(endpoint.get_type(), EndpointType::Path);
+    }
+
+    #[test]
+    fn test_endpoint_percent_encoding_roundtrip() {
+        let path_with_spaces = "/Users/test/Library/Application Support/rustfs/data";
+        let endpoint = Endpoint::try_from(path_with_spaces).unwrap();
+
+        // Verify that the URL internally stores percent-encoded path
+        assert!(
+            endpoint.url.path().contains("%20"),
+            "URL path should contain percent-encoded spaces: {}",
+            endpoint.url.path()
+        );
+
+        // Verify that get_file_path() decodes the percent-encoded path correctly
+        assert_eq!(
+            endpoint.get_file_path(),
+            "/Users/test/Library/Application Support/rustfs/data",
+            "get_file_path() should decode percent-encoded spaces"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_with_various_special_characters() {
+        // Test path with multiple special characters that get percent-encoded
+        let path_with_special = "/tmp/test path/data[1]/file+name&more";
+        let endpoint = Endpoint::try_from(path_with_special).unwrap();
+
+        // get_file_path() should return the original path with decoded characters
+        assert_eq!(endpoint.get_file_path(), path_with_special);
     }
 
     #[test]

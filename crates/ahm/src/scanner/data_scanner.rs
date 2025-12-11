@@ -29,7 +29,7 @@ use rustfs_ecstore::{
     self as ecstore, StorageAPI,
     bucket::versioning::VersioningApi,
     bucket::versioning_sys::BucketVersioningSys,
-    data_usage::{aggregate_local_snapshots, store_data_usage_in_backend},
+    data_usage::{aggregate_local_snapshots, compute_bucket_usage, store_data_usage_in_backend},
     disk::{Disk, DiskAPI, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions},
     set_disk::SetDisks,
     store_api::ObjectInfo,
@@ -137,6 +137,8 @@ pub struct Scanner {
     data_usage_stats: Arc<Mutex<HashMap<String, DataUsageInfo>>>,
     /// Last data usage statistics collection time
     last_data_usage_collection: Arc<RwLock<Option<SystemTime>>>,
+    /// Backoff timestamp for heavy fallback collection
+    fallback_backoff_until: Arc<RwLock<Option<SystemTime>>>,
     /// Heal manager for auto-heal integration
     heal_manager: Option<Arc<HealManager>>,
 
@@ -192,6 +194,7 @@ impl Scanner {
             disk_metrics: Arc::new(Mutex::new(HashMap::new())),
             data_usage_stats: Arc::new(Mutex::new(HashMap::new())),
             last_data_usage_collection: Arc::new(RwLock::new(None)),
+            fallback_backoff_until: Arc::new(RwLock::new(None)),
             heal_manager,
             node_scanner,
             stats_aggregator,
@@ -473,6 +476,8 @@ impl Scanner {
             size: usage.total_size as i64,
             delete_marker: !usage.has_live_object && usage.delete_markers_count > 0,
             mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
+            // Set is_latest to true for live objects - required for lifecycle expiration evaluation
+            is_latest: usage.has_live_object,
             ..Default::default()
         }
     }
@@ -879,12 +884,17 @@ impl Scanner {
     /// Collect and persist data usage statistics
     async fn collect_and_persist_data_usage(&self) -> Result<()> {
         info!("Starting data usage collection and persistence");
+        let now = SystemTime::now();
 
         // Get ECStore instance
         let Some(ecstore) = rustfs_ecstore::new_object_layer_fn() else {
             warn!("ECStore not available for data usage collection");
             return Ok(());
         };
+
+        // Helper to avoid hammering the storage layer with repeated realtime scans.
+        let mut use_cached_on_backoff = false;
+        let fallback_backoff_secs = Duration::from_secs(300);
 
         // Run local usage scan and aggregate snapshots; fall back to on-demand build when necessary.
         let mut data_usage = match local_scan::scan_and_persist_local_usage(ecstore.clone()).await {
@@ -907,15 +917,54 @@ impl Scanner {
                             "Failed to aggregate local data usage snapshots, falling back to realtime collection: {}",
                             e
                         );
-                        self.build_data_usage_from_ecstore(&ecstore).await?
+                        match self.maybe_fallback_collection(now, fallback_backoff_secs, &ecstore).await? {
+                            Some(usage) => usage,
+                            None => {
+                                use_cached_on_backoff = true;
+                                DataUsageInfo::default()
+                            }
+                        }
                     }
                 }
             }
             Err(e) => {
                 warn!("Local usage scan failed (using realtime collection instead): {}", e);
-                self.build_data_usage_from_ecstore(&ecstore).await?
+                match self.maybe_fallback_collection(now, fallback_backoff_secs, &ecstore).await? {
+                    Some(usage) => usage,
+                    None => {
+                        use_cached_on_backoff = true;
+                        DataUsageInfo::default()
+                    }
+                }
             }
         };
+
+        // If heavy fallback was skipped due to backoff, try to reuse cached stats to avoid empty responses.
+        if use_cached_on_backoff && data_usage.buckets_usage.is_empty() {
+            let cached = {
+                let guard = self.data_usage_stats.lock().await;
+                guard.values().next().cloned()
+            };
+            if let Some(cached_usage) = cached {
+                data_usage = cached_usage;
+            }
+
+            // If there is still no data, try backend before persisting zeros
+            if data_usage.buckets_usage.is_empty() {
+                if let Ok(existing) = rustfs_ecstore::data_usage::load_data_usage_from_backend(ecstore.clone()).await {
+                    if !existing.buckets_usage.is_empty() {
+                        info!("Using existing backend data usage during fallback backoff");
+                        data_usage = existing;
+                    }
+                }
+            }
+
+            // Avoid overwriting valid backend stats with zeros when fallback is throttled
+            if data_usage.buckets_usage.is_empty() {
+                warn!("Skipping data usage persistence: fallback throttled and no cached/backend data available");
+                return Ok(());
+            }
+        }
 
         // Make sure bucket counters reflect aggregated content
         data_usage.buckets_count = data_usage.buckets_usage.len() as u64;
@@ -959,8 +1008,31 @@ impl Scanner {
         Ok(())
     }
 
+    async fn maybe_fallback_collection(
+        &self,
+        now: SystemTime,
+        backoff: Duration,
+        ecstore: &Arc<rustfs_ecstore::store::ECStore>,
+    ) -> Result<Option<DataUsageInfo>> {
+        let backoff_until = *self.fallback_backoff_until.read().await;
+        let within_backoff = backoff_until.map(|ts| now < ts).unwrap_or(false);
+
+        if within_backoff {
+            warn!(
+                "Skipping heavy data usage fallback within backoff window (until {:?}); using cached stats if available",
+                backoff_until
+            );
+            return Ok(None);
+        }
+
+        let usage = self.build_data_usage_from_ecstore(ecstore).await?;
+        let mut backoff_guard = self.fallback_backoff_until.write().await;
+        *backoff_guard = Some(now + backoff);
+        Ok(Some(usage))
+    }
+
     /// Build data usage statistics directly from ECStore
-    async fn build_data_usage_from_ecstore(&self, ecstore: &Arc<rustfs_ecstore::store::ECStore>) -> Result<DataUsageInfo> {
+    pub async fn build_data_usage_from_ecstore(&self, ecstore: &Arc<rustfs_ecstore::store::ECStore>) -> Result<DataUsageInfo> {
         let mut data_usage = DataUsageInfo::default();
 
         // Get bucket list
@@ -973,6 +1045,8 @@ impl Scanner {
                 data_usage.last_update = Some(SystemTime::now());
 
                 let mut total_objects = 0u64;
+                let mut total_versions = 0u64;
+                let mut total_delete_markers = 0u64;
                 let mut total_size = 0u64;
 
                 for bucket_info in buckets {
@@ -980,37 +1054,26 @@ impl Scanner {
                         continue; // Skip system buckets
                     }
 
-                    // Try to get actual object count for this bucket
-                    let (object_count, bucket_size) = match ecstore
-                        .clone()
-                        .list_objects_v2(
-                            &bucket_info.name,
-                            "",    // prefix
-                            None,  // continuation_token
-                            None,  // delimiter
-                            100,   // max_keys - small limit for performance
-                            false, // fetch_owner
-                            None,  // start_after
-                            false, // incl_deleted
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            let count = result.objects.len() as u64;
-                            let size = result.objects.iter().map(|obj| obj.size as u64).sum();
-                            (count, size)
-                        }
-                        Err(_) => (0, 0),
-                    };
+                    // Use ecstore pagination helper to avoid truncating at 100 objects
+                    let (object_count, bucket_size, versions_count, delete_markers) =
+                        match compute_bucket_usage(ecstore.clone(), &bucket_info.name).await {
+                            Ok(usage) => (usage.objects_count, usage.size, usage.versions_count, usage.delete_markers_count),
+                            Err(e) => {
+                                warn!("Failed to compute bucket usage for {}: {}", bucket_info.name, e);
+                                (0, 0, 0, 0)
+                            }
+                        };
 
                     total_objects += object_count;
+                    total_versions += versions_count;
+                    total_delete_markers += delete_markers;
                     total_size += bucket_size;
 
                     let bucket_usage = rustfs_common::data_usage::BucketUsageInfo {
                         size: bucket_size,
                         objects_count: object_count,
-                        versions_count: object_count, // Simplified
-                        delete_markers_count: 0,
+                        versions_count,
+                        delete_markers_count: delete_markers,
                         ..Default::default()
                     };
 
@@ -1020,7 +1083,8 @@ impl Scanner {
 
                 data_usage.objects_total_count = total_objects;
                 data_usage.objects_total_size = total_size;
-                data_usage.versions_total_count = total_objects;
+                data_usage.versions_total_count = total_versions;
+                data_usage.delete_markers_total_count = total_delete_markers;
             }
             Err(e) => {
                 warn!("Failed to list buckets for data usage collection: {}", e);
@@ -2554,6 +2618,7 @@ impl Scanner {
             disk_metrics: Arc::clone(&self.disk_metrics),
             data_usage_stats: Arc::clone(&self.data_usage_stats),
             last_data_usage_collection: Arc::clone(&self.last_data_usage_collection),
+            fallback_backoff_until: Arc::clone(&self.fallback_backoff_until),
             heal_manager: self.heal_manager.clone(),
             node_scanner: Arc::clone(&self.node_scanner),
             stats_aggregator: Arc::clone(&self.stats_aggregator),

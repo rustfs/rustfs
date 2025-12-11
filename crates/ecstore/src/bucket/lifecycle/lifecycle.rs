@@ -283,7 +283,17 @@ impl Lifecycle for BucketLifecycleConfiguration {
             "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
             obj.name, obj.mod_time, now, obj.is_latest, obj.delete_marker
         );
-        if obj.mod_time.expect("err").unix_timestamp() == 0 {
+
+        // Gracefully handle missing mod_time instead of panicking
+        let mod_time = match obj.mod_time {
+            Some(t) => t,
+            None => {
+                info!("eval_inner: mod_time is None for object={}, returning default event", obj.name);
+                return Event::default();
+            }
+        };
+
+        if mod_time.unix_timestamp() == 0 {
             info!("eval_inner: mod_time is 0, returning default event");
             return Event::default();
         }
@@ -323,7 +333,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         }
 
                         if let Some(days) = expiration.days {
-                            let expected_expiry = expected_expiry_time(obj.mod_time.unwrap(), days /*, date*/);
+                            let expected_expiry = expected_expiry_time(mod_time, days /*, date*/);
                             if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
                                 events.push(Event {
                                     action: IlmAction::DeleteVersionAction,
@@ -446,11 +456,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 });
                             }
                         } else if let Some(days) = expiration.days {
-                            let expected_expiry: OffsetDateTime = expected_expiry_time(obj.mod_time.unwrap(), days);
+                            let expected_expiry: OffsetDateTime = expected_expiry_time(mod_time, days);
                             info!(
                                 "eval_inner: expiration check - days={}, obj_time={:?}, expiry_time={:?}, now={:?}, should_expire={}",
                                 days,
-                                obj.mod_time.expect("err!"),
+                                mod_time,
                                 expected_expiry,
                                 now,
                                 now.unix_timestamp() > expected_expiry.unix_timestamp()

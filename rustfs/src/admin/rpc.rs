@@ -19,6 +19,7 @@ use futures::StreamExt;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::WalkDirOptions;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -141,11 +142,11 @@ impl Operation for WalkDir {
         };
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "RPC request body too large or failed to read"));
             }
         };
 

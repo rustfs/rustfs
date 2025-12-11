@@ -21,9 +21,9 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
 };
-
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::{
@@ -393,11 +393,11 @@ impl Operation for ImportBucketMetadata {
         .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_BUCKET_METADATA_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "bucket metadata import body too large or failed to read"));
             }
         };
 

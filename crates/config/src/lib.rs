@@ -17,6 +17,8 @@ pub mod constants;
 #[cfg(feature = "constants")]
 pub use constants::app::*;
 #[cfg(feature = "constants")]
+pub use constants::body_limits::*;
+#[cfg(feature = "constants")]
 pub use constants::console::*;
 #[cfg(feature = "constants")]
 pub use constants::env::*;

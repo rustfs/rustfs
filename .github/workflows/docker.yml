@@ -83,7 +83,7 @@ jobs:
       create_latest: ${{ steps.check.outputs.create_latest }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           # For workflow_run events, checkout the specific commit that triggered the workflow
@@ -162,11 +162,11 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  # TODO: 临时修改 - 当前允许 alpha 版本也创建 latest 标签
-                  # 等版本稳定后，需要移除下面这行，恢复原有逻辑（只有稳定版本才创建 latest）
+                  # TODO: Temporary change - currently allows alpha versions to also create latest tags
+                  # After the version is stable, you need to remove the following line and restore the original logic (latest is created only for stable versions)
                   if [[ "$version" == *"alpha"* ]]; then
                     create_latest=true
-                    echo "🧪 Building Docker image for prerelease: $version (临时允许创建 latest 标签)"
+                     echo "🧪 Building Docker image for prerelease: $version (temporarily allowing creation of latest tag)"
                   else
                     echo "🧪 Building Docker image for prerelease: $version"
                   fi
@@ -215,11 +215,11 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                # TODO: 临时修改 - 当前允许 alpha 版本也创建 latest 标签
-                # 等版本稳定后，需要移除下面的 if 块，恢复原有逻辑
+                # TODO: Temporary change - currently allows alpha versions to also create latest tags
+                # After the version is stable, you need to remove the if block below and restore the original logic.
                 if [[ "$input_version" == *"alpha"* ]]; then
                   create_latest=true
-                  echo "🧪 Building with prerelease version: $input_version (临时允许创建 latest 标签)"
+                   echo "🧪 Building with prerelease version: $input_version (temporarily allowing creation of latest tag)"
                 else
                   echo "🧪 Building with prerelease version: $input_version"
                 fi
@@ -268,7 +268,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -330,9 +330,9 @@ jobs:
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
-            # TODO: 临时修改 - 当前 alpha 版本也会创建 latest 标签
-            # 等版本稳定后，这里的逻辑保持不变，但上游的 CREATE_LATEST 设置需要恢复
-            # Stable release (以及临时的 alpha 版本)
+            # TODO: Temporary change - the current alpha version will also create the latest tag
+            # After the version is stabilized, the logic here remains unchanged, but the upstream CREATE_LATEST setting needs to be restored.
+            # Stable release (and temporary alpha versions)
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
@@ -429,10 +429,10 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              # TODO: 临时修改 - alpha 版本当前会创建 latest 标签
-              # 等版本稳定后，需要恢复下面的提示信息
+              # TODO: Temporary change - alpha versions currently create the latest tag
+              # After the version is stable, you need to restore the following prompt information
               if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for alpha version (临时措施)"
+                echo "🏷️  Latest tag has been created for alpha version (temporary measures)"
               else
                 echo "🚫 Latest tag NOT created for prerelease"
               fi
