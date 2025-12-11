@@ -2460,7 +2460,7 @@ impl S3 for FS {
             .clone()
             .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
             .filter(|s| !s.is_empty())
-            .map(ObjectStorageClass::from);
+            .map(StorageClass::from);
 
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;

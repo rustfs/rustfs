@@ -1651,6 +1651,7 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
 }
 
 /// Testing helper to reset the global request counter.
+#[allow(dead_code)]
 pub(crate) fn reset_active_get_requests() {
     ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
 }
