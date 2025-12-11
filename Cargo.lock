@@ -3048,6 +3048,7 @@ dependencies = [
  "rand 0.10.0-rc.5",
  "reqwest",
  "rmp-serde",
+ "rustfs-common",
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-lock",
