@@ -33,28 +33,27 @@ spec:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
-                  mkdir -p /data/rustfs$i
-                done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
-                mkdir -p /data
-              fi
-
+              {{- if gt (int .Values.volumesPerReplica) 1 }}
+              {{- range $i := until (int .Values.volumesPerReplica) }}
+              mkdir -p /data/rustfs{{ $i }}
+              {{- end }}
+              {{- else }}
+              mkdir -p /data
+              {{- end }}
               chown -R 10001:10001 /data
               chown -R 10001:10001 /logs
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            - name: logs
+              mountPath: /logs
+            {{- if gt (int .Values.volumesPerReplica) 1 }}
+            {{- range $i := until (int .Values.volumesPerReplica) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
-            - name: logs
-              mountPath: /logs
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -69,9 +68,6 @@ spec:
               name: endpoint
             - containerPort: {{ .Values.service.console_port }}
               name: console
-          env:
-            - name: REPLICA_COUNT
-              value: "{{ .Values.replicaCount }}"
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
@@ -105,12 +101,12 @@ spec:
           volumeMounts:
             - name: logs
               mountPath: /logs
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if gt (int .Values.volumesPerReplica) 1 }}
+            {{- range $i := until (int .Values.volumesPerReplica) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -123,8 +119,8 @@ spec:
         resources:
           requests:
             storage: {{ $.Values.storageclass.logStorageSize}}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
+    {{- if gt (int .Values.volumesPerReplica) 1 }}
+    {{- range $i := until (int .Values.volumesPerReplica) }}
     - metadata:
         name: data-rustfs-{{ $i }}
       spec:
@@ -134,7 +130,7 @@ spec:
           requests:
             storage: {{ $.Values.storageclass.dataStorageSize}}
     {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
+    {{- else }}
     - metadata:
         name: data
       spec:
