@@ -18,12 +18,21 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     path::Path,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::SystemTime,
 };
 
-use rustfs_ecstore::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use rustfs_utils::path::SLASH_SEPARATOR;
+use http::HeaderMap;
+use rustfs_ecstore::{
+    StorageAPI,
+    config::com::save_config,
+    disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    error::{Error, Result as StorageResult, StorageError},
+    store_api::ObjectOptions,
+};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
+use tokio::time::{Duration, sleep, timeout};
+use tracing::{error, warn};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -523,11 +532,18 @@ impl DataUsageEntry {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DataUsageEntryInfo {
+    pub name: String,
+    pub parent: String,
+    pub entry: DataUsageEntry,
+}
+
 /// Data usage cache info
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageCacheInfo {
     pub name: String,
-    pub next_cycle: u32,
+    pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
 }
@@ -862,8 +878,225 @@ impl DataUsageCache {
         Ok(t)
     }
 
-    // Note: load and save methods are storage-specific and should be implemented
-    // in the ecstore crate where storage access is available
+    /// Load the cache content with name from minioMetaBackgroundOpsBucket.
+    /// Only backend errors are returned as errors.
+    /// The loader is optimistic and has no locking, but tries 5 times before giving up.
+    /// If the object is not found, a nil error with empty data usage cache is returned.
+    pub async fn load<S: StorageAPI>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
+        // By default, empty data usage cache
+        *self = DataUsageCache::default();
+
+        // Caches are read+written without locks
+        let mut retries = 0;
+        while retries < 5 {
+            let (should_retry, cache_opt, result) = Self::try_load_inner(store.clone(), name, Duration::from_secs(60)).await;
+            if let Err(e) = result {
+                return Err(e);
+            }
+            if let Some(cache) = cache_opt {
+                *self = cache;
+                return Ok(());
+            }
+            if !should_retry {
+                break;
+            }
+
+            // Try backup file
+            let backup_name = format!("{}.bkp", name);
+            let (backup_retry, backup_cache_opt, backup_result) =
+                Self::try_load_inner(store.clone(), &backup_name, Duration::from_secs(30)).await;
+            if let Err(_) = backup_result {
+                // Error loading backup, continue retry
+            } else if let Some(cache) = backup_cache_opt {
+                // Only return when we have valid data from the backup
+                *self = cache;
+                return Ok(());
+            } else if !backup_retry {
+                // Backup not found and not retryable
+                break;
+            }
+
+            retries += 1;
+            // Random sleep between 0 and 1 second
+            let sleep_ms: u64 = rand::random::<u64>() % 1000;
+            sleep(Duration::from_millis(sleep_ms)).await;
+        }
+
+        if retries == 5 {
+            warn!("maximum retry reached to load the data usage cache `{}`", name);
+        }
+
+        Ok(())
+    }
+    // Inner load function that attempts to load from a specific path
+    // Returns (should_retry, cache_option, error_option)
+    async fn try_load_inner<S: StorageAPI>(
+        store: Arc<S>,
+        load_name: &str,
+        timeout_duration: Duration,
+    ) -> (bool, Option<DataUsageCache>, StorageResult<()>) {
+        // Abandon if more than time.Minute, so we don't hold up scanner.
+        // drive timeout by default is 2 minutes, we do not need to wait longer.
+        let load_fut = async {
+            // First try: RUSTFS_META_BUCKET + BUCKET_META_PREFIX/name
+            let path = path_join_buf(&[BUCKET_META_PREFIX, load_name]);
+            match store
+                .get_object_reader(
+                    RUSTFS_META_BUCKET,
+                    &path,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(mut reader) => {
+                    match reader.read_all().await {
+                        Ok(data) => {
+                            match DataUsageCache::unmarshal(&data) {
+                                Ok(cache) => {
+                                    return Ok(Some(cache));
+                                }
+                                Err(_) => {
+                                    // Deserialization failed, but we got data
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Read error
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(err) => match err {
+                    Error::FileNotFound | Error::VolumeNotFound => {
+                        // Try second location: DATA_USAGE_BUCKET/name
+                        match store
+                            .get_object_reader(
+                                &*DATA_USAGE_BUCKET,
+                                load_name,
+                                None,
+                                HeaderMap::new(),
+                                &ObjectOptions {
+                                    no_lock: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(mut reader) => match reader.read_all().await {
+                                Ok(data) => match DataUsageCache::unmarshal(&data) {
+                                    Ok(cache) => {
+                                        return Ok(Some(cache));
+                                    }
+                                    Err(_) => {
+                                        return Ok(None);
+                                    }
+                                },
+                                Err(e) => {
+                                    return Err(e);
+                                }
+                            },
+                            Err(inner_err) => match inner_err {
+                                Error::FileNotFound | Error::VolumeNotFound => {
+                                    // Object not found in both locations
+                                    return Ok(None);
+                                }
+                                Error::ErasureReadQuorum => {
+                                    // InsufficientReadQuorum - retry
+                                    return Ok(None);
+                                }
+                                _ => {
+                                    // Other storage errors - retry
+                                    if matches!(
+                                        inner_err,
+                                        Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown
+                                    ) {
+                                        return Ok(None);
+                                    }
+                                    return Err(inner_err);
+                                }
+                            },
+                        }
+                    }
+                    Error::ErasureReadQuorum => {
+                        // InsufficientReadQuorum - retry
+                        return Ok(None);
+                    }
+                    _ => {
+                        // Other storage errors - retry
+                        if matches!(err, Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown) {
+                            return Ok(None);
+                        }
+                        return Err(err);
+                    }
+                },
+            }
+        };
+
+        match timeout(timeout_duration, load_fut).await {
+            Ok(result) => match result {
+                Ok(Some(cache)) => (false, Some(cache), Ok(())),
+                Ok(None) => {
+                    // Not found or deserialization failed - check if we should retry
+                    // For now, we don't retry on not found
+                    (false, None, Ok(()))
+                }
+                Err(e) => {
+                    // Check if it's a retryable error
+                    if matches!(
+                        e,
+                        Error::ErasureReadQuorum | Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown
+                    ) {
+                        (true, None, Ok(()))
+                    } else {
+                        (false, None, Err(e))
+                    }
+                }
+            },
+            Err(_) => {
+                // Timeout - retry
+                (true, None, Ok(()))
+            }
+        }
+    }
+
+    pub async fn save<S: StorageAPI>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+        let mut buf = Vec::new();
+        self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+
+        let store_clone = store.clone();
+        let buf_clone = buf.clone();
+        let res = timeout(Duration::from_secs(5), async move {
+            save_config(store_clone, name, buf_clone).await?;
+            Ok::<(), StorageError>(())
+        })
+        .await
+        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
+
+        if let Err(e) = res {
+            error!("Failed to save data usage cache: {e}");
+            return Err(e);
+        }
+
+        let store_clone = store.clone();
+        let backup_name = format!("{}.bkp", name);
+        let res = timeout(Duration::from_secs(5), async move {
+            save_config(store_clone, backup_name.as_str(), buf).await?;
+            Ok::<(), StorageError>(())
+        })
+        .await
+        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
+        if let Err(e) = res {
+            error!("Failed to save data usage cache backup: {e}");
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 /// Trait for storage-specific operations on DataUsageCache

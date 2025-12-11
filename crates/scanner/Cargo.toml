@@ -50,6 +50,8 @@ rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
 tokio-util = { workspace = true }
 rustfs-ecstore  = { workspace = true }
+http = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

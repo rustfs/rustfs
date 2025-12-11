@@ -1,17 +1,24 @@
+use std::collections::HashMap;
 use std::time::SystemTime;
 use std::{fmt::Debug, sync::Arc};
 
-use crate::{DataUsageCache, DataUsageInfo};
+use crate::{
+    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo,
+};
 use futures::future::join_all;
+use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
+use rustfs_common::last_minute::AccElem;
+use rustfs_ecstore::bucket;
 use rustfs_ecstore::error::Error;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::BucketOptions;
+use rustfs_ecstore::store_api::{BucketInfo, BucketOptions};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
+use rustfs_utils::path::{path_join, path_join_buf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, info};
 
 #[async_trait::async_trait]
 pub trait ScannerIO: Send + Sync + Debug + 'static {
@@ -27,8 +34,9 @@ pub trait ScannerIO: Send + Sync + Debug + 'static {
 #[async_trait::async_trait]
 pub trait ScannerIOCache: Send + Sync + Debug + 'static {
     async fn nsscanner_cache(
-        &self,
+        self: Arc<Self>,
         ctx: CancellationToken,
+        buckets: Vec<BucketInfo>,
         updates: mpsc::Sender<DataUsageCache>,
         want_cycle: u64,
         scan_mode: HealScanMode,
@@ -91,10 +99,11 @@ impl ScannerIO for ECStore {
                 });
                 wait_futs.push(receiver_fut);
 
+                let all_buckets_clone = all_buckets.clone();
                 // Spawn task to run the scanner
                 let scanner_fut = tokio::spawn(async move {
                     if let Err(e) = set_clone
-                        .nsscanner_cache(child_token_clone.clone(), tx, want_cycle_clone, scan_mode_clone)
+                        .nsscanner_cache(child_token_clone.clone(), all_buckets_clone, tx, want_cycle_clone, scan_mode_clone)
                         .await
                     {
                         error!("Failed to scan set: {e}");
@@ -175,12 +184,226 @@ impl ScannerIO for ECStore {
 #[async_trait::async_trait]
 impl ScannerIOCache for SetDisks {
     async fn nsscanner_cache(
-        &self,
+        self: Arc<Self>,
         ctx: CancellationToken,
+        buckets: Vec<BucketInfo>,
         updates: mpsc::Sender<DataUsageCache>,
         want_cycle: u64,
         scan_mode: HealScanMode,
     ) -> Result<()> {
+        if buckets.is_empty() {
+            return Ok(());
+        }
+
+        let (disks, healing) = self.get_online_disks_with_healing(false).await;
+        if disks.is_empty() {
+            info!("No online disks available for set");
+            return Ok(());
+        }
+
+        let mut old_cache = DataUsageCache::default();
+        old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await?;
+
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                next_cycle: old_cache.info.next_cycle,
+                ..Default::default()
+            },
+            cache: HashMap::new(),
+        };
+
+        let (bucket_tx, bucket_rx) = mpsc::channel::<BucketInfo>(buckets.len());
+
+        let mut permutes = buckets.clone();
+        permutes.shuffle(&mut rand::rng());
+
+        for bucket in permutes.iter() {
+            if old_cache.find(&bucket.name).is_none() {
+                if let Err(e) = bucket_tx.send(bucket.clone()).await {
+                    error!("Failed to send bucket info: {}", e);
+                }
+            }
+        }
+
+        for bucket in permutes.iter() {
+            if let Some(c) = old_cache.find(&bucket.name) {
+                cache.replace(&bucket.name, DATA_USAGE_ROOT, c.clone());
+
+                if let Err(e) = bucket_tx.send(bucket.clone()).await {
+                    error!("Failed to send bucket info: {}", e);
+                }
+            }
+        }
+
+        drop(bucket_tx);
+
+        let cache_mutex: Arc<Mutex<DataUsageCache>> = Arc::new(Mutex::new(cache));
+
+        let (bucket_result_tx, mut bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(disks.len());
+
+        let cache_mutex_clone = cache_mutex.clone();
+        let store_clone = self.clone();
+        let ctx_clone = ctx.clone();
+        let update_fut = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30 + rand::random::<u64>() % 10));
+
+            let mut last_update = None;
+
+            loop {
+                tokio::select! {
+                    _ = ctx_clone.cancelled() => {
+                        break;
+                    }
+                    _ = ticker.tick() => {
+
+                       let cache = cache_mutex_clone.lock().await;
+                       if cache.info.last_update == last_update {
+                           continue;
+                       }
+
+                       if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
+                           error!("Failed to save data usage cache: {}", e);
+                       }
+
+                       if let Err(e) = updates.send(cache.clone()).await {
+                           error!("Failed to send data usage cache: {}", e);
+
+                       }
+
+                       last_update = cache.info.last_update;
+                    }
+                    res =  bucket_result_rx.recv() => {
+                        if let Some(result) = res {
+                            let mut cache = cache_mutex_clone.lock().await;
+                            cache.replace(&result.name, &result.parent, result.entry);
+                            cache.info.last_update = Some(SystemTime::now());
+
+                        } else {
+                            let mut cache = cache_mutex_clone.lock().await;
+                            cache.info.next_cycle =want_cycle;
+                            cache.info.last_update = Some(SystemTime::now());
+
+                            if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
+                                error!("Failed to save data usage cache: {}", e);
+                            }
+
+                            if let Err(e) = updates.send(cache.clone()).await {
+                                error!("Failed to send data usage cache: {}", e);
+
+                            }
+
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut futs = Vec::new();
+
+        let bucket_rx_mutex: Arc<Mutex<mpsc::Receiver<BucketInfo>>> = Arc::new(Mutex::new(bucket_rx));
+        let bucket_result_tx_clone: Arc<Mutex<mpsc::Sender<DataUsageEntryInfo>>> = Arc::new(Mutex::new(bucket_result_tx));
+        for disk in disks.into_iter() {
+            let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
+            let ctx_clone = ctx.clone();
+            let store_clone_clone = self.clone();
+            let bucket_result_tx_clone_clone = bucket_result_tx_clone.clone();
+            futs.push(tokio::spawn(async move {
+                while let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await {
+                    if ctx_clone.is_cancelled() {
+                        break;
+                    }
+
+                    let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
+
+                    let mut cache = DataUsageCache::default();
+                    if let Err(e) = cache.load(store_clone_clone.clone(), &cache_name).await {
+                        error!("Failed to load data usage cache: {}", e);
+                    }
+
+                    if cache.info.name.is_empty() {
+                        cache.info.name = bucket.name.clone();
+                    }
+
+                    cache.info.skip_healing = healing;
+                    cache.info.next_cycle = want_cycle;
+                    if cache.info.name != bucket.name {
+                        cache.info = DataUsageCacheInfo {
+                            name: bucket.name.clone(),
+                            next_cycle: want_cycle,
+                            ..Default::default()
+                        };
+                    }
+
+                    let (updates_tx, mut updates_rx) = mpsc::channel::<DataUsageEntry>(1);
+
+                    let ctx_clone_clone = ctx_clone.clone();
+                    let bucket_name_clone = bucket.name.clone();
+                    let bucket_result_tx_clone_clone_clone = bucket_result_tx_clone_clone.clone();
+                    let update_fut = tokio::spawn(async move {
+                        while let Some(result) = updates_rx.recv().await {
+                            if ctx_clone_clone.is_cancelled() {
+                                break;
+                            }
+
+                            if let Err(e) = bucket_result_tx_clone_clone_clone
+                                .lock()
+                                .await
+                                .send(DataUsageEntryInfo {
+                                    name: bucket_name_clone.clone(),
+                                    parent: DATA_USAGE_ROOT.to_string(),
+                                    entry: result,
+                                })
+                                .await
+                            {
+                                error!("Failed to send data usage entry info: {}", e);
+                            }
+                        }
+                    });
+
+                    let before = cache.info.last_update;
+
+                    // TODO: disk.nsscan
+
+                    if let Err(e) = update_fut.await {
+                        error!("Failed to update data usage cache: {}", e);
+                    }
+
+                    let root = if let Some(r) = cache.root() {
+                        cache.flatten(&r)
+                    } else {
+                        DataUsageEntry::default()
+                    };
+
+                    if ctx_clone.is_cancelled() {
+                        break;
+                    }
+
+                    if let Err(e) = bucket_result_tx_clone_clone
+                        .lock()
+                        .await
+                        .send(DataUsageEntryInfo {
+                            name: cache.info.name.clone(),
+                            parent: DATA_USAGE_ROOT.to_string(),
+                            entry: root,
+                        })
+                        .await
+                    {
+                        error!("Failed to send data usage entry info: {}", e);
+                    }
+
+                    if let Err(e) = cache.save(store_clone_clone.clone(), &cache_name).await {
+                        error!("Failed to save data usage cache: {}", e);
+                    }
+                }
+            }));
+        }
+
+        let _ = join_all(futs).await;
+
+        update_fut.await?;
+
         Ok(())
     }
 }
