@@ -1650,13 +1650,18 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
     &CONCURRENCY_MANAGER
 }
 
+/// Testing helper to reset the global request counter.
+pub(crate) fn reset_active_get_requests() {
+    ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_concurrent_request_tracking() {
-        // Ensure we start from a clean state
+        reset_active_get_requests();
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
 
         let _guard1 = GetObjectGuard::new();

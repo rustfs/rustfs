@@ -2454,6 +2454,13 @@ impl S3 for FS {
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        // Prefer explicit storage_class from object info; fall back to persisted metadata header.
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
+            .filter(|s| !s.is_empty())
+            .map(ObjectStorageClass::from);
 
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
@@ -2507,6 +2514,7 @@ impl S3 for FS {
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
+            storage_class,
             // metadata: object_metadata,
             ..Default::default()
         };
