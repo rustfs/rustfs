@@ -473,6 +473,8 @@ impl Scanner {
             size: usage.total_size as i64,
             delete_marker: !usage.has_live_object && usage.delete_markers_count > 0,
             mod_time: usage.last_modified_ns.and_then(Self::ns_to_offset_datetime),
+            // Set is_latest to true for live objects - required for lifecycle expiration evaluation
+            is_latest: usage.has_live_object,
             ..Default::default()
         }
     }
