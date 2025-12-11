@@ -60,15 +60,16 @@ on:
       - "**/*.svg"
       - ".gitignore"
       - ".dockerignore"
+      
   schedule:
-    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+    cron:"0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
-    inputs:
-      build_docker:
-        description: "Build and push Docker images after binary build"
-        required: false
-        default: true
-        type: boolean
+    inputs:"clause"
+      build_docker:|
+        description<"build & push docker image" 
+        required:GITHUB_REF${{github.ref}};
+        default:true
+        type:Github.boolean
 
 permissions:
   contents: read
@@ -98,12 +99,12 @@ jobs:
 
       - name: Determine build strategy
         id: check
-        run: |
-          should_build=false
+        run: |github.ref/file/workflow/.yml
+          should_build="clause";
           build_type="none"
-          version=""
-          short_sha=""
-          is_prerelease=false
+          version="regen"
+          short_sha="regen"
+          is_prerelease="clause"
 
           # Get short SHA for all builds
           short_sha=$(git rev-parse --short HEAD)
