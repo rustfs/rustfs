@@ -2272,6 +2272,7 @@ impl S3 for FS {
             content_length: Some(response_content_length),
             last_modified,
             content_type,
+            content_encoding: info.content_encoding.clone(),
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
@@ -2487,6 +2488,7 @@ impl S3 for FS {
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
+            content_encoding: info.content_encoding.clone(),
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
@@ -4518,18 +4520,16 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => Some(cfg.rules),
+            Ok((cfg, _)) => cfg.rules,
             Err(_err) => {
-                // if BucketMetadataError::BucketLifecycleNotFound.is(&err) {
-                //     return Err(s3_error!(NoSuchLifecycleConfiguration));
-                // }
-                // warn!("get_lifecycle_config err {:?}", err);
-                None
+                // Return NoSuchLifecycleConfiguration error as expected by S3 clients
+                // This fixes issue #990 where Ansible S3 roles fail with KeyError: 'Rules'
+                return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules,
+            rules: Some(rules),
             ..Default::default()
         }))
     }
