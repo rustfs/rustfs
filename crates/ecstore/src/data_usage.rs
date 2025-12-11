@@ -32,6 +32,7 @@ use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
+use tokio::fs;
 use tracing::{error, info, warn};
 
 use crate::error::Error;
@@ -63,6 +64,21 @@ lazy_static::lazy_static! {
 
 /// Store data usage info to backend storage
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
+    // Prevent older data from overwriting newer persisted stats
+    if let Ok(buf) = read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
+        if let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf) {
+            if let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update) {
+                if new_ts <= existing_ts {
+                    info!(
+                        "Skip persisting data usage: incoming last_update {:?} <= existing {:?}",
+                        new_ts, existing_ts
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let data =
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
@@ -160,6 +176,39 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
 }
 
 /// Aggregate usage information from local disk snapshots.
+fn merge_snapshot(aggregated: &mut DataUsageInfo, mut snapshot: LocalUsageSnapshot, latest_update: &mut Option<SystemTime>) {
+    if let Some(update) = snapshot.last_update {
+        if latest_update.is_none_or(|current| update > current) {
+            *latest_update = Some(update);
+        }
+    }
+
+    snapshot.recompute_totals();
+
+    aggregated.objects_total_count = aggregated.objects_total_count.saturating_add(snapshot.objects_total_count);
+    aggregated.versions_total_count = aggregated.versions_total_count.saturating_add(snapshot.versions_total_count);
+    aggregated.delete_markers_total_count = aggregated
+        .delete_markers_total_count
+        .saturating_add(snapshot.delete_markers_total_count);
+    aggregated.objects_total_size = aggregated.objects_total_size.saturating_add(snapshot.objects_total_size);
+
+    for (bucket, usage) in snapshot.buckets_usage.into_iter() {
+        let bucket_size = usage.size;
+        match aggregated.buckets_usage.entry(bucket.clone()) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(&usage),
+            Entry::Vacant(entry) => {
+                entry.insert(usage.clone());
+            }
+        }
+
+        aggregated
+            .bucket_sizes
+            .entry(bucket)
+            .and_modify(|size| *size = size.saturating_add(bucket_size))
+            .or_insert(bucket_size);
+    }
+}
+
 pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskUsageStatus>, DataUsageInfo), Error> {
     let mut aggregated = DataUsageInfo::default();
     let mut latest_update: Option<SystemTime> = None;
@@ -196,7 +245,24 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
                     snapshot_exists: false,
                 };
 
-                if let Some(mut snapshot) = read_local_snapshot(root.as_path(), &disk_id).await? {
+                let snapshot_result = read_local_snapshot(root.as_path(), &disk_id).await;
+
+                // If a snapshot is corrupted or unreadable, skip it but keep processing others
+                if let Err(err) = &snapshot_result {
+                    warn!(
+                        "Failed to read data usage snapshot for disk {} (pool {}, set {}, disk {}): {}",
+                        disk_id, pool_idx, set_disks.set_index, disk_index, err
+                    );
+                    // Best-effort cleanup so next scan can rebuild a fresh snapshot instead of repeatedly failing
+                    let snapshot_file = snapshot_path(root.as_path(), &disk_id);
+                    if let Err(remove_err) = fs::remove_file(&snapshot_file).await {
+                        if remove_err.kind() != std::io::ErrorKind::NotFound {
+                            warn!("Failed to remove corrupted snapshot {:?}: {}", snapshot_file, remove_err);
+                        }
+                    }
+                }
+
+                if let Ok(Some(mut snapshot)) = snapshot_result {
                     status.last_update = snapshot.last_update;
                     status.snapshot_exists = true;
 
@@ -213,37 +279,7 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
                         snapshot.meta.disk_index = Some(disk_index);
                     }
 
-                    snapshot.recompute_totals();
-
-                    if let Some(update) = snapshot.last_update {
-                        if latest_update.is_none_or(|current| update > current) {
-                            latest_update = Some(update);
-                        }
-                    }
-
-                    aggregated.objects_total_count = aggregated.objects_total_count.saturating_add(snapshot.objects_total_count);
-                    aggregated.versions_total_count =
-                        aggregated.versions_total_count.saturating_add(snapshot.versions_total_count);
-                    aggregated.delete_markers_total_count = aggregated
-                        .delete_markers_total_count
-                        .saturating_add(snapshot.delete_markers_total_count);
-                    aggregated.objects_total_size = aggregated.objects_total_size.saturating_add(snapshot.objects_total_size);
-
-                    for (bucket, usage) in snapshot.buckets_usage.into_iter() {
-                        let bucket_size = usage.size;
-                        match aggregated.buckets_usage.entry(bucket.clone()) {
-                            Entry::Occupied(mut entry) => entry.get_mut().merge(&usage),
-                            Entry::Vacant(entry) => {
-                                entry.insert(usage.clone());
-                            }
-                        }
-
-                        aggregated
-                            .bucket_sizes
-                            .entry(bucket)
-                            .and_modify(|size| *size = size.saturating_add(bucket_size))
-                            .or_insert(bucket_size);
-                    }
+                    merge_snapshot(&mut aggregated, snapshot, &mut latest_update);
                 }
 
                 statuses.push(status);
@@ -548,4 +584,95 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
     });
     save_config(store, &name, buf).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_common::data_usage::BucketUsageInfo;
+
+    fn aggregate_for_test(
+        inputs: Vec<(DiskUsageStatus, Result<Option<LocalUsageSnapshot>, Error>)>,
+    ) -> (Vec<DiskUsageStatus>, DataUsageInfo) {
+        let mut aggregated = DataUsageInfo::default();
+        let mut latest_update: Option<SystemTime> = None;
+        let mut statuses = Vec::new();
+
+        for (mut status, snapshot_result) in inputs {
+            if let Ok(Some(snapshot)) = snapshot_result {
+                status.snapshot_exists = true;
+                status.last_update = snapshot.last_update;
+                merge_snapshot(&mut aggregated, snapshot, &mut latest_update);
+            }
+            statuses.push(status);
+        }
+
+        aggregated.buckets_count = aggregated.buckets_usage.len() as u64;
+        aggregated.last_update = latest_update;
+        aggregated.disk_usage_status = statuses.clone();
+
+        (statuses, aggregated)
+    }
+
+    #[test]
+    fn aggregate_skips_corrupted_snapshot_and_preserves_other_disks() {
+        let mut good_snapshot = LocalUsageSnapshot::new(LocalUsageSnapshotMeta {
+            disk_id: "good-disk".to_string(),
+            pool_index: Some(0),
+            set_index: Some(0),
+            disk_index: Some(0),
+        });
+        good_snapshot.last_update = Some(SystemTime::now());
+        good_snapshot.buckets_usage.insert(
+            "bucket-a".to_string(),
+            BucketUsageInfo {
+                objects_count: 3,
+                versions_count: 3,
+                size: 42,
+                ..Default::default()
+            },
+        );
+        good_snapshot.recompute_totals();
+
+        let bad_snapshot_err: Result<Option<LocalUsageSnapshot>, Error> = Err(Error::other("corrupted snapshot payload"));
+
+        let inputs = vec![
+            (
+                DiskUsageStatus {
+                    disk_id: "bad-disk".to_string(),
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                    disk_index: Some(1),
+                    last_update: None,
+                    snapshot_exists: false,
+                },
+                bad_snapshot_err,
+            ),
+            (
+                DiskUsageStatus {
+                    disk_id: "good-disk".to_string(),
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                    disk_index: Some(0),
+                    last_update: None,
+                    snapshot_exists: false,
+                },
+                Ok(Some(good_snapshot)),
+            ),
+        ];
+
+        let (statuses, aggregated) = aggregate_for_test(inputs);
+
+        // Bad disk stays non-existent, good disk is marked present
+        let bad_status = statuses.iter().find(|s| s.disk_id == "bad-disk").unwrap();
+        assert!(!bad_status.snapshot_exists);
+        let good_status = statuses.iter().find(|s| s.disk_id == "good-disk").unwrap();
+        assert!(good_status.snapshot_exists);
+
+        // Aggregated data is from good snapshot only
+        assert_eq!(aggregated.objects_total_count, 3);
+        assert_eq!(aggregated.objects_total_size, 42);
+        assert_eq!(aggregated.buckets_count, 1);
+        assert_eq!(aggregated.buckets_usage.get("bucket-a").map(|b| (b.objects_count, b.size)), Some((3, 42)));
+    }
 }
