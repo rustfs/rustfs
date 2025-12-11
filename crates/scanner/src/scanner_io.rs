@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::SystemTime;
 use std::{fmt::Debug, sync::Arc};
 
+use crate::metrics::global_metrics;
+use crate::scanner_folder::ScannerItem;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo,
 };
@@ -9,12 +12,22 @@ use futures::future::join_all;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::last_minute::AccElem;
-use rustfs_ecstore::bucket;
-use rustfs_ecstore::error::Error;
+use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
+use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
+use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt};
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
+use rustfs_ecstore::disk::{Disk, DiskAPI, DiskStore, local::LocalDisk};
+use rustfs_ecstore::error::{Error, StorageError};
+use rustfs_ecstore::rpc::RemoteDisk;
 use rustfs_ecstore::set_disk::SetDisks;
 use rustfs_ecstore::store_api::{BucketInfo, BucketOptions};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
-use rustfs_utils::path::{path_join, path_join_buf};
+use rustfs_ecstore::{bucket, new_object_layer_fn};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join, path_join_buf};
+use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration, VersioningConfiguration};
+use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +54,17 @@ pub trait ScannerIOCache: Send + Sync + Debug + 'static {
         want_cycle: u64,
         scan_mode: HealScanMode,
     ) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+pub trait ScannerIODisk: Send + Sync + Debug + 'static {
+    async fn nsscanner_disk(
+        &self,
+        ctx: CancellationToken,
+        cache: DataUsageCache,
+        updates: mpsc::Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache>;
 }
 
 #[async_trait::async_trait]
@@ -364,7 +388,29 @@ impl ScannerIOCache for SetDisks {
 
                     let before = cache.info.last_update;
 
-                    // TODO: disk.nsscan
+                    cache = match disk
+                        .clone()
+                        .nsscanner_disk(ctx_clone.clone(), cache.clone(), updates_tx, scan_mode)
+                        .await
+                    {
+                        Ok(cache) => cache,
+                        Err(e) => {
+                            error!("Failed to scan disk: {}", e);
+
+                            if let (Some(last_update), Some(before_update)) = (cache.info.last_update, before) {
+                                if last_update > before_update {
+                                    if let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await {
+                                        error!("Failed to save data usage cache: {}", e);
+                                    }
+                                }
+                            }
+
+                            if let Err(e) = update_fut.await {
+                                error!("Failed to update data usage cache: {}", e);
+                            }
+                            continue;
+                        }
+                    };
 
                     if let Err(e) = update_fut.await {
                         error!("Failed to update data usage cache: {}", e);
@@ -405,5 +451,165 @@ impl ScannerIOCache for SetDisks {
         update_fut.await?;
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerIODisk for Disk {
+    async fn nsscanner_disk(
+        &self,
+        ctx: CancellationToken,
+        cache: DataUsageCache,
+        updates: mpsc::Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        match self {
+            Disk::Local(local_disk) => local_disk.nsscanner_disk(ctx, cache, updates, scan_mode).await,
+            Disk::Remote(remote_disk) => remote_disk.nsscanner_disk(ctx, cache, updates, scan_mode).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerIODisk for LocalDisk {
+    async fn nsscanner_disk(
+        &self,
+        ctx: CancellationToken,
+        cache: DataUsageCache,
+        updates: mpsc::Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        let _guard = self.start_scan();
+
+        let mut cache = cache;
+
+        let (lifecycle_config, _) = get_lifecycle_config(&cache.info.name)
+            .await
+            .unwrap_or((BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
+
+        // if lifecycle_config.has_active_rules("").await {
+        //     cache.info.lifecycle = Some(lifecycle_config);
+        // }
+
+        let (replication_config, _) = get_replication_config(&cache.info.name).await.unwrap_or((
+            ReplicationConfiguration {
+                role: "".to_string(),
+                rules: vec![],
+            },
+            OffsetDateTime::now_utc(),
+        ));
+
+        // if replication_config.has_active_rules("", true) {
+        //     if let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await {
+        //         cache.info.replication = Some(ReplicationConfig {
+        //             config: Some(replication_config),
+        //             remotes: Some(targets),
+        //         });
+        //     }
+        // }
+
+        // TODO: object lock
+
+        let versioning_config = BucketVersioningSys::get(&cache.info.name).await.unwrap_or_default();
+
+        let Some(ecstore) = new_object_layer_fn() else {
+            error!("ECStore not available");
+            return Err(StorageError::other("ECStore not available".to_string()));
+        };
+
+        let disk_location = self.get_disk_location();
+
+        let (Some(pool_idx), Some(set_idx)) = (disk_location.pool_idx, disk_location.set_idx) else {
+            error!("Disk location not available");
+            return Err(StorageError::other("Disk location not available".to_string()));
+        };
+
+        let disks_result = ecstore.get_disks(pool_idx, set_idx).await?;
+
+        let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
+
+        cache.info.updates = Some(Arc::new(Mutex::new(updates)));
+
+        // Get disk path
+        let disk_path = self.path().to_string_lossy().to_string();
+
+        // Check if erasure mode (if we have multiple disks in the set)
+        let is_erasure = disks.len() > 1;
+
+        // Create we_sleep function (always return false for now, can be enhanced later)
+        let we_sleep: Box<dyn Fn() -> bool + Send + Sync> = Box::new(|| false);
+
+        // Create update_current_path function (no-op for now, can be enhanced with metrics)
+        let update_current_path: Box<dyn Fn(String) + Send + Sync> = Box::new(|_path| {
+            // TODO: Update metrics if needed
+        });
+
+        // Create check_disk_healing function
+        let check_disk_healing: Option<Box<dyn Fn() -> bool + Send + Sync>> = None; // TODO: Implement disk healing check
+
+        // Create get_size function
+        // Clone necessary data to avoid lifetime issues
+        // Note: LocalDisk may not implement Clone, so we'll use a different approach
+        // We'll pass the disk path and use it to read metadata
+        let disk_path_for_get_size = disk_path.clone();
+        let lifecycle_config_clone = lifecycle_config.clone();
+        let versioning_config_clone = versioning_config.clone();
+        let get_size: crate::scanner_folder::GetSizeFn = Box::new(move |item: ScannerItem| {
+            // Check if path ends with xl.meta
+            if !item.path.ends_with(&format!("{}{}", SLASH_SEPARATOR, STORAGE_FORMAT_FILE)) {
+                return Err(StorageError::other("skip file".to_string()));
+            }
+
+            // Read metadata
+            // Note: We can't use disk_clone here due to lifetime issues
+            // For now, we'll return an error indicating this needs to be implemented differently
+            // TODO: Implement proper metadata reading using async context or refactor GetSizeFn to be async
+            // The proper implementation would:
+            // 1. Read metadata from disk using async context
+            // 2. Transform meta dir (remove the last component from prefix)
+            // 3. Get file info versions from metadata
+            // 4. Process versions and apply lifecycle/healing/replication checks
+            // 5. Return SizeSummary
+
+            // Placeholder: return skip file error for now
+            Err(StorageError::other("skip file - metadata reading needs async implementation".to_string()))
+        });
+
+        // Call scan_data_folder
+        use crate::scanner_folder::scan_data_folder;
+        let result = scan_data_folder(
+            ctx,
+            disks,
+            disk_path,
+            cache,
+            get_size,
+            scan_mode,
+            we_sleep,
+            is_erasure,
+            update_current_path,
+            check_disk_healing,
+        )
+        .await;
+
+        match result {
+            Ok(mut data_usage_info) => {
+                data_usage_info.info.last_update = Some(SystemTime::now());
+                Ok(data_usage_info)
+            }
+            Err(e) => Err(StorageError::other(format!("Failed to scan data folder: {}", e))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerIODisk for RemoteDisk {
+    async fn nsscanner_disk(
+        &self,
+        ctx: CancellationToken,
+        cache: DataUsageCache,
+        updates: mpsc::Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        todo!()
     }
 }

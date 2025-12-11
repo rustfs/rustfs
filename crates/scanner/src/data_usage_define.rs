@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use path_clean::PathClean;
+use s3s::dto::BucketLifecycleConfiguration;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -25,13 +26,17 @@ use std::{
 use http::HeaderMap;
 use rustfs_ecstore::{
     StorageAPI,
+    bucket::replication::ReplicationConfig,
     config::com::save_config,
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
     store_api::ObjectOptions,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::{
+    sync::{Mutex, mpsc},
+    time::{Duration, sleep, timeout},
+};
 use tracing::{error, warn};
 
 // Data usage constants
@@ -546,6 +551,10 @@ pub struct DataUsageCacheInfo {
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
+    // pub lifecycle: Option<BucketLifecycleConfiguration>,
+    // pub replication: Option<ReplicationConfig>,
+    #[serde(skip)]
+    pub updates: Option<Arc<Mutex<mpsc::Sender<DataUsageEntry>>>>,
 }
 
 /// Data usage cache

@@ -7576,6 +7576,7 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-madmin",
  "rustfs-utils",
+ "s3s",
  "serde",
  "serde_json",
  "serial_test",

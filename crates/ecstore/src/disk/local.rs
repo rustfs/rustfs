@@ -99,7 +99,7 @@ pub struct LocalDisk {
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
     pub disk_info_cache: Arc<Cache<DiskInfo>>,
-    pub scanning: AtomicU32,
+    pub scanning: Arc<AtomicU32>,
     pub rotational: bool,
     pub fstype: String,
     pub major: u64,
@@ -225,7 +225,7 @@ impl LocalDisk {
             format_path,
             format_info: RwLock::new(format_info),
             disk_info_cache: Arc::new(cache),
-            scanning: AtomicU32::new(0),
+            scanning: Arc::new(AtomicU32::new(0)),
             rotational: Default::default(),
             fstype: Default::default(),
             minor: Default::default(),
@@ -1218,6 +1218,19 @@ impl LocalDisk {
         }
 
         Ok(())
+    }
+
+    pub fn start_scan(&self) -> ScanGuard {
+        self.scanning.fetch_add(1, Ordering::Relaxed);
+        ScanGuard(Arc::clone(&self.scanning))
+    }
+}
+
+pub struct ScanGuard(Arc<AtomicU32>);
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
