@@ -827,7 +827,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -878,7 +883,14 @@ impl ObjectInfo {
 
             if entry.is_dir() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    if let Some(idx) = {
+                        let remaining = if entry.name.starts_with(prefix) {
+                            &entry.name[prefix.len()..]
+                        } else {
+                            entry.name.as_str()
+                        };
+                        remaining.find(delimiter.as_str())
+                    } {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -914,7 +926,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -951,7 +968,14 @@ impl ObjectInfo {
 
             if entry.is_dir() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    if let Some(idx) = {
+                        let remaining = if entry.name.starts_with(prefix) {
+                            &entry.name[prefix.len()..]
+                        } else {
+                            entry.name.as_str()
+                        };
+                        remaining.find(delimiter.as_str())
+                    } {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
